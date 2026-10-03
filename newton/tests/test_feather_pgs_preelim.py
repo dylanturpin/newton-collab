@@ -32,9 +32,9 @@ class TestPreeliminationSignature(unittest.TestCase):
         """Bind a legacy positional gap without silently coercing it to a boolean."""
         signature = inspect.signature(newton.solvers.SolverFeatherPGS)
         positional = [p for p in signature.parameters.values() if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
-        self.assertEqual(len(positional), 55)
-        self.assertEqual(positional[12].name, "joint_limit_activation_gap")
-        arguments = [object()] + [p.default for p in positional[1:12]] + [0.123]
+        self.assertEqual(len(positional), 54)
+        self.assertEqual(positional[11].name, "joint_limit_activation_gap")
+        arguments = [object()] + [p.default for p in positional[1:11]] + [0.123]
         bound = signature.bind_partial(*arguments, bilateral_preelimination_include_mimics=False)
         self.assertEqual(bound.arguments["joint_limit_activation_gap"], 0.123)
         self.assertIs(bound.arguments["bilateral_preelimination_include_mimics"], False)

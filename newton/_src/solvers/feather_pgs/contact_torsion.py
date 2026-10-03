@@ -487,7 +487,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
 def torque_sweep_source(dofs):
     """Return the coupled residual-budget angular solve inside each PGS sweep."""
     return f"""
-        if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
+        if (row_phase == 0) {{
             for (int spin = 0; spin < m_dense; ++spin) {{
                 if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
                 float radius = contact_torsion_radius;

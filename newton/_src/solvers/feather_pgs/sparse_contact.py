@@ -28,7 +28,7 @@ def _get_sparse_contact_response_kernel(
 
     All input/output arrays must be contiguous for the native flat accesses.
     Launch total_num_workers * lanes_per_contact threads in blocks of
-    warps_per_block * 32. The CPU implementation uses one lane per group.
+    warps_per_block * 32. CUDA only.
     """
     n, lanes, warps = int(dof_count), int(lanes_per_contact), int(warps_per_block)
     if not 1 <= n <= 64 or lanes not in (8, 16, 32) or not 1 <= warps <= 32:
@@ -57,33 +57,12 @@ def _get_sparse_contact_response_kernel(
             directions_shared.data[row][k] = __shfl_sync(MASK, directions.data[row][k], 0, $LANES);
         }
     }
-#else
-    if ((tid & ($LANES - 1)) != 0) return;
-    const int lane = 0;
-    const int stride = 1;
-    float jacobian[$SCRATCH];
-    const auto angular_a_shared = angular_a;
-    const auto angular_b_shared = angular_b;
-    const auto directions_shared = directions;
-#endif
     float* free_factor = jacobian + $JACOBIAN;
     const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
         return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
     };
     const auto first_bit = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
         return __ffsll(mask) - 1;
-#else
-        int column = 0;
-        while ((mask & 1ull) == 0) { mask >>= 1; ++column; }
-        return column;
-#endif
     };
     const auto jacobian_value = [&](const auto& motion, const auto& angular_wrenches, int row) {
         const auto linear = wp::vec3(motion.c[0], motion.c[1], motion.c[2]);
@@ -129,9 +108,7 @@ def _get_sparse_contact_response_kernel(
                     incident.c[row] += value * velocity;
                 }
             }
-#if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
-#endif
             const int factor_base = group * 36;
             for (int node = lane; node < 6; node += stride) {
                 auto value = wp::vec3(0.0f);
@@ -147,9 +124,7 @@ def _get_sparse_contact_response_kernel(
                     if (row < row_count) free_factor[row * $PLANE + node] = value.c[row];
                 }
             }
-#if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
-#endif
             for (int node = lane; node < 6; node += stride) {
                 auto response = wp::vec3(0.0f);
                 for (int column = node; column < 6; ++column) {
@@ -193,9 +168,7 @@ def _get_sparse_contact_response_kernel(
                     incident.c[row] += value * velocity;
                 }
             }
-#if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
-#endif
             const int factor_base = group * inverse_factor.shape[1];
             for (int node = lane; node < $N; node += stride) {
                 const unsigned long long bit = 1ull << node;
@@ -229,9 +202,7 @@ def _get_sparse_contact_response_kernel(
             count += bit_count(mask);
         }
         // The next endpoint reuses the same group-local Jacobian storage.
-#if defined(__CUDA_ARCH__)
         __syncwarp(MASK);
-#endif
     }
 #pragma unroll
     for (int row = 0; row < 3; ++row) {
@@ -241,17 +212,16 @@ def _get_sparse_contact_response_kernel(
             row_dof.data[response_offset + index] = -1;
             row_factor.data[response_offset + index] = 0.0f;
         }
-#if defined(__CUDA_ARCH__)
         for (int shift = $LANES / 2; shift > 0; shift >>= 1) {
             norm.c[row] += __shfl_down_sync(MASK, norm.c[row], shift, $LANES);
             incident.c[row] += __shfl_down_sync(MASK, incident.c[row], shift, $LANES);
         }
-#endif
         if (lane == 0) {
             row_incident.data[row_offset + row] = incident.c[row];
             diagonal.data[row_offset + row] = norm.c[row];
         }
     }
+#endif
 """
     snippet = (
         snippet.replace("$STORAGE", str(groups * 3 * scratch_size))
@@ -437,25 +407,14 @@ def _get_sparse_contact_response_kernel(
 
 @wp.func_native(
     """
+#if defined(__CUDA_ARCH__)
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
-#if defined(__CUDA_ARCH__)
     constexpr unsigned MASK = 0xffffffffu;
     const int lane = tid & 31;
     const int width = 32;
-#else
-    if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int width = 1;
-#endif
     const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
         return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
     };
     const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
@@ -479,18 +438,12 @@ def _get_sparse_contact_response_kernel(
             active = wp::isfinite(bound)
                 && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
         }
-#if defined(__CUDA_ARCH__)
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
         const int active_count = __popc(active_mask);
         int first_slot = 0;
         if (lane == 0 && active_count != 0)
             first_slot = atomicAdd(&slot_counter.data[world], active_count);
         first_slot = __shfl_sync(MASK, first_slot, 0);
-#else
-        const unsigned active_mask = active != 0 ? 1u : 0u;
-        const int first_slot = slot_counter.data[world];
-        slot_counter.data[world] += active;
-#endif
         // Visit the ballot in lane order, matching the existing lower/upper DOF order.
         unsigned pending = active_mask;
         int rank = 0;
@@ -498,16 +451,10 @@ def _get_sparse_contact_response_kernel(
             const int row = first_slot + rank;
             // The reservation above still counts every over-capacity row.
             if (row >= capacity) break;
-#if defined(__CUDA_ARCH__)
             const int source = __ffs(pending) - 1;
             const int selected_dof = __shfl_sync(MASK, local_dof, source);
             const int selected_side = __shfl_sync(MASK, side, source);
             const float selected_gap = __shfl_sync(MASK, gap, source);
-#else
-            const int selected_dof = local_dof;
-            const int selected_side = side;
-            const float selected_gap = gap;
-#endif
             const float sign = selected_side == 0 ? 1.0f : -1.0f;
             const int column = inverse_permutation.data[selected_dof];
             const unsigned long long support_mask = dof_mask.data[selected_dof];
@@ -529,9 +476,7 @@ def _get_sparse_contact_response_kernel(
                 row_dof.data[response_offset + index] = -1;
                 row_factor.data[response_offset + index] = 0.0f;
             }
-#if defined(__CUDA_ARCH__)
             for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
-#endif
             if (lane == 0) {
                 row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
                 diagonal.data[row_offset] = norm;
@@ -547,6 +492,7 @@ def _get_sparse_contact_response_kernel(
             ++rank;
         }
     }
+#endif
 """.replace("$LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
 )
 def _build_sparse_joint_limit_rows(
@@ -613,7 +559,7 @@ def build_sparse_joint_limit_rows(
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
 ):
-    """Build ordered limit rows and sparse responses with one warp per articulation.
+    """Build ordered limit rows and sparse responses with one CUDA warp per articulation.
 
     Launch ``32 * group_count`` threads in blocks divisible by 32. Active row
     reservations include over-capacity demand; writes stay within row capacity.

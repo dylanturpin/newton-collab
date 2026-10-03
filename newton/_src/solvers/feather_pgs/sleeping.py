@@ -37,10 +37,8 @@ class _SleepState:
         self.linear_threshold = linear_threshold
         self.angular_threshold = angular_threshold
         self.quiet_time = quiet_time
+        # Also skips the articulated dynamics of islands that sleep through a step; their outputs are frozen anyway.
         self.skip_constraints = skip_constraints
-        self.carry_frozen_patches = True
-        # Skip the articulated dynamics of islands that sleep through a step; their outputs are frozen anyway.
-        self.skip_dynamics = skip_constraints
         body_nodes = solver.body_to_articulation.numpy().copy()
         response_counts = solver.articulation_response_dof_count.numpy()
         prescribed = (body_nodes >= 0) & (response_counts[np.maximum(body_nodes, 0)] == 0)
@@ -137,7 +135,7 @@ class _SleepState:
     @property
     def patch_frozen_bodies(self):
         """Bodies whose friction-patch history can be carried; only row-free sleeping qualifies."""
-        return self.frozen_bodies if self.skip_constraints and self.carry_frozen_patches else None
+        return self.frozen_bodies if self.skip_constraints else None
 
     def wake(self, world_mask=None):
         """Wake every component and invalidate state-change history, or wake only the masked worlds."""
@@ -353,14 +351,13 @@ class _SleepState:
             device=device,
         )
         solver = self.solver
-        skip = int(self.skip_constraints and self.skip_dynamics)
+        skip = int(self.skip_constraints)
         wp.launch(
             _articulation_activity,
             self.parent.size,
             [
                 self.art_awake,
                 self.art_skippable,
-                int(self.skip_constraints),
                 skip,
                 self.step_asleep,
                 solver._dynamics_art_active,
@@ -418,9 +415,7 @@ class _SleepState:
             [
                 self.body_nodes,
                 self.parent,
-                self.art_awake,
                 int(self.skip_constraints),
-                int(self.skip_constraints and self.skip_dynamics),
                 self.step_asleep,
                 state_out.body_q,
                 state_out.body_qd,
@@ -436,7 +431,7 @@ class _SleepState:
             [
                 self.coord_art,
                 self.parent,
-                int(self.skip_constraints and self.skip_dynamics),
+                int(self.skip_constraints),
                 self.step_asleep,
                 state_out.joint_q,
                 self.root_veto,
@@ -449,7 +444,7 @@ class _SleepState:
             [
                 self.dof_art,
                 self.parent,
-                int(self.skip_constraints and self.skip_dynamics),
+                int(self.skip_constraints),
                 self.step_asleep,
                 state_out.joint_qd,
                 self.root_veto,
@@ -835,7 +830,6 @@ def _wake_components(
 def _articulation_activity(
     awake: wp.array[int],
     skippable: wp.array[int],
-    skip_constraints: int,
     skip: int,
     step_asleep: wp.array[int],
     active: wp.array[int],
@@ -846,11 +840,11 @@ def _articulation_activity(
     i = wp.tid()
     step_asleep[i] = 1 - awake[i]
     rows_active[i] = 1
-    if skip_constraints != 0 and awake[i] == 0:
-        rows_active[i] = 0
     active[i] = 1
     active_mask[i] = True
     if skip != 0:
+        if awake[i] == 0:
+            rows_active[i] = 0
         if awake[i] == 0 and skippable[i] != 0:
             active[i] = 0
             active_mask[i] = False
@@ -870,9 +864,7 @@ def _entity_activity(nodes: wp.array[int], skip: int, awake: wp.array[int], acti
 def _output_motion(
     nodes: wp.array[int],
     parent: wp.array[int],
-    awake: wp.array[int],
-    skip_constraints: int,
-    skip_dynamics: int,
+    skip: int,
     step_asleep: wp.array[int],
     q: wp.array[wp.transform],
     qd: wp.array[wp.spatial_vector],
@@ -882,15 +874,16 @@ def _output_motion(
 ):
     i = wp.tid()
     # Sleepers whose dynamics were skipped hold stale outputs rather than trial results.
-    if nodes[i] >= 0 and not (skip_dynamics != 0 and step_asleep[nodes[i]] != 0):
+    if nodes[i] >= 0 and not (skip != 0 and step_asleep[nodes[i]] != 0):
         pose = q[i]
         for j in range(7):
             if not wp.isfinite(pose[j]):
                 wp.atomic_max(veto, parent[nodes[i]], 1)
         velocity = qd[i]
-        if not wp.isfinite(wp.length(velocity)) or (
-            (skip_constraints == 0 or awake[nodes[i]] != 0)
-            and (wp.length(wp.spatial_top(velocity)) > linear or wp.length(wp.spatial_bottom(velocity)) > angular)
+        if (
+            not wp.isfinite(wp.length(velocity))
+            or wp.length(wp.spatial_top(velocity)) > linear
+            or wp.length(wp.spatial_bottom(velocity)) > angular
         ):
             wp.atomic_max(veto, parent[nodes[i]], 1)
 
@@ -899,13 +892,13 @@ def _output_motion(
 def _output_finite(
     nodes: wp.array[int],
     parent: wp.array[int],
-    skip_dynamics: int,
+    skip: int,
     step_asleep: wp.array[int],
     value: wp.array[float],
     veto: wp.array[int],
 ):
     i = wp.tid()
-    if nodes[i] < 0 or (skip_dynamics != 0 and step_asleep[nodes[i]] != 0):
+    if nodes[i] < 0 or (skip != 0 and step_asleep[nodes[i]] != 0):
         return
     if not wp.isfinite(value[i]):
         wp.atomic_max(veto, parent[nodes[i]], 1)

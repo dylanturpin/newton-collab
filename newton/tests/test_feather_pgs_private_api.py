@@ -66,7 +66,6 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         plain_template = next(node for node in plain_factory.body if isinstance(node, ast.FunctionDef))
         diagonal_template = next(node for node in diagonal_factory.body if isinstance(node, ast.FunctionDef))
 
-        diagonal_factory_parameters = {argument.arg for argument in diagonal_factory.args.args}
         plain_parameters = {argument.arg for argument in plain_template.args.args}
         diagonal_parameters = {argument.arg for argument in diagonal_template.args.args}
         plain_names = {node.id for node in ast.walk(plain_template) if isinstance(node, ast.Name)}
@@ -74,8 +73,6 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
 
         self.assertNotIn("diag_group", plain_parameters)
         self.assertNotIn("diag_tile", plain_names)
-        self.assertIn("compute_diag", diagonal_factory_parameters)
-        self.assertIn("COMPUTE_DIAG", diagonal_names)
         self.assertIn("diag_group", diagonal_parameters)
         self.assertIn("diag_tile", diagonal_names)
 
