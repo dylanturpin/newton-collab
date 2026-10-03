@@ -303,10 +303,8 @@ def _append_group(work: _Workspace, representative: int, world: int, row: int, c
 def _group_world(
     contact_capacity: int,
     row_capacity: int,
-    patch_mode: int,
     row_count: wp.array[int],
     row_dropped: wp.array[int],
-    parents: wp.array2d[int],
     mu: wp.array2d[float],
     work: _Workspace,
 ):
@@ -329,25 +327,19 @@ def _group_world(
             other = work.indices[j]
             if work.eligible[other] != 1:
                 continue
-            same = bool(False)
-            if patch_mode != 0:
-                same = work.owner[c] == work.owner[other]
-            else:
-                same = work.shape_a[c] == work.shape_a[other] and work.shape_b[c] == work.shape_b[other]
-            if not same:
+            if work.shape_a[c] != work.shape_a[other] or work.shape_b[c] != work.shape_b[other]:
                 continue
             first_pair = wp.min(first_pair, other)
             if work.group[other] != other:
                 continue
             compatible = bool(True)
-            if patch_mode == 0:
-                member = other
-                while member >= 0:
-                    if _host_dot3(work.normal[c], work.normal[member]) < _NORMAL_COSINE:
-                        compatible = False
-                    if wp.abs(_host_dot3(work.normal[c], work.point[c] - work.point[member])) > _TOUCH_TOLERANCE:
-                        compatible = False
-                    member = work.next_member[member]
+            member = other
+            while member >= 0:
+                if _host_dot3(work.normal[c], work.normal[member]) < _NORMAL_COSINE:
+                    compatible = False
+                if wp.abs(_host_dot3(work.normal[c], work.point[c] - work.point[member])) > _TOUCH_TOLERANCE:
+                    compatible = False
+                member = work.next_member[member]
             if compatible and chosen < 0:
                 chosen = other
         if chosen < 0:
@@ -362,44 +354,19 @@ def _group_world(
         rep = work.indices[i]
         if work.group[rep] != rep:
             continue
-        rejected = bool(False)
-        anchor_count = int(0)
         first_anchor = int(-1)
         touching = int(-1)
         for j in range(start, end):
             c = work.indices[j]
-            if patch_mode != 0 and work.eligible[c] == -1 and work.owner[c] == work.owner[rep]:
-                rejected = True
             if work.group[c] != rep:
                 continue
-            if work.anchor[c] != 0:
-                anchor_count += 1
-                if first_anchor < 0:
-                    first_anchor = c
+            if work.anchor[c] != 0 and first_anchor < 0:
+                first_anchor = c
             if touching < 0 and work.gap[c] <= _TOUCH_TOLERANCE:
                 touching = c
-        if rejected:
-            continue
-        # Check every non-rejected region, even when it has no touching anchor.
-        # This is the host oracle's exact load-ring membership condition.
-        if patch_mode != 0:
-            for j in range(start, end):
-                c = work.indices[j]
-                if work.group[c] != rep:
-                    continue
-                parent = parents[world, work.slot[c]]
-                member = int(-1)
-                if parent >= 0 and parent < row_capacity:
-                    member = work.row_contact[world, parent]
-                if member < 0:
-                    wp.atomic_or(work.status, 0, 16)
-                elif work.group[member] != rep:
-                    wp.atomic_or(work.status, 0, 16)
         if first_anchor < 0 or touching < 0:
             continue
         coefficient = mu[world, work.slot[first_anchor] + 1]
-        if patch_mode != 0:
-            coefficient *= float(anchor_count)
         if coefficient <= 0.0:
             continue
         work.coefficient[rep] = coefficient
@@ -408,10 +375,7 @@ def _group_world(
     row = row_count[world]
     for i in range(start, end):
         rep = work.indices[i]
-        if patch_mode != 0:
-            if work.lead[rep] >= 0:
-                row = _append_group(work, rep, world, row, row_capacity)
-        elif work.group[rep] == rep and work.first_pair[rep] == rep:
+        if work.group[rep] == rep and work.first_pair[rep] == rep:
             # Python's dictionary emits all clusters of its first-seen shape
             # pair before the next pair, not simply global cluster-seed order.
             for j in range(i, end):
@@ -540,10 +504,9 @@ def _jacobians(
 class DeviceTorsionPreparation:
     """Own fixed-capacity preparation buffers and explicit error readback."""
 
-    def __init__(self, solver, *, deferred_errors=False, patch_segments=True):
+    def __init__(self, solver, *, deferred_errors=False):
         self.solver = solver
         self.deferred_errors = bool(deferred_errors)
-        self.patch_segments = bool(patch_segments)
         self.capacity = solver._max_contacts_alloc
         device = solver.model.device
         self.work = _Workspace()
@@ -644,37 +607,6 @@ class DeviceTorsionPreparation:
         if status & 16:
             raise RuntimeError("Persistent friction patch load ring does not match its contact torsion group")
 
-    def read_stats(self):
-        """Explicit diagnostic readback, never part of normal stepping or capture.
-
-        Unlike the host oracle, device preparation does not refresh Python
-        dictionaries each step. Return a fresh snapshot only when requested.
-        """
-        if self.solver.model.device.is_cuda and wp.get_stream(self.solver.model.device).is_capturing:
-            raise RuntimeError("Read torsion statistics outside graph capture")
-        self.validate()
-        names = ("world", "slot", "group", "spin_row", "lead", "anchor", "shape_a", "shape_b", "gap", "coefficient")
-        arrays = {name: getattr(self.work, name).numpy() for name in names}
-        groups = []
-        for representative in np.flatnonzero(arrays["spin_row"] >= 0):
-            lead = arrays["lead"][representative]
-            members = np.flatnonzero(arrays["group"] == representative)
-            anchors = members[arrays["anchor"][members] != 0]
-            touching = members[arrays["gap"][members] <= _TOUCH_TOLERANCE]
-            groups.append(
-                {
-                    "world": int(arrays["world"][representative]),
-                    "row": int(arrays["spin_row"][representative]),
-                    "normal_rows": arrays["slot"][members].tolist(),
-                    "anchor_rows": arrays["slot"][anchors].tolist(),
-                    "shape_pair": [int(arrays["shape_a"][lead]), int(arrays["shape_b"][lead])],
-                    "effective_radius_m": self.solver.contact_torsion_radius,
-                    "mu": float(arrays["coefficient"][representative]),
-                    "gap_max_m": float(np.max(arrays["gap"][touching])),
-                }
-            )
-        return {"rows": len(groups), "groups": groups}
-
     def prepare(self, state, augmented_state, contacts):
         """Build rows entirely on device, followed by optional scalar error readback."""
         s = self.solver
@@ -726,7 +658,7 @@ class DeviceTorsionPreparation:
             ],
             device=device,
         )
-        if patches and self.patch_segments:
+        if patches:
             wp.launch(_patch_keys, dim=self.capacity, inputs=[w], device=device)
             wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
             # Stable sort keeps contact order inside each patch segment.
@@ -752,10 +684,8 @@ class DeviceTorsionPreparation:
                 inputs=[
                     self.capacity,
                     s.dense_max_constraints,
-                    int(patches),
                     s.constraint_count,
                     s._row_dropped_dense,
-                    s.row_parent,
                     s.row_mu,
                     w,
                 ],
@@ -811,7 +741,7 @@ class DeviceTorsionPreparation:
         )
 
 
-def enable_device_torsion(solver, *, deferred_errors=False):
+def enable_device_torsion(solver):
     """Opt into the local experimental port without changing the host default.
 
     The caller must invoke ``solver._device_torsion.validate()`` after every
@@ -820,10 +750,8 @@ def enable_device_torsion(solver, *, deferred_errors=False):
     solver after fixing the input instead of reusing an invalid captured graph.
     Warm up one eager step before capturing, to allocate rollback buffers.
     """
-    if not solver._contact_torsion_enabled:
-        raise ValueError("Enable a positive contact_torsion_radius before device preparation")
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Configure device torsion before CUDA graph capture")
-    solver._device_torsion = DeviceTorsionPreparation(solver, deferred_errors=deferred_errors)
+    solver._device_torsion = DeviceTorsionPreparation(solver)
     solver._torsion_stats = {"device_resident": True, "rows": None, "groups": None}
     return solver._device_torsion

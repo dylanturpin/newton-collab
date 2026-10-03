@@ -102,7 +102,6 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 1,
                 friction_gap_threshold,
                 0,
-                0,
                 patches,
             ],
             outputs=[
@@ -247,7 +246,6 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 8,
                 0,
                 0.0,
-                0,
                 0,
                 FrictionPatches(),
             ],

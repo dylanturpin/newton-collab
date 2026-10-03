@@ -1,0 +1,1 @@
+Remove `SolverFeatherPGS`'s `contact_friction_anchor_limit` parameter, which had no effect. Stop passing it; use `friction_anchor_beta` to tune or disable patch friction. Positional arguments after `contact_friction_shared_anchor` shift left by one.

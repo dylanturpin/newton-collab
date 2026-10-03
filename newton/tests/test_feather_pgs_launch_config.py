@@ -209,9 +209,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_launch_geometry_kernels_use_dedicated_modules(self):
         """Keep custom-block-dimension kernels out of the general module."""
         expected_modules = {
-            "update_articulation_origins": "kinematics",
-            "eval_rigid_fk": "kinematics",
-            "eval_rigid_id": "kinematics",
             "eval_rigid_tau": "inverse_dynamics",
             "compute_composite_inertia": "mass_dynamics",
             "crba_fill_par_dof": "mass_dynamics",
