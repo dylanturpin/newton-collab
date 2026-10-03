@@ -1758,9 +1758,8 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
-        # Native tiled kernels are CUDA-only and every CPU selector resolves to
-        # the scalar suite below, so validate against the kernel that will run.
-        effective_pgs_kernel = "loop" if model.device.is_cpu else pgs_kernel
+        # pgs_kernel only runs in split mode on CUDA; CPU resolves to the scalar loop below.
+        effective_pgs_kernel = "loop" if model.device.is_cpu or pgs_mode == "matrix_free" else pgs_kernel
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
@@ -6360,7 +6359,7 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_tiled_row_kernel = None
         self._pgs_solve_tiled_contact_kernel = None
         self._pgs_solve_streaming_kernel = None
-        if self.dense_max_constraints > 0:
+        if self.dense_max_constraints > 0 and self.pgs_mode != "matrix_free":
             if self.pgs_kernel == "tiled_row":
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
                     self.dense_max_constraints, device_arch
