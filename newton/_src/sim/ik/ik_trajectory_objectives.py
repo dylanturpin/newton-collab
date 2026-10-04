@@ -55,11 +55,10 @@ def _accumulate_joint_tangent_diff(
     Angular components are the axis-angle of the left-difference quaternion,
     matching the retraction used by the IK optimizers (``jcalc_integrate``).
     Free-joint linear components are the plain position difference, which is
-    invariant to where the trajectory sits in the world; for non-root free
-    joints its coupling to the angular tangent coordinates (the ``w x p``
-    lever arm of the spatial velocity convention) is reported exactly through
-    the temporal objectives' coefficient blocks (root joints use
-    body-centered tangents and have none).
+    invariant to where the trajectory sits in the world; its coupling to the
+    angular tangent coordinates (the ``w x p`` lever arm of the spatial
+    velocity convention) is reported exactly through the temporal objectives'
+    coefficient blocks.
     """
     t = joint_type[joint_idx]
     if t == JointType.FIXED:
@@ -210,19 +209,14 @@ def _stencil_free_lever_coeffs(
 ):
     """Free-joint lever-arm coefficient blocks for position-difference stencils.
 
-    For non-root free joints the retraction (``jcalc_integrate``) moves the
-    joint's position by ``delta_lin + delta_ang x p`` (spatial velocity
-    convention), so the linear residual rows couple to the angular tangent
-    coordinates: d r_lin / d delta_ang(t + j) = -c_j [p_{t+j}]x. Root joints
-    use body-centered tangents (cf. ``_integrate_dq_dof``): the angular
-    tangent pivots about the joint's own anchor and leaves the position
-    coordinates unchanged, so they carry no lever coupling.
+    The retraction (``jcalc_integrate``) moves a free joint's position by
+    ``delta_lin + delta_ang x p`` (spatial velocity convention, pivoting
+    about the parent anchor), so the linear residual rows couple to the
+    angular tangent coordinates: d r_lin / d delta_ang(t + j) = -c_j [p_{t+j}]x.
     """
     row, joint_idx = wp.tid()
     jt = joint_type[joint_idx]
     if jt != JointType.FREE and jt != JointType.DISTANCE:
-        return
-    if joint_parent[joint_idx] < 0:
         return
     t = row % n_frames
     if t + width >= n_frames:
@@ -245,14 +239,13 @@ def _stencil_free_lever_coeffs(
                 coeffs[row, j, dof0 + a, dof0 + 3 + b] = -c * s_row * _skew_entry(p, a, b)
 
 
-def _has_nonroot_free_joint(model: Model) -> bool:
-    """Whether any FREE/DISTANCE joint has a parent (root joints use
-    body-centered tangents and carry no lever coupling, cf.
+def _has_free_joint(model: Model) -> bool:
+    """Whether the model has any FREE/DISTANCE joint (all of them carry the
+    ``[p]x`` lever coupling under the parent-anchor tangent convention, cf.
     ``_stencil_free_lever_coeffs``)."""
     jt = model.joint_type.numpy()
-    jp = model.joint_parent.numpy()
     free = (jt == JointType.FREE) | (jt == JointType.DISTANCE)
-    return bool((free & (jp >= 0)).any())
+    return bool(free.any())
 
 
 @wp.kernel(enable_backward=False)
@@ -370,9 +363,6 @@ def _velocity_limit_free_lever_coeffs(
     row, joint_idx = wp.tid()
     jt = joint_type[joint_idx]
     if jt != JointType.FREE and jt != JointType.DISTANCE:
-        return
-    # root free joints use body-centered tangents: no lever coupling
-    if joint_parent[joint_idx] < 0:
         return
     t = row % n_frames
     if t + 1 >= n_frames:
@@ -550,10 +540,8 @@ class IKObjectiveTemporal(IKObjective):
         After this call, ``self.coeffs[row, j, c, a]`` must equal the partial
         derivative of residual row ``(row, c)`` with respect to tangent
         coordinate ``a`` of frame ``row + j``. Most joints only populate the
-        diagonal ``c == a``; non-root free-joint linear rows additionally
-        carry the exact ``[p]x`` lever-arm coupling to the angular tangent
-        coordinates (root joints use body-centered tangents with no
-        coordinate coupling).
+        diagonal ``c == a``; free-joint linear rows additionally carry the
+        exact ``[p]x`` lever-arm coupling to the angular tangent coordinates.
 
         Args:
             joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
@@ -642,7 +630,7 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             outputs=[self.coeffs],
             device=self.device,
         )
-        self._needs_free_lever = _has_nonroot_free_joint(model)
+        self._needs_free_lever = _has_free_joint(model)
 
     @property
     def _scale(self) -> float:
@@ -951,7 +939,7 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             outputs=[self.coeffs],
             device=self.device,
         )
-        self._needs_free_lever = _has_nonroot_free_joint(model)
+        self._needs_free_lever = _has_free_joint(model)
 
     def compute_residuals(
         self,
@@ -1094,16 +1082,11 @@ def _motion_subspace_rows(
             S_s_out,
         )
         # jcalc anchors the free-joint angular columns at the child COM, but
-        # the solver's retraction pivots root joints about their own anchor
-        # position (body-centered tangents, cf. _integrate_dq_dof) and
-        # non-root free joints about the parent anchor origin
-        # (jcalc_integrate; cf. _stencil_free_lever_coeffs). Rewrite the
-        # linear parts so downstream point Jacobians dp = v + omega x p
+        # the solver's retraction (jcalc_integrate) pivots free joints about
+        # the parent anchor origin (cf. _stencil_free_lever_coeffs). Rewrite
+        # the linear parts so downstream point Jacobians dp = v + omega x p
         # match the tangent convention.
         anchor = wp.transform_get_translation(X_wpj)
-        if parent < 0:
-            p_j = wp.vec3(joint_q_1d[q_start + 0], joint_q_1d[q_start + 1], joint_q_1d[q_start + 2])
-            anchor = wp.transform_point(X_wpj, p_j)
         for k in range(3):
             S = S_s_out[qd_start + 3 + k]
             omega = wp.vec3(S[3], S[4], S[5])

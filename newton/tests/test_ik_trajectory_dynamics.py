@@ -105,7 +105,7 @@ def _ee_positions(model, joint_q_np, device):
 
 
 def test_gravity_torque_matches_inverse_dynamics(test, device):
-    """Residual rows must equal eval_inverse_dynamics' gravity_force."""
+    """Residual rows must equal eval_inverse_dynamics_passive's gravity_force."""
     with wp.ScopedDevice(device):
         model = _build_planar_vertical(device)
         rng = np.random.default_rng(11)
@@ -114,13 +114,13 @@ def test_gravity_torque_matches_inverse_dynamics(test, device):
         res = _objective_residuals(obj, model, q_np, device)
 
         state = model.state()
-        inv = model.inverse_dynamics()
+        gravity_force = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=device)
         for t in range(N_FRAMES):
             state.joint_q.assign(q_np[t].astype(np.float32))
             state.joint_qd.zero_()
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            newton.eval_inverse_dynamics(model, state, newton.InverseDynamics.EvalType.GRAVITY_FORCE, inv)
-            assert_np_equal(res[t], inv.gravity_force.numpy(), tol=1e-4)
+            newton.eval_inverse_dynamics_passive(model, state, gravity_force=gravity_force)
+            assert_np_equal(res[t], gravity_force.numpy(), tol=1e-4)
 
 
 def test_gravity_torque_coeffs_match_fd(test, device):
@@ -247,12 +247,13 @@ def test_gravity_torque_reduces_torque(test, device):
 
 
 def _perturb_free_tangent(q, dof, eps, coord0=0, origin_pivot=False):
-    """Free-joint tangent step matching the retraction. Root joints are
-    body-centered: the angular tangent rotates about the joint's own anchor,
-    leaving the position coordinates unchanged. Non-root joints
-    (``origin_pivot=True``) keep jcalc_integrate's pivot about the parent
-    anchor origin (``p += eps * e_a x p`` in anchor coordinates). The
-    orientation quaternion is left-multiplied either way."""
+    """Free-joint tangent step matching the retraction (``jcalc_integrate``):
+    the angular tangent pivots about the parent anchor origin, so the
+    position moves by ``p += eps * e_a x p`` in anchor coordinates
+    (``origin_pivot=True``, the convention of every free joint on this base;
+    ``origin_pivot=False`` keeps the position fixed and is retained only for
+    callers that model a body-centered tangent). The orientation quaternion
+    is left-multiplied either way."""
     qp = q.copy()
     if dof < 3:
         qp[coord0 + dof] += eps
@@ -442,8 +443,8 @@ def test_apparent_gravity_free_joint_coeffs(test, device):
                 qp = q_np.copy()
                 qm = q_np.copy()
                 if dof < 6:
-                    qp[m] = _perturb_free_tangent(q_np[m], dof, eps)
-                    qm[m] = _perturb_free_tangent(q_np[m], dof, -eps)
+                    qp[m] = _perturb_free_tangent(q_np[m], dof, eps, origin_pivot=True)
+                    qm[m] = _perturb_free_tangent(q_np[m], dof, -eps, origin_pivot=True)
                 else:
                     qp[m, 7] += eps
                     qm[m, 7] -= eps
