@@ -2596,7 +2596,7 @@ class IKObjectiveGravityTorque(IKObjectiveTemporal):
     ``weight * dof_weights[d] * tau_g,d(q_t)`` [N or N·m], where
     ``tau_g(q) = dU/dq`` is the joint force that holds the articulation
     static under gravity (the ``gravity_force`` convention of
-    :func:`~newton.eval_inverse_dynamics`). Minimizing it steers redundant
+    :func:`~newton.eval_inverse_dynamics_passive`). Minimizing it steers redundant
     DoFs toward gravity-friendly postures — e.g. an elbow hanging below the
     wrist instead of winging sideways — which is most visible with a heavy
     payload attached to the end effector.
