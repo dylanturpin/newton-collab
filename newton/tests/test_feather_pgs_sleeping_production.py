@@ -3,7 +3,9 @@
 
 """Exercise sleeping with persistent friction anchors, device torsion and mimic constraints."""
 
+import functools
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -246,31 +248,43 @@ class TestSleepingProductionProfile(unittest.TestCase):
 
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        base = builder.add_link(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
-        builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.05)
-        joints = [builder.add_joint_free(child=base)]
-        for side in (-1.0, 1.0):
-            finger = builder.add_link(xform=wp.transform((side * 0.15, 0.0, 0.15), wp.quat_identity()))
-            builder.add_shape_box(finger, hx=0.02, hy=0.02, hz=0.05)
-            joints.append(
-                builder.add_joint_revolute(
-                    parent=base, child=finger, parent_xform=wp.transform((side * 0.15, 0.0, 0.1), wp.quat_identity())
-                )
-            )
-        builder.add_articulation(joints)
-        builder.set_joint_mimic(joints[2], joints[1])
-        box = builder.add_body(xform=wp.transform((2.0, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cuda:0")
-        solver = _solver(self, model, contact_torsion_radius=0.0)
-        self.assertGreater(solver._mimic_count, 0)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
-        _advance(pipeline, solver, [model.state(), model.state()], model.control(), 400)
-        awake = solver.sleeping.art_awake.numpy()
-        self.assertEqual(int(awake[solver.body_to_articulation.numpy()[base]]), 1)
-        self.assertEqual(int(awake[solver.body_to_articulation.numpy()[box]]), 0)
+        for legacy in (False, True):
+            with self.subTest(legacy_constraint_mimic=legacy):
+                builder = newton.ModelBuilder()
+                builder.add_ground_plane()
+                base = builder.add_link(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+                builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.05)
+                joints = [builder.add_joint_free(child=base)]
+                for side in (-1.0, 1.0):
+                    finger = builder.add_link(xform=wp.transform((side * 0.15, 0.0, 0.15), wp.quat_identity()))
+                    builder.add_shape_box(finger, hx=0.02, hy=0.02, hz=0.05)
+                    joints.append(
+                        builder.add_joint_revolute(
+                            parent=base,
+                            child=finger,
+                            parent_xform=wp.transform((side * 0.15, 0.0, 0.1), wp.quat_identity()),
+                        )
+                    )
+                builder.add_articulation(joints)
+                if legacy:
+                    _expect_one_warning(
+                        self,
+                        DeprecationWarning,
+                        r"add_constraint_mimic\(\) is deprecated",
+                        functools.partial(builder.add_constraint_mimic, joint0=joints[2], joint1=joints[1]),
+                    )
+                else:
+                    builder.set_joint_mimic(joints[2], joints[1])
+                box = builder.add_body(xform=wp.transform((2.0, 0.0, 0.1), wp.quat_identity()))
+                builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+                model = builder.finalize(device="cuda:0")
+                solver = _solver(self, model, contact_torsion_radius=0.0)
+                self.assertGreater(solver._mimic_count, 0)
+                pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+                _advance(pipeline, solver, [model.state(), model.state()], model.control(), 400)
+                awake = solver.sleeping.art_awake.numpy()
+                self.assertEqual(int(awake[solver.body_to_articulation.numpy()[base]]), 1)
+                self.assertEqual(int(awake[solver.body_to_articulation.numpy()[box]]), 0)
 
 
 def _articulations(test, tiles=False):
@@ -320,8 +334,23 @@ def _two_world_boxes(test):
 
 def _solver(test, model, **overrides):
     """Construct the profile solver, which warns that patch friction keeps shared anchors on normal rows only."""
-    with test.assertWarnsRegex(UserWarning, "contact_shared_anchor still applies to normal rows"):
-        return newton.solvers.SolverFeatherPGS(model, **{**_PROFILE, **overrides})
+    return _expect_one_warning(
+        test,
+        UserWarning,
+        "contact_shared_anchor still applies to normal rows",
+        lambda: newton.solvers.SolverFeatherPGS(model, **{**_PROFILE, **overrides}),
+    )
+
+
+def _expect_one_warning(test, category, pattern, call):
+    """Return ``call()``, requiring it to emit exactly one warning, of ``category`` and matching ``pattern``."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = call()
+    test.assertEqual(len(caught), 1, [f"{w.category.__name__}: {w.message}" for w in caught])
+    test.assertIs(caught[0].category, category)
+    test.assertRegex(str(caught[0].message), pattern)
+    return result
 
 
 def _torsion_rows(solver):
