@@ -1,0 +1,1 @@
+Restrict the `newton.ik.IKSolverTrajectory` dense Jacobian and its J^T J tile kernel to the per-frame objectives' residual rows (temporal objectives contribute through their banded stencil coefficients); temporal residual rows now follow all per-frame rows in the residual buffer.

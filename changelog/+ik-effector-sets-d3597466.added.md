@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectivePositionSet` and `newton.ik.IKObjectiveRotationSet`, fused multi-effector variants of the position/rotation IK objectives that evaluate all effectors' residual and Jacobian rows in two kernel launches (analytic mode); with many effectors this substantially reduces per-iteration assembly cost.

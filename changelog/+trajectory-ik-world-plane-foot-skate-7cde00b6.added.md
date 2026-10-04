@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveWorldPlane` and `newton.ik.IKObjectiveFootSkate` trajectory-IK objectives (ports of PyRoKi's world-collision and foot-skating costs): the first keeps selected link points out of a world plane with a smoothed one-sided penalty, the second pins contact points in place across frames while contact labels are active.

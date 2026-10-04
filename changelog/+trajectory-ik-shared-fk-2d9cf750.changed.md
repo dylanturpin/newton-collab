@@ -1,0 +1,1 @@
+Share the trajectory IK solver's forward-kinematics pass and motion-subspace rows with FK-consuming temporal objectives (`IKObjectiveTemporal.compute_coeffs(joint_q, body_q=..., joint_S_s=...)`); standalone objectives keep computing their own, now into lazily allocated buffers.

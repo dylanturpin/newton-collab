@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveGravityTorque`, a trajectory-IK objective penalizing the static gravity-compensation torque `g(q)` at every frame; it steers redundant DoFs toward gravity-friendly postures (most visible when carrying a heavy payload). Free- and distance-joint DoFs are unactuated and contribute zero rows.

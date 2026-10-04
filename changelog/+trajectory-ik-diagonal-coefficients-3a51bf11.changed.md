@@ -1,0 +1,1 @@
+Write the configuration-independent diagonal stencil coefficients of `newton.ik.IKObjectiveSmoothness` and `newton.ik.IKObjectiveJointReference` once at solver initialization (weights are read at that point) and skip the free-joint lever pass on models without non-root free joints.

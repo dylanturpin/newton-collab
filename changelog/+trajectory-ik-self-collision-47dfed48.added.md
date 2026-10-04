@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveSelfCollision`, a trajectory-IK objective keeping user-specified capsule pairs on the robot from interpenetrating (a port of PyRoKi's self-collision cost): the smoothed one-sided penalty of `IKObjectiveWorldPlane` applied to each pair's segment-segment separation.

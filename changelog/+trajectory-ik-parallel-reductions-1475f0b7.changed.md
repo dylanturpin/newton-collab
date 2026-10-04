@@ -1,0 +1,1 @@
+Speed up `newton.ik.IKSolverTrajectory` per-trajectory cost and predicted-reduction sums with a two-stage parallel reduction; long-horizon solves with few trajectories no longer serialize on one thread per trajectory.

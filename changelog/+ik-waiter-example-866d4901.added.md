@@ -1,0 +1,1 @@
+Add `ik_waiter` example: dynamics-aware trajectory IK with a forward simulation in the loop — a Franka carries a plate with a free ball while `IKObjectiveApparentGravity` banks the plate into every dash toward a draggable goal; the IK output drives a PD-controlled MuJoCo simulation, so the ball's fate is decided by contact physics.

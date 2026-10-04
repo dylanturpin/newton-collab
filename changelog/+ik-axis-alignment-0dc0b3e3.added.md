@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveAxisAlignment`, an IK objective aligning a link-fixed axis with per-problem world directions while leaving rotation about the axis free — the natural constraint for axisymmetric tools (laser heads, spindles, nozzles) that must track a surface normal while the solver resolves the spin as redundancy.

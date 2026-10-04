@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveWorldPlaneCapsule`, a trajectory-IK objective keeping link-attached capsules (or spheres, with coincident endpoints) on the positive side of a world plane; unlike the sampled points of `IKObjectiveWorldPlane` it bounds the whole limb-segment surface, so retargeted floor work cannot graze the ground between guard points.

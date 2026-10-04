@@ -1,0 +1,1 @@
+Add `newton.ik.IKObjectiveApparentGravity`, a trajectory-IK "waiter" objective keeping the apparent gravity felt by a carried surface (tray, plate) aligned with its normal, so a resting object is not flung off; the solver both smooths the carried point's acceleration and banks the surface into the residual acceleration.

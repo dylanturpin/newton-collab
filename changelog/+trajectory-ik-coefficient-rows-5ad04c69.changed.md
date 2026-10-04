@@ -1,0 +1,1 @@
+Store only the populated residual rows in temporal IK objectives' stencil-coefficient buffers (`IKObjectiveTemporal.coeff_row_count()`); sparse-row objectives such as the plane guards and contact pins shrink their buffers and the band accumulation skips their padding rows.
