@@ -75,6 +75,10 @@ logger = logging.getLogger("newton")
 AttributeFrequency = Model.AttributeFrequency
 
 _NEWTON_SRC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir)) + os.sep
+_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG = (
+    "add_usd(physx_missing_inertia_fallback=...) is deprecated in Newton 1.7 and has no effect; "
+    "it will be removed in a future release, so drop the argument."
+)
 
 # `UsdPreviewSurface`'s schema default for `diffuseColor`. A visual shape whose prim binds no
 # material is given this rather than left for ModelBuilder's per-shape debug palette, which
@@ -177,6 +181,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
+    physx_missing_inertia_fallback: bool | None = None,
     legacy_margin_gap: bool = False,
     return_deformable_results: bool = False,
 ) -> dict[str, Any]:
@@ -309,6 +314,10 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        physx_missing_inertia_fallback: Ignored.
+
+            .. deprecated:: 1.7
+                Has no effect and will be removed; drop the argument.
         legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
             where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
             Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -436,6 +445,8 @@ def parse_usd(
             * - ``"actuator_count"``
               - Number of external actuators parsed from the USD stage
     """
+    if physx_missing_inertia_fallback is not None:
+        warnings.warn(_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
     first_imported_joint = builder.joint_count
