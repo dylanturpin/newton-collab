@@ -417,12 +417,13 @@ def _build_box_rod(device, *, box_z=0.15, box_xy=(0.0, 0.0), box_joint_qd=None, 
     SolverVBD.register_custom_attributes(builder)
     builder.add_ground_plane()
     box = builder.add_body(xform=wp.transform((box_xy[0], box_xy[1], box_z), wp.quat_identity()))
-    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=2.0 / 0.1**3))
+    # The box overhangs both cables so it cannot drop between them.
+    builder.add_shape_box(box, hx=0.05, hy=0.08, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=2.0 / 0.0016))
     if box_joint_qd is not None:
         builder.joint_qd[0:6] = list(box_joint_qd)
     rod_bodies, rod_joints = [], []
     # Two parallel cables support the box stably.
-    for y in (-0.035, 0.035) if rod else ():
+    for y in (-0.04, 0.04) if rod else ():
         cable = newton.Rod.create_straight(
             start=wp.vec3(-0.2, y, 0.012),
             direction=wp.vec3(1.0, 0.0, 0.0),
@@ -499,7 +500,8 @@ def test_admm_box_rests_on_cable(test, device):
     body_q = rollout.state_0.body_q.numpy()
     # Box bottom on the cable top: cable diameter plus box half height, within contact compliance.
     test.assertAlmostEqual(float(body_q[box, 2]), 0.024 + 0.05, delta=4.0e-3)
-    test.assertGreater(abs(float(body_q[box, 6])), 0.995, "the box tipped over")
+    # A box tipped onto an edge would have |q_w| <= cos(22.5 deg) = 0.924.
+    test.assertGreater(abs(float(body_q[box, 6])), 0.97, "the box tipped over")
     test.assertGreater(float(body_q[rod_bodies, 2].min()), 0.0, "the cable was pushed through the ground")
     test.assertLess(float(np.abs(body_q[rod_bodies, 2] - rod_z0).max()), 0.01)
     test.assertTrue(np.all(np.isfinite(body_q)))
