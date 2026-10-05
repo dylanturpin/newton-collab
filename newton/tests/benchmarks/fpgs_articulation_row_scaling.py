@@ -374,17 +374,12 @@ def _row_solver_bytes(solver: SolverFeatherPGS) -> int:
         "propagation_MiJt_b",
         "propagation_body_a",
         "propagation_body_b",
-        "world_deferred_dof_mask",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
 
 def _propagation_extra_bytes(solver: SolverFeatherPGS) -> int:
     names = (
-        "_deferred_dense_prev_impulses",
-        "_deferred_dense_delta_impulses",
-        "_deferred_dense_tau",
-        "_deferred_dense_qd_delta",
         "propagation_body_response",
         "propagation_body_qd",
         "propagation_body_impulses",

@@ -46,16 +46,13 @@ class TestContactComplianceSafety(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "body-pair"):
             start_step(solver, contacts, 0.005)
 
-    def test_capture_and_torsion_rejected(self):
-        """Prevent silent capture fallback or an unvalidated friction-law combination."""
+    def test_capture_rejected(self):
+        """Prevent silent capture fallback."""
         solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
         contacts = self.contacts()
         with wp.ScopedCapture(device=self.device):
             with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
                 start_step(solver, contacts, 0.005)
-        solver.contact_torsion_radius = 0.001
-        with self.assertRaisesRegex(ValueError, "contact_torsion_radius"):
-            start_step(solver, contacts, 0.005)
 
     def test_nonfinite_inputs_rejected(self):
         """Reject invalid time steps instead of emitting infinite row coefficients."""

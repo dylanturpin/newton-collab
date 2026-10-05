@@ -73,7 +73,6 @@ def validate_configuration(model, settings):
         "pgs_debug": False,
         "contact_friction_position_iterations": -1,
         "friction_mode": "current",
-        "contact_friction_anchor_limit": 0,
         "contact_friction_shared_anchor": False,
         "contact_shared_anchor": False,
     }
@@ -90,8 +89,6 @@ def validate_step(solver):
     """Reject unqualified combinations before any contact preprocessing."""
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("contact_compliance does not support CUDA graph capture")
-    if getattr(solver, "contact_torsion_radius", 0.0) > 0:
-        raise ValueError("contact_compliance is not validated with contact_torsion_radius > 0")
     # The persistent-patch implementation allocates a dummy buffer even when OFF.
     if getattr(solver, "friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
         raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")

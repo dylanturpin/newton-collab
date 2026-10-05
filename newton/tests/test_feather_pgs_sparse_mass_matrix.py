@@ -34,6 +34,17 @@ def _branched_humanoid_topology():
     return parents, counts
 
 
+def _support(plan, *joints):
+    """Sparse DOFs supporting any of the given joints."""
+    mask = 0
+    for joint in joints:
+        mask |= int(plan.joint_ancestor_mask[joint])
+    return np.flatnonzero([(mask >> dof) & 1 for dof in range(plan.dof_count)])
+
+
+_CUDA = unittest.skipUnless(wp.is_cuda_available(), "Sparse factor kernels require CUDA")
+
+
 class TestSparseMassMatrix(unittest.TestCase):
     def test_factor_schedules_follow_dependencies(self):
         """Cover each packed factor entry once and schedule independent branch pivots together."""
@@ -65,12 +76,8 @@ class TestSparseMassMatrix(unittest.TestCase):
         plan = _SparseMassMatrixPlan.build([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])
         np.testing.assert_array_equal(np.sort(plan.permutation), np.arange(9))
         np.testing.assert_array_equal(plan.inverse_permutation[plan.permutation], np.arange(9))
-        self.assertEqual(plan.endpoint_support(2).size, 3)
-        self.assertEqual(plan.endpoint_support(0, 5).size, 8)
-        for joint in range(6):
-            support = plan.endpoint_support(joint)
-            mask = sum(1 << int(i) for i in support)
-            self.assertEqual(int(plan.joint_ancestor_mask[joint]), mask)
+        self.assertEqual(_support(plan, 2).size, 3)
+        self.assertEqual(_support(plan, 0, 5).size, 8)
         rng = np.random.default_rng(54)
         lower = np.zeros((9, 9))
         lower[plan.entry_rows, plan.columns] = rng.normal(size=plan.nonzero_count)
@@ -96,7 +103,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             with self.subTest(parents=parents, counts=counts), self.assertRaises(ValueError):
                 _SparseMassMatrixPlan.build(parents, counts)
 
-    def _factor(self, parents, counts, *, fused_drive=True, mask=None, armature=0.4, device="cpu"):
+    def _factor(self, parents, counts, *, mask=None, armature=0.4, device="cuda:0"):
         plan = _SparseMassMatrixPlan.build(parents, counts)
         n, j = plan.dof_count, len(parents)
         rng = np.random.default_rng(742)
@@ -108,7 +115,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             for joint in range(j):
                 q = rng.normal(size=(6, 6))
                 body_inertia[art * j + joint] = q @ q.T + np.eye(6)
-                physical_support = plan.permutation[plan.endpoint_support(joint)]
+                physical_support = plan.permutation[_support(plan, joint)]
                 jacobian = np.zeros((6, n))
                 jacobian[:, physical_support] = motion[art * n + physical_support].T
                 dense[art] += jacobian.T @ body_inertia[art * j + joint] @ jacobian
@@ -123,10 +130,9 @@ class TestSparseMassMatrix(unittest.TestCase):
         mapping = np.array([1, 0], dtype=np.int32)
         for group, art in enumerate(mapping):
             diagonal = regularizer[group].astype(np.float64)
-            if fused_drive:
-                diagonal += np.where(
-                    drive_map[art * n : (art + 1) * n] >= 0, np.maximum(stiffness[art * n : (art + 1) * n], 0.0), 0.0
-                )
+            diagonal += np.where(
+                drive_map[art * n : (art + 1) * n] >= 0, np.maximum(stiffness[art * n : (art + 1) * n], 0.0), 0.0
+            )
             dense[art] += np.diag(diagonal)
 
         def array(value, dtype):
@@ -149,7 +155,6 @@ class TestSparseMassMatrix(unittest.TestCase):
             array(motion, wp.spatial_vector),
             array(reordered_composite, wp.spatial_matrix),
             array(regularizer, float),
-            int(fused_drive),
             array(drive_map, int),
             array(stiffness, float),
             indices,
@@ -164,67 +169,66 @@ class TestSparseMassMatrix(unittest.TestCase):
         )
         return plan, dense, inverse, status, inputs
 
+    @_CUDA
     def test_crba_factor_solve_and_endpoint_response(self):
         """Match dense dynamics and endpoint response for branched multi-DOF forests."""
+        device = "cuda:0"
         for parents, counts in [([-1, 0, 0, 1], [6, 1, 3, 0]), ([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])]:
-            for fused_drive in (False, True):
-                with self.subTest(parents=parents, fused_drive=fused_drive):
-                    plan, dense, inverse, status, inputs = self._factor(parents, counts, fused_drive=fused_drive)
-                    np.testing.assert_array_equal(status.numpy(), [0, 0])
-                    n = plan.dof_count
-                    rng = np.random.default_rng(66)
-                    tau = rng.normal(size=2 * n).astype(np.float32)
-                    qdd = wp.zeros(2 * n, dtype=float, device="cpu")
-                    scratch = wp.zeros((2, n), dtype=float, device="cpu")
-                    wp.launch(
-                        solve_sparse_mass_matrix,
-                        dim=64,
-                        inputs=[
-                            inputs[0],
-                            inputs[3],
-                            inputs[-1],
-                            inverse,
-                            wp.array(tau, device="cpu"),
-                            wp.ones(2, dtype=int, device="cpu"),
-                            scratch,
-                        ],
-                        outputs=[qdd],
-                        device="cpu",
-                        block_dim=128,
+            with self.subTest(parents=parents):
+                plan, dense, inverse, status, inputs = self._factor(parents, counts, device=device)
+                np.testing.assert_array_equal(status.numpy(), [0, 0])
+                n = plan.dof_count
+                rng = np.random.default_rng(66)
+                tau = rng.normal(size=2 * n).astype(np.float32)
+                qdd = wp.zeros(2 * n, dtype=float, device=device)
+                scratch = wp.zeros((2, n), dtype=float, device=device)
+                wp.launch(
+                    solve_sparse_mass_matrix,
+                    dim=64,
+                    inputs=[
+                        inputs[0],
+                        inputs[3],
+                        inputs[-1],
+                        inverse,
+                        wp.array(tau, device=device),
+                        wp.ones(2, dtype=int, device=device),
+                        scratch,
+                    ],
+                    outputs=[qdd],
+                    device=device,
+                    block_dim=128,
+                )
+                for group, art in enumerate([1, 0]):
+                    whiten = np.zeros((n, n))
+                    whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
+                    reordered = dense[art][np.ix_(plan.permutation, plan.permutation)]
+                    np.testing.assert_allclose(
+                        whiten @ np.linalg.cholesky(reordered), np.eye(n), rtol=2.0e-5, atol=2.0e-5
                     )
-                    for group, art in enumerate([1, 0]):
-                        whiten = np.zeros((n, n))
-                        whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
-                        reordered = dense[art][np.ix_(plan.permutation, plan.permutation)]
-                        np.testing.assert_allclose(
-                            whiten @ np.linalg.cholesky(reordered), np.eye(n), rtol=2.0e-5, atol=2.0e-5
-                        )
-                        np.testing.assert_allclose(
-                            qdd.numpy()[art * n : (art + 1) * n],
-                            np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
-                            rtol=1.0e-4,
-                            atol=1.0e-5,
-                        )
-                        support = plan.endpoint_support(0, len(parents) - 1)
-                        row = np.zeros(n)
-                        row[plan.permutation[support]] = rng.normal(size=len(support))
-                        z = whiten @ row[plan.permutation]
-                        np.testing.assert_allclose(np.delete(z, support), 0.0, atol=1.0e-12)
-                        np.testing.assert_allclose(
-                            z @ z, row @ np.linalg.solve(dense[art], row), rtol=3.0e-5, atol=1.0e-6
-                        )
+                    np.testing.assert_allclose(
+                        qdd.numpy()[art * n : (art + 1) * n],
+                        np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
+                        rtol=1.0e-4,
+                        atol=1.0e-5,
+                    )
+                    support = _support(plan, 0, len(parents) - 1)
+                    row = np.zeros(n)
+                    row[plan.permutation[support]] = rng.normal(size=len(support))
+                    z = whiten @ row[plan.permutation]
+                    np.testing.assert_allclose(np.delete(z, support), 0.0, atol=1.0e-12)
+                    np.testing.assert_allclose(z @ z, row @ np.linalg.solve(dense[art], row), rtol=3.0e-5, atol=1.0e-6)
 
     def test_mask_bit_63_and_fixed_root(self):
         """Preserve the highest mask bit and fixed-root endpoint support."""
         plan = _SparseMassMatrixPlan.build([-1, 0], [0, 64])
-        self.assertEqual(plan.endpoint_support(0).size, 0)
+        self.assertEqual(int(plan.joint_ancestor_mask[0]), 0)
         self.assertEqual(int(plan.joint_ancestor_mask[1]), (1 << 64) - 1)
         self.assertEqual(int(plan.ancestor_mask[0]), (1 << 64) - 1)
-        with self.assertRaises(ValueError):
-            plan.endpoint_support(2)
 
-    def _check_branched_factor(self, device):
-        """Compare a broad articulated tree with the independent dense oracle."""
+    @_CUDA
+    def test_branched_43_dof_factor_and_predictor(self):
+        """Match the dense oracle with parallel factor dependencies and inverse columns."""
+        device = "cuda:0"
         plan, dense, inverse, status, inputs = self._factor(*_branched_humanoid_topology(), armature=2.0, device=device)
         np.testing.assert_array_equal(status.numpy(), [0, 0])
         n = plan.dof_count
@@ -259,21 +263,14 @@ class TestSparseMassMatrix(unittest.TestCase):
                 rtol=2.0e-4,
             )
 
-    def test_branched_43_dof_factor_and_predictor(self):
-        """Match dense dynamics for a broad 43-DOF articulated tree on CPU."""
-        self._check_branched_factor("cpu")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Sparse factor CUDA schedule requires CUDA")
-    def test_branched_43_dof_factor_and_predictor_cuda(self):
-        """Match the dense oracle with parallel factor dependencies and inverse columns."""
-        self._check_branched_factor("cuda:0")
-
+    @_CUDA
     def test_mask_preserves_factor(self):
         """Retain the inverse factor and status when an articulation is not refreshed."""
         _, _, inverse, status, _ = self._factor([-1, 0, 0], [2, 1, 1], mask=[0, 1])
         np.testing.assert_array_equal(inverse.numpy()[1], -98.0)
         np.testing.assert_array_equal(status.numpy(), [0, 17])
 
+    @_CUDA
     def test_invalid_pivot_is_not_regularized(self):
         """Report an invalid factor without adding a new pivot floor."""
         _, _, inverse, status, _ = self._factor([-1], [1], armature=-1.0e6)

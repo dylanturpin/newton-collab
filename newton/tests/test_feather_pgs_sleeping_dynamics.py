@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.tests.test_feather_pgs_sleeping_production import _solver
+from newton.tests.test_feather_pgs_sleeping_production import _SleepReference, _solver
 
 _FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
 
@@ -39,12 +39,16 @@ class TestSleepingDynamicsSkip(unittest.TestCase):
     def _compare(self, *, interval, velocity_limits, graph, **options):
         runs = [_Run(self, skip, interval, velocity_limits, graph, options) for skip in (False, True)]
         self.assertTrue(runs[1].solver._sleep_skips_dynamics)
-        self.assertFalse(runs[0].solver._sleep_skips_dynamics)
         slept = woke = False
         for phase, steps, force in (("settle", 400, 0.0), ("push", 6, 20.0), ("resettle", 600, 0.0)):
             for step in range(steps):
                 for run in runs:
                     run.advance(force)
+                # The reference computes dynamics even while both runs omit sleeping constraint rows.
+                self.assertTrue(runs[0].solver._dynamics_art_active.numpy().all())
+                np.testing.assert_array_equal(
+                    runs[1].solver.sleeping.art_awake.numpy(), runs[0].solver.sleeping.art_awake.numpy()
+                )
                 for field in _FIELDS:
                     np.testing.assert_array_equal(
                         runs[1].field(field), runs[0].field(field), err_msg=f"{phase} step {step} {field}"
@@ -72,7 +76,8 @@ class _Run:
                 enable_joint_velocity_limits=velocity_limits,
                 **options,
             )
-        self.solver.sleeping.skip_dynamics = skip
+        if not skip:
+            self.solver.sleeping = _SleepReference(self.solver.sleeping, compute_dynamics=True)
         self.states = [self.model.state(), self.model.state()]
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()

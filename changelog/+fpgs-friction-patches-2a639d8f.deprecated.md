@@ -1,1 +1,0 @@
-Deprecate FeatherPGS `contact_friction_anchor_limit` in favor of persistent patches controlled by `friction_anchor_beta`. Positive legacy values warn and have no effect; the positional argument remains available for compatibility.

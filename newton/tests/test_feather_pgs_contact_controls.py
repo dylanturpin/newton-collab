@@ -105,7 +105,6 @@ def _launch_contact_allocator(
             int(enable_friction),
             friction_gap,
             int(friction_pairs_only),
-            0,
             FrictionPatches(),
         ],
         outputs=[
@@ -188,7 +187,6 @@ def _launch_articulation_pair_contact_allocator(
             int(enable_friction),
             friction_gap,
             int(friction_pairs_only),
-            0,
             FrictionPatches(),
         ],
         outputs=[
@@ -224,7 +222,6 @@ def _dense_speculative_rhs(scale: float) -> float:
         dim=1,
         inputs=[
             wp.array([1], dtype=wp.int32, device="cpu"),
-            1,
             wp.array([[1.0]], dtype=wp.float32, device="cpu"),
             wp.array([[0.2]], dtype=wp.float32, device="cpu"),
             wp.array([[0]], dtype=wp.int32, device="cpu"),
@@ -564,7 +561,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         """Append new controls without shifting established positional arguments."""
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         for sequence in (
-            ("contact_friction_anchor_limit", "contact_friction_scale", "contact_shared_anchor"),
+            ("contact_friction_shared_anchor", "contact_friction_scale", "contact_shared_anchor"),
             ("row_watermark", "restitution_velocity_threshold", "contact_speculative_scale", "contact_gap_gate"),
         ):
             start = parameters.index(sequence[0])
