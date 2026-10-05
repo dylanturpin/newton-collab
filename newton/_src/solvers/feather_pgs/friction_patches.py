@@ -1076,6 +1076,7 @@ class _FrictionPatchState:
         self.view.next_contact = wp.full(n, -1, dtype=int, device=device)
         self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
+        self._history_snapshot = None
         if not enabled:
             return
         self.body_world = model.body_world
@@ -1279,6 +1280,37 @@ class _FrictionPatchState:
             ],
             device=model.device,
         )
+
+    def reserve_history_snapshot(self):
+        """Allocate the buffers :meth:`snapshot_history` writes; call outside graph capture."""
+        if self.view.enabled and self._history_snapshot is None:
+            device = self.previous_q.device
+            self._history_snapshot = (
+                self._frame(self.capacity, device),
+                wp.empty_like(self.previous_world),
+                wp.empty_like(self.previous_q),
+            )
+
+    def snapshot_history(self):
+        """Save the carried history so a repeated solve of the same step can restore it."""
+        if not self.view.enabled:
+            return
+        self.reserve_history_snapshot()
+        frame, world, q = self._history_snapshot
+        for name in _PatchFrame.vars:
+            wp.copy(getattr(frame, name), getattr(self.previous, name))
+        wp.copy(world, self.previous_world)
+        wp.copy(q, self.previous_q)
+
+    def restore_history(self):
+        """Restore the history saved by :meth:`snapshot_history`."""
+        if not self.view.enabled or self._history_snapshot is None:
+            return
+        frame, world, q = self._history_snapshot
+        for name in _PatchFrame.vars:
+            wp.copy(getattr(self.previous, name), getattr(frame, name))
+        wp.copy(self.previous_world, world)
+        wp.copy(self.previous_q, q)
 
     def store(self, state):
         wp.launch(

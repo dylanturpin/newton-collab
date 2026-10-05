@@ -4,9 +4,9 @@
 ###########################################################################
 # Example Rigid-VBD Coupled Solver
 #
-# Rigid boxes and an articulated pendulum chain (driven by MuJoCo or Kamino)
-# interact with a cloth sheet and several soft bodies (simulated by
-# VBD).  Contact forces from the deformables are fed back to the
+# Rigid boxes and an articulated pendulum chain (driven by MuJoCo, Kamino or
+# FeatherPGS) interact with a cloth sheet and several soft bodies (simulated
+# by VBD).  Contact forces from the deformables are fed back to the
 # rigid bodies, causing them to bounce and settle realistically.
 #
 # This example builds rigid/VBD proxy coupling directly through
@@ -16,6 +16,7 @@
 # (no coupling) as a reference baseline.
 #
 # Command: python -m newton.examples mujoco_vbd_coupled_solver
+#          python -m newton.examples mujoco_vbd_coupled_solver --rigid-solver featherpgs
 #          python -m newton.examples mujoco_vbd_coupled_solver --solver vbd
 #
 ###########################################################################
@@ -30,7 +31,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverKamino, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo, SolverVBD
 
 
 def _add_rigid_solver_arg(parser) -> None:
@@ -38,7 +39,7 @@ def _add_rigid_solver_arg(parser) -> None:
         "--rigid-solver",
         help="Rigid-body solver used by the coupled path.",
         type=str,
-        choices=["mujoco", "kamino"],
+        choices=["mujoco", "kamino", "featherpgs"],
         default="mujoco",
     )
 
@@ -72,6 +73,8 @@ def _rigid_solver_entry_args(
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
+    if rigid_solver == "featherpgs":
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 

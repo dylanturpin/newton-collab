@@ -5,13 +5,15 @@
 # Example MuJoCo Franka + Rigid Chain ADMM Pick-and-Place
 #
 # A fixed-base Franka arm tracks a pick-and-place IK sequence through MuJoCo
-# position targets while a short rigid payload chain is simulated by XPBD by
+# (or, with --rigid-solver featherpgs, FeatherPGS) position targets while a
+# short rigid payload chain is simulated by XPBD by
 # default. The original VBD cable payload is kept as an alternate mode for A/B
 # testing. SolverCoupledADMM detects rigid-rigid contacts between the robot and
 # the payload from the model collision pairs, and the same template is
 # replicated across many worlds to exercise ADMM contact scaling.
 #
 # Command: python -m newton.examples mujoco_franka_vbd_cable_admm_solver
+#          python -m newton.examples mujoco_franka_vbd_cable_admm_solver --rigid-solver featherpgs
 #
 ###########################################################################
 
@@ -27,7 +29,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD, SolverXPBD
 
 PAYLOAD_CENTER = wp.vec3(0.5, 0.0, 0.256)
 PAYLOAD_LENGTH = 0.42
@@ -117,6 +119,7 @@ class Example:
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
         self.payload_kind = str(args.payload_kind)
+        self.rigid_solver = str(args.rigid_solver)
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
         self.surface_z = float(PAYLOAD_CENTER[2]) - self.payload_radius
@@ -144,24 +147,19 @@ class Example:
         self.use_graph = self.use_graph and self.device.is_cuda
         self._count_admm_shape_pairs_per_world()
 
-        mujoco_contact_budget = max(64, 16 * self.world_count)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+        )
+        self.contacts = self.collision_pipeline.contacts()
         payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
         payload_solver = self._make_payload_solver(args)
+        rigid_name, rigid_solver = self._make_rigid_solver(args)
         self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        solver="newton",
-                        integrator="implicitfast",
-                        iterations=int(args.mujoco_iterations),
-                        ls_iterations=int(args.mujoco_ls_iterations),
-                        use_mujoco_contacts=False,
-                        njmax=max(256, 64 * self.world_count),
-                        nconmax=mujoco_contact_budget,
-                    ),
+                    name=rigid_name,
+                    solver=rigid_solver,
                     bodies=self.franka_bodies,
                     joints=self.franka_joints,
                 ),
@@ -183,7 +181,7 @@ class Example:
                 contact_matching_force_scale=args.contact_matching_force_scale,
                 contact_pairs=[
                     SolverCoupledADMM.ContactPair(
-                        source="mjc",
+                        source=rigid_name,
                         destination=payload_name,
                     ),
                 ],
@@ -192,10 +190,6 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.collision_pipeline = newton.CollisionPipeline(
-            self.model,
-        )
-        self.contacts = self.collision_pipeline.contacts()
         self.solver.prepare_contacts(self.contacts)
         self.control = self.model.control()
         self._build_keyframes()
@@ -212,6 +206,29 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
         self.capture()
+
+    def _make_rigid_solver(self, args):
+        if self.rigid_solver == "featherpgs":
+            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+            self.model.rigid_contact_max = self.contacts.rigid_contact_max
+            return "fpgs", lambda v: SolverFeatherPGS(
+                v,
+                pgs_mode="matrix_free",
+                pgs_iterations=int(args.fpgs_iterations),
+                enable_joint_limits=True,
+                dense_max_constraints=64,
+            )
+        mujoco_contact_budget = max(64, 16 * self.world_count)
+        return "mjc", lambda v: SolverMuJoCo(
+            model=v,
+            solver="newton",
+            integrator="implicitfast",
+            iterations=int(args.mujoco_iterations),
+            ls_iterations=int(args.mujoco_ls_iterations),
+            use_mujoco_contacts=False,
+            njmax=max(256, 64 * self.world_count),
+            nconmax=mujoco_contact_budget,
+        )
 
     def _make_payload_solver(self, args):
         if self.payload_kind == "vbd-cable":
@@ -260,6 +277,8 @@ class Example:
             gravcomp.values = {}
         for body in franka_bodies:
             gravcomp.values[body] = 1.0
+            if self.rigid_solver == "featherpgs":
+                builder.body_disable_gravity[body] = True
 
         payload_shape_start = builder.shape_count
         if self.payload_kind == "vbd-cable":
@@ -600,6 +619,12 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)
+        parser.add_argument(
+            "--rigid-solver",
+            choices=["mujoco", "featherpgs"],
+            default="mujoco",
+            help="Solver that owns the Franka arm.",
+        )
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
         parser.add_argument("--admm-iterations", type=int, default=5, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=200.0, help="ADMM penalty parameter.")
@@ -653,6 +678,7 @@ class Example:
         parser.add_argument("--vbd-iterations", type=int, default=8, help="VBD iterations per coupled substep.")
         parser.add_argument("--mujoco-iterations", type=int, default=12, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=25, help="MuJoCo line-search iterations.")
+        parser.add_argument("--fpgs-iterations", type=int, default=24, help="FeatherPGS PGS iterations.")
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",

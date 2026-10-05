@@ -6,9 +6,10 @@
 #
 # A fixed-base Franka FR3 arm uses Newton's GPU IK solver to pick up a
 # deformable cable and move it to a target location. The arm is simulated
-# by MuJoCo (PD position targets driven from the IK result), the cable is
-# a VBD rod, and SolverCoupledProxy couples the two: the gripper bodies are
-# exposed to VBD as virtual proxies so the cable detects them as contacts.
+# by MuJoCo or FeatherPGS (PD position targets driven from the IK result),
+# the cable is a VBD rod, and SolverCoupledProxy couples the two: the gripper
+# bodies are exposed to VBD as virtual proxies so the cable detects them as
+# contacts.
 #
 # Cable geometry/material, Franka joint gains, contact parameters and the
 # proxy coupling solver settings mirror IsaacLab's franka_cable_env_cfg.
@@ -16,6 +17,7 @@
 # Standalone: depends only on newton + warp (no IsaacLab).
 #
 # Command: python -m newton.examples franka_cable_ik_pick_place
+#          python -m newton.examples franka_cable_ik_pick_place --rigid-solver featherpgs
 ###########################################################################
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverMuJoCo, SolverVBD
+from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
 
 # Initial Franka joint configuration (7 arm + 2 finger).
 FRANKA_Q = [
@@ -104,23 +106,27 @@ class Example:
         self.world_count = max(1, int(args.world_count))
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
+        self.rigid_solver = args.rigid_solver
         # Working-surface height: the cable rests on it and the arm is mounted on it.
         self.surface_z = float(CABLE_CENTER[2]) - self.payload_radius
 
         self._build_scene()
         self.use_graph = self.use_graph and self.device.is_cuda
         self.control = self.model.control()
-        self._build_solvers(args)
-        self._build_ik()
-
-        self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="explicit",
             shape_pairs_filtered=self._ground_shape_pairs(),
         )
         self.contacts = self.collision_pipeline.contacts()
+        if self.rigid_solver == "featherpgs":
+            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+            self.model.rigid_contact_max = self.contacts.rigid_contact_max
+        self._build_solvers(args)
+        self._build_ik()
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
         self.solver.prepare_contacts(self.contacts)
 
         newton.examples.configure_coupled_view(self, args)
@@ -226,6 +232,8 @@ class Example:
             gravcomp.values = {}
         for body in self.franka_bodies:
             gravcomp.values[body] = 1.0
+            if self.rigid_solver == "featherpgs":
+                builder.body_disable_gravity[body] = True
 
         # VBD cable.
         payload_body_start = builder.body_count
@@ -290,23 +298,41 @@ class Example:
     # Solvers
     # ------------------------------------------------------------------
     def _build_solvers(self, args):
-        mujoco_contact_budget = max(64, 16 * self.world_count)
+        if self.rigid_solver == "featherpgs":
+            rigid_name = "fpgs"
+
+            def rigid_solver(v):
+                return SolverFeatherPGS(
+                    v,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=int(args.fpgs_iterations),
+                    enable_joint_limits=True,
+                    dense_max_constraints=64,
+                )
+
+        else:
+            rigid_name = "mjc"
+            mujoco_contact_budget = max(64, 16 * self.world_count)
+
+            def rigid_solver(v):
+                return SolverMuJoCo(
+                    model=v,
+                    solver="newton",
+                    integrator="implicitfast",
+                    cone="elliptic",
+                    iterations=int(args.mujoco_iterations),
+                    ls_iterations=int(args.mujoco_ls_iterations),
+                    use_mujoco_contacts=False,
+                    njmax=max(256, 64 * self.world_count),
+                    nconmax=mujoco_contact_budget,
+                )
+
         self.solver = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        solver="newton",
-                        integrator="implicitfast",
-                        cone="elliptic",
-                        iterations=int(args.mujoco_iterations),
-                        ls_iterations=int(args.mujoco_ls_iterations),
-                        use_mujoco_contacts=False,
-                        njmax=max(256, 64 * self.world_count),
-                        nconmax=mujoco_contact_budget,
-                    ),
+                    name=rigid_name,
+                    solver=rigid_solver,
                     bodies=self.franka_bodies,
                     joints=self.franka_joints,
                 ),
@@ -325,7 +351,7 @@ class Example:
             coupling=SolverCoupledProxy.Config(
                 proxies=[
                     SolverCoupledProxy.Proxy(
-                        source="mjc",
+                        source=rigid_name,
                         destination="vbd",
                         bodies=self.gripper_bodies,
                         mass_scale=float(args.mass_scale),
@@ -527,13 +553,20 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
+        parser.add_argument(
+            "--rigid-solver",
+            type=str,
+            choices=["mujoco", "featherpgs"],
+            default="mujoco",
+            help="Solver that owns the Franka arm.",
+        )
         parser.add_argument("--substeps", type=int, default=10, help="Coupled substeps per rendered frame.")
         parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per substep.")
         parser.add_argument(
             "--mass-scale",
             type=float,
             default=1.0,
-            help="Scale factor for MuJoCo effective mass/inertia used by VBD proxy bodies.",
+            help="Scale factor for the arm solver's effective mass/inertia used by VBD proxy bodies.",
         )
         parser.add_argument(
             "--coupling-mode",
@@ -547,6 +580,7 @@ class Example:
         parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
         parser.add_argument("--mujoco-iterations", type=int, default=100, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=20, help="MuJoCo line-search iterations.")
+        parser.add_argument("--fpgs-iterations", type=int, default=24, help="FeatherPGS PGS iterations.")
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",
