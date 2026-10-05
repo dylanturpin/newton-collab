@@ -462,8 +462,8 @@ class Example:
         newton.examples.log_coupled_view(self, self.contacts)
         self.viewer.end_frame()
 
-    def block_cloth_report(self) -> dict:
-        """Return per-world block position, cloth sag and block-to-cloth gap."""
+    def block_cloth_report(self) -> list[dict]:
+        """Return per-world block position, cloth low point and block-to-cloth gap."""
         body_q = self.state_0.body_q.numpy()
         particle_q = self.state_0.particle_q.numpy().reshape(self.world_count, -1, 3)
         report = []

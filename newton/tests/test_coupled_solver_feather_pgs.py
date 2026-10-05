@@ -492,7 +492,7 @@ def test_admm_no_contact_matches_standalone(test, device):
 
 
 def test_admm_box_rests_on_cable(test, device):
-    """A box dropped on two free VBD cables rests flat on them through ADMM contact rows."""
+    """A box dropped on two free VBD cables is supported by them through ADMM contact rows."""
     model, box, rod_bodies, rod_joints = _build_box_rod(device)
     rollout = _Rollout(model, _admm(model, box, rod_bodies, rod_joints))
     rod_z0 = rollout.state_0.body_q.numpy()[rod_bodies, 2].copy()
@@ -500,8 +500,8 @@ def test_admm_box_rests_on_cable(test, device):
     body_q = rollout.state_0.body_q.numpy()
     # Box bottom on the cable top: cable diameter plus box half height, within contact compliance.
     test.assertAlmostEqual(float(body_q[box, 2]), 0.024 + 0.05, delta=4.0e-3)
-    # A box tipped onto an edge would have |q_w| <= cos(22.5 deg) = 0.924.
-    test.assertGreater(abs(float(body_q[box, 6])), 0.97, "the box tipped over")
+    # Free cables let the supported box rock; this bounds total rotation to about 28 degrees.
+    test.assertGreater(abs(float(body_q[box, 6])), 0.97, "the box rotated off its supports")
     test.assertGreater(float(body_q[rod_bodies, 2].min()), 0.0, "the cable was pushed through the ground")
     test.assertLess(float(np.abs(body_q[rod_bodies, 2] - rod_z0).max()), 0.01)
     test.assertTrue(np.all(np.isfinite(body_q)))
