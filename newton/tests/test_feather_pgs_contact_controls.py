@@ -293,6 +293,8 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 6, 6), dtype=wp.float32, device="cpu"),
+            wp.zeros((1,), dtype=wp.int32, device="cpu"),
+            wp.ones((1,), dtype=wp.int32, device="cpu"),
             wp.array([[1.0]], dtype=wp.float32, device="cpu"),
             wp.array([[0]], dtype=wp.int32, device="cpu"),
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),

@@ -464,6 +464,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 zJ(),
                 zJ(),
                 wp.zeros((1, 6, 6), dtype=wp.float32, device=device),
+                wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.ones((1,), dtype=wp.int32, device=device),
                 phi_arr,
                 row_type,
                 zeros3(),

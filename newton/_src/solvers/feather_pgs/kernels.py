@@ -7867,6 +7867,40 @@ def compute_mf_rhs_bias(
 
 
 @wp.kernel
+def count_propagation_coupled_bodies(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    propagation_body_coupling_group: wp.array[int],
+    # outputs
+    propagation_body_split_seen: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
+):
+    """Count the distinct row-bearing bodies in each coupling group."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    ba = propagation_body_a[world, i]
+    if ba >= 0 and wp.atomic_add(propagation_body_split_seen, ba, 1) == 0:
+        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[ba], 1)
+    bb = propagation_body_b[world, i]
+    if bb >= 0 and wp.atomic_add(propagation_body_split_seen, bb, 1) == 0:
+        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[bb], 1)
+
+
+@wp.func
+def propagation_body_split(
+    body: int,
+    propagation_body_coupling_group: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
+) -> float:
+    return float(wp.max(propagation_coupling_group_body_count[propagation_body_coupling_group[body]], 1))
+
+
+@wp.kernel
 def compute_propagation_effective_mass_and_rhs(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
@@ -7874,6 +7908,8 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     propagation_body_response: wp.array3d[float],
+    propagation_body_coupling_group: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_restitution: wp.array2d[float],
@@ -7906,19 +7942,25 @@ def compute_propagation_effective_mass_and_rhs(
 
     d = pgs_cfm
 
+    # Mass splitting: a sweep sees only each body's own response, so a body shares its coupling
+    # group's mobility with the group's other row-bearing bodies to keep the Jacobi update contractive.
     if ba >= 0:
+        split_a = propagation_body_split(ba, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
             value = float(0.0)
             for c in range(6):
                 value += propagation_body_response[ba, r, c] * propagation_J_a[world, i, c]
+            value *= split_a
             propagation_MiJt_a[world, i, r] = value
             d += propagation_J_a[world, i, r] * value
 
     if bb >= 0:
+        split_b = propagation_body_split(bb, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
             value = float(0.0)
             for c in range(6):
                 value += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
+            value *= split_b
             propagation_MiJt_b[world, i, r] = value
             d += propagation_J_b[world, i, r] * value
 
