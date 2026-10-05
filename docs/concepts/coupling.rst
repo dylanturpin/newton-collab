@@ -373,13 +373,17 @@ raw body mass.
 :class:`~newton.solvers.SolverFeatherPGS` can own rigid bodies and articulations
 as a proxy source or an ADMM entry; it must not own particles. It consumes
 coupling forces through ``state.body_f`` and reports articulated effective mass
-as the axis mean of the endpoint mobility ``J H^-1 J^T``, with the joint-space
-mass matrix ``H`` (including armature) evaluated on the host at
-``model.joint_q``; joint drives, limits, and contacts are not included. Its
-input-state hook invalidates cached kinematics after coupler writes and restores
-persistent friction-patch history on iteration restarts, so repeated solves of
-one step start from the same history. Sleeping, warm starting, contact
-compliance, and contact torsion raise :class:`NotImplementedError` in coupled
+as the inverse of the axis mean of the endpoint mobility ``J H^-1 J^T``, with
+the tree-only joint-space mass matrix ``H`` (including armature, excluding
+loop-closing joints) evaluated on the host at ``model.joint_q``; joint drives,
+limits, and contacts are not included. Its input-state hook invalidates cached
+kinematics after coupler writes and restores persistent friction-patch history
+before the next solve after an iteration restart, so repeated solves of one step
+start from the same history; a reset cancels that restore, so worlds a masked
+reset does not select keep their history. A reset that selects global entities
+also clears world 0, where FeatherPGS solves global articulations. Sleeping,
+warm starting, contact compliance, contact torsion, owning particles, and
+acting as a proxy destination raise :class:`NotImplementedError` in coupled
 use. Proxy-contact friction between FeatherPGS bodies and deformables is solved
 by the destination solver, not by FeatherPGS patch or torsional friction. Size
 ``model.rigid_contact_max`` to the contact buffer passed to the coupled step

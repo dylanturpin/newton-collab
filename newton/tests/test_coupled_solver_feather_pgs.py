@@ -4,6 +4,7 @@
 """FeatherPGS as the rigid source of experimental proxy coupling with VBD."""
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -504,6 +505,133 @@ def test_admm_box_rests_on_cable(test, device):
     test.assertTrue(np.all(np.isfinite(body_q)))
 
 
+def _history_snapshot(solver):
+    patches = solver._friction_patches
+    return {
+        "q": patches.previous_q.numpy().copy(),
+        "world": patches.previous_world.numpy().copy(),
+        "valid": patches.previous.valid.numpy().copy(),
+        "displacement": patches.previous.displacement.numpy().copy(),
+    }
+
+
+def test_reset_preserves_unselected_patch_history(test, device):
+    """All-false and global-only coupled resets are no-ops; a single-world reset keeps the other world's history."""
+    kwargs = {
+        "box_masses": (5.0, 5.0),
+        "box_z": 0.13,
+        "box_xy": (3.0, 0.0),
+        "box_joint_qd": (1.0, 0.3, -0.5, 0.0, 0.0, 3.0),
+        "ground": True,
+    }
+    for mask_values in ((False, False, False), (False, False, True), (False, True, False)):
+        model, boxes = _build_box_cloth(device, **kwargs)
+        rollout = _Rollout(model, _coupled(model, boxes, iterations=2))
+        rollout.run(60)
+        solver = rollout.solver.solver("rigid")
+        before = _history_snapshot(solver)
+        test.assertGreater(int(np.count_nonzero(before["valid"])), 0, "no carried patches to protect")
+        rollout.solver.reset(rollout.state_0, wp.array(mask_values, dtype=wp.bool, device=device))
+        after = _history_snapshot(solver)
+        kept = before["world"] != 1 if mask_values[1] else np.ones_like(before["world"], dtype=bool)
+        test.assertTrue(np.any(kept & (before["valid"] != 0)))
+        np.testing.assert_array_equal(after["valid"][kept], before["valid"][kept], err_msg=str(mask_values))
+        np.testing.assert_array_equal(after["displacement"][kept], before["displacement"][kept])
+        np.testing.assert_array_equal(after["q"][boxes[0]], before["q"][boxes[0]])
+        if mask_values[1]:
+            test.assertEqual(int(np.count_nonzero(after["valid"][before["world"] == 1])), 0)
+        else:
+            np.testing.assert_array_equal(after["q"], before["q"])
+
+
+def test_effective_mass_ignores_loop_closures(test, device):
+    """Disabled loop-closing joints leave the tree-only effective mass unchanged, also before a later articulation."""
+    results = {}
+    for links in (1, 2):
+        for closure in (False, True):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            for _articulation in range(2):
+                bodies, joints = [], []
+                for index in range(links):
+                    body = builder.add_link()
+                    builder.add_shape_box(
+                        body, hx=0.25, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=400.0)
+                    )
+                    joints.append(
+                        builder.add_joint_revolute(
+                            -1 if index == 0 else bodies[-1],
+                            body,
+                            axis=wp.vec3(0.0, 1.0, 0.0),
+                            parent_xform=wp.transform((0.0 if index == 0 else 0.25, 0.0, 0.0), wp.quat_identity()),
+                            child_xform=wp.transform((-0.25, 0.0, 0.0), wp.quat_identity()),
+                            armature=0.01,
+                        )
+                    )
+                    bodies.append(body)
+                builder.add_articulation(joints)
+                if closure:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        builder.add_joint_ball(-1, bodies[0], enabled=False)
+            model = builder.finalize(device=device)
+            solver = _fpgs(model)
+            last = [links - 1, 2 * links - 1]
+            kind = wp.array([int(CouplingInterface.EndpointKind.BODY)] * 2, dtype=int, device=device)
+            mass = wp.zeros(2, dtype=float, device=device)
+            solver.coupling_eval_effective_mass(
+                kind, wp.array(last, dtype=int, device=device), wp.zeros(2, dtype=wp.vec3, device=device), mass
+            )
+            results[(links, closure)] = mass.numpy()
+        np.testing.assert_allclose(results[(links, True)], results[(links, False)], rtol=1.0e-5)
+        np.testing.assert_allclose(results[(links, False)][0], results[(links, False)][1], rtol=1.0e-5)
+    test.assertAlmostEqual(float(results[(1, False)][0]), 8.56, delta=1.0e-3)
+
+
+def test_unsupported_roles_raise(test, device):
+    """FeatherPGS rejects owning particles and acting as a proxy destination."""
+    model, _ = _build_box_cloth(device)
+    with test.assertRaises(NotImplementedError):
+        solver = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="rigid",
+                    solver=_fpgs,
+                    bodies=list(range(model.body_count)),
+                    joints=list(range(model.joint_count)),
+                    particles=list(range(model.particle_count)),
+                ),
+            ],
+        )
+        _Rollout(model, solver).step()
+
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    rigid_box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(rigid_box, hx=0.1, hy=0.1, hz=0.1)
+    soft_box = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+    builder.add_shape_box(soft_box, hx=0.1, hy=0.1, hz=0.1)
+    builder.color()
+    model = builder.finalize(device=device)
+    with test.assertRaises(NotImplementedError):
+        solver = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupledProxy.Entry(
+                    name="vbd",
+                    solver=lambda v: SolverVBD(model=v, iterations=4, rigid_compliant_alm=True),
+                    bodies=[soft_box],
+                    joints=[1],
+                ),
+                SolverCoupledProxy.Entry(name="rigid", solver=_fpgs, bodies=[rigid_box], joints=[0]),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(source="vbd", destination="rigid", bodies=[soft_box])]
+            ),
+        )
+        _Rollout(model, solver).step()
+
+
 class TestCoupledSolverFeatherPGS(unittest.TestCase):
     pass
 
@@ -521,6 +649,9 @@ for _name, _func in (
     ("test_unsupported_options_raise", test_unsupported_options_raise),
     ("test_articulated_effective_mass", test_articulated_effective_mass),
     ("test_offset_contact_turns_hinge", test_offset_contact_turns_hinge),
+    ("test_reset_preserves_unselected_patch_history", test_reset_preserves_unselected_patch_history),
+    ("test_effective_mass_ignores_loop_closures", test_effective_mass_ignores_loop_closures),
+    ("test_unsupported_roles_raise", test_unsupported_roles_raise),
     ("test_admm_no_contact_matches_standalone", test_admm_no_contact_matches_standalone),
     ("test_admm_box_rests_on_cable", test_admm_box_rests_on_cable),
 ):
