@@ -2923,6 +2923,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Coupled resets pass the SolverBase mask, shape (model.world_count + 1,); it is
         # translated into this solver-world mask so masked resets stay capturable.
         self._base_reset_world_mask = wp.zeros(max(self.world_count, 1), dtype=wp.bool, device=model.device)
+        self._coupling_patch_history_saved = False
         self._has_global_articulation = bool(
             model.articulation_count
             and model.articulation_world is not None
@@ -3038,6 +3039,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """
         if self.sleeping is not None:
             self.sleeping.notify(flags)
+        self._coupling_patch_history_saved = False
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -3107,6 +3109,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        self._coupling_patch_history_saved = False
         if self.contact_compliance:
             self._compliant_contacts = None
             self._compliant_prepared = False
@@ -3185,11 +3188,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         del state, dt
         self._require_coupling_support()
         kinematic = int(flags) & int(StateFlags.BODY_Q | StateFlags.BODY_QD | StateFlags.JOINT_Q | StateFlags.JOINT_QD)
-        if iteration_restart:
-            if self._friction_anchors_enabled:
+        if self._friction_anchors_enabled:
+            if iteration_restart:
                 self._friction_patches.restore_history()
-        elif kinematic and self._friction_anchors_enabled:
-            self._friction_patches.snapshot_history()
+            elif kinematic and not self._coupling_patch_history_saved:
+                self._friction_patches.snapshot_history()
+            # Until the next step, reset or model change, the carried history equals the saved copy.
+            self._coupling_patch_history_saved |= bool(iteration_restart or kinematic)
         if kinematic or iteration_restart:
             self.notify_state_changed()
 
@@ -9035,6 +9040,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
+        self._coupling_patch_history_saved = False
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
