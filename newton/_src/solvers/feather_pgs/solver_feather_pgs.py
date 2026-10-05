@@ -4694,7 +4694,7 @@ class SolverFeatherPGS(SolverBase):
         body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
         body_response_dof_mask = np.zeros(model.body_count, dtype=np.uint32)
         body_single_response_dof = np.full(model.body_count, -1, dtype=np.int32)
-        # Bodies have a nonzero cross response iff they share their topmost moving ancestor joint.
+        # Only bodies sharing their topmost moving ancestor joint can have a cross response.
         body_coupling_group = np.arange(model.body_count, dtype=np.int32)
         for body, joint in enumerate(body_to_joint):
             articulation = body_to_articulation[body]
@@ -7747,6 +7747,7 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_J_a,
                         self.propagation_J_b,
                         self.pgs_cfm,
+                        self._contact_w,
                         self.propagation_max_constraints,
                         self.propagation_tree_pA,
                         self.propagation_tree_u,
@@ -7757,6 +7758,7 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_eff_mass_inv,
                         self.propagation_MiJt_a,
                         self.propagation_MiJt_b,
+                        self.propagation_row_w,
                     ],
                     device=self.model.device,
                 )
