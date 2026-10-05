@@ -4,6 +4,7 @@
 """Regression tests for persistent patch friction in FeatherPGS."""
 
 import unittest
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -1150,15 +1151,32 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cuda:0")
-        for kwargs in (
-            {"pgs_mode": "matrix_free", "friction_mode": "bisection"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "tiled_contact"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "streaming"},
-        ):
+        for kwargs in ({"pgs_mode": "matrix_free", "friction_mode": "bisection"},):
             with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
                 self.assertFalse(solver._friction_anchors_enabled)
                 self.assertEqual(solver.friction_anchor_beta, 0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    def test_matrix_free_ignores_dense_pgs_kernel_for_friction(self):
+        """pgs_kernel only selects the split-mode dense solve, so matrix_free keeps patch friction."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cuda:0")
+        for kernel in ("tiled_contact", "streaming"):
+            with self.subTest(pgs_kernel=kernel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel=kernel)
+                    self.assertTrue(solver._friction_anchors_enabled)
+                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model, pgs_mode="matrix_free", pgs_kernel=kernel, friction_anchor_beta=0.3
+                    )
+                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
+                self.assertIsNone(solver._pgs_solve_streaming_kernel)
+                self.assertIsNone(solver._pgs_solve_tiled_contact_kernel)
 
     def test_shared_point_flags_warn_with_patch_friction(self):
         """Explain when patch anchors override an explicitly requested shared friction point."""
