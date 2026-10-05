@@ -1062,6 +1062,63 @@ def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shape
         prev.valid[c] = 0
 
 
+# Fields of the previous frame that _store_history writes and later steps read.
+_CARRIED_HISTORY_FIELDS = frozenset(
+    (
+        "keys",
+        "indices",
+        "normal",
+        "displacement",
+        "mu",
+        "body_a",
+        "body_b",
+        "owner",
+        "shape_a",
+        "shape_b",
+        "anchor_a",
+        "anchor_b",
+        "surface_a",
+        "surface_b",
+        "valid",
+        "tangent_impulse",
+    )
+)
+
+
+@wp.kernel(enable_backward=False)
+def _copy_carried_history(
+    src: _PatchFrame,
+    src_world: wp.array[int],
+    src_q: wp.array[wp.transform],
+    dst: _PatchFrame,
+    dst_world: wp.array[int],
+    dst_q: wp.array[wp.transform],
+):
+    """Copy the carried patch history written by _store_history."""
+    c = wp.tid()
+    if c < src_q.shape[0]:
+        dst_q[c] = src_q[c]
+    if c >= src_world.shape[0]:
+        return
+    dst.keys[c] = src.keys[c]
+    dst.indices[c] = src.indices[c]
+    dst.normal[c] = src.normal[c]
+    dst.displacement[c] = src.displacement[c]
+    dst.mu[c] = src.mu[c]
+    dst.body_a[c] = src.body_a[c]
+    dst.body_b[c] = src.body_b[c]
+    dst.owner[c] = src.owner[c]
+    dst.shape_a[c] = src.shape_a[c]
+    dst.shape_b[c] = src.shape_b[c]
+    dst.anchor_a[c] = src.anchor_a[c]
+    dst.anchor_b[c] = src.anchor_b[c]
+    dst.surface_a[c] = src.surface_a[c]
+    dst.surface_b[c] = src.surface_b[c]
+    dst.valid[c] = src.valid[c]
+    dst.tangent_impulse[c] = src.tangent_impulse[c]
+    dst_world[c] = src_world[c]
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
@@ -1285,11 +1342,11 @@ class _FrictionPatchState:
         """Allocate the buffers :meth:`snapshot_history` writes; call outside graph capture."""
         if self.view.enabled and self._history_snapshot is None:
             device = self.previous_q.device
-            self._history_snapshot = (
-                self._frame(self.capacity, device),
-                wp.empty_like(self.previous_world),
-                wp.empty_like(self.previous_q),
-            )
+            frame = _PatchFrame()
+            for name in _PatchFrame.vars:
+                count = self.capacity if name in _CARRIED_HISTORY_FIELDS else 0
+                setattr(frame, name, wp.empty(count, dtype=getattr(self.previous, name).dtype, device=device))
+            self._history_snapshot = (frame, wp.empty_like(self.previous_world), wp.empty_like(self.previous_q))
 
     def snapshot_history(self):
         """Save the carried history so a repeated solve of the same step can restore it."""
@@ -1297,20 +1354,23 @@ class _FrictionPatchState:
             return
         self.reserve_history_snapshot()
         frame, world, q = self._history_snapshot
-        for name in _PatchFrame.vars:
-            wp.copy(getattr(frame, name), getattr(self.previous, name))
-        wp.copy(world, self.previous_world)
-        wp.copy(q, self.previous_q)
+        self._copy_history(self.previous, self.previous_world, self.previous_q, frame, world, q)
 
     def restore_history(self):
         """Restore the history saved by :meth:`snapshot_history`."""
         if not self.view.enabled or self._history_snapshot is None:
             return
         frame, world, q = self._history_snapshot
-        for name in _PatchFrame.vars:
-            wp.copy(getattr(self.previous, name), getattr(frame, name))
-        wp.copy(self.previous_world, world)
-        wp.copy(self.previous_q, q)
+        self._copy_history(frame, world, q, self.previous, self.previous_world, self.previous_q)
+
+    def _copy_history(self, src, src_world, src_q, dst, dst_world, dst_q):
+        wp.launch(
+            _copy_carried_history,
+            dim=max(self.capacity, src_q.shape[0]),
+            inputs=[src, src_world, src_q],
+            outputs=[dst, dst_world, dst_q],
+            device=src_q.device,
+        )
 
     def store(self, state):
         wp.launch(
