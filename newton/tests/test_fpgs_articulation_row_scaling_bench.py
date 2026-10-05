@@ -38,8 +38,7 @@ def _load_row_scaling_module():
 
 
 def _require_cuda(reason: str):
-    wp.init()
-    if not wp.get_device("cuda:0").is_cuda:
+    if not wp.is_cuda_available():
         raise unittest.SkipTest(reason)
 
 
@@ -265,12 +264,36 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
             else:
                 self.assertTrue(np.isfinite(row["joint_qd_rel_l2"]))
                 self.assertTrue(np.isfinite(row["state_linf"]))
-                if row["path"] == "propagation":
-                    # Propagation uses deferred articulation response, so high-contact smoke
-                    # rows are not expected to be bit-close to immediate D-wide GS
-                    # after only two iterations. Keep this as a gross sanity bound.
-                    self.assertLess(row["joint_qd_rel_l2"], 1.0e-1)
-                    self.assertLess(row["state_linf"], 1.0e-1)
+
+    def test_fpgs_propagation_matches_immediate_when_converged(self):
+        _require_cuda("CUDA is required for the FPGS production scaling benchmark")
+
+        script = BENCHMARKS_DIR / "fpgs_articulation_row_scaling.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "fpgs_articulation_row_scaling"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--preset",
+                    "smoke",
+                    "--no-plots",
+                    "--pgs-iterations",
+                    "32",
+                    "--out-dir",
+                    str(out_dir),
+                ],
+                check=True,
+            )
+            results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
+
+        # At 2 iterations the routes sweep rows in different orders and differ
+        # by ~0.14 rel-L2 on multi-box cases; at 32 they agree to ~1e-5.
+        compared = [row for row in results if row["case_kind"] == "articulated_free" and row["path"] != "mf_immediate"]
+        self.assertTrue(compared)
+        for row in compared:
+            self.assertLess(row["joint_qd_rel_l2"], 1.0e-4, row["label"])
+            self.assertLess(row["state_linf"], 1.0e-4, row["label"])
 
     def test_fpgs_articulation_operator_diagnostic_smoke(self):
         _require_cuda("CUDA is required for the FPGS operator diagnostic")

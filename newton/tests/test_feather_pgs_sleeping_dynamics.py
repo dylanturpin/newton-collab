@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sleeping articulations skip their dynamics through sleep, wake and resettle."""
+"""Skipping sleeping articulations' dynamics must not change any published state."""
 
 import unittest
 from unittest import mock
@@ -10,66 +10,74 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.tests.test_feather_pgs_sleeping_production import _PROFILE
+from newton.tests.test_feather_pgs_sleeping_production import _SleepReference, _solver
 
 _FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
 class TestSleepingDynamicsSkip(unittest.TestCase):
-    def test_eager_sleep_cycle(self):
-        """Settle, sleep, force-wake and resettle with skipped dynamics."""
+    def test_eager_trajectories_match(self):
+        """Settle, sleep, force-wake and resettle identically with and without skipped dynamics."""
         for interval in (1, 3):
             for velocity_limits in (False, True):
                 with self.subTest(interval=interval, velocity_limits=velocity_limits):
                     self._compare(interval=interval, velocity_limits=velocity_limits, graph=False)
 
-    def test_alternate_kernel_paths(self):
+    def test_alternate_kernel_paths_match(self):
         """Cover tiled triangular solves and cooperative tree traversal."""
         for options in ({"kernel_overrides": {"trisolve_kernel": "tiled"}}, {"parallel_tree": True}):
             with self.subTest(options=options):
                 self._compare(interval=3, velocity_limits=False, graph=False, **options)
 
-    def test_graph_sleep_cycle(self):
-        """Replay the sleep cycle through captured steps."""
+    def test_graph_trajectories_match(self):
+        """Replay captured steps identically with and without skipped dynamics."""
         for interval in (1, 2):
             with self.subTest(interval=interval):
                 self._compare(interval=interval, velocity_limits=True, graph=True)
 
     def _compare(self, *, interval, velocity_limits, graph, **options):
-        run = _Run(interval, velocity_limits, graph, options)
-        self.assertTrue(run.solver._sleep_skips_dynamics)
+        runs = [_Run(self, skip, interval, velocity_limits, graph, options) for skip in (False, True)]
+        self.assertTrue(runs[1].solver._sleep_skips_dynamics)
         slept = woke = False
         for phase, steps, force in (("settle", 400, 0.0), ("push", 6, 20.0), ("resettle", 600, 0.0)):
             for step in range(steps):
-                run.advance(force)
+                for run in runs:
+                    run.advance(force)
+                # The reference computes dynamics even while both runs omit sleeping constraint rows.
+                self.assertTrue(runs[0].solver._dynamics_art_active.numpy().all())
+                np.testing.assert_array_equal(
+                    runs[1].solver.sleeping.art_awake.numpy(), runs[0].solver.sleeping.art_awake.numpy()
+                )
                 for field in _FIELDS:
-                    self.assertTrue(np.isfinite(run.field(field)).all(), f"{phase} step {step} {field}")
-                awake = run.solver.sleeping.art_awake.numpy()
+                    np.testing.assert_array_equal(
+                        runs[1].field(field), runs[0].field(field), err_msg=f"{phase} step {step} {field}"
+                    )
+                awake = runs[1].solver.sleeping.art_awake.numpy()
                 slept |= phase == "settle" and not awake[:2].any()
                 woke |= phase == "push" and bool(awake[0])
         self.assertTrue(slept and woke)
         # The driven mimic articulation never sleeps, and everything else settles again.
-        np.testing.assert_array_equal(run.solver.sleeping.art_awake.numpy(), [0, 0, 0, 1])
-        self.assertFalse(run.solver._dynamics_art_active.numpy()[:3].any())
+        np.testing.assert_array_equal(runs[1].solver.sleeping.art_awake.numpy(), [0, 0, 0, 1])
+        self.assertFalse(runs[1].solver._dynamics_art_active.numpy()[:3].any())
 
 
 class _Run:
-    def __init__(self, interval, velocity_limits, graph, options):
+    def __init__(self, test, skip, interval, velocity_limits, graph, options):
         self.model = _scene()
         self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=512)
         options = dict(options)
         overrides = options.pop("kernel_overrides", {})
         with mock.patch.object(newton.solvers.SolverFeatherPGS, "_kernel_overrides", overrides):
-            self.solver = newton.solvers.SolverFeatherPGS(
+            self.solver = _solver(
+                test,
                 self.model,
-                **{
-                    **_PROFILE,
-                    "update_mass_matrix_interval": interval,
-                    "enable_joint_velocity_limits": velocity_limits,
-                    **options,
-                },
+                update_mass_matrix_interval=interval,
+                enable_joint_velocity_limits=velocity_limits,
+                **options,
             )
+        if not skip:
+            self.solver.sleeping = _SleepReference(self.solver.sleeping, compute_dynamics=True)
         self.states = [self.model.state(), self.model.state()]
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()
@@ -144,7 +152,7 @@ def _scene():
         )
         parent = link
     builder.add_articulation(joints)
-    builder.add_constraint_mimic(joint0=joints[3], joint1=joints[2])
+    builder.set_joint_mimic(joints[3], joints[2])
     builder.joint_velocity_limit[:] = [5.0] * len(builder.joint_velocity_limit)
     return builder.finalize(device="cuda:0")
 
