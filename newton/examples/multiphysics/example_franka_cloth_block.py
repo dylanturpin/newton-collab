@@ -110,8 +110,8 @@ class Example:
         if self.world_count > 1:
             self.viewer.set_world_offsets((1.2, 1.2, 0.0))
         if isinstance(self.viewer, newton.viewer.ViewerGL):
-            self.viewer.set_camera(pos=wp.vec3(1.05, -0.75, 0.6), pitch=-22.0, yaw=145.0)
-            self.viewer.camera.look_at(wp.vec3(0.5, 0.0, 0.25))
+            self.viewer.set_camera(pos=wp.vec3(1.25, -0.6, 0.65), pitch=-20.0, yaw=150.0)
+            self.viewer.camera.look_at(wp.vec3(0.45, 0.1, 0.25))
 
         self.capture()
 
