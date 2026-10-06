@@ -194,8 +194,12 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         support_func, _support_funcs=(_support_map_b, _minkowski_support, geometric_center)
     ).core
 
+    from .penetration import _box_polyhedron_pair, create_solve_box_penetration  # noqa: PLC0415
+
+    solve_sat = create_solve_box_penetration(_minkowski_support)
+
     @wp.func
-    def solve_mpr_portal(
+    def solve_mpr_portal_unchecked(
         geom_a: Any,
         geom_b: Any,
         orientation_b: wp.quat,
@@ -451,6 +455,41 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     v1 = v4
 
     @wp.func
+    def solve_mpr_portal(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        seed: wp.vec3,
+        MAX_ITER: int = 30,
+        COLLIDE_EPSILON: float = 1e-5,
+    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, bool]:
+        if not _box_polyhedron_pair(geom_a, geom_b):
+            return solve_mpr_portal_unchecked(
+                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
+            )
+        sat_normal = wp.vec3(0.0)
+        sat_depth = float(-1.0)
+        portal_seed = seed
+        sat_normal, sat_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider)
+        if sat_depth > COLLIDE_EPSILON:
+            # SAT certifies an interior ball and its nearest plane.
+            portal_seed = -0.5 * sat_depth * sat_normal
+        collision, pa, pb, normal, depth, next_seed, valid = solve_mpr_portal_unchecked(
+            geom_a, geom_b, orientation_b, position_b, extend, data_provider, portal_seed, MAX_ITER, COLLIDE_EPSILON
+        )
+        if sat_depth > COLLIDE_EPSILON:
+            if not collision or not valid or wp.abs(depth - extend - sat_depth) > COLLIDE_EPSILON:
+                collision = True
+                normal = sat_normal
+                depth = sat_depth + extend
+                next_seed = -0.5 * sat_depth * sat_normal
+                valid = False
+        return collision, pa, pb, normal, depth, next_seed, valid
+
+    @wp.func
     def solve_mpr_raycast(
         geom_a: Any,
         geom_b: Any,
@@ -560,13 +599,21 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         point_a = wp.vec3(0.0)
         point_b = wp.vec3(0.0)
         last_normal = normal
+        minimum_depth = float(-1.0)
+        if _box_polyhedron_pair(geom_a, geom_b):
+            minimum_normal, minimum_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider)
+            if minimum_depth > COLLIDE_EPSILON:
+                last_normal = minimum_normal
         for _attempt in range(3):
             if wp.length_sq(seed) == 0.0:
                 break
-            retry_collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
+            retry_collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal_unchecked(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
             )
-            if not retry_collision or penetration > bound:
+            wrong_depth = (
+                minimum_depth > COLLIDE_EPSILON and wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON
+            )
+            if not retry_collision or penetration > bound or wrong_depth:
                 normal = last_normal
                 valid = False
                 break
