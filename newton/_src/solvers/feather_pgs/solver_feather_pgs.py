@@ -54,6 +54,7 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
+from .differentiable import DifferentiableStep, validate_differentiable_model, validate_differentiable_options
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -1266,10 +1267,29 @@ class SolverFeatherPGS(SolverBase):
         sleep_angular_threshold: float = 0.15,
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
+        differentiable: bool = False,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            differentiable: Experimental opt-in step for reverse-mode differentiation with :class:`warp.Tape`.
+                It runs the same forward law with a fixed generic kernel selection, and keeps every
+                intermediate in buffers owned by ``state_out``. Record each step into a distinct output
+                state, as in ``solver.step(states[i], states[i + 1], ...)``. Gradients reach
+                ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
+                ``Control.joint_target_q`` and ``Control.joint_target_qd``. Model parameters are not validated
+                gradient inputs. Contacts are not supported yet, and ``step`` raises if any are passed.
+                Construction raises ``ValueError`` unless the model has ``requires_grad=True``, no
+                particles, kinematic bodies, mimic or loop-closing joints, single-body free articulations
+                or rigid-body velocity limits, and the solver uses immediate response, augmented drives,
+                ``update_mass_matrix_interval=1``, no joint or velocity limits, no warm start, sleeping,
+                torsion, compliance, friction patches, velocity iterations, debug or ``parallel_tree``.
+                With omitted ``friction_anchor_beta`` it selects point friction. Unlike the default step, it
+                does not refresh ``state_in.body_q`` in place. Defaults to False.
+
+                .. experimental::
+
+                    ``differentiable=True`` and its supported combinations may change without prior notice.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.
@@ -1727,6 +1747,27 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if differentiable:
+            validate_differentiable_options(
+                model,
+                {
+                    "enable_sleeping": enable_sleeping,
+                    "pgs_warmstart": pgs_warmstart,
+                    "mf_warmstart": mf_warmstart,
+                    "friction_anchor_beta": friction_anchor_beta,
+                    "contact_torsion_radius": contact_torsion_radius,
+                    "contact_torsion_device": contact_torsion_device,
+                    "contact_compliance": contact_compliance,
+                    "articulated_contact_response": articulated_contact_response,
+                    "update_mass_matrix_interval": update_mass_matrix_interval,
+                    "enable_joint_limits": enable_joint_limits,
+                    "enable_joint_velocity_limits": enable_joint_velocity_limits,
+                    "drive_mode": drive_mode,
+                    "pgs_velocity_iterations": pgs_velocity_iterations,
+                    "pgs_debug": pgs_debug,
+                    "parallel_tree": parallel_tree,
+                },
+            )
         if contact_compliance:
             _contact_compliance.validate_configuration(
                 model,
@@ -1767,7 +1808,9 @@ class SolverFeatherPGS(SolverBase):
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if contact_compliance:
+            if differentiable:
+                friction_anchor_beta = 0.0
+            elif contact_compliance:
                 friction_anchor_beta = 0.0
                 warnings.warn(
                     "The selected contact material law uses velocity-only point friction; "
@@ -2872,6 +2915,11 @@ class SolverFeatherPGS(SolverBase):
             if enable_sleeping
             else None
         )
+
+        self._differentiable_step = None
+        if differentiable:
+            validate_differentiable_model(self)
+            self._differentiable_step = DifferentiableStep(self)
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
@@ -8533,6 +8581,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._differentiable_step is not None:
+            return self._differentiable_step.step(state_in, state_out, control, contacts, dt)
         if self._sparse_mass_matrix_size is not None and (
             self.pgs_mode != "matrix_free"
             or self.pgs_schedule != "interleaved"
