@@ -163,6 +163,14 @@ class DifferentiableStep:
         self.body_dof_chain = wp.array(chain, dtype=wp.int32, device=device)
         restitution = solver.shape_material_restitution.numpy()
         self.has_restitution = bool(solver.enable_restitution and restitution.size and np.any(restitution > 0.0))
+        # Free rigid bodies take dense rows; the default solves them after the articulated rows instead.
+        plan = solver._model_plan
+        free = plan.is_free_rigid != 0
+        worlds_free = set(plan.articulation_world[free].tolist())
+        worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
+        self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
+        depenetration = solver.rigid_body_max_depenetration_velocity.numpy()
+        self.has_depenetration_clamp = bool(np.any(np.isfinite(depenetration) & (depenetration > 0.0)))
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
 
     def buffers(self, state_out: State) -> _StepBuffers:
@@ -440,7 +448,8 @@ class DifferentiableStep:
         solver = self.solver
         checks = (
             (solver.pgs_mode != "split", 'pgs_mode="split" with contacts'),
-            (solver._has_free_rigid_bodies, "no single-body free articulations with contacts"),
+            (self.has_mixed_free_worlds, "no world mixing free rigid bodies and articulations"),
+            (self.has_depenetration_clamp, "no rigid-body depenetration velocity clamp"),
             (solver.contact_friction_shared_anchor and solver.enable_contact_friction, "no shared friction anchor"),
             (self.has_restitution, "zero contact restitution"),
             (solver._regularization_enabled, "pgs_contact_regularization=0"),
@@ -1803,13 +1812,30 @@ def _dense_pgs_sweep(
                     )
                     a = trial[0]
                     b = trial[1]
-                    magnitude = wp.sqrt(a * a + b * b)
+                    magnitude = _guarded_sqrt(a * a + b * b)
                     if magnitude > radius:
                         scale = radius / magnitude
                         a *= scale
                         b *= scale
                     impulses_out[world, i] = a
                     impulses_out[world, sibling] = b
+
+
+@wp.func
+def _guarded_sqrt(x: float):
+    """wp.sqrt whose adjoint is zero where the root is zero.
+
+    At an isotropic tangent block (a = d, c = 0, e.g. any sphere) the eigen-gap root is zero; the pair solve
+    stays smooth there and perturbations keep the block isotropic, so the zero adjoint is its exact derivative.
+    """
+    return wp.sqrt(x)
+
+
+@wp.func_grad(_guarded_sqrt)
+def _adj_guarded_sqrt(x: float, adj_ret: float):
+    root = wp.sqrt(x)
+    if root > 0.0:
+        wp.adjoint[x] += 0.5 / root * adj_ret
 
 
 @wp.func
@@ -1823,7 +1849,7 @@ def _friction_pair_unrolled(
     a /= scale
     c /= scale
     d /= scale
-    largest = 0.5 * (a + d + wp.sqrt((a - d) * (a - d) + 4.0 * c * c))
+    largest = 0.5 * (a + d + _guarded_sqrt((a - d) * (a - d) + 4.0 * c * c))
     smallest = float(0.0)
     if largest > 0.0:
         smallest = wp.max((a * d - c * c) / largest, 0.0)
