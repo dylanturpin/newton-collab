@@ -240,12 +240,52 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
                             }}
                             lipschitz = fmaxf(lipschitz, row_sum);
                         }}
-                        for (int k = 0; k < 5; ++k) y[k] = y0[k];
-                        angular_cone_projection(y, load);
-                        if (lipschitz > 0.0f) {{
+                        // Sticking: the unconstrained block minimizer, when it lies inside the cone, is exact.
+                        bool solved = false;
+                        {{
+                            float L[5][5], step[5], largest_pivot = 0.0f;
+                            for (int k = 0; k < 5; ++k) largest_pivot = fmaxf(largest_pivot, mu[k] > 0.0f ? H[k][k] : 0.0f);
+                            // Near-singular blocks (rows without response) take the projected-gradient path.
+                            bool positive = largest_pivot > 0.0f;
+                            for (int k = 0; k < 5 && positive; ++k) {{
+                                for (int l = 0; l <= k; ++l) {{
+                                    float value = mu[k] > 0.0f && mu[l] > 0.0f ? H[k][l] : (k == l ? 1.0f : 0.0f);
+                                    for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
+                                    if (k == l) {{
+                                        if (!(value > 1.0e-5f * largest_pivot)) positive = false;
+                                        L[k][k] = sqrtf(fmaxf(value, 0.0f));
+                                    }} else {{
+                                        L[k][l] = value / L[l][l];
+                                    }}
+                                }}
+                            }}
+                            if (positive) {{
+                                for (int k = 0; k < 5; ++k) {{
+                                    float value = mu[k] > 0.0f ? -gradient0[k] : 0.0f;
+                                    for (int m = 0; m < k; ++m) value -= L[k][m] * step[m];
+                                    step[k] = value / L[k][k];
+                                }}
+                                for (int k = 4; k >= 0; --k) {{
+                                    float value = step[k];
+                                    for (int m = k + 1; m < 5; ++m) value -= L[m][k] * step[m];
+                                    step[k] = value / L[k][k];
+                                }}
+                                for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? y0[k] + step[k] : 0.0f;
+                                float trial[5];
+                                for (int k = 0; k < 5; ++k) trial[k] = y[k];
+                                angular_cone_projection(trial, load);
+                                solved = true;
+                                for (int k = 0; k < 5; ++k) solved = solved && trial[k] == y[k];
+                            }}
+                        }}
+                        if (!solved) {{
+                            for (int k = 0; k < 5; ++k) y[k] = y0[k];
+                            angular_cone_projection(y, load);
+                        }}
+                        if (!solved && lipschitz > 0.0f) {{
                             for (int k = 0; k < 5; ++k) z[k] = y[k];
                             float momentum = 1.0f;
-                            for (int iteration = 0; iteration < 64; ++iteration) {{
+                            for (int iteration = 0; iteration < 32; ++iteration) {{
                                 float next[5];
                                 for (int k = 0; k < 5; ++k) {{
                                     float gradient = gradient0[k];
@@ -255,11 +295,15 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
                                 angular_cone_projection(next, load);
                                 float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
                                 float blend = (momentum - 1.0f) / next_momentum;
+                                float change = 0.0f;
                                 for (int k = 0; k < 5; ++k) {{
+                                    change = fmaxf(change, fabsf(next[k] - y[k]));
                                     z[k] = next[k] + blend * (next[k] - y[k]);
                                     y[k] = next[k];
                                 }}
                                 momentum = next_momentum;
+                                // Outer sweeps warm-start the block, so stop once an iterate stalls.
+                                if (change <= 1.0e-6f * load) break;
                             }}
                         }}
                         float x[5];
