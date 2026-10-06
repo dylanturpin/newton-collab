@@ -284,6 +284,17 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(zero, ball(mu_torsional=0.0, mu_rolling=0.0, enable=False).run(60))
         np.testing.assert_array_equal(baseline, ball(enable=False, mu_rolling=0.5).run(60))
 
+    def test_contact_force_reports_the_sliding_pair(self):
+        """Angular contacts still report their normal and sliding force; the angular impulses are not reported."""
+        scene = ball(speed=1.0, rolling=False)
+        scene.model.request_contact_attributes("force")
+        scene.contacts = scene.pipeline.contacts()
+        scene.step()
+        scene.solver.update_contacts(scene.contacts)
+        force = scene.contacts.force.numpy()[0, :3]
+        self.assertAlmostEqual(abs(float(force[2])), GRAVITY * 1.0003, delta=0.01)
+        self.assertAlmostEqual(float(np.linalg.norm(force[:2])), MU * GRAVITY * 1.0003, delta=0.02)
+
     def test_zero_coefficients_allocate_no_rows(self):
         scene = ball(mu_torsional=0.0, mu_rolling=0.0)
         scene.step()

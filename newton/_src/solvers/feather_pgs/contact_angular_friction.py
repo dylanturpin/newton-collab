@@ -3,7 +3,8 @@
 """Per-contact torsional and rolling friction from the shape material coefficients.
 
 Each dense contact that receives a sliding pair and has a positive pair coefficient
-reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``. The
+reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``, and its
+five friction rows take the angular-friction row type so that one solve owns them. The
 spin row resists relative rotation about the normal and the rolling pair about the
 contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
 five friction rows of a contact as one block: it minimizes the block's quadratic
@@ -327,22 +328,17 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
         }}
     }};
 """
-    block_open = f"""
-                    if (parent_idx + 5 < m_dense &&
-                        world_row_type.data[off_dense + parent_idx + 3] == {angular} &&
-                        world_row_parent.data[off_dense + parent_idx + 3] == parent_idx) {{
-                        // Block solve of the five friction rows [t1, t2, spin, roll1, roll2] at fixed normal load.
-                        const int first_row = parent_idx + 1;
-                        new_impulse = AngularFrictionBlock::solve(
-                            s_v, &s_lam_dense[first_row], &s_mu_dense[first_row], &s_rhs_dense[first_row],
-                            &J_world.data[jy_world_base + first_row * {dofs}], &Y_world.data[jy_world_base + first_row * {dofs}],
-                            lane, MASK, s_lam_dense[parent_idx], omega, &iteration_changed);
-                    }} else {{"""
-    block_close = """
-                    }"""
     row_block = f"""
             }} else if (row_type == {angular}) {{
-                // The contact's first sliding row solves these rows in its friction block.
-                new_impulse = old_impulse;
-                delta_impulse = 0.0f;"""
-    return {"helpers": helpers, "block_open": block_open, "block_close": block_close, "row_block": row_block}
+                // Rows [t1, t2, spin, roll1, roll2] of one contact; the first solves the whole block.
+                int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
+                if (i == parent_idx + 1) {{
+                    new_impulse = AngularFrictionBlock::solve(
+                        s_v, &s_lam_dense[i], &s_mu_dense[i], &s_rhs_dense[i],
+                        &J_world.data[jy_world_base + i * {dofs}], &Y_world.data[jy_world_base + i * {dofs}],
+                        lane, MASK, s_lam_dense[parent_idx], omega, &iteration_changed);
+                }} else {{
+                    new_impulse = old_impulse;
+                }}
+                delta_impulse = new_impulse - old_impulse;"""
+    return {"helpers": helpers, "row_block": row_block}

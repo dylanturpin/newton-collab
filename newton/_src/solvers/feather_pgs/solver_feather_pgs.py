@@ -24160,7 +24160,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
                 if (i != parent_idx + 1) {{
                     new_impulse = old_impulse;
-                }} else {{__ANGULAR_BLOCK_OPEN__
+                }} else {{
                     int sib = parent_idx + 2;
                     int sib_row_base = jy_world_base + sib * {D};
                     float lambda_n = s_lam_dense[parent_idx];
@@ -24189,7 +24189,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float sib_delta = b * scale - s_lam_dense[sib];
                     s_lam_dense[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
-                    {dense_sib_v_code}__ANGULAR_BLOCK_CLOSE__
+                    {dense_sib_v_code}
                 }}
 """
 
@@ -24198,16 +24198,11 @@ def _get_pgs_solve_mf_gs_kernel(
         if angular_friction_cone is not None
         else None
     )
-    dense_friction_block = dense_friction_block.replace(
-        "__ANGULAR_BLOCK_OPEN__", angular_sources["block_open"] if angular_sources else ""
-    ).replace("__ANGULAR_BLOCK_CLOSE__", angular_sources["block_close"] if angular_sources else "")
     dense_friction_block = dense_friction_block.replace("__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS))
     angular_row_block = ""
     if angular_sources:
-        angular_row_block = (
-            angular_sources["row_block"]
-            .replace("__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS))
-            .replace("__SIB_V_UPDATE__", dense_sib_v_code)
+        angular_row_block = angular_sources["row_block"].replace(
+            "__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS)
         )
     # Angular friction rows are contact-phase rows that start with sliding friction.
     friction_like = (

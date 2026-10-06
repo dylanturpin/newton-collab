@@ -2621,6 +2621,12 @@ def reset_friction_anchor_history(
     prev_valid[c] = 0
 
 
+@wp.func
+def _is_sliding_row_type(row_type: int):
+    """Dense sliding rows are friction rows, or angular-friction rows when the contact has angular friction."""
+    return row_type == PGS_CONSTRAINT_TYPE_FRICTION or row_type == PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+
+
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
     contact_count: wp.array[wp.int32],
@@ -2671,9 +2677,9 @@ def compute_contact_linear_force_from_impulses(
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and _is_sliding_row_type(world_row_type[world, slot + 1])
                 and world_row_parent[world, slot + 1] == slot
-                and world_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and _is_sliding_row_type(world_row_type[world, slot + 2])
                 and world_row_parent[world, slot + 2] == slot
             ):
                 lam_t0 = world_impulses[world, slot + 1]
@@ -5908,6 +5914,10 @@ def populate_world_angular_friction_rows(
                         row,
                         J_group,
                     )
+            if write_metadata != 0 and k == 0:
+                # The block solve owns the contact's sliding pair too, so it runs from the angular row type.
+                world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+                world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
             if write_metadata != 0:
                 torsional, rolling = contact_angular_friction_coefficients(
                     shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
