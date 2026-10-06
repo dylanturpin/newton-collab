@@ -201,6 +201,31 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
         _, qd = _advance(solver, states, control, 5)
         np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
 
+    def test_strided_coefficients_are_read_by_stride(self):
+        """Read strided coefficient views at construction and after notified replacement."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for _ in range(2):
+            builder.add_world(_single_dof_builder("revolute", friction=0.0))
+        expected = np.array([1.5 / INERTIA * DT, 0.5 / INERTIA * DT], dtype=np.float32)
+        for strided in (False, True):
+            for when in ("construction", "replacement"):
+                with self.subTest(strided=strided, when=when):
+                    model = builder.finalize()
+                    storage = wp.array([1.0, 99.0, 2.0, 99.0], dtype=wp.float32, device=model.device)
+                    coefficients = (
+                        storage[::2] if strided else wp.array([1.0, 2.0], dtype=wp.float32, device=model.device)
+                    )
+                    if when == "construction":
+                        model.joint_friction = coefficients
+                    solver = _solver(model)
+                    if when == "replacement":
+                        model.joint_friction = coefficients
+                        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+                    states, control = [model.state(), model.state()], model.control()
+                    control.joint_f.fill_(2.5)
+                    _, qd = _advance(solver, states, control, 1)
+                    np.testing.assert_allclose(qd, expected, atol=1.0e-6)
+
     def test_graph_replay_matches_eager_and_reads_edits(self):
         """Replay captured steps bit-identically and read in-place coefficient edits."""
         model = _single_dof_model("revolute")

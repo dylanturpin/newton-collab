@@ -1494,15 +1494,21 @@ class SolverFeatherPGS(SolverBase):
                 around a zero-velocity target, so the DOF sticks until the required effort exceeds
                 the friction and then slides against it. The rows use the articulated response, so
                 coupled inertia, armature, augmented drives, limits and contacts act jointly; their
-                impulses cold-start each step. Coefficients are read every step, so assignments into
-                the array take effect immediately; call
-                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)`` after editing or replacing
-                the array, and recapture CUDA graphs after replacing it. Nonzero friction on BALL,
+                impulses cold-start each step. After editing or replacing the coefficients, call
+                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)``: it validates the values and
+                wakes sleeping islands whose friction changed (a sleeping articulation builds no rows).
+                Coefficients are read on the device every step, including on graph replay; recapture
+                CUDA graphs after replacing the array. Nonzero friction on BALL,
                 FREE, DISTANCE or CABLE joints, and non-finite or negative values, raise
                 :class:`ValueError`. Requires ``pgs_mode="matrix_free"`` on CUDA and is not supported
                 with ``contact_compliance``, bilateral pre-elimination or ``model.requires_grad``;
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
+
+                .. experimental::
+
+                    ``enable_joint_friction=True`` and its supported combinations may change without
+                    prior notice.
             velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
                 row allocation. ``0.0`` allocates the lower/upper row pair for every finitely
                 limited joint DOF and free-rigid-body axis each step, preserving the historical
@@ -13893,7 +13899,9 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
         float bound = 0.0f;
         int active = 0;
         if (local_dof < {size} && friction_dof_eligible.data[dof] != 0 && kinematic_dof_mask.data[dof] == 0) {{
-            bound = joint_friction.data[dof] * dt;
+            // Honor the stride: callers may replace Model.joint_friction with a strided view.
+            bound = *reinterpret_cast<const float*>(
+                reinterpret_cast<const char*>(joint_friction.data) + dof * joint_friction.strides[0]) * dt;
             active = bound > 0.0f;
         }}
 
