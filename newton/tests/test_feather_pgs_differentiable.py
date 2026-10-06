@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.differentiable import _dense_pgs_sweep, _friction_pair
+from newton._src.solvers.feather_pgs.differentiable import SmoothContactLaw, _dense_pgs_sweep, _friction_pair
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1028,6 +1028,8 @@ def _pair_sweep(device, a, c, d, rhs, seed=(0.0, 1.0, 0.0)):
                 array([[1.0, 1.0, 1.0]]),
                 1.0,
                 0,
+                0,
+                array([[0.0, 0.0, 0.0]]),
                 array([[0.0, 0.0, 0.0]]),
             ],
             outputs=[residuals, impulses],
@@ -1281,6 +1283,77 @@ def test_free_body_rows_use_dense_capacity(test, device):
             np.testing.assert_allclose(results[True], results[False], rtol=0.0, atol=1.0e-5)
 
 
+def test_smooth_contact_rejects_unsupported_configs(test, device):
+    model = _build_free_body(device)
+    law = SmoothContactLaw(stiffness=1.0e4)
+    with test.assertRaises(ValueError):
+        SolverFeatherPGS(model, smooth_contact=law, enable_restitution=False)
+    with test.assertRaises(ValueError):
+        SolverFeatherPGS(model, differentiable=True, smooth_contact=law)
+    with test.assertRaises(ValueError):
+        SmoothContactLaw(stiffness=1.0e4, softness=0.0)
+
+
+def test_smooth_contact_bounce_gradient_converges_across_eps(test, device):
+    """An elastic SmoothContactLaw bounce: central FD agrees with the tape at every eps, unlike hard restitution."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.3)
+    body = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.15), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
+    law = SmoothContactLaw(stiffness=1.0e4, softness=1.0e-2)
+    options = {"friction_anchor_beta": 0.0, "enable_restitution": False, "pgs_iterations": 8, "smooth_contact": law}
+    steps = 40
+    dt = 1.0 / 240.0
+    wq = wp.array(np.array([1.0, 0.5, 2.0, 0.0, 0.0, 0.0, 0.0], np.float32), device=device)
+    wqd = wp.array(np.array([0.3, 0.2, 1.0, 0.1, 0.1, 0.1], np.float32), device=device)
+    qd0 = np.array([0.3, 0.0, -2.0, 0.0, 0.0, 0.0], np.float32)
+    solver = SolverFeatherPGS(model, differentiable=True, **options)
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    contacts = pipeline.contacts()
+
+    def rollout(qd, tape=None):
+        states[0].joint_q.assign(model.joint_q)
+        states[0].joint_qd.assign(qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        for k in range(steps):
+            pipeline.collide(states[k], contacts)
+            if tape is not None:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], None, contacts, dt)
+            if tape is not None:
+                tape.__exit__(None, None, None)
+        loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        if tape is not None:
+            tape.__enter__()
+        wp.launch(
+            _weighted_loss,
+            dim=7,
+            inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+            outputs=[loss],
+            device=device,
+        )
+        if tape is not None:
+            tape.__exit__(None, None, None)
+        return loss
+
+    tape = wp.Tape()
+    loss = rollout(qd0, tape)
+    tape.backward(loss)
+    gradient = states[0].joint_qd.grad.numpy().copy()
+    test.assertGreater(states[-1].joint_qd.numpy()[2], 1.0)
+    tape.zero()
+    direction = np.random.default_rng(3).normal(size=6).astype(np.float32)
+    direction /= np.linalg.norm(direction)
+    for eps in (1.0e-1, 1.0e-2):
+        fd = (rollout(qd0 + eps * direction).numpy()[0] - rollout(qd0 - eps * direction).numpy()[0]) / (2.0 * eps)
+        with test.subTest(eps=eps):
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=1.0e-2 * max(1.0, abs(fd)))
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -1310,6 +1383,8 @@ for _device in get_test_devices():
         test_friction_pair_shift_dominated_slide,
         test_pgs_kernel_selection,
         test_free_body_rows_use_dense_capacity,
+        test_smooth_contact_rejects_unsupported_configs,
+        test_smooth_contact_bounce_gradient_converges_across_eps,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:

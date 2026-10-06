@@ -54,7 +54,12 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
-from .differentiable import DifferentiableStep, validate_differentiable_model, validate_differentiable_options
+from .differentiable import (
+    DifferentiableStep,
+    SmoothContactLaw,
+    validate_differentiable_model,
+    validate_differentiable_options,
+)
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -1280,6 +1285,7 @@ class SolverFeatherPGS(SolverBase):
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         differentiable: bool = False,
+        smooth_contact: SmoothContactLaw | None = None,
     ):
         """
         Args:
@@ -1326,6 +1332,10 @@ class SolverFeatherPGS(SolverBase):
                 .. experimental::
 
                     ``differentiable=True`` and its supported combinations may change without prior notice.
+            smooth_contact: Experimental, forward-changing contact law for ``differentiable=True``: a smooth
+                explicit spring-damper replaces the hard normal rows and restitution, and point friction is
+                solved by PGS against that normal impulse. It is a surrogate model, not FeatherPGS contact
+                parity. Requires ``enable_restitution=False``. See :class:`SmoothContactLaw`. Defaults to None.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.
@@ -1808,6 +1818,8 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if smooth_contact is not None and (not differentiable or enable_restitution):
+            raise ValueError("smooth_contact requires differentiable=True and enable_restitution=False")
         if differentiable:
             validate_differentiable_options(
                 model,
@@ -3011,7 +3023,7 @@ class SolverFeatherPGS(SolverBase):
         self._differentiable_patch_friction_default = getattr(self, "_differentiable_patch_friction_default", False)
         if differentiable:
             validate_differentiable_model(self)
-            self._differentiable_step = DifferentiableStep(self)
+            self._differentiable_step = DifferentiableStep(self, smooth_contact)
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.

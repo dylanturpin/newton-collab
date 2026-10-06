@@ -10,6 +10,7 @@ stores every intermediate in buffers owned by the output state, so a
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -97,11 +98,32 @@ def validate_differentiable_model(solver: SolverFeatherPGS) -> None:
             raise ValueError(f"differentiable=True requires {requirement}")
 
 
+@dataclass(frozen=True)
+class SmoothContactLaw:
+    """Smooth explicit spring-damper normal law; a forward-changing surrogate, not FeatherPGS parity.
+
+    Each normal row applies ``dt * k * s * softplus(-(phi + (c / k) * sigmoid(-phi / s) * u) / s)`` from the
+    step's gap ``phi`` and predicted separating velocity ``u``; it tends to ``dt * max(0, -k phi - c u)`` as s -> 0.
+    """
+
+    stiffness: float
+    """Spring stiffness k [N/m]; the explicit update is stable for ``dt * sqrt(k / m) < 2``."""
+    damping: float = 0.0
+    """Dashpot c [N s/m], gated smoothly to closed gaps; zero gives an elastic contact."""
+    softness: float = 1.0e-3
+    """Activation length s [m]; keep it well below the collision margin so rows enter the set with ~zero force."""
+
+    def __post_init__(self):
+        if not (self.stiffness > 0.0 and self.damping >= 0.0 and self.softness > 0.0):
+            raise ValueError(f"SmoothContactLaw needs k > 0, c >= 0, s > 0; got {self}")
+
+
 class DifferentiableStep:
     """Fixed-selection FeatherPGS step whose intermediates are owned by the output state."""
 
-    def __init__(self, solver: SolverFeatherPGS):
+    def __init__(self, solver: SolverFeatherPGS, smooth_contact: SmoothContactLaw | None = None):
         self.solver = solver
+        self.smooth_contact = smooth_contact
         model = solver.model
         device = model.device
         joint_parent = model.joint_parent.numpy()
@@ -756,24 +778,47 @@ class DifferentiableStep:
                 device=device,
             )
 
-        wp.launch(
-            _dense_contact_restitution,
-            dim=(solver.world_count, max_rows),
-            inputs=[
-                c.row_count,
-                c.phi,
-                c.row_beta,
-                c.row_type,
-                c.row_restitution,
-                c.row_max_depenetration,
-                c.rhs,
-                dt,
-                solver.contact_speculative_scale,
-                solver._effective_restitution_velocity_threshold,
-            ],
-            outputs=[c.rhs_restituted],
-            device=device,
-        )
+        rhs = c.rhs_restituted
+        smooth = self.smooth_contact
+        if smooth is not None:
+            rhs = c.rhs
+            wp.launch(
+                _smooth_contact_impulse,
+                dim=(solver.world_count, max_rows),
+                inputs=[
+                    c.row_count,
+                    c.phi,
+                    c.row_beta,
+                    c.row_type,
+                    c.rhs,
+                    dt,
+                    solver.contact_speculative_scale,
+                    smooth.stiffness,
+                    smooth.damping,
+                    smooth.softness,
+                ],
+                outputs=[c.smooth_impulse],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _dense_contact_restitution,
+                dim=(solver.world_count, max_rows),
+                inputs=[
+                    c.row_count,
+                    c.phi,
+                    c.row_beta,
+                    c.row_type,
+                    c.row_restitution,
+                    c.row_max_depenetration,
+                    c.rhs,
+                    dt,
+                    solver.contact_speculative_scale,
+                    solver._effective_restitution_velocity_threshold,
+                ],
+                outputs=[c.rhs_restituted],
+                device=device,
+            )
 
         # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
         c.impulses[0].zero_()
@@ -786,12 +831,14 @@ class DifferentiableStep:
                     c.row_count,
                     c.diag,
                     c.C,
-                    c.rhs_restituted,
+                    rhs,
                     c.row_type,
                     c.row_parent,
                     c.row_mu,
                     solver.pgs_omega,
                     int(k < friction_start),
+                    int(smooth is not None),
+                    c.smooth_impulse,
                     c.impulses[k],
                 ],
                 outputs=[c.residuals[k], c.impulses[k + 1]],
@@ -904,6 +951,7 @@ class _ContactBuffers:
         self.rhs_restituted = zeros((worlds, rows))
         self.row_restitution = zeros((worlds, rows))
         self.row_max_depenetration = zeros((worlds, rows))
+        self.smooth_impulse = zeros((worlds, rows))
         self.diag = zeros((worlds, rows))
         self.C = zeros((worlds, rows, rows))
         self.impulses = [zeros((worlds, rows)) for _ in range(solver.pgs_iterations + 1)]
@@ -1820,6 +1868,52 @@ def _dense_contact_restitution(
 
 
 @wp.kernel
+def _smooth_contact_impulse(
+    row_count: wp.array[int],
+    row_phi: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_type: wp.array2d[int],
+    rhs: wp.array2d[float],
+    dt: float,
+    contact_speculative_scale: float,
+    stiffness: float,
+    damping: float,
+    softness: float,
+    # outputs
+    impulse: wp.array2d[float],
+):
+    """SmoothContactLaw normal impulse from the gap and the predicted separating velocity."""
+    world, i = wp.tid()
+    if i >= row_count[world]:
+        return
+    value = float(0.0)
+    if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
+        phi = row_phi[world, i]
+        geometric_bias = contact_speculative_scale * phi / dt
+        if phi < 0.0:
+            geometric_bias = row_beta[world, i] * phi / dt
+        separating_velocity = rhs[world, i] - geometric_bias
+        gate = _sigmoid(-phi / softness)
+        depth = -(phi + damping / stiffness * gate * separating_velocity)
+        value = dt * stiffness * softness * _softplus(depth / softness)
+    impulse[world, i] = value
+
+
+@wp.func
+def _softplus(x: float):
+    return wp.max(x, 0.0) + wp.log(1.0 + wp.exp(-wp.abs(x)))
+
+
+@wp.func
+def _sigmoid(x: float):
+    # Branches keep exp's argument non-positive, so neither the value nor its adjoint overflows.
+    if x >= 0.0:
+        return 1.0 / (1.0 + wp.exp(-x))
+    e = wp.exp(x)
+    return e / (1.0 + e)
+
+
+@wp.kernel
 def _delassus_dense(
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
@@ -1863,6 +1957,8 @@ def _dense_pgs_sweep(
     row_mu: wp.array2d[float],
     omega: float,
     skip_friction: int,
+    smooth_normal: int,
+    smooth_impulse: wp.array2d[float],
     impulses_in: wp.array2d[float],
     # outputs
     residuals: wp.array2d[float],
@@ -1889,7 +1985,9 @@ def _dense_pgs_sweep(
             residuals[world, i] = w
             residual = residuals[world, i]
             denom = diag[world, i]
-            if kind != PGS_CONSTRAINT_TYPE_FRICTION:
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT and smooth_normal != 0:
+                impulses_out[world, i] = smooth_impulse[world, i]
+            elif kind != PGS_CONSTRAINT_TYPE_FRICTION:
                 new_impulse = impulses_in[world, i]
                 if denom > 0.0:
                     new_impulse = impulses_in[world, i] + omega * (-residual / denom)
