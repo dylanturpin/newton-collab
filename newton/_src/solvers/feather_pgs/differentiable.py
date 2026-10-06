@@ -19,15 +19,23 @@ from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import JointType
 from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
     _compute_body_net_wrench,
     _gyro_skew,
+    allocate_world_contact_slots,
     apply_free_root_transport_to_predictor,
+    apply_impulses_world_par_dof,
     compute_composite_inertia,
     compute_link_transform,
     compute_link_velocity,
     compute_velocity_predictor,
+    compute_world_contact_bias,
+    finalize_world_constraint_counts,
+    finalize_world_diag_cfm,
     integrate_generalized_joints,
+    prescribed_relative_contact_target,
     remove_free_root_transport_from_qdd,
+    rhs_accum_world_par_art,
     update_qdd_from_velocity,
 )
 
@@ -132,6 +140,24 @@ class DifferentiableStep:
             self.crba_body[size] = wp.array(body, dtype=wp.int32, device=device)
             self.crba_dofs[size] = wp.array(dofs.reshape(len(arts), size, size * 2), dtype=wp.int32, device=device)
         self.mass_update_mask = wp.ones(model.articulation_count, dtype=wp.int32, device=device)
+        # body_dof_chain[body, d]: DOF d of the body's articulation moves the body (its joint chain).
+        body_art = solver.body_to_articulation.numpy()
+        max_size = max(solver.size_groups, default=1)
+        chain = np.zeros((max(model.body_count, 1), max_size), dtype=np.int32)
+        for body, body_joint in body_to_joint.items():
+            art = int(body_art[body])
+            if art < 0:
+                continue
+            base = int(dof_start[art])
+            joint = body_joint
+            while joint >= 0:
+                for dof in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+                    chain[body, dof - base] = 1
+                parent_body = joint_parent[joint]
+                joint = body_to_joint.get(int(parent_body), -1) if parent_body >= 0 else -1
+        self.body_dof_chain = wp.array(chain, dtype=wp.int32, device=device)
+        restitution = solver.shape_material_restitution.numpy()
+        self.has_restitution = bool(solver.enable_restitution and restitution.size and np.any(restitution > 0.0))
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
 
     def buffers(self, state_out: State) -> _StepBuffers:
@@ -146,7 +172,7 @@ class DifferentiableStep:
         model = solver.model
         device = model.device
         if contacts is not None:
-            raise NotImplementedError("differentiable=True does not support contacts yet; pass contacts=None")
+            self.validate_contacts()
         if state_in is state_out:
             raise ValueError("differentiable=True requires distinct input and output states")
         if control is None:
@@ -352,7 +378,8 @@ class DifferentiableStep:
                 device=device,
             )
             v_out = b.v_gyro
-        # Without constraint rows the PGS stages leave v_out == v_hat.
+        if contacts is not None:
+            v_out = self._solve_dense_contacts(b, contacts, v_out, dt)
         wp.launch(
             update_qdd_from_velocity,
             dim=model.joint_dof_count,
@@ -401,6 +428,319 @@ class DifferentiableStep:
         solver._step += 1
         return state_out
 
+    def validate_contacts(self) -> None:
+        """Raise for contact configurations the differentiable step does not reproduce yet."""
+        solver = self.solver
+        checks = (
+            (solver.pgs_mode != "split", 'pgs_mode="split" with contacts'),
+            (solver._has_free_rigid_bodies, "no single-body free articulations with contacts"),
+            (solver.enable_contact_friction, "enable_contact_friction=False"),
+            (self.has_restitution, "zero contact restitution"),
+            (solver._regularization_enabled, "pgs_contact_regularization=0"),
+        )
+        for unsupported, requirement in checks:
+            if unsupported:
+                raise NotImplementedError(f"differentiable=True contacts require {requirement}")
+
+    def _solve_dense_contacts(self, b: _StepBuffers, contacts: Contacts, v_hat: wp.array, dt: float) -> wp.array:
+        """Dense articulated contact rows and fixed-iteration PGS with every iterate stored."""
+        # Deferred: the solver module imports this one.
+        from .solver_feather_pgs import (  # noqa: PLC0415
+            _CONTACT_BUILD_THREAD_CAP,
+            _ROW_SLOT_UNBOUNDED,
+            _clear_dense_row_state,
+            _finalize_constraint_status,
+        )
+
+        solver = self.solver
+        model = solver.model
+        device = model.device
+        max_rows = solver.dense_max_constraints
+        c = b.contact_buffers(contacts)
+        for src, dst in (
+            (contacts.rigid_contact_count, c.count),
+            (contacts.rigid_contact_point0, c.point0),
+            (contacts.rigid_contact_point1, c.point1),
+            (contacts.rigid_contact_normal, c.normal),
+            (contacts.rigid_contact_shape0, c.shape0),
+            (contacts.rigid_contact_shape1, c.shape1),
+            (contacts.rigid_contact_margin0, c.margin0),
+            (contacts.rigid_contact_margin1, c.margin1),
+        ):
+            wp.copy(dst, src)
+        threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
+
+        # Topology: integer bookkeeping, frozen for the derivative and kept off the tape.
+        wp.launch(
+            _clear_dense_row_state,
+            dim=solver.world_count,
+            inputs=[c.slot_counter, c.dense_world_flag, solver._row_dropped_all],
+            device=device,
+            record_tape=False,
+        )
+        solver._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
+        dummy = solver._dummy_mf_slot_counter
+        wp.launch(
+            allocate_world_contact_slots,
+            dim=threads,
+            inputs=[
+                c.count,
+                threads,
+                c.shape0,
+                c.shape1,
+                c.point0,
+                c.point1,
+                c.normal,
+                c.margin0,
+                c.margin1,
+                b.body_q,
+                model.shape_transform,
+                model.shape_body,
+                solver.body_to_articulation,
+                solver.art_to_world,
+                solver.articulation_response_dof_count,
+                model.body_flags,
+                solver.body_has_response_dofs,
+                solver._dummy_is_free_rigid if solver.is_free_rigid is None else solver.is_free_rigid,
+                0,
+                0,
+                0,
+                0,
+                solver.contact_gap_gate,
+                solver.same_articulation_contact_gap_gate,
+                solver.articulation_pair_contact_gap_gate,
+                max_rows,
+                solver.mf_max_constraints,
+                solver.propagation_max_constraints,
+                0,
+                solver.contact_friction_gap_threshold,
+                1 if solver.contact_friction_articulation_pairs_only else 0,
+                solver._friction_patches.view,
+            ],
+            outputs=[
+                c.world,
+                c.slot,
+                c.art_a,
+                c.art_b,
+                c.slot_counter,
+                c.path,
+                dummy,
+                dummy,
+                c.dense_world_flag,
+                c.slots_needed,
+                solver._row_dropped_dense,
+                solver._row_dropped_mf,
+                solver._row_dropped_propagation,
+                solver._dense_first_rejected_slot,
+                dummy,
+                dummy,
+            ],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            finalize_world_constraint_counts,
+            dim=solver.world_count,
+            inputs=[c.slot_counter, max_rows, solver._dense_first_rejected_slot],
+            outputs=[c.row_count],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            _finalize_constraint_status,
+            dim=solver.world_count,
+            inputs=[
+                c.slot_counter,
+                dummy,
+                dummy,
+                solver._row_dropped_all,
+                c.count,
+                contacts._reduction_overflow,
+                max_rows,
+                solver.mf_max_constraints,
+                solver.propagation_max_constraints,
+                contacts.rigid_contact_max,
+                solver.constraint_overflow,
+            ],
+            device=device,
+            record_tape=False,
+        )
+
+        # Rows: geometry recomputed from this step's FK poses; the contact normal is stop-gradient.
+        for array in (c.C, c.diag, c.rhs, *c.J.values(), *c.Y.values()):
+            array.zero_()
+        wp.launch(
+            _dense_contact_rows,
+            dim=threads,
+            inputs=[
+                c.count,
+                threads,
+                c.point0,
+                c.point1,
+                c.normal,
+                c.shape0,
+                c.shape1,
+                c.margin0,
+                c.margin1,
+                c.world,
+                c.slot,
+                c.art_a,
+                c.art_b,
+                c.path,
+                model.shape_body,
+                b.body_q,
+                b.body_v_s,
+                solver._prescribed_articulation,
+                b.articulation_origin,
+                solver.shape_material_mu,
+                solver.shape_material_restitution,
+                int(solver.contact_shared_anchor),
+                solver.pgs_beta,
+                solver.pgs_cfm,
+            ],
+            outputs=[c.row_type, c.row_parent, c.row_mu, c.row_beta, c.row_cfm, c.phi, c.target_velocity],
+            device=device,
+        )
+        for size in solver.size_groups:
+            n_arts = solver.n_arts_by_size[size]
+            wp.launch(
+                _dense_contact_jacobian,
+                dim=(threads, size),
+                inputs=[
+                    c.count,
+                    threads,
+                    c.point0,
+                    c.point1,
+                    c.normal,
+                    c.shape0,
+                    c.shape1,
+                    c.margin0,
+                    c.margin1,
+                    c.slot,
+                    c.art_a,
+                    c.art_b,
+                    c.path,
+                    size,
+                    solver.articulation_response_dof_count,
+                    solver.art_group_idx,
+                    solver.articulation_dof_start,
+                    b.articulation_origin,
+                    self.body_dof_chain,
+                    b.joint_S_s,
+                    model.shape_body,
+                    b.body_q,
+                    int(solver.contact_shared_anchor),
+                ],
+                outputs=[c.J[size]],
+                device=device,
+            )
+            wp.launch(
+                _hinv_jt_dense,
+                dim=n_arts * max_rows,
+                inputs=[
+                    b.L[size],
+                    c.J[size],
+                    solver.group_to_art[size],
+                    solver.art_to_world,
+                    c.row_count,
+                    size,
+                    max_rows,
+                    c.Y_tmp[size],
+                ],
+                outputs=[c.Y[size]],
+                device=device,
+            )
+        for size in solver.size_groups:
+            n_arts = solver.n_arts_by_size[size]
+            wp.launch(
+                _delassus_dense,
+                dim=n_arts * max_rows * max_rows,
+                inputs=[
+                    c.J[size],
+                    c.Y[size],
+                    solver.group_to_art[size],
+                    solver.art_to_world,
+                    c.row_count,
+                    size,
+                    max_rows,
+                    n_arts,
+                ],
+                outputs=[c.C, c.diag],
+                device=device,
+            )
+        wp.launch(
+            finalize_world_diag_cfm,
+            dim=solver.world_count,
+            inputs=[c.row_count, c.row_cfm],
+            outputs=[c.diag],
+            device=device,
+        )
+        wp.launch(
+            compute_world_contact_bias,
+            dim=solver.world_count,
+            inputs=[
+                c.row_count,
+                c.phi,
+                c.row_beta,
+                c.row_type,
+                c.target_velocity,
+                dt,
+                1.0,
+                solver.contact_speculative_scale,
+                1.0,
+                solver._contact_w,
+            ],
+            outputs=[c.rhs, c.row_w],
+            device=device,
+        )
+        for size in solver.size_groups:
+            wp.launch(
+                rhs_accum_world_par_art,
+                dim=solver.n_arts_by_size[size],
+                inputs=[
+                    c.row_count,
+                    solver.art_to_world,
+                    solver.articulation_dof_start,
+                    v_hat,
+                    solver.group_to_art[size],
+                    c.J[size],
+                    size,
+                ],
+                outputs=[c.rhs],
+                device=device,
+            )
+
+        # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
+        c.impulses[0].zero_()
+        for k in range(solver.pgs_iterations):
+            wp.launch(
+                _dense_pgs_sweep,
+                dim=solver.world_count,
+                inputs=[c.row_count, c.diag, c.C, c.rhs, c.row_type, solver.pgs_omega, c.impulses[k]],
+                outputs=[c.residuals[k], c.impulses[k + 1]],
+                device=device,
+            )
+        for size in solver.size_groups:
+            n_arts = solver.n_arts_by_size[size]
+            wp.launch(
+                apply_impulses_world_par_dof,
+                dim=n_arts * size,
+                inputs=[
+                    solver.group_to_art[size],
+                    solver.art_to_world,
+                    solver.articulation_dof_start,
+                    size,
+                    n_arts,
+                    c.row_count,
+                    c.Y[size],
+                    c.impulses[solver.pgs_iterations],
+                    v_hat,
+                ],
+                outputs=[c.v_out],
+                device=device,
+            )
+        return c.v_out
+
 
 class _StepBuffers:
     """Intermediates of one differentiable step, kept alive with its output state."""
@@ -435,6 +775,7 @@ class _StepBuffers:
         self.solve_tmp = zeros(dofs)
         self.v_gyro = zeros(dofs)
         self.gyro_iterates = zeros((max(solver._free_root_joint_count, 1), _GYRO_MAX_MICROSTEPS + 1), wp.vec3)
+        self.contacts = None
         self.H = {}
         self.L = {}
         self.factor_tmp = {}
@@ -443,6 +784,57 @@ class _StepBuffers:
             self.H[size] = zeros((n_arts, size, size))
             self.L[size] = zeros((n_arts, size, size))
             self.factor_tmp[size] = zeros((n_arts, 2, size, size))
+
+    def contact_buffers(self, contacts: Contacts) -> _ContactBuffers:
+        if self.contacts is None or self.contacts.capacity != contacts.rigid_contact_max:
+            self.contacts = _ContactBuffers(self.owner.solver, contacts.rigid_contact_max)
+        return self.contacts
+
+
+class _ContactBuffers:
+    """One step's contact snapshot, frozen topology, dense rows and stored PGS iterates."""
+
+    def __init__(self, solver: SolverFeatherPGS, capacity: int):
+        device = solver.model.device
+        self.capacity = capacity
+        worlds, rows = solver.world_count, solver.dense_max_constraints
+
+        def zeros(shape, dtype=wp.float32, requires_grad=True):
+            return wp.zeros(shape, dtype=dtype, device=device, requires_grad=requires_grad)
+
+        self.count = zeros(1, wp.int32, False)
+        self.point0 = zeros(capacity, wp.vec3, False)
+        self.point1 = zeros(capacity, wp.vec3, False)
+        self.normal = zeros(capacity, wp.vec3, False)
+        self.shape0 = zeros(capacity, wp.int32, False)
+        self.shape1 = zeros(capacity, wp.int32, False)
+        self.margin0 = zeros(capacity, wp.float32, False)
+        self.margin1 = zeros(capacity, wp.float32, False)
+        for name in ("world", "slot", "art_a", "art_b", "path", "slots_needed"):
+            setattr(self, name, zeros(capacity, wp.int32, False))
+        self.slot_counter = zeros(worlds, wp.int32, False)
+        self.dense_world_flag = zeros(worlds, wp.int32, False)
+        self.row_count = zeros(worlds, wp.int32, False)
+        self.row_type = zeros((worlds, rows), wp.int32, False)
+        self.row_parent = zeros((worlds, rows), wp.int32, False)
+        self.row_mu = zeros((worlds, rows))
+        self.row_beta = zeros((worlds, rows))
+        self.row_cfm = zeros((worlds, rows))
+        self.row_w = zeros((worlds, rows))
+        self.phi = zeros((worlds, rows))
+        self.target_velocity = zeros((worlds, rows))
+        self.rhs = zeros((worlds, rows))
+        self.diag = zeros((worlds, rows))
+        self.C = zeros((worlds, rows, rows))
+        self.impulses = [zeros((worlds, rows)) for _ in range(solver.pgs_iterations + 1)]
+        self.residuals = [zeros((worlds, rows)) for _ in range(solver.pgs_iterations)]
+        self.v_out = zeros(solver.model.joint_dof_count)
+        self.J, self.Y, self.Y_tmp = {}, {}, {}
+        for size in solver.size_groups:
+            n_arts = solver.n_arts_by_size[size]
+            self.J[size] = zeros((n_arts, rows, size))
+            self.Y[size] = zeros((n_arts, rows, size))
+            self.Y_tmp[size] = zeros((n_arts, rows, size))
 
 
 @wp.kernel
@@ -920,3 +1312,394 @@ def _solve_dense(
 ):
     g = wp.tid()
     _cholesky_solve(L, g, articulation_dof_start[group_to_art[g]], n, tau, tmp, qdd)
+
+
+@wp.func
+def _contact_world_points(
+    c: int,
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    normal: wp.vec3,
+    body_a: int,
+    body_b: int,
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    body_q: wp.array[wp.transform],
+):
+    """World witness points as _populate_world_J_for_size_contact forms them."""
+    point_a = point0[c] - margin0[c] * normal
+    if body_a >= 0:
+        point_a = wp.transform_point(body_q[body_a], point0[c]) - margin0[c] * normal
+    point_b = point1[c] + margin1[c] * normal
+    if body_b >= 0:
+        point_b = wp.transform_point(body_q[body_b], point1[c]) + margin1[c] * normal
+    return point_a, point_b
+
+
+@wp.kernel
+def _dense_contact_rows(
+    contact_count: wp.array[int],
+    thread_count: int,
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    contact_shared_anchor: int,
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_cfm: wp.array2d[float],
+    row_phi: wp.array2d[float],
+    row_target_velocity: wp.array2d[float],
+):
+    """Normal-row metadata of _populate_world_J_for_size_contact, one write per contact."""
+    total = wp.min(contact_count[0], point0.shape[0])
+    for c in range(wp.tid(), total, thread_count):
+        slot = contact_slot[c]
+        if contact_path[c] == 0 and slot >= 0:
+            world = contact_world[c]
+            normal = -contact_normal[c]
+            body_a = int(-1)
+            body_b = int(-1)
+            mu = float(0.0)
+            mat_count = int(0)
+            if shape0[c] >= 0:
+                body_a = shape_body[shape0[c]]
+                mu += shape_material_mu[shape0[c]]
+                mat_count += 1
+            if shape1[c] >= 0:
+                body_b = shape_body[shape1[c]]
+                mu += shape_material_mu[shape1[c]]
+                mat_count += 1
+            if mat_count > 0:
+                mu /= float(mat_count)
+            point_a, point_b = _contact_world_points(
+                c, point0, point1, normal, body_a, body_b, margin0, margin1, body_q
+            )
+            phi = wp.dot(normal, point_a - point_b)
+            anchor = 0.5 * (point_a + point_b)
+            target_a = point_a
+            target_b = point_b
+            if contact_shared_anchor != 0:
+                target_a = anchor
+                target_b = anchor
+            row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
+            row_parent[world, slot] = -1
+            row_mu[world, slot] = mu
+            row_beta[world, slot] = pgs_beta
+            row_cfm[world, slot] = pgs_cfm
+            row_phi[world, slot] = phi
+            row_target_velocity[world, slot] = prescribed_relative_contact_target(
+                body_a,
+                contact_art_a[c],
+                body_b,
+                contact_art_b[c],
+                target_a,
+                target_b,
+                normal,
+                prescribed_articulation,
+                articulation_origin,
+                body_v_s,
+            )
+
+
+@wp.func
+def _contact_jacobian_entry(
+    body: int,
+    art: int,
+    sign: float,
+    point_world: wp.vec3,
+    direction: wp.vec3,
+    local_dof: int,
+    articulation_dof_start: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_dof_chain: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+):
+    """accumulate_jacobian_row_world's contribution of one DOF, from the chain table."""
+    value = float(0.0)
+    if body >= 0 and body_dof_chain[body, local_dof] != 0:
+        S = joint_S_s[articulation_dof_start[art] + local_dof]
+        lin = wp.vec3(S[0], S[1], S[2])
+        ang = wp.vec3(S[3], S[4], S[5])
+        v = lin + wp.cross(ang, point_world - articulation_origin[art])
+        value = sign * wp.dot(direction, v)
+    return value
+
+
+@wp.kernel
+def _dense_contact_jacobian(
+    contact_count: wp.array[int],
+    thread_count: int,
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    target_size: int,
+    articulation_response_dof_count: wp.array[int],
+    art_group_idx: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_dof_chain: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    contact_shared_anchor: int,
+    # outputs
+    J_group: wp.array3d[float],
+):
+    """One normal-row Jacobian entry per (contact, DOF), summed in populate_world_J_for_size's order."""
+    thread, dof = wp.tid()
+    total = wp.min(contact_count[0], point0.shape[0])
+    for c in range(thread, total, thread_count):
+        slot = contact_slot[c]
+        if contact_path[c] == 0 and slot >= 0:
+            normal = -contact_normal[c]
+            body_a = int(-1)
+            body_b = int(-1)
+            if shape0[c] >= 0:
+                body_a = shape_body[shape0[c]]
+            if shape1[c] >= 0:
+                body_b = shape_body[shape1[c]]
+            point_a, point_b = _contact_world_points(
+                c, point0, point1, normal, body_a, body_b, margin0, margin1, body_q
+            )
+            if contact_shared_anchor != 0:
+                point_a = 0.5 * (point_a + point_b)
+                point_b = point_a
+            art_a = contact_art_a[c]
+            art_b = contact_art_b[c]
+            a_matches = art_a >= 0 and articulation_response_dof_count[art_a] == target_size
+            b_matches = art_b >= 0 and articulation_response_dof_count[art_b] == target_size
+            if a_matches:
+                value = float(0.0)
+                value += _contact_jacobian_entry(
+                    body_a,
+                    art_a,
+                    1.0,
+                    point_a,
+                    normal,
+                    dof,
+                    articulation_dof_start,
+                    articulation_origin,
+                    body_dof_chain,
+                    joint_S_s,
+                )
+                if b_matches and art_b == art_a:
+                    value += _contact_jacobian_entry(
+                        body_b,
+                        art_b,
+                        -1.0,
+                        point_b,
+                        normal,
+                        dof,
+                        articulation_dof_start,
+                        articulation_origin,
+                        body_dof_chain,
+                        joint_S_s,
+                    )
+                J_group[art_group_idx[art_a], slot, dof] = value
+            if b_matches and art_b != art_a:
+                value = float(0.0)
+                value += _contact_jacobian_entry(
+                    body_b,
+                    art_b,
+                    -1.0,
+                    point_b,
+                    normal,
+                    dof,
+                    articulation_dof_start,
+                    articulation_origin,
+                    body_dof_chain,
+                    joint_S_s,
+                )
+                J_group[art_group_idx[art_b], slot, dof] = value
+
+
+@wp.func
+def _cholesky_solve_row(
+    L: wp.array3d[float],
+    g: int,
+    row: int,
+    n: int,
+    rhs: wp.array3d[float],
+    tmp: wp.array3d[float],
+    x: wp.array3d[float],
+):
+    """hinv_jt_par_row's L L^T x = rhs for one constraint row of one articulation."""
+    for i in range(n):
+        value = rhs[g, row, i]
+        for k in range(i):
+            value -= L[g, i, k] * x[g, row, k]
+        L_ii = L[g, i, i]
+        if L_ii != 0.0:
+            x[g, row, i] = value / L_ii
+        else:
+            x[g, row, i] = 0.0
+    for i_rev in range(n):
+        i = n - 1 - i_rev
+        value = x[g, row, i]
+        for k in range(i + 1, n):
+            value -= L[g, k, i] * x[g, row, k]
+        L_ii = L[g, i, i]
+        if L_ii != 0.0:
+            x[g, row, i] = value / L_ii
+        else:
+            x[g, row, i] = 0.0
+
+
+@wp.func_grad(_cholesky_solve_row)
+def _adj_cholesky_solve_row(
+    L: wp.array3d[float],
+    g: int,
+    row: int,
+    n: int,
+    rhs: wp.array3d[float],
+    tmp: wp.array3d[float],
+    x: wp.array3d[float],
+):
+    # Same adjoint as _adj_cholesky_solve, on one row of grouped storage.
+    if not wp.adjoint[x]:
+        return
+    for i in range(n):
+        value = wp.adjoint[x][g, row, i]
+        for k in range(i):
+            value -= L[g, i, k] * tmp[g, row, k]
+        tmp[g, row, i] = value / L[g, i, i]
+    for i_rev in range(n):
+        i = n - 1 - i_rev
+        value = tmp[g, row, i]
+        for k in range(i + 1, n):
+            value -= L[g, k, i] * tmp[g, row, k]
+        tmp[g, row, i] = value / L[g, i, i]
+    if wp.adjoint[rhs]:
+        for i in range(n):
+            wp.adjoint[rhs][g, row, i] += tmp[g, row, i]
+    if wp.adjoint[L]:
+        for j in range(n):
+            y_j = float(0.0)
+            u_j = float(0.0)
+            for k in range(j, n):
+                y_j += L[g, k, j] * x[g, row, k]
+                u_j += L[g, k, j] * tmp[g, row, k]
+            for i in range(j, n):
+                wp.adjoint[L][g, i, j] -= tmp[g, row, i] * y_j + x[g, row, i] * u_j
+    for i in range(n):
+        wp.adjoint[x][g, row, i] = 0.0
+
+
+@wp.kernel
+def _hinv_jt_dense(
+    L: wp.array3d[float],
+    J: wp.array3d[float],
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    row_count: wp.array[int],
+    n: int,
+    max_rows: int,
+    tmp: wp.array3d[float],
+    Y: wp.array3d[float],
+):
+    """Y = H^-1 J^T per (articulation, row), as hinv_jt_par_row computes it."""
+    tid = wp.tid()
+    row = tid % max_rows
+    g = tid // max_rows
+    if row < row_count[art_to_world[group_to_art[g]]]:
+        _cholesky_solve_row(L, g, row, n, J, tmp, Y)
+
+
+@wp.kernel
+def _delassus_dense(
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    row_count: wp.array[int],
+    n_dofs: int,
+    max_rows: int,
+    n_arts: int,
+    # outputs
+    world_C: wp.array3d[float],
+    world_diag: wp.array2d[float],
+):
+    """delassus_par_row_col without its nonzero gate, which the reverse pass evaluates before the loop sum."""
+    tid = wp.tid()
+    j = tid % max_rows
+    i = (tid // max_rows) % max_rows
+    idx = tid // (max_rows * max_rows)
+    if idx >= n_arts:
+        return
+    world = art_to_world[group_to_art[idx]]
+    m = row_count[world]
+    if i >= m or j >= m:
+        return
+    val = float(0.0)
+    for k in range(n_dofs):
+        val += J_group[idx, i, k] * Y_group[idx, j, k]
+    wp.atomic_add(world_C, world, i, j, val)
+    if i == j:
+        wp.atomic_add(world_diag, world, i, val)
+
+
+@wp.kernel
+def _dense_pgs_sweep(
+    row_count: wp.array[int],
+    diag: wp.array2d[float],
+    C: wp.array3d[float],
+    rhs: wp.array2d[float],
+    row_type: wp.array2d[int],
+    omega: float,
+    impulses_in: wp.array2d[float],
+    # outputs
+    residuals: wp.array2d[float],
+    impulses_out: wp.array2d[float],
+):
+    """One pgs_solve_loop sweep over normal rows; earlier rows of this sweep read impulses_out.
+
+    Each residual is stored and read back: the reverse pass replays code after a dynamic loop with
+    the loop-carried sum's initial value, so the projection must branch on the stored residual.
+    """
+    world = wp.tid()
+    m = row_count[world]
+    for i in range(m):
+        w = rhs[world, i]
+        for j in range(m):
+            impulse = impulses_in[world, j]
+            if j < i:
+                impulse = impulses_out[world, j]
+            w += C[world, i, j] * impulse
+        residuals[world, i] = w
+        residual = residuals[world, i]
+        new_impulse = impulses_in[world, i]
+        denom = diag[world, i]
+        if denom > 0.0:
+            new_impulse = impulses_in[world, i] + omega * (-residual / denom)
+            if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
+                new_impulse = 0.0
+        impulses_out[world, i] = new_impulse

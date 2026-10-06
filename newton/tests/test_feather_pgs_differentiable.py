@@ -100,6 +100,7 @@ def _rollout(model, solver, inputs, steps, *, rotate=False, tape=None):
     control = model.control()
     control.joint_f.assign(inputs["joint_f"])
     control.joint_target_q.assign(inputs["joint_target_q"])
+    control.joint_target_qd.assign(inputs["joint_target_qd"])
     if tape is not None:
         tape.__enter__()
     try:
@@ -123,6 +124,7 @@ def _random_inputs(model, seed):
         "joint_qd": qd,
         "joint_f": rng.normal(size=model.joint_dof_count).astype(np.float32),
         "joint_target_q": (0.3 * rng.normal(size=model.control().joint_target_q.shape[0])).astype(np.float32),
+        "joint_target_qd": rng.normal(size=model.joint_dof_count).astype(np.float32),
     }
 
 
@@ -225,11 +227,12 @@ def test_gradient_matches_finite_difference(test, device):
             "joint_qd": initial.joint_qd.grad.numpy(),
             "joint_f": control.joint_f.grad.numpy(),
             "joint_target_q": control.joint_target_q.grad.numpy(),
+            "joint_target_qd": control.joint_target_qd.grad.numpy(),
         }
         joint_type = model.joint_type.numpy()
         q_start = model.joint_q_start.numpy()
         for key, gradient in gradients.items():
-            if key == "joint_target_q" and name != "chain_drives":
+            if key.startswith("joint_target") and name != "chain_drives":
                 continue
             direction = rng.normal(size=gradient.shape[0]).astype(np.float32)
             if key == "joint_q":
@@ -253,7 +256,11 @@ def test_gradient_matches_analytic_pendulum(test, device):
     solver = SolverFeatherPGS(model, differentiable=True, angular_damping=0.0)
     steps = 10
     inputs = {"joint_q": np.zeros(1, np.float32), "joint_qd": np.zeros(1, np.float32)}
-    inputs.update(joint_f=np.array([0.5], np.float32), joint_target_q=np.zeros(1, np.float32))
+    inputs.update(
+        joint_f=np.array([0.5], np.float32),
+        joint_target_q=np.zeros(1, np.float32),
+        joint_target_qd=np.zeros(1, np.float32),
+    )
     tape = wp.Tape()
     final, initial, control = _rollout(model, solver, inputs, steps, tape=tape)
     tape.backward(grads={final.joint_q: wp.ones(1, dtype=float, device=device)})
@@ -279,6 +286,178 @@ def test_repeated_backward_is_stable(test, device):
     test.assertTrue(np.all(np.isfinite(first)))
 
 
+_CONTACT_OPTIONS = {"friction_anchor_beta": 0.0, "enable_contact_friction": False, "enable_restitution": False}
+
+
+def _build_box_chain_on_plane(device, *, restitution=0.0, free_box=False):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.0, restitution=restitution)
+    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.098), wp.quat_identity()))
+    builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1, cfg=cfg)
+    joints = [builder.add_joint_free(parent=-1, child=base)]
+    if not free_box:
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.4, 0.0, 0.098), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.2, hy=0.1, hz=0.1, cfg=cfg)
+        joints.append(
+            builder.add_joint_revolute(
+                base,
+                link,
+                parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+                axis=(0.0, 1.0, 0.0),
+                armature=0.01,
+            )
+        )
+    builder.add_articulation(joints)
+    builder.add_ground_plane(cfg=cfg)
+    return builder.finalize(device=device, requires_grad=True)
+
+
+def _contact_rollout(model, pipeline, inputs, steps, *, differentiable, use_contacts=True, tape=None):
+    """Collide every step outside the tape; return the loss inputs and per-step contact counts."""
+    solver = SolverFeatherPGS(model, differentiable=differentiable, pgs_iterations=8, **_CONTACT_OPTIONS)
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    states[0].joint_q.assign(inputs["joint_q"])
+    states[0].joint_qd.assign(inputs["joint_qd"])
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control = model.control()
+    control.joint_f.assign(inputs["joint_f"])
+    contacts = pipeline.contacts()
+    counts = []
+    for k in range(steps):
+        pipeline.collide(states[k], contacts)
+        counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+        if tape is not None:
+            tape.__enter__()
+        solver.step(states[k], states[k + 1], control, contacts if use_contacts else None, _DT)
+        if tape is not None:
+            tape.__exit__(None, None, None)
+    return states, control, counts
+
+
+def _contact_inputs(model):
+    rng = np.random.default_rng(0)
+    return {
+        "joint_q": model.joint_q.numpy().copy(),
+        "joint_qd": (0.05 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+        "joint_f": (0.5 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+    }
+
+
+def test_contact_forward_matches_default(test, device):
+    model = _build_box_chain_on_plane(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    inputs = _contact_inputs(model)
+    reference, _, reference_counts = _contact_rollout(model, pipeline, inputs, 20, differentiable=False)
+    result, _, counts = _contact_rollout(model, pipeline, inputs, 20, differentiable=True)
+    test.assertEqual(counts, reference_counts)
+    test.assertGreater(min(counts), 0)
+    for attribute in ("joint_q", "joint_qd", "body_q", "body_qd"):
+        expected = getattr(reference[-1], attribute).numpy()
+        actual = getattr(result[-1], attribute).numpy()
+        with test.subTest(attribute=attribute):
+            if wp.get_device(device).is_cpu:
+                np.testing.assert_array_equal(actual, expected)
+            else:
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+
+
+def test_contact_gradient_matches_finite_difference(test, device):
+    model = _build_box_chain_on_plane(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    inputs = _contact_inputs(model)
+    steps = 5
+    eps = 1.0e-3
+    rng = np.random.default_rng(6)
+    wq = wp.array(rng.normal(size=model.joint_coord_count).astype(np.float32), device=device)
+    wqd = wp.array(rng.normal(size=model.joint_dof_count).astype(np.float32), device=device)
+
+    def loss_of(values, *, tape=None, use_contacts=True):
+        states, control, counts = _contact_rollout(
+            model, pipeline, values, steps, differentiable=True, use_contacts=use_contacts, tape=tape
+        )
+        loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        if tape is not None:
+            tape.__enter__()
+        wp.launch(
+            _weighted_loss,
+            dim=max(model.joint_coord_count, model.joint_dof_count),
+            inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+            outputs=[loss],
+            device=device,
+        )
+        if tape is not None:
+            tape.__exit__(None, None, None)
+        return loss, states, control, counts
+
+    gradients = {}
+    for use_contacts in (True, False):
+        tape = wp.Tape()
+        loss, states, control, counts = loss_of(inputs, tape=tape, use_contacts=use_contacts)
+        tape.backward(loss)
+        gradients[use_contacts] = {
+            "joint_q": states[0].joint_q.grad.numpy(),
+            "joint_qd": states[0].joint_qd.grad.numpy(),
+            "joint_f": control.joint_f.grad.numpy(),
+        }
+        if use_contacts:
+            nominal_counts = counts
+            # Strict complementarity keeps the FD interval off active-set kinks.
+            for state in states[1:]:
+                rows = state._fpgs_differentiable_buffers.contacts
+                count = int(rows.row_count.numpy()[0])
+                impulse = rows.impulses[-1].numpy()[0, :count]
+                residual = rows.residuals[-1].numpy()[0, :count]
+                test.assertGreater(float(np.min(np.maximum(impulse, np.abs(residual)))), 1.0e-5)
+    for key, gradient in gradients[True].items():
+        direction = rng.normal(size=gradient.shape[0]).astype(np.float32)
+        if key == "joint_q":
+            direction[3:7] = 0.0
+        direction /= np.linalg.norm(direction)
+        plus_loss, _, _, plus_counts = loss_of(dict(inputs, **{key: inputs[key] + eps * direction}))
+        minus_loss, _, _, minus_counts = loss_of(dict(inputs, **{key: inputs[key] - eps * direction}))
+        fd = (plus_loss.numpy()[0] - minus_loss.numpy()[0]) / (2.0 * eps)
+        analytic = float(gradient @ direction)
+        with test.subTest(input=key):
+            # The local derivative holds the contact set fixed.
+            test.assertEqual(plus_counts, nominal_counts)
+            test.assertEqual(minus_counts, nominal_counts)
+            test.assertAlmostEqual(analytic, fd, delta=3.0e-3 * max(1.0, abs(fd)))
+
+    # The contact solve changes the gradient.
+    with_contacts = np.concatenate(list(gradients[True].values()))
+    without_contacts = np.concatenate(list(gradients[False].values()))
+    test.assertGreater(np.linalg.norm(with_contacts - without_contacts), 0.1 * np.linalg.norm(with_contacts))
+
+
+def test_contact_rejects_unsupported_configs(test, device):
+    model = _build_box_chain_on_plane(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    state = model.state(requires_grad=True)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    unsupported = [
+        {**_CONTACT_OPTIONS, "enable_contact_friction": True},
+        {**_CONTACT_OPTIONS, "pgs_contact_regularization": 0.1},
+    ]
+    if wp.get_device(device).is_cuda:
+        unsupported.append({**_CONTACT_OPTIONS, "pgs_mode": "matrix_free"})
+    for options in unsupported:
+        solver = SolverFeatherPGS(model, differentiable=True, **options)
+        with test.subTest(**options), test.assertRaisesRegex(NotImplementedError, "contacts require"):
+            solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
+    for model, options in (
+        (_build_box_chain_on_plane(device, restitution=0.5), {**_CONTACT_OPTIONS, "enable_restitution": True}),
+        (_build_box_chain_on_plane(device, free_box=True), _CONTACT_OPTIONS),
+    ):
+        solver = SolverFeatherPGS(model, differentiable=True, **options)
+        state = model.state(requires_grad=True)
+        contacts = newton.CollisionPipeline(model, rigid_contact_max=64).contacts()
+        with test.assertRaisesRegex(NotImplementedError, "contacts require"):
+            solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -290,6 +469,9 @@ for _device in get_test_devices():
         test_gradient_matches_finite_difference,
         test_gradient_matches_analytic_pendulum,
         test_repeated_backward_is_stable,
+        test_contact_forward_matches_default,
+        test_contact_gradient_matches_finite_difference,
+        test_contact_rejects_unsupported_configs,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
 
