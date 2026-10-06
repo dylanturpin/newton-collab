@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_feather_pgs_module
 from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -1274,6 +1275,31 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[0.0]._local_internal_fast_path)
         self.assertTrue(solvers[0.01]._contact_torsion_enabled)
         self.assertFalse(solvers[0.01]._local_internal_fast_path)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local owners require CUDA")
+    def test_local_owners_are_limited_to_small_world_counts(self):
+        """Select local owners only up to one world per SM; larger models solve exactly as the general owner."""
+        limit = wp.get_device("cuda:0").sm_count
+        kwargs = {"pgs_mode": "matrix_free", "dense_max_constraints": 32, "mf_max_constraints": 32}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+            for world_count, expected in ((limit, True), (limit + 1, False)):
+                model = _build_mixed_response_model("cuda:0", world_count=world_count)
+                solver = SolverFeatherPGS(model, **kwargs)
+                self.assertEqual(solver._local_internal_fast_path, expected, f"world_count={world_count}")
+
+        # The two-world diagonal-mass scene is local by default, gated with no worlds per SM, ineligible without DOFs.
+        trajectories = {}
+        for label, attribute, value in (
+            ("local", "_LOCAL_SOLVE_WORLDS_PER_SM", 1),
+            ("gated", "_LOCAL_SOLVE_WORLDS_PER_SM", 0),
+            ("ineligible", "_LOCAL_INTERNAL_MAX_DOF", 0),
+        ):
+            with mock.patch.object(solver_feather_pgs_module, attribute, value):
+                solver, samples = _run_diagonal_mass_local(None, iterations=4, graph=False, steps=8)
+            self.assertEqual(solver._local_internal_fast_path, label == "local", label)
+            trajectories[label] = np.stack([sample[4] for sample in samples])
+        np.testing.assert_array_equal(trajectories["gated"], trajectories["ineligible"])
+        np.testing.assert_allclose(trajectories["local"], trajectories["gated"], rtol=0.0, atol=1.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local owners require CUDA")
     def test_local_owners_match_general_for_diagonal_mass_articulations(self):

@@ -260,6 +260,8 @@ _LOCAL_GENERAL_BLOCKS_PER_SM = 8
 _LOCAL_PAIR_BLOCKS_PER_SM = 8
 # The local solver performs a serial O(dof_count**2) triangular solve per row.
 _LOCAL_INTERNAL_MAX_DOF = 16
+# The local owners run each world serially on one warp, at most one per SM; past that the general owner is faster.
+_LOCAL_SOLVE_WORLDS_PER_SM = 1
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
@@ -2331,6 +2333,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self._debug_buffers_enabled
             and self._local_solve_max_rows > 0
+            and self.world_count <= _LOCAL_SOLVE_WORLDS_PER_SM * int(model.device.sm_count)
             # The local owners do not solve the appended torsion row; torsion is configured later in
             # construction, so gate on the requested radius here.
             and float(contact_torsion_radius) <= 0.0

@@ -1,0 +1,1 @@
+Select the `SolverFeatherPGS` articulation-local contact owners only when the model has at most one world per streaming multiprocessor of the device. Beyond that the general owner is faster, and larger models now use it automatically.
