@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.contact_compliance import prepare_rows, start_step
+from newton._src.solvers.feather_pgs.contact_compliance import begin_rows, normal_coefficients, prepare_rows, start_step
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_contact_compliance import make_fixture, run_fixture
 
@@ -130,6 +130,54 @@ class TestContactComplianceSafety(unittest.TestCase):
         solver.contact_slot.fill_(-1)
         with self.assertRaisesRegex(RuntimeError, "dropped"):
             prepare_rows(solver, contacts, 0.005)
+
+    def stepped_fixture(self, *, articulated, height, world_count=1, damping=20.0):
+        """Take one compliant step and return the fixture with its contacts still loaded."""
+        fixture = make_fixture(articulated=articulated, enabled=True, height=height, world_count=world_count)
+        model, contacts = fixture.model, fixture.contacts
+        state, output = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        fixture.pipeline.collide(state, contacts)
+        contacts.rigid_contact_stiffness.fill_(3000.0)
+        contacts.rigid_contact_damping.fill_(damping)
+        contacts.rigid_contact_friction.fill_(1.0)
+        fixture.solver.step(state, output, model.control(), contacts, 0.005)
+        return fixture
+
+    def test_device_coefficients_match_host_law(self):
+        """Prepare open-gap and penetrating rows exactly as the float64 host law, damping only when closed."""
+        for articulated in (True, False):
+            for height in (0.052, 0.0495):
+                with self.subTest(articulated=articulated, height=height):
+                    solver = self.stepped_fixture(articulated=articulated, height=height, damping=200.0).solver
+                    count = solver.compliance_contact_count
+                    self.assertEqual(count, 1)
+                    path, slot, world = (
+                        int(a.numpy()[0]) for a in (solver.contact_path, solver.contact_slot, solver.contact_world)
+                    )
+                    phi = (solver.phi if path == 0 else solver.mf_phi).numpy()[world, slot]
+                    self.assertEqual(phi > 0.0, height > 0.05)
+                    gamma, bias = normal_coefficients(3000.0, 200.0, float(phi), dt=0.005)
+                    buffers = solver._compliance
+                    stored_gamma = (buffers.dense_gamma if path == 0 else buffers.mf_gamma).numpy()[world, slot]
+                    stored_bias = (solver.rhs if path == 0 else solver.mf_rhs).numpy()[world, slot]
+                    self.assertEqual(stored_gamma, np.float32(gamma))
+                    self.assertEqual(stored_bias, np.float32(bias))
+
+    def test_duplicate_row_mapping_rejected(self):
+        """Two compliant contacts must never share one normal row."""
+        for articulated in (True, False):
+            with self.subTest(articulated=articulated):
+                fixture = self.stepped_fixture(articulated=articulated, height=0.05, world_count=2)
+                solver, contacts = fixture.solver, fixture.contacts
+                self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 2)
+                for name in ("contact_path", "contact_slot", "contact_world"):
+                    values = getattr(solver, name).numpy()
+                    values[1] = values[0]
+                    getattr(solver, name).assign(values)
+                begin_rows(solver)
+                with self.assertRaisesRegex(RuntimeError, "one-to-one"):
+                    prepare_rows(solver, contacts, 0.005)
 
     def test_reset_and_open_gap_release(self):
         """Clear only step-local compliance data and exert no force across an open gap."""
