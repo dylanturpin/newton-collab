@@ -1534,6 +1534,21 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_franka_shirt_fold_stack",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 600},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_shirt_fold_stack",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 600, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_mpm_coupled_solver",
     devices=cuda_test_devices,
     test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1},
