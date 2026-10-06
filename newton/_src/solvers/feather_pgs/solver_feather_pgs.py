@@ -65,6 +65,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_COUNT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
@@ -98,6 +99,7 @@ from .kernels import (
     apply_sparse_diagonal_contact_restitution_matrix_free,
     apply_world_contact_restitution_accumulated,
     apply_world_contact_restitution_matrix_free,
+    build_joint_friction_rows_for_size,
     build_joint_limit_rows_for_size,
     build_mass_update_mask,
     build_mf_body_map,
@@ -815,7 +817,7 @@ class _FeatherPGSKinematicsCache:
         )
 
 
-_DENSE_META_ROW_TYPE_BITS = 3
+_DENSE_META_ROW_TYPE_BITS = 4
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
 
@@ -1254,6 +1256,7 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         *,
+        enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
@@ -1486,6 +1489,21 @@ class SolverFeatherPGS(SolverBase):
                 Only supported with ``pgs_mode="matrix_free"``; passing any other
                 ``pgs_mode`` together with ``enable_joint_velocity_limits=True`` raises
                 :class:`NotImplementedError` at construction. Defaults to False.
+            enable_joint_friction: Enforce :attr:`~newton.Model.joint_friction` [N or N·m] as
+                dry joint friction (MuJoCo ``frictionloss``). Each REVOLUTE, PRISMATIC or D6 DOF with
+                positive friction adds one row whose impulse is bounded by ``joint_friction * dt``
+                around a zero-velocity target, so the DOF sticks until the required effort exceeds
+                the friction and then slides against it. The rows use the articulated response, so
+                coupled inertia, armature, augmented drives, limits and contacts act jointly; their
+                impulses cold-start each step. Coefficients are read every step, so assignments into
+                the array take effect immediately; call
+                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)`` after editing or replacing
+                the array, and recapture CUDA graphs after replacing it. Nonzero friction on BALL,
+                FREE, DISTANCE or CABLE joints, and non-finite or negative values, raise
+                :class:`ValueError`. Requires ``pgs_mode="matrix_free"`` on CUDA and is not supported
+                with ``contact_compliance``, bilateral pre-elimination or ``model.requires_grad``;
+                such combinations raise :class:`NotImplementedError`. When False,
+                :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
             velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
                 row allocation. ``0.0`` allocates the lower/upper row pair for every finitely
                 limited joint DOF and free-rigid-body axis each step, preserving the historical
@@ -1851,6 +1869,7 @@ class SolverFeatherPGS(SolverBase):
         if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
             raise ValueError("joint_limit_activation_gap must be non-negative or inf")
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
+        self.enable_joint_friction = bool(enable_joint_friction)
         try:
             self.velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         except (TypeError, ValueError) as exc:
@@ -1984,6 +2003,15 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_mode = pgs_mode
         if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'")
+        if self.enable_joint_friction:
+            if self.pgs_mode != "matrix_free":
+                raise NotImplementedError("enable_joint_friction=True currently requires pgs_mode='matrix_free'")
+            if model.requires_grad:
+                raise NotImplementedError("enable_joint_friction=True does not support model.requires_grad")
+            if self.contact_compliance:
+                raise NotImplementedError("enable_joint_friction=True does not support contact_compliance")
+            if self.enable_bilateral_preelimination:
+                raise NotImplementedError("enable_joint_friction=True does not support bilateral pre-elimination")
         if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
                 f"articulated_contact_response={articulated_contact_response!r} currently requires "
@@ -2223,6 +2251,8 @@ class SolverFeatherPGS(SolverBase):
         # and enforced as CONNECT rows; the propagation-family kernels still iterate full
         # articulation joint ranges, so gate that mode rather than corrupt silently.
         self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
+        if self.enable_joint_friction:
+            self._validate_joint_friction()
         if self._has_loop_joints and self.articulated_contact_response != "immediate":
             raise ValueError(
                 "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
@@ -2325,6 +2355,7 @@ class SolverFeatherPGS(SolverBase):
             and self.pgs_schedule == "interleaved"
             and self.drive_mode == "augmented"
             and not self.enable_joint_velocity_limits
+            and not self.enable_joint_friction
             and self.pgs_velocity_iterations == 0
             and self.friction_mode == "current"
             and not self.pgs_warmstart
@@ -2656,6 +2687,7 @@ class SolverFeatherPGS(SolverBase):
             and self.drive_mode == "augmented"
             and self.friction_mode == "current"
             and not self.enable_joint_velocity_limits
+            and not self.enable_joint_friction
             # The factor-coordinate owner does not solve the appended torsion row.
             and not self._contact_torsion_enabled
         )
@@ -3002,6 +3034,8 @@ class SolverFeatherPGS(SolverBase):
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
+        if self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES:
+            self._validate_joint_friction()
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia
             # in _allocate_common_buffers so runtime CoM/mass randomization
@@ -3028,6 +3062,29 @@ class SolverFeatherPGS(SolverBase):
             | ModelFlags.SHAPE_PROPERTIES
         ):
             self._clear_warmstart_history(None)
+
+    def _validate_joint_friction(self) -> None:
+        """Reject joint friction the per-DOF friction rows cannot represent."""
+        model = self.model
+        if model.joint_dof_count == 0:
+            return
+        friction = model.joint_friction.numpy()
+        if friction.shape != (model.joint_dof_count,):
+            raise ValueError(f"joint_friction has shape {friction.shape}, expected ({model.joint_dof_count},)")
+        if not np.all(np.isfinite(friction)) or np.any(friction < 0.0):
+            raise ValueError("joint_friction must be finite and non-negative")
+        joint_qd_start = model.joint_qd_start.numpy()
+        joint_dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
+        joint_type = model.joint_type.numpy()
+        supported = np.isin(joint_type, (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6)))
+        if self._model_plan is not None:
+            supported &= self._model_plan.loop_joint_articulation < 0
+        unsupported = np.flatnonzero((friction > 0.0) & ~supported[joint_dof_joint])
+        if unsupported.size:
+            joint = int(joint_dof_joint[unsupported[0]])
+            raise ValueError(
+                f"joint_friction is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
+            )
 
     @override
     def reset(
@@ -3235,7 +3292,7 @@ class SolverFeatherPGS(SolverBase):
         Propagation mode schedules the existing dense/MF row families around
         the articulated-contact tree propagation pass. Some of those split
         phases are optional by construction: phase 3 only contains PhysX-style
-        drive rows or joint position-limit rows, and phase 5 only contains
+        drive, joint position-limit, mimic, connect or joint-friction rows, and phase 5 only contains
         velocity-limit rows. Avoid launching those phases when the solver
         configuration did not allocate the row family they consume.
         """
@@ -3245,7 +3302,13 @@ class SolverFeatherPGS(SolverBase):
             has_position_limit_rows = self.enable_joint_limits and bool(self._joint_limit_sizes)
             has_mimic_rows = getattr(self, "_mimic_count", 0) > 0
             has_connect_rows = getattr(self, "_connect_count", 0) > 0
-            return has_drive_rows or has_position_limit_rows or has_mimic_rows or has_connect_rows
+            return (
+                has_drive_rows
+                or has_position_limit_rows
+                or has_mimic_rows
+                or has_connect_rows
+                or self.enable_joint_friction
+            )
         if row_phase == 5:
             if np.isinf(self.velocity_limit_activation_fraction):
                 return False
@@ -4026,6 +4089,7 @@ class SolverFeatherPGS(SolverBase):
             and self.friction_mode == "current"
             and self.enable_contact_friction
             and not self.enable_joint_velocity_limits
+            and not self.enable_joint_friction
             and not self.pgs_warmstart
             and not self._preelim_active
             and not self._has_free_rigid_bodies
@@ -4082,8 +4146,15 @@ class SolverFeatherPGS(SolverBase):
         )
         has_mimic_rows = getattr(self, "_mimic_count", 0) > 0
         has_connect_rows = getattr(self, "_connect_count", 0) > 0
+        # Runtime edits may enable friction on any eligible DOF, so reserve one row for each.
+        has_friction_rows = self.enable_joint_friction and model.joint_dof_count > 0
         if not (
-            has_drive_rows or has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or has_connect_rows
+            has_drive_rows
+            or has_position_limit_rows
+            or has_velocity_limit_rows
+            or has_mimic_rows
+            or has_connect_rows
+            or has_friction_rows
         ):
             return 0
 
@@ -4115,7 +4186,7 @@ class SolverFeatherPGS(SolverBase):
         joint_velocity_limit_arr = getattr(model, "joint_velocity_limit", None)
         if has_velocity_limit_rows and joint_velocity_limit_arr is None:
             has_velocity_limit_rows = False
-        if not (has_drive_rows or has_position_limit_rows or has_velocity_limit_rows):
+        if not (has_drive_rows or has_position_limit_rows or has_velocity_limit_rows or has_friction_rows):
             return int(np.max(per_world))  # mimic/connect rows only
 
         joint_target_ke = joint_target_ke_arr.numpy() if has_drive_rows else None
@@ -4167,6 +4238,8 @@ class SolverFeatherPGS(SolverBase):
                             per_world[world] += 1
                     if has_velocity_limit_rows and joint_velocity_limit is not None and joint_velocity_limit[dof] > 0.0:
                         per_world[world] += 2
+                    if has_friction_rows:
+                        per_world[world] += 1
 
         return int(np.max(per_world)) if per_world.size else 0
 
@@ -4535,6 +4608,7 @@ class SolverFeatherPGS(SolverBase):
             and self.pgs_iterations > 0
             and self.pgs_velocity_iterations == 0
             and not self.enable_joint_velocity_limits
+            and not self.enable_joint_friction
             and not self.pgs_warmstart
             and not self._debug_buffers_enabled
             and not self._regularization_enabled
@@ -8543,6 +8617,7 @@ class SolverFeatherPGS(SolverBase):
             or self.pgs_debug
             or self.pgs_velocity_iterations != 0
             or self.enable_joint_velocity_limits
+            or self.enable_joint_friction
             or self._contact_torsion_enabled
             or self.contact_compliance
         ):
@@ -11283,6 +11358,49 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         device=model.device,
                     )
+
+        # Joint-friction rows are internal rows of the phase-3 range.
+        if self.enable_joint_friction and model.joint_dof_count:
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                if n_arts == 0:
+                    continue
+                wp.launch(
+                    build_joint_friction_rows_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_joint_end,
+                        self.articulation_dof_start,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_friction,
+                        self._kinematic_dof_mask,
+                        self.art_to_world,
+                        self.group_to_art[size],
+                        self._constraint_art_active,
+                        max_constraints,
+                        dt,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.slot_counter,
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                    ],
+                    device=model.device,
+                )
 
         # Unconditional: the phase-3 boundary must include position-limit
         # rows and remain valid when that family is disabled (when it is just
@@ -19195,7 +19313,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 
             for (int i = dense_lo; i < dense_hi; ++i) {
                 const int row_type = s_rtype_dense[i];
-                if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6) continue;
+                if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6 && row_type != 8) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 5 && row_type != 4) continue;
                 if (freeze_drive_rows != 0 && row_type == 1) continue;
@@ -19246,6 +19364,11 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     }
                 } else if (row_type == 0 || row_type == 3) {
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    delta_impulse = new_impulse - old_impulse;
+                } else if (row_type == 8) {
+                    // Joint friction box [-f dt, f dt]; mu holds the impulse bound.
+                    const float bound = s_mu_dense[i];
+                    new_impulse = fminf(fmaxf(new_impulse, -bound), bound);
                     delta_impulse = new_impulse - old_impulse;
                 } else if (row_type == 2) {
                     const int parent_idx = s_parent_dense[i];
@@ -24876,7 +24999,7 @@ def _get_pgs_solve_mf_gs_kernel(
     __shared__ float s_lam_dense[{M_D}];
     __shared__ float s_rhs_dense[{M_D}];
     __shared__ float s_diag_dense[{M_D}];
-    // Low 3 bits: row type (0..4). Remaining bits: parent + 1 (-1 maps to 0).
+    // Low 4 bits: row type. Remaining bits: parent + 1 (-1 maps to 0).
     __shared__ int   s_meta_dense[{M_D}];
     __shared__ float s_mu_dense[{M_D}];
 {drive_shared_declarations}
@@ -24944,8 +25067,8 @@ def _get_pgs_solve_mf_gs_kernel(
             // row_phase 4: PhysX-grasp contact pass, contact/friction rows.
             // row_phase 5: PhysX-grasp final pass, joint velocity-limit rows.
             if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
-            if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4 && row_type != 5 && row_type != 6) continue;
-            if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6) continue;
+            if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4 && row_type != 5 && row_type != 6 && row_type != 8) continue;
+            if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6 && row_type != 8) continue;
             if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
             if (row_phase == 5 && row_type != 4) continue;
             if ((row_phase == 0 || row_phase == 2) && row_type == 4) continue;
@@ -25001,6 +25124,11 @@ def _get_pgs_solve_mf_gs_kernel(
             // projector with accumulated impulse.
             else if (row_type == 0 || row_type == 3) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_FRICTION)}) {{
+                // Box [-f dt, f dt]; mu holds the impulse bound.
+                float bound = s_mu_dense[i];
+                new_impulse = fminf(fmaxf(new_impulse, -bound), bound);
                 delta_impulse = new_impulse - old_impulse;
             }} else if (row_type == 2) {{
                 {dense_friction_block}
@@ -25268,7 +25396,7 @@ def _get_pgs_solve_mf_gs_kernel(
         # its load-time packing, and read row type/parent straight from their
         # global source arrays (identical values, S2-era storage classes).
         snippet = re.sub(
-            r"\s*// Low 3 bits[^\n]*\n\s*__shared__ int   s_meta_dense\[\d+\];\n",
+            r"\s*// Low \d+ bits[^\n]*\n\s*__shared__ int   s_meta_dense\[\d+\];\n",
             "\n",
             snippet,
         )
