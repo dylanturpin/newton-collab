@@ -1353,24 +1353,30 @@ class SolverFeatherPGS(SolverBase):
             enable_torsional_rolling_friction: Experimental opt-in per-contact torsional and rolling
                 friction from :attr:`~newton.Model.shape_material_mu_torsional` and
                 :attr:`~newton.Model.shape_material_mu_rolling` [m]. The pair coefficient is the mean of
-                the two shapes, as for sliding friction. Each dense articulated contact with sliding
+                the two shapes, as for sliding friction; MuJoCo's ``condim`` attribute and its max pair rule
+                are ignored, so enabling this applies every positive material coefficient, including on
+                shapes a MuJoCo model treats as ``condim=3``. Each dense articulated contact with sliding
                 friction and a positive pair coefficient gets one spin row about the normal and two
-                rolling rows about the tangents, bounding the relative angular impulse by the coefficient
-                times the normal impulse that sliding and the other angular block leave in the cone.
-                False ignores both fields. Requires CUDA ``matrix_free``/``immediate``/``interleaved``
-                solving with ``friction_mode="current"`` and point friction (``friction_anchor_beta=0``),
-                without warm start, velocity iterations, debug, contact compliance, contact torsion
-                radius, sleeping, or differentiation. Positive coefficients on free-rigid bodies, or on
-                static shapes when free-rigid bodies exist, raise ``ValueError``. Coefficient edits take
-                effect after :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; recapture graphs
-                after replacing the arrays. Reported contact forces exclude the angular impulses.
-            torsional_rolling_friction_cone: Experimental friction cone shared by sliding, torsional and
-                rolling friction: ``"pyramidal"`` sums the normalized magnitudes, ``"elliptic"`` sums
-                their squares. Each block keeps its own disk.
+                rolling rows about the tangents. At the solved normal impulse, each Gauss-Seidel visit
+                minimizes the contact's five-row friction quadratic over the joint cone selected by
+                ``torsional_rolling_friction_cone``. False ignores both fields. Requires CUDA
+                ``matrix_free``/``immediate``/``interleaved`` solving with ``friction_mode="current"``
+                and point friction (``friction_anchor_beta=0``), without warm start, velocity iterations,
+                debug, contact compliance, contact torsion radius, sleeping, or differentiation. Positive
+                coefficients on shapes that can reach the matrix-free free-rigid route (free bodies, and
+                static or zero-DOF articulated shapes when free bodies exist) raise ``ValueError``.
+                Construction-only: it selects a specialized solve kernel. Coefficient edits take effect
+                after :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; recapture graphs after
+                replacing the arrays. Reported contact forces exclude the angular impulses.
+            torsional_rolling_friction_cone: Experimental friction cone over coefficient-normalized
+                sliding, torsional and rolling impulses. ``"elliptic"`` bounds their Euclidean norm, as
+                MuJoCo's elliptic cone does. ``"pyramidal"`` bounds the sum of the three block norms, with a
+                disk inside the sliding and rolling blocks; this differs from MuJoCo's component-wise
+                pyramid. Construction-only.
             torsional_rolling_friction_creep_speed: Experimental creep speed [m/s] that softens
-                torsional/rolling stiction like a soft constraint: below the bound, the coefficient
-                times the relative angular rate settles at this speed times the load fraction
-                ``|tau| / (mu_i * f_n)``, independent of mass. Zero sticks rigidly. Construction-only.
+                torsional/rolling stiction: below the bound, the coefficient times the relative angular
+                rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
+                of mass. Zero sticks rigidly. Construction-only.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -24152,13 +24158,13 @@ def _get_pgs_solve_mf_gs_kernel(
                 int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
                 if (i != parent_idx + 1) {{
                     new_impulse = old_impulse;
-                }} else {{
+                }} else {{__ANGULAR_BLOCK_OPEN__
                     int sib = parent_idx + 2;
                     int sib_row_base = jy_world_base + sib * {D};
                     float lambda_n = s_lam_dense[parent_idx];
                     for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
                         lambda_n += s_lam_dense[patch_row];
-                    float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);__ANGULAR_SLIDING_RADIUS__
+                    float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
                     float sibling_residual = 0.0f;
                     for (int d = lane; d < {D}; d += 32)
                         sibling_residual += J_world.data[sib_row_base + d] * s_v[d];
@@ -24181,7 +24187,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float sib_delta = b * scale - s_lam_dense[sib];
                     s_lam_dense[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
-                    {dense_sib_v_code}
+                    {dense_sib_v_code}__ANGULAR_BLOCK_CLOSE__
                 }}
 """
 
@@ -24191,8 +24197,8 @@ def _get_pgs_solve_mf_gs_kernel(
         else None
     )
     dense_friction_block = dense_friction_block.replace(
-        "__ANGULAR_SLIDING_RADIUS__", angular_sources["sliding_radius"] if angular_sources else ""
-    )
+        "__ANGULAR_BLOCK_OPEN__", angular_sources["block_open"] if angular_sources else ""
+    ).replace("__ANGULAR_BLOCK_CLOSE__", angular_sources["block_close"] if angular_sources else "")
     dense_friction_block = dense_friction_block.replace("__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS))
     angular_row_block = ""
     if angular_sources:

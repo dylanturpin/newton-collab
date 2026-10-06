@@ -108,14 +108,62 @@ class Scene:
         return np.array(out)
 
 
-def rolling_deceleration(cone, radius=RADIUS, mu=MU, mu_rolling=MU_ROLLING):
-    """Steady rolling deceleration of the unit-mass solid sphere for a saturated cone [m/s^2]."""
-    sliding_per_torque = 5.0 / (7.0 * radius * mu)  # |f| / mu needed per unit rolling torque
-    if cone == "pyramidal":
-        torque = GRAVITY / (1.0 / mu_rolling + sliding_per_torque)
-    else:
-        torque = GRAVITY / math.hypot(1.0 / mu_rolling, sliding_per_torque)
-    return 5.0 / 7.0 * torque / radius
+def project_cone(y, load, cone, groups):
+    """Euclidean projection onto the elliptic ball or the L1-of-group-norms ball of radius ``load``."""
+    if cone == "elliptic":
+        norm = np.linalg.norm(y)
+        return y * (load / norm) if norm > load else y
+    norms = np.array([np.linalg.norm(y[g]) for g in groups])
+    if norms.sum() <= load:
+        return y
+    ordered = np.sort(norms)[::-1]
+    theta = 0.0
+    for k in range(len(ordered)):
+        candidate = (ordered[: k + 1].sum() - load) / (k + 1)
+        if ordered[k] - candidate > 0.0:
+            theta = candidate
+    out = y.copy()
+    for g, norm in zip(groups, norms, strict=True):
+        out[g] = y[g] * (max(norm - theta, 0.0) / norm if norm > 0.0 else 0.0)
+    return out
+
+
+def cone_minimum(delassus, velocity, coefficients, load, cone, groups, iterations=3000):
+    """Return the impulse minimizing ``0.5 l'Al + v'l`` over the cone in coefficient-normalized impulses."""
+    scale = np.asarray(coefficients, float)
+    hessian = scale[:, None] * delassus * scale[None, :]
+    gradient = scale * velocity
+    lipschitz = np.abs(hessian).sum(1).max()
+    y = np.zeros(len(scale))
+    z = y.copy()
+    momentum = 1.0
+    for _ in range(iterations):
+        step = project_cone(z - (gradient + hessian @ z) / lipschitz, load, cone, groups)
+        step[scale == 0.0] = 0.0
+        next_momentum = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * momentum * momentum))
+        z = step + (momentum - 1.0) / next_momentum * (step - y)
+        y, momentum = step, next_momentum
+    return scale * y
+
+
+def reference_velocities(
+    cone, steps, *, radius=RADIUS, mu=MU, mu_torsional=0.0, mu_rolling=MU_ROLLING, speed=1.0, rolling=True, spin=0.0
+):
+    """Velocities (center speed, rolling rate, spin rate) under an exactly solved joint cone each step, float64."""
+    mass = 1.0 + 3.0e-4
+    inertia = 0.4 * radius * radius
+    inverse_mass = np.diag([1.0 / mass, 1.0 / (inertia + 1.0e-8), 1.0 / inertia])
+    rows = np.array([[1.0, -radius, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])  # slip, spin, roll
+    delassus = rows @ inverse_mass @ rows.T
+    velocity = np.array([speed, speed / radius if rolling else 0.0, spin])
+    out = []
+    for _ in range(steps):
+        impulse = cone_minimum(
+            delassus, rows @ velocity, (mu, mu_torsional, mu_rolling), GRAVITY * DT, cone, [[0], [1], [2]]
+        )
+        velocity = velocity + inverse_mass @ rows.T @ impulse
+        out.append(velocity.copy())
+    return np.array(out)
 
 
 def holding_slope(cone, radius=RADIUS, mu=MU, mu_rolling=MU_ROLLING):
@@ -125,23 +173,23 @@ def holding_slope(cone, radius=RADIUS, mu=MU, mu_rolling=MU_ROLLING):
     return 1.0 / math.hypot(1.0 / mu, radius / mu_rolling)
 
 
-def fit_deceleration(qd, start, stop):
-    t = np.arange(1, len(qd) + 1) * DT
-    return -np.polyfit(t[start:stop], qd[start:stop, 0], 1)[0]
-
-
 @unittest.skipUnless(wp.is_cuda_available(), "Torsional/rolling friction requires CUDA")
 class TestFeatherPGSRollingFriction(unittest.TestCase):
-    def test_rolling_deceleration_matches_the_cone(self):
+    def test_trajectories_match_the_exact_joint_cone(self):
+        """Rolling, sliding and spinning starts follow a float64 reference that solves the cone exactly per step."""
+        cases = (
+            {"radius": 0.02, "mu_rolling": 0.01},
+            {"radius": 0.1, "mu_rolling": 0.002},
+            {"radius": 0.02, "mu_rolling": 0.01, "rolling": False},
+            {"radius": 0.1, "mu_torsional": 0.02, "mu_rolling": 0.0, "speed": 0.05, "rolling": False, "spin": 5.0},
+        )
         for cone in ("pyramidal", "elliptic"):
-            for radius, mu_rolling in ((0.02, 0.01), (0.1, 0.002)):
-                with self.subTest(cone=cone, radius=radius, mu_rolling=mu_rolling):
-                    qd = ball(radius=radius, mu_rolling=mu_rolling, cone=cone).run(80)
-                    expected = rolling_deceleration(cone, radius, MU, mu_rolling)
-                    self.assertAlmostEqual(fit_deceleration(qd, 8, 80), expected, delta=0.005 * expected)
-                    # Pure rolling is kept: the contact slip stays at its first-contact value.
-                    slip = qd[8:, 0] - qd[8:, 2] * radius
-                    self.assertLess(np.ptp(slip), 1e-3)
+            for case in cases:
+                with self.subTest(cone=cone, **case):
+                    qd = ball(cone=cone, **case).run(80)[:, [0, 2, 3]]
+                    expected = reference_velocities(cone, 80, **case)
+                    scale = np.abs(expected[0]) + np.array([1.0, 1.0, 1.0])
+                    np.testing.assert_array_less(np.abs(qd - expected).max(0), 0.005 * scale)
 
     def test_rolling_stops_and_rests(self):
         qd = ball(speed=0.1).run(200)
@@ -195,15 +243,39 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         rigid.control.joint_f.assign(force)
         self.assertLess(abs(rigid.run(200)[-1, 3]), 1e-5)
 
-    def test_sliding_saturates_the_pyramidal_cone_until_rolling(self):
-        """A sliding sphere spends the whole budget on sliding, then rolls with the coupled resistance."""
-        qd = ball(speed=1.0, rolling=False).run(160)
-        roll_time = 2.0 / (7.0 * MU * GRAVITY)
-        roll_step = int(roll_time / DT)
-        sliding = fit_deceleration(qd, 2, roll_step - 2)
-        self.assertAlmostEqual(sliding, MU * GRAVITY, delta=0.01 * MU * GRAVITY)
-        expected = rolling_deceleration("pyramidal")
-        self.assertAlmostEqual(fit_deceleration(qd, roll_step + 8, 160), expected, delta=0.01 * expected)
+    def test_competing_sliding_and_spin_share_the_cone(self):
+        """A sliding, spinning sphere gives spin budget, and more sweeps do not worsen the step objective."""
+        objectives = {}
+        for cone in ("pyramidal", "elliptic"):
+            for iterations in (16, 128):
+                scene = ball(
+                    radius=0.1, speed=0.0, mu_torsional=0.02, mu_rolling=0.0, cone=cone, pgs_iterations=iterations
+                )
+                scene.run(40)
+                scene.state.joint_qd.assign(np.array([0.05, 0.0, 0.0, 5.0], np.float32))
+                newton.eval_fk(scene.model, scene.state.joint_q, scene.state.joint_qd, scene.state)
+                scene.step()
+                solver = scene.solver
+                rows = int(solver.constraint_count.numpy()[0])
+                impulse = solver.impulses.numpy()[0, :rows].astype(float)
+                jacobian = solver.J_world.numpy()[0, :rows].astype(float)
+                response = solver.Y_world.numpy()[0, :rows].astype(float)
+                free_velocity = solver.v_out.numpy().astype(float) - response.T @ impulse
+                delassus = jacobian @ response.T
+
+                def objective(candidate, delassus=delassus, velocity=jacobian @ free_velocity):
+                    return 0.5 * candidate @ delassus @ candidate + velocity @ candidate
+
+                mu = solver.row_mu.numpy()[0, :rows].astype(float)
+                velocity = delassus[1:, :1] @ impulse[:1] + (jacobian @ free_velocity)[1:]
+                friction = cone_minimum(delassus[1:, 1:], velocity, mu[1:], impulse[0], cone, [[0, 1], [2], [3, 4]])
+                best = np.concatenate([impulse[:1], friction])
+                with self.subTest(cone=cone, iterations=iterations):
+                    self.assertGreater(abs(impulse[3]), 0.1 * mu[3] * impulse[0])
+                    self.assertLessEqual(objective(impulse), objective(best) + 1e-3 * abs(objective(best)))
+                objectives[cone, iterations] = objective(impulse)
+        for cone in ("pyramidal", "elliptic"):
+            self.assertLessEqual(objectives[cone, 128], objectives[cone, 16] + 1e-9)
 
     def test_disabled_and_zero_coefficients_match_the_baseline_bitwise(self):
         baseline = ball(enable=False).run(60)
@@ -227,12 +299,15 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         shapes = scene.model.shape_count
         scene.model.shape_material_mu_rolling.assign(np.full(shapes, MU_ROLLING, np.float32))
         scene.solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
-        expected = rolling_deceleration("pyramidal")
-        self.assertAlmostEqual(fit_deceleration(scene.run(60), 8, 60), expected, delta=0.005 * expected)
+        start = scene.state.joint_qd.numpy()
+        expected = reference_velocities("pyramidal", 60, speed=float(start[0]))
+        np.testing.assert_allclose(scene.run(60)[:, 0], expected[:, 0], atol=2e-3)
         scene.model.shape_material_mu_rolling = wp.zeros(shapes, dtype=wp.float32, device=scene.model.device)
         scene.solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
-        qd = scene.run(20)
-        self.assertAlmostEqual(qd[-1, 0], qd[0, 0], delta=1e-5)
+        # Sliding friction removes the rolling-friction slip, then the sphere rolls freely.
+        qd = scene.run(30)
+        self.assertAlmostEqual(qd[-1, 0], qd[-11, 0], delta=1e-5)
+        self.assertAlmostEqual(qd[-1, 0], qd[-1, 2] * RADIUS, delta=1e-4)
 
     def test_graph_replay_matches_eager(self):
         eager = ball().run(40)
@@ -286,20 +361,35 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         with self.assertRaises(ValueError):
             ball(torsional_rolling_friction_creep_speed=-1.0)
 
-    def test_free_rigid_coefficients_are_rejected(self):
-        b = newton.ModelBuilder()
-        b.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu_torsional=0.0, mu_rolling=0.0))
-        body = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
-        b.add_shape_sphere(body, radius=0.1)
-        model = b.finalize(device="cuda:0")
-        with self.assertRaises(ValueError):
-            SolverFeatherPGS(model, enable_torsional_rolling_friction=True, **SOLVER_OPTIONS)
-        model.shape_material_mu_torsional.zero_()
-        model.shape_material_mu_rolling.zero_()
-        solver = SolverFeatherPGS(model, enable_torsional_rolling_friction=True, **SOLVER_OPTIONS)
-        model.shape_material_mu_rolling.fill_(0.01)
-        with self.assertRaises(ValueError):
-            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    def test_free_rigid_route_coefficients_are_rejected(self):
+        """Free spheres on a world-static floor or a floor link fixed to the world both take the matrix-free route."""
+        for fixed in (False, True):
+            with self.subTest(fixed=fixed):
+                b = newton.ModelBuilder()
+                floor_material = newton.ModelBuilder.ShapeConfig(mu=MU, mu_torsional=0.02, mu_rolling=0.01, density=0.0)
+                pose = wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity())
+                if fixed:
+                    floor = b.add_link(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3, dtype=np.float32)))
+                    b.add_articulation([b.add_joint_fixed(-1, floor, parent_xform=pose)])
+                else:
+                    floor = -1
+                floor_shape = b.add_shape_box(
+                    floor, xform=None if fixed else pose, hx=2.0, hy=2.0, hz=0.05, cfg=floor_material
+                )
+                body = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+                sphere = newton.ModelBuilder.ShapeConfig(mu=MU, mu_torsional=0.0, mu_rolling=0.0)
+                b.add_shape_sphere(body, radius=0.1, cfg=sphere)
+                model = b.finalize(device="cuda:0")
+                with self.assertRaises(ValueError):
+                    SolverFeatherPGS(model, enable_torsional_rolling_friction=True, **SOLVER_OPTIONS)
+                model.shape_material_mu_torsional.zero_()
+                model.shape_material_mu_rolling.zero_()
+                solver = SolverFeatherPGS(model, enable_torsional_rolling_friction=True, **SOLVER_OPTIONS)
+                rolling = model.shape_material_mu_rolling.numpy()
+                rolling[floor_shape] = 0.01
+                model.shape_material_mu_rolling.assign(rolling)
+                with self.assertRaises(ValueError):
+                    solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
 
 if __name__ == "__main__":

@@ -5,17 +5,19 @@
 Each dense contact that receives a sliding pair and has a positive pair coefficient
 reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``. The
 spin row resists relative rotation about the normal and the rolling pair about the
-contact tangents. Their impulses [N m s] are bounded by the coefficient [m] times
-the normal impulse left after the other friction blocks, as MuJoCo's friction cones
-couple sliding, torsional and rolling friction:
+contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
+five friction rows of a contact as one block: it minimizes the block's quadratic
+over a joint cone in coefficient-normalized impulses ``(f_t / mu, tau_s / mu_s,
+tau_r / mu_r)``, using accelerated projected gradient with exact Euclidean projection:
 
-- ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``;
-- ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
+- ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``;
+- ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
+  over the three blocks with a disk inside the sliding and rolling blocks. This is not
+  MuJoCo's component-wise pyramid.
 
-Each block keeps a disk within itself. An optional creep speed ``s`` [m/s] softens
-stiction as MuJoCo's soft constraints do: below the bound the coefficient times the
-relative angular rate settles at ``s`` times the load fraction ``|tau| / (mu_i lambda_n)``.
-Rows are rebuilt every step and carry no history.
+An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
+bound the coefficient times the relative angular rate settles at ``s`` times the load
+fraction ``|tau| / (mu_i lambda_n)``. Rows are rebuilt every step and carry no history.
 """
 
 import numpy as np
@@ -83,9 +85,11 @@ def validate_torsional_rolling_friction_coefficients(solver) -> None:
     shape_body = model.shape_body.numpy()
     body_art = solver.body_to_articulation.numpy()
     free = solver.is_free_rigid.numpy()
+    response_dofs = solver.articulation_response_dof_count.numpy()
     art = np.where(shape_body >= 0, body_art[np.maximum(shape_body, 0)], -1)
-    # Free bodies and static shapes are the shapes a free-rigid route contact can pair.
-    free_route = (art < 0) | (free[np.maximum(art, 0)] != 0)
+    safe_art = np.maximum(art, 0)
+    # The allocator's matrix-free compatibility: no articulation, no response DOFs (e.g. fixed), or free rigid.
+    free_route = (art < 0) | (response_dofs[safe_art] == 0) | (free[safe_art] != 0)
     shapes = np.flatnonzero(free_route & (coefficients > 0.0))
     if shapes.size:
         raise ValueError(
@@ -145,80 +149,142 @@ def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads:
 
 def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dict[str, str]:
     """Return the CUDA fragments that the fused matrix-free GS kernel splices in for ``cone`` and ``creep_speed``."""
-    if cone == "pyramidal":
-        residual_load = "fmaxf(load - a - b, 0.0f)"
-    else:
-        residual_load = "sqrtf(fmaxf(load * load - a * a - b * b, 0.0f))"
     angular = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+    if cone == "elliptic":
+        projection = """
+        float norm = 0.0f;
+        for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
+        norm = sqrtf(norm);
+        if (norm > load) {
+            float scale = load / norm;
+            for (int k = 0; k < 5; ++k) y[k] *= scale;
+        }"""
+    else:
+        projection = """
+        float group[3] = {sqrtf(y[0] * y[0] + y[1] * y[1]), fabsf(y[2]), sqrtf(y[3] * y[3] + y[4] * y[4])};
+        if (group[0] + group[1] + group[2] > load) {
+            // Project the group norms onto the simplex of radius load, then rescale each group.
+            float sorted[3] = {group[0], group[1], group[2]};
+            for (int a = 0; a < 2; ++a)
+                for (int b = a + 1; b < 3; ++b)
+                    if (sorted[b] > sorted[a]) { float t = sorted[a]; sorted[a] = sorted[b]; sorted[b] = t; }
+            float theta = 0.0f, cumulative = 0.0f;
+            for (int a = 0; a < 3; ++a) {
+                cumulative += sorted[a];
+                float candidate = (cumulative - load) / (float)(a + 1);
+                if (sorted[a] - candidate > 0.0f) theta = candidate;
+            }
+            const int first[3] = {0, 2, 3};
+            const int count[3] = {2, 1, 2};
+            for (int g = 0; g < 3; ++g) {
+                float scale = group[g] > 0.0f ? fmaxf(group[g] - theta, 0.0f) / group[g] : 0.0f;
+                for (int k = first[g]; k < first[g] + count[g]; ++k) y[k] *= scale;
+            }
+        }"""
     helpers = f"""
-    // Normal load left for one friction block after the other two blocks' normalized usage.
-    const auto angular_residual_load = [](float load, float a, float b) {{
-        load = fmaxf(load, 0.0f);
-        return {residual_load};
-    }};
-    const auto angular_usage = [](float magnitude, float mu) {{
-        return mu > 0.0f ? magnitude / mu : 0.0f;
-    }};
-    // Row compliance giving a creep rate of creep_speed / mu at the bound of a load lambda_n.
-    const auto angular_compliance = [](float mu, float lambda_n) {{
-        return mu > 0.0f && lambda_n > 0.0f ? {float(creep_speed)!r}f / (mu * mu * lambda_n) : 0.0f;
+    // Exact Euclidean projection of normalized friction impulses onto the joint cone of radius load.
+    const auto angular_cone_projection = [](float* y, float load) {{
+        load = fmaxf(load, 0.0f);{projection}
     }};
 """
-    sliding_radius = f"""
+    block_open = f"""
                     if (parent_idx + 5 < m_dense &&
                         world_row_type.data[off_dense + parent_idx + 3] == {angular} &&
                         world_row_parent.data[off_dense + parent_idx + 3] == parent_idx) {{
-                        float spin_usage = angular_usage(fabsf(s_lam_dense[parent_idx + 3]), s_mu_dense[parent_idx + 3]);
-                        float roll_a = s_lam_dense[parent_idx + 4], roll_b = s_lam_dense[parent_idx + 5];
-                        float roll_usage = angular_usage(sqrtf(roll_a * roll_a + roll_b * roll_b), s_mu_dense[parent_idx + 4]);
-                        radius = fmaxf(s_mu_dense[i], 0.0f) * angular_residual_load(lambda_n, spin_usage, roll_usage);
-                    }}"""
+                        // Block solve of the five friction rows [t1, t2, spin, roll1, roll2] at fixed normal load.
+                        const int first_row = parent_idx + 1;
+                        float sums[20];
+                        for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
+                        for (int d = lane; d < {dofs}; d += 32) {{
+                            float jr[5], yr[5];
+                            for (int k = 0; k < 5; ++k) {{
+                                jr[k] = J_world.data[jy_world_base + (first_row + k) * {dofs} + d];
+                                yr[k] = Y_world.data[jy_world_base + (first_row + k) * {dofs} + d];
+                            }}
+                            int q = 5;
+                            for (int k = 0; k < 5; ++k) {{
+                                sums[k] += jr[k] * s_v[d];
+                                for (int l = k; l < 5; ++l) sums[q++] += jr[k] * yr[l];
+                            }}
+                        }}
+                        for (int q = 0; q < 20; ++q) {{
+                            float value = sums[q];
+                            for (int offset = 16; offset > 0; offset >>= 1)
+                                value += __shfl_down_sync(MASK, value, offset);
+                            sums[q] = __shfl_sync(MASK, value, 0);
+                        }}
+                        float load = fmaxf(s_lam_dense[parent_idx], 0.0f);
+                        float x0[5], gradient0[5], mu[5], H[5][5];
+                        int q = 5;
+                        for (int k = 0; k < 5; ++k) {{
+                            x0[k] = s_lam_dense[first_row + k];
+                            mu[k] = fmaxf(s_mu_dense[first_row + k], 0.0f);
+                            gradient0[k] = sums[k] + s_rhs_dense[first_row + k];
+                            for (int l = k; l < 5; ++l) {{ H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }}
+                        }}
+                        for (int k = 2; k < 5; ++k) {{
+                            // Creep compliance c adds 0.5 c x^2: c = creep_speed / (mu^2 lambda_n).
+                            float compliance = mu[k] > 0.0f && load > 0.0f ? {float(creep_speed)!r}f / (mu[k] * mu[k] * load) : 0.0f;
+                            H[k][k] += compliance;
+                            gradient0[k] += compliance * x0[k];
+                        }}
+                        // Normalized coordinates y = x / mu; rows with mu == 0 stay at zero.
+                        float y0[5], y[5], z[5], lipschitz = 0.0f;
+                        for (int k = 0; k < 5; ++k) {{
+                            y0[k] = mu[k] > 0.0f ? x0[k] / mu[k] : 0.0f;
+                            gradient0[k] *= mu[k];
+                            float row_sum = 0.0f;
+                            for (int l = 0; l < 5; ++l) {{
+                                H[k][l] *= mu[k] * mu[l];
+                                row_sum += fabsf(H[k][l]);
+                            }}
+                            lipschitz = fmaxf(lipschitz, row_sum);
+                        }}
+                        for (int k = 0; k < 5; ++k) y[k] = y0[k];
+                        angular_cone_projection(y, load);
+                        if (lipschitz > 0.0f) {{
+                            for (int k = 0; k < 5; ++k) z[k] = y[k];
+                            float momentum = 1.0f;
+                            for (int iteration = 0; iteration < 64; ++iteration) {{
+                                float next[5];
+                                for (int k = 0; k < 5; ++k) {{
+                                    float gradient = gradient0[k];
+                                    for (int l = 0; l < 5; ++l) gradient += H[k][l] * (z[l] - y0[l]);
+                                    next[k] = mu[k] > 0.0f ? z[k] - gradient / lipschitz : 0.0f;
+                                }}
+                                angular_cone_projection(next, load);
+                                float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
+                                float blend = (momentum - 1.0f) / next_momentum;
+                                for (int k = 0; k < 5; ++k) {{
+                                    z[k] = next[k] + blend * (next[k] - y[k]);
+                                    y[k] = next[k];
+                                }}
+                                momentum = next_momentum;
+                            }}
+                        }}
+                        float x[5];
+                        for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
+                        if (omega != 1.0f) {{
+                            for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? x[k] / mu[k] : 0.0f;
+                            angular_cone_projection(y, load);
+                            for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
+                        }}
+                        for (int k = 1; k < 5; ++k) {{
+                            float block_delta = x[k] - s_lam_dense[first_row + k];
+                            if (block_delta != 0.0f) {{
+                                iteration_changed = 1;
+                                for (int d = lane; d < {dofs}; d += 32)
+                                    s_v[d] += Y_world.data[jy_world_base + (first_row + k) * {dofs} + d] * block_delta;
+                            }}
+                            s_lam_dense[first_row + k] = x[k];
+                        }}
+                        new_impulse = x[0];
+                    }} else {{"""
+    block_close = """
+                    }"""
     row_block = f"""
             }} else if (row_type == {angular}) {{
-                int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
-                float lambda_n = s_lam_dense[parent_idx];
-                float slide_a = s_lam_dense[parent_idx + 1], slide_b = s_lam_dense[parent_idx + 2];
-                float slide_usage = angular_usage(sqrtf(slide_a * slide_a + slide_b * slide_b), s_mu_dense[parent_idx + 1]);
-                float spin_usage = angular_usage(fabsf(s_lam_dense[parent_idx + 3]), s_mu_dense[parent_idx + 3]);
-                float roll_a = s_lam_dense[parent_idx + 4], roll_b = s_lam_dense[parent_idx + 5];
-                float roll_usage = angular_usage(sqrtf(roll_a * roll_a + roll_b * roll_b), s_mu_dense[parent_idx + 4]);
-                if (i == parent_idx + 3) {{
-                    float bound = fmaxf(s_mu_dense[i], 0.0f) * angular_residual_load(lambda_n, slide_usage, roll_usage);
-                    float compliance = angular_compliance(s_mu_dense[i], lambda_n);
-                    if (compliance > 0.0f)
-                        new_impulse = old_impulse - omega * (residual + compliance * old_impulse) / (fmaxf(denom, 0.0f) + compliance);
-                    new_impulse = fminf(fmaxf(new_impulse, -bound), bound);
-                }} else if (i == parent_idx + 4) {{
-                    int sib = i + 1;
-                    int sib_row_base = jy_world_base + sib * {dofs};
-                    float radius = fmaxf(s_mu_dense[i], 0.0f) * angular_residual_load(lambda_n, slide_usage, spin_usage);
-                    float sibling_residual = 0.0f;
-                    for (int d = lane; d < {dofs}; d += 32)
-                        sibling_residual += J_world.data[sib_row_base + d] * s_v[d];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
-                    float cross = 0.0f;
-                    for (int d = lane; d < {dofs}; d += 32)
-                        cross += J_world.data[jy_world_base + i * {dofs} + d] * Y_world.data[sib_row_base + d];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        cross += __shfl_down_sync(MASK, cross, offset);
-                    cross = __shfl_sync(MASK, cross, 0);
-                    float compliance = angular_compliance(s_mu_dense[i], lambda_n);
-                    float2 pair = friction_pair_candidate(denom + compliance, cross, s_diag_dense[sib] + compliance,
-                        residual + compliance * old_impulse, sibling_residual + compliance * s_lam_dense[sib],
-                        old_impulse, s_lam_dense[sib], radius, omega);
-                    float a = pair.x;
-                    float b = pair.y;
-                    float mag = sqrtf(a * a + b * b);
-                    float scale = mag > radius ? radius / mag : 1.0f;
-                    new_impulse = a * scale;
-                    float sib_delta = b * scale - s_lam_dense[sib];
-                    s_lam_dense[sib] = b * scale;
-                    if (sib_delta != 0.0f) iteration_changed = 1;
-                    __SIB_V_UPDATE__
-                }} else {{
-                    new_impulse = old_impulse;
-                }}
-                delta_impulse = new_impulse - old_impulse;"""
-    return {"helpers": helpers, "sliding_radius": sliding_radius, "row_block": row_block}
+                // The contact's first sliding row solves these rows in its friction block.
+                new_impulse = old_impulse;
+                delta_impulse = 0.0f;"""
+    return {"helpers": helpers, "block_open": block_open, "block_close": block_close, "row_block": row_block}
