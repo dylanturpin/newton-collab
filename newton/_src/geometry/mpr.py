@@ -173,10 +173,12 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     Returns:
         ``solve_mpr`` wrapper function.  The core function is available as
         ``solve_mpr.core`` for callers that want to handle the relative-frame
-        transform themselves (e.g. fused MPR+GJK). Split kernels use
-        ``solve_mpr.portal_core`` for the bare portal pass, which also reports
-        whether its witnesses are valid, and ``solve_mpr.refine_core`` to
-        refine overlaps whose witnesses are not.
+        transform themselves (e.g. fused MPR+GJK). ``solve_mpr.portal_core``
+        includes box penetration direction selection. Split kernels use
+        ``solve_mpr.unchecked_portal_core`` for other pairs and
+        ``solve_mpr.after_sat_core`` after the cooperative box axis search.
+        The portal passes report witness validity; ``solve_mpr.refine_core``
+        refines overlaps whose witnesses are invalid.
     """
 
     if _support_funcs is not None:
@@ -455,6 +457,36 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     v1 = v4
 
     @wp.func
+    def solve_mpr_seeded_portal(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        seed: wp.vec3,
+        sat_normal: wp.vec3,
+        sat_depth: float,
+        MAX_ITER: int = 30,
+        COLLIDE_EPSILON: float = 1e-5,
+    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, bool]:
+        portal_seed = seed
+        if sat_depth > COLLIDE_EPSILON:
+            # SAT certifies an interior ball and its nearest plane.
+            portal_seed = -0.5 * sat_depth * sat_normal
+        collision, pa, pb, normal, depth, next_seed, valid = solve_mpr_portal_unchecked(
+            geom_a, geom_b, orientation_b, position_b, extend, data_provider, portal_seed, MAX_ITER, COLLIDE_EPSILON
+        )
+        if sat_depth > COLLIDE_EPSILON:
+            if not collision or not valid or wp.abs(depth - extend - sat_depth) > COLLIDE_EPSILON:
+                collision = True
+                normal = sat_normal
+                depth = sat_depth + extend
+                next_seed = -0.5 * sat_depth * sat_normal
+                valid = False
+        return collision, pa, pb, normal, depth, next_seed, valid
+
+    @wp.func
     def solve_mpr_portal(
         geom_a: Any,
         geom_b: Any,
@@ -470,24 +502,20 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             return solve_mpr_portal_unchecked(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
             )
-        sat_normal = wp.vec3(0.0)
-        sat_depth = float(-1.0)
-        portal_seed = seed
         sat_normal, sat_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider)
-        if sat_depth > COLLIDE_EPSILON:
-            # SAT certifies an interior ball and its nearest plane.
-            portal_seed = -0.5 * sat_depth * sat_normal
-        collision, pa, pb, normal, depth, next_seed, valid = solve_mpr_portal_unchecked(
-            geom_a, geom_b, orientation_b, position_b, extend, data_provider, portal_seed, MAX_ITER, COLLIDE_EPSILON
+        return solve_mpr_seeded_portal(
+            geom_a,
+            geom_b,
+            orientation_b,
+            position_b,
+            extend,
+            data_provider,
+            seed,
+            sat_normal,
+            sat_depth,
+            MAX_ITER,
+            COLLIDE_EPSILON,
         )
-        if sat_depth > COLLIDE_EPSILON:
-            if not collision or not valid or wp.abs(depth - extend - sat_depth) > COLLIDE_EPSILON:
-                collision = True
-                normal = sat_normal
-                depth = sat_depth + extend
-                next_seed = -0.5 * sat_depth * sat_normal
-                valid = False
-        return collision, pa, pb, normal, depth, next_seed, valid
 
     @wp.func
     def solve_mpr_raycast(
@@ -627,6 +655,26 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         return point_a, point_b, normal, penetration
 
     @wp.func
+    def solve_mpr_after_sat(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        sat_normal: wp.vec3,
+        sat_depth: float,
+    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
+        collision, pa, pb, normal, depth, seed, valid = solve_mpr_seeded_portal(
+            geom_a, geom_b, orientation_b, position_b, extend, data_provider, wp.vec3(0.0), sat_normal, sat_depth
+        )
+        if collision and not valid:
+            pa, pb, normal, depth = solve_mpr_restarts(
+                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, normal, depth
+            )
+        return collision, pa, pb, normal, depth
+
+    @wp.func
     def solve_mpr_core(
         geom_a: Any,
         geom_b: Any,
@@ -721,9 +769,11 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
         return collision, signed_distance, point, normal
 
+    solve_mpr.after_sat_core = solve_mpr_after_sat
     solve_mpr.core = solve_mpr_core
-    # Split collision kernels refine unresolved portals in their GJK pass so
+    # Split collision kernels refine unresolved portals in a separate pass so
     # the common MPR pass does not carry the raycast's register/local storage.
     solve_mpr.portal_core = solve_mpr_portal
+    solve_mpr.unchecked_portal_core = solve_mpr_portal_unchecked
     solve_mpr.refine_core = solve_mpr_restarts
     return solve_mpr

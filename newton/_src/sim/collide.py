@@ -1937,6 +1937,7 @@ class CollisionPipeline:
             max_mesh_plane_pairs = self.shape_pairs_max
             # Host copy of the explicit pair list, read at most once during setup.
             explicit_pairs_host = None
+            has_box_pairs = True
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
                 # Gate the mesh/heightfield narrow-phase stages pair-aware:
@@ -1961,6 +1962,14 @@ class CollisionPipeline:
                 # appear in no contact pair must not construct mesh subpipelines.
                 has_heightfields = bool((pair_shape_types == int(GeoType.HFIELD)).any())
                 has_meshes = bool((pair_shape_types == int(GeoType.MESH)).any())
+                box_count = int(
+                    np.count_nonzero(
+                        (colliding_shape_types == int(GeoType.BOX)) | (colliding_shape_types == int(GeoType.PLANE))
+                    )
+                )
+                has_box_pairs = box_count > 1 or (
+                    box_count > 0 and bool(np.any(colliding_shape_types == int(GeoType.CONVEX_MESH)))
+                )
                 # Mask-based sizing inputs (upstream #3961): conservative,
                 # colliding_mask-based (a superset of the pair-aware masks).
                 mesh_mask = colliding_mask & (shape_types == int(GeoType.MESH))
@@ -2123,6 +2132,8 @@ class CollisionPipeline:
                 contact_writer_supports_speculative=self._speculative_enabled,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
+            # Finite planes also become boxes in the convex query preparation.
+            self.narrow_phase._has_box_pairs = has_box_pairs
 
         # NarrowPhase is authoritative for the producer stage: it disables
         # mesh/heightfield reduction when no such collision path exists, and
