@@ -824,6 +824,122 @@ def test_restitution_bounce_matches_default_and_finite_difference(test, device):
         test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def _build_free_shape(device, shape, *, restitution=0.0):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, density=1000.0, restitution=restitution)
+    builder.add_ground_plane(cfg=cfg)
+    body = builder.add_link(mass=0.0)
+    if shape == "box":
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    else:
+        builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    return builder.finalize(device=device, requires_grad=True)
+
+
+def _free_body_rollout(model, solver, q0, qd0, steps, dt, contacts=None, tape=None):
+    """Collide every step unless contacts are given (then they are reused, frozen)."""
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    states[0].joint_q.assign(np.asarray(q0, np.float32))
+    states[0].joint_qd.assign(np.asarray(qd0, np.float32))
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    frozen = contacts if contacts is not None else [pipeline.contacts() for _ in range(steps)]
+    for k in range(steps):
+        if contacts is None:
+            pipeline.collide(states[k], frozen[k])
+        if tape is not None:
+            tape.__enter__()
+        solver.step(states[k], states[k + 1], None, frozen[k], dt)
+        if tape is not None:
+            tape.__exit__(None, None, None)
+    return states, frozen
+
+
+def _velocity_jacobians(model, options, q0, qd0, dt):
+    """Tape and central-FD Jacobians of joint_qd after one step w.r.t. initial joint_qd (contacts frozen)."""
+    device = model.device
+    solver = SolverFeatherPGS(model, differentiable=True, **options)
+    _, contacts = _free_body_rollout(model, solver, q0, qd0, 1, dt)
+    tape_jacobian = np.zeros((6, 6))
+    for row in range(6):
+        tape = wp.Tape()
+        states, _ = _free_body_rollout(model, solver, q0, qd0, 1, dt, contacts, tape)
+        seed = np.zeros(6, np.float32)
+        seed[row] = 1.0
+        tape.backward(grads={states[1].joint_qd: wp.array(seed, dtype=float, device=device)})
+        tape_jacobian[row] = states[0].joint_qd.grad.numpy()
+    fd_jacobian = np.zeros((6, 6))
+    for column in range(6):
+        step = np.zeros(6, np.float32)
+        step[column] = 3.0e-3
+        plus = _free_body_rollout(model, solver, q0, qd0 + step, 1, dt, contacts)[0][1].joint_qd.numpy()
+        minus = _free_body_rollout(model, solver, q0, qd0 - step, 1, dt, contacts)[0][1].joint_qd.numpy()
+        fd_jacobian[:, column] = (plus.astype(np.float64) - minus) / 6.0e-3
+    return tape_jacobian, fd_jacobian
+
+
+def test_sliding_box_velocity_jacobian(test, device):
+    """Four sliding friction pairs: every entry, including rotational couplings, matches FD."""
+    model = _build_free_shape(device, "box")
+    q0 = [0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0]
+    qd0 = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+    options = {"friction_anchor_beta": 0.0, "pgs_iterations": 12}
+    tape_jacobian, fd_jacobian = _velocity_jacobians(model, options, q0, qd0, 1.0 / 240.0)
+    np.testing.assert_allclose(tape_jacobian, fd_jacobian, rtol=0.0, atol=2.0e-3)
+    # Rolling-free sliding: Coulomb gives d(vx)/d(vz0) = mu and no induced spin.
+    test.assertAlmostEqual(fd_jacobian[0, 2], 0.5, delta=1.0e-3)
+
+
+def test_frictional_impact_matches_default(test, device):
+    """A sphere hitting the plane with tangential velocity rebounds as in the default matrix-free solve."""
+    q0 = [0.0, 0.0, 0.15, 0.0, 0.0, 0.0, 1.0]
+    qd0 = np.array([0.3, 0.0, -1.0, 0.0, 0.0, 0.0], np.float32)
+    dt = 1.0 / 240.0
+    results = {}
+    for differentiable in (False, True):
+        model = _build_free_shape(device, "sphere", restitution=0.5)
+        solver = SolverFeatherPGS(model, differentiable=differentiable, friction_anchor_beta=0.0)
+        results[differentiable] = _free_body_rollout(model, solver, q0, qd0, 12, dt)[0][-1].joint_qd.numpy()
+    test.assertGreater(results[True][2], 0.0)
+    test.assertGreater(abs(results[True][4]), 1.0)
+    np.testing.assert_allclose(results[True], results[False], rtol=0.0, atol=1.0e-6)
+    model = _build_free_shape(device, "sphere", restitution=0.5)
+    tape_jacobian, fd_jacobian = _velocity_jacobians(
+        model, {"friction_anchor_beta": 0.0}, [0.0, 0.0, 0.102, 0, 0, 0, 1], qd0, dt
+    )
+    np.testing.assert_allclose(tape_jacobian, fd_jacobian, rtol=0.0, atol=2.0e-3)
+
+
+def test_contact_law_options(test, device):
+    """Omitted patch friction raises; shared anchors and runtime depenetration clamps follow the default."""
+    model = _build_free_shape(device, "box")
+    state = model.state(requires_grad=True)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    contacts = newton.CollisionPipeline(model, rigid_contact_max=16).contacts()
+    solver = SolverFeatherPGS(model, differentiable=True)
+    with test.assertRaisesRegex(NotImplementedError, "friction_anchor_beta=0"):
+        solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
+
+    q0 = [0.0, 0.0, 0.09, 0.0, 0.0, 0.0, 1.0]
+    qd0 = np.array([0.4, 0.1, 0.0, 0.0, 0.0, 0.2], np.float32)
+    for options, clamp in (({"contact_shared_anchor": True}, None), ({}, 0.05)):
+        results = {}
+        for differentiable in (False, True):
+            model = _build_free_shape(device, "box")
+            solver = SolverFeatherPGS(model, differentiable=differentiable, friction_anchor_beta=0.0, **options)
+            if clamp is not None:
+                solver.rigid_body_max_depenetration_velocity.fill_(clamp)
+            results[differentiable] = _free_body_rollout(model, solver, q0, qd0, 4, _DT)[0][-1]
+        with test.subTest(options=options, clamp=clamp):
+            np.testing.assert_allclose(
+                results[True].joint_qd.numpy(), results[False].joint_qd.numpy(), rtol=0.0, atol=1.0e-5
+            )
+            if clamp is not None:
+                # The 1 cm penetration recovers at the clamped speed.
+                test.assertAlmostEqual(float(results[True].joint_qd.numpy()[2]), clamp, delta=1.0e-3)
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -843,6 +959,9 @@ for _device in get_test_devices():
         test_sphere_friction_matches_default_and_finite_difference,
         test_repeated_rollouts_reuse_buffers,
         test_restitution_bounce_matches_default_and_finite_difference,
+        test_sliding_box_velocity_jacobian,
+        test_frictional_impact_matches_default,
+        test_contact_law_options,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
 

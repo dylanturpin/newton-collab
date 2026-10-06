@@ -169,8 +169,6 @@ class DifferentiableStep:
         worlds_free = set(plan.articulation_world[free].tolist())
         worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
-        depenetration = solver.rigid_body_max_depenetration_velocity.numpy()
-        self.has_depenetration_clamp = bool(np.any(np.isfinite(depenetration) & (depenetration > 0.0)))
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
 
     def buffers(self, state_out: State) -> _StepBuffers:
@@ -449,7 +447,10 @@ class DifferentiableStep:
         checks = (
             (solver.pgs_mode != "split", 'pgs_mode="split" with contacts'),
             (self.has_mixed_free_worlds, "no world mixing free rigid bodies and articulations"),
-            (self.has_depenetration_clamp, "no rigid-body depenetration velocity clamp"),
+            (
+                solver._differentiable_patch_friction_default and solver.enable_contact_friction,
+                "an explicit friction_anchor_beta=0 (the default friction law is patch friction)",
+            ),
             (solver.contact_friction_shared_anchor and solver.enable_contact_friction, "no shared friction anchor"),
             (solver._regularization_enabled, "pgs_contact_regularization=0"),
         )
@@ -614,6 +615,9 @@ class DifferentiableStep:
                 solver.friction_anchor_beta,
                 solver.pgs_beta,
                 solver.pgs_cfm,
+                solver.rigid_body_max_depenetration_velocity,
+                solver.body_to_articulation,
+                solver._dummy_is_free_rigid if solver.is_free_rigid is None else solver.is_free_rigid,
             ],
             outputs=[
                 c.row_type,
@@ -624,6 +628,7 @@ class DifferentiableStep:
                 c.phi,
                 c.target_velocity,
                 c.row_restitution,
+                c.row_max_depenetration,
             ],
             device=device,
         )
@@ -745,6 +750,7 @@ class DifferentiableStep:
                 c.row_beta,
                 c.row_type,
                 c.row_restitution,
+                c.row_max_depenetration,
                 c.rhs,
                 dt,
                 solver.contact_speculative_scale,
@@ -882,6 +888,7 @@ class _ContactBuffers:
         self.rhs = zeros((worlds, rows))
         self.rhs_restituted = zeros((worlds, rows))
         self.row_restitution = zeros((worlds, rows))
+        self.row_max_depenetration = zeros((worlds, rows))
         self.diag = zeros((worlds, rows))
         self.C = zeros((worlds, rows, rows))
         self.impulses = [zeros((worlds, rows)) for _ in range(solver.pgs_iterations + 1)]
@@ -1422,6 +1429,9 @@ def _dense_contact_rows(
     friction_anchor_beta: float,
     pgs_beta: float,
     pgs_cfm: float,
+    max_depenetration_velocity: wp.array[float],
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
     # outputs
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
@@ -1431,6 +1441,7 @@ def _dense_contact_rows(
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
     row_restitution: wp.array2d[float],
+    row_max_depenetration: wp.array2d[float],
 ):
     """Row metadata of _populate_world_J_for_size_contact for point contacts, one thread per contact.
 
@@ -1468,6 +1479,18 @@ def _dense_contact_rows(
                 target_b = anchor
             row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
             row_restitution[world, slot] = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution)
+            # compute_mf_effective_mass_and_rhs clamps free-body depenetration; articulated rows are unclamped.
+            free_a = body_a < 0 or is_free_rigid[body_to_articulation[body_a]] != 0
+            free_b = body_b < 0 or is_free_rigid[body_to_articulation[body_b]] != 0
+            max_depenetration = float(1.0e20)
+            if free_a and free_b:
+                if body_a >= 0:
+                    max_depenetration = max_depenetration_velocity[body_a]
+                if body_b >= 0:
+                    depenetration_b = max_depenetration_velocity[body_b]
+                    if depenetration_b > 0.0 and wp.isfinite(depenetration_b) and depenetration_b < max_depenetration:
+                        max_depenetration = depenetration_b
+            row_max_depenetration[world, slot] = max_depenetration
             row_parent[world, slot] = -1
             row_mu[world, slot] = mu
             row_beta[world, slot] = pgs_beta
@@ -1746,6 +1769,7 @@ def _dense_contact_restitution(
     row_beta: wp.array2d[float],
     row_type: wp.array2d[int],
     row_restitution: wp.array2d[float],
+    row_max_depenetration: wp.array2d[float],
     rhs: wp.array2d[float],
     dt: float,
     contact_speculative_scale: float,
@@ -1753,17 +1777,27 @@ def _dense_contact_restitution(
     # outputs
     rhs_out: wp.array2d[float],
 ):
-    """apply_world_contact_restitution_accumulated into a separate array; firing is a nonsmooth event."""
+    """Depenetration clamp and restitution of the default contact RHS, into a separate array.
+
+    Both are nonsmooth events: the clamp activating and restitution firing.
+    """
     world, i = wp.tid()
     if i >= row_count[world]:
         return
     value = rhs[world, i]
+    if row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+        rhs_out[world, i] = value
+        return
+    phi = row_phi[world, i]
+    geometric_bias = contact_speculative_scale * phi / dt
+    if phi < 0.0:
+        geometric_bias = row_beta[world, i] * phi / dt
+        max_depenetration = row_max_depenetration[world, i]
+        if max_depenetration > 0.0 and wp.isfinite(max_depenetration) and geometric_bias < -max_depenetration:
+            value = value - geometric_bias - max_depenetration
+            geometric_bias = -max_depenetration
     restitution = row_restitution[world, i]
-    if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT and restitution > 0.0:
-        phi = row_phi[world, i]
-        geometric_bias = contact_speculative_scale * phi / dt
-        if phi < 0.0:
-            geometric_bias = row_beta[world, i] * phi / dt
+    if restitution > 0.0:
         relative_incident = value - geometric_bias
         if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
             value = (1.0 + restitution) * relative_incident
@@ -1856,11 +1890,12 @@ def _dense_pgs_sweep(
                     impulses_out[world, sibling] = 0.0
                 else:
                     w_sibling = rhs[world, sibling]
-                    for j in range(m):
-                        impulse = impulses_in[world, j]
-                        if j < i:
-                            impulse = impulses_out[world, j]
-                        w_sibling += C[world, sibling, j] * impulse
+                    # Distinct names: two dynamic loops sharing locals in one outer iteration get a wrong adjoint.
+                    for k in range(m):
+                        impulse_k = impulses_in[world, k]
+                        if k < i:
+                            impulse_k = impulses_out[world, k]
+                        w_sibling += C[world, sibling, k] * impulse_k
                     residuals[world, sibling] = w_sibling
                     trial = _friction_pair_unrolled(
                         denom,
@@ -1944,52 +1979,68 @@ def _friction_pair_unrolled(
             and wp.abs(cross_residual) <= 2.0e-7 * old_norm * residual_norm
         ):
             retained = True
-        if not retained:
-            old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
-            b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
-            solution = wp.vec2(0.0)
-            lo = float(0.0)
-            hi = wp.length(b) / radius
-            if hi > 0.0:
-                lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) / radius - smallest), 0.0)
-                alpha = lo
-                converged = bool(False)
-                for _ in range(8):
-                    if not converged:
-                        inv0 = 1.0 / (largest + alpha)
-                        inv1 = float(0.0)
-                        if smallest + alpha > 0.0:
-                            inv1 = 1.0 / (smallest + alpha)
-                        trial = old_rotated - wp.vec2(
-                            (residual_rotated[0] + alpha * old_rotated[0]) * inv0,
-                            (residual_rotated[1] + alpha * old_rotated[1]) * inv1,
-                        )
-                        norm = wp.length(trial)
-                        if wp.abs(norm - radius) <= 2.0e-7 * radius or (alpha == 0.0 and norm <= radius):
-                            solution = trial
-                            converged = True
-                        else:
-                            if norm > radius:
-                                lo = alpha
-                            else:
-                                hi = alpha
-                            slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
-                            candidate = alpha
-                            if slope > 0.0:
-                                candidate = alpha + (norm / radius - 1.0) * norm * norm / slope
-                            alpha = 0.5 * (lo + hi)
-                            if candidate > lo and candidate < hi:
-                                alpha = candidate
+        # The solve also runs for a retained impulse: its derivative stands in for the guard's.
+        old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
+        b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
+        solution = wp.vec2(0.0)
+        lo = float(0.0)
+        hi = wp.length(b) / radius
+        if hi > 0.0:
+            lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) / radius - smallest), 0.0)
+            alpha = lo
+            converged = bool(False)
+            for _ in range(8):
                 if not converged:
-                    for _ in range(24):
-                        alpha = 0.5 * (lo + hi)
-                        trial = wp.vec2(b[0] / (largest + alpha), b[1] / (smallest + alpha))
-                        if wp.length(trial) > radius:
+                    inv0 = 1.0 / (largest + alpha)
+                    inv1 = float(0.0)
+                    if smallest + alpha > 0.0:
+                        inv1 = 1.0 / (smallest + alpha)
+                    trial = old_rotated - wp.vec2(
+                        (residual_rotated[0] + alpha * old_rotated[0]) * inv0,
+                        (residual_rotated[1] + alpha * old_rotated[1]) * inv1,
+                    )
+                    norm = wp.length(trial)
+                    if wp.abs(norm - radius) <= 2.0e-7 * radius or (alpha == 0.0 and norm <= radius):
+                        solution = trial
+                        converged = True
+                    else:
+                        if norm > radius:
                             lo = alpha
                         else:
                             hi = alpha
-                    solution = wp.vec2(b[0] / (largest + hi), b[1] / (smallest + hi))
-            result = old + (solution[0] - old_rotated[0]) * axis + (solution[1] - old_rotated[1]) * perpendicular
+                        slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
+                        candidate = alpha
+                        if slope > 0.0:
+                            candidate = alpha + (norm / radius - 1.0) * norm * norm / slope
+                        alpha = 0.5 * (lo + hi)
+                        if candidate > lo and candidate < hi:
+                            alpha = candidate
+            if not converged:
+                for _ in range(24):
+                    alpha = 0.5 * (lo + hi)
+                    trial = wp.vec2(b[0] / (largest + alpha), b[1] / (smallest + alpha))
+                    if wp.length(trial) > radius:
+                        lo = alpha
+                    else:
+                        hi = alpha
+                solution = wp.vec2(b[0] / (largest + hi), b[1] / (smallest + hi))
+        result = old + (solution[0] - old_rotated[0]) * axis + (solution[1] - old_rotated[1]) * perpendicular
+    relaxed = old + omega * (result - old)
     if retained:
-        return old
-    return old + omega * (result - old)
+        return _value_with_gradient_of(old, relaxed)
+    return relaxed
+
+
+@wp.func
+def _value_with_gradient_of(value: wp.vec2, solved: wp.vec2):
+    """Return value, differentiated as solved.
+
+    friction_pair_candidate keeps an already-feasible sliding impulse (within 2e-7) to avoid roundoff
+    cycles; its derivative is that of the pair solve the guard stands in for, which is also what FD sees.
+    """
+    return value
+
+
+@wp.func_grad(_value_with_gradient_of)
+def _adj_value_with_gradient_of(value: wp.vec2, solved: wp.vec2, adj_ret: wp.vec2):
+    wp.adjoint[solved] += adj_ret
