@@ -13,7 +13,8 @@ tau_r / mu_r)``, using accelerated projected gradient with exact Euclidean proje
 - ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``;
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
-  MuJoCo's component-wise pyramid.
+  MuJoCo's component-wise pyramid, and its solutions sit on the cone's vertices: a contact
+  that pivots faster than it slides spends the whole budget on rolling.
 
 An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
 bound the coefficient times the relative angular rate settles at ``s`` times the load
@@ -182,9 +183,148 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
             }
         }"""
     helpers = f"""
-    // Exact Euclidean projection of normalized friction impulses onto the joint cone of radius load.
-    const auto angular_cone_projection = [](float* y, float load) {{
-        load = fmaxf(load, 0.0f);{projection}
+    // Kept out of line so contacts without angular rows keep the sweep's register budget.
+    struct AngularFrictionBlock {{
+        // Exact Euclidean projection of normalized friction impulses onto the joint cone of radius load.
+        static __device__ void project(float* y, float load) {{
+            load = fmaxf(load, 0.0f);{projection}
+        }}
+
+        // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
+        static __device__ __noinline__ float solve(
+            float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
+            int lane, unsigned MASK, float load, float omega, int* changed) {{
+                float sums[20];
+                for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
+                for (int d = lane; d < {dofs}; d += 32) {{
+                    float jr[5], yr[5];
+                    for (int k = 0; k < 5; ++k) {{
+                        jr[k] = J[k * {dofs} + d];
+                        yr[k] = Y[k * {dofs} + d];
+                    }}
+                    int q = 5;
+                    for (int k = 0; k < 5; ++k) {{
+                        sums[k] += jr[k] * v[d];
+                        for (int l = k; l < 5; ++l) sums[q++] += jr[k] * yr[l];
+                    }}
+                }}
+                for (int q = 0; q < 20; ++q) {{
+                    float value = sums[q];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        value += __shfl_down_sync(MASK, value, offset);
+                    sums[q] = __shfl_sync(MASK, value, 0);
+                }}
+                load = fmaxf(load, 0.0f);
+                float x0[5], gradient0[5], mu[5], H[5][5];
+                int q = 5;
+                for (int k = 0; k < 5; ++k) {{
+                    x0[k] = lam[k];
+                    mu[k] = fmaxf(mu_rows[k], 0.0f);
+                    gradient0[k] = sums[k] + rhs_rows[k];
+                    for (int l = k; l < 5; ++l) {{ H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }}
+                }}
+                for (int k = 2; k < 5; ++k) {{
+                    // Creep compliance c adds 0.5 c x^2: c = creep_speed / (mu^2 lambda_n).
+                    float compliance = mu[k] > 0.0f && load > 0.0f ? {float(creep_speed)!r}f / (mu[k] * mu[k] * load) : 0.0f;
+                    H[k][k] += compliance;
+                    gradient0[k] += compliance * x0[k];
+                }}
+                // Normalized coordinates y = x / mu; rows with mu == 0 stay at zero.
+                float y0[5], y[5], z[5], lipschitz = 0.0f;
+                for (int k = 0; k < 5; ++k) {{
+                    y0[k] = mu[k] > 0.0f ? x0[k] / mu[k] : 0.0f;
+                    gradient0[k] *= mu[k];
+                    float row_sum = 0.0f;
+                    for (int l = 0; l < 5; ++l) {{
+                        H[k][l] *= mu[k] * mu[l];
+                        row_sum += fabsf(H[k][l]);
+                    }}
+                    lipschitz = fmaxf(lipschitz, row_sum);
+                }}
+                // Sticking: the unconstrained block minimizer, when it lies inside the cone, is exact.
+                bool solved = false;
+                {{
+                    float L[5][5], step[5], largest_pivot = 0.0f;
+                    for (int k = 0; k < 5; ++k) largest_pivot = fmaxf(largest_pivot, mu[k] > 0.0f ? H[k][k] : 0.0f);
+                    // Near-singular blocks (rows without response) take the projected-gradient path.
+                    bool positive = largest_pivot > 0.0f;
+                    for (int k = 0; k < 5 && positive; ++k) {{
+                        for (int l = 0; l <= k; ++l) {{
+                            float value = mu[k] > 0.0f && mu[l] > 0.0f ? H[k][l] : (k == l ? 1.0f : 0.0f);
+                            for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
+                            if (k == l) {{
+                                if (!(value > 1.0e-5f * largest_pivot)) positive = false;
+                                L[k][k] = sqrtf(fmaxf(value, 0.0f));
+                            }} else {{
+                                L[k][l] = value / L[l][l];
+                            }}
+                        }}
+                    }}
+                    if (positive) {{
+                        for (int k = 0; k < 5; ++k) {{
+                            float value = mu[k] > 0.0f ? -gradient0[k] : 0.0f;
+                            for (int m = 0; m < k; ++m) value -= L[k][m] * step[m];
+                            step[k] = value / L[k][k];
+                        }}
+                        for (int k = 4; k >= 0; --k) {{
+                            float value = step[k];
+                            for (int m = k + 1; m < 5; ++m) value -= L[m][k] * step[m];
+                            step[k] = value / L[k][k];
+                        }}
+                        for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? y0[k] + step[k] : 0.0f;
+                        float trial[5];
+                        for (int k = 0; k < 5; ++k) trial[k] = y[k];
+                        project(trial, load);
+                        solved = true;
+                        for (int k = 0; k < 5; ++k) solved = solved && trial[k] == y[k];
+                    }}
+                }}
+                if (!solved) {{
+                    for (int k = 0; k < 5; ++k) y[k] = y0[k];
+                    project(y, load);
+                }}
+                if (!solved && lipschitz > 0.0f) {{
+                    for (int k = 0; k < 5; ++k) z[k] = y[k];
+                    float momentum = 1.0f;
+                    for (int iteration = 0; iteration < 32; ++iteration) {{
+                        float next[5];
+                        for (int k = 0; k < 5; ++k) {{
+                            float gradient = gradient0[k];
+                            for (int l = 0; l < 5; ++l) gradient += H[k][l] * (z[l] - y0[l]);
+                            next[k] = mu[k] > 0.0f ? z[k] - gradient / lipschitz : 0.0f;
+                        }}
+                        project(next, load);
+                        float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
+                        float blend = (momentum - 1.0f) / next_momentum;
+                        float change = 0.0f;
+                        for (int k = 0; k < 5; ++k) {{
+                            change = fmaxf(change, fabsf(next[k] - y[k]));
+                            z[k] = next[k] + blend * (next[k] - y[k]);
+                            y[k] = next[k];
+                        }}
+                        momentum = next_momentum;
+                        // Outer sweeps warm-start the block, so stop once an iterate stalls.
+                        if (change <= 1.0e-6f * load) break;
+                    }}
+                }}
+                float x[5];
+                for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
+                if (omega != 1.0f) {{
+                    for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? x[k] / mu[k] : 0.0f;
+                    project(y, load);
+                    for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
+                }}
+                for (int k = 1; k < 5; ++k) {{
+                    float block_delta = x[k] - lam[k];
+                    if (block_delta != 0.0f) {{
+                        *changed = 1;
+                        for (int d = lane; d < {dofs}; d += 32)
+                            v[d] += Y[k * {dofs} + d] * block_delta;
+                    }}
+                    lam[k] = x[k];
+                }}
+                return x[0];
+        }}
     }};
 """
     block_open = f"""
@@ -193,136 +333,10 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
                         world_row_parent.data[off_dense + parent_idx + 3] == parent_idx) {{
                         // Block solve of the five friction rows [t1, t2, spin, roll1, roll2] at fixed normal load.
                         const int first_row = parent_idx + 1;
-                        float sums[20];
-                        for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
-                        for (int d = lane; d < {dofs}; d += 32) {{
-                            float jr[5], yr[5];
-                            for (int k = 0; k < 5; ++k) {{
-                                jr[k] = J_world.data[jy_world_base + (first_row + k) * {dofs} + d];
-                                yr[k] = Y_world.data[jy_world_base + (first_row + k) * {dofs} + d];
-                            }}
-                            int q = 5;
-                            for (int k = 0; k < 5; ++k) {{
-                                sums[k] += jr[k] * s_v[d];
-                                for (int l = k; l < 5; ++l) sums[q++] += jr[k] * yr[l];
-                            }}
-                        }}
-                        for (int q = 0; q < 20; ++q) {{
-                            float value = sums[q];
-                            for (int offset = 16; offset > 0; offset >>= 1)
-                                value += __shfl_down_sync(MASK, value, offset);
-                            sums[q] = __shfl_sync(MASK, value, 0);
-                        }}
-                        float load = fmaxf(s_lam_dense[parent_idx], 0.0f);
-                        float x0[5], gradient0[5], mu[5], H[5][5];
-                        int q = 5;
-                        for (int k = 0; k < 5; ++k) {{
-                            x0[k] = s_lam_dense[first_row + k];
-                            mu[k] = fmaxf(s_mu_dense[first_row + k], 0.0f);
-                            gradient0[k] = sums[k] + s_rhs_dense[first_row + k];
-                            for (int l = k; l < 5; ++l) {{ H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }}
-                        }}
-                        for (int k = 2; k < 5; ++k) {{
-                            // Creep compliance c adds 0.5 c x^2: c = creep_speed / (mu^2 lambda_n).
-                            float compliance = mu[k] > 0.0f && load > 0.0f ? {float(creep_speed)!r}f / (mu[k] * mu[k] * load) : 0.0f;
-                            H[k][k] += compliance;
-                            gradient0[k] += compliance * x0[k];
-                        }}
-                        // Normalized coordinates y = x / mu; rows with mu == 0 stay at zero.
-                        float y0[5], y[5], z[5], lipschitz = 0.0f;
-                        for (int k = 0; k < 5; ++k) {{
-                            y0[k] = mu[k] > 0.0f ? x0[k] / mu[k] : 0.0f;
-                            gradient0[k] *= mu[k];
-                            float row_sum = 0.0f;
-                            for (int l = 0; l < 5; ++l) {{
-                                H[k][l] *= mu[k] * mu[l];
-                                row_sum += fabsf(H[k][l]);
-                            }}
-                            lipschitz = fmaxf(lipschitz, row_sum);
-                        }}
-                        // Sticking: the unconstrained block minimizer, when it lies inside the cone, is exact.
-                        bool solved = false;
-                        {{
-                            float L[5][5], step[5], largest_pivot = 0.0f;
-                            for (int k = 0; k < 5; ++k) largest_pivot = fmaxf(largest_pivot, mu[k] > 0.0f ? H[k][k] : 0.0f);
-                            // Near-singular blocks (rows without response) take the projected-gradient path.
-                            bool positive = largest_pivot > 0.0f;
-                            for (int k = 0; k < 5 && positive; ++k) {{
-                                for (int l = 0; l <= k; ++l) {{
-                                    float value = mu[k] > 0.0f && mu[l] > 0.0f ? H[k][l] : (k == l ? 1.0f : 0.0f);
-                                    for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
-                                    if (k == l) {{
-                                        if (!(value > 1.0e-5f * largest_pivot)) positive = false;
-                                        L[k][k] = sqrtf(fmaxf(value, 0.0f));
-                                    }} else {{
-                                        L[k][l] = value / L[l][l];
-                                    }}
-                                }}
-                            }}
-                            if (positive) {{
-                                for (int k = 0; k < 5; ++k) {{
-                                    float value = mu[k] > 0.0f ? -gradient0[k] : 0.0f;
-                                    for (int m = 0; m < k; ++m) value -= L[k][m] * step[m];
-                                    step[k] = value / L[k][k];
-                                }}
-                                for (int k = 4; k >= 0; --k) {{
-                                    float value = step[k];
-                                    for (int m = k + 1; m < 5; ++m) value -= L[m][k] * step[m];
-                                    step[k] = value / L[k][k];
-                                }}
-                                for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? y0[k] + step[k] : 0.0f;
-                                float trial[5];
-                                for (int k = 0; k < 5; ++k) trial[k] = y[k];
-                                angular_cone_projection(trial, load);
-                                solved = true;
-                                for (int k = 0; k < 5; ++k) solved = solved && trial[k] == y[k];
-                            }}
-                        }}
-                        if (!solved) {{
-                            for (int k = 0; k < 5; ++k) y[k] = y0[k];
-                            angular_cone_projection(y, load);
-                        }}
-                        if (!solved && lipschitz > 0.0f) {{
-                            for (int k = 0; k < 5; ++k) z[k] = y[k];
-                            float momentum = 1.0f;
-                            for (int iteration = 0; iteration < 32; ++iteration) {{
-                                float next[5];
-                                for (int k = 0; k < 5; ++k) {{
-                                    float gradient = gradient0[k];
-                                    for (int l = 0; l < 5; ++l) gradient += H[k][l] * (z[l] - y0[l]);
-                                    next[k] = mu[k] > 0.0f ? z[k] - gradient / lipschitz : 0.0f;
-                                }}
-                                angular_cone_projection(next, load);
-                                float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
-                                float blend = (momentum - 1.0f) / next_momentum;
-                                float change = 0.0f;
-                                for (int k = 0; k < 5; ++k) {{
-                                    change = fmaxf(change, fabsf(next[k] - y[k]));
-                                    z[k] = next[k] + blend * (next[k] - y[k]);
-                                    y[k] = next[k];
-                                }}
-                                momentum = next_momentum;
-                                // Outer sweeps warm-start the block, so stop once an iterate stalls.
-                                if (change <= 1.0e-6f * load) break;
-                            }}
-                        }}
-                        float x[5];
-                        for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
-                        if (omega != 1.0f) {{
-                            for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? x[k] / mu[k] : 0.0f;
-                            angular_cone_projection(y, load);
-                            for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
-                        }}
-                        for (int k = 1; k < 5; ++k) {{
-                            float block_delta = x[k] - s_lam_dense[first_row + k];
-                            if (block_delta != 0.0f) {{
-                                iteration_changed = 1;
-                                for (int d = lane; d < {dofs}; d += 32)
-                                    s_v[d] += Y_world.data[jy_world_base + (first_row + k) * {dofs} + d] * block_delta;
-                            }}
-                            s_lam_dense[first_row + k] = x[k];
-                        }}
-                        new_impulse = x[0];
+                        new_impulse = AngularFrictionBlock::solve(
+                            s_v, &s_lam_dense[first_row], &s_mu_dense[first_row], &s_rhs_dense[first_row],
+                            &J_world.data[jy_world_base + first_row * {dofs}], &Y_world.data[jy_world_base + first_row * {dofs}],
+                            lane, MASK, s_lam_dense[parent_idx], omega, &iteration_changed);
                     }} else {{"""
     block_close = """
                     }"""

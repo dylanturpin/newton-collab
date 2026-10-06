@@ -1268,7 +1268,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
         contact_torsion_device: bool = False,
         enable_torsional_rolling_friction: bool = False,
-        torsional_rolling_friction_cone: Literal["pyramidal", "elliptic"] = "pyramidal",
+        torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
         torsional_rolling_friction_creep_speed: float = 0.0,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
@@ -1372,7 +1372,9 @@ class SolverFeatherPGS(SolverBase):
                 sliding, torsional and rolling impulses. ``"elliptic"`` bounds their Euclidean norm, as
                 MuJoCo's elliptic cone does. ``"pyramidal"`` bounds the sum of the three block norms, with a
                 disk inside the sliding and rolling blocks; this differs from MuJoCo's component-wise
-                pyramid. Construction-only.
+                pyramid. Its maximum-dissipation solution concentrates the budget on the block with the
+                largest normalized velocity, so a pivoting contact keeps no sliding stiction until it
+                slips. Construction-only.
             torsional_rolling_friction_creep_speed: Experimental creep speed [m/s] that softens
                 torsional/rolling stiction: below the bound, the coefficient times the relative angular
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
