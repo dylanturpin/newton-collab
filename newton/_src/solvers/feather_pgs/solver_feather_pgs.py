@@ -1278,12 +1278,13 @@ class SolverFeatherPGS(SolverBase):
                 state, as in ``solver.step(states[i], states[i + 1], ...)``. Gradients reach
                 ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
                 ``Control.joint_target_q`` and ``Control.joint_target_qd``. Model parameters are not validated
-                gradient inputs. Contacts are supported for normal rows on articulations with more than one
-                body (``pgs_mode="split"``, ``enable_contact_friction=False``, zero restitution and
-                contact regularization), and ``step`` raises otherwise. The contact set and its row layout are
-                held fixed for the derivative. Contact points come from the given buffers and are
-                stop-gradient; the gap and Jacobians are recomputed from the step's poses, the normal is
-                stop-gradient, and every PGS iteration is differentiated as executed.
+                gradient inputs. Contacts are supported on articulations with more than one body, with
+                normal rows and point friction (``pgs_mode="split"``, no shared friction anchor, zero
+                restitution and contact regularization), and ``step`` raises otherwise. The contact set and its
+                row layout are held fixed for the derivative. Contact points come from the given buffers and
+                are stop-gradient; the gap and Jacobians are recomputed from the step's poses, the normal is
+                stop-gradient, and every PGS iteration, including the friction root solve, is differentiated
+                as executed. Contact activation and stick/slip switches are nonsmooth.
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True``, no
                 particles, kinematic bodies, mimic or loop-closing joints, single-body free articulations
                 or rigid-body velocity limits, and the solver uses immediate response, augmented drives,

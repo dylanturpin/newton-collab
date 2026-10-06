@@ -18,8 +18,10 @@ import warp as wp
 from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import JointType
+from .friction_patches import contact_tangent_basis
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     _compute_body_net_wrench,
     _gyro_skew,
     allocate_world_contact_slots,
@@ -41,6 +43,9 @@ from .kernels import (
 
 if TYPE_CHECKING:
     from .solver_feather_pgs import SolverFeatherPGS
+
+# Unroll the friction pair's fixed Newton and bisection loops so the reverse pass sees every iterate.
+wp.set_module_options({"max_unroll": 32})
 
 
 def validate_differentiable_options(model: Model, options: dict) -> None:
@@ -434,7 +439,7 @@ class DifferentiableStep:
         checks = (
             (solver.pgs_mode != "split", 'pgs_mode="split" with contacts'),
             (solver._has_free_rigid_bodies, "no single-body free articulations with contacts"),
-            (solver.enable_contact_friction, "enable_contact_friction=False"),
+            (solver.contact_friction_shared_anchor and solver.enable_contact_friction, "no shared friction anchor"),
             (self.has_restitution, "zero contact restitution"),
             (solver._regularization_enabled, "pgs_contact_regularization=0"),
         )
@@ -512,7 +517,7 @@ class DifferentiableStep:
                 max_rows,
                 solver.mf_max_constraints,
                 solver.propagation_max_constraints,
-                0,
+                int(solver.enable_contact_friction),
                 solver.contact_friction_gap_threshold,
                 1 if solver.contact_friction_articulation_pairs_only else 0,
                 solver._friction_patches.view,
@@ -571,10 +576,9 @@ class DifferentiableStep:
             array.zero_()
         wp.launch(
             _dense_contact_rows,
-            dim=threads,
+            dim=c.capacity,
             inputs=[
                 c.count,
-                threads,
                 c.point0,
                 c.point1,
                 c.normal,
@@ -587,6 +591,7 @@ class DifferentiableStep:
                 c.art_a,
                 c.art_b,
                 c.path,
+                c.slots_needed,
                 model.shape_body,
                 b.body_q,
                 b.body_v_s,
@@ -595,6 +600,8 @@ class DifferentiableStep:
                 solver.shape_material_mu,
                 solver.shape_material_restitution,
                 int(solver.contact_shared_anchor),
+                solver.contact_friction_scale,
+                solver.friction_anchor_beta,
                 solver.pgs_beta,
                 solver.pgs_cfm,
             ],
@@ -605,10 +612,9 @@ class DifferentiableStep:
             n_arts = solver.n_arts_by_size[size]
             wp.launch(
                 _dense_contact_jacobian,
-                dim=(threads, size),
+                dim=(c.capacity, size),
                 inputs=[
                     c.count,
-                    threads,
                     c.point0,
                     c.point1,
                     c.normal,
@@ -620,6 +626,7 @@ class DifferentiableStep:
                     c.art_a,
                     c.art_b,
                     c.path,
+                    c.slots_needed,
                     size,
                     solver.articulation_response_dof_count,
                     solver.art_group_idx,
@@ -712,11 +719,23 @@ class DifferentiableStep:
 
         # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
         c.impulses[0].zero_()
+        friction_start = solver._contact_friction_start_iteration(solver.pgs_iterations)
         for k in range(solver.pgs_iterations):
             wp.launch(
                 _dense_pgs_sweep,
                 dim=solver.world_count,
-                inputs=[c.row_count, c.diag, c.C, c.rhs, c.row_type, solver.pgs_omega, c.impulses[k]],
+                inputs=[
+                    c.row_count,
+                    c.diag,
+                    c.C,
+                    c.rhs,
+                    c.row_type,
+                    c.row_parent,
+                    c.row_mu,
+                    solver.pgs_omega,
+                    int(k < friction_start),
+                    c.impulses[k],
+                ],
                 outputs=[c.residuals[k], c.impulses[k + 1]],
                 device=device,
             )
@@ -1339,7 +1358,6 @@ def _contact_world_points(
 @wp.kernel
 def _dense_contact_rows(
     contact_count: wp.array[int],
-    thread_count: int,
     point0: wp.array[wp.vec3],
     point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -1352,6 +1370,7 @@ def _dense_contact_rows(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    slots_needed: wp.array[int],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
@@ -1360,6 +1379,8 @@ def _dense_contact_rows(
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     contact_shared_anchor: int,
+    contact_friction_scale: float,
+    friction_anchor_beta: float,
     pgs_beta: float,
     pgs_cfm: float,
     # outputs
@@ -1371,9 +1392,12 @@ def _dense_contact_rows(
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
 ):
-    """Normal-row metadata of _populate_world_J_for_size_contact, one write per contact."""
-    total = wp.min(contact_count[0], point0.shape[0])
-    for c in range(wp.tid(), total, thread_count):
+    """Row metadata of _populate_world_J_for_size_contact for point contacts, one thread per contact.
+
+    One thread per contact slot: Warp's reverse of an empty strided range replays one iteration.
+    """
+    c = wp.tid()
+    if c < wp.min(contact_count[0], point0.shape[0]):
         slot = contact_slot[c]
         if contact_path[c] == 0 and slot >= 0:
             world = contact_world[c]
@@ -1420,6 +1444,36 @@ def _dense_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
+            if slots_needed[c] == 3:
+                t0, t1 = contact_tangent_basis(normal)
+                friction_a = point_a
+                friction_b = point_b
+                if contact_shared_anchor != 0:
+                    friction_a = anchor
+                    friction_b = anchor
+                for k in range(2):
+                    tangent = t0
+                    if k == 1:
+                        tangent = t1
+                    row = slot + 1 + k
+                    row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                    row_parent[world, row] = slot
+                    row_mu[world, row] = mu * contact_friction_scale
+                    row_beta[world, row] = friction_anchor_beta
+                    row_cfm[world, row] = pgs_cfm
+                    row_phi[world, row] = 0.0
+                    row_target_velocity[world, row] = prescribed_relative_contact_target(
+                        body_a,
+                        contact_art_a[c],
+                        body_b,
+                        contact_art_b[c],
+                        friction_a,
+                        friction_b,
+                        tangent,
+                        prescribed_articulation,
+                        articulation_origin,
+                        body_v_s,
+                    )
 
 
 @wp.func
@@ -1449,7 +1503,6 @@ def _contact_jacobian_entry(
 @wp.kernel
 def _dense_contact_jacobian(
     contact_count: wp.array[int],
-    thread_count: int,
     point0: wp.array[wp.vec3],
     point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -1461,6 +1514,7 @@ def _dense_contact_jacobian(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    slots_needed: wp.array[int],
     target_size: int,
     articulation_response_dof_count: wp.array[int],
     art_group_idx: wp.array[int],
@@ -1474,10 +1528,9 @@ def _dense_contact_jacobian(
     # outputs
     J_group: wp.array3d[float],
 ):
-    """One normal-row Jacobian entry per (contact, DOF), summed in populate_world_J_for_size's order."""
-    thread, dof = wp.tid()
-    total = wp.min(contact_count[0], point0.shape[0])
-    for c in range(thread, total, thread_count):
+    """Normal and point-friction Jacobian entries per (contact, DOF), summed in populate_world_J_for_size's order."""
+    c, dof = wp.tid()
+    if c < wp.min(contact_count[0], point0.shape[0]):
         slot = contact_slot[c]
         if contact_path[c] == 0 and slot >= 0:
             normal = -contact_normal[c]
@@ -1490,56 +1543,67 @@ def _dense_contact_jacobian(
             point_a, point_b = _contact_world_points(
                 c, point0, point1, normal, body_a, body_b, margin0, margin1, body_q
             )
+            anchor = 0.5 * (point_a + point_b)
             if contact_shared_anchor != 0:
-                point_a = 0.5 * (point_a + point_b)
-                point_b = point_a
+                point_a = anchor
+                point_b = anchor
             art_a = contact_art_a[c]
             art_b = contact_art_b[c]
             a_matches = art_a >= 0 and articulation_response_dof_count[art_a] == target_size
             b_matches = art_b >= 0 and articulation_response_dof_count[art_b] == target_size
-            if a_matches:
-                value = float(0.0)
-                value += _contact_jacobian_entry(
-                    body_a,
-                    art_a,
-                    1.0,
-                    point_a,
-                    normal,
-                    dof,
-                    articulation_dof_start,
-                    articulation_origin,
-                    body_dof_chain,
-                    joint_S_s,
-                )
-                if b_matches and art_b == art_a:
+            row_total = 1
+            t0, t1 = contact_tangent_basis(normal)
+            if slots_needed[c] == 3:
+                row_total = 3
+            for k in range(row_total):
+                direction = normal
+                if k == 1:
+                    direction = t0
+                elif k == 2:
+                    direction = t1
+                if a_matches:
+                    value = float(0.0)
                     value += _contact_jacobian_entry(
-                        body_b,
-                        art_b,
-                        -1.0,
-                        point_b,
-                        normal,
+                        body_a,
+                        art_a,
+                        1.0,
+                        point_a,
+                        direction,
                         dof,
                         articulation_dof_start,
                         articulation_origin,
                         body_dof_chain,
                         joint_S_s,
                     )
-                J_group[art_group_idx[art_a], slot, dof] = value
-            if b_matches and art_b != art_a:
-                value = float(0.0)
-                value += _contact_jacobian_entry(
-                    body_b,
-                    art_b,
-                    -1.0,
-                    point_b,
-                    normal,
-                    dof,
-                    articulation_dof_start,
-                    articulation_origin,
-                    body_dof_chain,
-                    joint_S_s,
-                )
-                J_group[art_group_idx[art_b], slot, dof] = value
+                    if b_matches and art_b == art_a:
+                        value += _contact_jacobian_entry(
+                            body_b,
+                            art_b,
+                            -1.0,
+                            point_b,
+                            direction,
+                            dof,
+                            articulation_dof_start,
+                            articulation_origin,
+                            body_dof_chain,
+                            joint_S_s,
+                        )
+                    J_group[art_group_idx[art_a], slot + k, dof] = value
+                if b_matches and art_b != art_a:
+                    value = float(0.0)
+                    value += _contact_jacobian_entry(
+                        body_b,
+                        art_b,
+                        -1.0,
+                        point_b,
+                        direction,
+                        dof,
+                        articulation_dof_start,
+                        articulation_origin,
+                        body_dof_chain,
+                        joint_S_s,
+                    )
+                    J_group[art_group_idx[art_b], slot + k, dof] = value
 
 
 @wp.func
@@ -1674,32 +1738,169 @@ def _dense_pgs_sweep(
     C: wp.array3d[float],
     rhs: wp.array2d[float],
     row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
     omega: float,
+    skip_friction: int,
     impulses_in: wp.array2d[float],
     # outputs
     residuals: wp.array2d[float],
     impulses_out: wp.array2d[float],
 ):
-    """One pgs_solve_loop sweep over normal rows; earlier rows of this sweep read impulses_out.
+    """One pgs_solve_loop sweep for normal and point-friction rows; earlier rows read impulses_out.
 
-    Each residual is stored and read back: the reverse pass replays code after a dynamic loop with
-    the loop-carried sum's initial value, so the projection must branch on the stored residual.
+    Residuals are stored and read back: the reverse pass replays code after a dynamic loop with the
+    loop-carried sum's initial value, so projections must branch on stored values.
     """
     world = wp.tid()
     m = row_count[world]
     for i in range(m):
-        w = rhs[world, i]
-        for j in range(m):
-            impulse = impulses_in[world, j]
-            if j < i:
-                impulse = impulses_out[world, j]
-            w += C[world, i, j] * impulse
-        residuals[world, i] = w
-        residual = residuals[world, i]
-        new_impulse = impulses_in[world, i]
-        denom = diag[world, i]
-        if denom > 0.0:
-            new_impulse = impulses_in[world, i] + omega * (-residual / denom)
-            if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
-                new_impulse = 0.0
-        impulses_out[world, i] = new_impulse
+        kind = row_type[world, i]
+        if kind == PGS_CONSTRAINT_TYPE_FRICTION and skip_friction != 0:
+            impulses_out[world, i] = 0.0
+        elif kind != PGS_CONSTRAINT_TYPE_FRICTION or i == row_parent[world, i] + 1:
+            w = rhs[world, i]
+            for j in range(m):
+                impulse = impulses_in[world, j]
+                if j < i:
+                    impulse = impulses_out[world, j]
+                w += C[world, i, j] * impulse
+            residuals[world, i] = w
+            residual = residuals[world, i]
+            denom = diag[world, i]
+            if kind != PGS_CONSTRAINT_TYPE_FRICTION:
+                new_impulse = impulses_in[world, i]
+                if denom > 0.0:
+                    new_impulse = impulses_in[world, i] + omega * (-residual / denom)
+                    if kind == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
+                        new_impulse = 0.0
+                impulses_out[world, i] = new_impulse
+            else:
+                parent = row_parent[world, i]
+                sibling = parent + 2
+                radius = wp.max(row_mu[world, i] * impulses_out[world, parent], 0.0)
+                if radius <= 0.0:
+                    impulses_out[world, i] = 0.0
+                    impulses_out[world, sibling] = 0.0
+                else:
+                    w_sibling = rhs[world, sibling]
+                    for j in range(m):
+                        impulse = impulses_in[world, j]
+                        if j < i:
+                            impulse = impulses_out[world, j]
+                        w_sibling += C[world, sibling, j] * impulse
+                    residuals[world, sibling] = w_sibling
+                    trial = _friction_pair_unrolled(
+                        denom,
+                        C[world, i, sibling],
+                        diag[world, sibling],
+                        wp.vec2(residual, residuals[world, sibling]),
+                        wp.vec2(impulses_in[world, i], impulses_in[world, sibling]),
+                        radius,
+                        omega,
+                    )
+                    a = trial[0]
+                    b = trial[1]
+                    magnitude = wp.sqrt(a * a + b * b)
+                    if magnitude > radius:
+                        scale = radius / magnitude
+                        a *= scale
+                        b *= scale
+                    impulses_out[world, i] = a
+                    impulses_out[world, sibling] = b
+
+
+@wp.func
+def _friction_pair_unrolled(
+    a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float, omega: float
+) -> wp.vec2:
+    """friction_pair_candidate with its Newton and bisection loops unrolled and no early exits."""
+    if radius <= 0.0:
+        return wp.vec2(0.0)
+    scale = wp.max(wp.max(a, d), 1.0e-20)
+    a /= scale
+    c /= scale
+    d /= scale
+    largest = 0.5 * (a + d + wp.sqrt((a - d) * (a - d) + 4.0 * c * c))
+    smallest = float(0.0)
+    if largest > 0.0:
+        smallest = wp.max((a * d - c * c) / largest, 0.0)
+    axis = wp.vec2(c, largest - a)
+    if a >= d:
+        axis = wp.vec2(largest - d, c)
+    if wp.length(axis) > 0.0:
+        axis = wp.normalize(axis)
+    else:
+        axis = wp.vec2(1.0, 0.0)
+    perpendicular = wp.vec2(-axis[1], axis[0])
+    residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual)) / scale
+    result = old
+    sticking = bool(False)
+    if largest > 0.0 and (smallest > 0.0 or residual_rotated[1] == 0.0):
+        correction = (residual_rotated[0] / largest) * axis
+        if smallest > 0.0:
+            correction += (residual_rotated[1] / smallest) * perpendicular
+        result = old - correction
+        sticking = wp.length(result) <= radius
+    retained = bool(False)
+    if not sticking:
+        old_norm = wp.length(old)
+        residual_norm = wp.length(residual)
+        cross_residual = residual[0] * old[1] - residual[1] * old[0]
+        if (
+            old_norm > 0.0
+            and old_norm <= radius
+            and radius - old_norm <= 2.0e-7 * radius
+            and wp.dot(residual, old) <= 0.0
+            and wp.abs(cross_residual) <= 2.0e-7 * old_norm * residual_norm
+        ):
+            retained = True
+        if not retained:
+            old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
+            b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
+            solution = wp.vec2(0.0)
+            lo = float(0.0)
+            hi = wp.length(b) / radius
+            if hi > 0.0:
+                lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) / radius - smallest), 0.0)
+                alpha = lo
+                converged = bool(False)
+                for _ in range(8):
+                    if not converged:
+                        inv0 = 1.0 / (largest + alpha)
+                        inv1 = float(0.0)
+                        if smallest + alpha > 0.0:
+                            inv1 = 1.0 / (smallest + alpha)
+                        trial = old_rotated - wp.vec2(
+                            (residual_rotated[0] + alpha * old_rotated[0]) * inv0,
+                            (residual_rotated[1] + alpha * old_rotated[1]) * inv1,
+                        )
+                        norm = wp.length(trial)
+                        if wp.abs(norm - radius) <= 2.0e-7 * radius or (alpha == 0.0 and norm <= radius):
+                            solution = trial
+                            converged = True
+                        else:
+                            if norm > radius:
+                                lo = alpha
+                            else:
+                                hi = alpha
+                            slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
+                            candidate = alpha
+                            if slope > 0.0:
+                                candidate = alpha + (norm / radius - 1.0) * norm * norm / slope
+                            alpha = 0.5 * (lo + hi)
+                            if candidate > lo and candidate < hi:
+                                alpha = candidate
+                if not converged:
+                    for _ in range(24):
+                        alpha = 0.5 * (lo + hi)
+                        trial = wp.vec2(b[0] / (largest + alpha), b[1] / (smallest + alpha))
+                        if wp.length(trial) > radius:
+                            lo = alpha
+                        else:
+                            hi = alpha
+                    solution = wp.vec2(b[0] / (largest + hi), b[1] / (smallest + hi))
+            result = old + (solution[0] - old_rotated[0]) * axis + (solution[1] - old_rotated[1]) * perpendicular
+    if retained:
+        return old
+    return old + omega * (result - old)

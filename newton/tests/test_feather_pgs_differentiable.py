@@ -164,9 +164,6 @@ def test_rejects_unsupported_configs(test, device):
     state = model.state(requires_grad=True)
     with test.assertRaisesRegex(ValueError, "distinct input and output states"):
         solver.step(state, state, None, None, _DT)
-    with test.assertRaisesRegex(NotImplementedError, "contacts"):
-        contacts = newton.CollisionPipeline(model, rigid_contact_max=8).contacts()
-        solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
 
 
 def test_forward_matches_default(test, device):
@@ -438,7 +435,7 @@ def test_contact_rejects_unsupported_configs(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     unsupported = [
-        {**_CONTACT_OPTIONS, "enable_contact_friction": True},
+        {**_CONTACT_OPTIONS, "enable_contact_friction": True, "contact_friction_shared_anchor": True},
         {**_CONTACT_OPTIONS, "pgs_contact_regularization": 0.1},
     ]
     if wp.get_device(device).is_cuda:
@@ -458,6 +455,111 @@ def test_contact_rejects_unsupported_configs(test, device):
             solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
 
 
+def _build_slider_on_plane(device):
+    """Sphere on a prismatic x/y/z chain resting on a plane: one contact with one friction pair."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
+    inertia = wp.mat33(np.eye(3) * 0.01)
+    link_x = builder.add_link(mass=1.0, inertia=inertia)
+    link_y = builder.add_link(mass=0.5, inertia=inertia)
+    link_z = builder.add_link(mass=0.3, xform=wp.transform(wp.vec3(0.0, 0.0, 0.098), wp.quat_identity()))
+    builder.add_shape_sphere(link_z, radius=0.1, cfg=cfg)
+    joints = [
+        builder.add_joint_prismatic(-1, link_x, axis=(1.0, 0.0, 0.0)),
+        builder.add_joint_prismatic(link_x, link_y, axis=(0.0, 1.0, 0.0)),
+        builder.add_joint_prismatic(
+            link_y,
+            link_z,
+            axis=(0.0, 0.0, 1.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.098), wp.quat_identity()),
+        ),
+    ]
+    builder.add_articulation(joints)
+    builder.add_ground_plane(cfg=cfg)
+    return builder.finalize(device=device, requires_grad=True)
+
+
+def test_friction_gradient_matches_finite_difference(test, device):
+    model = _build_slider_on_plane(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+    steps = 5
+    eps = 1.0e-3
+    rng = np.random.default_rng(7)
+    wq = wp.array(rng.normal(size=3).astype(np.float32), device=device)
+    wqd = wp.array(rng.normal(size=3).astype(np.float32), device=device)
+    options = {**_CONTACT_OPTIONS, "enable_contact_friction": True}
+
+    def rollout(values, *, differentiable, tape=None):
+        solver = SolverFeatherPGS(model, differentiable=differentiable, pgs_iterations=8, **options)
+        states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+        states[0].joint_qd.assign(values["joint_qd"])
+        states[0].joint_q.assign(values["joint_q"])
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        control.joint_f.assign(values["joint_f"])
+        contacts = pipeline.contacts()
+        for k in range(steps):
+            pipeline.collide(states[k], contacts)
+            if tape is not None:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], control, contacts, _DT)
+            if tape is not None:
+                tape.__exit__(None, None, None)
+        loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        if tape is not None:
+            tape.__enter__()
+        wp.launch(
+            _weighted_loss,
+            dim=3,
+            inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+            outputs=[loss],
+            device=device,
+        )
+        if tape is not None:
+            tape.__exit__(None, None, None)
+        return loss, states, control
+
+    # Coulomb budget mu * m_sphere * g is about 22 N: 2 N sticks, 60 N slides.
+    for regime, push in (("stick", 2.0), ("slide", 60.0)):
+        inputs = {
+            "joint_q": np.zeros(3, np.float32),
+            "joint_qd": np.array([0.02, -0.01, 0.0], np.float32),
+            "joint_f": np.array([push, 0.4 * push, 0.0], np.float32),
+        }
+        _, reference, _ = rollout(inputs, differentiable=False)
+        tape = wp.Tape()
+        loss, states, control = rollout(inputs, differentiable=True, tape=tape)
+        tape.backward(loss)
+        with test.subTest(regime=regime, check="forward"):
+            if wp.get_device(device).is_cpu:
+                np.testing.assert_array_equal(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy())
+            else:
+                np.testing.assert_allclose(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy(), atol=1.0e-6)
+        for state in states[1:]:
+            rows = state._fpgs_differentiable_buffers.contacts
+            impulse = rows.impulses[-1].numpy()[0, :3]
+            budget = 0.5 * impulse[0]
+            tangential = np.hypot(impulse[1], impulse[2])
+            with test.subTest(regime=regime, check="regime"):
+                if regime == "stick":
+                    test.assertLess(tangential, 0.9 * budget)
+                else:
+                    test.assertAlmostEqual(tangential, budget, delta=1.0e-5 * budget)
+        gradients = {
+            "joint_q": states[0].joint_q.grad.numpy(),
+            "joint_qd": states[0].joint_qd.grad.numpy(),
+            "joint_f": control.joint_f.grad.numpy(),
+        }
+        for key, gradient in gradients.items():
+            direction = rng.normal(size=3).astype(np.float32)
+            direction /= np.linalg.norm(direction)
+            plus = rollout(dict(inputs, **{key: inputs[key] + eps * direction}), differentiable=True)[0]
+            minus = rollout(dict(inputs, **{key: inputs[key] - eps * direction}), differentiable=True)[0]
+            fd = (plus.numpy()[0] - minus.numpy()[0]) / (2.0 * eps)
+            with test.subTest(regime=regime, input=key):
+                test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -472,6 +574,7 @@ for _device in get_test_devices():
         test_contact_forward_matches_default,
         test_contact_gradient_matches_finite_difference,
         test_contact_rejects_unsupported_configs,
+        test_friction_gradient_matches_finite_difference,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
 
