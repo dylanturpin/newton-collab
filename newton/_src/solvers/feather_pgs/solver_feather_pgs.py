@@ -12655,11 +12655,14 @@ class SolverFeatherPGS(SolverBase):
                 else:
                     self._stage4_diag_from_JY(size)
         elif self._hinv_jt_writes_world:
+            # This reduction skips locally owned worlds.
             self._stage4_diag_from_JY_world()
+            return
         else:
             for size in self.size_groups:
                 self._stage4_diag_from_JY(size)
-        if self._local_internal_fast_path and not self._hinv_jt_writes_world:
+        # Local owners add the response themselves, so their rows keep only CFM.
+        if self._local_internal_fast_path:
             wp.launch(
                 clear_local_solve_diag,
                 dim=self.world_count * self.dense_max_constraints,
