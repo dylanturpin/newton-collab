@@ -7867,6 +7867,40 @@ def compute_mf_rhs_bias(
 
 
 @wp.kernel
+def count_propagation_coupled_bodies(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    propagation_body_coupling_group: wp.array[int],
+    # outputs
+    propagation_body_split_seen: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
+):
+    """Count the distinct row-bearing bodies in each coupling group."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    ba = propagation_body_a[world, i]
+    if ba >= 0 and wp.atomic_add(propagation_body_split_seen, ba, 1) == 0:
+        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[ba], 1)
+    bb = propagation_body_b[world, i]
+    if bb >= 0 and wp.atomic_add(propagation_body_split_seen, bb, 1) == 0:
+        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[bb], 1)
+
+
+@wp.func
+def propagation_body_split(
+    body: int,
+    propagation_body_coupling_group: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
+) -> float:
+    return float(wp.max(propagation_coupling_group_body_count[propagation_body_coupling_group[body]], 1))
+
+
+@wp.kernel
 def compute_propagation_effective_mass_and_rhs(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
@@ -7874,6 +7908,8 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     propagation_body_response: wp.array3d[float],
+    propagation_body_coupling_group: wp.array[int],
+    propagation_coupling_group_body_count: wp.array[int],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_restitution: wp.array2d[float],
@@ -7905,20 +7941,29 @@ def compute_propagation_effective_mass_and_rhs(
     row_type = propagation_row_type[world, i]
 
     d = pgs_cfm
+    d_unsplit = pgs_cfm
 
+    # Mass splitting: a sweep sees only each body's own response, so a body shares its coupling
+    # group's mobility with the group's other row-bearing bodies to damp the Jacobi update.
     if ba >= 0:
+        split_a = propagation_body_split(ba, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
             value = float(0.0)
             for c in range(6):
                 value += propagation_body_response[ba, r, c] * propagation_J_a[world, i, c]
+            d_unsplit += propagation_J_a[world, i, r] * value
+            value *= split_a
             propagation_MiJt_a[world, i, r] = value
             d += propagation_J_a[world, i, r] * value
 
     if bb >= 0:
+        split_b = propagation_body_split(bb, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
             value = float(0.0)
             for c in range(6):
                 value += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
+            d_unsplit += propagation_J_b[world, i, r] * value
+            value *= split_b
             propagation_MiJt_b[world, i, r] = value
             d += propagation_J_b[world, i, r] * value
 
@@ -7967,6 +8012,9 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_rhs[world, i] = bias
     propagation_restitution_target[world, i] = restitution_target
     if contact_w < 1.0:
+        if row_w < 1.0 and d != d_unsplit:
+            # Regularize against the unsplit diagonal so splitting changes the step, not the fixed point.
+            row_w = contact_w * d / (contact_w * d + (1.0 - contact_w) * d_unsplit)
         propagation_row_w[world, i] = row_w
 
 
@@ -8477,6 +8525,7 @@ def refine_same_articulation_propagation_rows(
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     pgs_cfm: float,
+    contact_w: float,
     propagation_max_constraints: int,
     # scratch
     propagation_tree_pA: wp.array2d[float],
@@ -8487,6 +8536,7 @@ def refine_same_articulation_propagation_rows(
     propagation_eff_mass_inv: wp.array2d[float],
     propagation_MiJt_a: wp.array3d[float],
     propagation_MiJt_b: wp.array3d[float],
+    propagation_row_w: wp.array2d[float],
 ):
     """Exact response for rows whose two bodies are links of one articulation.
 
@@ -8644,6 +8694,9 @@ def refine_same_articulation_propagation_rows(
             propagation_eff_mass_inv[world, i] = 1.0 / d
         else:
             propagation_eff_mass_inv[world, i] = 0.0
+        # The exact response is unsplit, so the row keeps the uniform regularization weight.
+        if contact_w < 1.0 and propagation_row_w[world, i] < 1.0:
+            propagation_row_w[world, i] = contact_w
 
 
 @wp.kernel

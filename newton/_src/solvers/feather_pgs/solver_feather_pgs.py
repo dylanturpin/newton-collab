@@ -133,6 +133,7 @@ from .kernels import (
     compute_world_contact_bias,
     compute_world_contact_velocity_bias,
     copy_free_rigid_propagation_body_response,
+    count_propagation_coupled_bodies,
     crba_fill_par_dof,
     delassus_par_row_col,
     diag_from_JY_par_art,
@@ -1539,17 +1540,22 @@ class SolverFeatherPGS(SolverBase):
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
-                rows on every route (matrix-free, dense, propagation). Each position iteration moves a
-                row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
-                weight ``g/(1+g)``, which is the same update as a damped contact spring integrated
-                implicitly. It is a numerical stabilizer, not a material model: it makes statically
-                indeterminate normal-force splits unique, damps the Gauss-Seidel sweep enough to hold
-                stacks that the exact rigid law drops at the same iteration count, and costs a resting
-                sag of ``g * a * dt^2 / pgs_beta`` per loaded row (0.3 mm at 60 Hz for a body under
-                gravity at ``g = 0.02``). Positive-gap speculative rows and rows whose rebound
-                target fires are solved rigid, and the velocity-only pass ignores ``g``. ``0`` is the
-                exact rigid law. Values above ``1e6`` are rejected because they are not
-                numerically useful in the float32 solve. Defaults to 0.0.
+                rows on every route (matrix-free, dense, propagation). Every route converges to
+                ``r + g * d * lambda = 0`` for a row with velocity residual ``r``, impulse ``lambda``
+                and unsplit Delassus diagonal ``d``, the equilibrium of a damped contact spring
+                integrated implicitly. Each position iteration moves a row's impulse toward the hard
+                solution with weight ``w = 1/(1+g)`` and toward zero with weight ``1 - w``.
+                Propagation rows whose response is split across coupled contact bodies, with split
+                diagonal ``d_s``, take weight ``w * d_s / (w * d_s + (1 - w) * d)``, which reaches
+                the same fixed point with a different step. It is a numerical stabilizer, not a
+                material model: it makes statically indeterminate normal-force splits unique, damps
+                the Gauss-Seidel sweep enough to hold stacks that the exact rigid law drops at the
+                same iteration count, and costs a resting sag of ``g * a * dt^2 / pgs_beta`` per
+                loaded row (0.3 mm at 60 Hz for a body under gravity at ``g = 0.02``). Positive-gap
+                speculative rows and rows whose rebound target fires are solved rigid, and the
+                velocity-only pass ignores ``g``. ``0`` is the exact rigid law. Values above ``1e6``
+                are rejected because they are not numerically useful in the float32 solve.
+                Defaults to 0.0.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
@@ -4661,6 +4667,7 @@ class SolverFeatherPGS(SolverBase):
             self.body_response_dof_mask = None
             self.body_single_response_dof = None
             self._body_single_response_dof_host = None
+            self._body_coupling_group_host = None
             return
 
         joint_child = model.joint_child.numpy()
@@ -4692,6 +4699,8 @@ class SolverFeatherPGS(SolverBase):
         body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
         body_response_dof_mask = np.zeros(model.body_count, dtype=np.uint32)
         body_single_response_dof = np.full(model.body_count, -1, dtype=np.int32)
+        # Only bodies sharing their topmost moving ancestor joint can have a cross response.
+        body_coupling_group = np.arange(model.body_count, dtype=np.int32)
         for body, joint in enumerate(body_to_joint):
             articulation = body_to_articulation[body]
             if joint < 0 or articulation < 0:
@@ -4714,6 +4723,7 @@ class SolverFeatherPGS(SolverBase):
                 overlap_end = min(joint_dof_end, response_end)
                 if overlap_start < overlap_end:
                     body_has_response_dofs[body] = 1
+                    body_coupling_group[body] = joint_child[ancestor_joint]
                     for global_dof in range(overlap_start, overlap_end):
                         response_dofs.append(global_dof)
                         local_dof = global_dof - response_start
@@ -4730,6 +4740,7 @@ class SolverFeatherPGS(SolverBase):
         self.body_response_dof_mask = wp.array(body_response_dof_mask, dtype=wp.uint32, device=device)
         self.body_single_response_dof = wp.array(body_single_response_dof, dtype=wp.int32, device=device)
         self._body_single_response_dof_host = body_single_response_dof
+        self._body_coupling_group_host = body_coupling_group
 
     def _classify_free_rigid_bodies(self, model):
         """Materialize free-rigid execution metadata from the model plan."""
@@ -5856,6 +5867,9 @@ class SolverFeatherPGS(SolverBase):
             self.propagation_body_com_rel = None
             self.propagation_body_seen = None
             self.propagation_body_local_slot = None
+            self.propagation_body_coupling_group = None
+            self.propagation_body_split_seen = None
+            self.propagation_coupling_group_body_count = None
             self.propagation_joint_S_flat = None
             self.propagation_tree_Ia = None
             self.propagation_tree_U = None
@@ -5986,6 +6000,12 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_body_com_rel = wp.zeros((body_count, 3), dtype=wp.float32, device=device)
         self.propagation_body_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
         self.propagation_body_local_slot = wp.zeros((body_count,), dtype=wp.int32, device=device)
+        coupling_group = self._body_coupling_group_host
+        if coupling_group is None:
+            coupling_group = np.arange(body_count, dtype=np.int32)
+        self.propagation_body_coupling_group = wp.array(coupling_group, dtype=wp.int32, device=device)
+        self.propagation_body_split_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
+        self.propagation_coupling_group_body_count = wp.zeros((body_count,), dtype=wp.int32, device=device)
 
         # ── Cached-response buffers (propagation_cached_response) ───────────
         # R: per (world, active-body slot) full joint-space response matrix
@@ -7654,6 +7674,21 @@ class SolverFeatherPGS(SolverBase):
         # rewrites all active rows each step, so stale entries past the count
         # are never read.
         with self._sync_timed("prop_setup_effective_mass_rhs"):
+            self.propagation_body_split_seen.zero_()
+            self.propagation_coupling_group_body_count.zero_()
+            wp.launch(
+                count_propagation_coupled_bodies,
+                dim=self.world_count * self.propagation_max_constraints,
+                inputs=[
+                    self.propagation_constraint_count,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_max_constraints,
+                    self.propagation_body_coupling_group,
+                ],
+                outputs=[self.propagation_body_split_seen, self.propagation_coupling_group_body_count],
+                device=self.model.device,
+            )
             wp.launch(
                 compute_propagation_effective_mass_and_rhs,
                 dim=self.world_count * self.propagation_max_constraints,
@@ -7664,6 +7699,8 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_J_a,
                     self.propagation_J_b,
                     self.propagation_body_response,
+                    self.propagation_body_coupling_group,
+                    self.propagation_coupling_group_body_count,
                     self.propagation_phi,
                     self.propagation_row_type,
                     self.propagation_row_restitution,
@@ -7715,6 +7752,7 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_J_a,
                         self.propagation_J_b,
                         self.pgs_cfm,
+                        self._contact_w,
                         self.propagation_max_constraints,
                         self.propagation_tree_pA,
                         self.propagation_tree_u,
@@ -7725,6 +7763,7 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_eff_mass_inv,
                         self.propagation_MiJt_a,
                         self.propagation_MiJt_b,
+                        self.propagation_row_w,
                     ],
                     device=self.model.device,
                 )
