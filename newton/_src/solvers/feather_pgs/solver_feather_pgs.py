@@ -8581,8 +8581,6 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
-        if self._differentiable_step is not None:
-            return self._differentiable_step.step(state_in, state_out, control, contacts, dt)
         if self._sparse_mass_matrix_size is not None and (
             self.pgs_mode != "matrix_free"
             or self.pgs_schedule != "interleaved"
@@ -8610,6 +8608,8 @@ class SolverFeatherPGS(SolverBase):
                 f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
             )
+        if self._differentiable_step is not None:
+            return self._differentiable_step.step(state_in, state_out, control, contacts, dt)
         if self.pgs_warmstart:
             # A reduced stream is valid when it carries retained identities.
             # Preserve the reader lease for an unreduced captured stream: a
