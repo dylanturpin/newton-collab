@@ -2614,6 +2614,9 @@ class SolverFeatherPGS(SolverBase):
         self._setup_sparse_mass_matrix(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
+        if not model.requires_grad:
+            # These buffers carry the FK/ID cache between steps; a graph that allocates them frees them on relaunch.
+            self._allocate_state_aux_vars(model, self, False)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
         # Torsion must never reinterpret it, including when patch PRs are merged.
         self._contact_torsion_group = wp.full(

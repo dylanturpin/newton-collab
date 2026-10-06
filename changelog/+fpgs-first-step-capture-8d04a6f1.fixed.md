@@ -1,0 +1,1 @@
+Fix `SolverFeatherPGS` producing non-finite or stale results when its first `step()` is captured in a CUDA graph: buffers that carry inverse-dynamics data between steps were allocated inside the capture and were released on every graph launch.
