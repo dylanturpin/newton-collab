@@ -3315,69 +3315,6 @@ def build_joint_limit_rows_for_size(
                 world_target_velocity[world, slot] = 0.0
 
 
-@wp.kernel
-def build_joint_friction_rows_for_size(
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_friction: wp.array[float],
-    kinematic_dof_mask: wp.array[int],
-    art_to_world: wp.array[int],
-    group_to_art: wp.array[int],
-    articulation_rows_active: wp.array[int],
-    max_constraints: int,
-    dt: float,
-    pgs_cfm: float,
-    # outputs
-    world_slot_counter: wp.array[int],
-    J_group: wp.array3d[float],
-    world_row_type: wp.array2d[int],
-    world_row_parent: wp.array2d[int],
-    world_row_mu: wp.array2d[float],
-    world_row_beta: wp.array2d[float],
-    world_row_cfm: wp.array2d[float],
-    world_phi: wp.array2d[float],
-    world_target_velocity: wp.array2d[float],
-):
-    """Allocate and populate one joint-friction row per DOF with positive friction."""
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
-    if articulation_rows_active[art] == 0:
-        return
-    world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
-
-    for j in range(articulation_start[art], articulation_joint_end[art]):
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        axis_count = joint_dof_dim[j, 0] + joint_dof_dim[j, 1]
-        qd_start = joint_qd_start[j]
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            friction = joint_friction[dof]
-            # Prescribed DOFs have no response; NaN and non-positive values build no row.
-            if not (friction > 0.0) or kinematic_dof_mask[dof] != 0:
-                continue
-
-            slot = wp.atomic_add(world_slot_counter, world, 1)
-            if slot >= max_constraints:
-                continue
-
-            J_group[group_idx, slot, dof - dof_start] = 1.0
-            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_FRICTION
-            world_row_parent[world, slot] = -1
-            world_row_mu[world, slot] = friction * dt
-            world_row_beta[world, slot] = 0.0
-            world_row_cfm[world, slot] = pgs_cfm
-            world_phi[world, slot] = 0.0
-            world_target_velocity[world, slot] = 0.0
-
-
 # =============================================================================
 # Mimic (Joint Coupling) Constraint Kernels
 # =============================================================================

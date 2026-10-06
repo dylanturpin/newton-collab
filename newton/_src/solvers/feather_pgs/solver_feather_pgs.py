@@ -99,7 +99,6 @@ from .kernels import (
     apply_sparse_diagonal_contact_restitution_matrix_free,
     apply_world_contact_restitution_accumulated,
     apply_world_contact_restitution_matrix_free,
-    build_joint_friction_rows_for_size,
     build_joint_limit_rows_for_size,
     build_mass_update_mask,
     build_mf_body_map,
@@ -1870,6 +1869,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("joint_limit_activation_gap must be non-negative or inf")
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.enable_joint_friction = bool(enable_joint_friction)
+        self._joint_friction_warp_kernels: dict[int, wp.Kernel] = {}
         try:
             self.velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         except (TypeError, ValueError) as exc:
@@ -4355,6 +4355,7 @@ class SolverFeatherPGS(SolverBase):
             self._joint_limit_q_index = None
             self._joint_limit_q_index_host = np.zeros(model.joint_dof_count, dtype=np.int32)
             self._joint_limit_warp_kernels = {}
+            self._joint_friction_warp_kernels = {}
             return
 
         response_dof_count = self._model_plan.response_dof_count
@@ -4417,6 +4418,20 @@ class SolverFeatherPGS(SolverBase):
                 for size in self._joint_limit_sizes
             }
             if model.device.is_cuda and not model.requires_grad
+            else {}
+        )
+        # Tree DOFs of joints that can carry friction rows; joint types are fixed after finalize.
+        self._friction_dof_eligible = wp.array(
+            (limit_q_index >= 0).astype(np.int32), dtype=wp.int32, device=model.device
+        )
+        self._joint_friction_warp_kernels = (
+            {
+                size: _get_joint_friction_warp_kernel(
+                    size, str(getattr(model.device, "arch", "")), warps_per_block=_JOINT_LIMIT_WARPS_PER_BLOCK
+                )
+                for size in solve_sizes
+            }
+            if self.enable_joint_friction
             else {}
         )
 
@@ -11360,30 +11375,25 @@ class SolverFeatherPGS(SolverBase):
                     )
 
         # Joint-friction rows are internal rows of the phase-3 range.
-        if self.enable_joint_friction and model.joint_dof_count:
+        if self._joint_friction_warp_kernels:
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
-            for size in self.size_groups:
+            for size, kernel in self._joint_friction_warp_kernels.items():
                 n_arts = self.n_arts_by_size[size]
-                if n_arts == 0:
-                    continue
-                wp.launch(
-                    build_joint_friction_rows_for_size,
-                    dim=n_arts,
+                wp.launch_tiled(
+                    kernel,
+                    dim=[(n_arts + _JOINT_LIMIT_WARPS_PER_BLOCK - 1) // _JOINT_LIMIT_WARPS_PER_BLOCK],
                     inputs=[
-                        model.articulation_start,
-                        self.articulation_joint_end,
+                        n_arts,
                         self.articulation_dof_start,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_friction,
-                        self._kinematic_dof_mask,
                         self.art_to_world,
                         self.group_to_art[size],
                         self._constraint_art_active,
+                        self._friction_dof_eligible,
+                        self._kinematic_dof_mask,
+                        model.joint_friction,
                         max_constraints,
                         dt,
                         self.pgs_cfm,
@@ -11399,6 +11409,7 @@ class SolverFeatherPGS(SolverBase):
                         self.phi,
                         self.target_velocity,
                     ],
+                    block_dim=32 * _JOINT_LIMIT_WARPS_PER_BLOCK,
                     device=model.device,
                 )
 
@@ -13859,6 +13870,134 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
     joint_limit_warp_template.__name__ = name
     joint_limit_warp_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(joint_limit_warp_template)
+
+
+@cache
+def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block: int) -> "wp.Kernel":
+    """Build a deterministic one-warp-per-articulation joint-friction row builder."""
+    _ = device_arch
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    constexpr unsigned MASK = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    const int group_idx = block * {warps_per_block} + (threadIdx.x >> 5);
+    if (group_idx >= articulation_count) return;
+
+    const int articulation = group_to_art.data[group_idx];
+    if (articulation_rows_active.data[articulation] == 0) return;
+    const int world = art_to_world.data[articulation];
+    const int dof_start = articulation_dof_start.data[articulation];
+    for (int base = 0; base < {size}; base += 32) {{
+        const int local_dof = base + lane;
+        const int dof = dof_start + local_dof;
+        float bound = 0.0f;
+        int active = 0;
+        if (local_dof < {size} && friction_dof_eligible.data[dof] != 0 && kinematic_dof_mask.data[dof] == 0) {{
+            bound = joint_friction.data[dof] * dt;
+            active = bound > 0.0f;
+        }}
+
+        const unsigned active_mask = __ballot_sync(MASK, active != 0);
+        const int active_count = __popc(active_mask);
+        int first_slot = 0;
+        if (lane == 0 && active_count != 0)
+            first_slot = atomicAdd(&world_slot_counter.data[world], active_count);
+        first_slot = __shfl_sync(MASK, first_slot, 0);
+        if (active != 0) {{
+            const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
+            const int slot = first_slot + __popc(active_mask & lower_lanes);
+            if (slot < max_constraints) {{
+                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = 1.0f;
+                const int row = world * max_constraints + slot;
+                world_row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_FRICTION};
+                world_row_parent.data[row] = -1;
+                world_row_mu.data[row] = bound;
+                world_row_beta.data[row] = 0.0f;
+                world_row_cfm.data[row] = pgs_cfm;
+                world_phi.data[row] = 0.0f;
+                world_target_velocity.data[row] = 0.0f;
+            }}
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def joint_friction_warp_native(
+        block: int,
+        articulation_count: int,
+        articulation_dof_start: wp.array[int],
+        art_to_world: wp.array[int],
+        group_to_art: wp.array[int],
+        articulation_rows_active: wp.array[int],
+        friction_dof_eligible: wp.array[int],
+        kinematic_dof_mask: wp.array[int],
+        joint_friction: wp.array[float],
+        max_constraints: int,
+        dt: float,
+        pgs_cfm: float,
+        world_slot_counter: wp.array[int],
+        J_group: wp.array3d[float],
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
+        world_row_beta: wp.array2d[float],
+        world_row_cfm: wp.array2d[float],
+        world_phi: wp.array2d[float],
+        world_target_velocity: wp.array2d[float],
+    ): ...
+
+    def joint_friction_warp_template(
+        articulation_count: int,
+        articulation_dof_start: wp.array[int],
+        art_to_world: wp.array[int],
+        group_to_art: wp.array[int],
+        articulation_rows_active: wp.array[int],
+        friction_dof_eligible: wp.array[int],
+        kinematic_dof_mask: wp.array[int],
+        joint_friction: wp.array[float],
+        max_constraints: int,
+        dt: float,
+        pgs_cfm: float,
+        world_slot_counter: wp.array[int],
+        J_group: wp.array3d[float],
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
+        world_row_beta: wp.array2d[float],
+        world_row_cfm: wp.array2d[float],
+        world_phi: wp.array2d[float],
+        world_target_velocity: wp.array2d[float],
+    ):
+        block, _lane = wp.tid()
+        joint_friction_warp_native(
+            block,
+            articulation_count,
+            articulation_dof_start,
+            art_to_world,
+            group_to_art,
+            articulation_rows_active,
+            friction_dof_eligible,
+            kinematic_dof_mask,
+            joint_friction,
+            max_constraints,
+            dt,
+            pgs_cfm,
+            world_slot_counter,
+            J_group,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_row_beta,
+            world_row_cfm,
+            world_phi,
+            world_target_velocity,
+        )
+
+    name = f"build_joint_friction_rows_warp_{size}_{warps_per_block}"
+    joint_friction_warp_template.__name__ = name
+    joint_friction_warp_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(joint_friction_warp_template)
 
 
 @cache
