@@ -260,7 +260,8 @@ _LOCAL_GENERAL_BLOCKS_PER_SM = 8
 _LOCAL_PAIR_BLOCKS_PER_SM = 8
 # The local solver performs a serial O(dof_count**2) triangular solve per row.
 _LOCAL_INTERNAL_MAX_DOF = 16
-# The local owners run each world serially on one warp, at most one per SM; past that the general owner is faster.
+# Conservative total-world proxy for local-owner selection; measured paired-residual batches beyond it ran faster on
+# the general owner.
 _LOCAL_SOLVE_WORLDS_PER_SM = 1
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40

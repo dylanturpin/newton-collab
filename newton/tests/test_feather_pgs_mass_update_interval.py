@@ -391,7 +391,6 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         for _ in range(16):
             wp.capture_launch(capture.graph)
             two_substeps(eager_solver, eager_a, eager_b, eager_control)
-        wp.synchronize_device("cuda:0")
 
         for name in ("joint_q", "joint_qd"):
             captured = getattr(graph_a, name).numpy()
