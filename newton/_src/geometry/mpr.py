@@ -173,12 +173,11 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     Returns:
         ``solve_mpr`` wrapper function.  The core function is available as
         ``solve_mpr.core`` for callers that want to handle the relative-frame
-        transform themselves (e.g. fused MPR+GJK). ``solve_mpr.portal_core``
-        includes box penetration direction selection. Split kernels use
-        ``solve_mpr.unchecked_portal_core`` for other pairs and
-        ``solve_mpr.after_sat_core`` after the cooperative box axis search.
-        The portal passes report witness validity; ``solve_mpr.refine_core``
-        refines overlaps whose witnesses are invalid.
+        transform themselves (e.g. fused MPR+GJK). Split kernels use
+        ``solve_mpr.portal_core`` for the bare portal pass, which also reports
+        whether its witnesses are valid, and ``solve_mpr.refine_core`` to
+        refine overlaps whose witnesses are not or for which
+        ``solve_mpr.needs_certificate`` requires a minimum-depth check.
     """
 
     if _support_funcs is not None:
@@ -196,12 +195,13 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         support_func, _support_funcs=(_support_map_b, _minkowski_support, geometric_center)
     ).core
 
-    from .penetration import _box_polyhedron_pair, create_solve_box_penetration  # noqa: PLC0415
+    from .penetration import box_polyhedron_pair as solve_mpr_needs_certificate  # noqa: PLC0415
+    from .penetration import create_solve_box_penetration  # noqa: PLC0415
 
     solve_sat = create_solve_box_penetration(_minkowski_support)
 
     @wp.func
-    def solve_mpr_portal_unchecked(
+    def solve_mpr_portal(
         geom_a: Any,
         geom_b: Any,
         orientation_b: wp.quat,
@@ -457,67 +457,6 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     v1 = v4
 
     @wp.func
-    def solve_mpr_seeded_portal(
-        geom_a: Any,
-        geom_b: Any,
-        orientation_b: wp.quat,
-        position_b: wp.vec3,
-        extend: float,
-        data_provider: Any,
-        seed: wp.vec3,
-        sat_normal: wp.vec3,
-        sat_depth: float,
-        MAX_ITER: int = 30,
-        COLLIDE_EPSILON: float = 1e-5,
-    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, bool]:
-        portal_seed = seed
-        if sat_depth > COLLIDE_EPSILON:
-            # SAT certifies an interior ball and its nearest plane.
-            portal_seed = -0.5 * sat_depth * sat_normal
-        collision, pa, pb, normal, depth, next_seed, valid = solve_mpr_portal_unchecked(
-            geom_a, geom_b, orientation_b, position_b, extend, data_provider, portal_seed, MAX_ITER, COLLIDE_EPSILON
-        )
-        if sat_depth > COLLIDE_EPSILON:
-            if not collision or not valid or wp.abs(depth - extend - sat_depth) > COLLIDE_EPSILON:
-                collision = True
-                normal = sat_normal
-                depth = sat_depth + extend
-                next_seed = -0.5 * sat_depth * sat_normal
-                valid = False
-        return collision, pa, pb, normal, depth, next_seed, valid
-
-    @wp.func
-    def solve_mpr_portal(
-        geom_a: Any,
-        geom_b: Any,
-        orientation_b: wp.quat,
-        position_b: wp.vec3,
-        extend: float,
-        data_provider: Any,
-        seed: wp.vec3,
-        MAX_ITER: int = 30,
-        COLLIDE_EPSILON: float = 1e-5,
-    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, bool]:
-        if not _box_polyhedron_pair(geom_a, geom_b):
-            return solve_mpr_portal_unchecked(
-                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
-            )
-        sat_normal, sat_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider)
-        return solve_mpr_seeded_portal(
-            geom_a,
-            geom_b,
-            orientation_b,
-            position_b,
-            extend,
-            data_provider,
-            seed,
-            sat_normal,
-            sat_depth,
-            MAX_ITER,
-            COLLIDE_EPSILON,
-        )
-
-    @wp.func
     def solve_mpr_raycast(
         geom_a: Any,
         geom_b: Any,
@@ -606,7 +545,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         return point_a, point_b, normal, penetration
 
     @wp.func
-    def solve_mpr_restarts(
+    def solve_mpr_refine(
         geom_a: Any,
         geom_b: Any,
         orientation_b: wp.quat,
@@ -614,65 +553,55 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         extend: float,
         data_provider: Any,
         seed: wp.vec3,
+        point_a: wp.vec3,
+        point_b: wp.vec3,
         normal: wp.vec3,
         penetration: float,
+        valid: bool,
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-5,
     ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
-        """Retry a confirmed overlap, preserving it if a portal restart fails."""
+        """Certify or retry a confirmed portal overlap, then refine it if needed.
+
+        The arguments after ``data_provider`` are the portal's result. Split and
+        fused kernels pass identical values, so both make the same decisions.
+        """
         # The first portal's support plane bounds the depth; a deeper retry
         # landed on a worse face (seeds near the boundary are ill-conditioned).
         bound = penetration + COLLIDE_EPSILON
-        valid = bool(False)
-        point_a = wp.vec3(0.0)
-        point_b = wp.vec3(0.0)
         last_normal = normal
+        retry = wp.length_sq(seed) > 0.0
         minimum_depth = float(-1.0)
-        if _box_polyhedron_pair(geom_a, geom_b):
-            minimum_normal, minimum_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider)
+        if solve_mpr_needs_certificate(geom_a, geom_b):
+            minimum_normal, minimum_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider, normal)
             if minimum_depth > COLLIDE_EPSILON:
-                last_normal = minimum_normal
+                if not valid or wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON:
+                    # SAT certifies an interior ball and its nearest plane.
+                    seed = -0.5 * minimum_depth * minimum_normal
+                    last_normal = minimum_normal
+                    bound = wp.max(bound, minimum_depth + extend + COLLIDE_EPSILON)
+                    valid = False
+                    retry = True
         for _attempt in range(3):
-            if wp.length_sq(seed) == 0.0:
+            if valid or not retry:
                 break
-            retry_collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal_unchecked(
+            hit, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
             )
+            retry = wp.length_sq(seed) > 0.0
             wrong_depth = (
                 minimum_depth > COLLIDE_EPSILON and wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON
             )
-            if not retry_collision or penetration > bound or wrong_depth:
+            if not hit or penetration > bound or wrong_depth:
                 normal = last_normal
                 valid = False
                 break
             last_normal = normal
-            if valid:
-                break
         if not valid:
             point_a, point_b, normal, penetration = solve_mpr_raycast(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, normal
             )
         return point_a, point_b, normal, penetration
-
-    @wp.func
-    def solve_mpr_after_sat(
-        geom_a: Any,
-        geom_b: Any,
-        orientation_b: wp.quat,
-        position_b: wp.vec3,
-        extend: float,
-        data_provider: Any,
-        sat_normal: wp.vec3,
-        sat_depth: float,
-    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
-        collision, pa, pb, normal, depth, seed, valid = solve_mpr_seeded_portal(
-            geom_a, geom_b, orientation_b, position_b, extend, data_provider, wp.vec3(0.0), sat_normal, sat_depth
-        )
-        if collision and not valid:
-            pa, pb, normal, depth = solve_mpr_restarts(
-                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, normal, depth
-            )
-        return collision, pa, pb, normal, depth
 
     @wp.func
     def solve_mpr_core(
@@ -689,8 +618,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
             geom_a, geom_b, orientation_b, position_b, extend, data_provider, wp.vec3(0.0), MAX_ITER, COLLIDE_EPSILON
         )
-        if collision and not valid:
-            point_a, point_b, normal, penetration = solve_mpr_restarts(
+        if collision and (not valid or solve_mpr_needs_certificate(geom_a, geom_b)):
+            point_a, point_b, normal, penetration = solve_mpr_refine(
                 geom_a,
                 geom_b,
                 orientation_b,
@@ -698,8 +627,11 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 extend,
                 data_provider,
                 seed,
+                point_a,
+                point_b,
                 normal,
                 penetration,
+                valid,
                 MAX_ITER,
                 COLLIDE_EPSILON,
             )
@@ -769,11 +701,10 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
         return collision, signed_distance, point, normal
 
-    solve_mpr.after_sat_core = solve_mpr_after_sat
     solve_mpr.core = solve_mpr_core
-    # Split collision kernels refine unresolved portals in a separate pass so
+    # Split collision kernels refine unresolved portals in their GJK pass so
     # the common MPR pass does not carry the raycast's register/local storage.
     solve_mpr.portal_core = solve_mpr_portal
-    solve_mpr.unchecked_portal_core = solve_mpr_portal_unchecked
-    solve_mpr.refine_core = solve_mpr_restarts
+    solve_mpr.needs_certificate = solve_mpr_needs_certificate
+    solve_mpr.refine_core = solve_mpr_refine
     return solve_mpr
