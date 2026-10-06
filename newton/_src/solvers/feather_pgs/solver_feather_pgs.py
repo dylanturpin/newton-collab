@@ -8611,7 +8611,6 @@ class SolverFeatherPGS(SolverBase):
             or self.contact_compliance
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
-        validate_torsional_rolling_friction_mode(self)
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if getattr(self, "_device_torsion", None) is not None:
@@ -8619,6 +8618,7 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
+        validate_torsional_rolling_friction_mode(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
