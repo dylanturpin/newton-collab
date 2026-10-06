@@ -1,1 +1,1 @@
-Add experimental `SolverFeatherPGS(differentiable=True)` for `wp.Tape` gradients through contact-free articulated and free-body steps.
+Add experimental `SolverFeatherPGS(differentiable=True)` for `wp.Tape` gradients through articulated and free-body steps, including normal contact, point friction and restitution with a fixed contact set.
