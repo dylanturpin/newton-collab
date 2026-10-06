@@ -1284,7 +1284,9 @@ class SolverFeatherPGS(SolverBase):
                 row layout are held fixed for the derivative. Contact points come from the given buffers and
                 are stop-gradient; the gap and Jacobians are recomputed from the step's poses, the normal is
                 stop-gradient, and every PGS iteration, including the friction root solve, is differentiated
-                as executed. Contact activation and stick/slip switches are nonsmooth.
+                as executed. Contact activation and stick/slip switches are nonsmooth. Every step rewrites the
+                buffers it reads, so optimizer loops may reuse one solver and one list of states without
+                :meth:`reset`.
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True``, no
                 particles, kinematic bodies, mimic or loop-closing joints, single-body free articulations
                 or rigid-body velocity limits, and the solver uses immediate response, augmented drives,

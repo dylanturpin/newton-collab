@@ -560,6 +560,58 @@ def test_friction_gradient_matches_finite_difference(test, device):
                 test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def test_repeated_rollouts_reuse_buffers(test, device):
+    """One solver and one State list reused across identical rollouts reproduce values and gradients."""
+    scenes = {
+        "chain_drives": (_MODELS["chain_drives"](device), None, {}),
+        "floating_chain": (_MODELS["floating_chain"](device), None, {}),
+        "free_body": (_MODELS["free_body"](device), None, {}),
+        "box_chain_contacts": (_build_box_chain_on_plane(device), 64, _CONTACT_OPTIONS),
+        "slider_friction": (_build_slider_on_plane(device), 16, {**_CONTACT_OPTIONS, "enable_contact_friction": True}),
+    }
+    steps = 6
+    for name, (model, contact_max, options) in scenes.items():
+        solver = SolverFeatherPGS(model, differentiable=True, **options)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_max) if contact_max else None
+        contacts = pipeline.contacts() if pipeline else None
+        states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+        control = model.control()
+        q0, qd0 = _initial_state(model, seed=9) if contact_max is None else (model.joint_q.numpy(), None)
+        rng = np.random.default_rng(10)
+        qd0 = (0.05 * rng.normal(size=model.joint_dof_count)).astype(np.float32) if qd0 is None else qd0
+        control.joint_f.assign((rng.normal(size=model.joint_dof_count)).astype(np.float32))
+        tape = wp.Tape()
+        results = []
+        for _rollout in range(3):
+            states[0].joint_q.assign(q0)
+            states[0].joint_qd.assign(qd0)
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            tape.reset()
+            for k in range(steps):
+                if pipeline:
+                    pipeline.collide(states[k], contacts)
+                with tape:
+                    solver.step(states[k], states[k + 1], control, contacts, _DT)
+            tape.backward(grads={states[-1].joint_qd: wp.ones(model.joint_dof_count, dtype=float, device=device)})
+            results.append(
+                (
+                    states[-1].joint_q.numpy().copy(),
+                    states[0].joint_q.grad.numpy().copy(),
+                    control.joint_f.grad.numpy().copy(),
+                )
+            )
+            tape.zero()
+        for rollout in results[1:]:
+            for index, (expected, actual) in enumerate(zip(results[0], rollout, strict=True)):
+                with test.subTest(scene=name, output=index):
+                    test.assertTrue(np.all(np.isfinite(actual)))
+                    if index == 0 or wp.get_device(device).is_cpu:
+                        np.testing.assert_array_equal(actual, expected)
+                    else:
+                        # CUDA adjoint atomics accumulate in a nondeterministic order.
+                        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-6 * np.max(np.abs(expected)))
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -575,6 +627,7 @@ for _device in get_test_devices():
         test_contact_gradient_matches_finite_difference,
         test_contact_rejects_unsupported_configs,
         test_friction_gradient_matches_finite_difference,
+        test_repeated_rollouts_reuse_buffers,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
 

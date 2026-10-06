@@ -186,6 +186,8 @@ class DifferentiableStep:
             solver._step += 1
             return state_out
         b = self.buffers(state_out)
+        # The wrench recursion accumulates into body_ft_s; buffers are reused when a state is stepped into again.
+        b.body_ft_s.zero_()
 
         wp.launch(
             _eval_fk_id_uncached,
