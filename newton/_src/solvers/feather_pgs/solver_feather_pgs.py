@@ -1540,17 +1540,22 @@ class SolverFeatherPGS(SolverBase):
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
-                rows on every route (matrix-free, dense, propagation). Each position iteration moves a
-                row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
-                weight ``g/(1+g)``, which is the same update as a damped contact spring integrated
-                implicitly. It is a numerical stabilizer, not a material model: it makes statically
-                indeterminate normal-force splits unique, damps the Gauss-Seidel sweep enough to hold
-                stacks that the exact rigid law drops at the same iteration count, and costs a resting
-                sag of ``g * a * dt^2 / pgs_beta`` per loaded row (0.3 mm at 60 Hz for a body under
-                gravity at ``g = 0.02``). Positive-gap speculative rows and rows whose rebound
-                target fires are solved rigid, and the velocity-only pass ignores ``g``. ``0`` is the
-                exact rigid law. Values above ``1e6`` are rejected because they are not
-                numerically useful in the float32 solve. Defaults to 0.0.
+                rows on every route (matrix-free, dense, propagation). Every route converges to
+                ``r + g * d * lambda = 0`` for a row with velocity residual ``r``, impulse ``lambda``
+                and unsplit Delassus diagonal ``d``, the equilibrium of a damped contact spring
+                integrated implicitly. Each position iteration moves a row's impulse toward the hard
+                solution with weight ``w = 1/(1+g)`` and toward zero with weight ``1 - w``.
+                Propagation rows whose response is split across coupled contact bodies, with split
+                diagonal ``d_s``, take weight ``w * d_s / (w * d_s + (1 - w) * d)``, which reaches
+                the same fixed point with a different step. It is a numerical stabilizer, not a
+                material model: it makes statically indeterminate normal-force splits unique, damps
+                the Gauss-Seidel sweep enough to hold stacks that the exact rigid law drops at the
+                same iteration count, and costs a resting sag of ``g * a * dt^2 / pgs_beta`` per
+                loaded row (0.3 mm at 60 Hz for a body under gravity at ``g = 0.02``). Positive-gap
+                speculative rows and rows whose rebound target fires are solved rigid, and the
+                velocity-only pass ignores ``g``. ``0`` is the exact rigid law. Values above ``1e6``
+                are rejected because they are not numerically useful in the float32 solve.
+                Defaults to 0.0.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
