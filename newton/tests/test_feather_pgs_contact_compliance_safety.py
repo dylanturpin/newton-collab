@@ -12,9 +12,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.contact_compliance import _prepare_compliant_rows, start_step
+from newton._src.solvers.feather_pgs.contact_compliance import prepare_rows, start_step
 from newton.solvers import SolverFeatherPGS
-from newton.tests.test_feather_pgs_contact_compliance import run_fixture
+from newton.tests.test_feather_pgs_contact_compliance import make_fixture, run_fixture
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
@@ -38,21 +38,20 @@ class TestContactComplianceSafety(unittest.TestCase):
 
     def test_input_overflow_and_reduction_rejected(self):
         """Fail explicitly for lost candidates or unqualified body-pair reduction."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
+        fixture = make_fixture(articulated=True, enabled=True)
+        model, contacts = fixture.model, fixture.contacts
+        state, output = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        fixture.pipeline.collide(state, contacts)
+        contacts.rigid_contact_stiffness.fill_(3000.0)
+        contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
         with self.assertRaisesRegex(RuntimeError, "overflowing contact"):
-            start_step(solver, self.contacts(count=5), 0.005)
+            fixture.solver.step(state, output, model.control(), contacts, 0.005)
+        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
         contacts = self.contacts()
         contacts.rigid_contacts_body_pair_reduced = True
         with self.assertRaisesRegex(ValueError, "body-pair"):
             start_step(solver, contacts, 0.005)
-
-    def test_capture_rejected(self):
-        """Prevent silent capture fallback."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
-        contacts = self.contacts()
-        with wp.ScopedCapture(device=self.device):
-            with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
-                start_step(solver, contacts, 0.005)
 
     def test_nonfinite_inputs_rejected(self):
         """Reject invalid time steps instead of emitting infinite row coefficients."""
@@ -117,14 +116,20 @@ class TestContactComplianceSafety(unittest.TestCase):
 
     def test_solver_overflow_and_dropped_contact_rejected(self):
         """Reject overflowing rows and missing mappings for positive stiffness."""
-        _, _, solver, _ = run_fixture(articulated=True, enabled=True, steps=1)
+        fixture = make_fixture(articulated=True, enabled=True)
+        model, contacts, solver = fixture.model, fixture.contacts, fixture.solver
+        state, output = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        fixture.pipeline.collide(state, contacts)
+        contacts.rigid_contact_stiffness.fill_(3000.0)
+        solver.step(state, output, model.control(), contacts, 0.005)
         solver.constraint_count.fill_(solver.dense_max_constraints + 1)
         with self.assertRaisesRegex(RuntimeError, "overflowing solver rows"):
-            _prepare_compliant_rows(solver)
+            prepare_rows(solver, contacts, 0.005)
         solver.constraint_count.fill_(1)
         solver.contact_slot.fill_(-1)
         with self.assertRaisesRegex(RuntimeError, "dropped"):
-            _prepare_compliant_rows(solver)
+            prepare_rows(solver, contacts, 0.005)
 
     def test_reset_and_open_gap_release(self):
         """Clear only step-local compliance data and exert no force across an open gap."""
@@ -136,7 +141,6 @@ class TestContactComplianceSafety(unittest.TestCase):
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         before = {name: getattr(state, name).numpy().copy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
         solver.reset(state)
-        self.assertIsNone(solver._compliant_contacts)
         self.assertEqual(solver.compliance_contact_count, 0)
         self.assertEqual(solver.compliance_skipped_contact_count, 0)
         for name, value in before.items():
