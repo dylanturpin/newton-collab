@@ -61,8 +61,14 @@ GRIP_BLOCK = 0.0
 
 CLOTH_RADIUS = 0.003
 CLOTH_CONTACT_GAP = 0.005
-CLOTH_KE = 1.0e4
-CLOTH_KD = 1.0e1
+# Cloth-side contact material: the self-contact spring, averaged with each shape's ke/kd for cloth-body contacts.
+# The cloth Franka example's cloth-robot contact in SI at this cloth density; stiffer self-contact makes the cloth bounce.
+CLOTH_SELF_KE = 30.0
+CLOTH_SELF_KD = 0.03
+# Finger and block material, stiff so the averaged contact pinches the cloth and carries the stack.
+# MuJoCo uses their raw solref instead, so these reach only VBD.
+CLOTH_KE = 2.0e4
+CLOTH_KD = 2.0e1
 CLOTH_MU = 5.0
 # Gripper friction outside cloth pinches, so released cloth slides off the hand and fingers.
 FINGER_RELEASE_MU = 0.5
@@ -202,7 +208,7 @@ class Example:
                 builder.body_disable_gravity[body] = True
 
         block_cfg = newton.ModelBuilder.ShapeConfig(
-            density=BLOCK_MASS / (2.0 * BLOCK_HALF) ** 3, ke=GRASP_KE, kd=GRASP_KD, mu=1.0, gap=0.005
+            density=BLOCK_MASS / (2.0 * BLOCK_HALF) ** 3, ke=CLOTH_KE, kd=CLOTH_KD, mu=1.0, gap=0.005
         )
         pedestal_top = PEDESTAL_CENTER[2] + PEDESTAL_HALF[2]
         self.block_bodies, self.block_joints = [], []
@@ -249,8 +255,8 @@ class Example:
             tri_ke=1.0e3,
             tri_ka=1.0e3,
             tri_kd=1.0e-3,
-            edge_ke=1.0e-4,
-            edge_kd=1.0e-5,
+            edge_ke=1.0e-3,
+            edge_kd=1.0e-4,
             particle_radius=CLOTH_RADIUS,
         )
         self.particles_per_world = builder.particle_count - self.particle_start
@@ -284,8 +290,8 @@ class Example:
         builder.color()
         self.model = builder.finalize()
         self.device = self.model.device
-        self.model.soft_contact_ke = CLOTH_KE
-        self.model.soft_contact_kd = CLOTH_KD
+        self.model.soft_contact_ke = CLOTH_SELF_KE
+        self.model.soft_contact_kd = CLOTH_SELF_KD
         self.model.soft_contact_mu = 0.25
         self.model.edge_rest_angle.zero_()
 
