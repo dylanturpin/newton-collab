@@ -32,9 +32,11 @@ from .kernels import (
     compute_link_velocity,
     compute_velocity_predictor,
     compute_world_contact_bias,
+    contact_restitution_fires,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     integrate_generalized_joints,
+    mixed_contact_restitution,
     prescribed_relative_contact_target,
     remove_free_root_transport_from_qdd,
     rhs_accum_world_par_art,
@@ -161,8 +163,6 @@ class DifferentiableStep:
                 parent_body = joint_parent[joint]
                 joint = body_to_joint.get(int(parent_body), -1) if parent_body >= 0 else -1
         self.body_dof_chain = wp.array(chain, dtype=wp.int32, device=device)
-        restitution = solver.shape_material_restitution.numpy()
-        self.has_restitution = bool(solver.enable_restitution and restitution.size and np.any(restitution > 0.0))
         # Free rigid bodies take dense rows; the default solves them after the articulated rows instead.
         plan = solver._model_plan
         free = plan.is_free_rigid != 0
@@ -451,7 +451,6 @@ class DifferentiableStep:
             (self.has_mixed_free_worlds, "no world mixing free rigid bodies and articulations"),
             (self.has_depenetration_clamp, "no rigid-body depenetration velocity clamp"),
             (solver.contact_friction_shared_anchor and solver.enable_contact_friction, "no shared friction anchor"),
-            (self.has_restitution, "zero contact restitution"),
             (solver._regularization_enabled, "pgs_contact_regularization=0"),
         )
         for unsupported, requirement in checks:
@@ -616,7 +615,16 @@ class DifferentiableStep:
                 solver.pgs_beta,
                 solver.pgs_cfm,
             ],
-            outputs=[c.row_type, c.row_parent, c.row_mu, c.row_beta, c.row_cfm, c.phi, c.target_velocity],
+            outputs=[
+                c.row_type,
+                c.row_parent,
+                c.row_mu,
+                c.row_beta,
+                c.row_cfm,
+                c.phi,
+                c.target_velocity,
+                c.row_restitution,
+            ],
             device=device,
         )
         for size in solver.size_groups:
@@ -728,6 +736,24 @@ class DifferentiableStep:
                 device=device,
             )
 
+        wp.launch(
+            _dense_contact_restitution,
+            dim=(solver.world_count, max_rows),
+            inputs=[
+                c.row_count,
+                c.phi,
+                c.row_beta,
+                c.row_type,
+                c.row_restitution,
+                c.rhs,
+                dt,
+                solver.contact_speculative_scale,
+                solver._effective_restitution_velocity_threshold,
+            ],
+            outputs=[c.rhs_restituted],
+            device=device,
+        )
+
         # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
         c.impulses[0].zero_()
         friction_start = solver._contact_friction_start_iteration(solver.pgs_iterations)
@@ -739,7 +765,7 @@ class DifferentiableStep:
                     c.row_count,
                     c.diag,
                     c.C,
-                    c.rhs,
+                    c.rhs_restituted,
                     c.row_type,
                     c.row_parent,
                     c.row_mu,
@@ -854,6 +880,8 @@ class _ContactBuffers:
         self.phi = zeros((worlds, rows))
         self.target_velocity = zeros((worlds, rows))
         self.rhs = zeros((worlds, rows))
+        self.rhs_restituted = zeros((worlds, rows))
+        self.row_restitution = zeros((worlds, rows))
         self.diag = zeros((worlds, rows))
         self.C = zeros((worlds, rows, rows))
         self.impulses = [zeros((worlds, rows)) for _ in range(solver.pgs_iterations + 1)]
@@ -1402,6 +1430,7 @@ def _dense_contact_rows(
     row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
+    row_restitution: wp.array2d[float],
 ):
     """Row metadata of _populate_world_J_for_size_contact for point contacts, one thread per contact.
 
@@ -1438,6 +1467,7 @@ def _dense_contact_rows(
                 target_a = anchor
                 target_b = anchor
             row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
+            row_restitution[world, slot] = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution)
             row_parent[world, slot] = -1
             row_mu[world, slot] = mu
             row_beta[world, slot] = pgs_beta
@@ -1707,6 +1737,37 @@ def _hinv_jt_dense(
     g = tid // max_rows
     if row < row_count[art_to_world[group_to_art[g]]]:
         _cholesky_solve_row(L, g, row, n, J, tmp, Y)
+
+
+@wp.kernel
+def _dense_contact_restitution(
+    row_count: wp.array[int],
+    row_phi: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_type: wp.array2d[int],
+    row_restitution: wp.array2d[float],
+    rhs: wp.array2d[float],
+    dt: float,
+    contact_speculative_scale: float,
+    restitution_velocity_threshold: float,
+    # outputs
+    rhs_out: wp.array2d[float],
+):
+    """apply_world_contact_restitution_accumulated into a separate array; firing is a nonsmooth event."""
+    world, i = wp.tid()
+    if i >= row_count[world]:
+        return
+    value = rhs[world, i]
+    restitution = row_restitution[world, i]
+    if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT and restitution > 0.0:
+        phi = row_phi[world, i]
+        geometric_bias = contact_speculative_scale * phi / dt
+        if phi < 0.0:
+            geometric_bias = row_beta[world, i] * phi / dt
+        relative_incident = value - geometric_bias
+        if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+            value = (1.0 + restitution) * relative_incident
+    rhs_out[world, i] = value
 
 
 @wp.kernel

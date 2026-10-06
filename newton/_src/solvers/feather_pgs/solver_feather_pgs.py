@@ -1273,30 +1273,30 @@ class SolverFeatherPGS(SolverBase):
         Args:
             model (Model): the model to be simulated.
             differentiable: Experimental opt-in step for reverse-mode differentiation with :class:`warp.Tape`.
-                It runs the same forward law with a fixed generic kernel selection, and keeps every
-                intermediate in buffers owned by ``state_out``. Record each step into a distinct output
-                state, as in ``solver.step(states[i], states[i + 1], ...)``. Gradients reach
-                ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
-                ``Control.joint_target_q`` and ``Control.joint_target_qd``. Model parameters are not validated
-                gradient inputs. Contacts are supported with normal rows and point friction
-                (``pgs_mode="split"``, no shared friction anchor, zero restitution and contact
-                regularization, no depenetration clamp, and no world that mixes single-body free
-                articulations with other articulations), and ``step`` raises otherwise. Free-body rows are
-                assembled with the articulated rows, so they match the default matrix-free solve up to
-                rounding. The contact set and its
-                row layout are held fixed for the derivative. Contact points come from the given buffers and
-                are stop-gradient; the gap and Jacobians are recomputed from the step's poses, the normal is
-                stop-gradient, and every PGS iteration, including the friction root solve, is differentiated
-                as executed. Contact activation and stick/slip switches are nonsmooth. Every step rewrites the
-                buffers it reads, so optimizer loops may reuse one solver and one list of states without
-                :meth:`reset`.
-                Construction raises ``ValueError`` unless the model has ``requires_grad=True``, no
-                particles, kinematic bodies, mimic or loop-closing joints, single-body free articulations
-                or rigid-body velocity limits, and the solver uses immediate response, augmented drives,
-                ``update_mass_matrix_interval=1``, no joint or velocity limits, no warm start, sleeping,
-                torsion, compliance, friction patches, velocity iterations, debug or ``parallel_tree``.
-                With omitted ``friction_anchor_beta`` it selects point friction. Unlike the default step, it
-                does not refresh ``state_in.body_q`` in place. Defaults to False.
+                It runs the same forward law with a fixed generic kernel selection and keeps every
+                intermediate in buffers owned by ``state_out``, so record each step into a distinct output
+                state, as in ``solver.step(states[i], states[i + 1], ...)``. Every step rewrites the buffers it
+                reads, so optimizer loops may reuse one solver and one list of states without :meth:`reset`.
+                Gradients reach ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
+                ``Control.joint_target_q`` and ``Control.joint_target_qd``; model parameters are not validated
+                gradient inputs. Unlike the default step, it does not refresh ``state_in.body_q`` in place.
+
+                Contacts support normal rows, point friction and restitution with ``pgs_mode="split"``.
+                The contact set and its row layout are held fixed for the derivative. Contact points and
+                normals come from the given buffers and are stop-gradient, while the gap and Jacobians are
+                recomputed from the step's poses. Every PGS iteration, including the friction root solve, is
+                differentiated as executed. Contact activation, restitution firing and stick/slip switches
+                are nonsmooth. Free-body rows are assembled with the articulated rows, so they match the
+                default matrix-free solve up to rounding. ``step`` raises ``NotImplementedError`` for
+                shared friction anchors, contact regularization, a depenetration velocity clamp, or worlds
+                that mix single-body free articulations with other articulations.
+
+                Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
+                particles, kinematic bodies, mimic or loop-closing joints or rigid-body velocity limits, and
+                the solver uses immediate response, augmented drives, ``update_mass_matrix_interval=1``, no
+                joint or velocity limits, no warm start, sleeping, torsion, compliance, friction patches,
+                velocity iterations, debug or ``parallel_tree``. With omitted ``friction_anchor_beta`` it
+                selects point friction. Defaults to False.
 
                 .. experimental::
 

@@ -448,10 +448,7 @@ def test_contact_rejects_unsupported_configs(test, device):
         solver = SolverFeatherPGS(model, differentiable=True, **options)
         with test.subTest(**options), test.assertRaisesRegex(NotImplementedError, "contacts require"):
             solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
-    for model, options in (
-        (_build_box_chain_on_plane(device, restitution=0.5), {**_CONTACT_OPTIONS, "enable_restitution": True}),
-        (_build_box_chain_on_plane(device, extra_free_box=True), _CONTACT_OPTIONS),
-    ):
+    for model, options in ((_build_box_chain_on_plane(device, extra_free_box=True), _CONTACT_OPTIONS),):
         solver = SolverFeatherPGS(model, differentiable=True, **options)
         state = model.state(requires_grad=True)
         contacts = newton.CollisionPipeline(model, rigid_contact_max=64).contacts()
@@ -756,6 +753,77 @@ def test_repeated_rollouts_reuse_buffers(test, device):
                         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-6 * np.max(np.abs(expected)))
 
 
+def test_restitution_bounce_matches_default_and_finite_difference(test, device):
+    """A sphere bounces (e = 0.5) at the same step in every FD sample; the firing step is the nonsmooth event."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.3, restitution=0.5)
+    body = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.15), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
+    options = {"friction_anchor_beta": 0.0, "enable_restitution": True, "pgs_iterations": 8}
+    steps = 20
+    dt = 1.0 / 240.0
+    wq = wp.array(np.array([1.0, 0.5, 2.0, 0.0, 0.0, 0.0, 0.0], np.float32), device=device)
+    wqd = wp.array(np.array([0.3, 0.2, 1.0, 0.1, 0.1, 0.1], np.float32), device=device)
+    qd0 = np.array([0.3, 0.0, -2.0, 0.0, 0.0, 0.0], np.float32)
+
+    def rollout(qd, *, differentiable, tape=None):
+        solver = SolverFeatherPGS(model, differentiable=differentiable, **options)
+        states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+        states[0].joint_qd.assign(qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        contacts = pipeline.contacts()
+        fired = []
+        for k in range(steps):
+            pipeline.collide(states[k], contacts)
+            if tape is not None:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], None, contacts, dt)
+            if tape is not None:
+                tape.__exit__(None, None, None)
+            if differentiable:
+                rows = states[k + 1]._fpgs_differentiable_buffers.contacts
+                count = int(rows.row_count.numpy()[0])
+                if not np.array_equal(rows.rhs.numpy()[0, :count], rows.rhs_restituted.numpy()[0, :count]):
+                    fired.append(k)
+        loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        if tape is not None:
+            tape.__enter__()
+        wp.launch(
+            _weighted_loss,
+            dim=7,
+            inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+            outputs=[loss],
+            device=device,
+        )
+        if tape is not None:
+            tape.__exit__(None, None, None)
+        return loss, states, fired
+
+    _, reference, _ = rollout(qd0, differentiable=False)
+    tape = wp.Tape()
+    loss, states, fired = rollout(qd0, differentiable=True, tape=tape)
+    tape.backward(loss)
+    test.assertEqual(len(fired), 1)
+    test.assertGreater(states[-1].joint_qd.numpy()[2], -1.0)
+    np.testing.assert_allclose(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
+    gradient = states[0].joint_qd.grad.numpy()
+    rng = np.random.default_rng(11)
+    eps = 1.0e-2
+    for _trial in range(2):
+        direction = rng.normal(size=6).astype(np.float32)
+        direction /= np.linalg.norm(direction)
+        plus, _, plus_fired = rollout(qd0 + eps * direction, differentiable=True)
+        minus, _, minus_fired = rollout(qd0 - eps * direction, differentiable=True)
+        test.assertEqual(plus_fired, fired)
+        test.assertEqual(minus_fired, fired)
+        fd = (plus.numpy()[0] - minus.numpy()[0]) / (2.0 * eps)
+        test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -774,6 +842,7 @@ for _device in get_test_devices():
         test_sphere_multistep_gradient_flow,
         test_sphere_friction_matches_default_and_finite_difference,
         test_repeated_rollouts_reuse_buffers,
+        test_restitution_bounce_matches_default_and_finite_difference,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
 
