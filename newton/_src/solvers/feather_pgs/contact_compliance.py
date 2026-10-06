@@ -395,8 +395,11 @@ def _prepare_contacts(
     weight = scale
     if scale == 0.0:
         weight = 1.0
-    phi = dense_phi[world, slot]
-    if path == 1:
+    # Index only the separation array of the validated route; dense and MF capacities differ.
+    phi = float(0.0)
+    if path == 0:
+        phi = dense_phi[world, slot]
+    else:
         phi = mf_phi[world, slot]
     if not wp.isfinite(phi):
         _latch(status, _INVALID_SEPARATION, contact)

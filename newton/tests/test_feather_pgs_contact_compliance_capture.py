@@ -3,6 +3,7 @@
 
 """Check CUDA graph capture and replay of experimental contact compliance."""
 
+import os
 import unittest
 
 import numpy as np
@@ -16,6 +17,62 @@ def _materials(contacts, stiffness):
     contacts.rigid_contact_stiffness.fill_(stiffness)
     contacts.rigid_contact_damping.fill_(20.0)
     contacts.rigid_contact_friction.fill_(1.0)
+
+
+def _run_free_spheres(*, dense_rows, graph, steps=20):
+    """Four free spheres in one world: their matrix-free slots exceed a one-row dense capacity."""
+    device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.add_ground_plane()
+        for i in range(4):
+            body = builder.add_body(xform=wp.transform((i * 0.3, 0.0, 0.049), wp.quat_identity()))
+            builder.add_shape_sphere(body, radius=0.05)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+        model.rigid_contact_max = 32
+        contacts = pipeline.contacts()
+        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+            setattr(contacts, name, wp.zeros(32, dtype=float))
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            contact_compliance=True,
+            friction_anchor_beta=0.0,
+            enable_restitution=False,
+            dense_max_constraints=dense_rows,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+        )
+        states = (model.state(), model.state())
+        newton.eval_fk(model, model.joint_q, model.joint_qd, states[0])
+        control = model.control()
+
+        def two_steps():
+            for source, target in (states, states[::-1]):
+                source.clear_forces()
+                pipeline.collide(source, contacts)
+                _materials(contacts, 3000.0)
+                solver.step(source, target, control, contacts, 0.005)
+
+        trace = []
+        two_steps()
+        trace.append(states[0].body_q.numpy().copy())
+        slots = solver.contact_slot.numpy()[: int(contacts.rigid_contact_count.numpy()[0])].copy()
+        captured = None
+        if graph:
+            with wp.ScopedCapture() as capture:
+                solver.seed_double_buffer_events()
+                two_steps()
+            captured = capture.graph
+        for _ in range(steps - 1):
+            if graph:
+                wp.capture_launch(captured)
+            else:
+                two_steps()
+            solver.validate_contact_compliance()
+            trace.append(states[0].body_q.numpy().copy())
+        return solver, np.asarray(trace), slots
 
 
 class _Episode:
@@ -163,6 +220,22 @@ class TestContactComplianceCapture(unittest.TestCase):
                         for _ in range(40):
                             wp.capture_launch(capture.graph)
                             fixture.solver.validate_contact_compliance()
+
+    def test_unequal_row_capacities(self):
+        """Free-body rows beyond the dense capacity prepare as with a large dense capacity, eager and replayed."""
+        traces, counts = {}, {}
+        for dense_rows in (1, 32):
+            for graph in (False, True):
+                solver, trace, slots = _run_free_spheres(dense_rows=dense_rows, graph=graph)
+                counts[dense_rows, graph] = solver.compliance_contact_count
+                if dense_rows == 1:
+                    self.assertGreaterEqual(int(slots.max()), dense_rows)
+                traces[dense_rows, graph] = trace
+        self.assertGreaterEqual(counts[32, False], 4)
+        for key, trace in traces.items():
+            with self.subTest(dense_rows=key[0], graph=key[1]):
+                self.assertEqual(counts[key], counts[32, False])
+                np.testing.assert_array_equal(trace, traces[32, False])
 
     def test_validate_rejects_capture(self):
         """Status readback is refused inside a capture."""
