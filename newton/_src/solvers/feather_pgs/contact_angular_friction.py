@@ -385,7 +385,7 @@ __PROJECT__
         // The ball subproblem by eigendecomposition, which dependent rows cannot break; true when interior.
         // Boundary: y = -(H + alpha I)^+ c with Newton on 1 / |y(alpha)| from a point below the root, stopping
         // on a 1e-6 relative boundary residual or after 40 steps, then rescaled into the ball.
-        static __device__ bool eigen_ball(const Row* H, const float* c, const bool* active, float load, float* y) {
+        static __device__ __noinline__ bool eigen_ball(const Row* H, const float* c, const bool* active, float load, float* y) {
             float Q[5][5], lambda[5], projected[5], c_norm = 0.0f;
             decompose(H, active, Q, lambda);
             for (int k = 0; k < 5; ++k) c_norm += active[k] ? c[k] * c[k] : 0.0f;
