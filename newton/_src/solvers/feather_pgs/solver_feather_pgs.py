@@ -261,6 +261,9 @@ _LOCAL_GENERAL_BLOCKS_PER_SM = 8
 _LOCAL_PAIR_BLOCKS_PER_SM = 8
 # The local solver performs a serial O(dof_count**2) triangular solve per row.
 _LOCAL_INTERNAL_MAX_DOF = 16
+# Conservative total-world proxy for local-owner selection; measured paired-residual batches beyond it ran faster on
+# the general owner.
+_LOCAL_SOLVE_WORLDS_PER_SM = 1
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
@@ -2379,6 +2382,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self._debug_buffers_enabled
             and self._local_solve_max_rows > 0
+            and self.world_count <= _LOCAL_SOLVE_WORLDS_PER_SM * int(model.device.sm_count)
             # The local owners do not solve the appended torsion row; torsion is configured later in
             # construction, so gate on the requested radius here.
             and float(contact_torsion_radius) <= 0.0
@@ -2664,6 +2668,9 @@ class SolverFeatherPGS(SolverBase):
         self._setup_sparse_mass_matrix(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
+        if not model.requires_grad:
+            # These buffers carry the FK/ID cache between steps; a graph that allocates them frees them on relaunch.
+            self._allocate_state_aux_vars(model, self, False)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
         # Torsion must never reinterpret it, including when patch PRs are merged.
         self._contact_torsion_group = wp.full(
@@ -12834,11 +12841,14 @@ class SolverFeatherPGS(SolverBase):
                 else:
                     self._stage4_diag_from_JY(size)
         elif self._hinv_jt_writes_world:
+            # This reduction skips locally owned worlds.
             self._stage4_diag_from_JY_world()
+            return
         else:
             for size in self.size_groups:
                 self._stage4_diag_from_JY(size)
-        if self._local_internal_fast_path and not self._hinv_jt_writes_world:
+        # Local owners add the response themselves, so their rows keep only CFM.
+        if self._local_internal_fast_path:
             wp.launch(
                 clear_local_solve_diag,
                 dim=self.world_count * self.dense_max_constraints,

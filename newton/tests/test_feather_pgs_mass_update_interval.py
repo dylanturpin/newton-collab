@@ -361,6 +361,42 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             self.assertTrue(np.isfinite(captured).all(), f"{name} became non-finite under graph replay")
             np.testing.assert_allclose(captured, getattr(eager_a, name).numpy(), rtol=0.0, atol=2.0e-6, err_msg=name)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_first_step_capture_keeps_fk_id_cache_between_graph_launches(self):
+        """Keep the FK/ID cache across launches of a graph that captures the solver's first step.
+
+        Graph allocations are released and reacquired on every launch, so buffers that carry data between steps
+        must exist before capture. Scratch released earlier in the frame makes the reacquired memory alias it.
+        """
+        graph_model = _build_model("cuda:0", ground=False)
+        eager_model = _build_model("cuda:0", ground=False)
+        graph_solver = SolverFeatherPGS(graph_model, pgs_mode="matrix_free")
+        eager_solver = SolverFeatherPGS(eager_model, pgs_mode="matrix_free")
+        self.assertTrue(graph_solver._fk_id_cache_enabled)
+        graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
+        eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
+        graph_control, eager_control = graph_model.control(), eager_model.control()
+
+        def two_substeps(solver, state_in, state_out, control):
+            for _ in range(2):
+                solver.step(state_in, state_out, control, None, DT)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    wp.copy(getattr(state_in, name), getattr(state_out, name))
+
+        # The very first launches of graph_solver happen inside the capture.
+        with wp.ScopedCapture("cuda:0") as capture:
+            scratch = wp.full(1000, float("nan"), dtype=wp.float32, device="cuda:0")
+            del scratch
+            two_substeps(graph_solver, graph_a, graph_b, graph_control)
+        for _ in range(16):
+            wp.capture_launch(capture.graph)
+            two_substeps(eager_solver, eager_a, eager_b, eager_control)
+
+        for name in ("joint_q", "joint_qd"):
+            captured = getattr(graph_a, name).numpy()
+            self.assertTrue(np.isfinite(captured).all(), f"{name} became non-finite under graph replay")
+            np.testing.assert_allclose(captured, getattr(eager_a, name).numpy(), rtol=0.0, atol=2.0e-6, err_msg=name)
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
