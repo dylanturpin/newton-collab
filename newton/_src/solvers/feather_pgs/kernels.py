@@ -51,7 +51,11 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 # directions, unbounded lambda, Baumgarte drift correction.
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_TORSION = 7
-PGS_CONSTRAINT_TYPE_COUNT = 8
+# Joint dry-friction row: ``J = e_dof`` with zero target velocity and no bias.
+# The accumulated impulse is boxed to ``[-f dt, f dt]`` (bound stored in the
+# row's ``mu`` slot), so the DOF sticks until the required impulse saturates.
+PGS_CONSTRAINT_TYPE_JOINT_FRICTION = 8
+PGS_CONSTRAINT_TYPE_COUNT = 9
 
 # Keep launch-geometry-specific dynamics kernels out of the large general
 # kernel module. Warp compiles one whole module variant per block dimension.
