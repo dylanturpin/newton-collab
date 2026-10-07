@@ -505,6 +505,34 @@ def test_box_box_sat_drift_manifold(test: unittest.TestCase, device):
             test.assertEqual(len(quads), 4, f"pose {k}: manifold does not span four corners: {p0}")
 
 
+def test_box_box_sat_thin_face_keeps_corners(test: unittest.TestCase, device):
+    """Keep both signs on both in-plane axes for an aligned, stacked thin face.
+
+    Long boxes with sub-millimeter half-widths emit more than eight candidates; candidate
+    reduction must not merge corners across the thin face."""
+    for half_width in (1.0e-4, 1.0e-5):
+        size = wp.vec3(1.0, half_width, 0.25)
+        dist, pos, _feat = _features_raw(device, size, wp.vec3(0.0, 0.0, 0.5 - 1.0e-6), size)
+        corners = pos[dist < 1.0e5]
+        signs = {(bool(p[0] > 0.0), bool(p[1] > 0.0)) for p in corners}
+        test.assertEqual(len(signs), 4, f"half-width {half_width}: corners {corners.tolist()}")
+
+
+def _features_raw(device, box1_size, box2_pos, box2_size):
+    ident = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    out_dist = wp.zeros(8, dtype=wp.float32, device=device)
+    out_pos = wp.zeros(8, dtype=wp.vec3, device=device)
+    out_feat = wp.zeros(8, dtype=wp.int32, device=device)
+    wp.launch(
+        _eval_box_box_features,
+        dim=1,
+        inputs=[wp.vec3(0.0), ident, box1_size, box2_pos, ident, box2_size, 0.0],
+        outputs=[out_dist, out_pos, out_feat],
+        device=device,
+    )
+    return out_dist.numpy(), out_pos.numpy(), out_feat.numpy()
+
+
 class TestBoxBoxSAT(unittest.TestCase):
     pass
 
@@ -561,6 +589,12 @@ add_function_test(
     TestBoxBoxSAT,
     "test_box_box_sat_drift_manifold",
     test_box_box_sat_drift_manifold,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_sat_thin_face_keeps_corners",
+    test_box_box_sat_thin_face_keeps_corners,
     devices=get_test_devices(),
 )
 
