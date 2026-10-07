@@ -232,7 +232,65 @@ _PYRAMIDAL_PROJECT = """
                 for (int k = 0; k < 5; ++k) y[k] *= scale;
             }
         }
-"""
+
+        // Find the face of the minimizer of 0.5 y'Hy + c'y over the cone, starting from y0, into y.
+        static __device__ __noinline__ void descend(
+            const Row* H, const float* c, const bool* active, float load, const float* y0, float* y) {
+            // Accelerated projected gradient in group-scaled coordinates u_g = s_g y_g, which give the
+            // sliding, spin and rolling groups comparable curvature; stops on the gradient-mapping residual.
+            const int first[3] = {0, 2, 3};
+            const int count[3] = {2, 1, 2};
+            float s[5], w[3], Hu[5][5], cu[5], u[5], z[5], lipschitz = 0.0f;
+            for (int g = 0; g < 3; ++g) {
+                float curvature = 0.0f;
+                for (int k = first[g]; k < first[g] + count[g]; ++k)
+                    curvature = fmaxf(curvature, active[k] ? H[k][k] : 0.0f);
+                float scale = curvature > 0.0f ? sqrtf(curvature) : 1.0f;
+                w[g] = 1.0f / scale;
+                for (int k = first[g]; k < first[g] + count[g]; ++k) s[k] = scale;
+            }
+            for (int k = 0; k < 5; ++k) {
+                float row_sum = 0.0f;
+                for (int l = 0; l < 5; ++l) {
+                    Hu[k][l] = H[k][l] / (s[k] * s[l]);
+                    row_sum += fabsf(Hu[k][l]);
+                }
+                lipschitz = fmaxf(lipschitz, active[k] ? row_sum : 0.0f);
+                cu[k] = c[k] / s[k];
+                u[k] = y0[k] * s[k];
+            }
+            project(u, w, load);
+            for (int k = 0; k < 5; ++k) z[k] = u[k];
+            float momentum = 1.0f;
+            for (int iteration = 0; iteration < 64 && lipschitz > 0.0f; ++iteration) {
+                float next[5];
+                for (int k = 0; k < 5; ++k) {
+                    float gradient = cu[k];
+                    for (int l = 0; l < 5; ++l) gradient += Hu[k][l] * z[l];
+                    next[k] = active[k] ? z[k] - gradient / lipschitz : 0.0f;
+                }
+                project(next, w, load);
+                // Residual of the projected-gradient fixed point at z, per group in y units.
+                float residual = 0.0f, ascent = 0.0f;
+                for (int g = 0; g < 3; ++g) {
+                    float squared = 0.0f;
+                    for (int k = first[g]; k < first[g] + count[g]; ++k)
+                        squared += (next[k] - z[k]) * (next[k] - z[k]);
+                    residual = fmaxf(residual, sqrtf(squared) * w[g]);
+                }
+                for (int k = 0; k < 5; ++k) ascent += (z[k] - next[k]) * (next[k] - u[k]);
+                momentum = ascent > 0.0f ? 1.0f : momentum;
+                float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
+                float blend = (momentum - 1.0f) / next_momentum;
+                for (int k = 0; k < 5; ++k) {
+                    z[k] = next[k] + blend * (next[k] - u[k]);
+                    u[k] = next[k];
+                }
+                momentum = next_momentum;
+                if (residual <= 1.0e-5f * load) break;
+            }
+            for (int k = 0; k < 5; ++k) y[k] = u[k] / s[k];
+        }"""
 
 _ELLIPTIC_CONSTRAINED = """
                     float c[5];
@@ -243,65 +301,15 @@ _ELLIPTIC_CONSTRAINED = """
                     trust_region(H, c, active, load, y);"""
 
 _PYRAMIDAL_CONSTRAINED = """
-                    // Accelerated projected gradient in group-scaled coordinates u_g = s_g y_g, which give the
-                    // sliding, spin and rolling groups comparable curvature; stops on the gradient-mapping residual.
                     const int first[3] = {0, 2, 3};
                     const int count[3] = {2, 1, 2};
-                    float c[5], s[5], w[3], Hu[5][5], cu[5], u[5], z[5], lipschitz = 0.0f;
+                    float c[5], Hu[5][5];
                     for (int k = 0; k < 5; ++k) {
                         c[k] = gradient0[k];
                         for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
                         c[k] = active[k] ? c[k] : 0.0f;
                     }
-                    for (int g = 0; g < 3; ++g) {
-                        float curvature = 0.0f;
-                        for (int k = first[g]; k < first[g] + count[g]; ++k)
-                            curvature = fmaxf(curvature, active[k] ? H[k][k] : 0.0f);
-                        float scale = curvature > 0.0f ? sqrtf(curvature) : 1.0f;
-                        w[g] = 1.0f / scale;
-                        for (int k = first[g]; k < first[g] + count[g]; ++k) s[k] = scale;
-                    }
-                    for (int k = 0; k < 5; ++k) {
-                        float row_sum = 0.0f;
-                        for (int l = 0; l < 5; ++l) {
-                            Hu[k][l] = H[k][l] / (s[k] * s[l]);
-                            row_sum += fabsf(Hu[k][l]);
-                        }
-                        lipschitz = fmaxf(lipschitz, active[k] ? row_sum : 0.0f);
-                        cu[k] = c[k] / s[k];
-                        u[k] = y0[k] * s[k];
-                    }
-                    project(u, w, load);
-                    for (int k = 0; k < 5; ++k) z[k] = u[k];
-                    float momentum = 1.0f;
-                    for (int iteration = 0; iteration < 64 && lipschitz > 0.0f; ++iteration) {
-                        float next[5];
-                        for (int k = 0; k < 5; ++k) {
-                            float gradient = cu[k];
-                            for (int l = 0; l < 5; ++l) gradient += Hu[k][l] * z[l];
-                            next[k] = active[k] ? z[k] - gradient / lipschitz : 0.0f;
-                        }
-                        project(next, w, load);
-                        // Residual of the projected-gradient fixed point at z, per group in y units.
-                        float residual = 0.0f, ascent = 0.0f;
-                        for (int g = 0; g < 3; ++g) {
-                            float squared = 0.0f;
-                            for (int k = first[g]; k < first[g] + count[g]; ++k)
-                                squared += (next[k] - z[k]) * (next[k] - z[k]);
-                            residual = fmaxf(residual, sqrtf(squared) * w[g]);
-                        }
-                        for (int k = 0; k < 5; ++k) ascent += (z[k] - next[k]) * (next[k] - u[k]);
-                        momentum = ascent > 0.0f ? 1.0f : momentum;
-                        float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
-                        float blend = (momentum - 1.0f) / next_momentum;
-                        for (int k = 0; k < 5; ++k) {
-                            z[k] = next[k] + blend * (next[k] - u[k]);
-                            u[k] = next[k];
-                        }
-                        momentum = next_momentum;
-                        if (residual <= 1.0e-5f * load) break;
-                    }
-                    for (int k = 0; k < 5; ++k) y[k] = u[k] / s[k];
+                    descend(H, c, active, load, y0, y);
                     // On the face found above, sum_g |y_g| <= load is sum_g |y_g|^2 / t_g <= load^2 at t_g = |y_g| / sum |y|.
                     // Alternating the weighted trust-region solve with that t converges to the optimum.
                     for (int iteration = 0; iteration < 8; ++iteration) {
@@ -325,6 +333,7 @@ _PYRAMIDAL_CONSTRAINED = """
                         trust_region(Hu, cr, active, load, y);
                         for (int k = 0; k < 5; ++k) y[k] *= r[k];
                     }"""
+
 
 _BLOCK_SOURCE = """
     // Kept out of line so contacts without angular rows keep the sweep's register budget.
