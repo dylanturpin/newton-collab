@@ -314,16 +314,15 @@ _PYRAMIDAL_CONSTRAINED = """
                         }
                         if (!(total > 0.0f)) break;
                         float r[5], cr[5];
-                        bool face[5];
                         for (int g = 0; g < 3; ++g)
                             for (int k = first[g]; k < first[g] + count[g]; ++k) {
                                 r[k] = sqrtf(norm[g] / total);
-                                face[k] = active[k] && r[k] > 0.0f;
                                 cr[k] = r[k] * c[k];
                             }
+                        // Groups off the face get zero weight, which removes their rows from the solve.
                         for (int k = 0; k < 5; ++k)
                             for (int l = 0; l < 5; ++l) Hu[k][l] = r[k] * r[l] * H[k][l];
-                        trust_region(Hu, cr, face, load, y);
+                        trust_region(Hu, cr, active, load, y);
                         for (int k = 0; k < 5; ++k) y[k] *= r[k];
                     }"""
 
@@ -333,15 +332,20 @@ _BLOCK_SOURCE = """
         typedef float Row[5];
 __PROJECT__
 
-        // Cholesky of H + alpha I over the active rows; fails when a pivot keeps under 1e-6 of its diagonal.
+        // A row takes part when it is active and has curvature; other rows keep zero impulse.
+        static __device__ bool live(const Row* H, const bool* active, int k) {
+            return active[k] && H[k][k] > 0.0f;
+        }
+
+        // Cholesky of H + alpha I over the live rows; fails when a pivot keeps under 1e-6 of its diagonal.
         static __device__ bool factor(const Row* H, const bool* active, float alpha, Row* L) {
             for (int k = 0; k < 5; ++k) {
                 for (int l = 0; l <= k; ++l) {
-                    float value = active[k] && active[l] ? H[k][l] : 0.0f;
-                    if (k == l) value = active[k] ? value + alpha : 1.0f;
+                    float value = live(H, active, k) && live(H, active, l) ? H[k][l] : 0.0f;
+                    if (k == l) value = live(H, active, k) ? value + alpha : 1.0f;
                     for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
                     if (k == l) {
-                        if (!(value > 1.0e-6f * (active[k] ? H[k][k] + alpha : 1.0f))) return false;
+                        if (!(value > 1.0e-6f * (live(H, active, k) ? H[k][k] + alpha : 1.0f))) return false;
                         L[k][k] = sqrtf(value);
                     } else {
                         L[k][l] = value / L[l][l];
@@ -365,12 +369,12 @@ __PROJECT__
             }
         }
 
-        // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows: y = -(H + alpha I)^-1 c, with alpha found by
+        // Minimize 0.5 y'Hy + c'y over |y| <= load on the live rows: y = -(H + alpha I)^-1 c, with alpha found by
         // Newton on 1 / |y(alpha)| (More-Sorensen) inside a bracket, stopping on the boundary residual.
         static __device__ void trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
             float L[5][5], b[5], c_norm = 0.0f;
             for (int k = 0; k < 5; ++k) {
-                b[k] = active[k] ? c[k] : 0.0f;
+                b[k] = live(H, active, k) ? c[k] : 0.0f;
                 c_norm += b[k] * b[k];
                 y[k] = 0.0f;
             }
