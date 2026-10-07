@@ -415,6 +415,13 @@ __PROJECT__
         static __device__ __noinline__ float solve(
             float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
             int lane, unsigned MASK, float load, float omega, int* changed) {
+                // Read the shared impulses before the warp reduction; a lane past it may write them back.
+                float x0[5], mu[5], rhs[5];
+                for (int k = 0; k < 5; ++k) {
+                    x0[k] = lam[k];
+                    mu[k] = fmaxf(mu_rows[k], 0.0f);
+                    rhs[k] = rhs_rows[k];
+                }
                 float sums[20];
                 for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
                 for (int d = lane; d < __DOFS__; d += 32) {
@@ -436,12 +443,10 @@ __PROJECT__
                     sums[q] = __shfl_sync(MASK, value, 0);
                 }
                 load = fmaxf(load, 0.0f);
-                float x0[5], gradient0[5], mu[5], H[5][5], largest = 0.0f;
+                float gradient0[5], H[5][5], largest = 0.0f;
                 int q = 5;
                 for (int k = 0; k < 5; ++k) {
-                    x0[k] = lam[k];
-                    mu[k] = fmaxf(mu_rows[k], 0.0f);
-                    gradient0[k] = sums[k] + rhs_rows[k];
+                    gradient0[k] = sums[k] + rhs[k];
                     for (int l = k; l < 5; ++l) { H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }
                     largest = fmaxf(largest, H[k][k]);
                 }
@@ -483,7 +488,7 @@ __CONSTRAINED__
                     for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
                 }
                 for (int k = 1; k < 5; ++k) {
-                    float block_delta = x[k] - lam[k];
+                    float block_delta = x[k] - x0[k];
                     if (block_delta != 0.0f) {
                         *changed = 1;
                         for (int d = lane; d < __DOFS__; d += 32)
