@@ -24,6 +24,13 @@ import newton
 import newton.examples
 from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
 
+# The fixed MPM grid is sized once from the bed (2 x 2 x 0.5 m) plus this padding, i.e. to |x|, |y| <= 8.55 m and
+# z <= 8.05 m; it holds the boxes' 5.2 m drop height. A grain leaving the grid gets runaway velocities, so cap grain
+# speed (the boxes never exceed 6.4 m/s) such that any ballistic grain stays inside: apex 0.5 + v^2 / 2g = 3.8 m and
+# range 1 + v^2 / g = 7.5 m at 8 m/s.
+_GRID_PADDING = 150
+_PARTICLE_MAX_VELOCITY = 8.0
+
 
 def _add_rigid_solver_arg(parser) -> None:
     parser.add_argument(
@@ -113,13 +120,13 @@ class Example:
         voxel_size = 0.05
         self._emit_particles(builder, voxel_size)
 
+        builder.particle_max_velocity = _PARTICLE_MAX_VELOCITY
         self.model = builder.finalize()
 
         mpm_config = SolverImplicitMPM.Config()
         mpm_config.voxel_size = voxel_size
-        # The rebuildable sparse grid follows the particles, so grains thrown up by the impacts stay inside it.
-        mpm_config.grid_type = "sparse"
-        mpm_config.grid_padding = 0
+        mpm_config.grid_type = "fixed"
+        mpm_config.grid_padding = _GRID_PADDING
         mpm_config.max_active_cell_count = 1 << 15
         mpm_config.strain_basis = "P0"
         mpm_config.max_iterations = 50
@@ -207,7 +214,6 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
-        self.mpm_solver.check_sparse_grid_rebuild_status()
         newton.examples.test_body_state(
             self.model,
             self.state_0,

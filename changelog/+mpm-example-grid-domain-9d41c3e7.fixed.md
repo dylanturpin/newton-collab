@@ -1,0 +1,1 @@
+The rigid/MPM coupled example sizes its fixed MPM grid to hold the scene and caps grain speed so thrown grains stay inside it: grains that left the former grid got runaway velocities that launched the boxes and made the sand non-finite.
