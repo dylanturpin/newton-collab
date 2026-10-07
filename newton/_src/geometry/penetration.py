@@ -7,7 +7,7 @@ from typing import Any
 
 import warp as wp
 
-from .support_function import unpack_mesh_ptr
+from .support_function import _has_verified_hull, unpack_mesh_ptr
 from .types import GeoType
 
 # Tangent offset [unitless] of the tilted certificate normals, about 2 degrees.
@@ -334,10 +334,11 @@ def create_solve_box_penetration(support: Any):
     @wp.func
     def solve(
         a: Any, b: Any, rotation: wp.quat, position: wp.vec3, provider: Any, hint: wp.vec3
-    ) -> tuple[wp.vec3, float]:
-        """Return the minimum-depth normal and depth, certifying ``hint`` first if nonzero."""
+    ) -> tuple[wp.vec3, float, bool]:
+        """Return a depth candidate and whether its minimum is certified."""
         if a.shape_type == int(GeoType.BOX) and b.shape_type == int(GeoType.BOX):
-            return _box_box_depth(a.scale, b.scale, rotation, position)
+            normal, depth = _box_box_depth(a.scale, b.scale, rotation, position)
+            return normal, depth, True
         normal = wp.vec3(1.0, 0.0, 0.0)
         depth = float(1.0e30)
         box_a = a.shape_type == int(GeoType.BOX)
@@ -366,7 +367,7 @@ def create_solve_box_penetration(support: Any):
             best_vertex = opposite.BtoA
             recent_vertex = first.BtoA
         if depth < 0.0:
-            return normal, depth
+            return normal, depth, False
         # A box plus a segment of genuine partner points is an inner
         # Minkowski body. Matching its depth to a support-plane upper bound
         # certifies the global minimum without visiting the mesh's edges.
@@ -374,7 +375,7 @@ def create_solve_box_penetration(support: Any):
         far = partner_point(box_a, rotation, position, opposite)
         lower, _direction = _box_triangle_depth(half, point, point, far)
         if lower > 0.0 and depth - lower <= 1.0e-6:
-            return normal, depth
+            return normal, depth, True
         # Partner points supporting normals tilted around the caller's
         # candidate (e.g. a portal normal) span the partner's contact feature.
         hint_length = wp.length(hint)
@@ -395,12 +396,19 @@ def create_solve_box_penetration(support: Any):
                 a, b, rotation, position, provider, box_a, half, points[0], points[1], points[2]
             )
             if lower > 0.0 and upper - lower <= 1.0e-6:
-                return hint, upper
+                return hint, upper, True
             if upper < depth:
                 depth = upper
                 normal = hint
                 recent_vertex = best_vertex
                 best_vertex = hint_vertex
-        return solve_box_mesh(a, b, rotation, position, provider, normal, depth, best_vertex, recent_vertex)
+        mesh = b if box_a else a
+        verified = _has_verified_hull(mesh, provider)
+        # Incomplete source triangles cannot certify an interior ball or a
+        # minimum depth. Keep the support-plane candidate as an upper bound.
+        if not verified:
+            return normal, depth, False
+        normal, depth = solve_box_mesh(a, b, rotation, position, provider, normal, depth, best_vertex, recent_vertex)
+        return normal, depth, True
 
     return solve

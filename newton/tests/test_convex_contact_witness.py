@@ -206,7 +206,7 @@ class TestConvexContactWitness(unittest.TestCase):
 
 
 def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
-    """Report a supported normal and its exact depth when refinement cannot converge."""
+    """Report hull witnesses, a supported normal, and its exact depth when refinement cannot converge."""
     with np.load(Path(__file__).parent / "assets" / "convex_contact_4414.npz", allow_pickle=False) as fixture:
         vertices = [fixture[key + "_vertices"].copy() for key in ("torso", "elbow")]
         indices = [fixture[key + "_indices"].astype(np.int32) for key in ("torso", "elbow")]
@@ -233,10 +233,9 @@ def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
             test.assertEqual(int(hit.numpy()[0]), 1)
             witnesses = points.numpy().astype(np.float64)
             test.assertTrue(np.all(np.isfinite(witnesses)))
-            if distance_query is None:
-                local_b = np.asarray(wp.quat_rotate_inv(rotation, wp.vec3(witnesses[1]) - position))
-                for side, point in enumerate((witnesses[0], local_b)):
-                    test.assertLessEqual(abs(_surface_error(vertices[side], indices[side], point)), 1.0e-5)
+            local_b = np.asarray(wp.quat_rotate_inv(rotation, wp.vec3(witnesses[1]) - position))
+            for side, point in enumerate((witnesses[0], local_b)):
+                test.assertLessEqual(abs(_surface_error(vertices[side], indices[side], point)), 1.0e-5)
             normal = witnesses[2]
             test.assertAlmostEqual(float(np.linalg.norm(normal)), 1.0, delta=1.0e-6)
             # Witnesses lie on both supporting planes of the reported normal,
@@ -250,10 +249,12 @@ def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
             test.assertTrue(np.isfinite(depth))
             test.assertGreaterEqual(depth, 0.05254986867157328 - 1.0e-5)
             test.assertAlmostEqual(float(np.dot(witnesses[0] - witnesses[1], normal)), depth, delta=1.0e-6)
-            # The contact writer stores a midpoint, not independent witnesses.
-            center = 0.5 * (witnesses[0] + witnesses[1])
-            np.testing.assert_allclose(center + 0.5 * depth * witnesses[2], witnesses[0], atol=1.0e-6)
-            np.testing.assert_allclose(center - 0.5 * depth * witnesses[2], witnesses[1], atol=1.0e-6)
+            if distance_query is None:
+                # Certified distance witnesses also survive the writer's
+                # midpoint and normal/depth reconstruction.
+                center = 0.5 * (witnesses[0] + witnesses[1])
+                np.testing.assert_allclose(center + 0.5 * depth * normal, witnesses[0], atol=1.0e-6)
+                np.testing.assert_allclose(center - 0.5 * depth * normal, witnesses[1], atol=1.0e-6)
 
 
 def test_convex_contact_failed_distance_query(test, device):

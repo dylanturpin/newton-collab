@@ -36,6 +36,7 @@ from typing import Any
 import warp as wp
 
 from .support_function import (
+    _has_verified_hull,
     create_shape_center_function,
     create_shape_support_function,
 )
@@ -198,7 +199,21 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     from .penetration import box_polyhedron_pair as solve_mpr_needs_certificate  # noqa: PLC0415
     from .penetration import create_solve_box_penetration  # noqa: PLC0415
 
-    solve_sat = create_solve_box_penetration(_minkowski_support)
+    @wp.func
+    def certificate_support(
+        a: Any, b: Any, direction: wp.vec3, rotation: wp.quat, position: wp.vec3, extend: float, provider: Any
+    ) -> Vert:
+        # A loose support walk supplies real vertices but not a proven upper
+        # support bound. Query all vertices when certifying unverified hulls.
+        query_a = a
+        query_b = b
+        if not _has_verified_hull(query_a, provider):
+            query_a.shape_index = -1
+        if not _has_verified_hull(query_b, provider):
+            query_b.shape_index = -1
+        return _minkowski_support(query_a, query_b, direction, rotation, position, extend, provider)
+
+    solve_sat = create_solve_box_penetration(certificate_support)
 
     @wp.func
     def solve_mpr_portal(
@@ -465,8 +480,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         extend: float,
         data_provider: Any,
         normal: wp.vec3,
-    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
-        """Refine a confirmed overlap with fixed storage and bounded distance queries."""
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float, bool]:
+        """Refine an inflated overlap and report whether the physical contact is resolved."""
         direction = wp.normalize(normal)
         if wp.length_sq(direction) == 0.0:
             direction = wp.vec3(1.0, 0.0, 0.0)
@@ -481,11 +496,12 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         # Float32 resolution follows coordinate magnitude; scale absolute tolerances.
         tolerance = wp.max(1.0, wp.max(wp.length(point_a), wp.length(point_b)))
         normal = direction
-        penetration = wp.max(wp.dot(support.BtoA, direction), 0.0) + extend
-        # Writers reconstruct witnesses from midpoint and normal/depth.
-        center = 0.5 * (point_a + point_b)
-        point_a = center + normal * (0.5 * penetration)
-        point_b = center - normal * (0.5 * penetration)
+        penetration = wp.dot(support.BtoA, direction) + extend
+        resolved = bool(False)
+        # Manifolds anchor each body's contact plane at its witness, so keep
+        # the genuine support points; they span the depth along the normal.
+        point_a += normal * (0.5 * extend)
+        point_b -= normal * (0.5 * extend)
 
         for _optimization in range(4):
             support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, extend, data_provider)
@@ -506,34 +522,41 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     break
                 pb = pb - translation * direction
                 # Remove inflation in the separating direction, then align the
-                # contact normal with the physical witnesses. Writers
-                # reconstruct them from midpoint and normal/depth.
+                # contact normal with the physical witnesses, keeping the sign
+                # of a physical gap. Writers reconstruct them from midpoint and
+                # normal/depth.
                 physical_delta = pa - pb - separating_normal * extend
-                physical_depth = wp.length(physical_delta)
+                physical_length = wp.length(physical_delta)
+                physical_depth = physical_length
+                if wp.dot(physical_delta, separating_normal) < 0.0:
+                    physical_depth = -physical_depth
                 depth = physical_depth + extend
-                candidate = direction
-                if physical_depth > 0.0:
+                # Keep the supporting orientation across zero physical depth.
+                candidate = separating_normal
+                if physical_length > 1e-7 * tolerance:
                     candidate = physical_delta / physical_depth
                 # Certify the reported normal, not the separating one: shifting
                 # B back along a ray off that normal tilts the witness
                 # difference, which shallow depths amplify. Witnesses inside
                 # both hulls support the normal only if they span its
                 # support-plane depth, whatever GJK's exit reason.
-                certificate = mpr_support(geom_a, geom_b, candidate, orientation_b, position_b, extend, data_provider)
+                certificate = certificate_support(
+                    geom_a, geom_b, candidate, orientation_b, position_b, extend, data_provider
+                )
                 support_gap = wp.dot(certificate.BtoA, candidate) - depth
                 if (
                     wp.isfinite(depth)
                     and depth >= 0.0
-                    and depth <= penetration
+                    and physical_length <= wp.abs(penetration - extend)
                     and wp.abs(wp.length_sq(separating_normal) - 1.0) <= 1e-4
                     and wp.abs(support_gap) <= 1e-6 * tolerance
-                    and physical_depth > 0.0
                 ):
                     normal = candidate
                     correction = (normal - separating_normal) * (0.5 * extend)
                     point_a = pa + correction
                     point_b = pb - correction
                     penetration = depth
+                    resolved = True
                 if gap > 2e-6 * tolerance:
                     gradient = separating_normal
                 if gap < 5e-7 * tolerance:
@@ -547,7 +570,14 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             if wp.dot(direction, gradient) > 1.0 - 1e-7:
                 break
             direction = gradient
-        return point_a, point_b, normal, penetration
+        if not resolved:
+            # Support witnesses alone do not establish overlap. Check the
+            # physical shapes before accepting a conservative positive depth.
+            physical_hit, _pa, _pb, _normal, _depth, _seed, _valid = solve_mpr_portal(
+                geom_a, geom_b, orientation_b, position_b, 0.0, data_provider, wp.vec3(0.0)
+            )
+            resolved = physical_hit
+        return point_a, point_b, normal, penetration, resolved
 
     @wp.func
     def solve_mpr_refine(
@@ -565,8 +595,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         valid: bool,
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-5,
-    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
-        """Certify or retry a confirmed portal overlap, then refine it if needed.
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float, bool]:
+        """Certify or retry a portal overlap and report whether a physical contact is resolved.
 
         The arguments after ``data_provider`` are the portal's result. Split and
         fused kernels pass identical values, so both make the same decisions.
@@ -577,9 +607,12 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         last_normal = normal
         retry = wp.length_sq(seed) > 0.0
         minimum_depth = float(-1.0)
+        minimum_verified = False
         if solve_mpr_needs_certificate(geom_a, geom_b):
-            minimum_normal, minimum_depth = solve_sat(geom_a, geom_b, orientation_b, position_b, data_provider, normal)
-            if minimum_depth > COLLIDE_EPSILON:
+            minimum_normal, minimum_depth, minimum_verified = solve_sat(
+                geom_a, geom_b, orientation_b, position_b, data_provider, normal
+            )
+            if minimum_verified and minimum_depth > COLLIDE_EPSILON:
                 if not valid or wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON:
                     # SAT certifies an interior ball and its nearest plane.
                     seed = -0.5 * minimum_depth * minimum_normal
@@ -595,7 +628,9 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             )
             retry = wp.length_sq(seed) > 0.0
             wrong_depth = (
-                minimum_depth > COLLIDE_EPSILON and wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON
+                minimum_verified
+                and minimum_depth > COLLIDE_EPSILON
+                and wp.abs(penetration - extend - minimum_depth) > COLLIDE_EPSILON
             )
             if not hit or penetration > bound or wrong_depth:
                 normal = last_normal
@@ -603,10 +638,10 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 break
             last_normal = normal
         if not valid:
-            point_a, point_b, normal, penetration = solve_mpr_raycast(
+            point_a, point_b, normal, penetration, valid = solve_mpr_raycast(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, normal
             )
-        return point_a, point_b, normal, penetration
+        return point_a, point_b, normal, penetration, valid
 
     @wp.func
     def solve_mpr_core(
@@ -624,7 +659,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             geom_a, geom_b, orientation_b, position_b, extend, data_provider, wp.vec3(0.0), MAX_ITER, COLLIDE_EPSILON
         )
         if collision and (not valid or solve_mpr_needs_certificate(geom_a, geom_b)):
-            point_a, point_b, normal, penetration = solve_mpr_refine(
+            point_a, point_b, normal, penetration, collision = solve_mpr_refine(
                 geom_a,
                 geom_b,
                 orientation_b,

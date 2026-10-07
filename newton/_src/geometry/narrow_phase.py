@@ -1249,8 +1249,8 @@ def create_narrow_phase_kernel_gjk_mpr(
             if type_b == GeoType.CONVEX_MESH:
                 shape_data_b.center = 0.5 * (shape_collision_aabb_lower[shape_b] + shape_collision_aabb_upper[shape_b])
             data_provider = provider_type()
+            data_provider.shape_support_data = shape_support_data
             if wp.static(accelerated_support):
-                data_provider.shape_support_data = shape_support_data
                 data_provider.support_lut = support_lut
                 data_provider.support_vertex_offsets = support_vertex_offsets
                 data_provider.support_neighbors = support_neighbors
@@ -1453,8 +1453,8 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             needs_manifold = False
             if valid:
                 provider = provider_type()
+                provider.shape_support_data = shape_support_data
                 if wp.static(accelerated_support):
-                    provider.shape_support_data = shape_support_data
                     provider.support_lut = support_lut
                     provider.support_vertex_offsets = support_vertex_offsets
                     provider.support_neighbors = support_neighbors
@@ -1565,17 +1565,22 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 needs_manifold = False
                 if valid:
                     provider = provider_type()
+                    provider.shape_support_data = shape_support_data
                     if wp.static(accelerated_support):
-                        provider.shape_support_data = shape_support_data
                         provider.support_lut = support_lut
                         provider.support_vertex_offsets = support_vertex_offsets
                         provider.support_neighbors = support_neighbors
+                    resolved = False
+                    point_a = wp.vec3(0.0)
+                    point_b = wp.vec3(0.0)
+                    normal = wp.vec3(0.0)
+                    signed_distance = float(0.0)
                     if wp.static(refine_overlap):
                         pending = query_results[pair_index]
                         seed = pending.point_a
                         if witnesses_valid:
                             seed = wp.vec3(0.0)
-                        point_a, point_b, normal, penetration = wp.static(solve_mpr.refine_core)(
+                        point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr.refine_core)(
                             query.geom_a,
                             query.geom_b,
                             query.relative_orientation_b,
@@ -1592,7 +1597,9 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                         point_a -= normal * (0.5 * query.enlarge)
                         point_b += normal * (0.5 * query.enlarge)
                         signed_distance = -penetration + query.enlarge
-                    else:
+                    # Unresolved refinements follow the ordinary distance query.
+                    if not resolved:
+                        resolved = True
                         _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                             query.geom_a,
                             query.geom_b,
@@ -1601,7 +1608,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                             0.0,
                             provider,
                         )
-                    if signed_distance <= query.contact_threshold:
+                    if resolved and signed_distance <= query.contact_threshold:
                         result = ConvexQueryResult()
                         result.point_a = point_a
                         result.point_b = point_b
@@ -1675,8 +1682,8 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 or query.type_b == GeoType.ELLIPSOID
             )
             provider = provider_type()
+            provider.shape_support_data = shape_support_data
             if wp.static(accelerated_support):
-                provider.shape_support_data = shape_support_data
                 provider.support_lut = support_lut
                 provider.support_vertex_offsets = support_vertex_offsets
                 provider.support_neighbors = support_neighbors
@@ -1956,8 +1963,8 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
             gap_sum = gap_a + gap_b
 
             data_provider = provider_type()
+            data_provider.shape_support_data = shape_support_data
             if wp.static(convex_support_acceleration):
-                data_provider.shape_support_data = shape_support_data
                 data_provider.support_lut = support_lut
                 data_provider.support_vertex_offsets = support_vertex_offsets
                 data_provider.support_neighbors = support_neighbors
@@ -2835,6 +2842,11 @@ class NarrowPhase:
             # Separated queries grow from the front; overlap refinements grow
             # from the back. Each candidate enters at most one of these queues.
             self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 2] if self.split_gjk_mpr else None
+            """Distance-query and overlap-refinement counts, shape [2], or None when unsplit.
+
+            Entry 0 counts distance queries; entry 1 counts overlap refinements.
+            Their sum is the shared queue occupancy. Both reset on each collision pass.
+            """
             self.split_manifold_work_count = c[split_gjk_idx + 2 : split_gjk_idx + 3] if self.split_gjk_mpr else None
             self.shape_pairs_sdf_sdf_count = c[sdf_sdf_idx : sdf_sdf_idx + 1]
             self.shape_pairs_mesh_count = c[mesh_like_idx : mesh_like_idx + 1] if has_mesh_like else None
@@ -3037,7 +3049,8 @@ class NarrowPhase:
             shape_source: Array of source pointers (mesh IDs, etc.) for each shape
             shape_support_data: Optional per-shape ``wp.vec4i`` metadata containing
                 packed support-LUT, vertex-offset, and neighbor starts plus the LUT resolution.
-                A nonpositive resolution disables acceleration for that shape.
+                The final entry packs resolution in its low 16 bits and strict hull
+                validity in bit 16. Zero resolution disables acceleration.
             support_lut: Optional packed octahedral-direction lookup tables whose entries
                 select seed vertices for convex support walks.
             support_vertex_offsets: Optional packed CSR offsets delimiting each convex
@@ -3743,7 +3756,8 @@ class NarrowPhase:
             shape_source: Array of source pointers (mesh IDs, etc.) for each shape
             shape_support_data: Optional per-shape ``wp.vec4i`` metadata containing
                 packed support-LUT, vertex-offset, and neighbor starts plus the LUT resolution.
-                A nonpositive resolution disables acceleration for that shape.
+                The final entry packs resolution in its low 16 bits and strict hull
+                validity in bit 16. Zero resolution disables acceleration.
             support_lut: Optional packed octahedral-direction lookup tables whose entries
                 select seed vertices for convex support walks.
             support_vertex_offsets: Optional packed CSR offsets delimiting each convex
