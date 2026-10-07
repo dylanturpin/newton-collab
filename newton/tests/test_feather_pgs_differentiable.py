@@ -999,49 +999,130 @@ def test_isotropic_friction_orientation_gradient(test, device):
             np.testing.assert_allclose(tape_derivative, fd, rtol=0.0, atol=1.0e-4)
 
 
-def test_friction_pair_off_diagonal_gradient(test, device):
-    """One sweep over a normal row and its friction pair: the tangent off-diagonal derivative matches FD."""
+def _pair_sweep(device, a, c, d, rhs, seed=(0.0, 1.0, 0.0)):
+    """One sweep over a normal row and its friction pair; return impulses and the tangent-block gradients."""
 
     def array(values, dtype=float):
         return wp.array(np.asarray(values), dtype=dtype, device=device, requires_grad=True)
 
-    def sweep(a, c, d, rhs, grad=False):
-        matrix = array([[[1.0, 0.0, 0.0], [0.0, a, c], [0.0, c, d]]])
-        residuals = wp.zeros((1, 3), device=device, requires_grad=True)
-        impulses = wp.zeros((1, 3), device=device, requires_grad=True)
-        row_type = [[PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]]
-        tape = wp.Tape()
-        with tape:
-            wp.launch(
-                _dense_pgs_sweep,
-                dim=1,
-                inputs=[
-                    array([3], int),
-                    array([[1.0, a, d]]),
-                    matrix,
-                    array([rhs]),
-                    array(row_type, int),
-                    array([[-1, 0, 0]], int),
-                    array([[1.0, 1.0, 1.0]]),
-                    1.0,
-                    0,
-                    array([[0.0, 0.0, 0.0]]),
-                ],
-                outputs=[residuals, impulses],
-                device=device,
-            )
-        if grad:
-            tape.backward(grads={impulses: array([[0.0, 1.0, 0.0]])})
-            return matrix.grad.numpy()[0, 1, 2] + matrix.grad.numpy()[0, 2, 1]
-        return float(impulses.numpy()[0, 1])
+    diag = array([[1.0, a, d]])
+    matrix = array([[[1.0, 0.0, 0.0], [0.0, a, c], [0.0, c, d]]])
+    bias = array([rhs])
+    residuals = wp.zeros((1, 3), device=device, requires_grad=True)
+    impulses = wp.zeros((1, 3), device=device, requires_grad=True)
+    row_type = [[PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]]
+    tape = wp.Tape()
+    with tape:
+        wp.launch(
+            _dense_pgs_sweep,
+            dim=1,
+            inputs=[
+                array([3], int),
+                diag,
+                matrix,
+                bias,
+                array(row_type, int),
+                array([[-1, 0, 0]], int),
+                array([[1.0, 1.0, 1.0]]),
+                1.0,
+                0,
+                array([[0.0, 0.0, 0.0]]),
+            ],
+            outputs=[residuals, impulses],
+            device=device,
+        )
+    tape.backward(grads={impulses: array([seed])})
+    matrix_grad, diag_grad = matrix.grad.numpy()[0], diag.grad.numpy()[0]
+    block_grad = [diag_grad[1], matrix_grad[1, 2] + matrix_grad[2, 1], diag_grad[2]]
+    return impulses.numpy()[0], np.array([*block_grad, *bias.grad.numpy()[0, 1:]], np.float64)
 
+
+def test_friction_pair_off_diagonal_gradient(test, device):
+    """One sweep over a normal row and its friction pair: the tangent off-diagonal derivative matches FD."""
     eps = 1.0e-3
     for a, c, d in ((1.0, 0.0, 1.0), (1.0, 0.2, 2.0)):
         for rhs in ((-1.0, 0.2, 0.3), (-1.0, 2.0, 3.0)):
             with test.subTest(block=(a, c, d), rhs=rhs):
-                fd = (sweep(a, c + eps, d, rhs) - sweep(a, c - eps, d, rhs)) / (2.0 * eps)
+                plus = _pair_sweep(device, a, c + eps, d, rhs)[0][1]
+                minus = _pair_sweep(device, a, c - eps, d, rhs)[0][1]
+                fd = (float(plus) - float(minus)) / (2.0 * eps)
                 test.assertGreater(abs(fd), 0.03)
-                test.assertAlmostEqual(sweep(a, c, d, rhs, grad=True), fd, delta=2.0e-4)
+                test.assertAlmostEqual(_pair_sweep(device, a, c, d, rhs)[1][1], fd, delta=2.0e-4)
+
+
+def test_friction_pair_gradient_scale_invariance(test, device):
+    """Scaling the tangent block and its bias by s keeps the impulse and scales every block derivative by 1/s."""
+    cases = (
+        ((1.0, 0.2, 2.0), (0.2, 0.3)),  # sticking
+        ((1.0, 0.2, 2.0), (2.0, 3.0)),  # sliding
+        ((0.0, 0.0, 2.25), (0.0, 0.3)),  # sticking on a rank-one block
+    )
+    for (a, c, d), tangent_rhs in cases:
+        reference_impulses, reference_grad = _pair_sweep(device, a, c, d, (-1.0, *tangent_rhs), seed=(0.0, 1.0, 1.0))
+        test.assertGreater(np.max(np.abs(reference_grad)), 0.01)
+        for scale in (1.0e-22, 1.0e22):
+            with test.subTest(block=(a, c, d), rhs=tangent_rhs, scale=scale):
+                impulses, grad = _pair_sweep(
+                    device,
+                    a * scale,
+                    c * scale,
+                    d * scale,
+                    (-1.0, tangent_rhs[0] * scale, tangent_rhs[1] * scale),
+                    seed=(0.0, 1.0, 1.0),
+                )
+                np.testing.assert_allclose(impulses, reference_impulses, rtol=1.0e-5, atol=1.0e-6)
+                np.testing.assert_allclose(grad * scale, reference_grad, rtol=1.0e-4, atol=1.0e-6)
+
+
+def test_rank_one_friction_pose_gradient(test, device):
+    """A prismatic-hinge chain whose contact has a rank-one tangent block: the hinge-angle derivative matches FD."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    slider = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    prismatic = builder.add_joint_prismatic(
+        -1, slider, axis=(0.0, 0.0, 1.0), parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.49), wp.quat_identity())
+    )
+    hinge = builder.add_joint_revolute(slider, body, axis=(0.0, 1.0, 0.0))
+    builder.add_articulation([prismatic, hinge])
+    cfg = newton.ModelBuilder.ShapeConfig(mu=10.0, density=0.0, restitution=0.0)
+    builder.add_shape_sphere(body, radius=1.0, xform=wp.transform(wp.vec3(1.0, 0.0, -0.5), wp.quat_identity()), cfg=cfg)
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=True)
+    initial = model.state()
+    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
+    contacts = pipeline.contacts()
+    pipeline.collide(initial, contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+    solver = SolverFeatherPGS(
+        model,
+        differentiable=True,
+        friction_anchor_beta=0.0,
+        pgs_iterations=1,
+        pgs_beta=0.0,
+        pgs_cfm=0.0,
+        angular_damping=0.0,
+        enable_restitution=False,
+    )
+
+    def run(angle, grad=False):
+        state, output = model.state(requires_grad=True), model.state(requires_grad=True)
+        state.joint_q.assign(np.array([0.0, angle], np.float32))
+        state.joint_qd.assign(np.array([-1.0, 0.4], np.float32))
+        tape = wp.Tape()
+        with tape:
+            solver.step(state, output, None, contacts, 0.01)
+        if not grad:
+            return float(output.joint_qd.numpy()[1])
+        # The y-tangent row has no Jacobian for these two DOFs, so the tangent block stays rank one.
+        test.assertEqual(float(output._fpgs_differentiable_buffers.contacts.diag.numpy()[0, 1]), 0.0)
+        tape.backward(grads={output.joint_qd: wp.array([0.0, 1.0], dtype=float, device=device)})
+        return float(state.joint_q.grad.numpy()[1])
+
+    for angle in (0.0, 0.1, 0.3):
+        with test.subTest(angle=angle):
+            fd = (run(angle + 3.0e-3) - run(angle - 3.0e-3)) / 6.0e-3
+            test.assertAlmostEqual(run(angle, grad=True), fd, delta=2.0e-3)
 
 
 @wp.func_native(
@@ -1181,6 +1262,8 @@ for _device in get_test_devices():
         test_contact_law_options,
         test_isotropic_friction_orientation_gradient,
         test_friction_pair_off_diagonal_gradient,
+        test_friction_pair_gradient_scale_invariance,
+        test_rank_one_friction_pose_gradient,
         test_pgs_kernel_selection,
         test_free_body_rows_use_dense_capacity,
     ):

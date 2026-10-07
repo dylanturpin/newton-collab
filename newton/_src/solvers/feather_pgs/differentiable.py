@@ -1953,12 +1953,8 @@ _PAIR_RETAINED = wp.constant(3.0)
 
 
 @wp.func
-def _friction_pair_solve(a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float) -> wp.vec4:
-    """friction_pair_candidate's unrelaxed result with loops unrolled, as (x, alpha, mode) for the adjoint."""
-    scale = wp.max(wp.max(a, d), 1.0e-20)
-    a /= scale
-    c /= scale
-    d /= scale
+def _pair_eigenbasis(a: float, c: float, d: float) -> wp.vec4:
+    """Unit major axis and both eigenvalues of the normalized tangent block, as friction_pair_candidate forms them."""
     largest = 0.5 * (a + d + wp.sqrt((a - d) * (a - d) + 4.0 * c * c))
     smallest = float(0.0)
     if largest > 0.0:
@@ -1970,6 +1966,20 @@ def _friction_pair_solve(a: float, c: float, d: float, residual: wp.vec2, old: w
         axis = wp.normalize(axis)
     else:
         axis = wp.vec2(1.0, 0.0)
+    return wp.vec4(axis[0], axis[1], largest, smallest)
+
+
+@wp.func
+def _friction_pair_solve(a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float) -> wp.vec4:
+    """friction_pair_candidate's unrelaxed result with loops unrolled, as (x, alpha, mode) for the adjoint."""
+    scale = wp.max(wp.max(a, d), 1.0e-20)
+    a /= scale
+    c /= scale
+    d /= scale
+    eigen = _pair_eigenbasis(a, c, d)
+    axis = wp.vec2(eigen[0], eigen[1])
+    largest = eigen[2]
+    smallest = eigen[3]
     perpendicular = wp.vec2(-axis[1], axis[0])
     residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual)) / scale
     result = old
@@ -2067,7 +2077,7 @@ def _adj_friction_pair(
 ):
     """Derivative of the pair map in the input basis, smooth where the tangent block is isotropic.
 
-    Sticking differentiates old - K^-1 r; sliding differentiates the root of (K + alpha I) x = K old - r,
+    Sticking differentiates old - K^+ r; sliding differentiates the computed root of (K + alpha I) x = K old - r,
     |x| = radius. A retained impulse substitutes the derivative of the solve it stands in for.
     """
     mode = float(_PAIR_ZERO)
@@ -2081,11 +2091,16 @@ def _adj_friction_pair(
         wp.adjoint[old] += (1.0 - omega) * adj_ret
         wp.adjoint[omega] += wp.dot(adj_ret, x - old)
     adj_x = omega * adj_ret
+    # Determinants of the normalized block, as in the forward, keep extreme scales finite.
+    scale = wp.max(wp.max(a, d), 1.0e-20)
+    a_n = a / scale
+    c_n = c / scale
+    d_n = d / scale
     if mode == _PAIR_STICK:
         wp.adjoint[old] += adj_x
-        det = a * d - c * c
+        det = a_n * d_n - c_n * c_n
         if det > 0.0:
-            inverse = wp.mat22(d, -c, -c, a) / det
+            inverse = wp.mat22(d_n, -c_n, -c_n, a_n) / (det * scale)
             y = inverse * adj_x
             z = inverse * residual
             wp.adjoint[residual] -= y
@@ -2093,23 +2108,33 @@ def _adj_friction_pair(
             wp.adjoint[d] += y[1] * z[1]
             wp.adjoint[c] += y[0] * z[1] + y[1] * z[0]
     elif mode == _PAIR_STICK_SINGULAR:
-        # The forward applies the rank-one block's pseudo-inverse, K / trace(K)^2.
-        trace = a + d
+        # The forward applies G = u u^T / lambda on the major axis u; dG holds for rank-preserving dK.
+        eigen = _pair_eigenbasis(a_n, c_n, d_n)
+        u = wp.vec2(eigen[0], eigen[1])
+        # Each factor is divided by lambda separately so the products stay in range at extreme scales.
+        inv_lam = 1.0 / (eigen[2] * scale)
+        u_h = wp.dot(u, adj_x) * inv_lam
+        u_r = wp.dot(u, residual) * inv_lam
+        h_perp = (adj_x - wp.dot(u, adj_x) * u) * inv_lam
+        r_perp = (residual - wp.dot(u, residual) * u) * inv_lam
         wp.adjoint[old] += adj_x
-        if trace > 0.0:
-            wp.adjoint[residual] -= wp.mat22(a, c, c, d) * adj_x / (trace * trace)
+        wp.adjoint[residual] -= u_h * u
+        gamma = u_h * u_r * wp.outer(u, u) - u_r * wp.outer(h_perp, u) - u_h * wp.outer(u, r_perp)
+        wp.adjoint[a] += gamma[0, 0]
+        wp.adjoint[d] += gamma[1, 1]
+        wp.adjoint[c] += gamma[0, 1] + gamma[1, 0]
     elif mode == _PAIR_SLIDE or mode == _PAIR_RETAINED:
         # [[M, x], [x^T, 0]] [p; q] = [adj_x; 0] with M = K + alpha I, solved through M's adjugate.
-        m00 = a + alpha
-        m11 = d + alpha
-        adjugate = wp.mat22(m11, -c, -c, m00)
-        det = m00 * m11 - c * c
+        m00 = a_n + alpha / scale
+        m11 = d_n + alpha / scale
+        adjugate = wp.mat22(m11, -c_n, -c_n, m00)
+        det = m00 * m11 - c_n * c_n
         u = adjugate * adj_x
         v = adjugate * x
         x_v = wp.dot(x, v)
         if det > 0.0 and x_v > 0.0:
             q = wp.dot(x, u) / x_v
-            p = (u - q * v) / det
+            p = (u - q * v) / (det * scale)
             w = old - x
             wp.adjoint[a] += p[0] * w[0]
             wp.adjoint[d] += p[1] * w[1]

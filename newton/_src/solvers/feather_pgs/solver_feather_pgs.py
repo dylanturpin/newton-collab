@@ -1285,10 +1285,13 @@ class SolverFeatherPGS(SolverBase):
                 Contacts support normal rows, point friction and restitution with ``pgs_mode="split"``.
                 The contact set and its row layout are held fixed for the derivative. Contact points and
                 normals come from the given buffers and are stop-gradient, while the gap and Jacobians are
-                recomputed from the step's poses. Every PGS sweep is differentiated as executed, and each
-                friction pair solve in closed form at its computed root. Where that solve keeps an already
-                feasible sliding impulse, the forward value is unchanged and the derivative of the pair
-                solve it stands in for is substituted. Contact activation, restitution firing and
+                recomputed from the step's poses. Every PGS sweep is differentiated as executed. Each
+                friction pair solve is differentiated in closed form at its computed root, rather than
+                through its root-finding iterates: the sticking (pseudo-)inverse, or the implicit derivative
+                of the sliding root. A rank-one tangent block, as on low-DOF articulations, is differentiated
+                along rank-preserving changes. Where the solve keeps an already feasible sliding impulse, the
+                forward value is unchanged and the derivative of the pair solve it stands in for is
+                substituted. Contact activation, restitution firing and
                 stick/slip switches are nonsmooth. Free-body rows are assembled with the articulated rows
                 and match the default matrix-free solve up to rounding, including its depenetration clamp.
                 Every contact row, free-body rows included, takes a ``dense_max_constraints`` slot, so size
