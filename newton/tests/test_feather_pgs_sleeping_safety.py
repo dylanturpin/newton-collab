@@ -177,8 +177,9 @@ class TestFeatherPGSSleepingSafety(unittest.TestCase):
                 contacts = pipeline.contacts()
                 pipeline.collide(state_in, contacts)
                 _seed_sleep(solver, state_in, [0])
-                # Only computed dynamics produce trial outputs; skipped ones publish the frozen state.
-                solver.sleeping.skip_dynamics = False
+                # Awake but quiet: only computed dynamics produce trial outputs to freeze over.
+                solver.sleeping.art_awake.fill_(1)
+                solver.sleeping.body_awake.fill_(1)
                 integrate = solver._stage6_integrate
 
                 def inject_nonfinite(*args, integrate=integrate, state_out=state_out, field=field):

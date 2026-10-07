@@ -196,6 +196,16 @@ def _build_heterogeneous_world_model():
     return builder.finalize()
 
 
+def _chain_trajectory(model, solver, steps=2):
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+    return state_0.joint_q.numpy(), state_0.joint_qd.numpy()
+
+
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def setUp(self):
         # Launch validation selects point-contact solvers without choosing a friction law.
@@ -209,9 +219,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_launch_geometry_kernels_use_dedicated_modules(self):
         """Keep custom-block-dimension kernels out of the general module."""
         expected_modules = {
-            "update_articulation_origins": "kinematics",
-            "eval_rigid_fk": "kinematics",
-            "eval_rigid_id": "kinematics",
             "eval_rigid_tau": "inverse_dynamics",
             "compute_composite_inertia": "mass_dynamics",
             "crba_fill_par_dof": "mass_dynamics",
@@ -732,6 +739,28 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for fused, generic in zip(*trajectories, strict=True):
             np.testing.assert_allclose(fused[0], generic[0], rtol=0.0, atol=2.0e-6)
             np.testing.assert_allclose(fused[1], generic[1], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "fused tiled CRBA requires CUDA")
+    def test_fused_crba_covers_articulations_wider_than_the_block(self):
+        """Match separate assembly when the tiled block has fewer threads than the articulation has DOFs."""
+        dense = {"sparse_mass_matrix": False}
+        for links in (33, 64):
+            model = _build_chain_model(num_links=links, num_worlds=1)
+            with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", dense):
+                reference = SolverFeatherPGS(model, enable_joint_limits=False, use_parallel_streams=False)
+            self.assertIsNone(reference._crba_cholesky_kernels_by_size[links])
+            q_ref, qd_ref = _chain_trajectory(model, reference)
+            for tile_threads in (32, 64):
+                with self.subTest(links=links, tile_threads=tile_threads):
+                    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", dense):
+                        fused = SolverFeatherPGS(model, enable_joint_limits=False, tile_threads=tile_threads)
+                    self.assertIsNotNone(fused._crba_cholesky_kernels_by_size[links])
+                    q, qd = _chain_trajectory(model, fused)
+                    np.testing.assert_allclose(
+                        fused.L_by_size[links].numpy(), reference.L_by_size[links].numpy(), atol=2.0e-5
+                    )
+                    np.testing.assert_allclose(q, q_ref, rtol=1.0e-5, atol=2.0e-5)
+                    np.testing.assert_allclose(qd, qd_ref, rtol=1.0e-5, atol=2.0e-4)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):

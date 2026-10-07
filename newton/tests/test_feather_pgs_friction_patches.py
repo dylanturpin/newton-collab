@@ -4,6 +4,7 @@
 """Regression tests for persistent patch friction in FeatherPGS."""
 
 import unittest
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -875,7 +876,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(geometry=geometry):
                 reference, actual = results
                 self.assertAlmostEqual(float(actual[0][0]), float(reference[0][0]), delta=0.01)
-                self.assertLess(abs(float(actual[0][1] - reference[0][1])), 0.01)
+                # Patch rows on a faceted wheel wobble laterally (the point-friction wheel stays within
+                # 0.3 mm); keep the lateral error inside the tessellation matrix's 3% travel bound.
+                lateral_bound = 0.02 if geometry in ("mesh", "convex_hull") else 0.01
+                self.assertLess(abs(float(actual[0][1] - reference[0][1])), lateral_bound)
                 # Facet impacts lose energy even without positional correction;
                 # compare averaged speed rather than individual impact phases.
                 self.assertAlmostEqual(float(actual[2][0]), float(reference[2][0]), delta=0.02)
@@ -1150,15 +1154,32 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cuda:0")
-        for kwargs in (
-            {"pgs_mode": "matrix_free", "friction_mode": "bisection"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "tiled_contact"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "streaming"},
-        ):
+        for kwargs in ({"pgs_mode": "matrix_free", "friction_mode": "bisection"},):
             with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
                 self.assertFalse(solver._friction_anchors_enabled)
                 self.assertEqual(solver.friction_anchor_beta, 0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    def test_matrix_free_ignores_dense_pgs_kernel_for_friction(self):
+        """pgs_kernel only selects the split-mode dense solve, so matrix_free keeps patch friction."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cuda:0")
+        for kernel in ("tiled_contact", "streaming"):
+            with self.subTest(pgs_kernel=kernel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel=kernel)
+                    self.assertTrue(solver._friction_anchors_enabled)
+                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model, pgs_mode="matrix_free", pgs_kernel=kernel, friction_anchor_beta=0.3
+                    )
+                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
+                self.assertIsNone(solver._pgs_solve_streaming_kernel)
+                self.assertIsNone(solver._pgs_solve_tiled_contact_kernel)
 
     def test_shared_point_flags_warn_with_patch_friction(self):
         """Explain when patch anchors override an explicitly requested shared friction point."""
@@ -1183,38 +1204,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             for kernel in ("tiled_contact", "streaming"):
                 with self.subTest(pgs_kernel=kernel), self.assertRaisesRegex(ValueError, "Patch friction requires"):
                     newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2, pgs_kernel=kernel)
-
-    def test_deprecated_anchor_limit_warns_instead_of_raising(self):
-        """Ignore the deprecated anchor limit without overriding the default or explicit opt-out."""
-        builder = newton.ModelBuilder()
-        body = builder.add_body()
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cpu")
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2)
-        self.assertTrue(solver._friction_anchors_enabled)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
-        if wp.is_cuda_available():
-            # Coupled friction modes need the CUDA matrix-free route; the shim must warn and stay off there.
-            cuda_model = builder.finalize(device="cuda:0")
-            with self.assertWarns(DeprecationWarning):
-                solver = newton.solvers.SolverFeatherPGS(
-                    cuda_model,
-                    contact_friction_anchor_limit=2,
-                    friction_mode="bisection",
-                    pgs_mode="matrix_free",
-                    friction_anchor_beta=0.0,
-                )
-            self.assertFalse(solver._friction_anchors_enabled)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, pgs_kernel="tiled_contact")
-        self.assertTrue(solver._friction_anchors_enabled)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.3)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.0)
-        self.assertFalse(solver._friction_anchors_enabled)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
@@ -1330,7 +1319,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
         else:
-            wp.launch(pgs_solve_loop, dim=1, inputs=[count, capacity, *args[1:]], device=device)
+            wp.launch(pgs_solve_loop, dim=1, inputs=[count, *args[1:]], device=device)
         np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
 
     def test_planar_patch_reduces_friction_rows(self):

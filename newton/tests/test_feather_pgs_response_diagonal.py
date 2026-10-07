@@ -1207,10 +1207,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             num_dofs,
             max_constraints,
             str(device.arch),
+            64,
             constraint_chunk_size=8,
             write_world=True,
             write_group=False,
-            compute_diag=True,
         )
         wp.launch_tiled(
             kernel,
