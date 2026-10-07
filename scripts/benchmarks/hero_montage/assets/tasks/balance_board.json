@@ -1,0 +1,1938 @@
+{
+  "name": "balance_board",
+  "family": "board_game_studio",
+  "parameters": {
+    "seed": 41,
+    "index": 5,
+    "branch": "balance_board",
+    "variant": 0,
+    "wood": "walnut",
+    "finish_color": "chalk"
+  },
+  "root": "fixed.walnut",
+  "joints": [
+    {
+      "id": "fixed.weld.chrome",
+      "parent": "fixed.walnut",
+      "child": "fixed.chrome",
+      "kind": "fixed",
+      "parent_frame": {
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.1,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "balance.pivot.q",
+      "parent": "fixed.walnut",
+      "child": "balance.pivot",
+      "kind": "revolute",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0.057
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0.057
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0,
+        1,
+        0
+      ],
+      "limits": [
+        -0.4,
+        0.4
+      ],
+      "home": 0.0,
+      "damping": 0.3,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "weight.-1.0.q",
+      "parent": "fixed.walnut",
+      "child": "weight.-1.0",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "weight.-1.1.q",
+      "parent": "fixed.walnut",
+      "child": "weight.-1.1",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "weight.1.0.q",
+      "parent": "fixed.walnut",
+      "child": "weight.1.0",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "weight.1.1.q",
+      "parent": "fixed.walnut",
+      "child": "weight.1.1",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    }
+  ],
+  "bodies": [
+    {
+      "id": "fixed.walnut",
+      "mass": 0.2699891412319548,
+      "com": [
+        -8.23537375020688e-19,
+        1.464066444481223e-18,
+        0.005392437367440948
+      ],
+      "inertia": [
+        [
+          0.000884223829394299,
+          -2.5631569914309816e-20,
+          -2.4342440619222993e-21
+        ],
+        [
+          -2.5631569914309816e-20,
+          0.0018781715320014417,
+          8.307815561302213e-21
+        ],
+        [
+          -2.4342440619222993e-21,
+          8.307815561302213e-21,
+          0.0027135055510040407
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b0_v0",
+          "material": "walnut",
+          "color": [
+            0.24,
+            0.115,
+            0.06
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c2"
+        }
+      ],
+      "bounds": [
+        [
+          -0.15,
+          -0.1,
+          0.0
+        ],
+        [
+          0.15,
+          0.1,
+          0.062
+        ]
+      ]
+    },
+    {
+      "id": "fixed.chrome",
+      "mass": 0.04242185298779278,
+      "com": [
+        -3.802290755527718e-20,
+        -2.1546314281323738e-19,
+        0.057000000000000016
+      ],
+      "inertia": [
+        [
+          4.294228747694827e-05,
+          -1.0081263715490025e-23,
+          -9.194112508526905e-23
+        ],
+        [
+          -1.0081263715490025e-23,
+          3.3383809518112556e-07,
+          4.736849777784912e-22
+        ],
+        [
+          -9.194112508526905e-23,
+          4.736849777784912e-22,
+          4.294228747694831e-05
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b1_v0",
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b1_c0"
+        }
+      ],
+      "bounds": [
+        [
+          -0.004,
+          -0.055,
+          0.053000000000000005
+        ],
+        [
+          0.004,
+          0.055,
+          0.061
+        ]
+      ]
+    },
+    {
+      "id": "balance.pivot",
+      "mass": 0.18753710906144827,
+      "com": [
+        0.0,
+        9.800702006612416e-19,
+        0.06338380955368747
+      ],
+      "inertia": [
+        [
+          6.76792562238132e-05,
+          5.10094711074367e-22,
+          3.780766853109038e-20
+        ],
+        [
+          5.10094711074367e-22,
+          0.0004527307137110942,
+          1.2080048457799219e-20
+        ],
+        [
+          3.780766853109038e-20,
+          1.2080048457799219e-20,
+          0.0004978734203849528
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b2_v0",
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ]
+        },
+        {
+          "prefix": "b2_v1",
+          "material": "walnut",
+          "color": [
+            0.24,
+            0.115,
+            0.06
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c2"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c3"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c4"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c5"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c6"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c7"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c8"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c9"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c10"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c11"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c12"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c13"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c14"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c15"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c16"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c17"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c18"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c19"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c20"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c21"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c22"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c23"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c24"
+        }
+      ],
+      "bounds": [
+        [
+          -0.12,
+          -0.035,
+          0.047
+        ],
+        [
+          0.12,
+          0.035,
+          0.07400000000000001
+        ]
+      ]
+    },
+    {
+      "id": "weight.-1.0",
+      "mass": 0.022361162425819987,
+      "com": [
+        -0.05800000000000003,
+        -2.071543215011145e-19,
+        0.08620000000000005
+      ],
+      "inertia": [
+        [
+          2.7040877024735864e-06,
+          4.260910732837216e-22,
+          -6.948317145445432e-20
+        ],
+        [
+          4.260910732837216e-22,
+          2.704087702473531e-06,
+          -1.7889600543806846e-21
+        ],
+        [
+          -6.948317145445432e-20,
+          -1.7889600543806846e-21,
+          3.2995953358889563e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b3_v0",
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c0"
+        }
+      ],
+      "bounds": [
+        [
+          -0.07300000000000001,
+          -0.015,
+          0.0742
+        ],
+        [
+          -0.043000000000000003,
+          0.015,
+          0.0982
+        ]
+      ]
+    },
+    {
+      "id": "weight.-1.1",
+      "mass": 0.022361162425819987,
+      "com": [
+        -0.09399999999999997,
+        2.071543215011145e-19,
+        0.08620000000000001
+      ],
+      "inertia": [
+        [
+          2.70408770247367e-06,
+          1.0917543314781137e-21,
+          1.1117307432712692e-19
+        ],
+        [
+          1.0917543314781137e-21,
+          2.7040877024739197e-06,
+          -6.392451773809789e-23
+        ],
+        [
+          1.1117307432712692e-19,
+          -6.392451773809789e-23,
+          3.29959533588922e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b4_v0",
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c0"
+        }
+      ],
+      "bounds": [
+        [
+          -0.109,
+          -0.015,
+          0.0742
+        ],
+        [
+          -0.079,
+          0.015,
+          0.0982
+        ]
+      ]
+    },
+    {
+      "id": "weight.1.0",
+      "mass": 0.02236116242582,
+      "com": [
+        0.05799999999999997,
+        0.0,
+        0.08619999999999996
+      ],
+      "inertia": [
+        [
+          2.7040877024738367e-06,
+          -1.9723087730561254e-22,
+          -1.1117307432712692e-19
+        ],
+        [
+          -1.9723087730561254e-22,
+          2.7040877024739477e-06,
+          -9.26442286059391e-22
+        ],
+        [
+          -1.1117307432712692e-19,
+          -9.26442286059391e-22,
+          3.299595335889109e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b5_v0",
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b5_c0"
+        }
+      ],
+      "bounds": [
+        [
+          0.043000000000000003,
+          -0.015,
+          0.0742
+        ],
+        [
+          0.07300000000000001,
+          0.015,
+          0.0982
+        ]
+      ]
+    },
+    {
+      "id": "weight.1.1",
+      "mass": 0.022361162425819977,
+      "com": [
+        0.09400000000000007,
+        2.071543215011146e-19,
+        0.08620000000000005
+      ],
+      "inertia": [
+        [
+          2.7040877024736144e-06,
+          -1.5622133048676476e-21,
+          1.1117307432712692e-19
+        ],
+        [
+          -1.5622133048676476e-21,
+          2.7040877024734196e-06,
+          -6.392451773809773e-23
+        ],
+        [
+          1.1117307432712692e-19,
+          -6.392451773809773e-23,
+          3.2995953358888034e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b6_v0",
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b6_c0"
+        }
+      ],
+      "bounds": [
+        [
+          0.079,
+          -0.015,
+          0.0742
+        ],
+        [
+          0.109,
+          0.015,
+          0.0982
+        ]
+      ]
+    }
+  ],
+  "features": {
+    "preview_surface": "parts",
+    "game": "balance_board",
+    "physical_scope": "independent rigid pieces with contact-supported arrangements; no calibrated brick clutch or flexible-card model",
+    "piece_roles": {
+      "balance.pivot": {
+        "motion": "revolute",
+        "parts": [
+          "balance_beam",
+          "pivot_sleeve"
+        ]
+      },
+      "weight.-1.0": {
+        "motion": "free",
+        "parts": [
+          "weight.-1.0"
+        ]
+      },
+      "weight.-1.1": {
+        "motion": "free",
+        "parts": [
+          "weight.-1.1"
+        ]
+      },
+      "weight.1.0": {
+        "motion": "free",
+        "parts": [
+          "weight.1.0"
+        ]
+      },
+      "weight.1.1": {
+        "motion": "free",
+        "parts": [
+          "weight.1.1"
+        ]
+      }
+    },
+    "preview_rest_poses": true,
+    "rigid_contact": {
+      "maximum_timestep": 0.0001,
+      "time_constant": 0.0008,
+      "damping_ratio": 1.0
+    },
+    "motions": [
+      {
+        "name": "balance.pivot",
+        "parts": [
+          "balance_beam",
+          "pivot_sleeve"
+        ],
+        "kind": "revolute",
+        "anchor": [
+          0,
+          0,
+          0.057
+        ],
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "limits": [
+          -0.4,
+          0.4
+        ]
+      },
+      {
+        "name": "weight.-1.0",
+        "parts": [
+          "weight.-1.0"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          0,
+          -1,
+          0
+        ],
+        "limits": [
+          0,
+          0.3
+        ]
+      },
+      {
+        "name": "weight.-1.1",
+        "parts": [
+          "weight.-1.1"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          0,
+          -1,
+          0
+        ],
+        "limits": [
+          0,
+          0.3
+        ]
+      },
+      {
+        "name": "weight.1.0",
+        "parts": [
+          "weight.1.0"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          0,
+          -1,
+          0
+        ],
+        "limits": [
+          0,
+          0.3
+        ]
+      },
+      {
+        "name": "weight.1.1",
+        "parts": [
+          "weight.1.1"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          0,
+          -1,
+          0
+        ],
+        "limits": [
+          0,
+          0.3
+        ]
+      }
+    ],
+    "color_finishes": {
+      "weight.-1.0": {
+        "schema": "color-finish-1",
+        "material": "paint_enamel",
+        "color_name": "terracotta",
+        "base_color": [
+          0.39157247774972326,
+          0.13286832155381798,
+          0.07618538148130785
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "phase": [
+          0.0,
+          0.0
+        ],
+        "roughness": 0.1690040903022594,
+        "clearcoat": 0.3420242576327976
+      },
+      "weight.-1.1": {
+        "schema": "color-finish-1",
+        "material": "paint_enamel",
+        "color_name": "dusty_blue",
+        "base_color": [
+          0.2581828529215958,
+          0.3467040563550296,
+          0.41254261348390375
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "phase": [
+          0.0,
+          0.0
+        ],
+        "roughness": 0.1690040903022594,
+        "clearcoat": 0.3420242576327976
+      },
+      "weight.1.0": {
+        "schema": "color-finish-1",
+        "material": "paint_enamel",
+        "color_name": "sage",
+        "base_color": [
+          0.2195261997292692,
+          0.2831487404299921,
+          0.1946178304415758
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "phase": [
+          0.0,
+          0.0
+        ],
+        "roughness": 0.1690040903022594,
+        "clearcoat": 0.3420242576327976
+      },
+      "weight.1.1": {
+        "schema": "color-finish-1",
+        "material": "paint_enamel",
+        "color_name": "chalk",
+        "base_color": [
+          0.7304607400903537,
+          0.7083757798916868,
+          0.6444796819705821
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "phase": [
+          0.0,
+          0.0
+        ],
+        "roughness": 0.1690040903022594,
+        "clearcoat": 0.3420242576327976
+      }
+    },
+    "wood_finishes": {
+      "board": {
+        "schema": "wood-finish-1",
+        "role": "panel",
+        "group": "matched_panels",
+        "species": "walnut",
+        "stain": "smoked",
+        "coat": "satin",
+        "material": "walnut_finish_wood_walnut_smoked_satin",
+        "texture_asset": "wood_walnut",
+        "texture_width_m": 0.4,
+        "base_color": [
+          0.23292369449043418,
+          0.13739353958011585,
+          0.09891273744056482
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "phase": [
+          1.3836441493688223,
+          0.9673995365515321
+        ],
+        "roughness": 0.5460972395351633,
+        "clearcoat": 0.21070832015258045,
+        "distribution_version": 2
+      },
+      "bearing.-1": {
+        "schema": "wood-finish-1",
+        "role": "panel",
+        "group": "matched_panels",
+        "species": "walnut",
+        "stain": "smoked",
+        "coat": "satin",
+        "material": "walnut_finish_wood_walnut_smoked_satin",
+        "texture_asset": "wood_walnut",
+        "texture_width_m": 0.4,
+        "base_color": [
+          0.23292369449043418,
+          0.13739353958011585,
+          0.09891273744056482
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "phase": [
+          1.3836441493688223,
+          0.9673995365515321
+        ],
+        "roughness": 0.5460972395351633,
+        "clearcoat": 0.21070832015258045,
+        "distribution_version": 2
+      },
+      "bearing.1": {
+        "schema": "wood-finish-1",
+        "role": "panel",
+        "group": "matched_panels",
+        "species": "walnut",
+        "stain": "smoked",
+        "coat": "satin",
+        "material": "walnut_finish_wood_walnut_smoked_satin",
+        "texture_asset": "wood_walnut",
+        "texture_width_m": 0.4,
+        "base_color": [
+          0.23292369449043418,
+          0.13739353958011585,
+          0.09891273744056482
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "phase": [
+          1.3836441493688223,
+          0.9673995365515321
+        ],
+        "roughness": 0.5460972395351633,
+        "clearcoat": 0.21070832015258045,
+        "distribution_version": 2
+      },
+      "balance_beam": {
+        "schema": "wood-finish-1",
+        "role": "support",
+        "group": "supports",
+        "species": "walnut",
+        "stain": "smoked",
+        "coat": "satin",
+        "material": "walnut_finish_wood_walnut_smoked_satin",
+        "texture_asset": "wood_walnut",
+        "texture_width_m": 0.4,
+        "base_color": [
+          0.23292369449043418,
+          0.13739353958011585,
+          0.09891273744056482
+        ],
+        "charts": [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "frame": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ]
+        ],
+        "phase": [
+          0.8844235942306563,
+          1.8041037669430222
+        ],
+        "roughness": 0.5460972395351633,
+        "clearcoat": 0.21070832015258045,
+        "distribution_version": 2
+      }
+    }
+  }
+}

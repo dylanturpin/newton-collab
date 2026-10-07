@@ -1,0 +1,2412 @@
+{
+  "source": "https://github.com/LuckyIYI/proc-gen-3d",
+  "commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+  "scope": "Original material surfaces for fixed set dressing; task physics is separate.",
+  "assets": {
+    "bench_ash": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "ash",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "shelf",
+        "slats": 5,
+        "corner_radius": 0.065,
+        "top_bulge": 0.1941216192184379,
+        "leg_splay": 0.08774105595113431,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.4282348019294212,
+        "edge_lower": 0.0,
+        "support": "trestle"
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1947,
+          "triangles": 2870
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.7986000000000001
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "bench_oak": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "oak",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "shelf",
+        "slats": 5,
+        "corner_radius": 0.065,
+        "top_bulge": 0.1941216192184379,
+        "leg_splay": 0.08774105595113431,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.4282348019294212,
+        "edge_lower": 0.0,
+        "support": "tapered"
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1209,
+          "triangles": 1614
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 320,
+          "triangles": 304
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.8210000000000001
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "bench_lab": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "ash",
+        "top_material": "wood",
+        "support_material": "chrome",
+        "storage": "shelf",
+        "slats": 5,
+        "corner_radius": 0.065,
+        "top_bulge": 0.1941216192184379,
+        "leg_splay": 0.08774105595113431,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.4282348019294212,
+        "edge_lower": 0.0,
+        "support": "hoop"
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 2726,
+          "triangles": 3154
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 320,
+          "triangles": 304
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.8210000000000001
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "bench_walnut": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "walnut",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "shelf",
+        "slats": 5,
+        "corner_radius": 0.065,
+        "top_bulge": 0.1941216192184379,
+        "leg_splay": 0.08774105595113431,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.4282348019294212,
+        "edge_lower": 0.0,
+        "support": "trestle"
+      },
+      "regions": [
+        {
+          "material": "walnut",
+          "color": [
+            0.24,
+            0.115,
+            0.06
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1947,
+          "triangles": 2870
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.7986000000000001
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "lamp": {
+      "family": "lamp_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "leaf",
+        "repeat_count": 4,
+        "curvature": 1.1189694757289428,
+        "phase": -0.14732646303898161,
+        "openings": "ribs",
+        "back_segments": "alternating",
+        "seed": 31,
+        "index": 0,
+        "branch": "anglepoise",
+        "shade_form": "cone",
+        "base": "disc",
+        "height": 0.65,
+        "shade_radius": 0.12,
+        "finish": "black",
+        "shade": "ivory",
+        "ribs": 6,
+        "tiers": 4,
+        "shade_depth": 0.2570402469967626,
+        "shade_neck": 0.40444993018868297,
+        "shade_belly": 1.0633447443878818,
+        "arc_reach": 0.2340631975478938,
+        "arc_bow": 0.36814971174377786,
+        "tripod_spread": 0.9942606395689211
+      },
+      "regions": [
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 2387,
+          "triangles": 3278
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 3571,
+          "triangles": 6794
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 19146,
+          "triangles": 26410
+        }
+      ],
+      "bounds": [
+        [
+          -0.23,
+          -0.1276013693265458,
+          0.0
+        ],
+        [
+          0.2476013693265458,
+          0.1276013693265458,
+          0.66
+        ]
+      ]
+    },
+    "mug": {
+      "family": "drinkware_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "leaf",
+        "repeat_count": 4,
+        "curvature": 0.7315964549325482,
+        "phase": -0.006934308129863886,
+        "openings": "shell",
+        "back_segments": "all",
+        "branch": "mug",
+        "seed": 31,
+        "index": 0,
+        "complexity": "simple",
+        "radius": 0.043,
+        "height": 0.105,
+        "profile": "rounded",
+        "handle": "ear",
+        "foot": "flat",
+        "finish": "blue_glaze",
+        "fluted": false,
+        "artwork": "none",
+        "font": "condensed",
+        "serving_set": false,
+        "saucer_spread": 1.9325589819704634,
+        "serving_style": "vintage"
+      },
+      "regions": [
+        {
+          "material": "blue_glaze",
+          "color": [
+            0.12,
+            0.3,
+            0.45
+          ],
+          "vertices": 8347,
+          "triangles": 10672
+        }
+      ],
+      "bounds": [
+        [
+          -0.043,
+          -0.043,
+          0.0
+        ],
+        [
+          0.08737731362046992,
+          0.043,
+          0.105
+        ]
+      ]
+    },
+    "mallet": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "mallet",
+        "seed": 31,
+        "index": 1,
+        "kind": "mallet",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 361,
+          "triangles": 478
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 96,
+          "triangles": 92
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 384,
+          "triangles": 376
+        }
+      ],
+      "bounds": [
+        [
+          -0.068,
+          -0.24588766361987716,
+          0.0
+        ],
+        [
+          0.068,
+          0.036,
+          0.072
+        ]
+      ]
+    },
+    "screwdriver": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "screwdriver",
+        "seed": 31,
+        "index": 3,
+        "kind": "screwdriver",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 361,
+          "triangles": 478
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 896,
+          "triangles": 868
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 452,
+          "triangles": 588
+        }
+      ],
+      "bounds": [
+        [
+          -0.017,
+          -0.115,
+          0.0
+        ],
+        [
+          0.017,
+          0.09050757313987515,
+          0.034
+        ]
+      ]
+    },
+    "wrench": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "wrench",
+        "seed": 31,
+        "index": 4,
+        "kind": "wrench",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 408,
+          "triangles": 396
+        }
+      ],
+      "bounds": [
+        [
+          -0.01955,
+          -0.09644980636394657,
+          0.0
+        ],
+        [
+          0.01955,
+          0.10446530636394656,
+          0.009000000000000001
+        ]
+      ]
+    },
+    "drill": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "drill",
+        "seed": 31,
+        "index": 6,
+        "kind": "drill",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 1574,
+          "triangles": 2730
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 2184,
+          "triangles": 3984
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 2539,
+          "triangles": 2372
+        }
+      ],
+      "bounds": [
+        [
+          -0.055499999999999994,
+          -0.128,
+          0.0
+        ],
+        [
+          0.15904736469491226,
+          0.0315,
+          0.1784
+        ]
+      ]
+    },
+    "hex_key": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "hex_key",
+        "seed": 31,
+        "index": 7,
+        "kind": "hex_key",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 196,
+          "triangles": 180
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 120,
+          "triangles": 236
+        }
+      ],
+      "bounds": [
+        [
+          -0.035,
+          -0.09150000000000001,
+          0.0
+        ],
+        [
+          0.035,
+          0.0,
+          0.014
+        ]
+      ]
+    },
+    "fastener_set": {
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "fastener_set",
+        "seed": 31,
+        "index": 9,
+        "kind": "fastener_set",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 19442,
+          "triangles": 19628
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 120,
+          "triangles": 236
+        }
+      ],
+      "bounds": [
+        [
+          -0.058,
+          -0.09150000000000001,
+          0.0
+        ],
+        [
+          0.012000000000000004,
+          1.8873791418627663e-18,
+          0.0425
+        ]
+      ]
+    },
+    "caddy": {
+      "family": "utensil_holder_studio",
+      "parameters": {
+        "branch": "divided_caddy",
+        "seed": 31,
+        "index": 1,
+        "complexity": "simple",
+        "length": 0.26163458166652415,
+        "width": 0.20567841299308473,
+        "height": 0.1817865770197918,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "black",
+        "material": "ivory",
+        "divisions": 3,
+        "detail_count": 3,
+        "filled": false,
+        "grip_bulge": 0.1280097377107339,
+        "form": {
+          "exponent": 4.87244069701024,
+          "aspect": 1.0,
+          "base": 0.9617216503637759,
+          "belly": 1.0983032248587499,
+          "shoulder": 1.078583146445069,
+          "mouth": 1.006726633384166,
+          "twist": -0.10903673228468705,
+          "amplitude": 0.037589986538615026,
+          "frequency": 8,
+          "axial_frequency": 1.9117695733333708,
+          "flute_twist": 2.4665809328188173,
+          "lean": 0.07415771065914184,
+          "phase": 3.1093599396112945
+        },
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 819,
+          "triangles": 1530
+        }
+      ],
+      "bounds": [
+        [
+          -0.13081729083326207,
+          -0.10283920649654237,
+          0.0
+        ],
+        [
+          0.13081729083326207,
+          0.10283920649654237,
+          0.1817865770197918
+        ]
+      ]
+    },
+    "knife_block": {
+      "family": "utensil_holder_studio",
+      "parameters": {
+        "branch": "knife_block",
+        "seed": 31,
+        "index": 2,
+        "complexity": "simple",
+        "length": 0.2179917779018551,
+        "width": 0.17447607810740165,
+        "height": 0.1541908272694003,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "oak",
+        "material": "ivory",
+        "divisions": 3,
+        "detail_count": 4,
+        "filled": false,
+        "grip_bulge": 0.1340946109092116,
+        "form": {
+          "exponent": 7.965781331773259,
+          "aspect": 1.0,
+          "base": 0.7572630073284368,
+          "belly": 0.9494369388079955,
+          "shoulder": 0.8114129750712271,
+          "mouth": 0.963217700254012,
+          "twist": -0.05065132523580182,
+          "amplitude": 0.03913121259377789,
+          "frequency": 5,
+          "axial_frequency": 2.3022662210204796,
+          "flute_twist": 1.899852694813546,
+          "lean": 0.0650681119721948,
+          "phase": -1.6809800246300752
+        },
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 1160,
+          "triangles": 1060
+        }
+      ],
+      "bounds": [
+        [
+          -0.10899589210748672,
+          -0.08723803905370082,
+          0.0
+        ],
+        [
+          0.10899589210748672,
+          0.08723803905370082,
+          0.1541908272694003
+        ]
+      ]
+    },
+    "parts_tray": {
+      "family": "drawer_organizer_studio",
+      "parameters": {
+        "branch": "modular_bins",
+        "seed": 31,
+        "index": 1,
+        "complexity": "simple",
+        "length": 0.36064803420036845,
+        "width": 0.2878792879661132,
+        "height": 0.057111927603864555,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "oak",
+        "material": "ivory",
+        "divisions": 2,
+        "detail_count": 3,
+        "filled": true,
+        "grip_bulge": 0.2898870987893037,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 2139,
+          "triangles": 4056
+        }
+      ],
+      "bounds": [
+        [
+          -0.17671753675818053,
+          -0.14106085110339545,
+          0.0
+        ],
+        [
+          0.17671753675818053,
+          0.14106085110339545,
+          0.057111927603864555
+        ]
+      ]
+    },
+    "plant": {
+      "family": "plant_studio",
+      "parameters": {
+        "branch": "rosette",
+        "seed": 31,
+        "index": 2,
+        "pot_radius": 0.16111853987398397,
+        "pot_height": 0.17884537575295664,
+        "branch_depth": 2,
+        "pot_form": "tapered",
+        "branch_count": 4,
+        "leaf_count": 6,
+        "planter": "blue_glaze",
+        "form": "lance",
+        "growth": 1.1165318894141811,
+        "crown_spread": 0.2924171053392561,
+        "leaf_twist": 0.41969461636246197,
+        "leaf_curl": 0.013733589500376597,
+        "leaf_aspect": 1.008208117196376,
+        "lobe_depth": 0.20299664865878347,
+        "tip_bias": 0.04376468455554212,
+        "flower_form": "layered",
+        "bloom_count": 3,
+        "flower_radius": 0.03522302887311318,
+        "petal_count": 5,
+        "petal_cup": -0.11124456553617919,
+        "flower_arrangement": "stalks",
+        "flower_height": 0.4449420913052095,
+        "stem_arch": 0.0172108808613967
+      },
+      "regions": [
+        {
+          "material": "blue_glaze",
+          "color": [
+            0.12,
+            0.3,
+            0.45
+          ],
+          "vertices": 304,
+          "triangles": 324
+        },
+        {
+          "material": "potting_soil",
+          "color": [
+            0.042,
+            0.022,
+            0.01
+          ],
+          "vertices": 160,
+          "triangles": 156
+        },
+        {
+          "material": "perlite",
+          "color": [
+            0.63,
+            0.61,
+            0.53
+          ],
+          "vertices": 100,
+          "triangles": 144
+        },
+        {
+          "material": "bark",
+          "color": [
+            0.11,
+            0.045,
+            0.018
+          ],
+          "vertices": 200,
+          "triangles": 288
+        },
+        {
+          "material": "leaf_waxy",
+          "color": [
+            0.045,
+            0.18,
+            0.026
+          ],
+          "vertices": 7171,
+          "triangles": 8566
+        }
+      ],
+      "bounds": [
+        [
+          -0.17223198509877863,
+          -0.17363089215466226,
+          0.0
+        ],
+        [
+          0.16111853987398397,
+          0.17418156252164546,
+          0.34401665748835036
+        ]
+      ]
+    },
+    "hockey": {
+      "family": "game_table_studio",
+      "parameters": {
+        "seed": 23,
+        "index": 1,
+        "branch": "air_hockey",
+        "variant": 0,
+        "support": 1,
+        "layout": 0,
+        "detail": 2,
+        "scale": 1.0,
+        "finish": "walnut",
+        "cloth": "fabric"
+      },
+      "regions": [
+        {
+          "material": "walnut",
+          "color": [
+            0.24,
+            0.115,
+            0.06
+          ],
+          "vertices": 480,
+          "triangles": 944
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 240,
+          "triangles": 472
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 2136,
+          "triangles": 1740
+        },
+        {
+          "material": "aluminum",
+          "color": [
+            0.62,
+            0.65,
+            0.68
+          ],
+          "vertices": 944,
+          "triangles": 1528
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1216,
+          "triangles": 2404
+        },
+        {
+          "material": "fruit_red",
+          "color": [
+            0.55,
+            0.035,
+            0.018
+          ],
+          "vertices": 3472,
+          "triangles": 4980
+        }
+      ],
+      "bounds": [
+        [
+          -0.49478431372549025,
+          -0.7746666666666666,
+          -0.197
+        ],
+        [
+          0.49478431372549025,
+          0.7746666666666666,
+          0.15299999999999997
+        ]
+      ]
+    },
+    "tool_rail": {
+      "family": "hero_fixture",
+      "parameters": {},
+      "regions": [
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 5376,
+          "triangles": 5208
+        }
+      ],
+      "bounds": [
+        [
+          -0.75,
+          -0.18,
+          0.0
+        ],
+        [
+          0.75,
+          0.020000000000000004,
+          0.35
+        ]
+      ]
+    },
+    "jenga": {
+      "family": "hero_jenga",
+      "parameters": {},
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 120,
+          "triangles": 236
+        }
+      ],
+      "bounds": [
+        [
+          -0.09,
+          -0.026,
+          -0.017
+        ],
+        [
+          0.09,
+          0.026,
+          0.017
+        ]
+      ]
+    },
+    "bench_white": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "portal",
+        "contour_form": "leaf",
+        "repeat_count": 5,
+        "curvature": 1.031720914912071,
+        "phase": -0.44518006440509245,
+        "openings": "ribs",
+        "back_segments": "low",
+        "branch": "dining",
+        "seed": 31,
+        "index": 0,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.0,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "ash",
+        "top_material": "plastic",
+        "support_material": "black",
+        "storage": "none",
+        "slats": 7,
+        "corner_radius": 0.08,
+        "top_bulge": 0.14201221474000564,
+        "leg_splay": 0.05674349656663846,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.20409858997796554,
+        "edge_lower": 0.0,
+        "support": "portal"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1199,
+          "triangles": 1526
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.0,
+          -0.8025
+        ],
+        [
+          1.125,
+          1.0,
+          0.0
+        ]
+      ]
+    },
+    "bench_round": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "portal",
+        "contour_form": "leaf",
+        "repeat_count": 5,
+        "curvature": 1.031720914912071,
+        "phase": -0.44518006440509245,
+        "openings": "ribs",
+        "back_segments": "low",
+        "branch": "dining",
+        "seed": 31,
+        "index": 0,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "round",
+        "base": "tapered",
+        "wood": "walnut",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "none",
+        "slats": 7,
+        "corner_radius": 0.08,
+        "top_bulge": 0.14201221474000564,
+        "leg_splay": 0.05674349656663846,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.20409858997796554,
+        "edge_lower": 0.0,
+        "support": "tulip"
+      },
+      "regions": [
+        {
+          "material": "walnut",
+          "color": [
+            0.24,
+            0.115,
+            0.06
+          ],
+          "vertices": 520,
+          "triangles": 896
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1867,
+          "triangles": 2468
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.809
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "bench_oval": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "portal",
+        "contour_form": "leaf",
+        "repeat_count": 5,
+        "curvature": 1.031720914912071,
+        "phase": -0.44518006440509245,
+        "openings": "ribs",
+        "back_segments": "low",
+        "branch": "dining",
+        "seed": 31,
+        "index": 0,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.25,
+        "height": 0.8,
+        "top": "oval",
+        "base": "tapered",
+        "wood": "oak",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "none",
+        "slats": 7,
+        "corner_radius": 0.08,
+        "top_bulge": 0.14201221474000564,
+        "leg_splay": 0.05674349656663846,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.20409858997796554,
+        "edge_lower": 0.0,
+        "support": "radial"
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 520,
+          "triangles": 896
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 835,
+          "triangles": 1058
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 240,
+          "triangles": 228
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.125,
+          -0.8210000000000001
+        ],
+        [
+          1.125,
+          1.125,
+          0.0
+        ]
+      ]
+    },
+    "bench_compact": {
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "portal",
+        "contour_form": "leaf",
+        "repeat_count": 5,
+        "curvature": 1.031720914912071,
+        "phase": -0.44518006440509245,
+        "openings": "ribs",
+        "back_segments": "low",
+        "branch": "dining",
+        "seed": 31,
+        "index": 0,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 1.85,
+        "height": 0.8,
+        "top": "capsule",
+        "base": "tapered",
+        "wood": "ash",
+        "top_material": "wood",
+        "support_material": "black",
+        "storage": "none",
+        "slats": 7,
+        "corner_radius": 0.08,
+        "top_bulge": 0.14201221474000564,
+        "leg_splay": 0.05674349656663846,
+        "edge_profile": "upper_roundover",
+        "edge_upper": 0.20409858997796554,
+        "edge_lower": 0.0,
+        "support": "hairpin"
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 224,
+          "triangles": 388
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1516,
+          "triangles": 1960
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 320,
+          "triangles": 304
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -0.925,
+          -0.8210000000000001
+        ],
+        [
+          1.125,
+          0.925,
+          0.0
+        ]
+      ]
+    },
+    "office_pen": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 0,
+        "branch": "pen",
+        "variant": 0,
+        "wood": "ash",
+        "finish_color": "chalk",
+        "ink_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 1141,
+          "triangles": 1492
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 646,
+          "triangles": 606
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 393,
+          "triangles": 468
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 64,
+          "triangles": 60
+        }
+      ],
+      "bounds": [
+        [
+          -0.006,
+          -0.021000000000000005,
+          0.0
+        ],
+        [
+          0.00781,
+          0.156,
+          0.014049999999999997
+        ]
+      ]
+    },
+    "office_pencil": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 1,
+        "branch": "pencil",
+        "variant": 0,
+        "wood": "ash",
+        "finish_color": "chalk",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 36,
+          "triangles": 20
+        },
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 25,
+          "triangles": 22
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 37,
+          "triangles": 46
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 386,
+          "triangles": 354
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 60,
+          "triangles": 68
+        }
+      ],
+      "bounds": [
+        [
+          -0.0042,
+          -0.024,
+          0.0
+        ],
+        [
+          0.0042,
+          0.163,
+          0.008400000000000001
+        ]
+      ]
+    },
+    "office_stapler": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 4,
+        "branch": "stapler",
+        "variant": 0,
+        "wood": "ash",
+        "finish_color": "ink",
+        "ink_color": "ink"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 240,
+          "triangles": 392
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 360,
+          "triangles": 708
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1512,
+          "triangles": 2348
+        }
+      ],
+      "bounds": [
+        [
+          -0.0215,
+          -0.0685,
+          0.0
+        ],
+        [
+          0.0215,
+          0.0685,
+          0.0505
+        ]
+      ]
+    },
+    "office_paper_clip": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 6,
+        "branch": "paper_clip",
+        "variant": 1,
+        "wood": "walnut",
+        "finish_color": "ink",
+        "ink_color": "ink"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 1961,
+          "triangles": 2124
+        }
+      ],
+      "bounds": [
+        [
+          -0.012959160949083089,
+          -0.01965,
+          0.0
+        ],
+        [
+          0.013861757884688521,
+          0.022228874528738056,
+          0.0013
+        ]
+      ]
+    },
+    "office_binder_clip": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 7,
+        "branch": "binder_clip",
+        "variant": 1,
+        "wood": "oak",
+        "finish_color": "eucalyptus",
+        "ink_color": "oxblood"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1064,
+          "triangles": 1556
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 120,
+          "triangles": 236
+        }
+      ],
+      "bounds": [
+        [
+          -0.027571200290254422,
+          -0.02,
+          0.0
+        ],
+        [
+          0.038299915019516705,
+          0.02,
+          0.04758128466352768
+        ]
+      ]
+    },
+    "office_ruler": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 13,
+        "branch": "ruler",
+        "variant": 0,
+        "wood": "walnut",
+        "finish_color": "chalk",
+        "ink_color": "ink"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 3720,
+          "triangles": 7316
+        }
+      ],
+      "bounds": [
+        [
+          -0.015,
+          -0.15,
+          0.0
+        ],
+        [
+          0.015,
+          0.15,
+          0.0031999999999999997
+        ]
+      ]
+    },
+    "office_scissors": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 14,
+        "branch": "scissors",
+        "variant": 0,
+        "wood": "oak",
+        "finish_color": "ink",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 462,
+          "triangles": 574
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 4208,
+          "triangles": 5184
+        }
+      ],
+      "bounds": [
+        [
+          -0.044,
+          -0.076,
+          0.0
+        ],
+        [
+          0.04784523851457196,
+          0.083,
+          0.007599999999999999
+        ]
+      ]
+    },
+    "office_tape_dispenser": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 15,
+        "branch": "tape_dispenser",
+        "variant": 1,
+        "wood": "oak",
+        "finish_color": "putty",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 336,
+          "triangles": 572
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 216,
+          "triangles": 328
+        },
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 224,
+          "triangles": 204
+        }
+      ],
+      "bounds": [
+        [
+          -0.027499999999999997,
+          -0.07,
+          0.0
+        ],
+        [
+          0.027499999999999997,
+          0.07,
+          0.0875
+        ]
+      ]
+    },
+    "office_sticky_notes": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 16,
+        "branch": "sticky_notes",
+        "variant": 1,
+        "wood": "walnut",
+        "finish_color": "chalk",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "cardboard",
+          "color": [
+            0.47,
+            0.29,
+            0.13
+          ],
+          "vertices": 460,
+          "triangles": 740
+        },
+        {
+          "material": "paper_ink",
+          "color": [
+            0.15,
+            0.25,
+            0.3
+          ],
+          "vertices": 840,
+          "triangles": 1652
+        }
+      ],
+      "bounds": [
+        [
+          -0.042499999999999996,
+          -0.041499999999999995,
+          0.0
+        ],
+        [
+          0.042499999999999996,
+          0.041499999999999995,
+          0.013000000000000001
+        ]
+      ]
+    },
+    "office_index_cards": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 17,
+        "branch": "index_cards",
+        "variant": 0,
+        "wood": "oak",
+        "finish_color": "ochre",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "paper_ink",
+          "color": [
+            0.15,
+            0.25,
+            0.3
+          ],
+          "vertices": 1315,
+          "triangles": 2586
+        }
+      ],
+      "bounds": [
+        [
+          -0.06355,
+          -0.038149999999999996,
+          0.0
+        ],
+        [
+          0.06355,
+          0.038,
+          0.0103
+        ]
+      ]
+    },
+    "office_clipboard": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 18,
+        "branch": "clipboard",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "putty",
+        "ink_color": "oxblood"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 480,
+          "triangles": 784
+        }
+      ],
+      "bounds": [
+        [
+          -0.11,
+          -0.155,
+          0.0
+        ],
+        [
+          0.11,
+          0.157,
+          0.0115
+        ]
+      ]
+    },
+    "office_document_tray": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 19,
+        "branch": "document_tray",
+        "variant": 1,
+        "wood": "oak",
+        "finish_color": "putty",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 516,
+          "triangles": 800
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 360,
+          "triangles": 708
+        }
+      ],
+      "bounds": [
+        [
+          -0.1245,
+          -0.165,
+          0.0
+        ],
+        [
+          0.1245,
+          0.165,
+          0.035500000000000004
+        ]
+      ]
+    },
+    "office_pen_cup": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 20,
+        "branch": "pen_cup",
+        "variant": 0,
+        "wood": "ash",
+        "finish_color": "dusty_blue",
+        "ink_color": "ink"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 246,
+          "triangles": 216
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 144,
+          "triangles": 84
+        },
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 192,
+          "triangles": 180
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 144,
+          "triangles": 132
+        }
+      ],
+      "bounds": [
+        [
+          -0.037,
+          -0.037,
+          0.0
+        ],
+        [
+          0.037,
+          0.037,
+          0.177
+        ]
+      ]
+    },
+    "office_eraser": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 12,
+        "branch": "eraser",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "putty",
+        "ink_color": "oxblood"
+      },
+      "regions": [
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 100,
+          "triangles": 116
+        },
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 432,
+          "triangles": 856
+        }
+      ],
+      "bounds": [
+        [
+          -0.018000000000000002,
+          -0.026,
+          0.0
+        ],
+        [
+          0.018000000000000002,
+          0.029,
+          0.0149
+        ]
+      ]
+    },
+    "office_highlighter": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 3,
+        "branch": "highlighter",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "sage",
+        "ink_color": "fluorescent_pink"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 1793,
+          "triangles": 2442
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 109,
+          "triangles": 114
+        },
+        {
+          "material": "paper_ink",
+          "color": [
+            0.15,
+            0.25,
+            0.3
+          ],
+          "vertices": 112,
+          "triangles": 100
+        },
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 360,
+          "triangles": 708
+        }
+      ],
+      "bounds": [
+        [
+          -0.0075,
+          -0.014000000000000002,
+          0.0
+        ],
+        [
+          0.00955,
+          0.137,
+          0.01735
+        ]
+      ]
+    },
+    "office_hole_punch": {
+      "family": "office_clutter_studio",
+      "parameters": {
+        "seed": 43,
+        "index": 24,
+        "branch": "hole_punch",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "sage",
+        "ink_color": "black"
+      },
+      "regions": [
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 288,
+          "triangles": 316
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 3312,
+          "triangles": 4208
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 120,
+          "triangles": 236
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 32,
+          "triangles": 20
+        }
+      ],
+      "bounds": [
+        [
+          -0.06,
+          -0.0415,
+          0.0
+        ],
+        [
+          0.06,
+          0.0415,
+          0.04688300286820655
+        ]
+      ]
+    }
+  },
+  "wood_textures": {
+    "ash": {
+      "seed": 19,
+      "parameters": {
+        "colorway": "natural",
+        "color": [
+          0.8,
+          0.7,
+          0.56
+        ],
+        "gamma": 0.85,
+        "scale": 1.0,
+        "rotation": 0.0,
+        "macro": 1.0602279653075293,
+        "meso": 1.0920972182547395,
+        "micro": 1.0984889417685337,
+        "grain": 1.5464120631628986,
+        "fossils": 1.0244752300533055,
+        "clouds": 0.8074291601065531,
+        "veins": 0.6142579896534607,
+        "vein_density": 0.9478664794347866,
+        "roughness": 0.2805146736552831,
+        "relief": 1.2291732008409775,
+        "layout": "running bond",
+        "grout_width": 0.002804016092854888,
+        "grout_depth": 0.0008453713960512226,
+        "bevel": 0.002323716275804287,
+        "saturation": 1.0
+      },
+      "iterations": 8,
+      "vein_strength": 1.0,
+      "vein_density": 1.0,
+      "contrast": 0.65,
+      "spectrum_relative_error": 0.053854121772361783,
+      "normal_length_max_error": 2.220446049250313e-16
+    },
+    "oak": {
+      "seed": 19,
+      "parameters": {
+        "colorway": "natural",
+        "color": [
+          0.68,
+          0.51,
+          0.32
+        ],
+        "gamma": 0.85,
+        "scale": 1.0,
+        "rotation": 0.0,
+        "macro": 1.0602279653075293,
+        "meso": 1.0920972182547395,
+        "micro": 1.0984889417685337,
+        "grain": 1.5464120631628986,
+        "fossils": 1.0244752300533055,
+        "clouds": 0.8074291601065531,
+        "veins": 0.6142579896534607,
+        "vein_density": 0.9478664794347866,
+        "roughness": 0.2805146736552831,
+        "relief": 1.2291732008409775,
+        "layout": "running bond",
+        "grout_width": 0.002804016092854888,
+        "grout_depth": 0.0008453713960512226,
+        "bevel": 0.002323716275804287,
+        "saturation": 1.0
+      },
+      "iterations": 8,
+      "vein_strength": 1.0,
+      "vein_density": 1.0,
+      "contrast": 0.65,
+      "spectrum_relative_error": 0.059907495173724304,
+      "normal_length_max_error": 2.220446049250313e-16
+    },
+    "walnut": {
+      "seed": 19,
+      "parameters": {
+        "colorway": "natural",
+        "color": [
+          0.48,
+          0.32,
+          0.2
+        ],
+        "gamma": 0.85,
+        "scale": 1.0,
+        "rotation": 0.0,
+        "macro": 1.0602279653075293,
+        "meso": 1.0920972182547395,
+        "micro": 1.0984889417685337,
+        "grain": 1.5464120631628986,
+        "fossils": 1.0244752300533055,
+        "clouds": 0.8074291601065531,
+        "veins": 0.6142579896534607,
+        "vein_density": 0.9478664794347866,
+        "roughness": 0.2805146736552831,
+        "relief": 1.2291732008409775,
+        "layout": "running bond",
+        "grout_width": 0.002804016092854888,
+        "grout_depth": 0.0008453713960512226,
+        "bevel": 0.002323716275804287,
+        "saturation": 1.0
+      },
+      "iterations": 8,
+      "vein_strength": 1.0,
+      "vein_density": 1.0,
+      "contrast": 0.65,
+      "spectrum_relative_error": 0.06239877258406869,
+      "normal_length_max_error": 2.220446049250313e-16
+    }
+  }
+}

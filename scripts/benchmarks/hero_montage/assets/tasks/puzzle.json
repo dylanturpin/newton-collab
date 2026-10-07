@@ -1,0 +1,1638 @@
+{
+  "name": "puzzle",
+  "family": "hard_toy_studio",
+  "parameters": {
+    "branch": "shape_puzzle",
+    "seed": 4,
+    "index": 4,
+    "length": 0.10797690989501768,
+    "kind": "shape_puzzle",
+    "variant": 1,
+    "finish_color": "oxblood"
+  },
+  "root": "fixed.plastic",
+  "joints": [
+    {
+      "id": "piece.0.lift.q",
+      "parent": "fixed.plastic",
+      "child": "piece.0.lift",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "piece.1.lift.q",
+      "parent": "fixed.plastic",
+      "child": "piece.1.lift",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "piece.2.lift.q",
+      "parent": "fixed.plastic",
+      "child": "piece.2.lift",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    },
+    {
+      "id": "piece.3.lift.q",
+      "parent": "fixed.plastic",
+      "child": "piece.3.lift",
+      "kind": "free",
+      "parent_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "child_frame": {
+        "translation": [
+          0,
+          0,
+          0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "limits": null,
+      "home": 0.0,
+      "damping": 0.0,
+      "friction": 0.0,
+      "stiffness": 0.0,
+      "rest": 0.0
+    }
+  ],
+  "bodies": [
+    {
+      "id": "fixed.plastic",
+      "mass": 0.16506107730290506,
+      "com": [
+        0.001829029581550004,
+        8.98035855524455e-19,
+        0.004509716728883925
+      ],
+      "inertia": [
+        [
+          8.469854418073066e-05,
+          -3.434650688749334e-21,
+          -2.8651316389902405e-06
+        ],
+        [
+          -3.434650688749334e-21,
+          0.0008945911317420634,
+          -2.579635219333907e-22
+        ],
+        [
+          -2.8651316389902405e-06,
+          -2.579635219333907e-22,
+          0.0009744031762068045
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b0_v0",
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c2"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c3"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c4"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c5"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c6"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c7"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c8"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c9"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c10"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c11"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c12"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c13"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c14"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c15"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c16"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c17"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c18"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c19"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c20"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c21"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c22"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c23"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c24"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c25"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c26"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c27"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c28"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c29"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c30"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c31"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c32"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c33"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c34"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c35"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c36"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c37"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c38"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c39"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c40"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c41"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b0_c42"
+        }
+      ],
+      "bounds": [
+        [
+          -0.128,
+          -0.04,
+          0.0
+        ],
+        [
+          0.128,
+          0.04,
+          0.021
+        ]
+      ]
+    },
+    {
+      "id": "piece.0.lift",
+      "mass": 0.009824489706930471,
+      "com": [
+        -0.09600000000000006,
+        2.8289783399310376e-18,
+        0.016057516749108814
+      ],
+      "inertia": [
+        [
+          8.236354005266537e-07,
+          -2.2049326408213524e-21,
+          -5.211237859084074e-21
+        ],
+        [
+          -2.2049326408213524e-21,
+          8.236354005266059e-07,
+          -7.483291014396752e-23
+        ],
+        [
+          -5.211237859084074e-21,
+          -7.483291014396752e-23,
+          1.0364793682446581e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b1_v0",
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b1_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b1_c1"
+        }
+      ],
+      "bounds": [
+        [
+          -0.10710000000000001,
+          -0.01922576396401453,
+          0.008
+        ],
+        [
+          -0.0738,
+          0.01922576396401454,
+          0.031
+        ]
+      ]
+    },
+    {
+      "id": "piece.1.lift",
+      "mass": 0.014177311662909257,
+      "com": [
+        -0.03200000000000001,
+        1.2252529447496823e-18,
+        0.015425802902840924
+      ],
+      "inertia": [
+        [
+          1.4118301860920416e-06,
+          -5.558653716356347e-22,
+          -8.68539643180679e-22
+        ],
+        [
+          -5.558653716356347e-22,
+          1.4118301860920407e-06,
+          7.396534025975076e-24
+        ],
+        [
+          -8.68539643180679e-22,
+          7.396534025975076e-24,
+          2.0828622192008483e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b2_v0",
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b2_c2"
+        }
+      ],
+      "bounds": [
+        [
+          -0.0542,
+          -0.0222,
+          0.008
+        ],
+        [
+          -0.0098,
+          0.0222,
+          0.031
+        ]
+      ]
+    },
+    {
+      "id": "piece.2.lift",
+      "mass": 0.017891235750951695,
+      "com": [
+        0.032,
+        1.1815275696414824e-18,
+        0.01512982984545276
+      ],
+      "inertia": [
+        [
+          2.098743074577488e-06,
+          -1.0523805343205893e-22,
+          3.474158572722716e-21
+        ],
+        [
+          -1.0523805343205893e-22,
+          2.0987430745774873e-06,
+          1.5105328744741776e-23
+        ],
+        [
+          3.474158572722716e-21,
+          1.5105328744741776e-23,
+          3.355588188440365e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b3_v0",
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c2"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c3"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b3_c4"
+        }
+      ],
+      "bounds": [
+        [
+          0.0098,
+          -0.019225763964014538,
+          0.008
+        ],
+        [
+          0.0542,
+          0.01922576396401454,
+          0.031
+        ]
+      ]
+    },
+    {
+      "id": "piece.3.lift",
+      "mass": 0.01932166516732416,
+      "com": [
+        0.09599999999999996,
+        -1.1722532807692739e-18,
+        0.015046185820342308
+      ],
+      "inertia": [
+        [
+          2.4138648822502412e-06,
+          -1.0742387820073028e-21,
+          -6.948317145445432e-21
+        ],
+        [
+          -1.0742387820073028e-21,
+          2.413864882250305e-06,
+          3.7834616427218296e-23
+        ],
+        [
+          -6.948317145445432e-21,
+          3.7834616427218296e-23,
+          3.948119928426223e-06
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b4_v0",
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c0"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c1"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c2"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c3"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c4"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c5"
+        },
+        {
+          "kind": "convex",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [],
+          "quaternion": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "prefix": "b4_c6"
+        }
+      ],
+      "bounds": [
+        [
+          0.0738,
+          -0.0222,
+          0.008
+        ],
+        [
+          0.1182,
+          0.0222,
+          0.031
+        ]
+      ]
+    }
+  ],
+  "features": {
+    "motions": [
+      {
+        "name": "piece.0.lift",
+        "parts": [
+          "piece.0",
+          "knob.0"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "limits": [
+          -1,
+          1
+        ],
+        "damping": 0.0
+      },
+      {
+        "name": "piece.1.lift",
+        "parts": [
+          "piece.1",
+          "knob.1"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "limits": [
+          -1,
+          1
+        ],
+        "damping": 0.0
+      },
+      {
+        "name": "piece.2.lift",
+        "parts": [
+          "piece.2",
+          "knob.2"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "limits": [
+          -1,
+          1
+        ],
+        "damping": 0.0
+      },
+      {
+        "name": "piece.3.lift",
+        "parts": [
+          "piece.3",
+          "knob.3"
+        ],
+        "kind": "free",
+        "anchor": [
+          0,
+          0,
+          0
+        ],
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "limits": [
+          -1,
+          1
+        ],
+        "damping": 0.0
+      }
+    ],
+    "fit": {
+      "radial_clearance_m": 0.0013,
+      "pieces": 4,
+      "operation": "independent lift, rotate and reinsert; rigid contact"
+    },
+    "preview_surface": "parts",
+    "physical_scope": "Rigid polymer toy approximations; real independent bodies and ideal joints. No elastic snap, magnetism, flotation, wear or strength certification."
+  }
+}

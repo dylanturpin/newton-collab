@@ -1,0 +1,8 @@
+{
+  "source": "https://github.com/HaozhiQi/hora",
+  "checkpoint_sha256": "cb7a03d49805e5b1c1f5da4101fb1c4e6e555a7e1a895561cb57424b616c0f87",
+  "controller_hz": 20,
+  "object_scale": 0.8,
+  "license": "MIT",
+  "object_pose_animation": false
+}

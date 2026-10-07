@@ -995,6 +995,17 @@ python -m newton.examples basic_urdf --device cuda:0
 python -m newton.examples basic_viewer --viewer gl --num-frames 500 --device cpu
 ```
 
+## Rigid Solver Benchmarks
+
+Run eight reconstructed Manda rigid fixtures with FPGS and native MuJoCo CPU:
+
+```bash
+uv run --extra dev python -m scripts.benchmarks.manda_rigid --scene all --solver both --output /tmp/manda-rigid-baseline
+```
+
+See [the benchmark guide](scripts/benchmarks/manda_rigid.md) for scene provenance,
+viewers, timestep refinements, geometry variants, and saved diagnostic traces.
+
 ## Contributing and Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for ways to contribute and the pull-request process. The [governance contribution guidelines](https://github.com/newton-physics/newton-governance/blob/main/CONTRIBUTING.md) cover legal requirements, project roles, and approval authority. Use the [development guide](https://newton-physics.github.io/newton/latest/guide/development.html) for environment setup and development workflows. Code and public API changes must follow the [source code guidelines](CODING_GUIDELINES.rst); reviewers may use the suggested [review guidelines](REVIEW_GUIDELINES.rst).

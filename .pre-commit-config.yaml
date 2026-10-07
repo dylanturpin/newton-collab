@@ -20,6 +20,8 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=500]
+        # Archived mesh, policy, and texture inputs (largest is 3.4 MB).
+        exclude: ^scripts/benchmarks/hero_montage/assets/(hora/(weights\.npz|meshes/allegro/(digitv2|base_link_left)\.obj)|furnishings/(ash|oak|walnut)\.png)$
       - id: check-case-conflict
       - id: check-illegal-windows-names
       - id: check-json
