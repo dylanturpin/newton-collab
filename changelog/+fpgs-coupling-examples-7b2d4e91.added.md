@@ -1,0 +1,1 @@
+The rigid/VBD ADMM, Kamino/MuJoCo ADMM four-bar, rigid/XPBD, rigid/MPM, proxy-joint gripper and rigid/soft contact examples accept `--rigid-solver featherpgs`, and the ADMM contact example accepts `--tray-solver featherpgs`.

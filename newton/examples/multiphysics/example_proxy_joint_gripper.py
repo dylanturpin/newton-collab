@@ -4,12 +4,13 @@
 ###########################################################################
 # Example Proxy Joint Gripper
 #
-# A MuJoCo-driven palm and two prismatic cube fingers grip a VBD soft grid.
-# The VBD entry receives the gripper bodies as body proxies and keeps the
-# fixed/prismatic joints enabled as proxy joints whose targets track the
-# MuJoCo source joint configuration.
+# A MuJoCo- or FeatherPGS-driven palm and two prismatic cube fingers grip a
+# VBD soft grid. The VBD entry receives the gripper bodies as body proxies and
+# keeps the fixed/prismatic joints enabled as proxy joints whose targets track
+# the rigid source joint configuration.
 #
 # Command: python -m newton.examples proxy_joint_gripper
+#          python -m newton.examples proxy_joint_gripper --rigid-solver featherpgs
 #
 ###########################################################################
 
@@ -23,7 +24,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverMuJoCo, SolverVBD
+from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
 
 
 @wp.kernel
@@ -106,17 +107,34 @@ class Example:
             "rigid_joint_angular_ke": 5.0e5 if self.scenario == "harsh" else 2.0e6,
         }
 
+        if args.rigid_solver == "featherpgs":
+            rigid_name = "fpgs"
+
+            def rigid_factory(v):
+                return SolverFeatherPGS(
+                    v,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=int(args.fpgs_iterations),
+                    enable_joint_limits=True,
+                )
+
+        else:
+            rigid_name = "mjc"
+
+            def rigid_factory(v):
+                return SolverMuJoCo(
+                    model=v,
+                    iterations=int(args.mujoco_iterations),
+                    disable_contacts=True,
+                    use_mujoco_contacts=False,
+                )
+
         self.solver = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupledProxy.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        iterations=int(args.mujoco_iterations),
-                        disable_contacts=True,
-                        use_mujoco_contacts=False,
-                    ),
+                    name=rigid_name,
+                    solver=rigid_factory,
                     bodies=self.gripper_bodies,
                     joints=self.gripper_joints,
                 ),
@@ -129,7 +147,7 @@ class Example:
             coupling=SolverCoupledProxy.Config(
                 proxies=[
                     SolverCoupledProxy.Proxy(
-                        source="mjc",
+                        source=rigid_name,
                         destination="vbd",
                         bodies=self.gripper_bodies,
                         joints=self.gripper_joints if args.proxy_joints else (),
@@ -357,13 +375,21 @@ class Example:
         parser.add_argument("--substeps", type=int, default=6, help="Simulation substeps per rendered frame.")
         newton.examples.add_coupled_view_args(parser)
         parser.add_argument("--vbd-iterations", type=int, default=30, help="VBD iterations per substep.")
+        parser.add_argument(
+            "--rigid-solver",
+            type=str,
+            choices=["mujoco", "featherpgs"],
+            default="mujoco",
+            help="Rigid solver that drives the gripper.",
+        )
         parser.add_argument("--mujoco-iterations", type=int, default=20, help="MuJoCo solver iterations.")
+        parser.add_argument("--fpgs-iterations", type=int, default=20, help="FeatherPGS PGS iterations.")
         parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy coupling iterations per substep.")
         parser.add_argument(
             "--mass-scale",
             type=float,
             default=1.0,
-            help="Scale factor for MuJoCo effective mass/inertia used by VBD proxy bodies.",
+            help="Scale factor for rigid-source effective mass/inertia used by VBD proxy bodies.",
         )
         parser.add_argument(
             "--proxy-relaxation",

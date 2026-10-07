@@ -22,7 +22,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverImplicitMPM, SolverKamino, SolverMuJoCo
+from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
 
 
 def _add_rigid_solver_arg(parser) -> None:
@@ -30,7 +30,7 @@ def _add_rigid_solver_arg(parser) -> None:
         "--rigid-solver",
         help="Rigid-body solver used by the coupled path.",
         type=str,
-        choices=["mujoco", "kamino"],
+        choices=["mujoco", "kamino", "featherpgs"],
         default="mujoco",
     )
 
@@ -64,6 +64,9 @@ def _rigid_solver_entry_args(
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
+    if rigid_solver == "featherpgs":
+        # Implicit MPM pauses graph capture, which needs FeatherPGS's memset side stream joined.
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free", "double_buffer": False}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 
