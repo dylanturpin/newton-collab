@@ -154,6 +154,7 @@ def test_rejects_unsupported_configs(test, device):
         {"enable_joint_limits": True},
         {"enable_joint_velocity_limits": True},
         {"enable_joint_friction": True},
+        {"contact_compliance": True},
         {"drive_mode": "physx_pgs"},
         {"pgs_velocity_iterations": 2},
         {"pgs_debug": True},
