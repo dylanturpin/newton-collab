@@ -82,11 +82,151 @@ def ball(
     return Scene(model, state, solver)
 
 
+def responsive_ball(*, radius, mu, mu_torsional, mu_rolling, velocity, cone, dt, **solver_overrides):
+    """Build a unit-mass solid sphere on three world-aligned slides and a ball joint, so all five friction rows respond.
+
+    ``velocity`` is the generalized velocity ``(vx, vy, vz, wx, wy, wz)``.
+    """
+    b = newton.ModelBuilder()
+    material = newton.ModelBuilder.ShapeConfig(mu=mu, mu_torsional=mu_torsional, mu_rolling=mu_rolling)
+    b.add_ground_plane(cfg=material)
+    pose = wp.transform(wp.vec3(0.0, 0.0, radius), wp.quat_identity())
+    tiny = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-8)
+    carriers = [b.add_link(xform=pose, mass=1.0e-4, inertia=tiny) for _ in range(3)]
+    body = b.add_link(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3, dtype=np.float32) * 0.4 * radius * radius))
+    identity = wp.transform_identity()
+    joints = [b.add_joint_prismatic(-1, carriers[0], parent_xform=pose, child_xform=identity, axis=(1.0, 0.0, 0.0))]
+    for parent, child, axis in ((0, 1, (0.0, 1.0, 0.0)), (1, 2, (0.0, 0.0, 1.0))):
+        joints.append(
+            b.add_joint_prismatic(
+                carriers[parent], carriers[child], parent_xform=identity, child_xform=identity, axis=axis
+            )
+        )
+    joints.append(b.add_joint_ball(carriers[2], body, parent_xform=identity, child_xform=identity))
+    b.add_articulation(joints)
+    sphere = newton.ModelBuilder.ShapeConfig(density=0.0, mu=mu, mu_torsional=mu_torsional, mu_rolling=mu_rolling)
+    b.add_shape_sphere(body, radius=radius, cfg=sphere)
+    model = b.finalize(device="cuda:0")
+    model.set_gravity((0.0, 0.0, -GRAVITY))
+    state = model.state()
+    state.joint_qd.assign(np.asarray(velocity, np.float32))
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    options = dict(SOLVER_OPTIONS)
+    options.update(solver_overrides)
+    solver = SolverFeatherPGS(
+        model, enable_torsional_rolling_friction=True, torsional_rolling_friction_cone=cone, **options
+    )
+    return Scene(model, state, solver, dt)
+
+
+def solved_block(scene):
+    """Return the normal impulse, friction impulses, coefficients, and the friction block's Delassus and free velocity."""
+    solver = scene.solver
+    rows = int(solver.constraint_count.numpy()[0])
+    impulse = solver.impulses.numpy()[0, :rows].astype(float)
+    jacobian = solver.J_world.numpy()[0, :rows].astype(float)
+    response = solver.Y_world.numpy()[0, :rows].astype(float)
+    mu = solver.row_mu.numpy()[0, :rows].astype(float)
+    free_velocity = solver.v_out.numpy().astype(float) - response.T @ impulse
+    delassus = jacobian @ response.T
+    # Velocity of the friction rows with the normal impulse applied and friction removed.
+    velocity = delassus[1:, :1] @ impulse[:1] + (jacobian @ free_velocity)[1:]
+    return impulse[0], impulse[1:], mu[1:], delassus[1:, 1:], velocity
+
+
+BLOCK_GROUPS = ([0, 1], [2], [3, 4])
+
+
+def cone_norm(normalized, cone):
+    """The norm whose ball of radius ``lambda_n`` is the cone, over coefficient-normalized friction impulses."""
+    if cone == "elliptic":
+        return float(np.linalg.norm(normalized))
+    return float(np.linalg.norm(normalized[:2]) + abs(normalized[2]) + np.linalg.norm(normalized[3:]))
+
+
+def elliptic_kkt_minimum(delassus, velocity, mu, load):
+    """Minimize ``0.5 l'Al + v'l`` over the elliptic cone by eigendecomposition and a bisected KKT multiplier."""
+    active = (mu > 0.0) & (np.diag(delassus) > 1.0e-12 * np.diag(delassus).max())
+    hessian = (mu[:, None] * delassus * mu[None, :])[np.ix_(active, active)]
+    gradient = (mu * velocity)[active]
+    eigenvalues, basis = np.linalg.eigh(hessian)
+    rotated = basis.T @ gradient
+
+    def minimizer(multiplier):
+        return -basis @ (rotated / np.maximum(eigenvalues + multiplier, 1.0e-300))
+
+    if eigenvalues.min() > 1.0e-12 * eigenvalues.max() and np.linalg.norm(minimizer(0.0)) <= load:
+        best = minimizer(0.0)
+    else:
+        low, high = 0.0, np.linalg.norm(gradient) / load
+        for _ in range(200):
+            middle = 0.5 * (low + high)
+            low, high = (middle, high) if np.linalg.norm(minimizer(middle)) > load else (low, middle)
+        best = minimizer(high)
+    out = np.zeros(len(mu))
+    out[active] = mu[active] * best
+    return out
+
+
+def pyramidal_gap(delassus, velocity, mu, load, impulse):
+    """Duality gap of ``impulse`` on the block-L1 cone, which bounds its objective excess, relative to the objective."""
+    gradient = delassus @ impulse + velocity
+    scaled = mu * gradient
+    gap = gradient @ impulse + load * max(np.linalg.norm(scaled[g]) for g in BLOCK_GROUPS)
+    return gap / abs(0.5 * impulse @ delassus @ impulse + velocity @ impulse)
+
+
+def certified_pyramidal_minimum(delassus, velocity, mu, load):
+    """Minimize over the block-L1 cone in float64 by group-scaled accelerated projection until the gap certifies it."""
+    active = (mu > 0.0) & (np.diag(delassus) > 1.0e-12 * np.diag(delassus).max())
+    hessian = mu[:, None] * delassus * mu[None, :] * np.outer(active, active)
+    gradient = mu * velocity * active
+    scale = np.ones(len(mu))
+    for g in BLOCK_GROUPS:
+        curvature = hessian[g, g].max()
+        scale[g] = math.sqrt(curvature) if curvature > 0.0 else 1.0
+    hessian = hessian / np.outer(scale, scale)
+    gradient = gradient / scale
+    weights = np.array([1.0 / scale[g[0]] for g in BLOCK_GROUPS])
+    step = 1.0 / np.linalg.eigvalsh(hessian).max()
+
+    def project(u):
+        norms = np.array([np.linalg.norm(u[g]) for g in BLOCK_GROUPS])
+        if weights @ norms <= load:
+            return u
+        low, high = 0.0, (norms / weights).max()
+        for _ in range(200):
+            middle = 0.5 * (low + high)
+            if weights @ np.maximum(norms - middle * weights, 0.0) > load:
+                low = middle
+            else:
+                high = middle
+        out = u.copy()
+        for g, norm, weight in zip(BLOCK_GROUPS, norms, weights, strict=True):
+            out[g] *= max(norm - high * weight, 0.0) / norm if norm > 0.0 else 0.0
+        return out
+
+    u = np.zeros(len(mu))
+    z = u.copy()
+    momentum = 1.0
+    for iteration in range(1, 200001):
+        following = project(z - step * (gradient + hessian @ z)) * active
+        momentum = 1.0 if (z - following) @ (following - u) > 0.0 else momentum
+        next_momentum = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * momentum * momentum))
+        z = following + (momentum - 1.0) / next_momentum * (following - u)
+        u, momentum = following, next_momentum
+        impulse = mu * u / scale
+        if iteration % 200 == 0 and pyramidal_gap(delassus, velocity, mu, load, impulse) < 1.0e-10:
+            return impulse
+    raise AssertionError("The block-L1 reference did not certify")
+
+
 class Scene:
     """Step one model with its own collision pipeline and record generalized velocities."""
 
-    def __init__(self, model, state, solver):
+    def __init__(self, model, state, solver, dt=DT):
         self.model = model
+        self.dt = dt
         self.solver = solver
         self.state = state
         self.next = model.state()
@@ -96,7 +236,7 @@ class Scene:
 
     def step(self):
         self.pipeline.collide(self.state, self.contacts)
-        self.solver.step(self.state, self.next, self.control, self.contacts, DT)
+        self.solver.step(self.state, self.next, self.control, self.contacts, self.dt)
         self.state, self.next = self.next, self.state
 
     def run(self, steps):
@@ -129,7 +269,7 @@ def project_cone(y, load, cone, groups):
 
 
 def cone_minimum(delassus, velocity, coefficients, load, cone, groups, iterations=3000):
-    """Return the impulse minimizing ``0.5 l'Al + v'l`` over the cone in coefficient-normalized impulses."""
+    """Approximate the impulse minimizing ``0.5 l'Al + v'l`` over the cone by a fixed number of float64 iterations."""
     scale = np.asarray(coefficients, float)
     hessian = scale[:, None] * delassus * scale[None, :]
     gradient = scale * velocity
@@ -149,7 +289,7 @@ def cone_minimum(delassus, velocity, coefficients, load, cone, groups, iteration
 def reference_velocities(
     cone, steps, *, radius=RADIUS, mu=MU, mu_torsional=0.0, mu_rolling=MU_ROLLING, speed=1.0, rolling=True, spin=0.0
 ):
-    """Velocities (center speed, rolling rate, spin rate) under an exactly solved joint cone each step, float64."""
+    """Velocities (center speed, rolling rate, spin rate) under a numerically solved joint cone each step, float64."""
     mass = 1.0 + 3.0e-4
     inertia = 0.4 * radius * radius
     inverse_mass = np.diag([1.0 / mass, 1.0 / (inertia + 1.0e-8), 1.0 / inertia])
@@ -175,8 +315,8 @@ def holding_slope(cone, radius=RADIUS, mu=MU, mu_rolling=MU_ROLLING):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Torsional/rolling friction requires CUDA")
 class TestFeatherPGSRollingFriction(unittest.TestCase):
-    def test_trajectories_match_the_exact_joint_cone(self):
-        """Rolling, sliding and spinning starts follow a float64 reference that solves the cone exactly per step."""
+    def test_trajectories_match_the_reference_joint_cone(self):
+        """Rolling, sliding and spinning starts follow a float64 reference that solves the cone per step."""
         cases = (
             {"radius": 0.02, "mu_rolling": 0.01},
             {"radius": 0.1, "mu_rolling": 0.002},
@@ -244,7 +384,8 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         self.assertLess(abs(rigid.run(200)[-1, 3]), 1e-5)
 
     def test_competing_sliding_and_spin_share_the_cone(self):
-        """A sliding, spinning sphere gives spin budget, and more sweeps do not worsen the step objective."""
+        """A sliding, spinning sphere gives spin budget within tolerance of the reference objective, and more sweeps
+        do not worsen it."""
         objectives = {}
         for cone in ("pyramidal", "elliptic"):
             for iterations in (16, 128):
@@ -276,6 +417,67 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 objectives[cone, iterations] = objective(impulse)
         for cone in ("pyramidal", "elliptic"):
             self.assertLessEqual(objectives[cone, 128], objectives[cone, 16] + 1e-9)
+
+    def test_zero_and_tiny_normal_loads_keep_friction_inside_the_cone(self):
+        """A separating contact applies no friction, and a barely loaded one stays inside its cone."""
+        for cone in ("pyramidal", "elliptic"):
+            for vertical in (1.0, -1.0e-9):
+                with self.subTest(cone=cone, vertical=vertical):
+                    scene = ball(radius=0.1, rolling=False, mu=1.0, mu_torsional=0.005, mu_rolling=0.0001, cone=cone)
+                    scene.model.set_gravity((0.0, 0.0, 0.0))
+                    scene.state.joint_qd.assign(np.array([1.0, vertical, 0.0, 0.0], np.float32))
+                    newton.eval_fk(scene.model, scene.state.joint_q, scene.state.joint_qd, scene.state)
+                    scene.step()
+                    self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 6)
+                    load, impulse, mu, _, _ = solved_block(scene)
+                    if vertical > 0.0:
+                        self.assertEqual(load, 0.0)
+                        np.testing.assert_array_equal(impulse, 0.0)
+                        self.assertEqual(scene.state.joint_qd.numpy()[0], 1.0)
+                    else:
+                        self.assertGreater(load, 0.0)
+                        self.assertLess(load, 1.0e-6)
+                    self.assertLessEqual(cone_norm(impulse / mu, cone), load * (1.0 + 1.0e-5))
+
+    def test_small_coefficients_reach_the_block_optimum(self):
+        """Small spin and rolling coefficients get the optimal block impulse at modest sweep counts."""
+        builders = {
+            "planar": lambda cone, iterations: ball(
+                radius=0.1,
+                speed=0.001,
+                mu=1.0,
+                mu_torsional=0.005,
+                mu_rolling=0.0001,
+                cone=cone,
+                pgs_iterations=iterations,
+            ),
+            "responsive": lambda cone, iterations: responsive_ball(
+                radius=0.1,
+                mu=1.0,
+                mu_torsional=0.005,
+                mu_rolling=0.0001,
+                velocity=(0.001, 0.0, 0.0, 0.0, 0.01, 0.0),
+                cone=cone,
+                dt=1.0 / 240.0,
+                pgs_iterations=iterations,
+            ),
+        }
+        for name, build in builders.items():
+            for cone in ("elliptic", "pyramidal"):
+                for iterations in (16, 128):
+                    with self.subTest(scene=name, cone=cone, iterations=iterations):
+                        scene = build(cone, iterations)
+                        scene.step()
+                        load, impulse, mu, delassus, velocity = solved_block(scene)
+                        self.assertGreater(load, 0.0)
+                        self.assertLessEqual(cone_norm(impulse / mu, cone), load * (1.0 + 1.0e-5))
+                        if cone == "elliptic":
+                            expected = elliptic_kkt_minimum(delassus, velocity, mu, load)
+                        else:
+                            expected = certified_pyramidal_minimum(delassus, velocity, mu, load)
+                        np.testing.assert_array_less(np.abs(impulse - expected), 1.0e-3 * mu * load + 1.0e-12)
+                        rolling = 3 + int(np.abs(expected[3:]).argmax())
+                        self.assertAlmostEqual(impulse[rolling] / expected[rolling], 1.0, delta=1.0e-3)
 
     def test_disabled_and_zero_coefficients_match_the_baseline_bitwise(self):
         baseline = ball(enable=False).run(60)

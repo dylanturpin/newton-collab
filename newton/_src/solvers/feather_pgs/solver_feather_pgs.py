@@ -1372,9 +1372,9 @@ class SolverFeatherPGS(SolverBase):
                 sliding, torsional and rolling impulses. ``"elliptic"`` bounds their Euclidean norm, as
                 MuJoCo's elliptic cone does. ``"pyramidal"`` bounds the sum of the three block norms, with a
                 disk inside the sliding and rolling blocks; this differs from MuJoCo's component-wise
-                pyramid. Its maximum-dissipation solution concentrates the budget on the block with the
-                largest normalized velocity, so a pivoting contact keeps no sliding stiction until it
-                slips. Construction-only.
+                pyramid. Its optimum can share the budget between blocks or stick inside the cone; in
+                locomotion tests pivoting stance feet put most of it on rolling, weakening sliding
+                stiction. Construction-only.
             torsional_rolling_friction_creep_speed: Experimental creep speed [m/s] that softens
                 torsional/rolling stiction: below the bound, the coefficient times the relative angular
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent

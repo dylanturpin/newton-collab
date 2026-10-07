@@ -7,15 +7,20 @@ reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``, a
 five friction rows take the angular-friction row type so that one solve owns them. The
 spin row resists relative rotation about the normal and the rolling pair about the
 contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
-five friction rows of a contact as one block: it minimizes the block's quadratic
-over a joint cone in coefficient-normalized impulses ``(f_t / mu, tau_s / mu_s,
-tau_r / mu_r)``, using accelerated projected gradient with exact Euclidean projection:
+five friction rows of a contact as one block: it minimizes the block's quadratic over a
+joint cone in coefficient-normalized impulses ``(f_t / mu, tau_s / mu_s, tau_r / mu_r)``.
+Rows with no coefficient or no response stay at zero, and the unconstrained minimizer is
+taken when it lies inside the cone.
 
-- ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``;
+- ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
+  The block is a trust-region subproblem, solved by safeguarded Newton on its multiplier
+  until the boundary residual is below a relative tolerance.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
-  MuJoCo's component-wise pyramid, and its solutions sit on the cone's vertices: a contact
-  that pivots faster than it slides spends the whole budget on rolling.
+  MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
+  coordinates finds the face, then reweighted trust-region solves refine on it. The
+  optimum may share the budget between blocks or stick inside the cone; in quadruped
+  locomotion tests pivoting stance feet put most of it on rolling.
 
 An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
 bound the coefficient times the relative angular rate settles at ``s`` times the load
@@ -152,182 +157,13 @@ def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads:
 def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dict[str, str]:
     """Return the CUDA fragments that the fused matrix-free GS kernel splices in for ``cone`` and ``creep_speed``."""
     angular = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
-    if cone == "elliptic":
-        projection = """
-        float norm = 0.0f;
-        for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
-        norm = sqrtf(norm);
-        if (norm > load) {
-            float scale = load / norm;
-            for (int k = 0; k < 5; ++k) y[k] *= scale;
-        }"""
-    else:
-        projection = """
-        float group[3] = {sqrtf(y[0] * y[0] + y[1] * y[1]), fabsf(y[2]), sqrtf(y[3] * y[3] + y[4] * y[4])};
-        if (group[0] + group[1] + group[2] > load) {
-            // Project the group norms onto the simplex of radius load, then rescale each group.
-            float sorted[3] = {group[0], group[1], group[2]};
-            for (int a = 0; a < 2; ++a)
-                for (int b = a + 1; b < 3; ++b)
-                    if (sorted[b] > sorted[a]) { float t = sorted[a]; sorted[a] = sorted[b]; sorted[b] = t; }
-            float theta = 0.0f, cumulative = 0.0f;
-            for (int a = 0; a < 3; ++a) {
-                cumulative += sorted[a];
-                float candidate = (cumulative - load) / (float)(a + 1);
-                if (sorted[a] - candidate > 0.0f) theta = candidate;
-            }
-            const int first[3] = {0, 2, 3};
-            const int count[3] = {2, 1, 2};
-            for (int g = 0; g < 3; ++g) {
-                float scale = group[g] > 0.0f ? fmaxf(group[g] - theta, 0.0f) / group[g] : 0.0f;
-                for (int k = first[g]; k < first[g] + count[g]; ++k) y[k] *= scale;
-            }
-        }"""
-    helpers = f"""
-    // Kept out of line so contacts without angular rows keep the sweep's register budget.
-    struct AngularFrictionBlock {{
-        // Exact Euclidean projection of normalized friction impulses onto the joint cone of radius load.
-        static __device__ void project(float* y, float load) {{
-            load = fmaxf(load, 0.0f);{projection}
-        }}
-
-        // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
-        static __device__ __noinline__ float solve(
-            float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
-            int lane, unsigned MASK, float load, float omega, int* changed) {{
-                float sums[20];
-                for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
-                for (int d = lane; d < {dofs}; d += 32) {{
-                    float jr[5], yr[5];
-                    for (int k = 0; k < 5; ++k) {{
-                        jr[k] = J[k * {dofs} + d];
-                        yr[k] = Y[k * {dofs} + d];
-                    }}
-                    int q = 5;
-                    for (int k = 0; k < 5; ++k) {{
-                        sums[k] += jr[k] * v[d];
-                        for (int l = k; l < 5; ++l) sums[q++] += jr[k] * yr[l];
-                    }}
-                }}
-                for (int q = 0; q < 20; ++q) {{
-                    float value = sums[q];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        value += __shfl_down_sync(MASK, value, offset);
-                    sums[q] = __shfl_sync(MASK, value, 0);
-                }}
-                load = fmaxf(load, 0.0f);
-                float x0[5], gradient0[5], mu[5], H[5][5];
-                int q = 5;
-                for (int k = 0; k < 5; ++k) {{
-                    x0[k] = lam[k];
-                    mu[k] = fmaxf(mu_rows[k], 0.0f);
-                    gradient0[k] = sums[k] + rhs_rows[k];
-                    for (int l = k; l < 5; ++l) {{ H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }}
-                }}
-                for (int k = 2; k < 5; ++k) {{
-                    // Creep compliance c adds 0.5 c x^2: c = creep_speed / (mu^2 lambda_n).
-                    float compliance = mu[k] > 0.0f && load > 0.0f ? {float(creep_speed)!r}f / (mu[k] * mu[k] * load) : 0.0f;
-                    H[k][k] += compliance;
-                    gradient0[k] += compliance * x0[k];
-                }}
-                // Normalized coordinates y = x / mu; rows with mu == 0 stay at zero.
-                float y0[5], y[5], z[5], lipschitz = 0.0f;
-                for (int k = 0; k < 5; ++k) {{
-                    y0[k] = mu[k] > 0.0f ? x0[k] / mu[k] : 0.0f;
-                    gradient0[k] *= mu[k];
-                    float row_sum = 0.0f;
-                    for (int l = 0; l < 5; ++l) {{
-                        H[k][l] *= mu[k] * mu[l];
-                        row_sum += fabsf(H[k][l]);
-                    }}
-                    lipschitz = fmaxf(lipschitz, row_sum);
-                }}
-                // Sticking: the unconstrained block minimizer, when it lies inside the cone, is exact.
-                bool solved = false;
-                {{
-                    float L[5][5], step[5], largest_pivot = 0.0f;
-                    for (int k = 0; k < 5; ++k) largest_pivot = fmaxf(largest_pivot, mu[k] > 0.0f ? H[k][k] : 0.0f);
-                    // Near-singular blocks (rows without response) take the projected-gradient path.
-                    bool positive = largest_pivot > 0.0f;
-                    for (int k = 0; k < 5 && positive; ++k) {{
-                        for (int l = 0; l <= k; ++l) {{
-                            float value = mu[k] > 0.0f && mu[l] > 0.0f ? H[k][l] : (k == l ? 1.0f : 0.0f);
-                            for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
-                            if (k == l) {{
-                                if (!(value > 1.0e-5f * largest_pivot)) positive = false;
-                                L[k][k] = sqrtf(fmaxf(value, 0.0f));
-                            }} else {{
-                                L[k][l] = value / L[l][l];
-                            }}
-                        }}
-                    }}
-                    if (positive) {{
-                        for (int k = 0; k < 5; ++k) {{
-                            float value = mu[k] > 0.0f ? -gradient0[k] : 0.0f;
-                            for (int m = 0; m < k; ++m) value -= L[k][m] * step[m];
-                            step[k] = value / L[k][k];
-                        }}
-                        for (int k = 4; k >= 0; --k) {{
-                            float value = step[k];
-                            for (int m = k + 1; m < 5; ++m) value -= L[m][k] * step[m];
-                            step[k] = value / L[k][k];
-                        }}
-                        for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? y0[k] + step[k] : 0.0f;
-                        float trial[5];
-                        for (int k = 0; k < 5; ++k) trial[k] = y[k];
-                        project(trial, load);
-                        solved = true;
-                        for (int k = 0; k < 5; ++k) solved = solved && trial[k] == y[k];
-                    }}
-                }}
-                if (!solved) {{
-                    for (int k = 0; k < 5; ++k) y[k] = y0[k];
-                    project(y, load);
-                }}
-                if (!solved && lipschitz > 0.0f) {{
-                    for (int k = 0; k < 5; ++k) z[k] = y[k];
-                    float momentum = 1.0f;
-                    for (int iteration = 0; iteration < 32; ++iteration) {{
-                        float next[5];
-                        for (int k = 0; k < 5; ++k) {{
-                            float gradient = gradient0[k];
-                            for (int l = 0; l < 5; ++l) gradient += H[k][l] * (z[l] - y0[l]);
-                            next[k] = mu[k] > 0.0f ? z[k] - gradient / lipschitz : 0.0f;
-                        }}
-                        project(next, load);
-                        float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
-                        float blend = (momentum - 1.0f) / next_momentum;
-                        float change = 0.0f;
-                        for (int k = 0; k < 5; ++k) {{
-                            change = fmaxf(change, fabsf(next[k] - y[k]));
-                            z[k] = next[k] + blend * (next[k] - y[k]);
-                            y[k] = next[k];
-                        }}
-                        momentum = next_momentum;
-                        // Outer sweeps warm-start the block, so stop once an iterate stalls.
-                        if (change <= 1.0e-6f * load) break;
-                    }}
-                }}
-                float x[5];
-                for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
-                if (omega != 1.0f) {{
-                    for (int k = 0; k < 5; ++k) y[k] = mu[k] > 0.0f ? x[k] / mu[k] : 0.0f;
-                    project(y, load);
-                    for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
-                }}
-                for (int k = 1; k < 5; ++k) {{
-                    float block_delta = x[k] - lam[k];
-                    if (block_delta != 0.0f) {{
-                        *changed = 1;
-                        for (int d = lane; d < {dofs}; d += 32)
-                            v[d] += Y[k * {dofs} + d] * block_delta;
-                    }}
-                    lam[k] = x[k];
-                }}
-                return x[0];
-        }}
-    }};
-"""
+    elliptic = cone == "elliptic"
+    helpers = (
+        _BLOCK_SOURCE.replace("__PROJECT__", _ELLIPTIC_PROJECT if elliptic else _PYRAMIDAL_PROJECT)
+        .replace("__CONSTRAINED__", _ELLIPTIC_CONSTRAINED if elliptic else _PYRAMIDAL_CONSTRAINED)
+        .replace("__DOFS__", str(dofs))
+        .replace("__CREEP__", f"{float(creep_speed)!r}f")
+    )
     row_block = f"""
             }} else if (row_type == {angular}) {{
                 // Rows [t1, t2, spin, roll1, roll2] of one contact; the first solves the whole block.
@@ -342,3 +178,320 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
                 }}
                 delta_impulse = new_impulse - old_impulse;"""
     return {"helpers": helpers, "row_block": row_block}
+
+
+_ELLIPTIC_PROJECT = """
+        static __device__ float cone_norm(const float* y) {
+            float norm = 0.0f;
+            for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
+            return sqrtf(norm);
+        }
+
+        static __device__ void project(float* y, const float* w, float load) {
+            float norm = cone_norm(y);
+            if (norm > load) {
+                float scale = load / norm;
+                for (int k = 0; k < 5; ++k) y[k] *= scale;
+            }
+        }"""
+
+_PYRAMIDAL_PROJECT = """
+        static __device__ float cone_norm(const float* y) {
+            return sqrtf(y[0] * y[0] + y[1] * y[1]) + fabsf(y[2]) + sqrtf(y[3] * y[3] + y[4] * y[4]);
+        }
+
+        // Projection onto sum_g w_g |y_g| <= load over the groups (t1, t2), (spin), (roll1, roll2).
+        static __device__ void project(float* y, const float* w, float load) {
+            const int first[3] = {0, 2, 3};
+            const int count[3] = {2, 1, 2};
+            float norm[3] = {sqrtf(y[0] * y[0] + y[1] * y[1]), fabsf(y[2]), sqrtf(y[3] * y[3] + y[4] * y[4])};
+            if (w[0] * norm[0] + w[1] * norm[1] + w[2] * norm[2] <= load) return;
+            int order[3] = {0, 1, 2};
+            for (int a = 0; a < 2; ++a)
+                for (int b = a + 1; b < 3; ++b)
+                    if (norm[order[b]] * w[order[a]] > norm[order[a]] * w[order[b]]) {
+                        int t = order[a]; order[a] = order[b]; order[b] = t;
+                    }
+            // The shrink solving sum_g w_g max(|y_g| - theta w_g, 0) = load is the largest prefix candidate;
+            // when rounding swallows load it is the largest breakpoint, which zeroes every group.
+            float theta = 0.0f, linear = 0.0f, quadratic = 0.0f;
+            for (int a = 0; a < 3; ++a) {
+                int g = order[a];
+                linear += w[g] * norm[g];
+                quadratic += w[g] * w[g];
+                theta = fmaxf(theta, (linear - load) / quadratic);
+            }
+            float total = 0.0f;
+            for (int g = 0; g < 3; ++g) {
+                float scale = norm[g] > 0.0f ? fmaxf(norm[g] - theta * w[g], 0.0f) / norm[g] : 0.0f;
+                for (int k = first[g]; k < first[g] + count[g]; ++k) y[k] *= scale;
+                total += w[g] * norm[g] * scale;
+            }
+            if (total > load) {
+                float scale = load / total;
+                for (int k = 0; k < 5; ++k) y[k] *= scale;
+            }
+        }
+"""
+
+_ELLIPTIC_CONSTRAINED = """
+                    float c[5];
+                    for (int k = 0; k < 5; ++k) {
+                        c[k] = gradient0[k];
+                        for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
+                    }
+                    trust_region(H, c, active, load, y);"""
+
+_PYRAMIDAL_CONSTRAINED = """
+                    // Accelerated projected gradient in group-scaled coordinates u_g = s_g y_g, which give the
+                    // sliding, spin and rolling groups comparable curvature; stops on the gradient-mapping residual.
+                    const int first[3] = {0, 2, 3};
+                    const int count[3] = {2, 1, 2};
+                    float c[5], s[5], w[3], Hu[5][5], cu[5], u[5], z[5], lipschitz = 0.0f;
+                    for (int k = 0; k < 5; ++k) {
+                        c[k] = gradient0[k];
+                        for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
+                        c[k] = active[k] ? c[k] : 0.0f;
+                    }
+                    for (int g = 0; g < 3; ++g) {
+                        float curvature = 0.0f;
+                        for (int k = first[g]; k < first[g] + count[g]; ++k)
+                            curvature = fmaxf(curvature, active[k] ? H[k][k] : 0.0f);
+                        float scale = curvature > 0.0f ? sqrtf(curvature) : 1.0f;
+                        w[g] = 1.0f / scale;
+                        for (int k = first[g]; k < first[g] + count[g]; ++k) s[k] = scale;
+                    }
+                    for (int k = 0; k < 5; ++k) {
+                        float row_sum = 0.0f;
+                        for (int l = 0; l < 5; ++l) {
+                            Hu[k][l] = H[k][l] / (s[k] * s[l]);
+                            row_sum += fabsf(Hu[k][l]);
+                        }
+                        lipschitz = fmaxf(lipschitz, active[k] ? row_sum : 0.0f);
+                        cu[k] = c[k] / s[k];
+                        u[k] = y0[k] * s[k];
+                    }
+                    project(u, w, load);
+                    for (int k = 0; k < 5; ++k) z[k] = u[k];
+                    float momentum = 1.0f;
+                    for (int iteration = 0; iteration < 64 && lipschitz > 0.0f; ++iteration) {
+                        float next[5];
+                        for (int k = 0; k < 5; ++k) {
+                            float gradient = cu[k];
+                            for (int l = 0; l < 5; ++l) gradient += Hu[k][l] * z[l];
+                            next[k] = active[k] ? z[k] - gradient / lipschitz : 0.0f;
+                        }
+                        project(next, w, load);
+                        // Residual of the projected-gradient fixed point at z, per group in y units.
+                        float residual = 0.0f, ascent = 0.0f;
+                        for (int g = 0; g < 3; ++g) {
+                            float squared = 0.0f;
+                            for (int k = first[g]; k < first[g] + count[g]; ++k)
+                                squared += (next[k] - z[k]) * (next[k] - z[k]);
+                            residual = fmaxf(residual, sqrtf(squared) * w[g]);
+                        }
+                        for (int k = 0; k < 5; ++k) ascent += (z[k] - next[k]) * (next[k] - u[k]);
+                        momentum = ascent > 0.0f ? 1.0f : momentum;
+                        float next_momentum = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * momentum * momentum));
+                        float blend = (momentum - 1.0f) / next_momentum;
+                        for (int k = 0; k < 5; ++k) {
+                            z[k] = next[k] + blend * (next[k] - u[k]);
+                            u[k] = next[k];
+                        }
+                        momentum = next_momentum;
+                        if (residual <= 1.0e-5f * load) break;
+                    }
+                    for (int k = 0; k < 5; ++k) y[k] = u[k] / s[k];
+                    // On the face found above, sum_g |y_g| <= load is sum_g |y_g|^2 / t_g <= load^2 at t_g = |y_g| / sum |y|.
+                    // Alternating the weighted trust-region solve with that t converges to the optimum.
+                    for (int iteration = 0; iteration < 8; ++iteration) {
+                        float norm[3], total = 0.0f;
+                        for (int g = 0; g < 3; ++g) {
+                            float squared = 0.0f;
+                            for (int k = first[g]; k < first[g] + count[g]; ++k) squared += y[k] * y[k];
+                            norm[g] = sqrtf(squared);
+                            total += norm[g];
+                        }
+                        if (!(total > 0.0f)) break;
+                        float r[5], cr[5];
+                        bool face[5];
+                        for (int g = 0; g < 3; ++g)
+                            for (int k = first[g]; k < first[g] + count[g]; ++k) {
+                                r[k] = sqrtf(norm[g] / total);
+                                face[k] = active[k] && r[k] > 0.0f;
+                                cr[k] = r[k] * c[k];
+                            }
+                        for (int k = 0; k < 5; ++k)
+                            for (int l = 0; l < 5; ++l) Hu[k][l] = r[k] * r[l] * H[k][l];
+                        trust_region(Hu, cr, face, load, y);
+                        for (int k = 0; k < 5; ++k) y[k] *= r[k];
+                    }"""
+
+_BLOCK_SOURCE = """
+    // Kept out of line so contacts without angular rows keep the sweep's register budget.
+    struct AngularFrictionBlock {
+        typedef float Row[5];
+__PROJECT__
+
+        // Cholesky of H + alpha I over the active rows; fails when a pivot keeps under 1e-6 of its diagonal.
+        static __device__ bool factor(const Row* H, const bool* active, float alpha, Row* L) {
+            for (int k = 0; k < 5; ++k) {
+                for (int l = 0; l <= k; ++l) {
+                    float value = active[k] && active[l] ? H[k][l] : 0.0f;
+                    if (k == l) value = active[k] ? value + alpha : 1.0f;
+                    for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
+                    if (k == l) {
+                        if (!(value > 1.0e-6f * (active[k] ? H[k][k] + alpha : 1.0f))) return false;
+                        L[k][k] = sqrtf(value);
+                    } else {
+                        L[k][l] = value / L[l][l];
+                    }
+                }
+            }
+            return true;
+        }
+
+        static __device__ void lower(const Row* L, float* x) {
+            for (int k = 0; k < 5; ++k) {
+                for (int m = 0; m < k; ++m) x[k] -= L[k][m] * x[m];
+                x[k] /= L[k][k];
+            }
+        }
+
+        static __device__ void upper(const Row* L, float* x) {
+            for (int k = 4; k >= 0; --k) {
+                for (int m = k + 1; m < 5; ++m) x[k] -= L[m][k] * x[m];
+                x[k] /= L[k][k];
+            }
+        }
+
+        // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows: y = -(H + alpha I)^-1 c, with alpha found by
+        // Newton on 1 / |y(alpha)| (More-Sorensen) inside a bracket, stopping on the boundary residual.
+        static __device__ void trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
+            float L[5][5], b[5], c_norm = 0.0f;
+            for (int k = 0; k < 5; ++k) {
+                b[k] = active[k] ? c[k] : 0.0f;
+                c_norm += b[k] * b[k];
+                y[k] = 0.0f;
+            }
+            c_norm = sqrtf(c_norm);
+            if (!(load > 0.0f && c_norm > 0.0f)) return;
+            // |y(hi)| <= |c| / hi = load because H is positive semidefinite.
+            float lo = 0.0f, hi = c_norm / load, alpha = 0.0f;
+            for (int iteration = 0; iteration < 40; ++iteration) {
+                float next = -1.0f;
+                if (factor(H, active, alpha, L)) {
+                    for (int k = 0; k < 5; ++k) y[k] = -b[k];
+                    lower(L, y);
+                    upper(L, y);
+                    float norm = 0.0f;
+                    for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
+                    norm = sqrtf(norm);
+                    if (alpha == 0.0f && norm <= load) return;
+                    if (fabsf(norm - load) <= 1.0e-5f * load) break;
+                    if (norm < load) hi = alpha; else lo = alpha;
+                    float w[5], w_norm = 0.0f;
+                    for (int k = 0; k < 5; ++k) w[k] = y[k];
+                    lower(L, w);
+                    for (int k = 0; k < 5; ++k) w_norm += w[k] * w[k];
+                    next = alpha + norm * norm / w_norm * (norm - load) / load;
+                } else {
+                    lo = alpha;
+                }
+                // A singular block whose minimizer is interior closes the bracket from below.
+                if (hi - lo <= 1.0e-4f * hi) break;
+                alpha = next > lo && next < hi ? next : (lo > 0.0f ? sqrtf(lo * hi) : 1.0e-3f * hi);
+            }
+            float norm = 0.0f;
+            for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
+            norm = sqrtf(norm);
+            if (norm > load) {
+                float scale = load / norm;
+                for (int k = 0; k < 5; ++k) y[k] *= scale;
+            }
+        }
+
+        // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
+        static __device__ __noinline__ float solve(
+            float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
+            int lane, unsigned MASK, float load, float omega, int* changed) {
+                float sums[20];
+                for (int q = 0; q < 20; ++q) sums[q] = 0.0f;
+                for (int d = lane; d < __DOFS__; d += 32) {
+                    float jr[5], yr[5];
+                    for (int k = 0; k < 5; ++k) {
+                        jr[k] = J[k * __DOFS__ + d];
+                        yr[k] = Y[k * __DOFS__ + d];
+                    }
+                    int q = 5;
+                    for (int k = 0; k < 5; ++k) {
+                        sums[k] += jr[k] * v[d];
+                        for (int l = k; l < 5; ++l) sums[q++] += jr[k] * yr[l];
+                    }
+                }
+                for (int q = 0; q < 20; ++q) {
+                    float value = sums[q];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        value += __shfl_down_sync(MASK, value, offset);
+                    sums[q] = __shfl_sync(MASK, value, 0);
+                }
+                load = fmaxf(load, 0.0f);
+                float x0[5], gradient0[5], mu[5], H[5][5], largest = 0.0f;
+                int q = 5;
+                for (int k = 0; k < 5; ++k) {
+                    x0[k] = lam[k];
+                    mu[k] = fmaxf(mu_rows[k], 0.0f);
+                    gradient0[k] = sums[k] + rhs_rows[k];
+                    for (int l = k; l < 5; ++l) { H[k][l] = sums[q]; H[l][k] = sums[q]; ++q; }
+                    largest = fmaxf(largest, H[k][k]);
+                }
+                // Rows without a coefficient, or whose response is round-off, stay at zero.
+                bool active[5];
+                for (int k = 0; k < 5; ++k) active[k] = mu[k] > 0.0f && H[k][k] > 1.0e-12f * largest;
+                for (int k = 2; k < 5; ++k) {
+                    // Creep compliance c adds 0.5 c x^2: c = creep_speed / (mu^2 lambda_n).
+                    float compliance = active[k] && load > 0.0f ? __CREEP__ / (mu[k] * mu[k] * load) : 0.0f;
+                    H[k][k] += compliance;
+                    gradient0[k] += compliance * x0[k];
+                }
+                // Normalized coordinates y = x / mu, in which the cone has radius load.
+                float y0[5], y[5], L[5][5];
+                for (int k = 0; k < 5; ++k) {
+                    y0[k] = active[k] ? x0[k] / mu[k] : 0.0f;
+                    gradient0[k] = active[k] ? gradient0[k] * mu[k] : 0.0f;
+                    for (int l = 0; l < 5; ++l) H[k][l] *= mu[k] * mu[l];
+                }
+                // Sticking: the unconstrained minimizer is exact when it lies inside the cone.
+                bool sticking = false;
+                if (factor(H, active, 0.0f, L)) {
+                    for (int k = 0; k < 5; ++k) y[k] = -gradient0[k];
+                    lower(L, y);
+                    upper(L, y);
+                    for (int k = 0; k < 5; ++k) y[k] = active[k] ? y0[k] + y[k] : 0.0f;
+                    sticking = cone_norm(y) <= load;
+                }
+                const float unit[3] = {1.0f, 1.0f, 1.0f};
+                if (!sticking) {
+__CONSTRAINED__
+                    project(y, unit, load);
+                }
+                float x[5];
+                for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
+                if (omega != 1.0f) {
+                    for (int k = 0; k < 5; ++k) y[k] = active[k] ? x[k] / mu[k] : 0.0f;
+                    project(y, unit, load);
+                    for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
+                }
+                for (int k = 1; k < 5; ++k) {
+                    float block_delta = x[k] - lam[k];
+                    if (block_delta != 0.0f) {
+                        *changed = 1;
+                        for (int d = lane; d < __DOFS__; d += 32)
+                            v[d] += Y[k * __DOFS__ + d] * block_delta;
+                    }
+                    lam[k] = x[k];
+                }
+                return x[0];
+        }
+    };
+"""
