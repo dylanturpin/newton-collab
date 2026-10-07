@@ -592,9 +592,14 @@ class Example:
             low, high = cloth.min(axis=0), cloth.max(axis=0)
             cells = np.unique(np.floor(cloth[:, :2] / FOOTPRINT_CELL).astype(np.int64), axis=0)
             lower = min(blocks[world], key=lambda pose: pose[2])
+            # Measure in the block frame: a block resting on a crease tilts.
+            qv, qw = -lower[3:6], lower[6]
+            offset = cloth - lower[:3]
+            t = 2.0 * np.cross(qv, offset)
+            local = offset + qw * t + np.cross(qv, t)
             # The inner footprint excludes cloth folded up against the block's sides.
-            under = np.all(np.abs(cloth[:, :2] - lower[:2]) < 0.7 * BLOCK_HALF, axis=1)
-            clearance = float(lower[2] - BLOCK_HALF - (cloth[under, 2].max() + CLOTH_RADIUS)) if under.any() else None
+            under = np.all(np.abs(local[:, :2]) < 0.7 * BLOCK_HALF, axis=1)
+            clearance = float(-BLOCK_HALF - (local[under, 2].max() + CLOTH_RADIUS)) if under.any() else None
             report.append(
                 {
                     "xy_area": float((high[0] - low[0]) * (high[1] - low[1])),
