@@ -9,16 +9,20 @@ spin row resists relative rotation about the normal and the rolling pair about t
 contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
 five friction rows of a contact as one block: it minimizes the block's quadratic over a
 joint cone in coefficient-normalized impulses ``(f_t / mu, tau_s / mu_s, tau_r / mu_r)``.
-Rows with no coefficient or no response stay at zero, and the unconstrained minimizer is
-taken when it lies inside the cone.
+Rows with no coefficient or no response stay at zero. The block is eigendecomposed, so
+rows that depend on each other share their impulse instead of breaking a factorization, and
+the unconstrained minimizer is taken when it lies inside the cone.
 
 - ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
-  The block is a trust-region subproblem, solved by safeguarded Newton on its multiplier
-  until the boundary residual is below a relative tolerance.
+  The block is a trust-region subproblem: Newton on its multiplier targets a 1e-6 relative
+  boundary residual within 40 steps, and the result is rescaled into the ball, so it is
+  always feasible and optimal to that tolerance when the iteration converges.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
-  coordinates finds the face, then reweighted trust-region solves refine on it. The
+  coordinates finds the face, then reweighted trust-region solves refine on it. This is
+  approximate: a block left off the face is not revived, and badly coupled blocks can land
+  away from the optimum. The
   optimum may share the budget between blocks or stick inside the cone; in quadruped
   locomotion tests pivoting stance feet put most of it on rolling.
 
@@ -292,23 +296,12 @@ _PYRAMIDAL_PROJECT = """
             for (int k = 0; k < 5; ++k) y[k] = u[k] / s[k];
         }"""
 
-_ELLIPTIC_CONSTRAINED = """
-                    float c[5];
-                    for (int k = 0; k < 5; ++k) {
-                        c[k] = gradient0[k];
-                        for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
-                    }
-                    trust_region(H, c, active, load, y);"""
+_ELLIPTIC_CONSTRAINED = ""
 
 _PYRAMIDAL_CONSTRAINED = """
                     const int first[3] = {0, 2, 3};
                     const int count[3] = {2, 1, 2};
-                    float c[5], Hu[5][5];
-                    for (int k = 0; k < 5; ++k) {
-                        c[k] = gradient0[k];
-                        for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
-                        c[k] = active[k] ? c[k] : 0.0f;
-                    }
+                    float Hu[5][5];
                     descend(H, c, active, load, y0, y);
                     // On the face found above, sum_g |y_g| <= load is sum_g |y_g|^2 / t_g <= load^2 at t_g = |y_g| / sum |y|.
                     // Alternating the weighted trust-region solve with that t converges to the optimum.
@@ -340,6 +333,115 @@ _BLOCK_SOURCE = """
     struct AngularFrictionBlock {
         typedef float Row[5];
 __PROJECT__
+
+        // Jacobi eigendecomposition H = Q diag(lambda) Q' over the active rows. A direction whose eigenvalue is
+        // below 1e-6 of its own diagonal curvature gets lambda = 0, which marks dependent rows.
+        static __device__ void decompose(const Row* H, const bool* active, Row* Q, float* lambda) {
+            float A[5][5], curvature[5];
+            for (int k = 0; k < 5; ++k) {
+                curvature[k] = active[k] ? fmaxf(H[k][k], 0.0f) : 0.0f;
+                for (int l = 0; l < 5; ++l) {
+                    A[k][l] = active[k] && active[l] ? H[k][l] : 0.0f;
+                    Q[k][l] = k == l ? 1.0f : 0.0f;
+                }
+            }
+            for (int sweep = 0; sweep < 12; ++sweep) {
+                bool rotated = false;
+                for (int p = 0; p < 4; ++p) {
+                    for (int q = p + 1; q < 5; ++q) {
+                        float apq = A[p][q];
+                        if (!(fabsf(apq) > 1.0e-7f * sqrtf(fabsf(A[p][p] * A[q][q])))) continue;
+                        rotated = true;
+                        float theta = (A[q][q] - A[p][p]) / (2.0f * apq);
+                        float t = fabsf(theta) > 1.0e18f
+                            ? 0.5f / theta
+                            : copysignf(1.0f, theta) / (fabsf(theta) + sqrtf(1.0f + theta * theta));
+                        float cs = 1.0f / sqrtf(1.0f + t * t), sn = t * cs;
+                        A[p][p] -= t * apq;
+                        A[q][q] += t * apq;
+                        A[p][q] = 0.0f;
+                        A[q][p] = 0.0f;
+                        for (int r = 0; r < 5; ++r) {
+                            if (r != p && r != q) {
+                                float arp = A[r][p], arq = A[r][q];
+                                A[r][p] = A[p][r] = cs * arp - sn * arq;
+                                A[r][q] = A[q][r] = sn * arp + cs * arq;
+                            }
+                            float qrp = Q[r][p], qrq = Q[r][q];
+                            Q[r][p] = cs * qrp - sn * qrq;
+                            Q[r][q] = sn * qrp + cs * qrq;
+                        }
+                    }
+                }
+                if (!rotated) break;
+            }
+            for (int i = 0; i < 5; ++i) {
+                float scale = 0.0f;
+                for (int k = 0; k < 5; ++k) scale += Q[k][i] * Q[k][i] * curvature[k];
+                lambda[i] = A[i][i] > 1.0e-6f * scale ? A[i][i] : 0.0f;
+            }
+        }
+
+        // The ball subproblem by eigendecomposition, which dependent rows cannot break; true when interior.
+        // Boundary: y = -(H + alpha I)^+ c with Newton on 1 / |y(alpha)| from a point below the root, stopping
+        // on a 1e-6 relative boundary residual or after 40 steps, then rescaled into the ball.
+        static __device__ bool eigen_ball(const Row* H, const float* c, const bool* active, float load, float* y) {
+            float Q[5][5], lambda[5], projected[5], c_norm = 0.0f;
+            decompose(H, active, Q, lambda);
+            for (int k = 0; k < 5; ++k) c_norm += active[k] ? c[k] * c[k] : 0.0f;
+            c_norm = sqrtf(c_norm);
+            // Along a zero-curvature direction, a gradient component under 1e-5 |c| is round-off of a consistent
+            // system; a larger one makes the quadratic unbounded there, so the minimizer is on the boundary.
+            bool bounded = true;
+            for (int i = 0; i < 5; ++i) {
+                projected[i] = 0.0f;
+                for (int k = 0; k < 5; ++k) projected[i] += active[k] ? Q[k][i] * c[k] : 0.0f;
+                if (lambda[i] == 0.0f) {
+                    if (fabsf(projected[i]) <= 1.0e-5f * c_norm) projected[i] = 0.0f;
+                    else bounded = false;
+                }
+            }
+            float alpha = 0.0f, norm = 0.0f;
+            if (bounded) {
+                for (int i = 0; i < 5; ++i)
+                    if (projected[i] != 0.0f) norm += (projected[i] / lambda[i]) * (projected[i] / lambda[i]);
+                norm = sqrtf(norm);
+            }
+            bool interior = bounded && norm <= load;
+            if (!interior && load > 0.0f) {
+                // |y(alpha)| >= |c_i| / (lambda_i + alpha), so this alpha is at most the root.
+                for (int i = 0; i < 5; ++i) alpha = fmaxf(alpha, fabsf(projected[i]) / load - lambda[i]);
+                for (int iteration = 0; iteration < 40; ++iteration) {
+                    float squared = 0.0f, cubed = 0.0f;
+                    for (int i = 0; i < 5; ++i) {
+                        if (projected[i] == 0.0f) continue;
+                        float denominator = lambda[i] + alpha, ratio = projected[i] / denominator;
+                        squared += ratio * ratio;
+                        cubed += ratio * ratio / denominator;
+                    }
+                    norm = sqrtf(squared);
+                    if (!(norm > (1.0f + 1.0e-6f) * load)) break;
+                    float next = alpha + squared * (norm - load) / (load * cubed);
+                    if (!(next > alpha)) break;
+                    alpha = next;
+                }
+            }
+            for (int k = 0; k < 5; ++k) y[k] = 0.0f;
+            if (!(load > 0.0f)) return false;
+            for (int i = 0; i < 5; ++i) {
+                if (projected[i] == 0.0f) continue;
+                float weight = projected[i] / (lambda[i] + alpha);
+                for (int k = 0; k < 5; ++k) y[k] -= weight * Q[k][i];
+            }
+            norm = 0.0f;
+            for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
+            norm = sqrtf(norm);
+            if (norm > load) {
+                float scale = load / norm;
+                for (int k = 0; k < 5; ++k) y[k] *= scale;
+            }
+            return interior;
+        }
 
         // A row takes part when it is active and has curvature; other rows keep zero impulse.
         static __device__ bool live(const Row* H, const bool* active, int k) {
@@ -378,9 +480,11 @@ __PROJECT__
             }
         }
 
-        // Minimize 0.5 y'Hy + c'y over |y| <= load on the live rows: y = -(H + alpha I)^-1 c, with alpha found by
-        // Newton on 1 / |y(alpha)| (More-Sorensen) inside a bracket, stopping on the boundary residual.
-        static __device__ void trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
+        // The ball subproblem by Cholesky: y = -(H + alpha I)^-1 c with alpha from Newton on 1 / |y(alpha)|
+        // (More-Sorensen) inside a bracket. True when it met the 1e-5 boundary residual or found an interior
+        // minimizer; false when factorizations failed, the bracket collapsed, or 40 steps ran out.
+        static __device__ bool cholesky_ball(
+            const Row* H, const float* c, const bool* active, float load, float* y, bool* interior) {
             float L[5][5], b[5], c_norm = 0.0f;
             for (int k = 0; k < 5; ++k) {
                 b[k] = live(H, active, k) ? c[k] : 0.0f;
@@ -388,9 +492,11 @@ __PROJECT__
                 y[k] = 0.0f;
             }
             c_norm = sqrtf(c_norm);
-            if (!(load > 0.0f && c_norm > 0.0f)) return;
+            *interior = !(c_norm > 0.0f);
+            if (!(load > 0.0f && c_norm > 0.0f)) return true;
             // |y(hi)| <= |c| / hi = load because H is positive semidefinite.
             float lo = 0.0f, hi = c_norm / load, alpha = 0.0f;
+            bool converged = false;
             for (int iteration = 0; iteration < 40; ++iteration) {
                 float next = -1.0f;
                 if (factor(H, active, alpha, L)) {
@@ -400,8 +506,14 @@ __PROJECT__
                     float norm = 0.0f;
                     for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
                     norm = sqrtf(norm);
-                    if (alpha == 0.0f && norm <= load) return;
-                    if (fabsf(norm - load) <= 1.0e-5f * load) break;
+                    if (alpha == 0.0f && norm <= load) {
+                        *interior = true;
+                        return true;
+                    }
+                    if (fabsf(norm - load) <= 1.0e-5f * load) {
+                        converged = true;
+                        break;
+                    }
                     if (norm < load) hi = alpha; else lo = alpha;
                     float w[5], w_norm = 0.0f;
                     for (int k = 0; k < 5; ++k) w[k] = y[k];
@@ -411,7 +523,6 @@ __PROJECT__
                 } else {
                     lo = alpha;
                 }
-                // A singular block whose minimizer is interior closes the bracket from below.
                 if (hi - lo <= 1.0e-4f * hi) break;
                 alpha = next > lo && next < hi ? next : (lo > 0.0f ? sqrtf(lo * hi) : 1.0e-3f * hi);
             }
@@ -422,13 +533,23 @@ __PROJECT__
                 float scale = load / norm;
                 for (int k = 0; k < 5; ++k) y[k] *= scale;
             }
+            return converged;
+        }
+
+        // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows; true when the minimizer is interior.
+        // Cholesky is accurate on graded blocks; dependent rows that defeat it fall back to the eigensolve.
+        static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
+            bool interior = false;
+            if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
+            return eigen_ball(H, c, active, load, y);
         }
 
         // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
         static __device__ __noinline__ float solve(
             float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
             int lane, unsigned MASK, float load, float omega, int* changed) {
-                // Read the shared impulses before the warp reduction; a lane past it may write them back.
+                // Order the sweep's earlier shared writes before these reads, and read once: lanes write back below.
+                __syncwarp(MASK);
                 float x0[5], mu[5], rhs[5];
                 for (int k = 0; k < 5; ++k) {
                     x0[k] = lam[k];
@@ -473,21 +594,20 @@ __PROJECT__
                     gradient0[k] += compliance * x0[k];
                 }
                 // Normalized coordinates y = x / mu, in which the cone has radius load.
-                float y0[5], y[5], L[5][5];
+                float y0[5], y[5], c[5];
                 for (int k = 0; k < 5; ++k) {
                     y0[k] = active[k] ? x0[k] / mu[k] : 0.0f;
                     gradient0[k] = active[k] ? gradient0[k] * mu[k] : 0.0f;
                     for (int l = 0; l < 5; ++l) H[k][l] *= mu[k] * mu[l];
                 }
-                // Sticking: the unconstrained minimizer is exact when it lies inside the cone.
-                bool sticking = false;
-                if (factor(H, active, 0.0f, L)) {
-                    for (int k = 0; k < 5; ++k) y[k] = -gradient0[k];
-                    lower(L, y);
-                    upper(L, y);
-                    for (int k = 0; k < 5; ++k) y[k] = active[k] ? y0[k] + y[k] : 0.0f;
-                    sticking = cone_norm(y) <= load;
+                // Gradient at y = 0, on the active rows.
+                for (int k = 0; k < 5; ++k) {
+                    c[k] = gradient0[k];
+                    for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
+                    c[k] = active[k] ? c[k] : 0.0f;
                 }
+                // The ball's minimizer is the elliptic answer; inside the cone it is also the pyramidal one.
+                bool sticking = trust_region(H, c, active, load, y) && cone_norm(y) <= load;
                 const float unit[3] = {1.0f, 1.0f, 1.0f};
                 if (!sticking) {
 __CONSTRAINED__
@@ -500,6 +620,8 @@ __CONSTRAINED__
                     project(y, unit, load);
                     for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
                 }
+                // Every lane has read the impulses before any writes them back.
+                __syncwarp(MASK);
                 for (int k = 1; k < 5; ++k) {
                     float block_delta = x[k] - x0[k];
                     if (block_delta != 0.0f) {

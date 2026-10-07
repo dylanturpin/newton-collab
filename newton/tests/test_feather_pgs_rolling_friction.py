@@ -479,6 +479,50 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                         rolling = 3 + int(np.abs(expected[3:]).argmax())
                         self.assertAlmostEqual(impulse[rolling] / expected[rolling], 1.0, delta=1.0e-3)
 
+    def test_dependent_sliding_rows_keep_spin_friction(self):
+        """Two tangent rows driven by one diagonal slide are dependent; the independent spin row still gets its bound."""
+        for cone in ("elliptic", "pyramidal"):
+            for iterations in (16, 128):
+                with self.subTest(cone=cone, iterations=iterations):
+                    b = newton.ModelBuilder()
+                    material = newton.ModelBuilder.ShapeConfig(mu=1.0, mu_torsional=1.0e-4, mu_rolling=0.0)
+                    b.add_ground_plane(cfg=material)
+                    pose = wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity())
+                    identity = wp.transform_identity()
+                    tiny = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-8)
+                    carriers = [b.add_link(xform=pose, mass=1.0e-4, inertia=tiny) for _ in range(2)]
+                    body = b.add_link(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3, dtype=np.float32)))
+                    diagonal = (2.0**-0.5, 2.0**-0.5, 0.0)
+                    joints = [
+                        b.add_joint_prismatic(-1, carriers[0], parent_xform=pose, child_xform=identity, axis=diagonal),
+                        b.add_joint_prismatic(
+                            carriers[0], carriers[1], parent_xform=identity, child_xform=identity, axis=(0.0, 0.0, 1.0)
+                        ),
+                        b.add_joint_revolute(
+                            carriers[1], body, parent_xform=identity, child_xform=identity, axis=(0.0, 0.0, 1.0)
+                        ),
+                    ]
+                    b.add_articulation(joints)
+                    sphere = newton.ModelBuilder.ShapeConfig(density=0.0, mu=1.0, mu_torsional=1.0e-4, mu_rolling=0.0)
+                    b.add_shape_sphere(body, radius=0.1, cfg=sphere)
+                    model = b.finalize(device="cuda:0")
+                    state = model.state()
+                    state.joint_qd.assign(np.array([0.0, 0.0, 1.0e-5], np.float32))
+                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                    options = dict(SOLVER_OPTIONS, pgs_iterations=iterations)
+                    solver = SolverFeatherPGS(
+                        model, enable_torsional_rolling_friction=True, torsional_rolling_friction_cone=cone, **options
+                    )
+                    scene = Scene(model, state, solver, dt=1.0 / 240.0)
+                    scene.step()
+                    load, impulse, mu, delassus, velocity = solved_block(scene)
+                    np.testing.assert_allclose(delassus[0, :2], delassus[1, :2], rtol=1.0e-5)
+                    # The spin row is decoupled: it stops the spin or saturates at its bound.
+                    expected = -min(abs(velocity[2]) / delassus[2, 2], mu[2] * load)
+                    self.assertAlmostEqual(impulse[2] / expected, 1.0, delta=1.0e-3)
+                    normalized = np.divide(impulse, mu, out=np.zeros_like(impulse), where=mu > 0.0)
+                    self.assertLessEqual(cone_norm(normalized, cone), load * (1.0 + 1.0e-5))
+
     def test_disabled_and_zero_coefficients_match_the_baseline_bitwise(self):
         baseline = ball(enable=False).run(60)
         self.assertAlmostEqual(baseline[-1, 0], 1.0, delta=1e-4)
