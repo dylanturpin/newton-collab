@@ -7216,23 +7216,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             return
         self._memset_stream = wp.Stream(self.model.device)
         self._j_active_counts = [wp.zeros_like(self.constraint_count), wp.zeros_like(self.constraint_count)]
-        # Track the last memset-done event per buffer slot so the main stream
-        # can wait only for the specific buffer it needs.
-        self._memset_done_event: list[wp.Event | None] = [None, None]
 
     def seed_double_buffer_events(self):
-        """Record initial memset_done events on the main stream.
-
-        Must be called inside CUDA graph capture, before the first ``step()`` call.
-        Since buffers are allocated with ``wp.zeros()``, they are already zeroed;
-        recording here provides trivially-satisfied wait targets for the first two
-        substeps.
-        """
-        if self._memset_stream is None:
-            return
-        main_stream = wp.get_stream(self.model.device)
-        self._memset_done_event[0] = main_stream.record_event()
-        self._memset_done_event[1] = main_stream.record_event()
+        """Accept the pre-capture call; ``step()`` joins its maintenance stream before returning."""
 
     def _contact_friction_start_iteration(self, iterations: int, *, velocity_pass: bool = False) -> int:
         """Return the first local PGS iteration that should solve friction rows.
@@ -9075,16 +9061,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._step += 1
             return state_out
 
-        # Double-buffer: select buffer set and wait for its memset to finish
+        # Double-buffer: select the buffer set; its clear was joined when the previous step returned.
         if self._memset_stream is not None:
             self.H_by_size = self._H_bufs[self._buf_idx]
             self.J_by_size = self._J_bufs[self._buf_idx]
             if self._jy_world_aliased:
                 # J_world aliases the active J buffer; track the ping-pong.
                 self.J_world = self.J_by_size[self.size_groups[0]]
-            evt = self._memset_done_event[self._buf_idx]
-            if evt is not None:
-                wp.get_stream(model.device).wait_event(evt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 1: FK/ID + drives + CRBA
@@ -9829,8 +9812,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # inactive row is already clean by induction because each previously
         # active prefix was cleared immediately after use. H keeps its existing
         # conditional full-buffer clear.
-        # ScopedStream(sync_enter=True) records an event on the main stream and
-        # makes the memset stream wait — this is what forks it into graph capture.
+        # ScopedStream forks the memset stream from the main stream and joins it back on exit, so
+        # step() returns with no outstanding fork (capture pauses, e.g. in conditional nodes, need that).
         # J must be zeroed every step (constraint rows are rebuilt per step),
         # but H is only zeroed on steps whose host-evaluated global mass-update
         # flag was 1 (see _stage1_crba): with update_mass_matrix_interval=N and
@@ -9845,7 +9828,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
                 wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
-                with wp.ScopedStream(self._memset_stream):
+                with wp.ScopedStream(self._memset_stream, sync_enter=True, sync_exit=True):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
@@ -9863,7 +9846,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             block_dim=256,
                             device=self.model.device,
                         )
-                self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
 
         # Opt-in row high-water telemetry (behavior-neutral). Launched here, at
@@ -24591,6 +24573,8 @@ def _get_pgs_solve_mf_gs_kernel(
                     float d_n_total = 0.0f;
                     float d_t2_total = 0.0f;
 
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
@@ -24757,6 +24741,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float scale = mag > radius ? radius / mag : 1.0f;
                     new_impulse = a * scale;
                     float sib_delta = b * scale - s_lam_dense[sib];
+                    __syncwarp();
                     s_lam_dense[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
                     {dense_sib_v_code}
@@ -24830,6 +24815,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
                     // Lane 0 runs the serial bisection; other lanes
                     // wait and then consume the broadcast results.
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         if (dof_a_par >= 0) {
@@ -25064,6 +25051,8 @@ def _get_pgs_solve_mf_gs_kernel(
                     float d_n_total = 0.0f;
                     float d_t2_total = 0.0f;
 
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         if (dof_a_par >= 0) {
@@ -25319,6 +25308,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float scale = mag > radius ? radius / mag : 1.0f;
                     new_impulse = a * scale;
                     float sib_delta = b * scale - s_lam_mf[sib];
+                    __syncwarp();
                     s_lam_mf[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
                     if (lane < 6 && dof_a >= 0)
@@ -25669,6 +25659,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 delta_impulse = new_impulse - old_impulse;
             }}
 
+            // Every lane has read this row's old impulse before any lane overwrites it.
+            __syncwarp();
             s_lam_dense[i] = new_impulse;
 
             // V update using prefetched Y
@@ -25789,6 +25781,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
 
             if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
+            __syncwarp();
             s_lam_mf[i] = new_impulse;
 
             // V update using prefetched MiJt values

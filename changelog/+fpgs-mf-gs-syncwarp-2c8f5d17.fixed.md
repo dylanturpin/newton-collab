@@ -1,0 +1,1 @@
+Fix `SolverFeatherPGS` matrix-free Gauss-Seidel kernel ordering of shared-memory impulse reads and writes across warp lanes: add `__syncwarp()` before each in-row impulse overwrite so every lane has read the previous value first.
