@@ -47,11 +47,10 @@ class TestContactComplianceSafety(unittest.TestCase):
         contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
         with self.assertRaisesRegex(RuntimeError, "overflowing contact"):
             fixture.solver.step(state, output, model.control(), contacts, 0.005)
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
-        contacts = self.contacts()
+        fixture.pipeline.collide(state, contacts)
         contacts.rigid_contacts_body_pair_reduced = True
-        with self.assertRaisesRegex(ValueError, "body-pair"):
-            start_step(solver, contacts, 0.005)
+        with self.assertRaisesRegex(ValueError, "contact_compliance=True is not validated for body-pair"):
+            fixture.solver.step(state, output, model.control(), contacts, 0.005)
 
     def test_nonfinite_inputs_rejected(self):
         """Reject invalid time steps instead of emitting infinite row coefficients."""

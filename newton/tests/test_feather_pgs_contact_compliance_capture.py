@@ -3,8 +3,10 @@
 
 """Check CUDA graph capture and replay of experimental contact compliance."""
 
+import gc
 import os
 import unittest
+import weakref
 
 import numpy as np
 import warp as wp
@@ -244,6 +246,155 @@ class TestContactComplianceCapture(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
                 with wp.ScopedCapture():
                     episode.fixture.solver.validate_contact_compliance()
+
+
+def _reducer(fixture):
+    """Body-pair reducer writing the fixture's Contacts buffer."""
+    return newton.CollisionPipeline(
+        fixture.model,
+        broad_phase="nxn",
+        deterministic=True,
+        rigid_contact_max=fixture.contacts.rigid_contact_max,
+        reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
+    )
+
+
+def _contact_rows(contacts):
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    return (
+        count,
+        contacts.rigid_contact_normal.numpy()[:count].copy(),
+        contacts.rigid_contact_point0.numpy()[:count].copy(),
+    )
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+class TestContactComplianceContactsLease(unittest.TestCase):
+    """A captured compliant step must keep body-pair reduction off its Contacts buffer."""
+
+    def assert_reducer_rejected(self, episode, reducer):
+        """Eager and captured reducer writes both fail before touching the buffer."""
+        contacts = episode.fixture.contacts
+        state = episode.states[0]
+        before = _contact_rows(contacts)
+        with self.assertRaisesRegex(RuntimeError, "unreduced-only solver configuration"):
+            reducer.collide(state, contacts)
+        capture = wp.ScopedCapture()
+        capture.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "unreduced-only solver configuration"):
+                reducer.collide(state, contacts)
+        finally:
+            capture.__exit__(None, None, None)
+        self.assertFalse(contacts.rigid_contacts_body_pair_reduced)
+        self.assertFalse(contacts.rigid_contacts_body_pair_reduced_capture)
+        after = _contact_rows(contacts)
+        self.assertEqual(before[0], after[0])
+        np.testing.assert_array_equal(before[1], after[1])
+        np.testing.assert_array_equal(before[2], after[2])
+
+    def test_captured_step_blocks_reducer_and_replays(self):
+        """Consumer first: reducer writes are refused while the replayed graph still matches eager."""
+        options = {"articulated": True, "enabled": True}
+        eager = _Episode(**options).run(12)
+        episode = _Episode(**options)
+        reducer = _reducer(episode.fixture)
+        attempted = []
+
+        def write_reduced(episode, pair):
+            if pair in (3, 7):
+                self.assert_reducer_rejected(episode, reducer)
+                attempted.append(pair)
+
+        replay = episode.run(12, graph=True, between=write_reduced)
+        self.assertEqual(attempted, [3, 7])
+        self.assertEqual(len(eager), len(replay))
+        for pair, (a, b) in enumerate(zip(eager, replay, strict=True)):
+            for name in a:
+                np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} at pair {pair}")
+        self.assertGreater(episode.fixture.solver.compliance_contact_count, 0)
+
+    def test_reader_lease_lives_with_graph(self):
+        """Lifetime: the lease outlives the capture object and ends with the last graph reference."""
+        episode = _Episode(articulated=False, enabled=True)
+        fixture = episode.fixture
+        reducer = _reducer(fixture)
+        with wp.ScopedDevice(fixture.device):
+            episode.two_steps()
+            with wp.ScopedCapture() as capture:
+                fixture.solver.seed_double_buffer_events()
+                episode.two_steps()
+            graph = capture.graph
+            graph_ref = weakref.ref(graph)
+            del capture
+            gc.collect()
+            wp.capture_launch(graph)
+            fixture.solver.validate_contact_compliance()
+            self.assert_reducer_rejected(episode, reducer)
+            del graph
+            gc.collect()
+            self.assertIsNone(graph_ref())
+            state, output = episode.states
+            reducer.collide(state, fixture.contacts)
+            self.assertTrue(fixture.contacts.rigid_contacts_body_pair_reduced)
+            _materials(fixture.contacts, 3000.0)
+            # Already-reduced eager input still rejects with the configuration named.
+            with self.assertRaisesRegex(ValueError, "contact_compliance=True is not validated for body-pair"):
+                fixture.solver.step(state, output, episode.control, fixture.contacts, episode.dt)
+
+    def test_live_reducer_graph_rejects_step(self):
+        """Producer first: a live reducer graph rejects compliant steps after an ordinary refill."""
+        episode = _Episode(articulated=True, enabled=True)
+        fixture = episode.fixture
+        contacts = fixture.contacts
+        reducer = _reducer(fixture)
+        state, output = episode.states
+        with wp.ScopedDevice(fixture.device):
+            episode.two_steps()
+            reducer.collide(state, contacts)
+            with wp.ScopedCapture() as reducer_capture:
+                reducer.collide(state, contacts)
+            wp.capture_launch(reducer_capture.graph)
+            fixture.pipeline.collide(state, contacts)
+            _materials(contacts, 3000.0)
+            self.assertFalse(contacts.rigid_contacts_body_pair_reduced)
+            self.assertTrue(contacts.rigid_contacts_body_pair_reduced_capture)
+            body_q = output.body_q.numpy().copy()
+            with self.assertRaisesRegex(ValueError, "contact_compliance=True is not validated for body-pair"):
+                fixture.solver.step(state, output, episode.control, contacts, episode.dt)
+            np.testing.assert_array_equal(output.body_q.numpy(), body_q)
+            solver_capture = wp.ScopedCapture()
+            solver_capture.__enter__()
+            try:
+                with self.assertRaisesRegex(ValueError, "contact_compliance=True is not validated for body-pair"):
+                    fixture.solver.step(state, output, episode.control, contacts, episode.dt)
+            finally:
+                solver_capture.__exit__(None, None, None)
+            del reducer_capture, solver_capture
+            gc.collect()
+            reducer.release_body_pair_reduction_capture()
+            self.assertFalse(contacts.rigid_contacts_body_pair_reduced_capture)
+            fixture.pipeline.collide(state, contacts)
+            _materials(contacts, 3000.0)
+            fixture.solver.step(state, output, episode.control, contacts, episode.dt)
+            fixture.solver.validate_contact_compliance()
+
+    def test_noncompliant_capture_keeps_reduction(self):
+        """Control: without compliance, a captured FeatherPGS step leaves reduction available."""
+        episode = _Episode(articulated=True, enabled=False)
+        fixture = episode.fixture
+        reducer = _reducer(fixture)
+        state, output = episode.states
+        with wp.ScopedDevice(fixture.device):
+            episode.two_steps()
+            with wp.ScopedCapture() as capture:
+                fixture.solver.seed_double_buffer_events()
+                episode.two_steps()
+            wp.capture_launch(capture.graph)
+            reducer.collide(state, fixture.contacts)
+            self.assertTrue(fixture.contacts.rigid_contacts_body_pair_reduced)
+            fixture.solver.step(state, output, episode.control, fixture.contacts, episode.dt)
+            self.assertTrue(np.isfinite(output.body_q.numpy()).all())
 
 
 if __name__ == "__main__":

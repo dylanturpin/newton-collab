@@ -1360,6 +1360,8 @@ class SolverFeatherPGS(SolverBase):
                 Rows are prepared on the device and the step is CUDA graph capturable; ``dt`` is
                 baked into a captured graph. Eager steps raise input errors synchronously; after
                 graph replay call :meth:`validate_contact_compliance` before consuming results.
+                Body-pair-reduced contacts are rejected, and a captured step keeps body-pair
+                reduction from writing its ``Contacts`` buffer while the graph is alive.
                 Compliant worlds use the general or paired-factor solve owners. This experimental
                 implementation may change without the normal deprecation period. Defaults to False.
                 Enabling this option with zero stiffness preserves the hard-contact law, not
@@ -8581,13 +8583,20 @@ class SolverFeatherPGS(SolverBase):
             or self.contact_compliance
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
+        if self.contact_compliance:
+            # Reject incompatible contact preprocessing before it can mutate the stream.
+            _contact_compliance.validate_step(self)
+            # The material law is validated on unreduced contacts only. A captured step also
+            # leases the buffer so no reducer graph can compact it behind replay.
+            self._require_unreduced_contacts(
+                contacts,
+                supports_body_pair_reduced_contacts=False,
+                configuration="contact_compliance=True",
+            )
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if getattr(self, "_device_torsion", None) is not None:
                 self._device_torsion.begin_step(state_in, state_out)
-        if self.contact_compliance:
-            # Reject incompatible contact preprocessing before it can mutate the stream.
-            _contact_compliance.validate_step(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "

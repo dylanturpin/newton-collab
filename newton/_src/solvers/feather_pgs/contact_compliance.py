@@ -132,8 +132,6 @@ def start_step(solver, contacts, dt):
         for key in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction")
     ):
         raise ValueError("contact_compliance requires native per-contact material arrays")
-    if getattr(contacts, "rigid_contacts_body_pair_reduced", False):
-        raise ValueError("contact_compliance does not support body-pair contact reduction")
 
 
 class ComplianceBuffers:
