@@ -121,8 +121,9 @@ class Example:
 
         mpm_config = SolverImplicitMPM.Config()
         mpm_config.voxel_size = voxel_size
-        mpm_config.grid_type = "fixed"
-        mpm_config.grid_padding = 50
+        # The rebuildable sparse grid follows the particles, so grains thrown up by the impacts stay inside it.
+        mpm_config.grid_type = "sparse"
+        mpm_config.grid_padding = 0
         mpm_config.max_active_cell_count = 1 << 15
         mpm_config.strain_basis = "P0"
         mpm_config.max_iterations = 50
@@ -210,6 +211,7 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
+        self.mpm_solver.check_sparse_grid_rebuild_status()
         newton.examples.test_body_state(
             self.model,
             self.state_0,
