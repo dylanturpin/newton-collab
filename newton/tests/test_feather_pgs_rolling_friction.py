@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.contact_angular_friction import angular_friction_gs_sources
 from newton.solvers import SolverFeatherPGS
 
 GRAVITY = 9.81
@@ -219,6 +220,62 @@ def certified_pyramidal_minimum(delassus, velocity, mu, load):
         if iteration % 200 == 0 and pyramidal_gap(delassus, velocity, mu, load, impulse) < 1.0e-10:
             return impulse
     raise AssertionError("The block-L1 reference did not certify")
+
+
+_BLOCK_KERNELS = {}
+
+
+def block_impulses(cone, jacobian, velocity, mu, load):
+    """Run the emitted friction block once in a single warp on rows ``jacobian`` (5 x 3) with unit inverse mass."""
+    if cone not in _BLOCK_KERNELS:
+        snippet = (
+            "#if defined(__CUDA_ARCH__)\n"
+            + angular_friction_gs_sources(cone, 0.0, 3)["helpers"]
+            + """
+    int lane = static_cast<int>(threadIdx.x) & 31;
+    __shared__ float v[3], lam[5], mu[5], rhs[5];
+    if (lane < 3) v[lane] = velocity.data[lane];
+    if (lane < 5) {
+        lam[lane] = 0.f;
+        rhs[lane] = 0.f;
+        mu[lane] = coefficients.data[lane];
+    }
+    __syncwarp();
+    int changed = 0;
+    float first = AngularFrictionBlock::solve(
+        v, lam, mu, rhs, jacobian.data, jacobian.data, lane, 0xffffffffu, load, 1.f, &changed);
+    __syncwarp();
+    if (lane == 0) lam[0] = first;
+    __syncwarp();
+    if (lane < 5) out.data[lane] = lam[lane];
+#endif
+"""
+        )
+
+        @wp.func_native(snippet)
+        def block(
+            jacobian: wp.array(dtype=float),
+            velocity: wp.array(dtype=float),
+            coefficients: wp.array(dtype=float),
+            load: float,
+            out: wp.array(dtype=float),
+        ): ...
+
+        @wp.kernel(enable_backward=False, module="unique")
+        def probe(
+            jacobian: wp.array(dtype=float),
+            velocity: wp.array(dtype=float),
+            coefficients: wp.array(dtype=float),
+            load: float,
+            out: wp.array(dtype=float),
+        ):
+            block(jacobian, velocity, coefficients, load, out)
+
+        _BLOCK_KERNELS[cone] = probe
+    out = wp.zeros(5, dtype=float, device="cuda:0")
+    arrays = [wp.array(np.asarray(a, np.float32).ravel(), device="cuda:0") for a in (jacobian, velocity, mu)]
+    wp.launch(_BLOCK_KERNELS[cone], dim=32, block_dim=32, inputs=[*arrays, float(load), out], device="cuda:0")
+    return out.numpy().astype(float)
 
 
 class Scene:
@@ -522,6 +579,55 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                     self.assertAlmostEqual(impulse[2] / expected, 1.0, delta=1.0e-3)
                     normalized = np.divide(impulse, mu, out=np.zeros_like(impulse), where=mu > 0.0)
                     self.assertLessEqual(cone_norm(normalized, cone), load * (1.0 + 1.0e-5))
+
+    def test_large_dependency_coefficients_stay_finite(self):
+        """Weak tangents made dependent by a strong row keep the independent rolling row exact, never NaN."""
+        mu = [0.5, 0.5, 0.01, 1.0e-4, 1.0e-4]
+        for cone in ("elliptic", "pyramidal"):
+            for scale in (1.0e-4, 1.0e-5, 2.0e-6, 1.0e-6, 1.0e-7):
+                with self.subTest(cone=cone, scale=scale):
+                    jacobian = [[scale, 0, 0], [0, scale, 0], [1, 1, 0], [0, 0, 1], [0, 0, 0]]
+                    impulse = block_impulses(cone, jacobian, [0.0, 0.0, 1.0e-5], mu, 1.0)
+                    self.assertTrue(np.isfinite(impulse).all())
+                    # The rolling row is independent and well inside its bound, so it stops the rotation.
+                    self.assertAlmostEqual(impulse[3] / -1.0e-5, 1.0, delta=1.0e-3)
+
+    def test_dependent_blocks_stay_finite_feasible_and_dissipative(self):
+        """Rank-deficient blocks with extreme row scales give finite impulses inside the cone that remove energy."""
+        rng = np.random.default_rng(3)
+        for cone in ("elliptic", "pyramidal"):
+            for trial in range(60):
+                with self.subTest(cone=cone, trial=trial):
+                    # Three generalized velocities make any five rows dependent.
+                    jacobian = rng.normal(size=(5, 3)) * 10.0 ** rng.uniform(-7.0, 0.0, size=(5, 1))
+                    if trial % 3 == 1:
+                        jacobian[1] = jacobian[0] * 10.0 ** rng.uniform(-3.0, 3.0)
+                    elif trial % 3 == 2:
+                        # Two weak tangents, just above the activity cutoff, that a strong spin row combines with large
+                        # coefficients, and an independent rolling row.
+                        weak = 10.0 ** rng.uniform(-5.8, -5.5)
+                        u, w = rng.normal(size=(2, 2))
+                        jacobian[:] = 0.0
+                        jacobian[0, :2], jacobian[1, :2] = weak * u, weak * w
+                        jacobian[2, :2] = u + w
+                        jacobian[3, 2] = rng.uniform(0.5, 2.0)
+                    velocity = rng.normal(size=3) * 10.0 ** rng.uniform(-6.0, 0.0)
+                    if trial % 3 == 2:
+                        velocity[:2] = 0.0
+                    mu = np.concatenate([[rng.uniform(0.2, 1.5)] * 2, 10.0 ** rng.uniform(-5.0, -1.0, size=3)])
+                    mu[4] = mu[3]
+                    if trial % 3 == 2:
+                        # Normalized dependency coefficients mu_spin / (mu_slide * weak) of 1e3 to 1e5.
+                        mu[:2] = rng.uniform(0.2, 0.6)
+                        mu[2], mu[3:] = 10.0 ** rng.uniform(-2.0, -1.5), 10.0 ** rng.uniform(-4.5, -3.5)
+                    load = 10.0 ** rng.uniform(-4.0, 0.0)
+                    impulse = block_impulses(cone, jacobian, velocity, mu, load)
+                    self.assertTrue(np.isfinite(impulse).all())
+                    self.assertLessEqual(cone_norm(impulse / mu, cone), load * (1.0 + 1.0e-5))
+                    delassus = jacobian @ jacobian.T
+                    rate = jacobian @ velocity
+                    objective = 0.5 * impulse @ delassus @ impulse + rate @ impulse
+                    self.assertLessEqual(objective, 1.0e-6 * abs(rate @ rate))
 
     def test_disabled_and_zero_coefficients_match_the_baseline_bitwise(self):
         baseline = ball(enable=False).run(60)

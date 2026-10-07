@@ -432,10 +432,10 @@ __PROJECT__
         // diagonal. Each is a combination of earlier independent rows, row_d = sum_i B_id row_i, and impulses
         // y = B' lambda are the least-norm ones for their effect, so |y| = |lambda|_N with N = B B' = R R'. With
         // mu = R' lambda the subproblem is again a Euclidean ball: K = R^-1 B H B' R^-T, g = R^-1 B c on the
-        // independent rows; y = T mu with T = B' R^-T.
-        static __device__ void whiten(
+        // independent rows; y = T mu with T = B' R^-T. False when the rewrite is not finite.
+        static __device__ bool whiten(
             const Row* H, const float* c, const bool* active, Row* T, Row* K, float* g, bool* independent) {
-            float B[5][5], N[5][5], R[5][5], L[5][5];
+            float B[5][5], R[5][5], L[5][5];
             #pragma unroll 1
             for (int k = 0; k < 5; ++k) {
                 independent[k] = live(H, active, k);
@@ -476,7 +476,7 @@ __PROJECT__
                 #pragma unroll 1
                 for (int m = 0; m < 5; ++m) L[k][m] = 0.0f;
             }
-            // Reduced problem over lambda: K = B H B', N = B B', g = B c, on the independent rows.
+            // Reduced problem over lambda: K = B H B', g = B c, on the independent rows.
             #pragma unroll 1
             for (int i = 0; i < 5; ++i) {
                 g[i] = 0.0f;
@@ -484,31 +484,42 @@ __PROJECT__
                 for (int k = 0; k < 5; ++k) g[i] += B[i][k] * (active[k] ? c[k] : 0.0f);
                 #pragma unroll 1
                 for (int j = 0; j < 5; ++j) {
-                    float h = 0.0f, n = 0.0f;
+                    float h = 0.0f;
                     #pragma unroll 1
-                    for (int k = 0; k < 5; ++k) {
-                        n += B[i][k] * B[j][k];
+                    for (int k = 0; k < 5; ++k)
                         #pragma unroll 1
                         for (int l = 0; l < 5; ++l) h += B[i][k] * H[k][l] * B[j][l];
-                    }
                     K[i][j] = h;
-                    N[i][j] = n;
                 }
             }
-            // N = R R' (N is at least the identity, so R is well conditioned).
+            // N = I + sum_d b_d b_d' over the dependent columns b_d of B, factored N = R R' by rank-one updates of the
+            // identity, each a Givens rotation; forming N would round its identity away when coefficients are large.
             #pragma unroll 1
             for (int k = 0; k < 5; ++k)
                 #pragma unroll 1
-                for (int l = 0; l <= k; ++l) {
-                    float value = independent[k] && independent[l] ? N[k][l] : (k == l ? 1.0f : 0.0f);
+                for (int l = 0; l < 5; ++l) R[k][l] = k == l ? 1.0f : 0.0f;
+            #pragma unroll 1
+            for (int d = 0; d < 5; ++d) {
+                if (independent[d] || !live(H, active, d)) continue;
+                float x[5];
+                #pragma unroll 1
+                for (int i = 0; i < 5; ++i) x[i] = independent[i] ? B[i][d] : 0.0f;
+                #pragma unroll 1
+                for (int k = 0; k < 5; ++k) {
+                    if (x[k] == 0.0f) continue;
+                    float r = hypotf(R[k][k], x[k]), cs = R[k][k] / r, sn = x[k] / r;
+                    R[k][k] = r;
                     #pragma unroll 1
-                    for (int m = 0; m < l; ++m) value -= R[k][m] * R[l][m];
-                    R[k][l] = k == l ? sqrtf(value) : value / R[l][l];
+                    for (int i = k + 1; i < 5; ++i) {
+                        float old = R[i][k];
+                        R[i][k] = cs * old + sn * x[i];
+                        x[i] = cs * x[i] - sn * old;
+                    }
                 }
+            }
             #pragma unroll 1
             for (int k = 0; k < 5; ++k)
-                #pragma unroll 1
-                for (int l = k + 1; l < 5; ++l) R[k][l] = 0.0f;
+                if (!isfinite(R[k][k])) return false;
             // K <- R^-1 K R^-T and g <- R^-1 g by forward substitution on columns, then rows.
             #pragma unroll 1
             for (int j = 0; j < 5; ++j) {
@@ -532,24 +543,29 @@ __PROJECT__
                 #pragma unroll 1
                 for (int i = 0; i < 5; ++i) T[k][i] = column[i];
             }
+            return true;
         }
 
         // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows into y; true when the minimizer is interior.
         // Dependent rows defeat the Cholesky pass; the problem is then whitened over the independent rows and
-        // solved again.
+        // solved again. The first pass's result stands when the second is not finite.
         static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
             bool interior = false;
             if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
-            float T[5][5], K[5][5], g[5], mu[5];
-            bool independent[5];
-            whiten(H, c, active, T, K, g, independent);
-            cholesky_ball(K, g, independent, load, mu, &interior);
+            float T[5][5], K[5][5], g[5], mu[5], reduced[5];
+            bool independent[5], reduced_interior = false;
+            if (!whiten(H, c, active, T, K, g, independent)) return interior;
+            cholesky_ball(K, g, independent, load, mu, &reduced_interior);
+            bool finite = true;
             #pragma unroll 1
             for (int k = 0; k < 5; ++k) {
-                y[k] = 0.0f;
-                for (int i = 0; i < 5; ++i) y[k] += T[k][i] * mu[i];
+                reduced[k] = 0.0f;
+                for (int i = 0; i < 5; ++i) reduced[k] += T[k][i] * mu[i];
+                finite = finite && isfinite(reduced[k]);
             }
-            return interior;
+            if (!finite) return interior;
+            for (int k = 0; k < 5; ++k) y[k] = reduced[k];
+            return reduced_interior;
         }
 
         // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
