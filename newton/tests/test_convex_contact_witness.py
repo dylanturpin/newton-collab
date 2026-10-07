@@ -206,7 +206,7 @@ class TestConvexContactWitness(unittest.TestCase):
 
 
 def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
-    """Preserve overlap and boundary witnesses when refinement cannot converge."""
+    """Report a supported normal and its exact depth when refinement cannot converge."""
     with np.load(Path(__file__).parent / "assets" / "convex_contact_4414.npz", allow_pickle=False) as fixture:
         vertices = [fixture[key + "_vertices"].copy() for key in ("torso", "elbow")]
         indices = [fixture[key + "_indices"].astype(np.int32) for key in ("torso", "elbow")]
@@ -220,8 +220,7 @@ def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
     hit = wp.zeros(1, dtype=int, device=device)
     points = wp.zeros(3, dtype=wp.vec3, device=device)
     penetration = wp.zeros(1, dtype=float, device=device)
-    world_b = np.asarray([wp.quat_rotate(rotation, wp.vec3(v)) + position for v in vertices[1]])
-    maximum_distance = float(np.max(np.linalg.norm(vertices[0][:, None] - world_b[None, :], axis=2)))
+    world_b = np.asarray([wp.quat_rotate(rotation, wp.vec3(v)) + position for v in vertices[1]], dtype=np.float64)
     for budget, extend in ((1, 0.0), (2, 0.0), (3, 0.0), (2, 0.0002)):
         with test.subTest(budget=budget, extend=extend):
             wp.launch(
@@ -234,15 +233,23 @@ def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
             test.assertEqual(int(hit.numpy()[0]), 1)
             witnesses = points.numpy().astype(np.float64)
             test.assertTrue(np.all(np.isfinite(witnesses)))
-            local_b = np.asarray(wp.quat_rotate_inv(rotation, wp.vec3(witnesses[1]) - position))
-            for side, point in enumerate((witnesses[0], local_b)):
-                test.assertLessEqual(abs(_surface_error(vertices[side], indices[side], point)), 1.0e-5)
-            test.assertAlmostEqual(float(np.linalg.norm(witnesses[2])), 1.0, delta=1.0e-6)
+            if distance_query is None:
+                local_b = np.asarray(wp.quat_rotate_inv(rotation, wp.vec3(witnesses[1]) - position))
+                for side, point in enumerate((witnesses[0], local_b)):
+                    test.assertLessEqual(abs(_surface_error(vertices[side], indices[side], point)), 1.0e-5)
+            normal = witnesses[2]
+            test.assertAlmostEqual(float(np.linalg.norm(normal)), 1.0, delta=1.0e-6)
+            # Witnesses lie on both supporting planes of the reported normal,
+            # so the depth is the exact overlap along it. Without distance
+            # witnesses, this is the support plane along the refinement ray.
+            test.assertAlmostEqual(
+                float(np.dot(witnesses[0], normal)), float(np.max(vertices[0] @ normal)), delta=1.0e-5
+            )
+            test.assertAlmostEqual(float(np.dot(witnesses[1], normal)), float(np.min(world_b @ normal)), delta=1.0e-5)
             depth = float(penetration.numpy()[0])
             test.assertTrue(np.isfinite(depth))
             test.assertGreaterEqual(depth, 0.05254986867157328 - 1.0e-5)
-            test.assertLessEqual(depth, maximum_distance + 1.0e-5)
-            test.assertAlmostEqual(float(np.dot(witnesses[0] - witnesses[1], witnesses[2])), depth, delta=1.0e-6)
+            test.assertAlmostEqual(float(np.dot(witnesses[0] - witnesses[1], normal)), depth, delta=1.0e-6)
             # The contact writer stores a midpoint, not independent witnesses.
             center = 0.5 * (witnesses[0] + witnesses[1])
             np.testing.assert_allclose(center + 0.5 * depth * witnesses[2], witnesses[0], atol=1.0e-6)
@@ -250,7 +257,7 @@ def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
 
 
 def test_convex_contact_failed_distance_query(test, device):
-    """Use genuine support points when the raycast encounters overlap."""
+    """Fall back to the refinement ray's support plane when the raycast encounters overlap."""
     test_convex_contact_iteration_limit(test, device, distance_query=_failed_distance_query)
 
 
@@ -334,6 +341,37 @@ add_function_test(
     TestConvexContactWitness,
     "test_convex_contact_resting_box",
     test_convex_contact_resting_box,
+    devices=get_test_devices(),
+)
+
+
+def test_convex_contact_shallow_cubes(test, device):
+    """Keep a shallow cube contact on its minimum face when the raycast refines it."""
+    # Pose captured from a collapsed cube pile. The portal misses the minimum
+    # certificate by its convergence tolerance, and a raycast candidate
+    # shifted along a tilted ray must not tilt the normal.
+    normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    depth = wp.zeros(1, dtype=float, device=device)
+    wp.launch(
+        _resting_box_kernel,
+        dim=1,
+        inputs=[
+            wp.vec3(0.4),
+            wp.vec3(0.4),
+            wp.quat(-0.0001483643427491188, -0.006294019520282745, 1.2986361980438232e-05, 0.9999802112579346),
+            wp.vec3(0.8049442768096924, -6.67572021484375e-06, 0.005084991455078125),
+        ],
+        outputs=[normal, depth],
+        device=device,
+    )
+    np.testing.assert_allclose(normal.numpy()[0], (1.0, 0.0, 0.0), atol=1.0e-3)
+    test.assertAlmostEqual(float(depth.numpy()[0]), 6.8724155e-05, delta=1.0e-5)
+
+
+add_function_test(
+    TestConvexContactWitness,
+    "test_convex_contact_shallow_cubes",
+    test_convex_contact_shallow_cubes,
     devices=get_test_devices(),
 )
 

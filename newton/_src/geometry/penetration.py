@@ -75,10 +75,43 @@ def _box_triangle_depth(half: wp.vec3, first: wp.vec3, second: wp.vec3, third: w
     return depth, direction
 
 
+@wp.func
+def _box_box_depth(half_a: wp.vec3, half_b: wp.vec3, rotation: wp.quat, position: wp.vec3) -> tuple[wp.vec3, float]:
+    """Return the minimum-depth normal and depth of two boxes in A's frame.
+
+    The face normals and edge cross products include every Minkowski facet
+    normal. Each axis's closed-form support-plane overlap bounds the minimum
+    from above, so degenerate cross products cannot undercut it. The normal
+    points from A toward B, matching the Minkowski support convention.
+    """
+    axes_b = wp.quat_to_matrix(rotation)
+    normal = wp.vec3(1.0, 0.0, 0.0)
+    depth = float(1.0e30)
+    for index in range(15):
+        axis = wp.vec3(0.0)
+        if index < 3:
+            axis = _axis(index)
+        elif index < 6:
+            axis = axes_b * _axis(index - 3)
+        else:
+            axis = wp.cross(_axis((index - 6) // 3), axes_b * _axis((index - 6) % 3))
+        length = wp.length(axis)
+        if length > 0.0:
+            axis /= length
+            radius = wp.dot(wp.abs(axis), half_a) + wp.dot(wp.abs(wp.transpose(axes_b) * axis), half_b)
+            offset = wp.dot(axis, position)
+            overlap = radius - wp.abs(offset)
+            if overlap < depth:
+                depth = overlap
+                normal = axis if offset >= 0.0 else -axis
+    return normal, depth
+
+
 def create_solve_box_penetration(support: Any):
     """Find minimum depth for a box against a box or convex mesh.
 
-    Cheap certificates come first: a box plus a triangle of genuine partner
+    Box pairs use the closed-form separating-axis test. For convex meshes,
+    cheap certificates come first: a box plus a triangle of genuine partner
     points is an inner Minkowski body, so its depth bounds the minimum from
     below, and a support plane bounds it from above. Only pairs neither
     certificate resolves stream the complete separating-axis basis: face
@@ -303,18 +336,10 @@ def create_solve_box_penetration(support: Any):
         a: Any, b: Any, rotation: wp.quat, position: wp.vec3, provider: Any, hint: wp.vec3
     ) -> tuple[wp.vec3, float]:
         """Return the minimum-depth normal and depth, certifying ``hint`` first if nonzero."""
+        if a.shape_type == int(GeoType.BOX) and b.shape_type == int(GeoType.BOX):
+            return _box_box_depth(a.scale, b.scale, rotation, position)
         normal = wp.vec3(1.0, 0.0, 0.0)
         depth = float(1.0e30)
-        if a.shape_type == int(GeoType.BOX) and b.shape_type == int(GeoType.BOX):
-            if rotation[0] == 0.0 and rotation[1] == 0.0 and rotation[2] == 0.0:
-                # Identical frames give an exact box Minkowski sum.
-                depths = a.scale + b.scale - wp.abs(position)
-                if depths[0] <= depths[1] and depths[0] <= depths[2]:
-                    return wp.vec3(1.0 if position[0] >= 0.0 else -1.0, 0.0, 0.0), depths[0]
-                elif depths[1] <= depths[2]:
-                    return wp.vec3(0.0, 1.0 if position[1] >= 0.0 else -1.0, 0.0), depths[1]
-                else:
-                    return wp.vec3(0.0, 0.0, 1.0 if position[2] >= 0.0 else -1.0), depths[2]
         box_a = a.shape_type == int(GeoType.BOX)
         half = a.scale if box_a else b.scale
         offset = position if box_a else wp.quat_rotate_inv(rotation, -position)
@@ -376,31 +401,6 @@ def create_solve_box_penetration(support: Any):
                 normal = hint
                 recent_vertex = best_vertex
                 best_vertex = hint_vertex
-        if a.shape_type == int(GeoType.BOX) and b.shape_type == int(GeoType.BOX):
-            for face in range(3):
-                normal, depth, best_vertex, recent_vertex = test_axis(
-                    a, b, rotation, position, provider, _axis(face), normal, depth, best_vertex, recent_vertex
-                )
-                axis = wp.quat_rotate(rotation, _axis(face))
-                normal, depth, best_vertex, recent_vertex = test_axis(
-                    a, b, rotation, position, provider, axis, normal, depth, best_vertex, recent_vertex
-                )
-            for edge_a in range(3):
-                for edge_b in range(3):
-                    axis_b = wp.quat_rotate(rotation, _axis(edge_b))
-                    normal, depth, best_vertex, recent_vertex = test_axis(
-                        a,
-                        b,
-                        rotation,
-                        position,
-                        provider,
-                        wp.cross(_axis(edge_a), axis_b),
-                        normal,
-                        depth,
-                        best_vertex,
-                        recent_vertex,
-                    )
-            return normal, depth
         return solve_box_mesh(a, b, rotation, position, provider, normal, depth, best_vertex, recent_vertex)
 
     return solve

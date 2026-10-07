@@ -471,20 +471,21 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         if wp.length_sq(direction) == 0.0:
             direction = wp.vec3(1.0, 0.0, 0.0)
 
-        # Genuine support points are a conservative fallback even if every
-        # distance query fails. Never return extrapolated portal witnesses.
+        # The support plane along the ray is the exact depth in that direction,
+        # so it is the fallback if every distance query fails. A support
+        # vertex's distance is not a depth: it can reach a far corner of the
+        # Minkowski difference. Never return extrapolated portal witnesses.
         support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, 0.0, data_provider)
         point_a = vert_a(support)
         point_b = support.B
         # Float32 resolution follows coordinate magnitude; scale absolute tolerances.
         tolerance = wp.max(1.0, wp.max(wp.length(point_a), wp.length(point_b)))
-        physical_depth = wp.length(support.BtoA)
         normal = direction
-        if physical_depth > 0.0:
-            normal = support.BtoA / physical_depth
-        penetration = physical_depth + extend
-        point_a += normal * (0.5 * extend)
-        point_b -= normal * (0.5 * extend)
+        penetration = wp.max(wp.dot(support.BtoA, direction), 0.0) + extend
+        # Writers reconstruct witnesses from midpoint and normal/depth.
+        center = 0.5 * (point_a + point_b)
+        point_a = center + normal * (0.5 * penetration)
+        point_b = center - normal * (0.5 * penetration)
 
         for _optimization in range(4):
             support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, extend, data_provider)
@@ -504,18 +505,22 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 if not separated or not wp.isfinite(gap) or gap < 0.0:
                     break
                 pb = pb - translation * direction
-                # Certify boundary membership independently of GJK's exit
-                # reason (it may stop at an iteration limit or duplicate).
-                certificate = mpr_support(
-                    geom_a, geom_b, separating_normal, orientation_b, position_b, extend, data_provider
-                )
-                support_gap = wp.dot(certificate.BtoA - (pa - pb), separating_normal)
-                # Remove inflation in the certified supporting direction,
-                # then align the contact normal with the physical witnesses.
-                # Writers reconstruct them from midpoint and normal/depth.
+                # Remove inflation in the separating direction, then align the
+                # contact normal with the physical witnesses. Writers
+                # reconstruct them from midpoint and normal/depth.
                 physical_delta = pa - pb - separating_normal * extend
                 physical_depth = wp.length(physical_delta)
                 depth = physical_depth + extend
+                candidate = direction
+                if physical_depth > 0.0:
+                    candidate = physical_delta / physical_depth
+                # Certify the reported normal, not the separating one: shifting
+                # B back along a ray off that normal tilts the witness
+                # difference, which shallow depths amplify. Witnesses inside
+                # both hulls support the normal only if they span its
+                # support-plane depth, whatever GJK's exit reason.
+                certificate = mpr_support(geom_a, geom_b, candidate, orientation_b, position_b, extend, data_provider)
+                support_gap = wp.dot(certificate.BtoA, candidate) - depth
                 if (
                     wp.isfinite(depth)
                     and depth >= 0.0
@@ -524,7 +529,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     and wp.abs(support_gap) <= 1e-6 * tolerance
                     and physical_depth > 0.0
                 ):
-                    normal = physical_delta / physical_depth
+                    normal = candidate
                     correction = (normal - separating_normal) * (0.5 * extend)
                     point_a = pa + correction
                     point_b = pb - correction
