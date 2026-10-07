@@ -144,8 +144,7 @@ class Example:
             rigid_name = "fpgs"
 
             def rigid_factory(v):
-                # Kamino pauses graph capture, which needs FeatherPGS's memset side stream joined.
-                return SolverFeatherPGS(v, pgs_mode="matrix_free", double_buffer=False)
+                return SolverFeatherPGS(v, pgs_mode="matrix_free")
 
         else:
             rigid_name = "mjc"

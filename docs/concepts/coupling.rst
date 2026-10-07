@@ -390,10 +390,7 @@ by the destination solver, not by FeatherPGS patch or torsional friction. Size
 before constructing the solver, because FeatherPGS allocates its contact scratch
 from the model. FeatherPGS does not integrate the cross-solver joints that ADMM
 joint proxies keep in its view, so route those proxies to the other entry with
-``joint_proximal_destination_entries``. Next to an entry that pauses graph
-capture, such as :class:`~newton.solvers.SolverKamino` or
-:class:`~newton.solvers.SolverImplicitMPM`, construct FeatherPGS with
-``double_buffer=False``.
+``joint_proximal_destination_entries``.
 
 Current Limitations
 -------------------
