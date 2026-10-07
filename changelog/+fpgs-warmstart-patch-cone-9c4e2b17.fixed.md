@@ -1,0 +1,1 @@
+Fix `SolverFeatherPGS` warm start seeding patch-friction anchors that have no patch history outside their friction cone: the contact-matched seed was bounded before the region's anchor count and pooled normal load were known, so it could start the solve up to the anchor count times too large.

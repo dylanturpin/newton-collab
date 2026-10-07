@@ -1613,6 +1613,9 @@ class SolverFeatherPGS(SolverBase):
                 contact matching. Body-pair reduction is supported with
                 ``contact_matching="latest"``. Carried friction is transported into
                 the current tangent frame and clamped to the current friction cone.
+                On slowly converging systems such as tall stacks, carried impulses lag
+                the solve and can sustain a rocking limit cycle; a ``pgs_warmstart_decay``
+                below 1 or a small ``pgs_contact_regularization`` damps it.
                 Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. This option is appended to
