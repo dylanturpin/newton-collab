@@ -1046,10 +1046,11 @@ def _resolve_shape_pairs_max(model: Model, override: int | None) -> int:
 
 
 BROAD_PHASE_MODES = ("nxn", "sap", "explicit")
-_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD = 27_776
-# Overlap refinement benefits from splitting medium full-support workloads;
-# retain fused execution where the extra launches dominate small scenes.
-_SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD = 32_768
+# The fused kernel inlines overlap refinement for every pair, while split
+# kernels refine on a concurrent stream. Splitting pays off once the extra
+# launches amortize: from about 4k lean or 8k full-support pairs.
+_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD = 4_096
+_SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD = 8_192
 
 
 def _compute_generic_convex_pair_stats(

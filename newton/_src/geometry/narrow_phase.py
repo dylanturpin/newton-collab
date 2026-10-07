@@ -2874,6 +2874,10 @@ class NarrowPhase:
             self.split_manifold_work_items = (
                 wp.zeros(candidate_pair_work_estimate, dtype=wp.int32, device=device) if self.split_gjk_mpr else None
             )
+            # Overlap refinement runs beside separated distance queries; the
+            # events fork it from and join it back to the caller's stream.
+            self.split_refine_stream = wp.Stream(device) if self.split_gjk_mpr else None
+            self.split_refine_events = (wp.Event(device), wp.Event(device)) if self.split_gjk_mpr else None
             self.shape_pairs_mesh = (
                 wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_mesh_like else None
             )
@@ -3203,24 +3207,39 @@ class NarrowPhase:
                     block_dim=self.split_convex_block_dim,
                     record_tape=False,
                 )
-                for distance_kernel in (self.narrow_phase_gjk_kernel, self.narrow_phase_refine_kernel):
-                    wp.launch(
-                        kernel=distance_kernel,
-                        dim=self.split_convex_total_num_threads,
-                        inputs=[
-                            convex_pairs,
-                            *common_inputs,
-                            self.split_convex_total_num_threads,
-                            self.split_query_results,
-                            self.split_gjk_work_items,
-                            self.split_gjk_work_count,
-                            self.split_manifold_work_items,
-                            self.split_manifold_work_count,
-                        ],
-                        device=device,
-                        block_dim=self.split_convex_block_dim,
-                        record_tape=False,
-                    )
+                distance_inputs = [
+                    convex_pairs,
+                    *common_inputs,
+                    self.split_convex_total_num_threads,
+                    self.split_query_results,
+                    self.split_gjk_work_items,
+                    self.split_gjk_work_count,
+                    self.split_manifold_work_items,
+                    self.split_manifold_work_count,
+                ]
+                # Refinements and separated queries use disjoint queue segments
+                # and results, so their latency tails overlap on two streams.
+                main_stream = wp.get_stream(device)
+                fork_event, join_event = self.split_refine_events
+                self.split_refine_stream.wait_event(main_stream.record_event(fork_event))
+                wp.launch(
+                    kernel=self.narrow_phase_refine_kernel,
+                    dim=self.split_convex_total_num_threads,
+                    inputs=distance_inputs,
+                    device=device,
+                    stream=self.split_refine_stream,
+                    block_dim=self.split_convex_block_dim,
+                    record_tape=False,
+                )
+                wp.launch(
+                    kernel=self.narrow_phase_gjk_kernel,
+                    dim=self.split_convex_total_num_threads,
+                    inputs=distance_inputs,
+                    device=device,
+                    block_dim=self.split_convex_block_dim,
+                    record_tape=False,
+                )
+                main_stream.wait_event(self.split_refine_stream.record_event(join_event))
                 wp.launch(
                     kernel=self.narrow_phase_manifold_kernel,
                     dim=self.split_convex_total_num_threads,
