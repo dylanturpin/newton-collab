@@ -257,6 +257,18 @@ class Example:
                 if self.deterministic_solver
                 else wp.DeterministicMode.NOT_GUARANTEED,
             )
+        elif self.solver_type == "featherpgs":
+            # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
+            self.solver = newton.solvers.SolverFeatherPGS(
+                self.model,
+                pgs_mode="matrix_free",
+                contact_compliance=True,
+                friction_anchor_beta=0.0,
+                enable_restitution=False,
+                pgs_iterations=args.pgs_iterations,
+                dense_max_constraints=32,
+                mf_max_constraints=3 * 256 * self.num_per_world,
+            )
         else:
             raise ValueError(f"Unknown solver '{self.solver_type}'")
 
@@ -341,6 +353,8 @@ class Example:
 
     def capture(self):
         with wp.ScopedCapture() as capture:
+            if self.solver_type == "featherpgs":
+                self.solver.seed_double_buffer_events()
             self.simulate()
         self.graph = capture.graph
 
@@ -362,6 +376,8 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
+        if self.solver_type == "featherpgs":
+            self.solver.validate_contact_compliance()
 
         self.sim_time += self.frame_dt
 
@@ -496,9 +512,15 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["xpbd", "mujoco"],
+            choices=["xpbd", "mujoco", "featherpgs"],
             default="mujoco",
-            help="Solver to use: 'xpbd' or 'mujoco'.",
+            help="Solver to use: 'xpbd', 'mujoco' or the experimental compliant 'featherpgs'.",
+        )
+        parser.add_argument(
+            "--pgs-iterations",
+            type=int,
+            default=16,
+            help="FeatherPGS position iterations (only with --solver featherpgs).",
         )
         parser.add_argument(
             "--num-per-world",
