@@ -6,6 +6,7 @@ Run with Blender --background --python SCRIPT -- SOURCE REPLICAS CAMERA OUTPUT.
 """
 
 import argparse
+import collections
 import hashlib
 import json
 import math
@@ -35,6 +36,7 @@ def configure_cycles(scene):
     scene.cycles.use_adaptive_sampling = True
     scene.cycles.adaptive_threshold = 0.025
     scene.cycles.use_denoising = True
+    scene.cycles.denoising_use_gpu = True
     scene.cycles.max_bounces = 10
     preferences = bpy.context.preferences.addons["cycles"].preferences
     try:
@@ -62,12 +64,6 @@ def render(source, replicas, camera_path, output, single_scene=False):
     quats = np.fromfile(replicas / "rotations.bin", "<f4").reshape(-1, 4)
     replica_vertices = np.memmap(replicas / "vertices.bin", dtype="<f4", mode="r").reshape(-1, 16)
     replica_indices = np.memmap(replicas / "indices.bin", dtype="<u4", mode="r")
-    table_materials = {}
-    for record in arrangement["meshes"]:
-        if "/furnishing/bench_" in record["name"]:
-            vi = replica_indices[record["first_index"]]
-            mi = int(replica_vertices[vi, 14]) - 1
-            table_materials[(record["world"], record["name"])] = arrangement["materials"][mi]
     material_cache = {}
 
     def material(spec):
@@ -77,17 +73,18 @@ def render(source, replicas, camera_path, output, single_scene=False):
         mat = bpy.data.materials.new("surface-" + hashlib.sha256(key.encode()).hexdigest()[:12])
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get("Principled BSDF")
-        color = [*spec["color"], 1]
-        bsdf.inputs["Base Color"].default_value = [
-            c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in color[:3]
-        ] + [1]
+        color = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in spec["color"]] + [1]
+        bsdf.inputs["Base Color"].default_value = color
         bsdf.inputs["Roughness"].default_value = spec["roughness"]
         bsdf.inputs["Metallic"].default_value = spec["metallic"]
         bsdf.inputs["Transmission Weight"].default_value = spec.get("transmission", 0)
         bsdf.inputs["IOR"].default_value = spec.get("ior", 1.47)
         if spec.get("texture"):
             tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
-            tex.image = bpy.data.images.load(str(source / spec["texture"]), check_existing=True)
+            texture_path = replicas / spec["texture"]
+            if not texture_path.exists():
+                texture_path = source / spec["texture"]
+            tex.image = bpy.data.images.load(str(texture_path), check_existing=True)
             multiply = mat.node_tree.nodes.new("ShaderNodeMixRGB")
             multiply.blend_type = "MULTIPLY"
             multiply.inputs[0].default_value = 1
@@ -97,17 +94,47 @@ def render(source, replicas, camera_path, output, single_scene=False):
         material_cache[key] = mat
         return mat
 
+    # Match surviving records to full-resolution originals. Iterating the dressed
+    # arrangement also preserves explicit deletions and appended set dressing.
+    source_lookup = collections.defaultdict(list)
+    for record in original["meshes"]:
+        source_lookup[(record["world"], record["body"], record["name"])].append(record)
+    worlds = {w["id"]: (i, w) for i, w in enumerate(original["worlds"])}
+    counters = collections.Counter()
     geometry = {}
-    for world_index, world in enumerate(original["worlds"]):
-        if single_scene and world["id"] not in camera_spec["worlds"]:
+    object_count = 0
+    source_geometry = set()
+    decor_object_count = 0
+    for record in arrangement["meshes"]:
+        cell = record["world"]
+        tile = arrangement["worlds"][cell]
+        if single_scene and tile["id"] not in camera_spec["worlds"]:
             continue
-        shapes = []
-        for record in original["meshes"]:
-            if record["world"] != world_index:
-                continue
-            tri = indices[record["first_index"] : record["first_index"] + record["index_count"]]
-            used, faces = np.unique(tri, return_inverse=True)
-            attrs = vertices[used][faces]
+        source_wi, source_world = worlds[arrangement["replica_provenance"][cell]["source_world"]]
+        body = record["body"]
+        source_body = (
+            body - tile["body_start"] + source_world["body_start"]
+            if body < arrangement["recorded_body_count"]
+            else original["recorded_body_count"] + source_wi
+        )
+        key = (source_wi, source_body, record["name"])
+        replica_tri = replica_indices[record["first_index"] : record["first_index"] + record["index_count"]]
+        spec = arrangement["materials"][int(replica_vertices[replica_tri[0], 14]) - 1]
+        if "/retro_lighter" in record["name"]:
+            spec = lighter_material(spec)
+        if source_lookup.get(key):
+            candidates = source_lookup[key]
+            source_record = candidates[counters[(cell, key)] % len(candidates)]
+            counters[(cell, key)] += 1
+            geometry_key = ("source", source_record["first_index"])
+            source_geometry.add(geometry_key)
+            tri = indices[source_record["first_index"] : source_record["first_index"] + source_record["index_count"]]
+            vertex_data = vertices
+        else:
+            geometry_key = ("decor", record["first_index"])
+            tri, vertex_data = replica_tri, replica_vertices
+        if geometry_key not in geometry:
+            attrs = vertex_data[tri]
             triangle_points = attrs[:, :3].reshape(-1, 3, 3)
             valid = (
                 np.linalg.norm(
@@ -127,42 +154,22 @@ def render(source, replicas, camera_path, output, single_scene=False):
             mesh.normals_split_custom_set_from_vertices(attrs[:, 4:7].tolist())
             uv = mesh.uv_layers.new(name="UVMap")
             uv.data.foreach_set("uv", attrs[faces, 12:14].ravel())
-            mid = int(attrs[0, 14]) - 1
-            spec = original["materials"][mid]
-            if "/retro_lighter" in record["name"]:
-                spec = lighter_material(spec)
             mesh.materials.append(material(spec))
-            shapes.append((record, mesh))
-        geometry[world["id"]] = shapes
-        print(f"Loaded full geometry {world['id']}", flush=True)
-    source_mesh_count = sum(len(shapes) for shapes in geometry.values())
-    object_count = 0
-    for cell, tile in enumerate(arrangement["worlds"]):
-        if single_scene and tile["id"] not in camera_spec["worlds"]:
-            continue
-        provenance = arrangement["replica_provenance"][cell]
-        source_world = next(w for w in original["worlds"] if w["id"] == provenance["source_world"])
-        for record, mesh in geometry[source_world["id"]]:
-            source_body = record["body"]
-            body = (
-                tile["body_start"] + source_body - source_world["body_start"]
-                if source_body < original["recorded_body_count"]
-                else arrangement["recorded_body_count"] + cell
-            )
-            obj = bpy.data.objects.new(f"{tile['id']}/{record['name']}", mesh)
-            bpy.context.scene.collection.objects.link(obj)
-            obj.location = poses[body, :3]
-            obj.rotation_mode = "QUATERNION"
-            x, y, z, w = quats[body]
-            obj.rotation_quaternion = Quaternion((float(w), float(x), float(y), float(z)))
-            if (cell, record["name"]) in table_materials:
-                obj.material_slots[0].link = "OBJECT"
-                obj.material_slots[0].material = material(table_materials[(cell, record["name"])])
-            object_count += 1
-    if not single_scene:
-        assert len(bpy.data.meshes) == len(original["meshes"])
-    if not single_scene:
-        assert object_count > len(bpy.data.meshes) * 4
+            geometry[geometry_key] = mesh
+        mesh = geometry[geometry_key]
+        obj = bpy.data.objects.new(f"{tile['id']}/{record['name']}", mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        obj.location = poses[body, :3]
+        obj.rotation_mode = "QUATERNION"
+        x, y, z, w = quats[body]
+        obj.rotation_quaternion = Quaternion((float(w), float(x), float(y), float(z)))
+        obj.material_slots[0].link = "OBJECT"
+        obj.material_slots[0].material = material(spec)
+        object_count += 1
+        decor_object_count += record["name"].startswith("paper-decor/")
+        if object_count % 1000 == 0:
+            print(f"Imported {object_count} objects, {len(geometry)} shared meshes", flush=True)
+    source_mesh_count = len(source_geometry)
     bpy.ops.mesh.primitive_plane_add(size=180, location=(0, 0, 0.005))
     ground = bpy.context.object
     floor = bpy.data.materials.new("checkerboard")
@@ -243,6 +250,11 @@ def render(source, replicas, camera_path, output, single_scene=False):
                 "tiles": 1 if single_scene else 96,
                 "linked_objects": object_count,
                 "unique_source_meshes": source_mesh_count,
+                "unique_geometry_meshes": len(geometry),
+                "decoration_objects": decor_object_count,
+                "device": scene.cycles.device,
+                "gpu_denoising_requested": scene.cycles.denoising_use_gpu,
+                "arrangement_export": str(replicas),
                 "mesh_simplification": False,
                 "setup_seconds": setup_seconds,
                 "render_seconds": time.monotonic() - render_started,

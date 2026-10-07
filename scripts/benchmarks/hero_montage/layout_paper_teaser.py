@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 
-def layout(folder):
+def layout(folder, renderer="Blender Cycles"):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -40,7 +40,7 @@ def layout(folder):
                 "right_column": ["Contact-only lighter", "Bolts sweep", "Plate placement"],
                 "source": "Replicated accepted CUDA recordings with render-only layout and material variation",
                 "simultaneous_heterogeneous_batch": False,
-                "overview_renderer": "Blender Cycles, linked full-resolution source meshes",
+                "overview_renderer": renderer,
                 "overview_mesh_simplification": False,
                 "labels": False,
             },
@@ -53,4 +53,6 @@ def layout(folder):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
-    layout(parser.parse_args().folder)
+    parser.add_argument("--renderer", default="Blender Cycles")
+    args = parser.parse_args()
+    layout(args.folder, args.renderer)

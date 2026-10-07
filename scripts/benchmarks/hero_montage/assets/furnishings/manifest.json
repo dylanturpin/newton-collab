@@ -4516,6 +4516,80 @@
           1.2
         ]
       ]
+    },
+    "desk_task_lamp": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "lamp_studio",
+      "parameters": {
+        "support_system": "tripod",
+        "contour_form": "soft_square",
+        "repeat_count": 4,
+        "curvature": 0.6950573310320406,
+        "phase": -0.5176048995782041,
+        "openings": "ribs",
+        "back_segments": "all",
+        "seed": 71,
+        "index": 0,
+        "branch": "anglepoise",
+        "shade_form": "cone",
+        "base": "disc",
+        "height": 0.68,
+        "shade_radius": 0.14,
+        "finish": "black",
+        "shade": "ivory",
+        "ribs": 10,
+        "tiers": 3,
+        "shade_depth": 0.27746349785691465,
+        "shade_neck": 0.5426738962960829,
+        "shade_belly": 1.140990237782123,
+        "arc_reach": 0.12430365460286984,
+        "arc_bow": 0.33327252040115735,
+        "tripod_spread": 1.118190796548088
+      },
+      "regions": [
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 2377,
+          "triangles": 3278
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 3891,
+          "triangles": 7434
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 26476,
+          "triangles": 37020
+        }
+      ],
+      "bounds": [
+        [
+          -0.23,
+          -0.15973863328949725,
+          0.0
+        ],
+        [
+          0.2797386332894972,
+          0.15973863328949725,
+          0.6900000000000001
+        ]
+      ]
     }
   },
   "wood_textures": {

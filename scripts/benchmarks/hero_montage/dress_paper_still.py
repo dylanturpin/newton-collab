@@ -39,6 +39,7 @@ def dress(source, output):
     ni = 0
     dressing = []
     shutil.copy2(source / "vertices.bin", output / "vertices.bin")
+    output_vertices = np.memmap(output / "vertices.bin", dtype="<f4", mode="r+").reshape(-1, 16)
 
     @cache
     def asset(name):
@@ -222,6 +223,8 @@ def dress(source, output):
                     tint = [(0.24, 0.49, 0.43), (0.22, 0.40, 0.54)][wi % 2]
                 elif style == "mixing_bowl":
                     tint = PALETTE[wi % 2]
+                elif style == "desk_task_lamp":
+                    tint = PALETTE[wi % 3]
                 fitted_prop(wi, style, x, y, angle, color=tint)
 
         for wi, world in enumerate(meta["worlds"]):
@@ -237,61 +240,45 @@ def dress(source, output):
                         continue
                 original_meshes.append(mesh)
             tables = [m for m in original_meshes if "/furnishing/bench_" in m["name"]]
-            # Locomotion decks keep their own working surface.
-            replacement = None
-            plastic = bool(tables) and (any("bench_white/" in m["name"] for m in tables) or wi % 3 == 1)
-            if plastic:
-                replacement = "bench_white"
-                grays = [(0.61, 0.65, 0.66), (0.67, 0.70, 0.71), (0.64, 0.67, 0.67)]
-                top_color = (0.50, 0.59, 0.55) if wi % 5 == 0 else grays[wi % len(grays)]
-                for i, (v, n, f, uv, region) in enumerate(asset(replacement)):
-                    emit(
-                        wi,
-                        f"{replacement}/{i}",
-                        v,
-                        n,
-                        f,
-                        uv,
-                        material(top_color if region["material"] == "plastic" else region["color"], 0.53),
-                        (0, 0, -0.001),
-                    )
-            elif tables and wi % 4 == 0:
-                replacement = ["bench_maple_lab", "bench_oak_studio"][wi // 4 % 2]
-                prop(wi, replacement, (0, 0, -0.001))
+            # Keep the approved per-table mix of wood, cream, gray, blue-gray,
+            # and sage. Only the two close-up surfaces get explicit overrides.
             for mesh in original_meshes:
-                if replacement and mesh in tables:
-                    continue
                 chunk = indices[mesh["first_index"] : mesh["first_index"] + mesh["index_count"]]
                 if mesh in tables:
                     old_material = materials[int(vertices[chunk[0], 14]) - 1]
-                    if old_material.get("texture"):
-                        used, faces = np.unique(chunk, return_inverse=True)
-                        attrs = vertices[used]
-                        emit(
-                            wi,
-                            "neutral-wood-table",
-                            attrs[:, :3],
-                            attrs[:, 4:7],
-                            faces.reshape(-1, 3),
-                            attrs[:, 12:14],
-                            material((0.88, 0.90, 0.88), 0.55, texture="textures/decor-ash.png"),
+                    color = np.asarray(old_material["color"])
+                    surface = old_material.get("texture") or (color.sum() > 0.8 and old_material["metallic"] < 0.5)
+                    override = None
+                    if surface and wi in (6, 88):
+                        override = material((0.48, 0.55, 0.62) if wi == 6 else (0.47, 0.55, 0.51), 0.53)
+                    elif (
+                        old_material.get("texture")
+                        and color[0] > color[1] + 0.06
+                        and (color[0] > color[2] + 0.04 or color[2] > color[1] + 0.06)
+                    ):
+                        # Remove the random red cast without replacing the wood
+                        # scan or lifting its darker grain to pale ash.
+                        override = material(
+                            (float(color.mean()),) * 3,
+                            old_material["roughness"],
+                            old_material["metallic"],
+                            old_material["texture"],
                         )
-                        continue
+                    if override is not None:
+                        output_vertices[np.unique(chunk), 14] = override
+                        output_vertices[np.unique(chunk), 7] = materials[override - 1]["roughness"]
                 chunk.tofile(inf)
                 meshes.append({**mesh, "first_index": ni})
                 ni += len(chunk)
             if not tables:
                 dressing.append({"world": world["id"], "clusters": [], "surface": "locomotion deck"})
                 continue
-            if replacement:
-                table_vertices = np.concatenate([v for v, *_ in asset(replacement)])
-            else:
-                table_vertices = np.concatenate(
-                    [
-                        vertices[np.unique(indices[m["first_index"] : m["first_index"] + m["index_count"]]), :3]
-                        for m in tables
-                    ]
-                )
+            table_vertices = np.concatenate(
+                [
+                    vertices[np.unique(indices[m["first_index"] : m["first_index"] + m["index_count"]]), :3]
+                    for m in tables
+                ]
+            )
             top = table_vertices[table_vertices[:, 2] > table_vertices[:, 2].max() - 0.006, :2]
             hull = ConvexHull(top).equations
             occupied = []
@@ -321,7 +308,7 @@ def dress(source, output):
                 "stack": ["book_stack", "ring_stack", "clock_twin"],
                 "sort": ["clock_twin", "parts_box", "book_stack"],
                 "hand": ["desk_fan", "toy_gear_kit", "book_stack"],
-                "shadow": ["clock_mantel", "book_stack", "desk_shelf"],
+                "shadow": ["clock_mantel", "book_stack", "desk_task_lamp"],
             }
             candidates = [
                 (x, y)
@@ -360,12 +347,13 @@ def dress(source, output):
                 {
                     "world": world["id"],
                     "clusters": clusters,
-                    "table": replacement or "original",
+                    "table": "approved-reference",
                     "hand_guides": world["kind"] in ("hand", "shadow"),
                     "removed_accessory_regions": removed,
                 }
             )
-            print(world["id"], len(clusters), replacement or "original", flush=True)
+            print(world["id"], len(clusters), "approved-reference", flush=True)
+    output_vertices.flush()
     meta.update(
         materials=materials,
         meshes=meshes,

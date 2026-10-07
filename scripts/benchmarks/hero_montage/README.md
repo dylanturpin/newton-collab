@@ -282,7 +282,7 @@ the entire recorded motion against new decoration.
 | Demolition | Excavator and dump-truck toys, stacked timber |
 | Workshop and weighing | Ventilated carrying crates, lidded totes, cordless drills |
 | Assembly and play | Gear kits, shape puzzles, toy trains, ring stacks, brick crates |
-| Floating hand stations | Desk fans, mantel clocks, small bookshelves, bound journals |
+| Floating hand stations | Desk fans, mantel clocks, articulated desk lamps, bound journals |
 | Air hockey | Twin-bell clock and parts storage |
 
 Rejected details include the filled slot caddy, whose thin rods read poorly
@@ -292,3 +292,38 @@ appliances and clocks. Plastic worktops are mostly light asphalt gray,
 with sage on every fifth eligible tile. Recorded body poses and neighboring
 task separation remain unchanged. `decor-study/appliance-scene-96` and
 `appliance-metal` hold this revision; earlier studies are retained separately.
+
+The final color revision restores the approved per-table material mix from
+`paper-teaser/scene-96`: cream, neutral gray, some blue-gray and sage, plus
+light and darker wood. Only red-biased random wood tints are neutralized;
+the original wood textures and darker values remain. The two explicit
+close-up overrides are sage for the lighter and blue-gray for hardware;
+the plate scene keeps its wood surface. Miniature bookcases are replaced
+by proc-gen anglepoise desk lamps with colored shades. This version is
+stored as `decor-study/balanced-scene-96`; the overly uniform blue-gray
+study remains separately available for comparison.
+
+## Final decorated teaser exports
+
+`prepare_paper_closeups.py SOURCE DRESSED CAMERAS OUTPUT` extracts the
+accepted lighter (3.4 s), early hardware sweep (1.6 s), and plate placement
+(4.7 s) from the original recording. It keeps the chosen decorated table
+variants, restores full-resolution geometry, and translates the camera with
+the centered hand. The resulting single-frame exports are shared by native
+HQ Metal and Blender, so their recorded configurations match exactly.
+
+The Cycles importer follows the dressed mesh inventory. It links surviving
+original meshes, imports appended decor, respects deleted accessories, and
+uses each tile's material overrides. Texture lookup includes the decorated
+export, and texture multipliers use scene-linear colors. An import regression
+check on the plate close-up found zero of the 13 expected decoration regions
+before this change; afterward, all 13 and exactly the approved total mesh
+count were instantiated.
+
+Final outputs are kept separately in `paper-teaser/final-avbd-balanced` and
+`paper-teaser/final-cycles-balanced`, preserving the approved checkpoint. Native HQ
+uses 64 accumulated samples and eight diffuse samples with no upscaling.
+Cycles uses 128 adaptive samples, Metal acceleration, and denoising. The
+overview is 3600x2400, each inset 1600x1000, and the assembled figure
+4920x2448. Pass `--renderer` to `layout_paper_teaser.py` to record the actual
+renderer in the figure manifest. The saved Cycles files pack their textures.

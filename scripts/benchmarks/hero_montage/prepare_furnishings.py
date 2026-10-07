@@ -344,6 +344,13 @@ def main():
     family("kitchen_toaster", "toaster_studio", "retro", {"finish_color": "chalk"}, seed=71)
     family("clock_mantel", "clock_studio", "arched_mantel", {"frame": "oak", "radius": 0.11}, seed=71)
     family(
+        "desk_task_lamp",
+        "lamp_studio",
+        "anglepoise",
+        {"height": 0.68, "shade_radius": 0.14, "shade": "ivory", "finish": "black", "base": "disc"},
+        seed=71,
+    )
+    family(
         "desk_shelf",
         "shelf_studio",
         "bookcase",
