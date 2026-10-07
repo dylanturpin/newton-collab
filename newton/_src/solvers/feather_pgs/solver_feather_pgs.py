@@ -24267,6 +24267,8 @@ def _get_pgs_solve_mf_gs_kernel(
                     float d_n_total = 0.0f;
                     float d_t2_total = 0.0f;
 
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
@@ -24433,6 +24435,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float scale = mag > radius ? radius / mag : 1.0f;
                     new_impulse = a * scale;
                     float sib_delta = b * scale - s_lam_dense[sib];
+                    __syncwarp();
                     s_lam_dense[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
                     {dense_sib_v_code}
@@ -24506,6 +24509,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
                     // Lane 0 runs the serial bisection; other lanes
                     // wait and then consume the broadcast results.
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         if (dof_a_par >= 0) {
@@ -24740,6 +24745,8 @@ def _get_pgs_solve_mf_gs_kernel(
                     float d_n_total = 0.0f;
                     float d_t2_total = 0.0f;
 
+                    // Every lane has read the old impulses before lane 0 overwrites them.
+                    __syncwarp();
                     if (lane == 0) {
                         float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
                         if (dof_a_par >= 0) {
@@ -24995,6 +25002,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     float scale = mag > radius ? radius / mag : 1.0f;
                     new_impulse = a * scale;
                     float sib_delta = b * scale - s_lam_mf[sib];
+                    __syncwarp();
                     s_lam_mf[sib] = b * scale;
                     if (sib_delta != 0.0f) iteration_changed = 1;
                     if (lane < 6 && dof_a >= 0)
@@ -25345,6 +25353,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 delta_impulse = new_impulse - old_impulse;
             }}
 
+            // Every lane has read this row's old impulse before any lane overwrites it.
+            __syncwarp();
             s_lam_dense[i] = new_impulse;
 
             // V update using prefetched Y
@@ -25465,6 +25475,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
 
             if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
+            __syncwarp();
             s_lam_mf[i] = new_impulse;
 
             // V update using prefetched MiJt values
