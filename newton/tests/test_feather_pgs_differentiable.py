@@ -153,6 +153,7 @@ def test_rejects_unsupported_configs(test, device):
         {"update_mass_matrix_interval": 2},
         {"enable_joint_limits": True},
         {"enable_joint_velocity_limits": True},
+        {"enable_joint_friction": True},
         {"drive_mode": "physx_pgs"},
         {"pgs_velocity_iterations": 2},
         {"pgs_debug": True},

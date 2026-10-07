@@ -1309,9 +1309,9 @@ class SolverFeatherPGS(SolverBase):
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
                 particles, kinematic bodies, mimic or loop-closing joints or rigid-body velocity limits, and
                 the solver uses immediate response, augmented drives, ``update_mass_matrix_interval=1``, no
-                joint or velocity limits, no warm start, sleeping, torsion, compliance, friction patches,
-                velocity iterations, debug or ``parallel_tree``, and on CUDA ``pgs_kernel="loop"`` or
-                ``"tiled_row"``. Defaults to False.
+                joint or velocity limits, no joint friction, warm start, sleeping, torsion, compliance,
+                friction patches, velocity iterations, debug or ``parallel_tree``, and on CUDA
+                ``pgs_kernel="loop"`` or ``"tiled_row"``. Defaults to False.
 
                 .. experimental::
 
@@ -1815,6 +1815,7 @@ class SolverFeatherPGS(SolverBase):
                     "parallel_tree": parallel_tree,
                     "pgs_mode": pgs_mode,
                     "pgs_kernel": pgs_kernel,
+                    "enable_joint_friction": enable_joint_friction,
                 },
             )
         if contact_compliance:

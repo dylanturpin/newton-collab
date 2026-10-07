@@ -67,6 +67,7 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["update_mass_matrix_interval"] != 1, "update_mass_matrix_interval=1"),
         (options["enable_joint_limits"], "enable_joint_limits=False"),
         (options["enable_joint_velocity_limits"], "enable_joint_velocity_limits=False"),
+        (options["enable_joint_friction"], "enable_joint_friction=False"),
         (options["drive_mode"] != "augmented", 'drive_mode="augmented"'),
         (options["pgs_velocity_iterations"] != 0, "pgs_velocity_iterations=0"),
         (options["pgs_debug"], "pgs_debug=False"),
