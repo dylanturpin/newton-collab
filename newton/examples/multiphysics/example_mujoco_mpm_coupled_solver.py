@@ -65,12 +65,8 @@ def _rigid_solver_entry_args(
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
     if rigid_solver == "featherpgs":
-        # Side streams off: implicit MPM pauses graph capture, and the box pile can diverge with them on.
-        return (
-            "fpgs",
-            SolverFeatherPGS,
-            {"pgs_mode": "matrix_free", "double_buffer": False, "use_parallel_streams": False},
-        )
+        # Implicit MPM pauses graph capture, which needs FeatherPGS's memset side stream joined.
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free", "double_buffer": False}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 
