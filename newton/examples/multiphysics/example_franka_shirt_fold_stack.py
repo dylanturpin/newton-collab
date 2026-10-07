@@ -532,6 +532,8 @@ class Example:
                 outputs=[self.model.shape_material_mu],
                 device=self.device,
             )
+            # Coupled entries hold their own copies of shape materials.
+            self.solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
             self.finger_mu = finger_mu
         self.ik_target_positions.assign(interp[:, :3])
         self.ik_target_rotations.assign(rot)

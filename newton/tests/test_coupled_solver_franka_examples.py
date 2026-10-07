@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Frame stepping of the Franka coupled examples."""
+"""Frame stepping and runtime material updates of the Franka coupled examples."""
 
 import types
 import unittest
@@ -81,11 +81,43 @@ def test_cloth_block_graph_matches_eager(test, device):
         np.testing.assert_allclose(graph_particle_q, eager_particle_q, atol=1.0e-4, err_msg=f"substeps={substeps}")
 
 
+def test_shirt_finger_friction_reaches_coupled_entries(test, device):
+    """The shirt's pinch and release friction reaches every coupled entry's shape materials in place."""
+    module = example_franka_shirt_fold_stack
+    for rigid_solver in ("mujoco", "featherpgs"):
+        with wp.ScopedDevice(device):
+            example = _build_example(module, ["--viewer", "null", "--rigid-solver", rigid_solver])
+        solver = example.solver
+        fingers = example.finger_shape_ids.numpy()
+        mu_arrays = [example.model.shape_material_mu] + [
+            solver.view(name).shape_material_mu for name in solver.entry_names()
+        ]
+        pointers = [array.ptr for array in mu_arrays]
+
+        # The open-hand start, then mid-lift of the first sleeve pinch.
+        for sim_time, expected in ((0.0, module.FINGER_RELEASE_MU), (5.5, module.CLOTH_MU)):
+            example.sim_time = sim_time
+            example.update_ik_targets()
+            for name, array in zip(("parent", *solver.entry_names()), mu_arrays, strict=True):
+                np.testing.assert_allclose(
+                    array.numpy()[fingers], expected, err_msg=f"{rigid_solver}: {name} at t={sim_time}"
+                )
+        test.assertEqual([array.ptr for array in mu_arrays], pointers)
+        example.step()
+        test.assertTrue(np.all(np.isfinite(example.state_0.body_q.numpy())))
+
+
 devices = get_cuda_test_devices()
 add_function_test(
     TestCoupledFrankaExamples,
     "test_cloth_block_graph_matches_eager",
     test_cloth_block_graph_matches_eager,
+    devices=devices,
+)
+add_function_test(
+    TestCoupledFrankaExamples,
+    "test_shirt_finger_friction_reaches_coupled_entries",
+    test_shirt_finger_friction_reaches_coupled_entries,
     devices=devices,
 )
 
