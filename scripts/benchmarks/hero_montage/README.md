@@ -226,3 +226,10 @@ while hardware remains ahead of the pusher; the lighter uses teal enamel
 and warm yellow metallic trim. `render_cycles_teaser.py` renders each
 close-up directly from the recorded poses selected by
 `cycles-miniatures.json`, using the same Cycles configuration.
+
+`arrange_paper_still.py SOURCE REPLICAS` rearranges the existing recorded
+tiles while preserving template counts. Matching task types are separated
+in all eight neighboring grid directions, including across variants.
+Floating hand tasks are centered by their visible hand bounds; the hand
+and manipulated objects move together while the table stays fixed.
+Relative recorded body configurations and centered hand bounds are checked.
