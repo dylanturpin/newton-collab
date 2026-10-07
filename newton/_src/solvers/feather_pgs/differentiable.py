@@ -2124,17 +2124,19 @@ def _adj_friction_pair(
         wp.adjoint[d] += gamma[1, 1]
         wp.adjoint[c] += gamma[0, 1] + gamma[1, 0]
     elif mode == _PAIR_SLIDE or mode == _PAIR_RETAINED:
-        # [[M, x], [x^T, 0]] [p; q] = [adj_x; 0] with M = K + alpha I, solved through M's adjugate.
-        m00 = a_n + alpha / scale
-        m11 = d_n + alpha / scale
-        adjugate = wp.mat22(m11, -c_n, -c_n, m00)
-        det = m00 * m11 - c_n * c_n
+        # [[M, x], [x^T, 0]] [p; q] = [adj_x; 0] with M = K + alpha I, normalized by its own scale.
+        shift_scale = wp.max(scale, alpha)
+        m00 = (a + alpha) / shift_scale
+        m11 = (d + alpha) / shift_scale
+        m01 = c / shift_scale
+        adjugate = wp.mat22(m11, -m01, -m01, m00)
+        det = m00 * m11 - m01 * m01
         u = adjugate * adj_x
         v = adjugate * x
         x_v = wp.dot(x, v)
         if det > 0.0 and x_v > 0.0:
             q = wp.dot(x, u) / x_v
-            p = (u - q * v) / (det * scale)
+            p = (u - q * v) / (det * shift_scale)
             w = old - x
             wp.adjoint[a] += p[0] * w[0]
             wp.adjoint[d] += p[1] * w[1]

@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.differentiable import _dense_pgs_sweep
+from newton._src.solvers.feather_pgs.differentiable import _dense_pgs_sweep, _friction_pair
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1074,6 +1074,41 @@ def test_friction_pair_gradient_scale_invariance(test, device):
                 np.testing.assert_allclose(grad * scale, reference_grad, rtol=1.0e-4, atol=1.0e-6)
 
 
+@wp.kernel
+def _friction_pair_kernel(rows: wp.array2d[float], out: wp.array[wp.vec2]):
+    i = wp.tid()
+    out[i] = _friction_pair(
+        rows[i, 0],
+        rows[i, 1],
+        rows[i, 2],
+        wp.vec2(rows[i, 3], rows[i, 4]),
+        wp.vec2(rows[i, 5], rows[i, 6]),
+        rows[i, 7],
+        rows[i, 8],
+    )
+
+
+def test_friction_pair_shift_dominated_slide(test, device):
+    """Sliding on a vanishing tangent block, where the root's shift dwarfs the block: x = -R r / |r| exactly."""
+    residual = np.array([0.01, 0.005])
+    radius = 0.01
+    seed = np.array([1.0, 0.3])
+    unit = residual / np.linalg.norm(residual)
+    expected = -radius / np.linalg.norm(residual) * (np.eye(2) - np.outer(unit, unit)) @ seed
+    for block in (1.0e-20, 0.0):
+        with test.subTest(block=block):
+            rows = wp.array(
+                [[block, 0.0, block, *residual, 0.0, 0.0, radius, 1.0]], dtype=float, device=device, requires_grad=True
+            )
+            out = wp.zeros(1, dtype=wp.vec2, device=device, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(_friction_pair_kernel, dim=1, inputs=[rows], outputs=[out], device=device)
+            tape.backward(grads={out: wp.array([seed], dtype=wp.vec2, device=device)})
+            np.testing.assert_allclose(out.numpy()[0], -radius * unit, rtol=1.0e-5)
+            np.testing.assert_allclose(rows.grad.numpy()[0, 3:5], expected, rtol=1.0e-4)
+
+
 def test_rank_one_friction_pose_gradient(test, device):
     """A prismatic-hinge chain whose contact has a rank-one tangent block: the hinge-angle derivative matches FD."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -1115,7 +1150,13 @@ def test_rank_one_friction_pose_gradient(test, device):
         if not grad:
             return float(output.joint_qd.numpy()[1])
         # The y-tangent row has no Jacobian for these two DOFs, so the tangent block stays rank one.
-        test.assertEqual(float(output._fpgs_differentiable_buffers.contacts.diag.numpy()[0, 1]), 0.0)
+        rows = output._fpgs_differentiable_buffers.contacts
+        diag = rows.diag.numpy()[0]
+        test.assertEqual(float(diag[1]), 0.0)
+        test.assertGreater(float(diag[2]), 0.1)
+        # The pair sticks strictly inside the friction disk, away from the stick/slip switch.
+        impulses = rows.impulses[-1].numpy()[0]
+        test.assertLess(float(np.hypot(impulses[1], impulses[2])), 0.5 * 10.0 * float(impulses[0]))
         tape.backward(grads={output.joint_qd: wp.array([0.0, 1.0], dtype=float, device=device)})
         return float(state.joint_q.grad.numpy()[1])
 
@@ -1264,6 +1305,7 @@ for _device in get_test_devices():
         test_friction_pair_off_diagonal_gradient,
         test_friction_pair_gradient_scale_invariance,
         test_rank_one_friction_pose_gradient,
+        test_friction_pair_shift_dominated_slide,
         test_pgs_kernel_selection,
         test_free_body_rows_use_dense_capacity,
     ):
