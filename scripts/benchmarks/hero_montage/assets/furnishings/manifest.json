@@ -565,6 +565,7 @@
       ]
     },
     "drill": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
       "family": "tool_studio",
       "parameters": {
         "branch": "drill",
@@ -579,12 +580,13 @@
         {
           "material": "plastic",
           "color": [
-            0.42,
-            0.46,
-            0.43
+            0.02,
+            0.64,
+            0.49
           ],
-          "vertices": 1574,
-          "triangles": 2730
+          "vertices": 1513,
+          "triangles": 2620,
+          "roughness": 0.19731731242901188
         },
         {
           "material": "rubber",
@@ -595,6 +597,17 @@
           ],
           "vertices": 2184,
           "triangles": 3984
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.20392156862745098,
+            0.23137254901960785,
+            0.23529411764705882
+          ],
+          "vertices": 120,
+          "triangles": 236,
+          "roughness": 0.19731731242901188
         },
         {
           "material": "chrome",
@@ -2298,6 +2311,2209 @@
           0.06,
           0.0415,
           0.04688300286820655
+        ]
+      ]
+    },
+    "spare_bin": {
+      "source_commit": "8b86c951df57b766f7201edd5b605249f739e409",
+      "family": "food_container_studio",
+      "parameters": {
+        "branch": "open_tub",
+        "seed": 31,
+        "index": 6,
+        "complexity": "simple",
+        "length": 0.26,
+        "width": 0.18,
+        "height": 0.12,
+        "grip": "plain",
+        "section": "square",
+        "grip_material": "oak",
+        "material": "navy",
+        "divisions": 3,
+        "detail_count": 4,
+        "filled": false
+      },
+      "regions": [
+        {
+          "material": "navy",
+          "color": [
+            0.09,
+            0.16,
+            0.24
+          ],
+          "vertices": 692,
+          "triangles": 710
+        }
+      ],
+      "bounds": [
+        [
+          -0.13,
+          -0.09,
+          0.0
+        ],
+        [
+          0.13,
+          0.09,
+          0.12
+        ]
+      ]
+    },
+    "parts_box": {
+      "source_commit": "8b86c951df57b766f7201edd5b605249f739e409",
+      "family": "food_container_studio",
+      "parameters": {
+        "branch": "clip_lid_box",
+        "seed": 31,
+        "index": 1,
+        "complexity": "simple",
+        "length": 0.26,
+        "width": 0.18,
+        "height": 0.12,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "oak",
+        "material": "ivory",
+        "divisions": 3,
+        "detail_count": 3,
+        "filled": false
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 684,
+          "triangles": 780
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 727,
+          "triangles": 1042
+        }
+      ],
+      "bounds": [
+        [
+          -0.136,
+          -0.091,
+          0.0
+        ],
+        [
+          0.136,
+          0.091,
+          0.14150000000000001
+        ]
+      ]
+    },
+    "stack_box": {
+      "source_commit": "8b86c951df57b766f7201edd5b605249f739e409",
+      "family": "food_container_studio",
+      "parameters": {
+        "branch": "lift_lid_box",
+        "seed": 31,
+        "index": 0,
+        "complexity": "simple",
+        "length": 0.26,
+        "width": 0.18,
+        "height": 0.12,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "black",
+        "material": "navy",
+        "divisions": 2,
+        "detail_count": 4,
+        "filled": false
+      },
+      "regions": [
+        {
+          "material": "navy",
+          "color": [
+            0.09,
+            0.16,
+            0.24
+          ],
+          "vertices": 684,
+          "triangles": 780
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 119,
+          "triangles": 234
+        }
+      ],
+      "bounds": [
+        [
+          -0.131,
+          -0.091,
+          0.0
+        ],
+        [
+          0.131,
+          0.091,
+          0.14150000000000001
+        ]
+      ]
+    },
+    "bench_maple_lab": {
+      "source_commit": "8b86c951df57b766f7201edd5b605249f739e409",
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.0,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "hairpin",
+        "wood": "ash",
+        "storage": "shelf",
+        "slats": 5,
+        "support": "portal",
+        "support_material": "chrome",
+        "top_material": "wood",
+        "corner_radius": 0.08
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 1996,
+          "triangles": 2884
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.0,
+          -0.8225
+        ],
+        [
+          1.125,
+          1.0,
+          0.0
+        ]
+      ]
+    },
+    "bench_oak_studio": {
+      "source_commit": "8b86c951df57b766f7201edd5b605249f739e409",
+      "family": "table_studio",
+      "parameters": {
+        "support_system": "sled",
+        "contour_form": "oval",
+        "repeat_count": 2,
+        "curvature": 1.1273595552654814,
+        "phase": -0.4226600929009561,
+        "openings": "open",
+        "back_segments": "low",
+        "branch": "workbench",
+        "seed": 31,
+        "index": 6,
+        "opening": "bar_pull",
+        "width": 2.25,
+        "depth": 2.0,
+        "height": 0.8,
+        "top": "rounded_rectangle",
+        "base": "tapered",
+        "wood": "oak",
+        "storage": "shelf",
+        "slats": 5,
+        "support": "sled",
+        "support_material": "black",
+        "top_material": "wood",
+        "corner_radius": 0.08
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 1996,
+          "triangles": 2884
+        }
+      ],
+      "bounds": [
+        [
+          -1.125,
+          -1.0,
+          -0.8225
+        ],
+        [
+          1.125,
+          1.0,
+          0.0
+        ]
+      ]
+    },
+    "toy_excavator": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "excavator",
+        "seed": 71,
+        "index": 2,
+        "length": 0.12,
+        "kind": "excavator",
+        "variant": 1,
+        "finish_color": "ochre"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.20392156862745098,
+            0.23137254901960785,
+            0.23529411764705882
+          ],
+          "vertices": 2508,
+          "triangles": 2160,
+          "roughness": 0.18
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 576,
+          "triangles": 556
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.68,
+            0.16
+          ],
+          "vertices": 5891,
+          "triangles": 7252,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.123,
+          -0.229,
+          0.0
+        ],
+        [
+          0.123,
+          0.102,
+          0.171
+        ]
+      ]
+    },
+    "toy_dump_truck": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "dump_truck",
+        "seed": 71,
+        "index": 3,
+        "length": 0.12,
+        "kind": "dump_truck",
+        "variant": 1,
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.20392156862745098,
+            0.23137254901960785,
+            0.23529411764705882
+          ],
+          "vertices": 4676,
+          "triangles": 5020,
+          "roughness": 0.18
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 640,
+          "triangles": 624
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 1395,
+          "triangles": 2446,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.05550000000000001,
+          -0.102,
+          0.0
+        ],
+        [
+          0.05550000000000001,
+          0.102,
+          0.1285
+        ]
+      ]
+    },
+    "toy_gear_kit": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "gear_kit",
+        "seed": 71,
+        "index": 9,
+        "length": 0.12,
+        "kind": "gear_kit",
+        "variant": 1,
+        "finish_color": "slate_blue"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 1327,
+          "triangles": 2062,
+          "roughness": 0.18
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 192,
+          "triangles": 176
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.55,
+            0.13
+          ],
+          "vertices": 1700,
+          "triangles": 2364,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.68,
+            0.16
+          ],
+          "vertices": 2044,
+          "triangles": 2952,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 1444,
+          "triangles": 1992,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.12,
+          -0.075,
+          0.0
+        ],
+        [
+          0.12,
+          0.075,
+          0.063
+        ]
+      ]
+    },
+    "toy_train": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "train",
+        "seed": 71,
+        "index": 0,
+        "length": 0.12,
+        "kind": "train",
+        "variant": 1,
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.20392156862745098,
+            0.23137254901960785,
+            0.23529411764705882
+          ],
+          "vertices": 2560,
+          "triangles": 2172,
+          "roughness": 0.18
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 544,
+          "triangles": 528
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 2048,
+          "triangles": 3496,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.0285,
+          -0.075,
+          0.0
+        ],
+        [
+          0.0285,
+          0.075,
+          0.096
+        ]
+      ]
+    },
+    "toy_shovel": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "shovel",
+        "seed": 71,
+        "index": 5,
+        "length": 0.12,
+        "kind": "shovel",
+        "variant": 1,
+        "finish_color": "ochre"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.68,
+            0.16
+          ],
+          "vertices": 529,
+          "triangles": 558,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.038,
+          -0.06714774337103063,
+          0.0
+        ],
+        [
+          0.038,
+          0.246,
+          0.06399453550891342
+        ]
+      ]
+    },
+    "pliers": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "pliers",
+        "seed": 31,
+        "index": 5,
+        "kind": "pliers",
+        "variant": 2,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1546,
+          "triangles": 2704
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 320,
+          "triangles": 312
+        }
+      ],
+      "bounds": [
+        [
+          -0.037815893904608,
+          -0.13709395588182927,
+          0.0
+        ],
+        [
+          0.037815893904608,
+          0.038,
+          0.03
+        ]
+      ]
+    },
+    "socket_wrench": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "tool_studio",
+      "parameters": {
+        "branch": "socket_wrench",
+        "seed": 31,
+        "index": 8,
+        "kind": "socket_wrench",
+        "variant": 1,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1316,
+          "triangles": 1782
+        }
+      ],
+      "bounds": [
+        [
+          -0.04,
+          -0.008,
+          0.0
+        ],
+        [
+          0.04,
+          0.008,
+          0.042
+        ]
+      ]
+    },
+    "vase_fluted": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "vase_studio",
+      "parameters": {
+        "seed": 83,
+        "index": 1,
+        "branch": "fluted_urn",
+        "height": 0.32,
+        "radius": 0.09,
+        "material": "blue_glaze",
+        "ribs": 20,
+        "twist": 0.5198529014700617,
+        "translucent_style": "rippled",
+        "translucent_roughness": 0,
+        "form": {
+          "exponent": 2.0,
+          "aspect": 1.0,
+          "base": 0.64,
+          "belly": 1.0,
+          "shoulder": 0.72,
+          "mouth": 0.46,
+          "twist": 0.0,
+          "amplitude": 0.055,
+          "frequency": 16,
+          "axial_frequency": 0.0,
+          "flute_twist": 0.0,
+          "lean": 0.0,
+          "phase": 0.5928769667405444
+        },
+        "repeat_count": 5,
+        "spread": 0.9820430235207835,
+        "rhythm": 0.7142062625474167,
+        "phase": 0.0,
+        "member_radius": 0.008420596866355188,
+        "profile_lobes": 2,
+        "profile_waist": 0.3978513732461352,
+        "profile_flare": 0.30804425018095827,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "blue_glaze",
+          "color": [
+            0.12,
+            0.3,
+            0.45
+          ],
+          "vertices": 3280,
+          "triangles": 4700
+        }
+      ],
+      "bounds": [
+        [
+          -0.093884773344688,
+          -0.093884773344688,
+          0.0
+        ],
+        [
+          0.093884773344688,
+          0.093884773344688,
+          0.32
+        ]
+      ]
+    },
+    "vase_bud": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "vase_studio",
+      "parameters": {
+        "seed": 83,
+        "index": 0,
+        "branch": "rounded_bud",
+        "height": 0.23,
+        "radius": 0.09,
+        "material": "ceramic",
+        "ribs": 20,
+        "twist": 0.8079434780035071,
+        "translucent_style": "frosted",
+        "translucent_roughness": 1,
+        "form": {
+          "exponent": 2.0,
+          "aspect": 1.0,
+          "base": 0.6238900102867315,
+          "belly": 0.9114318225732476,
+          "shoulder": 1.0267842129500613,
+          "mouth": 0.6033048800823525,
+          "twist": 0,
+          "amplitude": 0,
+          "frequency": 3,
+          "axial_frequency": 0.3432721933974617,
+          "flute_twist": 0,
+          "lean": 0.04815153004219901,
+          "phase": 0.0788633418708242
+        },
+        "repeat_count": 5,
+        "spread": 0.82838902878571,
+        "rhythm": 2.9870837747224503,
+        "phase": 3.8178316272232298,
+        "member_radius": 0.004444113186231156,
+        "profile_lobes": 4,
+        "profile_waist": 0.380247939899473,
+        "profile_flare": 0.5456023193913097,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "ceramic",
+          "color": [
+            0.88,
+            0.86,
+            0.79
+          ],
+          "vertices": 2496,
+          "triangles": 4476
+        }
+      ],
+      "bounds": [
+        [
+          -0.08872103160163647,
+          -0.09229072370835971,
+          0.0
+        ],
+        [
+          0.09589401176979626,
+          0.09229072370835971,
+          0.23
+        ]
+      ]
+    },
+    "vase_amphora": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "vase_studio",
+      "parameters": {
+        "seed": 83,
+        "index": 3,
+        "branch": "handled_amphora",
+        "height": 0.3,
+        "radius": 0.09,
+        "material": "ceramic",
+        "ribs": 12,
+        "twist": 0.856191103604833,
+        "translucent_style": "rippled",
+        "translucent_roughness": 0,
+        "form": {
+          "exponent": 2.0,
+          "aspect": 1.0,
+          "base": 0.64,
+          "belly": 1.0,
+          "shoulder": 0.72,
+          "mouth": 0.46,
+          "twist": 0.0,
+          "amplitude": 0.0,
+          "frequency": 16,
+          "axial_frequency": 0.0,
+          "flute_twist": 0.0,
+          "lean": 0.0,
+          "phase": -2.0614135893666825
+        },
+        "repeat_count": 9,
+        "spread": 1.2266020354421343,
+        "rhythm": 1.291248304568282,
+        "phase": 0.0,
+        "member_radius": 0.00995840022581574,
+        "profile_lobes": 1,
+        "profile_waist": 0.23829281524533846,
+        "profile_flare": 0.41247383910209434,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "ceramic",
+          "color": [
+            0.88,
+            0.86,
+            0.79
+          ],
+          "vertices": 17560,
+          "triangles": 23664
+        }
+      ],
+      "bounds": [
+        [
+          -0.10970890817684943,
+          -0.08978917365395127,
+          0.0
+        ],
+        [
+          0.10970890817684943,
+          0.08978917365395127,
+          0.3
+        ]
+      ]
+    },
+    "crate_vented": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "transport_studio",
+      "parameters": {
+        "branch": "ventilated_crate",
+        "seed": 83,
+        "index": 1,
+        "crate_pattern": "vertical_slots",
+        "pattern_pitch": 0.04812996035526434,
+        "corner_radius": 0.03210120942023183,
+        "wall_taper": 0.8750589282977401,
+        "width": 0.45,
+        "depth": 0.35,
+        "container_height": 0.22,
+        "cart_width": 0.6579046840987439,
+        "cart_depth": 0.9369681314809533,
+        "height": 0.8722916204466789,
+        "wheel_radius": 0.05,
+        "caster_layout": "four_swivel",
+        "shelves": 2,
+        "worktop": "wood",
+        "finish_color": "petrol",
+        "base_mode": "free",
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 6066,
+          "triangles": 5910
+        }
+      ],
+      "bounds": [
+        [
+          -0.23,
+          -0.18,
+          0.0
+        ],
+        [
+          0.23,
+          0.18,
+          0.22
+        ]
+      ]
+    },
+    "tote_lidded": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "transport_studio",
+      "parameters": {
+        "branch": "lidded_tote",
+        "seed": 83,
+        "index": 2,
+        "crate_pattern": "vertical_slots",
+        "pattern_pitch": 0.05393375741798237,
+        "corner_radius": 0.029322237239351442,
+        "wall_taper": 0.9025346939465617,
+        "width": 0.45,
+        "depth": 0.35,
+        "container_height": 0.22,
+        "cart_width": 0.6416623426146651,
+        "cart_depth": 0.8790482073218849,
+        "height": 0.8674122509932363,
+        "wheel_radius": 0.0625,
+        "caster_layout": "four_swivel",
+        "shelves": 3,
+        "worktop": "wood",
+        "finish_color": "petrol",
+        "base_mode": "free",
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 5882,
+          "triangles": 8058
+        }
+      ],
+      "bounds": [
+        [
+          -0.247,
+          -0.19,
+          0.0
+        ],
+        [
+          0.247,
+          0.19,
+          0.238
+        ]
+      ]
+    },
+    "pantry_canister": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "food_container_studio",
+      "parameters": {
+        "branch": "plug_canister",
+        "seed": 71,
+        "index": 1,
+        "length": 0.18006741721821223,
+        "width": 0.12001388558244967,
+        "height": 0.18,
+        "form": "barrel",
+        "radius": 0.049,
+        "pitch": 0.005834392558685109,
+        "material": "ceramic",
+        "lid_material": "plastic",
+        "divisions": 4,
+        "complexity": "moderate",
+        "finish_color": "sage",
+        "plug_material": "ash",
+        "corner_ratio": 0.19155264366389405
+      },
+      "regions": [
+        {
+          "material": "ceramic",
+          "color": [
+            0.88,
+            0.86,
+            0.79
+          ],
+          "vertices": 380,
+          "triangles": 508
+        },
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 1792,
+          "triangles": 3324
+        }
+      ],
+      "bounds": [
+        [
+          -0.054880000000000005,
+          -0.054880000000000005,
+          0.0
+        ],
+        [
+          0.054880000000000005,
+          0.054880000000000005,
+          0.191
+        ]
+      ]
+    },
+    "kitchen_crock": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "utensil_holder_studio",
+      "parameters": {
+        "branch": "crock",
+        "seed": 71,
+        "index": 0,
+        "complexity": "simple",
+        "length": 0.25014445020222115,
+        "width": 0.18791128046376582,
+        "height": 0.1507566145591073,
+        "grip": "plain",
+        "section": "round",
+        "grip_material": "oak",
+        "material": "ivory",
+        "divisions": 3,
+        "detail_count": 4,
+        "filled": false,
+        "grip_bulge": 0.2832196134706043,
+        "form": {
+          "exponent": 2.3597694697528766,
+          "aspect": 1.0,
+          "base": 0.8956274564412522,
+          "belly": 0.9779907309860016,
+          "shoulder": 0.8202949218274076,
+          "mouth": 0.988987991351224,
+          "twist": 0.23194013805445332,
+          "amplitude": 0.022008729326082842,
+          "frequency": 5,
+          "axial_frequency": 1.1855837879355313,
+          "flute_twist": 0.331604253676695,
+          "lean": -0.0633533360802206,
+          "phase": -0.4862031199526306
+        },
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "ceramic",
+          "color": [
+            0.88,
+            0.86,
+            0.79
+          ],
+          "vertices": 5007,
+          "triangles": 7788
+        }
+      ],
+      "bounds": [
+        [
+          -0.09662284806634645,
+          -0.09426993803633946,
+          0.0
+        ],
+        [
+          0.09330230523271137,
+          0.09603829015699904,
+          0.1547566145591073
+        ]
+      ]
+    },
+    "kitchen_kettle": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "kettle_studio",
+      "parameters": {
+        "lip_reach": 0.34702529217740985,
+        "lip_width": 0.2867351845554737,
+        "seed": 71,
+        "index": 3,
+        "branch": "stovetop_gooseneck",
+        "radius": 0.10155928156812653,
+        "height": 0.1322771894411142,
+        "belly": 0.14039629738432938,
+        "neck": 0.6352436503292287,
+        "finish": "ivory"
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 2000,
+          "triangles": 2586
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 5980,
+          "triangles": 7952
+        }
+      ],
+      "bounds": [
+        [
+          -0.1736900688936852,
+          -0.09343467210989707,
+          0.0
+        ],
+        [
+          0.20376809859306416,
+          0.09343467210989707,
+          0.1593771894411142
+        ]
+      ]
+    },
+    "mixing_bowl": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "prep_tool_studio",
+      "parameters": {
+        "branch": "mixing_bowl",
+        "seed": 71,
+        "index": 15,
+        "complexity": "simple",
+        "length": 0.19629254306039381,
+        "width": 0.07373827457905868,
+        "height": 0.04230317344626417,
+        "grip": "plain",
+        "section": "square",
+        "grip_material": "black",
+        "material": "chrome",
+        "divisions": 3,
+        "detail_count": 3,
+        "filled": true,
+        "grip_bulge": 0.22702821373953722,
+        "radius": 0.145,
+        "depth_ratio": 0.7456907592161424,
+        "finish": "ivory",
+        "ears": 1,
+        "ribs": 32,
+        "grater_taper": 0.28544196790907356,
+        "panel_bow": 0.00435268204164461,
+        "handle_style": "plastic_scales",
+        "handle_bulge": 0.18149724728136654,
+        "working_count": 7,
+        "slicer_count": 5,
+        "grip_form": "ribbed",
+        "variant": 0,
+        "design_quality": "standard",
+        "finish_color": "oat"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.42,
+            0.46,
+            0.43
+          ],
+          "vertices": 5015,
+          "triangles": 4378
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 3726,
+          "triangles": 2694
+        }
+      ],
+      "bounds": [
+        [
+          -0.14775,
+          -0.14775,
+          0.0
+        ],
+        [
+          0.1848,
+          0.14775,
+          0.11700016008634065
+        ]
+      ]
+    },
+    "cutting_board": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "prep_tool_studio",
+      "parameters": {
+        "branch": "cutting_board",
+        "seed": 71,
+        "index": 10,
+        "complexity": "simple",
+        "length": 0.18528636832975134,
+        "width": 0.06574387908557475,
+        "height": 0.03818948904785483,
+        "grip": "plain",
+        "section": "square",
+        "grip_material": "ash",
+        "material": "navy",
+        "divisions": 3,
+        "detail_count": 3,
+        "filled": true,
+        "grip_bulge": 0.32539330968348323,
+        "radius": 0.10374525343428478,
+        "depth_ratio": 0.9007305762061235,
+        "finish": "chrome",
+        "ears": 1,
+        "ribs": 48,
+        "grater_taper": 0.2983601561521105,
+        "panel_bow": 0.003873385009626758,
+        "handle_style": "wood_scales",
+        "handle_bulge": 0.18199264773672613,
+        "working_count": 9,
+        "slicer_count": 5,
+        "grip_form": "palm",
+        "variant": 2,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 112,
+          "triangles": 108
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 480,
+          "triangles": 944
+        }
+      ],
+      "bounds": [
+        [
+          -0.12970045783082593,
+          -0.062456685131296014,
+          0.0
+        ],
+        [
+          0.12970045783082593,
+          0.062456685131296014,
+          0.016
+        ]
+      ]
+    },
+    "serving_carafe": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "bottle",
+      "parameters": {
+        "support_system": "tripod",
+        "contour_form": "bean",
+        "repeat_count": 4,
+        "curvature": 1.050137604903397,
+        "phase": 0.5798107391789084,
+        "openings": "shell",
+        "back_segments": "alternating",
+        "branch": "carafe",
+        "seed": 71,
+        "index": 0,
+        "radius": 0.06006852992845076,
+        "height": 0.2753943870276822,
+        "body": "bulbous",
+        "outline": "round",
+        "finish": "blue_glaze",
+        "handle": "angular",
+        "closure": "open",
+        "ribs": true,
+        "design_quality": "standard"
+      },
+      "regions": [
+        {
+          "material": "blue_glaze",
+          "color": [
+            0.12,
+            0.3,
+            0.45
+          ],
+          "vertices": 6854,
+          "triangles": 11010
+        }
+      ],
+      "bounds": [
+        [
+          -0.06846266733677449,
+          -0.06846266733677449,
+          0.0
+        ],
+        [
+          0.06846266733677449,
+          0.06846266733677449,
+          0.2753943870276822
+        ]
+      ]
+    },
+    "book_journal": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "book_studio",
+      "parameters": {
+        "cover_art": {
+          "layout": "classic",
+          "font": "serif",
+          "title": "OBJECTS",
+          "subtitle": "A STUDY IN EVERYDAY LIFE",
+          "author": "M. VALE",
+          "ink": "#F2E9D6",
+          "accent": "#AFAAD3"
+        },
+        "seed": 71,
+        "index": 2,
+        "branch": "cloth_journal",
+        "variant": 0,
+        "finish_color": "petrol",
+        "width": 0.2,
+        "height": 0.27,
+        "thickness": 0.037
+      },
+      "regions": [
+        {
+          "material": "cloth_linen",
+          "color": [
+            0.66,
+            0.55,
+            0.38
+          ],
+          "vertices": 240,
+          "triangles": 472
+        },
+        {
+          "material": "paper",
+          "color": [
+            0.88,
+            0.86,
+            0.8
+          ],
+          "vertices": 1148,
+          "triangles": 2032
+        },
+        {
+          "material": "paper_ink",
+          "color": [
+            0.5843137254901961,
+            0.5450980392156862,
+            0.4941176470588236
+          ],
+          "vertices": 2160,
+          "triangles": 4248,
+          "roughness": 0.1780785171926821
+        },
+        {
+          "material": "cloth_twill",
+          "color": [
+            0.09,
+            0.16,
+            0.24
+          ],
+          "vertices": 120,
+          "triangles": 236
+        }
+      ],
+      "bounds": [
+        [
+          0.0,
+          -0.14579999999999999,
+          0.0
+        ],
+        [
+          0.2,
+          0.135,
+          0.0427
+        ]
+      ]
+    },
+    "radio_table": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "audio_studio",
+      "parameters": {
+        "branch": "table_radio",
+        "seed": 71,
+        "index": 0,
+        "speaker_depth": 0.28218143298624027,
+        "wood": "ivory",
+        "grille": "exposed",
+        "ways": 3,
+        "stand": "column",
+        "display": "digital",
+        "tiers": 3,
+        "records": true
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 360,
+          "triangles": 708
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 2256,
+          "triangles": 3856
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1728,
+          "triangles": 2632
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 576,
+          "triangles": 552
+        },
+        {
+          "material": "fabric",
+          "color": [
+            0.3,
+            0.46,
+            0.44
+          ],
+          "vertices": 600,
+          "triangles": 1180
+        }
+      ],
+      "bounds": [
+        [
+          -0.35500000000000004,
+          -0.164,
+          0.0
+        ],
+        [
+          0.35500000000000004,
+          0.135,
+          0.228
+        ]
+      ]
+    },
+    "speaker_portable": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "audio_studio",
+      "parameters": {
+        "seed": 71,
+        "index": 8,
+        "branch": "portable_speaker",
+        "device_variant": 1,
+        "finish": "chrome",
+        "accent": "ivory",
+        "scale": 1.034775026996136,
+        "speaker_layout": 2
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.17558162099195662,
+            0.18974828038019456,
+            0.2028509139322185
+          ],
+          "vertices": 5045,
+          "triangles": 6318,
+          "roughness": 0.48
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 5810,
+          "triangles": 6702
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 26061,
+          "triangles": 20330
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 512,
+          "triangles": 480
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 517,
+          "triangles": 894
+        }
+      ],
+      "bounds": [
+        [
+          -0.16039012918440107,
+          -0.06881253929524306,
+          0.0
+        ],
+        [
+          0.16039012918440107,
+          0.06570821421425463,
+          0.23972391463788412
+        ]
+      ]
+    },
+    "desk_fan": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "climate_studio",
+      "parameters": {
+        "branch": "desk_fan",
+        "seed": 71,
+        "index": 0,
+        "radius": 0.16397138464458502,
+        "height": 0.49512785970897777,
+        "blades": 3,
+        "finish_color": "sage",
+        "metal": "chrome",
+        "slats": 9
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 1526,
+          "triangles": 2540
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 5690,
+          "triangles": 4932
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 96,
+          "triangles": 92
+        }
+      ],
+      "bounds": [
+        [
+          -0.19997138464458503,
+          -0.10617710771566802,
+          0.0
+        ],
+        [
+          0.19997138464458503,
+          0.156177107715668,
+          0.6779427692891701
+        ]
+      ]
+    },
+    "clock_twin": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "clock_studio",
+      "parameters": {
+        "branch": "twin_bell",
+        "seed": 71,
+        "index": 3,
+        "radius": 0.11,
+        "variant": 0,
+        "frame": "chrome",
+        "case_shape": "tapered",
+        "case_width": 2.721891863195552,
+        "case_height": 3.1640915419780247,
+        "case_depth": 0.08991593592622042,
+        "case_corner": 0.18179558598970588,
+        "arch_rise": 0.3601854517709779
+      },
+      "regions": [
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 3398,
+          "triangles": 3158
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 256,
+          "triangles": 252
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 576,
+          "triangles": 336
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 52,
+          "triangles": 32
+        },
+        {
+          "material": "brass",
+          "color": [
+            0.66,
+            0.45,
+            0.19
+          ],
+          "vertices": 26,
+          "triangles": 16
+        }
+      ],
+      "bounds": [
+        [
+          -0.12100000000000001,
+          -0.07,
+          0.0
+        ],
+        [
+          0.12100000000000001,
+          0.0407,
+          0.2655131021118488
+        ]
+      ]
+    },
+    "toy_puzzle": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "hard_toy_studio",
+      "parameters": {
+        "branch": "shape_puzzle",
+        "seed": 71,
+        "index": 4,
+        "length": 0.11092428206491256,
+        "kind": "shape_puzzle",
+        "variant": 1,
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 372,
+          "triangles": 404,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.55,
+            0.13
+          ],
+          "vertices": 114,
+          "triangles": 104,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 128,
+          "triangles": 112,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.96,
+            0.68,
+            0.16
+          ],
+          "vertices": 132,
+          "triangles": 116,
+          "roughness": 0.18
+        },
+        {
+          "material": "plastic",
+          "color": [
+            0.05,
+            0.4,
+            0.78
+          ],
+          "vertices": 144,
+          "triangles": 124,
+          "roughness": 0.18
+        }
+      ],
+      "bounds": [
+        [
+          -0.128,
+          -0.04,
+          0.0
+        ],
+        [
+          0.128,
+          0.04,
+          0.031
+        ]
+      ]
+    },
+    "ring_stack": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "board_game_studio",
+      "parameters": {
+        "seed": 71,
+        "index": 7,
+        "branch": "ring_stack",
+        "variant": 0,
+        "wood": "ash",
+        "finish_color": "petrol"
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 216,
+          "triangles": 328
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.96,
+            0.55,
+            0.13
+          ],
+          "vertices": 272,
+          "triangles": 260,
+          "roughness": 0.22172167479607374
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.5450980392156862,
+            0.6235294117647059,
+            0.6745098039215687
+          ],
+          "vertices": 272,
+          "triangles": 260,
+          "roughness": 0.22172167479607374
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.96,
+            0.68,
+            0.16
+          ],
+          "vertices": 272,
+          "triangles": 260,
+          "roughness": 0.22172167479607374
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.02,
+            0.64,
+            0.49
+          ],
+          "vertices": 272,
+          "triangles": 260,
+          "roughness": 0.22172167479607374
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.8705882352941177,
+            0.8588235294117647,
+            0.8235294117647058
+          ],
+          "vertices": 272,
+          "triangles": 260,
+          "roughness": 0.22172167479607374
+        }
+      ],
+      "bounds": [
+        [
+          -0.12,
+          -0.09,
+          0.0
+        ],
+        [
+          0.12,
+          0.09,
+          0.1022
+        ]
+      ]
+    },
+    "tool_caddy": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "utensil_holder_studio",
+      "parameters": {
+        "branch": "tool_slot_caddy",
+        "slot_count": 3,
+        "spacing": "progressive",
+        "item_width": 0.032,
+        "item_depth": 0.12,
+        "clearance": 0.01064046371167033,
+        "divider_height": 0.13,
+        "deck": "slats",
+        "divider": "comb",
+        "tray_access": "sliding",
+        "material": "navy",
+        "removable_dividers": false,
+        "seed": 71,
+        "index": 8,
+        "complexity": "simple",
+        "filled": true
+      },
+      "regions": [
+        {
+          "material": "navy",
+          "color": [
+            0.09,
+            0.16,
+            0.24
+          ],
+          "vertices": 1203,
+          "triangles": 1754
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1112,
+          "triangles": 1392
+        }
+      ],
+      "bounds": [
+        [
+          -0.11402139113501099,
+          -0.08,
+          0.0
+        ],
+        [
+          0.11402139113501099,
+          0.08,
+          0.195
+        ]
+      ]
+    },
+    "kitchen_microwave": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "microwave_studio",
+      "parameters": {
+        "branch": "countertop",
+        "seed": 71,
+        "index": 0,
+        "finish": "ivory",
+        "handle": "bow",
+        "shelves": 2,
+        "door_bins": 3,
+        "controls": "knobs",
+        "third_rack": true,
+        "rack_pattern": "plates",
+        "crispers": "full_width",
+        "deli_drawer": false,
+        "control_detail": "mixed",
+        "door_hand": "left",
+        "door_release": "button"
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 2070,
+          "triangles": 4014
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 1070,
+          "triangles": 1864
+        },
+        {
+          "material": "glass",
+          "color": [
+            0.57,
+            0.77,
+            0.8
+          ],
+          "vertices": 216,
+          "triangles": 328
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 1024,
+          "triangles": 1016
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 240,
+          "triangles": 472
+        }
+      ],
+      "bounds": [
+        [
+          -0.24,
+          -0.26,
+          0.0
+        ],
+        [
+          0.24,
+          0.20350000000000001,
+          0.29
+        ]
+      ]
+    },
+    "kitchen_toaster": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "toaster_studio",
+      "parameters": {
+        "branch": "retro",
+        "seed": 71,
+        "index": 1,
+        "slot_width": 0.029442842005344447,
+        "slot_length": 0.13778600981006997,
+        "height": 0.2191711665381838,
+        "finish_color": "chalk",
+        "grille": "crossbar",
+        "dial": "plain",
+        "material_choices": {
+          "metal.chrome": "steel_polished"
+        }
+      },
+      "regions": [
+        {
+          "material": "ivory",
+          "color": [
+            0.8705882352941177,
+            0.8588235294117647,
+            0.8235294117647058
+          ],
+          "vertices": 679,
+          "triangles": 1098,
+          "roughness": 0.15384092300532673
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 4480,
+          "triangles": 6012
+        },
+        {
+          "material": "ceramic",
+          "color": [
+            0.5468542818359313,
+            0.5168810746919994,
+            0.46135612950044164
+          ],
+          "vertices": 480,
+          "triangles": 944,
+          "roughness": 0.82
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 1828,
+          "triangles": 2360
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 1120,
+          "triangles": 1800
+        }
+      ],
+      "bounds": [
+        [
+          -0.08344284200534444,
+          -0.14239300490503498,
+          0.0
+        ],
+        [
+          0.08344284200534444,
+          0.11239300490503498,
+          0.2191711665381838
+        ]
+      ]
+    },
+    "clock_mantel": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "clock_studio",
+      "parameters": {
+        "branch": "arched_mantel",
+        "seed": 71,
+        "index": 5,
+        "radius": 0.11,
+        "variant": 1,
+        "frame": "oak",
+        "case_shape": "parabolic",
+        "case_width": 3.073541719337566,
+        "case_height": 3.0567842396096983,
+        "case_depth": 0.08716076644665137,
+        "case_corner": 0.15585737500222124,
+        "arch_rise": 0.30928724918535466
+      },
+      "regions": [
+        {
+          "material": "oak",
+          "color": [
+            0.53,
+            0.32,
+            0.16
+          ],
+          "vertices": 651,
+          "triangles": 852
+        },
+        {
+          "material": "ivory",
+          "color": [
+            0.82,
+            0.8,
+            0.71
+          ],
+          "vertices": 256,
+          "triangles": 252
+        },
+        {
+          "material": "brass",
+          "color": [
+            0.66,
+            0.45,
+            0.19
+          ],
+          "vertices": 554,
+          "triangles": 532
+        },
+        {
+          "material": "rubber",
+          "color": [
+            0.035,
+            0.04,
+            0.044
+          ],
+          "vertices": 2880,
+          "triangles": 1680
+        },
+        {
+          "material": "black",
+          "color": [
+            0.055,
+            0.065,
+            0.073
+          ],
+          "vertices": 52,
+          "triangles": 32
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 288,
+          "triangles": 192
+        }
+      ],
+      "bounds": [
+        [
+          -0.17564479456356613,
+          -0.058,
+          0.0
+        ],
+        [
+          0.17564479456356613,
+          0.07608038322332569,
+          0.3662462666590823
+        ]
+      ]
+    },
+    "desk_shelf": {
+      "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+      "family": "shelf_studio",
+      "parameters": {
+        "support_system": "portal",
+        "contour_form": "petal",
+        "repeat_count": 5,
+        "curvature": 1.0803554138880958,
+        "phase": -0.46027115889551606,
+        "openings": "ribs",
+        "back_segments": "all",
+        "branch": "bookcase",
+        "seed": 71,
+        "index": 0,
+        "opening": "bar_pull",
+        "width": 1.4,
+        "height": 1.2,
+        "depth": 0.43,
+        "rows": 3,
+        "columns": 2,
+        "back": "full",
+        "wood": "ash",
+        "lower_doors": false
+      },
+      "regions": [
+        {
+          "material": "ash",
+          "color": [
+            0.76,
+            0.62,
+            0.4
+          ],
+          "vertices": 420,
+          "triangles": 812
+        }
+      ],
+      "bounds": [
+        [
+          -0.711,
+          -0.215,
+          0.0
+        ],
+        [
+          0.711,
+          0.221,
+          1.2
         ]
       ]
     }

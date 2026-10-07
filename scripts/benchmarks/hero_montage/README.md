@@ -233,3 +233,62 @@ in all eight neighboring grid directions, including across variants.
 Floating hand tasks are centered by their visible hand bounds; the hand
 and manipulated objects move together while the table stays fixed.
 Relative recorded body configurations and centered hand bounds are checked.
+
+## Metal decor and lighting study
+
+Keep an approved copy of the paper folder before a composition study.
+`dress_paper_still.py SOURCE OUTPUT` adds fixed proc-gen storage boxes,
+spare parts, paper trays, plate/block stacks, wood table variants, and
+painted guides around hand stations. It checks table footprints and
+existing decoration bounds, and preserves the recorded pose files byte
+for byte. Assets retain their source commit in the furnishings manifest.
+
+`prepare_metal_paper_view.py ORIGINAL DRESSED CAMERA OUTPUT` restores the
+original detailed mesh surfaces and compacts visible tiles with a two-metre
+margin for edges and shadow casters. The 96-tile layout remains in the
+metadata; offscreen geometry is omitted only from this camera-specific
+preview export. Rebuild it after changing the camera.
+
+The native HQ replay tool accepts `--lighting soft-studio`, `warm-window`,
+`cool-lab`, or `warm-gallery`. For still comparisons, `--frame-count 1`
+renders a single accumulated frame. Use native resolution and the same
+quality settings for every lighting option.
+
+The approved pre-decor paper folder is kept as
+`paper-teaser-checkpoint-approved` beside the active output. New studies use
+`paper-teaser/decor-study`, so returning to the accepted composition requires
+no inverse edits. Keep sage and light gray plastic worktops dominant; use
+wood for accents. Wrecking-ball side clusters use proc-gen excavator and
+dump-truck toys, while assembly/hand stations get gear kits and precision
+tools, and kitchen stations get plate stacks. When moving this revision to
+Blender, import the dressed metadata, including its appended static meshes,
+rather than rebuilding only the original template geometry.
+
+The furnishings baker preserves per-part polymer finishes before unioning
+toy geometry. Their main colors follow the teaser's teal, blue, and yellow
+palette, while dark chassis and metallic joints retain separate materials.
+
+The next curation pass replaces the tiny generic office accessories with
+larger activity-specific groups. It checks the saved task geometry near the
+worktop as well as the table outline before placing each group. Tables keep
+their orientation; red wood tints become neutral ash, and sage/gray plastic
+remains dominant. Two or three groups fit each bench without crowding the
+main action. This is a still-composition clearance check, not validation of
+the entire recorded motion against new decoration.
+
+| Activity | Proc-gen categories and selected objects |
+| --- | --- |
+| Plates and kitchen | Countertop microwaves, retro toasters, gooseneck kettles, ceramic canisters, mixing bowls, crocks, cutting boards |
+| Demolition | Excavator and dump-truck toys, stacked timber |
+| Workshop and weighing | Ventilated carrying crates, lidded totes, cordless drills |
+| Assembly and play | Gear kits, shape puzzles, toy trains, ring stacks, brick crates |
+| Floating hand stations | Desk fans, mantel clocks, small bookshelves, bound journals |
+| Air hockey | Twin-bell clock and parts storage |
+
+Rejected details include the filled slot caddy, whose thin rods read poorly
+from the overview, heavily distorted vessels, and the three-part stereo
+station. The final selection removes decorative vases/audio and favors
+appliances and clocks. Plastic worktops are mostly light asphalt gray,
+with sage on every fifth eligible tile. Recorded body poses and neighboring
+task separation remain unchanged. `decor-study/appliance-scene-96` and
+`appliance-metal` hold this revision; earlier studies are retained separately.

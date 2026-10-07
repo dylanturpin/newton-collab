@@ -380,6 +380,37 @@ struct HeroHQReplay {
         renderer.options.sunIntensity = 0.35
         renderer.options.ambientExposure = 0.15
         renderer.options.displayExposure = 0
+        let lighting = option("--lighting", default: "soft-studio")
+        func panel(_ position: SIMD3<Float>, _ target: SIMD3<Float>, _ size: SIMD2<Float>,
+                   _ radiance: SIMD3<Float>) throws -> GPUSimAreaLight {
+            try GPUSimAreaLight(position: position, normal: normalize(target - position),
+                                up: SIMD3(0, 1, 0), size: size, radiance: radiance)
+        }
+        switch lighting {
+        case "soft-studio": break
+        case "warm-window":
+            renderer.options.sunIntensity = 0.85
+            renderer.options.sunAngularRadius = 0.035
+            renderer.options.sunDirection = normalize(SIMD3<Float>(-0.65, 0.30, -0.65))
+            renderer.options.ambientExposure = -0.65
+            renderer.options.displayExposure = -0.15
+            renderer.options.areaLights = [try panel(SIMD3(-10, -8, 15), .zero, SIMD2(18, 16), SIMD3(3.5, 2.6, 1.8))]
+        case "cool-lab":
+            renderer.options.sunIntensity = 0.12
+            renderer.options.ambientExposure = -0.7
+            renderer.options.areaLights = [
+                try panel(SIMD3(0, -4, 16), .zero, SIMD2(32, 20), SIMD3(2.1, 2.5, 3.2)),
+                try panel(SIMD3(13, 2, 10), .zero, SIMD2(12, 16), SIMD3(1.3, 1.6, 2.0))]
+        case "warm-gallery":
+            renderer.options.sunIntensity = 0.45
+            renderer.options.sunAngularRadius = 0.09
+            renderer.options.sunDirection = normalize(SIMD3<Float>(0.75, -0.4, -0.8))
+            renderer.options.ambientExposure = -0.5
+            renderer.options.areaLights = [
+                try panel(SIMD3(-7, -9, 14), .zero, SIMD2(22, 18), SIMD3(2.8, 2.5, 2.1)),
+                try panel(SIMD3(10, 6, 12), .zero, SIMD2(15, 16), SIMD3(1.0, 1.3, 1.8))]
+        default: preconditionFailure("Unknown lighting preset")
+        }
         let capture = FrameCapture(renderer: renderer, device: device, width: width, height: height)
         let startupSeconds = Date().timeIntervalSince(startup)
         let selectedCameras = cameras.filter { requested.isEmpty || $0.name == requested }
@@ -406,17 +437,18 @@ struct HeroHQReplay {
             let center = scene.renderContentBounds!.center
             let large = camera.worlds.isEmpty
             let spread: Float = large ? 2.2 : 1
-            renderer.options.areaLights = [
+            if lighting == "soft-studio" { renderer.options.areaLights = [
                 try GPUSimAreaLight(position: center + SIMD3(-3, -4, 6) * spread, normal: SIMD3(3, 4, -6), size: SIMD2(4, 3) * spread, radiance: SIMD3(5, 4.7, 4.3)),
                 try GPUSimAreaLight(position: center + SIMD3(3, 1, 4) * spread, normal: SIMD3(-3, -1, -4), size: SIMD2(3, 3) * spread, radiance: SIMD3(2.3, 2.6, 3.0))
             ]
+            }
             let videoWriter = directVideo ? try DirectVideoWriter(device: device,
                 url: folder.appendingPathComponent("video.mp4"), width: width, height: height) : nil
             let setupSeconds = Date().timeIntervalSince(setupStarted)
             let totalFrames = Int((camera.duration * 30).rounded())
             let endFrame = frameCount > 0 ? min(totalFrames, firstFrame + frameCount) : totalFrames
             precondition(firstFrame >= 0 && firstFrame < endFrame)
-            let frameTimes = video ? (firstFrame..<endFrame).map { Double($0) / 30 } : [0.15, 0.6, 0.95].map { $0 * camera.duration }
+            let frameTimes = video ? (firstFrame..<endFrame).map { Double($0) / 30 } : (frameCount == 1 ? [0.0] : [0.15, 0.6, 0.95].map { $0 * camera.duration })
             let started = Date()
             var finalPassGPUMS = 0.0, totalGPUMS = 0.0, outputSeconds = 0.0
             var drawCount = 0
@@ -450,7 +482,7 @@ struct HeroHQReplay {
             }
             try await videoWriter?.finish()
             var report: [String: Any] = [
-                "renderer": "avbd-metal GPUSimRenderer HQ", "device": device.name,
+                "renderer": "avbd-metal GPUSimRenderer HQ", "device": device.name, "lighting": lighting,
                 "shot": camera.name, "worlds": camera.worlds, "trace_sha256": description.traceSha256,
                 "simulation_steps_executed": 0, "source_start_s": camera.startTime,
                 "duration_s": camera.duration, "output_fps": 30, "playback_speed": 1,

@@ -27,7 +27,8 @@ def main():
     sys.path[:0] = [str(args.source.resolve()), str(args.source.resolve() / "src")]
     from assetgen import registry  # noqa: PLC0415 -- source checkout is selected above
     from assetgen.design import PALETTES, Program  # noqa: PLC0415
-    from assetgen.design.preview import compile_visual  # noqa: PLC0415
+    from assetgen.design.preview import VisualRegion, compile_visual  # noqa: PLC0415
+    from assetgen.geometry import mesh_of, union  # noqa: PLC0415
 
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -44,13 +45,14 @@ def main():
 
     material_source = args.source / "tools" / "procedural-materials"
     sys.path.insert(0, str(material_source.resolve()))
-    from material_fields import generate  # noqa: PLC0415 -- optional authoring dependency
-    from variation import sample_variant  # noqa: PLC0415
 
     manifest.setdefault("wood_textures", {})
     for wood, color in (("ash", [0.80, 0.70, 0.56]), ("oak", [0.68, 0.51, 0.32]), ("walnut", [0.48, 0.32, 0.20])):
         if selected:
             continue
+        from material_fields import generate  # noqa: PLC0415 -- optional authoring dependency
+        from variation import sample_variant  # noqa: PLC0415
+
         name = "wood_" + wood
         parameters = sample_variant(name, 19, index=0)
         parameters.update(scale=1.0, rotation=0.0, color=color, gamma=0.85)
@@ -62,7 +64,44 @@ def main():
     def save(name, program, align="floor"):
         if selected and name not in selected:
             return
-        regions = compile_visual(program)
+        finishes = {**program.features.get("color_finishes", {}), **program.features.get("polymer_finishes", {})}
+        if finishes:
+            # The preview compiler unions by substrate, which would erase the
+            # toy generator's per-part colors. Union each authored finish
+            # separately and keep the dark chassis and rubber distinct.
+            groups = {}
+            for part in program.parts:
+                authored = finishes.get(part.name)
+                finish = (
+                    {key: authored[key] for key in ("base_color", "color_name", "roughness") if key in authored}
+                    if authored
+                    else None
+                )
+                key = (part.material, json.dumps(finish, sort_keys=True))
+                groups.setdefault(key, []).extend(part.solids)
+            regions = []
+            palette = {
+                "ochre": (0.96, 0.68, 0.16),
+                "petrol": (0.02, 0.64, 0.49),
+                "slate_blue": (0.05, 0.40, 0.78),
+                "sage": (0.02, 0.64, 0.49),
+                "terracotta": (0.96, 0.55, 0.13),
+            }
+            for (substrate, encoded), solids in groups.items():
+                finish = json.loads(encoded)
+                color = None
+                if finish:
+                    linear = np.asarray(finish["base_color"][:3])
+                    srgb = np.where(linear <= 0.0031308, 12.92 * linear, 1.055 * linear ** (1 / 2.4) - 0.055)
+                    color = palette.get(finish.get("color_name"), tuple(srgb))
+                mesh = mesh_of(union(solids))
+                mesh.update_faces(mesh.area_faces > 1e-16)
+                mesh.remove_unreferenced_vertices()
+                if not len(mesh.faces) or not np.isfinite(mesh.vertices).all():
+                    raise ValueError(f"Invalid finish region in {name}: {substrate}")
+                regions.append(VisualRegion(substrate, mesh, finish, color))
+        else:
+            regions = compile_visual(program)
         low = np.min([r.mesh.bounds[0] for r in regions], axis=0)
         high = np.max([r.mesh.bounds[1] for r in regions], axis=0)
         origin = np.array([0, 0, high[2] if align == "top" else 0 if align == "none" else low[2]])
@@ -101,15 +140,23 @@ def main():
                     f"uv{i}": uv.astype("f4"),
                 }
             )
-            color = list((region.color or PALETTES[region.material][1])[:3])
-            records.append({"material": region.material, "color": color, "vertices": len(v), "triangles": len(faces)})
+            color = list((getattr(region, "color", None) or PALETTES[region.material][1])[:3])
+            record = {"material": region.material, "color": color, "vertices": len(v), "triangles": len(faces)}
+            finish = getattr(region, "finish", None)
+            if finish and "roughness" in finish:
+                record["roughness"] = finish["roughness"]
+            records.append(record)
         np.savez_compressed(args.output / f"{name}.npz", **data)
         manifest["assets"][name] = {
+            "source_commit": subprocess.check_output(
+                ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True
+            ).strip(),
             "family": program.family,
             "parameters": program.parameters,
             "regions": records,
             "bounds": [(low - origin).tolist(), (high - origin).tolist()],
         }
+        (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(name, sum(r["triangles"] for r in records), flush=True)
 
     def family(name, family_id, branch, overrides=None, seed=31, align="floor"):
@@ -118,6 +165,23 @@ def main():
         plugin = registry.load(family_id)
         p = plugin.sample(seed=seed, mode="coverage", index=plugin.branches.index(branch))
         p.update(overrides or {})
+        if name in ("vase_fluted", "vase_amphora"):
+            # Calm, recognizable vessel profiles at overview scale.
+            p["form"].update(
+                exponent=2.0,
+                aspect=1.0,
+                base=0.64,
+                belly=1.0,
+                shoulder=0.72,
+                mouth=0.46,
+                twist=0.0,
+                amplitude=0.055 if name == "vase_fluted" else 0.0,
+                frequency=16,
+                axial_frequency=0.0,
+                flute_twist=0.0,
+                lean=0.0,
+            )
+            p["phase"] = 0.0
         program = plugin.build_program(p, quality="standard")
         if name in ("hex_key", "fastener_set"):
             program.place_since(0, rotation=(90, 0, 0))
@@ -222,6 +286,124 @@ def main():
         "hole_punch",
     ):
         family("office_" + branch, "office_clutter_studio", branch, seed=43)
+
+    for name, branch, finish in (
+        ("toy_excavator", "excavator", "ochre"),
+        ("toy_dump_truck", "dump_truck", "petrol"),
+        ("toy_gear_kit", "gear_kit", "slate_blue"),
+        ("toy_train", "train", "petrol"),
+        ("toy_shovel", "shovel", "ochre"),
+    ):
+        family(name, "hard_toy_studio", branch, {"length": 0.12, "variant": 1, "finish_color": finish}, seed=71)
+    family("pliers", "tool_studio", "pliers", {"variant": 2, "finish_color": "petrol"})
+    family("socket_wrench", "tool_studio", "socket_wrench", {"variant": 1, "finish_color": "petrol"})
+
+    # Larger silhouettes selected across kitchen, transport, domestic, climate,
+    # and play categories. These form activity-specific tabletop groups.
+    for name, branch, height, finish in (
+        ("vase_fluted", "fluted_urn", 0.32, "blue_glaze"),
+        ("vase_bud", "rounded_bud", 0.23, "ceramic"),
+        ("vase_amphora", "handled_amphora", 0.30, "ceramic"),
+    ):
+        family(name, "vase_studio", branch, {"height": height, "radius": 0.09, "material": finish}, seed=83)
+    for name, branch in (("crate_vented", "ventilated_crate"), ("tote_lidded", "lidded_tote")):
+        family(
+            name,
+            "transport_studio",
+            branch,
+            {"width": 0.45, "depth": 0.35, "container_height": 0.22, "finish_color": "petrol"},
+            seed=83,
+        )
+    family(
+        "pantry_canister",
+        "food_container_studio",
+        "plug_canister",
+        {"height": 0.18, "radius": 0.049, "material": "ceramic", "plug_material": "ash"},
+        seed=71,
+    )
+    family("kitchen_crock", "utensil_holder_studio", "crock", {"filled": False, "material": "ivory"}, seed=71)
+    family("kitchen_kettle", "kettle_studio", "stovetop_gooseneck", {"finish": "ivory"}, seed=71)
+    family("mixing_bowl", "prep_tool_studio", "mixing_bowl", {"radius": 0.145, "finish": "ivory"}, seed=71)
+    family("cutting_board", "prep_tool_studio", "cutting_board", {"grip_material": "ash"}, seed=71)
+    family("serving_carafe", "bottle", "carafe", {"finish": "blue_glaze", "outline": "round"}, seed=71)
+    family(
+        "book_journal",
+        "book_studio",
+        "cloth_journal",
+        {"variant": 0, "finish_color": "petrol", "width": 0.20, "height": 0.27, "thickness": 0.037},
+        seed=71,
+    )
+    family("radio_table", "audio_studio", "table_radio", {"wood": "ivory", "grille": "exposed"}, seed=71)
+    family("speaker_portable", "audio_studio", "portable_speaker", {"finish": "chrome", "accent": "ivory"}, seed=71)
+    family("desk_fan", "climate_studio", "desk_fan", {"finish_color": "sage", "metal": "chrome"}, seed=71)
+    family("clock_twin", "clock_studio", "twin_bell", {"frame": "chrome", "radius": 0.11}, seed=71)
+    family("toy_puzzle", "hard_toy_studio", "shape_puzzle", {"variant": 1, "finish_color": "petrol"}, seed=71)
+    family("ring_stack", "board_game_studio", "ring_stack", {"wood": "ash", "finish_color": "petrol"}, seed=71)
+    family("tool_caddy", "utensil_holder_studio", "tool_slot_caddy", {"filled": True}, seed=71)
+    family("kitchen_microwave", "microwave_studio", "countertop", {"finish": "ivory", "controls": "knobs"}, seed=71)
+    family("kitchen_toaster", "toaster_studio", "retro", {"finish_color": "chalk"}, seed=71)
+    family("clock_mantel", "clock_studio", "arched_mantel", {"frame": "oak", "radius": 0.11}, seed=71)
+    family(
+        "desk_shelf",
+        "shelf_studio",
+        "bookcase",
+        {
+            "wood": "ash",
+            "width": 1.4,
+            "height": 1.2,
+            "depth": 0.43,
+            "rows": 3,
+            "columns": 2,
+            "back": "full",
+            "lower_doors": False,
+        },
+        seed=71,
+    )
+
+    # Additional workshop storage for the paper overview's side clusters.
+    family(
+        "spare_bin",
+        "transport_studio",
+        "bus_tub",
+        {"width": 0.45, "depth": 0.35, "container_height": 0.12, "finish_color": "petrol"},
+    )
+    for name, branch, color in (
+        ("parts_box", "clip_lid_box", "putty"),
+        ("stack_box", "lift_lid_box", "petrol"),
+    ):
+        family(
+            name,
+            "food_container_studio",
+            branch,
+            {"length": 0.26, "width": 0.18, "height": 0.12, "material": "plastic", "finish_color": color},
+        )
+    for name, wood, support, material in (
+        ("bench_maple_lab", "ash", "portal", "chrome"),
+        ("bench_oak_studio", "oak", "sled", "black"),
+    ):
+        family(
+            name,
+            "table_studio",
+            "workbench",
+            {
+                "width": 2.25,
+                "depth": 2.0,
+                "height": 0.8,
+                "top": "rounded_rectangle",
+                "support": support,
+                "wood": wood,
+                "support_material": material,
+                "base": "hairpin" if wood == "ash" else "tapered",
+                "storage": "shelf",
+                "top_material": "wood",
+                "corner_radius": 0.08,
+            },
+            align="top",
+        )
+
+    if selected and not selected.intersection({"hockey", "tool_rail", "jenga"}):
+        (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return
 
     # Reuse the game's perforated bed, aluminum rails, cabinet and goal details.
     # Loose pucks/strikers and the support legs are omitted: the existing task
