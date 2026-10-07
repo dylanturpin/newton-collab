@@ -16,8 +16,8 @@ when it lies inside the cone.
   The block is a trust-region subproblem. Newton on its multiplier runs over a Cholesky
   factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
   collapsed bracket, or 40 steps), the block is solved again with each dependent row written
-  over the independent ones, which keeps the least-norm impulses and a definite system; if that
-  pass is not finite, the first pass's result is kept. A finite result is rescaled into the
+  over the independent ones, which keeps the least-norm impulses and a definite system; unless
+  that pass converges to a finite result, the first pass's result is kept. A finite result is rescaled into the
   ball. Convergence of the second pass does not certify optimality for the original block: its
   rank reduction is approximate and it drops gradient components along dependent directions.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
@@ -549,14 +549,14 @@ __PROJECT__
 
         // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows into y; true when the minimizer is interior.
         // Dependent rows defeat the Cholesky pass; the problem is then whitened over the independent rows and
-        // solved again. The first pass's result stands when the second is not finite.
+        // solved again. The first pass's result stands unless the second converges to a finite result.
         static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
             bool interior = false;
             if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
             float T[5][5], K[5][5], g[5], mu[5], reduced[5];
             bool independent[5], reduced_interior = false;
             if (!whiten(H, c, active, T, K, g, independent)) return interior;
-            cholesky_ball(K, g, independent, load, mu, &reduced_interior);
+            if (!cholesky_ball(K, g, independent, load, mu, &reduced_interior)) return interior;
             bool finite = true;
             #pragma unroll 1
             for (int k = 0; k < 5; ++k) {

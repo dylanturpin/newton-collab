@@ -585,12 +585,13 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         mu = [0.5, 0.5, 0.01, 1.0e-4, 1.0e-4]
         for cone in ("elliptic", "pyramidal"):
             for scale in (1.0e-4, 1.0e-5, 2.0e-6, 1.0e-6, 1.0e-7):
-                with self.subTest(cone=cone, scale=scale):
-                    jacobian = [[scale, 0, 0], [0, scale, 0], [1, 1, 0], [0, 0, 1], [0, 0, 0]]
-                    impulse = block_impulses(cone, jacobian, [0.0, 0.0, 1.0e-5], mu, 1.0)
-                    self.assertTrue(np.isfinite(impulse).all())
-                    # The rolling row is independent and well inside its bound, so it stops the rotation.
-                    self.assertAlmostEqual(impulse[3] / -1.0e-5, 1.0, delta=1.0e-3)
+                for speed in (1.0e-5, 1.0e-9):
+                    with self.subTest(cone=cone, scale=scale, speed=speed):
+                        jacobian = [[scale, 0, 0], [0, scale, 0], [1, 1, 0], [0, 0, 1], [0, 0, 0]]
+                        impulse = block_impulses(cone, jacobian, [0.0, 0.0, speed], mu, 1.0)
+                        self.assertTrue(np.isfinite(impulse).all())
+                        # The rolling row is independent and well inside its bound, so it stops the rotation.
+                        self.assertAlmostEqual(impulse[3] / -speed, 1.0, delta=1.0e-3)
 
     def test_dependent_blocks_stay_finite_feasible_and_dissipative(self):
         """Rank-deficient blocks with extreme row scales give finite impulses inside the cone that remove energy."""
