@@ -16,9 +16,10 @@ when it lies inside the cone.
   The block is a trust-region subproblem. Newton on its multiplier runs over a Cholesky
   factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
   collapsed bracket, or 40 steps), the block is solved again with each dependent row written
-  over the independent ones, which keeps the least-norm impulses and a definite system. The
-  result is rescaled into the ball: always feasible, and optimal to that tolerance when the
-  iteration converges.
+  over the independent ones, which keeps the least-norm impulses and a definite system; if that
+  pass is not finite, the first pass's result is kept. A finite result is rescaled into the
+  ball. Convergence of the second pass does not certify optimality for the original block: its
+  rank reduction is approximate and it drops gradient components along dependent directions.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
