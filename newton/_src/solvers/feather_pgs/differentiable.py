@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental differentiable FeatherPGS step without contacts.
+"""Experimental differentiable FeatherPGS step.
 
 The step reuses the FeatherPGS forward law with a fixed kernel selection and
 stores every intermediate in buffers owned by the output state, so a
@@ -46,13 +46,15 @@ from .kernels import (
 if TYPE_CHECKING:
     from .solver_feather_pgs import SolverFeatherPGS
 
-# Unroll the friction pair's fixed Newton and bisection loops so the reverse pass sees every iterate.
+# Unroll fixed-count loops up to 32 iterations, so taped kernels replay every iterate.
 wp.set_module_options({"max_unroll": 32})
 
 
 def validate_differentiable_options(model: Model, options: dict) -> None:
     """Raise for constructor options the differentiable step does not reproduce."""
     beta = options["friction_anchor_beta"]
+    # The dense sweep reproduces the loop and tiled_row updates; CPU and matrix_free resolve to loop.
+    block_kernel = model.device.is_cuda and options["pgs_mode"] == "split"
     checks = (
         (not model.requires_grad, "a model finalized with requires_grad=True"),
         (model.particle_count > 0, "no particles"),
@@ -69,6 +71,7 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["pgs_velocity_iterations"] != 0, "pgs_velocity_iterations=0"),
         (options["pgs_debug"], "pgs_debug=False"),
         (options["parallel_tree"], "parallel_tree=False"),
+        (block_kernel and options["pgs_kernel"] in ("tiled_contact", "streaming"), 'pgs_kernel="loop" or "tiled_row"'),
     )
     for unsupported, requirement in checks:
         if unsupported:
@@ -178,7 +181,15 @@ class DifferentiableStep:
             state_out._fpgs_differentiable_buffers = buffers
         return buffers
 
-    def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+        collide_done_event: wp.Event | None = None,
+    ):
         solver = self.solver
         model = solver.model
         device = model.device
@@ -391,6 +402,8 @@ class DifferentiableStep:
                 device=device,
             )
             v_out = b.v_gyro
+        if collide_done_event is not None:
+            wp.get_stream(device).wait_event(collide_done_event)
         if contacts is not None:
             v_out = self._solve_dense_contacts(b, contacts, v_out, dt)
         wp.launch(
@@ -471,6 +484,7 @@ class DifferentiableStep:
         solver = self.solver
         model = solver.model
         device = model.device
+        # Every contact row takes a dense slot, including free-body rows the default budgets as matrix-free.
         max_rows = solver.dense_max_constraints
         c = b.contact_buffers(contacts)
         for src, dst in (
@@ -1897,7 +1911,7 @@ def _dense_pgs_sweep(
                             impulse_k = impulses_out[world, k]
                         w_sibling += C[world, sibling, k] * impulse_k
                     residuals[world, sibling] = w_sibling
-                    trial = _friction_pair_unrolled(
+                    trial = _friction_pair(
                         denom,
                         C[world, i, sibling],
                         diag[world, sibling],
@@ -1919,11 +1933,7 @@ def _dense_pgs_sweep(
 
 @wp.func
 def _guarded_sqrt(x: float):
-    """wp.sqrt whose adjoint is zero where the root is zero.
-
-    At an isotropic tangent block (a = d, c = 0, e.g. any sphere) the eigen-gap root is zero; the pair solve
-    stays smooth there and perturbations keep the block isotropic, so the zero adjoint is its exact derivative.
-    """
+    """wp.sqrt whose adjoint is zero where the root is zero."""
     return wp.sqrt(x)
 
 
@@ -1934,18 +1944,22 @@ def _adj_guarded_sqrt(x: float, adj_ret: float):
         wp.adjoint[x] += 0.5 / root * adj_ret
 
 
+# Defined ahead of _friction_pair: its custom adjoint is built when it is declared.
+_PAIR_ZERO = wp.constant(-1.0)
+_PAIR_STICK = wp.constant(0.0)
+_PAIR_STICK_SINGULAR = wp.constant(1.0)
+_PAIR_SLIDE = wp.constant(2.0)
+_PAIR_RETAINED = wp.constant(3.0)
+
+
 @wp.func
-def _friction_pair_unrolled(
-    a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float, omega: float
-) -> wp.vec2:
-    """friction_pair_candidate with its Newton and bisection loops unrolled and no early exits."""
-    if radius <= 0.0:
-        return wp.vec2(0.0)
+def _friction_pair_solve(a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float) -> wp.vec4:
+    """friction_pair_candidate's unrelaxed result with loops unrolled, as (x, alpha, mode) for the adjoint."""
     scale = wp.max(wp.max(a, d), 1.0e-20)
     a /= scale
     c /= scale
     d /= scale
-    largest = 0.5 * (a + d + _guarded_sqrt((a - d) * (a - d) + 4.0 * c * c))
+    largest = 0.5 * (a + d + wp.sqrt((a - d) * (a - d) + 4.0 * c * c))
     smallest = float(0.0)
     if largest > 0.0:
         smallest = wp.max((a * d - c * c) / largest, 0.0)
@@ -1959,6 +1973,10 @@ def _friction_pair_unrolled(
     perpendicular = wp.vec2(-axis[1], axis[0])
     residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual)) / scale
     result = old
+    alpha = float(0.0)
+    mode = float(_PAIR_STICK)
+    if smallest <= 0.0:
+        mode = _PAIR_STICK_SINGULAR
     sticking = bool(False)
     if largest > 0.0 and (smallest > 0.0 or residual_rotated[1] == 0.0):
         correction = (residual_rotated[0] / largest) * axis
@@ -1966,8 +1984,8 @@ def _friction_pair_unrolled(
             correction += (residual_rotated[1] / smallest) * perpendicular
         result = old - correction
         sticking = wp.length(result) <= radius
-    retained = bool(False)
     if not sticking:
+        mode = _PAIR_SLIDE
         old_norm = wp.length(old)
         residual_norm = wp.length(residual)
         cross_residual = residual[0] * old[1] - residual[1] * old[0]
@@ -1978,8 +1996,7 @@ def _friction_pair_unrolled(
             and wp.dot(residual, old) <= 0.0
             and wp.abs(cross_residual) <= 2.0e-7 * old_norm * residual_norm
         ):
-            retained = True
-        # The solve also runs for a retained impulse: its derivative stands in for the guard's.
+            mode = _PAIR_RETAINED
         old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
         b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
         solution = wp.vec2(0.0)
@@ -1987,60 +2004,116 @@ def _friction_pair_unrolled(
         hi = wp.length(b) / radius
         if hi > 0.0:
             lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) / radius - smallest), 0.0)
-            alpha = lo
+            shift = lo
             converged = bool(False)
             for _ in range(8):
                 if not converged:
-                    inv0 = 1.0 / (largest + alpha)
+                    inv0 = 1.0 / (largest + shift)
                     inv1 = float(0.0)
-                    if smallest + alpha > 0.0:
-                        inv1 = 1.0 / (smallest + alpha)
+                    if smallest + shift > 0.0:
+                        inv1 = 1.0 / (smallest + shift)
                     trial = old_rotated - wp.vec2(
-                        (residual_rotated[0] + alpha * old_rotated[0]) * inv0,
-                        (residual_rotated[1] + alpha * old_rotated[1]) * inv1,
+                        (residual_rotated[0] + shift * old_rotated[0]) * inv0,
+                        (residual_rotated[1] + shift * old_rotated[1]) * inv1,
                     )
                     norm = wp.length(trial)
-                    if wp.abs(norm - radius) <= 2.0e-7 * radius or (alpha == 0.0 and norm <= radius):
+                    if wp.abs(norm - radius) <= 2.0e-7 * radius or (shift == 0.0 and norm <= radius):
                         solution = trial
+                        alpha = shift
                         converged = True
                     else:
                         if norm > radius:
-                            lo = alpha
+                            lo = shift
                         else:
-                            hi = alpha
+                            hi = shift
                         slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
-                        candidate = alpha
+                        candidate = shift
                         if slope > 0.0:
-                            candidate = alpha + (norm / radius - 1.0) * norm * norm / slope
-                        alpha = 0.5 * (lo + hi)
+                            candidate = shift + (norm / radius - 1.0) * norm * norm / slope
+                        shift = 0.5 * (lo + hi)
                         if candidate > lo and candidate < hi:
-                            alpha = candidate
+                            shift = candidate
             if not converged:
                 for _ in range(24):
-                    alpha = 0.5 * (lo + hi)
-                    trial = wp.vec2(b[0] / (largest + alpha), b[1] / (smallest + alpha))
+                    shift = 0.5 * (lo + hi)
+                    trial = wp.vec2(b[0] / (largest + shift), b[1] / (smallest + shift))
                     if wp.length(trial) > radius:
-                        lo = alpha
+                        lo = shift
                     else:
-                        hi = alpha
+                        hi = shift
                 solution = wp.vec2(b[0] / (largest + hi), b[1] / (smallest + hi))
+                alpha = hi
         result = old + (solution[0] - old_rotated[0]) * axis + (solution[1] - old_rotated[1]) * perpendicular
-    relaxed = old + omega * (result - old)
-    if retained:
-        return _value_with_gradient_of(old, relaxed)
-    return relaxed
+    return wp.vec4(result[0], result[1], alpha * scale, mode)
 
 
 @wp.func
-def _value_with_gradient_of(value: wp.vec2, solved: wp.vec2):
-    """Return value, differentiated as solved.
+def _friction_pair(
+    a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float, omega: float
+) -> wp.vec2:
+    """friction_pair_candidate with no early exits, differentiated by the closed-form adjoint below."""
+    if radius <= 0.0:
+        return wp.vec2(0.0)
+    solve = _friction_pair_solve(a, c, d, residual, old, radius)
+    relaxed = old + omega * (wp.vec2(solve[0], solve[1]) - old)
+    if solve[3] == _PAIR_RETAINED:
+        return old
+    return relaxed
 
-    friction_pair_candidate keeps an already-feasible sliding impulse (within 2e-7) to avoid roundoff
-    cycles; its derivative is that of the pair solve the guard stands in for, which is also what FD sees.
+
+@wp.func_grad(_friction_pair)
+def _adj_friction_pair(
+    a: float, c: float, d: float, residual: wp.vec2, old: wp.vec2, radius: float, omega: float, adj_ret: wp.vec2
+):
+    """Derivative of the pair map in the input basis, smooth where the tangent block is isotropic.
+
+    Sticking differentiates old - K^-1 r; sliding differentiates the root of (K + alpha I) x = K old - r,
+    |x| = radius. A retained impulse substitutes the derivative of the solve it stands in for.
     """
-    return value
-
-
-@wp.func_grad(_value_with_gradient_of)
-def _adj_value_with_gradient_of(value: wp.vec2, solved: wp.vec2, adj_ret: wp.vec2):
-    wp.adjoint[solved] += adj_ret
+    mode = float(_PAIR_ZERO)
+    x = wp.vec2(0.0)
+    alpha = float(0.0)
+    if radius > 0.0:
+        solve = _friction_pair_solve(a, c, d, residual, old, radius)
+        x = wp.vec2(solve[0], solve[1])
+        alpha = solve[2]
+        mode = solve[3]
+        wp.adjoint[old] += (1.0 - omega) * adj_ret
+        wp.adjoint[omega] += wp.dot(adj_ret, x - old)
+    adj_x = omega * adj_ret
+    if mode == _PAIR_STICK:
+        wp.adjoint[old] += adj_x
+        det = a * d - c * c
+        if det > 0.0:
+            inverse = wp.mat22(d, -c, -c, a) / det
+            y = inverse * adj_x
+            z = inverse * residual
+            wp.adjoint[residual] -= y
+            wp.adjoint[a] += y[0] * z[0]
+            wp.adjoint[d] += y[1] * z[1]
+            wp.adjoint[c] += y[0] * z[1] + y[1] * z[0]
+    elif mode == _PAIR_STICK_SINGULAR:
+        # The forward applies the rank-one block's pseudo-inverse, K / trace(K)^2.
+        trace = a + d
+        wp.adjoint[old] += adj_x
+        if trace > 0.0:
+            wp.adjoint[residual] -= wp.mat22(a, c, c, d) * adj_x / (trace * trace)
+    elif mode == _PAIR_SLIDE or mode == _PAIR_RETAINED:
+        # [[M, x], [x^T, 0]] [p; q] = [adj_x; 0] with M = K + alpha I, solved through M's adjugate.
+        m00 = a + alpha
+        m11 = d + alpha
+        adjugate = wp.mat22(m11, -c, -c, m00)
+        det = m00 * m11 - c * c
+        u = adjugate * adj_x
+        v = adjugate * x
+        x_v = wp.dot(x, v)
+        if det > 0.0 and x_v > 0.0:
+            q = wp.dot(x, u) / x_v
+            p = (u - q * v) / det
+            w = old - x
+            wp.adjoint[a] += p[0] * w[0]
+            wp.adjoint[d] += p[1] * w[1]
+            wp.adjoint[c] += p[0] * w[1] + p[1] * w[0]
+            wp.adjoint[old] += wp.mat22(a, c, c, d) * p
+            wp.adjoint[residual] -= p
+            wp.adjoint[radius] += q * radius

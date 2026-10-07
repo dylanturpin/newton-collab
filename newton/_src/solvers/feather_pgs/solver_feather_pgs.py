@@ -1279,26 +1279,34 @@ class SolverFeatherPGS(SolverBase):
                 reads, so optimizer loops may reuse one solver and one list of states without :meth:`reset`.
                 Gradients reach ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
                 ``Control.joint_target_q`` and ``Control.joint_target_qd``; model parameters are not validated
-                gradient inputs. Unlike the default step, it does not refresh ``state_in.body_q`` in place.
+                gradient inputs. Free-joint quaternion gradients are meaningful along tangent directions of
+                the unit quaternion. Unlike the default step, it does not refresh ``state_in.body_q`` in place.
 
                 Contacts support normal rows, point friction and restitution with ``pgs_mode="split"``.
                 The contact set and its row layout are held fixed for the derivative. Contact points and
                 normals come from the given buffers and are stop-gradient, while the gap and Jacobians are
-                recomputed from the step's poses. Every PGS iteration, including the friction root solve, is
-                differentiated as executed. Contact activation, restitution firing and stick/slip switches
-                are nonsmooth. Free-body rows are assembled with the articulated rows, so they match the
-                default matrix-free solve up to rounding, including its depenetration clamp. Point friction
-                needs an explicit ``friction_anchor_beta=0``; with it omitted, the default law is persistent
-                patch friction and a frictional contact step raises ``NotImplementedError``. ``step`` also
-                raises for a shared friction anchor, contact regularization, or worlds that mix single-body
-                free articulations with other articulations. Contact buffers take about nine times the
-                default step's memory per environment and step.
+                recomputed from the step's poses. Every PGS sweep is differentiated as executed, and each
+                friction pair solve in closed form at its computed root. Where that solve keeps an already
+                feasible sliding impulse, the forward value is unchanged and the derivative of the pair
+                solve it stands in for is substituted. Contact activation, restitution firing and
+                stick/slip switches are nonsmooth. Free-body rows are assembled with the articulated rows
+                and match the default matrix-free solve up to rounding, including its depenetration clamp.
+                Every contact row, free-body rows included, takes a ``dense_max_constraints`` slot, so size
+                that capacity for all of a world's contact rows; overflow sets :attr:`constraint_overflow`
+                for :meth:`check_constraint_capacity`, and agreement with the default step excludes
+                overflowing steps. Point friction needs an explicit ``friction_anchor_beta=0``; with it
+                omitted, the default law is persistent patch friction and a frictional contact step raises
+                ``NotImplementedError``. ``step`` also raises for a shared friction anchor, contact
+                regularization, or worlds that mix single-body free articulations with other
+                articulations. ``collide_done_event`` is waited on before contacts are read. Contact
+                buffers take about nine times the default step's memory per environment and step.
 
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
                 particles, kinematic bodies, mimic or loop-closing joints or rigid-body velocity limits, and
                 the solver uses immediate response, augmented drives, ``update_mass_matrix_interval=1``, no
                 joint or velocity limits, no warm start, sleeping, torsion, compliance, friction patches,
-                velocity iterations, debug or ``parallel_tree``. Defaults to False.
+                velocity iterations, debug or ``parallel_tree``, and on CUDA ``pgs_kernel="loop"`` or
+                ``"tiled_row"``. Defaults to False.
 
                 .. experimental::
 
@@ -1779,6 +1787,8 @@ class SolverFeatherPGS(SolverBase):
                     "pgs_velocity_iterations": pgs_velocity_iterations,
                     "pgs_debug": pgs_debug,
                     "parallel_tree": parallel_tree,
+                    "pgs_mode": pgs_mode,
+                    "pgs_kernel": pgs_kernel,
                 },
             )
         if contact_compliance:
@@ -8625,7 +8635,7 @@ class SolverFeatherPGS(SolverBase):
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
             )
         if self._differentiable_step is not None:
-            return self._differentiable_step.step(state_in, state_out, control, contacts, dt)
+            return self._differentiable_step.step(state_in, state_out, control, contacts, dt, collide_done_event)
         if self.pgs_warmstart:
             # A reduced stream is valid when it carries retained identities.
             # Preserve the reader lease for an unreduced captured stream: a

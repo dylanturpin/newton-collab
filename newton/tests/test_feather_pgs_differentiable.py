@@ -7,6 +7,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.differentiable import _dense_pgs_sweep
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -940,6 +942,221 @@ def test_contact_law_options(test, device):
                 test.assertAlmostEqual(float(results[True].joint_qd.numpy()[2]), clamp, delta=1.0e-3)
 
 
+def test_isotropic_friction_orientation_gradient(test, device):
+    """An offset sphere sticking under an isotropic tangent block: the tangent-direction pose derivative matches FD."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(
+        mass=1.0,
+        inertia=wp.mat33(np.diag([2.0, 1.0, 2.0])),
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.99), wp.quat_identity()),
+    )
+    cfg = newton.ModelBuilder.ShapeConfig(mu=2.0, density=0.0, restitution=0.0)
+    builder.add_shape_sphere(body, radius=1.0, xform=wp.transform(wp.vec3(1.0, 0.0, 0.0), wp.quat_identity()), cfg=cfg)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=True)
+    solver = SolverFeatherPGS(
+        model,
+        differentiable=True,
+        friction_anchor_beta=0.0,
+        pgs_iterations=1,
+        pgs_beta=0.0,
+        pgs_cfm=0.0,
+        angular_damping=0.0,
+        enable_restitution=False,
+    )
+    q0 = model.joint_q.numpy().copy()
+    qd0 = np.array([0.2, 0.3, -0.5, 0.0, 0.0, 0.0], np.float32)
+    initial = model.state()
+    initial.joint_q.assign(q0)
+    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
+    contacts = pipeline.contacts()
+    pipeline.collide(initial, contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+
+    def run(theta, seed=None):
+        state, output = model.state(requires_grad=True), model.state(requires_grad=True)
+        q = q0.copy()
+        q[3:7] = [np.sin(theta / 2), 0.0, 0.0, np.cos(theta / 2)]
+        state.joint_q.assign(q)
+        state.joint_qd.assign(qd0)
+        tape = wp.Tape()
+        with tape:
+            solver.step(state, output, None, contacts, 0.01)
+        if seed is None:
+            return output.joint_qd.numpy().astype(np.float64)
+        tape.backward(grads={output.joint_qd: wp.array(seed, dtype=float, device=device)})
+        direction = np.array([0, 0, 0, 0.5 * np.cos(theta / 2), 0, 0, -0.5 * np.sin(theta / 2)])
+        return float(state.joint_q.grad.numpy() @ direction)
+
+    # At theta = 0 the pair sticks strictly inside its cone with a 2I tangent block, so FD is smooth.
+    for theta in (0.0, 0.05):
+        tape_derivative = np.array([run(theta, np.eye(6, dtype=np.float32)[j]) for j in range(6)])
+        fd = (run(theta + 3.0e-3) - run(theta - 3.0e-3)) / 6.0e-3
+        with test.subTest(theta=theta):
+            test.assertGreater(abs(fd[1]), 5.0e-3)
+            np.testing.assert_allclose(tape_derivative, fd, rtol=0.0, atol=1.0e-4)
+
+
+def test_friction_pair_off_diagonal_gradient(test, device):
+    """One sweep over a normal row and its friction pair: the tangent off-diagonal derivative matches FD."""
+
+    def array(values, dtype=float):
+        return wp.array(np.asarray(values), dtype=dtype, device=device, requires_grad=True)
+
+    def sweep(a, c, d, rhs, grad=False):
+        matrix = array([[[1.0, 0.0, 0.0], [0.0, a, c], [0.0, c, d]]])
+        residuals = wp.zeros((1, 3), device=device, requires_grad=True)
+        impulses = wp.zeros((1, 3), device=device, requires_grad=True)
+        row_type = [[PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]]
+        tape = wp.Tape()
+        with tape:
+            wp.launch(
+                _dense_pgs_sweep,
+                dim=1,
+                inputs=[
+                    array([3], int),
+                    array([[1.0, a, d]]),
+                    matrix,
+                    array([rhs]),
+                    array(row_type, int),
+                    array([[-1, 0, 0]], int),
+                    array([[1.0, 1.0, 1.0]]),
+                    1.0,
+                    0,
+                    array([[0.0, 0.0, 0.0]]),
+                ],
+                outputs=[residuals, impulses],
+                device=device,
+            )
+        if grad:
+            tape.backward(grads={impulses: array([[0.0, 1.0, 0.0]])})
+            return matrix.grad.numpy()[0, 1, 2] + matrix.grad.numpy()[0, 2, 1]
+        return float(impulses.numpy()[0, 1])
+
+    eps = 1.0e-3
+    for a, c, d in ((1.0, 0.0, 1.0), (1.0, 0.2, 2.0)):
+        for rhs in ((-1.0, 0.2, 0.3), (-1.0, 2.0, 3.0)):
+            with test.subTest(block=(a, c, d), rhs=rhs):
+                fd = (sweep(a, c + eps, d, rhs) - sweep(a, c - eps, d, rhs)) / (2.0 * eps)
+                test.assertGreater(abs(fd), 0.03)
+                test.assertAlmostEqual(sweep(a, c, d, rhs, grad=True), fd, delta=2.0e-4)
+
+
+@wp.func_native(
+    snippet="""
+#if defined(__CUDA_ARCH__)
+unsigned long long start = clock64();
+while (clock64() - start < (unsigned long long) ticks) {}
+#endif
+"""
+)
+def _spin(ticks: wp.int64): ...
+
+
+@wp.kernel
+def _publish_after_delay(count: wp.array[int], value: int, ticks: wp.int64):
+    _spin(ticks)
+    count[0] = value
+
+
+def test_collide_done_event(test, device):
+    """Contacts published on another stream are read after collide_done_event, eagerly and in a graph."""
+    device = wp.get_device(device)
+    model = _build_free_shape(device, "sphere")
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+    producer = wp.Stream(device)
+    solver = SolverFeatherPGS(model, differentiable=True, friction_anchor_beta=0.0, pgs_iterations=8)
+    initial, output = model.state(), model.state()
+    initial.joint_q.assign(np.array([0.0, 0.0, 0.095, 0.0, 0.0, 0.0, 1.0], np.float32))
+    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+    contacts = pipeline.contacts()
+    pipeline.collide(initial, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+    solver.step(initial, output, None, contacts, _DT)
+    reference = output.joint_qd.numpy().copy()
+    test.assertGreater(reference[2], 0.0)
+
+    def publish_on_producer():
+        producer.wait_stream(wp.get_stream(device))
+        with wp.ScopedStream(producer):
+            wp.launch(
+                _publish_after_delay, dim=1, inputs=[contacts.rigid_contact_count, count, 200_000_000], device=device
+            )
+            return producer.record_event()
+
+    wp.launch(_publish_after_delay, dim=1, inputs=[contacts.rigid_contact_count, count, 0], device=device)
+    contacts.rigid_contact_count.zero_()
+    solver.step(initial, output, None, contacts, _DT, collide_done_event=publish_on_producer())
+    np.testing.assert_array_equal(output.joint_qd.numpy(), reference)
+
+    with wp.ScopedCapture(device) as capture:
+        contacts.rigid_contact_count.zero_()
+        solver.step(initial, output, None, contacts, _DT, collide_done_event=publish_on_producer())
+    output.joint_qd.zero_()
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(output.joint_qd.numpy(), reference)
+
+
+def test_pgs_kernel_selection(test, device):
+    """Accepted pgs_kernel selections match the default step; CUDA rejects the contact-block kernels."""
+    model = _build_box_chain_on_plane(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+    initial = model.state()
+    initial.joint_qd.assign(np.full(model.joint_dof_count, 0.5, np.float32))
+    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+    contacts = pipeline.contacts()
+    pipeline.collide(initial, contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 8)
+    block_kernels = ("tiled_contact", "streaming") if wp.get_device(device).is_cuda else ()
+    for kernel in ("loop", "tiled_row", "tiled_contact", "streaming"):
+        options = {"friction_anchor_beta": 0.0, "pgs_kernel": kernel, "pgs_iterations": 1}
+        with test.subTest(pgs_kernel=kernel):
+            if kernel in block_kernels:
+                with test.assertRaisesRegex(ValueError, 'pgs_kernel="loop" or "tiled_row"'):
+                    SolverFeatherPGS(model, differentiable=True, **options)
+                continue
+            results = []
+            for differentiable in (False, True):
+                output = model.state(requires_grad=True)
+                SolverFeatherPGS(model, differentiable=differentiable, **options).step(
+                    initial, output, None, contacts, 0.01
+                )
+                results.append(output.joint_qd.numpy())
+            np.testing.assert_allclose(results[1], results[0], rtol=0.0, atol=1.0e-5)
+
+
+def test_free_body_rows_use_dense_capacity(test, device):
+    """Free-body contact rows take dense_max_constraints slots; mf_max_constraints does not cover them."""
+    q0 = [0.0, 0.0, 0.095, 0.0, 0.0, 0.0, 1.0]
+    qd0 = np.array([0.2, 0.3, -0.5, 0.0, 0.0, 0.0], np.float32)
+    for capacity in (3, 32):
+        results = {}
+        for differentiable in (False, True):
+            model = _build_free_shape(device, "box")
+            solver = SolverFeatherPGS(
+                model,
+                differentiable=differentiable,
+                friction_anchor_beta=0.0,
+                dense_max_constraints=capacity,
+                mf_max_constraints=32,
+                pgs_iterations=1,
+            )
+            states, contacts = _free_body_rollout(model, solver, q0, qd0, 1, 0.01)
+            test.assertEqual(int(contacts[0].rigid_contact_count.numpy()[0]), 4)
+            results[differentiable] = states[1].joint_qd.numpy()
+            with test.subTest(capacity=capacity, differentiable=differentiable):
+                if differentiable and capacity == 3:
+                    with test.assertRaisesRegex(RuntimeError, "capacity exceeded"):
+                        solver.check_constraint_capacity()
+                else:
+                    solver.check_constraint_capacity()
+        if capacity == 32:
+            np.testing.assert_allclose(results[True], results[False], rtol=0.0, atol=1.0e-5)
+
+
 class TestFeatherPGSDifferentiable(unittest.TestCase):
     pass
 
@@ -962,8 +1179,16 @@ for _device in get_test_devices():
         test_sliding_box_velocity_jacobian,
         test_frictional_impact_matches_default,
         test_contact_law_options,
+        test_isotropic_friction_orientation_gradient,
+        test_friction_pair_off_diagonal_gradient,
+        test_pgs_kernel_selection,
+        test_free_body_rows_use_dense_capacity,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])
+    if _device.is_cuda:
+        add_function_test(
+            TestFeatherPGSDifferentiable, "test_collide_done_event", test_collide_done_event, devices=[_device]
+        )
 
 
 if __name__ == "__main__":
