@@ -380,21 +380,27 @@ class TestContactComplianceContactsLease(unittest.TestCase):
             fixture.solver.validate_contact_compliance()
 
     def test_noncompliant_capture_keeps_reduction(self):
-        """Control: without compliance, a captured FeatherPGS step leaves reduction available."""
+        """Control: without compliance, FeatherPGS steps reduced contacts and its graph leaves reduction available."""
         episode = _Episode(articulated=True, enabled=False)
         fixture = episode.fixture
+        contacts = fixture.contacts
         reducer = _reducer(fixture)
         state, output = episode.states
         with wp.ScopedDevice(fixture.device):
             episode.two_steps()
+            reducer.collide(state, contacts)
+            self.assertTrue(contacts.rigid_contacts_body_pair_reduced)
+            fixture.solver.step(state, output, episode.control, contacts, episode.dt)
+            self.assertTrue(np.isfinite(output.body_q.numpy()).all())
             with wp.ScopedCapture() as capture:
                 fixture.solver.seed_double_buffer_events()
                 episode.two_steps()
             wp.capture_launch(capture.graph)
-            reducer.collide(state, fixture.contacts)
-            self.assertTrue(fixture.contacts.rigid_contacts_body_pair_reduced)
-            fixture.solver.step(state, output, episode.control, fixture.contacts, episode.dt)
-            self.assertTrue(np.isfinite(output.body_q.numpy()).all())
+            reducer.collide(state, contacts)
+            self.assertTrue(contacts.rigid_contacts_body_pair_reduced)
+            self.assertFalse(contacts.rigid_contacts_body_pair_reduced_capture)
+            wp.capture_launch(capture.graph)
+            self.assertTrue(np.isfinite(episode.states[0].body_q.numpy()).all())
 
 
 if __name__ == "__main__":
