@@ -89,20 +89,20 @@ def test_shirt_finger_friction_reaches_coupled_entries(test, device):
             example = _build_example(module, ["--viewer", "null", "--rigid-solver", rigid_solver])
         solver = example.solver
         fingers = example.finger_shape_ids.numpy()
-        mu_arrays = [example.model.shape_material_mu] + [
-            solver.view(name).shape_material_mu for name in solver.entry_names()
-        ]
-        pointers = [array.ptr for array in mu_arrays]
+        names = ("parent", *solver.entry_names())
+        pointers = [array.ptr for array in _live_shape_mu(example)]
 
         # The open-hand start, then mid-lift of the first sleeve pinch.
         for sim_time, expected in ((0.0, module.FINGER_RELEASE_MU), (5.5, module.CLOTH_MU)):
             example.sim_time = sim_time
             example.update_ik_targets()
-            for name, array in zip(("parent", *solver.entry_names()), mu_arrays, strict=True):
+            arrays = _live_shape_mu(example)
+            # A captured graph keeps reading the storage bound at capture time.
+            test.assertEqual([array.ptr for array in arrays], pointers, f"{rigid_solver} at t={sim_time}")
+            for name, array in zip(names, arrays, strict=True):
                 np.testing.assert_allclose(
                     array.numpy()[fingers], expected, err_msg=f"{rigid_solver}: {name} at t={sim_time}"
                 )
-        test.assertEqual([array.ptr for array in mu_arrays], pointers)
         example.step()
         test.assertTrue(np.all(np.isfinite(example.state_0.body_q.numpy())))
 
@@ -180,6 +180,12 @@ def _counting_example(module, substeps: int, *, use_graph: bool, recorder: _Reco
     example.state_0 = _CountingState(recorder)
     example.state_1 = _CountingState(recorder)
     return example
+
+
+def _live_shape_mu(example) -> list[wp.array]:
+    """The parent's shape friction array, then the one each coupled entry's view currently binds."""
+    solver = example.solver
+    return [example.model.shape_material_mu] + [solver.view(name).shape_material_mu for name in solver.entry_names()]
 
 
 def _build_example(module, args: list[str]):
