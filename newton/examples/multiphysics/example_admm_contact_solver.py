@@ -13,6 +13,7 @@
 #
 # Command: python -m newton.examples admm_contact_solver
 #          python -m newton.examples admm_contact_solver --solver free
+#          python -m newton.examples admm_contact_solver --tray-solver mujoco
 #          python -m newton.examples admm_contact_solver --tray-solver featherpgs
 #
 ###########################################################################
@@ -25,7 +26,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
-from newton.solvers import SolverFeatherPGS, SolverSemiImplicit, SolverXPBD
+from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverSemiImplicit, SolverXPBD
 
 
 @wp.kernel(enable_backward=False)
@@ -73,6 +74,11 @@ class Example:
 
             def tray_factory(v):
                 return SolverFeatherPGS(v, pgs_mode="matrix_free")
+
+        elif args.tray_solver == "mujoco":
+
+            def tray_factory(v):
+                return SolverMuJoCo(model=v, use_mujoco_contacts=False, disable_contacts=True)
 
         else:
 
@@ -369,7 +375,7 @@ class Example:
             "--tray-solver",
             help="Rigid solver that owns the ball-jointed tray",
             type=str,
-            choices=["semi_implicit", "featherpgs"],
+            choices=["semi_implicit", "mujoco", "featherpgs"],
             default="semi_implicit",
         )
         parser.add_argument(

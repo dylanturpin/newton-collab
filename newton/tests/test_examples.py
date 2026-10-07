@@ -1486,6 +1486,14 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_admm_contact_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "tray-solver": "mujoco"},
+    use_viewer=True,
+    test_suffix="mujoco",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_kamino_mujoco_admm_solver",
     devices=["cpu"],
     test_options={"num-frames": 30, "world-count": 4},
