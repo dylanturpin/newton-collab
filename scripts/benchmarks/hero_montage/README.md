@@ -23,7 +23,7 @@ There are no titles, HUD overlays or animated object pose assignments.
 | Hardware pile | A scraper pushes 96 randomly blue, teal and gold nuts, bolts and washers off a raised deck into a lower collection bin |
 | Wrecking crane | A gripper slews an unpowered stock crane, swinging a five-link steel chain and heavy ball into a furnished three-floor miniature building |
 | Knife insertion | The arm lifts a stock chef’s knife and seats its blade in a 5 mm slotted knife block |
-| Shadow hand | A floating five-finger hand supports a free lacquer-and-brass lighter in its palm; the hinge is on the left and the thumb approaches from the right (contact-only acceptance currently fails) |
+| Shadow hand | A floating five-finger hand supports a free lacquer-and-brass lighter in its palm; the hinge is on the left and the thumb approaches from the right (one contact-only take accepted for the teaser) |
 | Serving | Different arms grasp a loose dinner plate and seat it in a stock wire rack with two free plates already resting inside |
 | Toy vehicles | An arm pushes a train or articulated dump truck on independently rolling wheels |
 | Air hockey | A physical striker sends a puck through a goal |
@@ -34,9 +34,10 @@ There are no titles, HUD overlays or animated object pose assignments.
 
 The lighter has a passive bistable spring-detent potential and a freely
 simulated case; its hinge has no position target or motor. The previous assisted opening has been rejected. Direct hinge and contact-gated
-opening-force paths have been removed. CUDA tests have not yet produced a
-repeatable contact-only opening that passes the acceptance gates. The current
-thumb configuration is an orientation prototype, not a validated teaser shot.
+opening-force paths have been removed. The user accepted the specific `contact-tilted/shadow-3` CUDA recording for
+the teaser: about 65 degrees of opening, with 9.6 mm case slip. It does not
+pass the earlier full-open or repeatability gates; acceptance of that take
+does not relax those gates for other recordings.
 Finger joint actuators remain the only active drives. The lid's spring and detent
 depend only on hinge angle and velocity, never the animation clock.
 The jar is a physically fixed tool on the arm flange, while every studded
@@ -157,3 +158,27 @@ uv run python source/plan_metal_teaser.py --data metal-data \
 - [Unitree RL Gym](https://github.com/unitreerobotics/unitree_rl_gym): public
   hardware-demo reference. G1 and Go2 shots here are simulations; public hardware
   footage does not validate this FPGS run or establish identical policies.
+
+## Separate editorial clips (October 7)
+
+The wrecking crane releases its handle at 5.85 s and lifts clear by 7.1 s.
+`validate_crane_release.py RUN` checks the recorded opening, retreat, and
+settled gripper speed. The check fails on probe-109 and passes on
+`wrecking-release` (A6000, 8 substeps, 32 iterations, 15 seconds). The
+demolition gate still passes with all six upper floor panels collapsed.
+
+`crane_visuals.py` adds cab glazing, panels, rollers, vents, pivot caps,
+and hoses only during Metal export. These are zero-density, noncolliding
+meshes on existing bodies; body masses and counts are asserted unchanged.
+
+`compose_replay.py --spec SPEC --output DIR` assembles a presentation-only
+overview from recorded worlds. It preserves every sampled pose (apart from
+display translations), rejects out-of-range times, and records each source.
+This overview is a composite, not evidence of a new simultaneous batch run.
+
+`package_edit_clips.py --spec SPEC --output DIR` copies the individually
+named close-ups and final zoom-out, fully decodes each MP4, verifies native
+2560x1440 at 30 fps and frame count, and writes a provenance manifest.
+The accepted lighter is one 4.5-second shot; the new wrecking shot is
+10 seconds to include the turn, impact, release, and retreat. Existing
+unchanged close-ups are reused without re-encoding.

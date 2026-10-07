@@ -136,7 +136,7 @@ def populate(b, info, ee, down, device, variant):
         (3.2, -0.12, -0.4),
         (4.0, -0.12, -0.4),
         (5.4, -0.12, 1.65),
-        (11.0, -0.12, 1.65),
+        (5.55, -0.12, 1.65),
     ]
     previous_time, previous_lift, previous_slew = 1.8, 0.0, 0.0
     for time, lift, slew in phases:
@@ -159,9 +159,10 @@ def populate(b, info, ee, down, device, variant):
     last = control_point(-0.12, 1.65)
     poses.extend(
         [
-            (11.7, last, 0.018, turned),
-            (13.0, last + np.array([0, 0, 0.18]), 0.018, turned),
-            (15, last + np.array([0, 0, 0.18]), 0.018, turned),
+            (5.85, last, 0.035, turned),
+            (6.15, last, 0.035, turned),
+            (7.1, last + np.array([0, 0, 0.18]), 0.035, turned),
+            (15, last + np.array([0, 0, 0.18]), 0.035, turned),
         ]
     )
     info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1934), poses, device, desired_rotation=down)
@@ -251,5 +252,7 @@ def populate(b, info, ee, down, device, variant):
         crane_boom=mapping["boom.lift"],
         crane_hook=mapping["hook.swing"],
         demolition_windup_time=4.0,
+        crane_release_time=5.85,
+        crane_retreat_time=7.1,
         task="Operate a passive wrecking crane to swing a linked steel ball into a three-floor miniature building",
     )

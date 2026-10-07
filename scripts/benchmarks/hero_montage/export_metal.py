@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from crane_visuals import dress_crane
 from scene import build_template
 
 import newton
@@ -83,6 +84,8 @@ def main():
     for i, world in enumerate(summary["worlds"]):
         print(f"Exporting geometry {world['id']}", flush=True)
         template, _ = build_template(world["kind"], world["variant"], assets, args.device)
+        if world["kind"] == "gear":
+            dress_crane(template)
         assert template.body_count == world["body_count"]
         builder.add_world(template, label_prefix=f"{i:02d}_{world['kind']}")
     model = builder.finalize(device=args.device)
