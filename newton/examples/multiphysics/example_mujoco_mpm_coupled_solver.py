@@ -24,9 +24,9 @@ import newton
 import newton.examples
 from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
 
-# A grain that leaves the fixed MPM grid gets runaway velocities, so cap grain speed just above the boxes' 6.4 m/s
-# and pad the grid to contain any ballistic grain: from the bed (|x| <= 1, z <= 0.5) or the stack top (|x| <= 0.45,
-# z <= 3.11) it reaches |x| <= 7.2 m and z <= 5.3 m, inside the padded grid's |x|, |y| <= 7.3 m and z <= 6.8 m.
+# A grain that leaves the fixed MPM grid gets runaway velocities. The cap clips MPM advection velocity (not collider
+# impulses), and the padding is a conservative single-flight estimate: a grain launched at the cap from the bed or the
+# settled stack top lands within |x| <= 7.2 m and peaks below z = 5.3 m, inside |x|, |y| <= 7.3 m and z <= 6.8 m.
 _GRID_PADDING = 125
 _PARTICLE_MAX_VELOCITY = 6.5
 
