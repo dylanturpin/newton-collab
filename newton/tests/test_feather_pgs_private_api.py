@@ -88,12 +88,12 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
             with self.subTest(parameter=parameter.name):
                 self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
 
-    def test_constructor_has_no_global_physics_switches(self):
-        """Keep physical behavior local to the model: no global friction or damping switches.
+    def test_global_physics_switches_default_to_the_model(self):
+        """Keep physical behavior local to the model unless a solver-wide override is requested.
 
-        The deliberate exceptions are opt-in and off by default: ``enable_joint_limits``, like the
-        reference solver's, the experimental ``contact_compliance``, and the experimental
-        ``friction_mode``, whose default is the standard Coulomb update.
+        ``enable_joint_limits``, the experimental ``contact_compliance`` and the experimental
+        ``friction_mode`` are opt-in. The solver-wide damping, friction and restitution overrides
+        default to the values that leave the model's per-body and per-shape properties in charge.
         """
         parameters = inspect.signature(SolverFeatherPGS.__init__).parameters
         for opt_in in ("enable_joint_limits", "contact_compliance"):
@@ -101,22 +101,33 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                 self.assertIs(parameters[opt_in].default, False)
         self.assertEqual(parameters["friction_mode"].default, "current")
         self.assertIn(".. experimental::", SolverFeatherPGS.__doc__)
-        for removed in (
-            "angular_damping",
-            "enable_contact_friction",
-            "enable_restitution",
+        for option, default in (
+            ("angular_damping", None),
+            ("enable_contact_friction", True),
+            ("contact_friction_scale", 1.0),
+            ("contact_friction_position_iterations", -1),
+            ("enable_restitution", True),
         ):
-            with self.subTest(option=removed):
-                self.assertNotIn(removed, parameters)
+            with self.subTest(option=option):
+                self.assertEqual(parameters[option].default, default)
 
     def test_pgs_mode_selects_only_the_supported_solves(self):
         """Offer exactly the matrix-free and split solves, with the matrix-free solve as the default."""
         parameter = inspect.signature(SolverFeatherPGS.__init__).parameters["pgs_mode"]
         self.assertEqual(parameter.default, "matrix_free")
         self.assertEqual(typing.get_args(parameter.annotation), ("matrix_free", "split"))
-        for option in ("pgs_kernel", "delassus_kernel", "tile_threads", "pgs_chunk_size"):
+        parameters = inspect.signature(SolverFeatherPGS.__init__).parameters
+        self.assertNotIn("delassus_kernel", parameters)
+        for option, default in (
+            ("pgs_kernel", "auto"),
+            ("pgs_chunk_size", None),
+            ("tile_threads", 64),
+            ("serial_kernel_block_dim", 256),
+            ("pgs_debug", False),
+            ("nvtx", False),
+        ):
             with self.subTest(option=option):
-                self.assertNotIn(option, inspect.signature(SolverFeatherPGS.__init__).parameters)
+                self.assertEqual(parameters[option].default, default)
 
     def test_solver_reads_no_environment_variables(self):
         """Configure the solver only through its constructor, never through the environment."""
