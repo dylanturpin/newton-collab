@@ -9,22 +9,22 @@ spin row resists relative rotation about the normal and the rolling pair about t
 contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
 five friction rows of a contact as one block: it minimizes the block's quadratic over a
 joint cone in coefficient-normalized impulses ``(f_t / mu, tau_s / mu_s, tau_r / mu_r)``.
-Rows with no coefficient or no response stay at zero. The block is eigendecomposed, so
-rows that depend on each other share their impulse instead of breaking a factorization, and
-the unconstrained minimizer is taken when it lies inside the cone.
+Rows with no coefficient or no response stay at zero. The unconstrained minimizer is taken
+when it lies inside the cone.
 
 - ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
-  The block is a trust-region subproblem: Newton on its multiplier targets a 1e-6 relative
-  boundary residual within 40 steps, and the result is rescaled into the ball, so it is
-  always feasible and optimal to that tolerance when the iteration converges.
+  The block is a trust-region subproblem. Newton on its multiplier runs over a Cholesky
+  factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
+  collapsed bracket, or 40 steps), an eigendecomposition handles zero-curvature directions
+  and Newton targets 1e-6. The result is rescaled into the ball: always feasible, and
+  optimal to those tolerances when the iteration converges.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
   coordinates finds the face, then reweighted trust-region solves refine on it. This is
   approximate: a block left off the face is not revived, and badly coupled blocks can land
-  away from the optimum. The
-  optimum may share the budget between blocks or stick inside the cone; in quadruped
-  locomotion tests pivoting stance feet put most of it on rolling.
+  away from the optimum. The optimum may share the budget between blocks or stick inside
+  the cone; in quadruped locomotion tests pivoting stance feet put most of it on rolling.
 
 An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
 bound the coefficient times the relative angular rate settles at ``s`` times the load
