@@ -1191,13 +1191,11 @@ def collide_box_box_features(
         normal = wp.where(inv, -1.0, 1.0) * rw @ rnorm
 
     # Past eight candidates, keep distinct incident corners, then reference corners, then edge clips.
-    # Points are in the reference-face frame; each in-plane tolerance stays below a quarter of that face's width.
+    # Candidates of one corner differ by float32 rounding of box-scale coordinates; the tolerance stays at that scale.
     order = _vec8i()
     contact_count = int(n)
     if n > 8:
-        dedup_scale = 1.0e-4 * wp.length(box1_size + box2_size)
-        dedup_x = wp.min(dedup_scale, 0.25 * lx)
-        dedup_y = wp.min(dedup_scale, 0.25 * ly)
+        dedup_tol = 1.0e-6 * wp.length(box1_size + box2_size)
         contact_count = int(0)
         for family in range(2, -1, -1):
             for i in range(n):
@@ -1205,7 +1203,7 @@ def collide_box_box_features(
                     distinct = bool(True)
                     for kept in range(contact_count):
                         offset = points[i] - points[order[kept]]
-                        if wp.abs(offset[0]) < dedup_x and wp.abs(offset[1]) < dedup_y:
+                        if wp.abs(offset[0]) < dedup_tol and wp.abs(offset[1]) < dedup_tol:
                             distinct = False
                     if distinct:
                         order[contact_count] = i
