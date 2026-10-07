@@ -1,0 +1,1 @@
+Fix `SolverFeatherPGS` with `double_buffer=True` failing with CUDA error 904 when a CUDA graph capture is paused between its steps (for example by `wp.capture_if` or `wp.capture_while`, as SolverKamino and SolverImplicitMPM do): `step()` now joins its buffer-clear stream back into the caller stream before returning.

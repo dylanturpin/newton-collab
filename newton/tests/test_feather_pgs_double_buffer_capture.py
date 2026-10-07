@@ -64,6 +64,7 @@ class TestFeatherPGSDoubleBufferCapture(unittest.TestCase):
             self.skipTest("requires conditional graph nodes")
 
     def test_capture_pause_after_double_buffered_step(self):
+        """A capture pause between double-buffered steps succeeds and matches single buffering."""
         solver, body_q, body_qd = _run(self.device, True, True, replays=20)
         self.assertIsNotNone(solver._memset_stream)
         _, ref_q, ref_qd = _run(self.device, False, True, replays=20)
@@ -71,6 +72,7 @@ class TestFeatherPGSDoubleBufferCapture(unittest.TestCase):
         np.testing.assert_array_equal(body_qd, ref_qd)
 
     def test_double_buffer_matches_single_buffer_without_pause(self):
+        """Captured double-buffered steps match single buffering bitwise."""
         _, body_q, body_qd = _run(self.device, True, False, replays=20)
         _, ref_q, ref_qd = _run(self.device, False, False, replays=20)
         self.assertTrue(np.isfinite(body_q).all())
