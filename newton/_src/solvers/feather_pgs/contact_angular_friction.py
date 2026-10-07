@@ -331,7 +331,6 @@ _PYRAMIDAL_CONSTRAINED = """
 
 
 _BLOCK_SOURCE = """
-    // Kept out of line so contacts without angular rows keep the sweep's register budget.
     struct AngularFrictionBlock {
         typedef float Row[5];
 __PROJECT__
@@ -553,6 +552,25 @@ __PROJECT__
         static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
             bool interior = false;
             if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
+            // Copies keep the operands of the common path out of the call's memory.
+            Row H_copy[5];
+            float c_copy[5], y_copy[5];
+            bool active_copy[5];
+            for (int k = 0; k < 5; ++k) {
+                for (int l = 0; l < 5; ++l) H_copy[k][l] = H[k][l];
+                c_copy[k] = c[k];
+                y_copy[k] = y[k];
+                active_copy[k] = active[k];
+            }
+            interior = dependent_pass(H_copy, c_copy, active_copy, load, y_copy, interior);
+            for (int k = 0; k < 5; ++k) y[k] = y_copy[k];
+            return interior;
+        }
+
+        // The whitened second pass; y keeps the first pass's result unless this one converges to a finite result.
+        // Out of line, so the sweep that inlines the block solve keeps its register budget.
+        static __device__ __noinline__ bool dependent_pass(
+            const Row* H, const float* c, const bool* active, float load, float* y, bool interior) {
             float T[5][5], K[5][5], g[5], mu[5], reduced[5];
             bool independent[5], reduced_interior = false;
             if (!whiten(H, c, active, T, K, g, independent)) return interior;
@@ -570,7 +588,7 @@ __PROJECT__
         }
 
         // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
-        static __device__ __noinline__ float solve(
+        static __device__ __forceinline__ float solve(
             float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y,
             int lane, unsigned MASK, float load, float omega, int* changed) {
                 // Order the sweep's earlier shared writes before these reads, and read once: lanes write back below.
