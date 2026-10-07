@@ -34,7 +34,12 @@ def targets_at_frame(targets: wp.array2d[float], frame: int, out: wp.array[float
 
 @wp.kernel
 def lighter_cam(
-    q_indices: wp.array[int], v_indices: wp.array[int], q: wp.array[float], qd: wp.array[float], forces: wp.array[float]
+    q_indices: wp.array[int],
+    v_indices: wp.array[int],
+    closed_detents: wp.array[float],
+    q: wp.array[float],
+    qd: wp.array[float],
+    forces: wp.array[float],
 ):
     i = wp.tid()
     angle = q[q_indices[i]]
@@ -43,120 +48,7 @@ def lighter_cam(
     # torques derive from an angle-only potential; there is no clock,
     # commanded cap pose or actuator. Thumb contact releases the detent.
     scaled = angle / 0.08
-    forces[v_indices[i]] = 0.01 * (2.4 - angle) - 0.030 * wp.exp(-scaled * scaled) - 0.001 * velocity
-
-
-@wp.kernel
-def set_script_frame(frame: int, out: wp.array[int]):
-    out[0] = frame
-
-
-@wp.kernel
-def lighter_force_reference(
-    q_indices: wp.array[int],
-    v_indices: wp.array[int],
-    q: wp.array[float],
-    qd: wp.array[float],
-    frame: wp.array[int],
-    forces: wp.array[float],
-):
-    i = wp.tid()
-    t = float(frame[0]) / 50.0
-    if t >= 2.5 and t < 4.5:
-        u = wp.clamp((t - 2.5) / 1.2, 0.0, 1.0)
-        desired = 1.95 * u * u * (3.0 - 2.0 * u)
-        torque = wp.clamp(0.25 * (desired - q[q_indices[i]]) - 0.015 * qd[v_indices[i]], -0.08, 0.08)
-        forces[v_indices[i]] += torque
-
-
-@wp.kernel
-def lighter_fitted_force(
-    indices: wp.array2d[int],
-    thumbs: wp.array2d[int],
-    command_coordinates: wp.array2d[int],
-    command_rest: wp.array2d[float],
-    targets: wp.array[float],
-    points: wp.array2d[wp.vec3],
-    q_indices: wp.array[int],
-    v_indices: wp.array[int],
-    q: wp.array[float],
-    qd: wp.array[float],
-    frame: wp.array[int],
-    body_q: wp.array[wp.transform],
-    com: wp.array[wp.vec3],
-    body_f: wp.array[wp.spatial_vector],
-    shape_body: wp.array[int],
-    count: wp.array[int],
-    shape0: wp.array[int],
-    shape1: wp.array[int],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-    dt: float,
-    stats: wp.array2d[float],
-):
-    i = wp.tid()
-    t = float(frame[0]) / 50.0
-    lid, case = indices[i, 0], indices[i, 2]
-    finger = int(-1)
-    p = wp.vec3()
-    best_gap = float(1.0)
-    command_delta = float(0.0)
-    for j in range(5):
-        command_delta += wp.abs(targets[command_coordinates[i, j]] - command_rest[i, j])
-    # Use the actual current narrow-phase surfaces, including capsule radii.
-    # Mesh markers used for pose fitting can be blocked by other thumb links.
-    if t >= 2.5 and t < 4.5 and command_delta > 0.25:
-        for k in range(count[0]):
-            a, b = shape0[k], shape1[k]
-            if a >= 0 and b >= 0:
-                ba, bb = shape_body[a], shape_body[b]
-                other = int(-1)
-                if ba == lid:
-                    other = bb
-                elif bb == lid:
-                    other = ba
-                is_thumb = bool(False)
-                for j in range(4):
-                    if other == thumbs[i, j]:
-                        is_thumb = True
-                if is_thumb:
-                    pa = wp.transform_point(body_q[ba], point0[k])
-                    pb = wp.transform_point(body_q[bb], point1[k])
-                    gap = wp.dot(pb - pa, normal[k]) - margin0[k] - margin1[k]
-                    if gap >= -0.002 and gap <= 0.001 and wp.abs(gap) < best_gap:
-                        best_gap = wp.abs(gap)
-                        finger = other
-                        p = 0.5 * (pa + margin0[k] * normal[k] + pb - margin1[k] * normal[k])
-    if finger >= 0:
-        u = wp.clamp((t - 2.5) / 1.2, 0.0, 1.0)
-        desired = 1.95 * u * u * (3.0 - 2.0 * u)
-        torque = wp.clamp(0.25 * (desired - q[q_indices[i]]) - 0.015 * qd[v_indices[i]], 0.0, 0.08)
-        hinge = wp.transform_point(body_q[case], points[i, 2])
-        axis = wp.transform_vector(body_q[case], points[i, 3])
-        radius = p - hinge
-        tangent = wp.cross(axis, radius)
-        force = torque * tangent / wp.max(wp.dot(tangent, tangent), 1.0e-8)
-        force *= wp.min(1.0, 6.0 / wp.max(wp.length(force), 1.0e-8))
-        wp.atomic_add(
-            body_f, lid, wp.spatial_vector(force, wp.cross(p - wp.transform_point(body_q[lid], com[lid]), force))
-        )
-        wp.atomic_add(
-            body_f,
-            finger,
-            wp.spatial_vector(-force, wp.cross(p - wp.transform_point(body_q[finger], com[finger]), -force)),
-        )
-        if torque > 1.0e-6:
-            if stats[i, 0] == 0.0:
-                stats[i, 5] = t
-            stats[i, 0] += 1.0
-            stats[i, 1] += wp.dot(force, tangent) * dt
-            stats[i, 2] = wp.max(stats[i, 2], wp.length(force))
-            stats[i, 3] = wp.max(stats[i, 3], best_gap)
-            stats[i, 4] += wp.length(force) * dt
-            stats[i, 6] = t
+    forces[v_indices[i]] = 0.01 * (2.4 - angle) - closed_detents[i] * wp.exp(-scaled * scaled) - 0.001 * velocity
 
 
 @wp.kernel
@@ -277,57 +169,8 @@ class Example:
         self.lighter_v = wp.array(
             [w["v_start"] + w["lighter_lid_v"] for w in self.worlds if w.get("lighter")], dtype=int
         )
-        self.script_frame = wp.zeros(1, dtype=int)
-        self.lighter_reference = os.environ.get("HERO_LIGHTER_FORCE_REFERENCE") == "1"
-        lighter_worlds = [w for w in self.worlds if w.get("lighter")]
-        self.lighter_force_fitted = bool(lighter_worlds) and all(w.get("lighter_force_fitted") for w in lighter_worlds)
-        self.lighter_force_bodies = wp.array(
-            np.asarray(
-                [
-                    [
-                        w["body_start"] + w["lighter_lid"],
-                        w["body_start"] + w["thumb_body"],
-                        w["body_start"] + w["tracked_body"],
-                    ]
-                    for w in lighter_worlds
-                ],
-                dtype=np.int32,
-            ).reshape(-1, 3),
-            dtype=int,
-        )
-        self.lighter_force_points = wp.array(
-            np.asarray(
-                [
-                    [
-                        w.get("lighter_lid_contact", [0, 0, 0]),
-                        w.get("lighter_pad_contact", [0, 0, 0]),
-                        w.get("lighter_hinge_anchor", [0, 0, 0]),
-                        w.get("lighter_hinge_axis", [1, 0, 0]),
-                    ]
-                    for w in lighter_worlds
-                ],
-                dtype=np.float32,
-            ).reshape(-1, 4, 3),
-            dtype=wp.vec3,
-        )
-        self.lighter_thumb_bodies = wp.array(
-            np.asarray(
-                [[w["body_start"] + j for j in w["thumb_contact_bodies"]] for w in lighter_worlds],
-                dtype=np.int32,
-            ).reshape(-1, 4),
-            dtype=int,
-        )
-        self.lighter_force_stats = wp.zeros((len(lighter_worlds), 7), dtype=float)
-        self.lighter_command_coordinates = wp.array(
-            np.asarray(
-                [[w["q_start"] + j for j in w["thumb_command_coordinates"]] for w in lighter_worlds],
-                dtype=np.int32,
-            ).reshape(-1, 5),
-            dtype=int,
-        )
-        self.lighter_command_rest = wp.array(
-            np.asarray([w["thumb_command_rest"] for w in lighter_worlds], dtype=np.float32).reshape(-1, 5),
-            dtype=float,
+        self.lighter_detents = wp.array(
+            [w["passive_cam"]["closed_detent_torque"] for w in self.worlds if w.get("lighter")], dtype=float
         )
         self.pipeline = newton.CollisionPipeline(
             self.model,
@@ -363,13 +206,13 @@ class Example:
                 for f in range(self.frames + 1):
                     targets[f, start : start + n] = interpolate(
                         w["waypoints"],
-                        max(0, f / self.fps - w["variant"] * 0.25),
+                        max(0, f / self.fps - w.get("phase_delay", w["variant"] * 0.25)),
                         smooth=not w.get("dense_waypoints", False),
                     )
             for local_index, points in w.get("extra_drives", []):
                 for f in range(self.frames + 1):
                     targets[f, w["q_start"] + local_index] = interpolate(
-                        points, max(0, f / self.fps - w["variant"] * 0.25)
+                        points, max(0, f / self.fps - w.get("phase_delay", w["variant"] * 0.25))
                     )
             if w["policy"]:
                 c = w["policy"]["config"]
@@ -385,7 +228,31 @@ class Example:
                         "prev": wp.zeros((1, n), dtype=float),
                     }
                 )
+        replay = os.environ.get("HERO_REPLAY_JOINT_TARGETS")
+        if replay:
+            targets = np.load(replay)["targets"]
+            assert targets.shape == (self.frames + 1, self.model.joint_coord_count)
         self.targets = wp.array(targets)
+        self.thumb_servos = []
+        for w in self.worlds:
+            if "_thumb_ik_model" not in w or w.get("thumb_frozen") or replay:
+                continue
+            model = w["_thumb_ik_model"]
+            position = ik.IKObjectivePosition(
+                w["thumb_body"], wp.vec3(*w["thumb_tip_point"]), wp.zeros(1, dtype=wp.vec3)
+            )
+            limits = ik.IKObjectiveJointLimit(model.joint_limit_lower, model.joint_limit_upper, weight=5)
+            mask = np.zeros(model.joint_dof_count, dtype=bool)
+            mask[w["thumb_command_coordinates"]] = True
+            solver = ik.IKSolver(
+                model,
+                n_problems=1,
+                objectives=[position, limits],
+                joint_dof_mask=wp.array(mask, dtype=wp.bool),
+                lambda_initial=0.01,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+            )
+            self.thumb_servos.append((w, position, solver, wp.array(model.joint_q.numpy()[None])))
         integral_indices = [w["q_start"] + i for w in self.worlds for i in range(w.get("integral_drive_count", 0))]
         self.integral_indices = wp.array(integral_indices, dtype=int)
         self.drive_integral = wp.zeros(len(integral_indices), dtype=float)
@@ -448,7 +315,8 @@ class Example:
 
     def reset(self):
         self.drive_integral.zero_()
-        self.lighter_force_stats.zero_()
+        for world in self.worlds:
+            world.pop("_thumb_released", None)
         for policy in self.hora_policies:
             policy.reset()
         for *_, servo in self.insertion_servos:
@@ -482,62 +350,17 @@ class Example:
                     inputs=[
                         self.lighter_q,
                         self.lighter_v,
+                        self.lighter_detents,
                         self.state_0.joint_q,
                         self.state_0.joint_qd,
                         self.control.joint_f,
                     ],
                 )
-                if self.lighter_reference:
-                    wp.launch(
-                        lighter_force_reference,
-                        dim=len(self.lighter_q),
-                        inputs=[
-                            self.lighter_q,
-                            self.lighter_v,
-                            self.state_0.joint_q,
-                            self.state_0.joint_qd,
-                            self.script_frame,
-                            self.control.joint_f,
-                        ],
-                    )
             self.pipeline.collide(self.state_0, self.contacts)
-            if self.lighter_force_fitted:
-                wp.launch(
-                    lighter_fitted_force,
-                    dim=len(self.lighter_q),
-                    inputs=[
-                        self.lighter_force_bodies,
-                        self.lighter_thumb_bodies,
-                        self.lighter_command_coordinates,
-                        self.lighter_command_rest,
-                        self.control.joint_target_q,
-                        self.lighter_force_points,
-                        self.lighter_q,
-                        self.lighter_v,
-                        self.state_0.joint_q,
-                        self.state_0.joint_qd,
-                        self.script_frame,
-                        self.state_0.body_q,
-                        self.model.body_com,
-                        self.state_0.body_f,
-                        self.model.shape_body,
-                        self.contacts.rigid_contact_count,
-                        self.contacts.rigid_contact_shape0,
-                        self.contacts.rigid_contact_shape1,
-                        self.contacts.rigid_contact_point0,
-                        self.contacts.rigid_contact_point1,
-                        self.contacts.rigid_contact_normal,
-                        self.contacts.rigid_contact_margin0,
-                        self.contacts.rigid_contact_margin1,
-                        self.dt,
-                        self.lighter_force_stats,
-                    ],
-                )
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self, f):
-        wp.launch(set_script_frame, dim=1, inputs=[f, self.script_frame])
         wp.launch(
             targets_at_frame, dim=self.model.joint_coord_count, inputs=[self.targets, f, self.control.joint_target_q]
         )
@@ -553,6 +376,49 @@ class Example:
                     1 / self.fps,
                 ],
             )
+        if self.thumb_servos:
+            body_q, joint_q = self.state_0.body_q.numpy(), self.state_0.joint_q.numpy()
+            commanded = self.control.joint_target_q.numpy()
+            for w, position, solver, q in self.thumb_servos:
+                t = f / self.fps
+                if t < 1.8:
+                    continue
+                case = wp.transform(*body_q[w["body_start"] + w["tracked_body"]])
+                lid = wp.transform(*body_q[w["body_start"] + w["lighter_lid"]])
+                config = w["thumb_feedback"]
+                point = wp.transform_point(lid, wp.vec3(*config.get("contact_point", [0.021, -0.012, 0.060])))
+                hinge = wp.transform_point(case, wp.vec3(*w["lighter_hinge_anchor"]))
+                axis = wp.transform_vector(case, wp.vec3(*w["lighter_hinge_axis"]))
+                tangent = wp.normalize(wp.cross(axis, point - hinge))
+                normal = wp.transform_vector(
+                    lid, wp.normalize(wp.vec3(*config.get("contact_normal", [1.0, -0.25, 0.0])))
+                )
+                angle = joint_q[w["q_start"] + w["lighter_lid_q"]]
+                if angle > config.get("release_angle", math.inf):
+                    w["_thumb_released"] = True
+                if w.get("_thumb_released"):
+                    release = config.get("release_joints", w["thumb_command_rest"])
+                    for local, value in zip(w["thumb_command_coordinates"], release, strict=True):
+                        commanded[w["q_start"] + local] = value
+                    continue
+                approach = np.clip((t - 1.8) / 1.0, 0.0, 1.0)
+                if angle > 1.5:
+                    goal = point + 0.025 * normal - wp.transform_vector(case, wp.vec3(0.0, 0.025, 0.0))
+                else:
+                    goal = point + float(approach * config["lead"]) * tangent
+                    goal += float(0.010 * (1 - approach) - config["depth"] * approach) * normal
+                position.set_target_position(0, goal)
+                count = w["arm_dofs"]
+                seed = joint_q[w["q_start"] : w["q_start"] + count].copy()
+                if "ik_seed" in config:
+                    seed[w["thumb_command_coordinates"]] = config["ik_seed"]
+                q.assign(seed[None])
+                solver.reset()
+                solver.step(q, q, iterations=20)
+                result = q.numpy()[0]
+                for local in w["thumb_command_coordinates"]:
+                    commanded[w["q_start"] + local] = result[local]
+            self.control.joint_target_q.assign(commanded)
         active = [
             item
             for item in self.insertion_servos
@@ -563,7 +429,7 @@ class Example:
         if active:
             body_q, joint_q = self.state_0.body_q.numpy(), self.state_0.joint_q.numpy()
             for w, position, rotation, solver, q, servo in active:
-                t = f / self.fps - w["variant"] * 0.25
+                t = f / self.fps - w.get("phase_delay", w["variant"] * 0.25)
                 key = wp.transform(*body_q[w["body_start"] + w["tracked_body"]])
                 hand = wp.transform(*body_q[w["body_start"] + w["servo_ee"]])
                 relative = wp.transform_inverse(hand) * key
@@ -766,28 +632,20 @@ class Example:
             self.graph = capture.graph
         self.reset()
         poses = [self.state_0.body_q.numpy()]
+        joint_positions = [self.state_0.joint_q.numpy()]
+        commands = []
         started = time.perf_counter()
         for f in range(self.frames):
             self.step(f)
             poses.append(self.state_0.body_q.numpy())
+            joint_positions.append(self.state_0.joint_q.numpy())
+            commands.append(self.control.joint_target_q.numpy())
             if f % 100 == 0:
                 print(f"Simulated {f / self.fps:.1f}s/{self.args.duration}s", flush=True)
+        commands.append(commands[-1].copy())
+        np.savez_compressed(self.args.output / "executed-joint-targets.npz", targets=np.asarray(commands), fps=self.fps)
         self.poses = np.asarray(poses, dtype=np.float32)
         self.wall = time.perf_counter() - started
-        force_stats = self.lighter_force_stats.numpy()
-        for i, world in enumerate(w for w in self.worlds if w.get("lighter")):
-            if world.get("lighter_force_fitted"):
-                values = force_stats[i]
-                world["thumb_force_execution"] = {
-                    "applied_substeps": int(values[0]),
-                    "hinge_torque_impulse_Nms": float(values[1]),
-                    "peak_force_N": float(values[2]),
-                    "maximum_contact_surface_gap_m": float(values[3]),
-                    "force_impulse_Ns": float(values[4]),
-                    "first_force_time_s": float(values[5]),
-                    "last_force_time_s": float(values[6]),
-                    "equal_opposite_reaction_at_same_point": True,
-                }
         summary = {
             "worlds": [
                 {k: v for k, v in w.items() if k not in ("waypoints", "policy") and not k.startswith("_")}
@@ -796,7 +654,9 @@ class Example:
             "body_labels": self.model.body_label,
         }
         (self.args.output / "model-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        np.savez_compressed(self.args.output / "trace.npz", poses=self.poses, fps=self.fps)
+        np.savez_compressed(
+            self.args.output / "trace.npz", poses=self.poses, joint_positions=np.asarray(joint_positions), fps=self.fps
+        )
         self.test_final()
 
     def test_final(self):

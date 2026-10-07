@@ -346,6 +346,9 @@ def audit(folder):
             )
             relative = Rotation.from_quat(palm[:, 3:]).inv().apply(obj[:, :3] - palm[:, :3])
             check.update(
+                case_tilt_degrees=float(
+                    np.rad2deg(np.arccos(np.clip(body_rotation.as_matrix()[:, 2, 2], -1, 1))).max()
+                ),
                 lid_opening_degrees=float(np.rad2deg(angle.max())),
                 final_lid_angle_degrees=float(np.rad2deg(angle[-1])),
                 pre_action_lid_angle_degrees=float(np.rad2deg(np.abs(angle[: int(1.5 * fps)]).max())),
@@ -353,42 +356,15 @@ def audit(folder):
                 unpowered_hinge=not world["lighter_hinge_actuated"] and not world.get("force_authoring"),
                 force_authoring=world.get("force_authoring"),
             )
-            if world.get("lighter_force_fitted"):
-                finger = poses[:, start + world["thumb_body"]]
-                lid = poses[:, start + world["lighter_lid"]]
-                pad = finger[:, :3] + Rotation.from_quat(finger[:, 3:]).apply(
-                    np.tile(world["lighter_pad_contact"], (len(finger), 1))
-                )
-                contact = lid[:, :3] + Rotation.from_quat(lid[:, 3:]).apply(
-                    np.tile(world["lighter_lid_contact"], (len(lid), 1))
-                )
-                times = np.arange(len(poses)) / fps
-                candidate = (times >= 2.5) & (times < 4.5)
-                gap = np.linalg.norm(pad - contact, axis=1)
-                enabled = candidate & (gap <= 0.005)
-                check["fitted_marker_near_lid_frames"] = int(enabled.sum())
-                check["minimum_fitted_marker_gap_mm"] = float(1000 * gap[candidate].min())
-                check["hinge_position_drive"] = world["lighter_hinge_actuated"]
-                execution = world.get("thumb_force_execution", {})
-                check["thumb_force_execution"] = execution
-                check["actual_thumb_contact_force_pass"] = bool(
-                    execution.get("applied_substeps", 0) >= 3
-                    and execution.get("hinge_torque_impulse_Nms", 0) > 1.0e-6
-                    and execution.get("peak_force_N", 1.0e9) <= 6.001
-                    and execution.get("maximum_contact_surface_gap_m", 1.0) <= 0.001001
-                    and execution.get("equal_opposite_reaction_at_same_point", False)
-                )
             check["pass"] = bool(
                 not world.get("lighter_force_reference", False)
-                and (
-                    check["unpowered_hinge"]
-                    or world.get("force_authoring", {}).get("method") == "fitted finger force script"
-                )
+                and not world.get("lighter_force_fitted", False)
+                and check["unpowered_hinge"]
                 and check["lid_opening_degrees"] > 80
                 and check["final_lid_angle_degrees"] > 75
                 and check["pre_action_lid_angle_degrees"] < 8
                 and check["case_grasp_slip_mm"] < 20
-                and (not world.get("lighter_force_fitted") or check["actual_thumb_contact_force_pass"])
+                and check["case_tilt_degrees"] < 30
             )
         elif world.get("plate_rack"):
             rotation = Rotation.from_quat(obj[:, 3:])

@@ -65,9 +65,11 @@ def main():
     (args.output / "textures").mkdir(exist_ok=True)
     report = json.loads((args.run / "report.json").read_text())
     summary = json.loads((args.run / "model-summary.json").read_text())
-    assert args.diagnostic or not any(w.get("lighter_force_reference") for w in summary["worlds"]), (
-        "Force-authoring reference recordings are diagnostic only"
-    )
+    assert args.diagnostic or not any(
+        w.get("lighter")
+        and (w.get("lighter_force_reference") or w.get("lighter_force_fitted") or w.get("force_authoring"))
+        for w in summary["worlds"]
+    ), "Assisted lighter recordings are diagnostic only"
     assert report["quality_gate_passed"] or args.diagnostic
     trace_path = args.run / "trace.npz"
     assert hashlib.sha256(trace_path.read_bytes()).hexdigest() == report["trace_sha256"]
