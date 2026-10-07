@@ -132,6 +132,17 @@ def test_convex_contact_witness(test, device, *, swap=False, margin=0.0, capture
         delta_rotation = wp.quat_from_axis_angle(wp.vec3(direction), angle)
         poses.append((position + delta_position, delta_rotation * rotation))
 
+    raycast_pose_index = len(poses)
+    # This pose reaches the raycast fallback. Its support points lie on the
+    # hulls but lose surface membership if the writer projects them onto a
+    # normal that is not aligned with their difference.
+    poses.append(
+        (
+            np.array([0.030662711709737778, 0.03921249508857727, 0.15601256489753723]),
+            wp.quat(0.4862031936645508, 0.7860594987869263, -0.33473095297813416, 0.18349947035312653),
+        )
+    )
+
     offset = wp.vec3(0.1, -0.03, 0.02)
     builder = newton.ModelBuilder()
     for side in range(2):
@@ -196,6 +207,10 @@ def test_convex_contact_witness(test, device, *, swap=False, margin=0.0, capture
                     test.assertAlmostEqual(depth, -0.001, delta=1.0e-5)
                 else:
                     test.assertGreater(depth, 0.0)
+                if pose_index == raycast_pose_index:
+                    # Preserve the original ray's 65.76 mm depth bound;
+                    # aligning distant support vertices would give 176 mm.
+                    test.assertLessEqual(depth, 0.06576)
                 if pose_index == 0 or (capture and pose_index == len(poses) - 1):
                     # Independent FP64 convex Minkowski-difference boundary calculation.
                     test.assertAlmostEqual(depth, 0.05254986867157328, delta=1.0e-5)
@@ -346,40 +361,86 @@ add_function_test(
 )
 
 
-def test_convex_contact_shallow_cubes(test, device):
-    """Keep a shallow cube contact on its minimum face when the raycast refines it."""
-    # Pose captured from a collapsed cube pile. The portal misses the minimum
-    # certificate by its convergence tolerance, and a raycast candidate
-    # shifted along a tilted ray must not tilt the normal.
-    normal = wp.zeros(1, dtype=wp.vec3, device=device)
-    depth = wp.zeros(1, dtype=float, device=device)
-    wp.launch(
-        _resting_box_kernel,
-        dim=1,
-        inputs=[
-            wp.vec3(0.4),
-            wp.vec3(0.4),
+def _box_minimum_depth(half, rotation, position):
+    """Return the FP64 separating-axis depth of two equal boxes, B posed in A's frame."""
+    axes_b = np.array([wp.quat_rotate(rotation, wp.vec3(*axis)) for axis in np.eye(3)], dtype=np.float64)
+    axes = [*np.eye(3), *axes_b, *(np.cross(a, b) for a in np.eye(3) for b in axes_b)]
+    depth = np.inf
+    for axis in axes:
+        length = np.linalg.norm(axis)
+        if length > 1.0e-12:
+            unit = axis / length
+            radius = half * (np.sum(np.abs(unit)) + np.sum(np.abs(axes_b @ unit)))
+            depth = min(depth, radius - abs(float(np.dot(unit, position))))
+    return depth
+
+
+def test_convex_contact_shallow_cubes(test, device, *, split=False):
+    """Report no contact deeper than the minimum for shallow cube contacts that need refinement."""
+    # Relative poses captured from a collapsed cube pile where refinement once
+    # reported a far Minkowski corner, or a normal tilted by the ray shift, and
+    # launched cubes. The portal misses the minimum certificate by its
+    # convergence tolerance, so refinement runs.
+    poses = (
+        (
+            wp.quat(-0.0011170628713443875, 1.7762567949830554e-05, -0.004657822661101818, 0.9999886751174927),
+            wp.vec3(0.4209620952606201, -6.29425048828125e-05, 0.8006205558776855),
+        ),
+        (
             wp.quat(-0.0001483643427491188, -0.006294019520282745, 1.2986361980438232e-05, 0.9999802112579346),
             wp.vec3(0.8049442768096924, -6.67572021484375e-06, 0.005084991455078125),
-        ],
-        outputs=[normal, depth],
-        device=device,
+        ),
     )
-    np.testing.assert_allclose(normal.numpy()[0], (1.0, 0.0, 0.0), atol=1.0e-3)
-    test.assertAlmostEqual(float(depth.numpy()[0]), 6.8724155e-05, delta=1.0e-5)
+    half = 0.4
+    for case, (rotation, position) in enumerate(poses):
+        with test.subTest(case=case):
+            builder = newton.ModelBuilder()
+            builder.add_shape_box(-1, hx=half, hy=half, hz=half)
+            body = builder.add_body(xform=wp.transform(position, rotation))
+            builder.add_shape_box(body, hx=half, hy=half, hz=half)
+            model = builder.finalize(device)
+            pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+            test.assertEqual(pipeline.narrow_phase.split_gjk_mpr, split)
+            contacts = pipeline.contacts()
+            state = model.state()
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertGreater(count, 0)
+            pose = wp.transform(*state.body_q.numpy()[body])
+            depths = []
+            for contact in range(count):
+                points = [
+                    contacts.rigid_contact_point0.numpy()[contact],
+                    contacts.rigid_contact_point1.numpy()[contact],
+                ]
+                if int(contacts.rigid_contact_shape0.numpy()[contact]) == 1:
+                    points.reverse()
+                points[1] = np.asarray(wp.transform_point(pose, wp.vec3(points[1])))
+                sign = 1.0 if int(contacts.rigid_contact_shape0.numpy()[contact]) == 0 else -1.0
+                normal = sign * contacts.rigid_contact_normal.numpy()[contact]
+                depths.append(-float(np.dot(points[1] - points[0], normal)))
+            # The deepest contact must match the minimum penetration depth.
+            test.assertAlmostEqual(max(depths), _box_minimum_depth(half, rotation, position), delta=1.0e-5)
 
 
-add_function_test(
-    TestConvexContactWitness,
-    "test_convex_contact_shallow_cubes",
-    test_convex_contact_shallow_cubes,
-    devices=get_test_devices(),
-)
+def test_convex_contact_shallow_cubes_split(test, device):
+    """Report no contact deeper than the minimum through the split CUDA collision kernels."""
+    if not device.is_cuda:
+        test.skipTest("Split collision kernels run only on CUDA")
+    with patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0):
+        test_convex_contact_shallow_cubes(test, device, split=True)
+
+
+for function in (test_convex_contact_shallow_cubes, test_convex_contact_shallow_cubes_split):
+    add_function_test(TestConvexContactWitness, function.__name__, function, devices=get_test_devices())
 
 
 def test_convex_contact_witness_swapped(test, device):
     """Preserve surface membership when the two convex hulls are inserted in reverse order."""
     test_convex_contact_witness(test, device, swap=True)
+    # Margins remove the inflation, so the raycast must certify its first
+    # candidate even when it ties the fallback ray's depth.
+    test_convex_contact_witness(test, device, swap=True, margin=0.0001)
 
 
 add_function_test(

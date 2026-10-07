@@ -480,6 +480,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         extend: float,
         data_provider: Any,
         normal: wp.vec3,
+        COLLIDE_EPSILON: float,
     ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float, bool]:
         """Refine an inflated overlap and report whether the physical contact is resolved."""
         direction = wp.normalize(normal)
@@ -504,7 +505,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         point_b -= normal * (0.5 * extend)
 
         for _optimization in range(4):
-            support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, extend, data_provider)
+            support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, 0.0, data_provider)
             translation = wp.dot(support.BtoA, direction) + 1e-5 * tolerance
             gradient = direction
             for _ray_step in range(30):
@@ -513,7 +514,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     geom_b,
                     orientation_b,
                     position_b + translation * direction,
-                    extend,
+                    0.0,
                     data_provider,
                     30,
                     1e-7 * tolerance,
@@ -521,11 +522,11 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 if not separated or not wp.isfinite(gap) or gap < 0.0:
                     break
                 pb = pb - translation * direction
-                # Remove inflation in the separating direction, then align the
-                # contact normal with the physical witnesses, keeping the sign
-                # of a physical gap. Writers reconstruct them from midpoint and
-                # normal/depth.
-                physical_delta = pa - pb - separating_normal * extend
+                # Query physical shapes so the witnesses remain inside them.
+                # Align the contact normal with their difference, preserving
+                # the sign of a physical gap. Midpoint writers can then
+                # reconstruct both witnesses without a tangential shift.
+                physical_delta = pa - pb
                 physical_length = wp.length(physical_delta)
                 physical_depth = physical_length
                 if wp.dot(physical_delta, separating_normal) < 0.0:
@@ -544,15 +545,22 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     geom_a, geom_b, candidate, orientation_b, position_b, extend, data_provider
                 )
                 support_gap = wp.dot(certificate.BtoA, candidate) - depth
+                # For physical witnesses inside the hulls, this sum of
+                # support deficits bounds each witness's surface error. The
+                # budget is the portal's contact tolerance scaled by
+                # coordinate magnitude, like the other raycast tolerances.
+                accuracy = COLLIDE_EPSILON * tolerance
+                # Depths are support-plane depths within that budget; a
+                # certified pair as deep as the fallback ray must win.
                 if (
                     wp.isfinite(depth)
                     and depth >= 0.0
-                    and physical_length <= wp.abs(penetration - extend)
+                    and physical_length <= wp.abs(penetration - extend) + accuracy
                     and wp.abs(wp.length_sq(separating_normal) - 1.0) <= 1e-4
-                    and wp.abs(support_gap) <= 1e-6 * tolerance
+                    and wp.abs(support_gap) <= accuracy
                 ):
                     normal = candidate
-                    correction = (normal - separating_normal) * (0.5 * extend)
+                    correction = normal * (0.5 * extend)
                     point_a = pa + correction
                     point_b = pb - correction
                     penetration = depth
@@ -639,7 +647,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             last_normal = normal
         if not valid:
             point_a, point_b, normal, penetration, valid = solve_mpr_raycast(
-                geom_a, geom_b, orientation_b, position_b, extend, data_provider, normal
+                geom_a, geom_b, orientation_b, position_b, extend, data_provider, normal, COLLIDE_EPSILON
             )
         return point_a, point_b, normal, penetration, valid
 
@@ -742,7 +750,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         return collision, signed_distance, point, normal
 
     solve_mpr.core = solve_mpr_core
-    # Split collision kernels refine unresolved portals in their GJK pass so
+    # Split collision kernels refine unresolved portals in a separate pass so
     # the common MPR pass does not carry the raycast's register/local storage.
     solve_mpr.portal_core = solve_mpr_portal
     solve_mpr.needs_certificate = solve_mpr_needs_certificate
