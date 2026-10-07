@@ -182,3 +182,21 @@ named close-ups and final zoom-out, fully decodes each MP4, verifies native
 The accepted lighter is one 4.5-second shot; the new wrecking shot is
 10 seconds to include the turn, impact, release, and retreat. Existing
 unchanged close-ups are reused without re-encoding.
+
+## 96-tile paper teaser
+
+`expand_replay_still.py --source METAL_EXPORT --output DIR` creates a
+single-frame, seeded 12x8 arrangement of 96 replicas from the accepted
+recordings. It balances template counts, varies recorded action phases,
+whole-tile yaw/placement, and table finishes. Every pose is transformed
+rigidly as a whole scene; inverse-transform assertions preserve the source
+configuration. This is a presentation of recorded replicas, not validation
+of a new 96-world simultaneous simulation.
+
+The distant overview uses simplified display meshes; the three close-ups
+retain the original detailed meshes. Dependencies are available with
+`uv run --with fast-simplification --with scipy`.
+
+`layout_paper_teaser.py FOLDER` assembles the 3600x2400 overview and three
+1600x1000 manipulation renders into a 4920x2448 PNG and SVG with a clean
+right-hand column. It uses Matplotlib and adds no labels or overlays.
