@@ -15,9 +15,10 @@ when it lies inside the cone.
 - ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
   The block is a trust-region subproblem. Newton on its multiplier runs over a Cholesky
   factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
-  collapsed bracket, or 40 steps), an eigendecomposition handles zero-curvature directions
-  and Newton targets 1e-6. The result is rescaled into the ball: always feasible, and
-  optimal to those tolerances when the iteration converges.
+  collapsed bracket, or 40 steps), the block is solved again with each dependent row written
+  over the independent ones, which keeps the least-norm impulses and a definite system. The
+  result is rescaled into the ball: always feasible, and optimal to that tolerance when the
+  iteration converges.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
@@ -334,115 +335,6 @@ _BLOCK_SOURCE = """
         typedef float Row[5];
 __PROJECT__
 
-        // Jacobi eigendecomposition H = Q diag(lambda) Q' over the active rows. A direction whose eigenvalue is
-        // below 1e-6 of its own diagonal curvature gets lambda = 0, which marks dependent rows.
-        static __device__ void decompose(const Row* H, const bool* active, Row* Q, float* lambda) {
-            float A[5][5], curvature[5];
-            for (int k = 0; k < 5; ++k) {
-                curvature[k] = active[k] ? fmaxf(H[k][k], 0.0f) : 0.0f;
-                for (int l = 0; l < 5; ++l) {
-                    A[k][l] = active[k] && active[l] ? H[k][l] : 0.0f;
-                    Q[k][l] = k == l ? 1.0f : 0.0f;
-                }
-            }
-            for (int sweep = 0; sweep < 12; ++sweep) {
-                bool rotated = false;
-                for (int p = 0; p < 4; ++p) {
-                    for (int q = p + 1; q < 5; ++q) {
-                        float apq = A[p][q];
-                        if (!(fabsf(apq) > 1.0e-7f * sqrtf(fabsf(A[p][p] * A[q][q])))) continue;
-                        rotated = true;
-                        float theta = (A[q][q] - A[p][p]) / (2.0f * apq);
-                        float t = fabsf(theta) > 1.0e18f
-                            ? 0.5f / theta
-                            : copysignf(1.0f, theta) / (fabsf(theta) + sqrtf(1.0f + theta * theta));
-                        float cs = 1.0f / sqrtf(1.0f + t * t), sn = t * cs;
-                        A[p][p] -= t * apq;
-                        A[q][q] += t * apq;
-                        A[p][q] = 0.0f;
-                        A[q][p] = 0.0f;
-                        for (int r = 0; r < 5; ++r) {
-                            if (r != p && r != q) {
-                                float arp = A[r][p], arq = A[r][q];
-                                A[r][p] = A[p][r] = cs * arp - sn * arq;
-                                A[r][q] = A[q][r] = sn * arp + cs * arq;
-                            }
-                            float qrp = Q[r][p], qrq = Q[r][q];
-                            Q[r][p] = cs * qrp - sn * qrq;
-                            Q[r][q] = sn * qrp + cs * qrq;
-                        }
-                    }
-                }
-                if (!rotated) break;
-            }
-            for (int i = 0; i < 5; ++i) {
-                float scale = 0.0f;
-                for (int k = 0; k < 5; ++k) scale += Q[k][i] * Q[k][i] * curvature[k];
-                lambda[i] = A[i][i] > 1.0e-6f * scale ? A[i][i] : 0.0f;
-            }
-        }
-
-        // The ball subproblem by eigendecomposition, which dependent rows cannot break; true when interior.
-        // Boundary: y = -(H + alpha I)^+ c with Newton on 1 / |y(alpha)| from a point below the root, stopping
-        // on a 1e-6 relative boundary residual or after 40 steps, then rescaled into the ball.
-        static __device__ __noinline__ bool eigen_ball(const Row* H, const float* c, const bool* active, float load, float* y) {
-            float Q[5][5], lambda[5], projected[5], c_norm = 0.0f;
-            decompose(H, active, Q, lambda);
-            for (int k = 0; k < 5; ++k) c_norm += active[k] ? c[k] * c[k] : 0.0f;
-            c_norm = sqrtf(c_norm);
-            // Along a zero-curvature direction, a gradient component under 1e-5 |c| is round-off of a consistent
-            // system; a larger one makes the quadratic unbounded there, so the minimizer is on the boundary.
-            bool bounded = true;
-            for (int i = 0; i < 5; ++i) {
-                projected[i] = 0.0f;
-                for (int k = 0; k < 5; ++k) projected[i] += active[k] ? Q[k][i] * c[k] : 0.0f;
-                if (lambda[i] == 0.0f) {
-                    if (fabsf(projected[i]) <= 1.0e-5f * c_norm) projected[i] = 0.0f;
-                    else bounded = false;
-                }
-            }
-            float alpha = 0.0f, norm = 0.0f;
-            if (bounded) {
-                for (int i = 0; i < 5; ++i)
-                    if (projected[i] != 0.0f) norm += (projected[i] / lambda[i]) * (projected[i] / lambda[i]);
-                norm = sqrtf(norm);
-            }
-            bool interior = bounded && norm <= load;
-            if (!interior && load > 0.0f) {
-                // |y(alpha)| >= |c_i| / (lambda_i + alpha), so this alpha is at most the root.
-                for (int i = 0; i < 5; ++i) alpha = fmaxf(alpha, fabsf(projected[i]) / load - lambda[i]);
-                for (int iteration = 0; iteration < 40; ++iteration) {
-                    float squared = 0.0f, cubed = 0.0f;
-                    for (int i = 0; i < 5; ++i) {
-                        if (projected[i] == 0.0f) continue;
-                        float denominator = lambda[i] + alpha, ratio = projected[i] / denominator;
-                        squared += ratio * ratio;
-                        cubed += ratio * ratio / denominator;
-                    }
-                    norm = sqrtf(squared);
-                    if (!(norm > (1.0f + 1.0e-6f) * load)) break;
-                    float next = alpha + squared * (norm - load) / (load * cubed);
-                    if (!(next > alpha)) break;
-                    alpha = next;
-                }
-            }
-            for (int k = 0; k < 5; ++k) y[k] = 0.0f;
-            if (!(load > 0.0f)) return false;
-            for (int i = 0; i < 5; ++i) {
-                if (projected[i] == 0.0f) continue;
-                float weight = projected[i] / (lambda[i] + alpha);
-                for (int k = 0; k < 5; ++k) y[k] -= weight * Q[k][i];
-            }
-            norm = 0.0f;
-            for (int k = 0; k < 5; ++k) norm += y[k] * y[k];
-            norm = sqrtf(norm);
-            if (norm > load) {
-                float scale = load / norm;
-                for (int k = 0; k < 5; ++k) y[k] *= scale;
-            }
-            return interior;
-        }
-
         // A row takes part when it is active and has curvature; other rows keep zero impulse.
         static __device__ bool live(const Row* H, const bool* active, int k) {
             return active[k] && H[k][k] > 0.0f;
@@ -536,12 +428,128 @@ __PROJECT__
             return converged;
         }
 
-        // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows; true when the minimizer is interior.
-        // Cholesky is accurate on graded blocks; dependent rows that defeat it fall back to the eigensolve.
+        // Rewrites the ball subproblem for dependent rows, those whose Cholesky pivot keeps under 1e-6 of their
+        // diagonal. Each is a combination of earlier independent rows, row_d = sum_i B_id row_i, and impulses
+        // y = B' lambda are the least-norm ones for their effect, so |y| = |lambda|_N with N = B B' = R R'. With
+        // mu = R' lambda the subproblem is again a Euclidean ball: K = R^-1 B H B' R^-T, g = R^-1 B c on the
+        // independent rows; y = T mu with T = B' R^-T.
+        static __device__ void whiten(
+            const Row* H, const float* c, const bool* active, Row* T, Row* K, float* g, bool* independent) {
+            float B[5][5], N[5][5], R[5][5], L[5][5];
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k) {
+                independent[k] = live(H, active, k);
+                #pragma unroll 1
+                for (int l = 0; l < 5; ++l) {
+                    L[k][l] = 0.0f;
+                    B[k][l] = k == l && independent[k] ? 1.0f : 0.0f;
+                }
+            }
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k) {
+                if (!independent[k]) continue;
+                #pragma unroll 1
+                for (int l = 0; l < k; ++l) {
+                    if (!independent[l]) continue;
+                    float value = H[k][l];
+                    #pragma unroll 1
+                    for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
+                    L[k][l] = value / L[l][l];
+                }
+                float pivot = H[k][k];
+                #pragma unroll 1
+                for (int m = 0; m < k; ++m) pivot -= L[k][m] * L[k][m];
+                if (pivot > 1.0e-6f * H[k][k]) {
+                    L[k][k] = sqrtf(pivot);
+                    continue;
+                }
+                // Dependent: solve L_I' a = L[k][I] for its coefficients over the earlier independent rows.
+                independent[k] = false;
+                #pragma unroll 1
+                for (int m = k - 1; m >= 0; --m) {
+                    if (!independent[m]) continue;
+                    float value = L[k][m];
+                    #pragma unroll 1
+                    for (int j = m + 1; j < k; ++j) value -= independent[j] ? L[j][m] * B[j][k] : 0.0f;
+                    B[m][k] = value / L[m][m];
+                }
+                #pragma unroll 1
+                for (int m = 0; m < 5; ++m) L[k][m] = 0.0f;
+            }
+            // Reduced problem over lambda: K = B H B', N = B B', g = B c, on the independent rows.
+            #pragma unroll 1
+            for (int i = 0; i < 5; ++i) {
+                g[i] = 0.0f;
+                #pragma unroll 1
+                for (int k = 0; k < 5; ++k) g[i] += B[i][k] * (active[k] ? c[k] : 0.0f);
+                #pragma unroll 1
+                for (int j = 0; j < 5; ++j) {
+                    float h = 0.0f, n = 0.0f;
+                    #pragma unroll 1
+                    for (int k = 0; k < 5; ++k) {
+                        n += B[i][k] * B[j][k];
+                        #pragma unroll 1
+                        for (int l = 0; l < 5; ++l) h += B[i][k] * H[k][l] * B[j][l];
+                    }
+                    K[i][j] = h;
+                    N[i][j] = n;
+                }
+            }
+            // N = R R' (N is at least the identity, so R is well conditioned).
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k)
+                #pragma unroll 1
+                for (int l = 0; l <= k; ++l) {
+                    float value = independent[k] && independent[l] ? N[k][l] : (k == l ? 1.0f : 0.0f);
+                    #pragma unroll 1
+                    for (int m = 0; m < l; ++m) value -= R[k][m] * R[l][m];
+                    R[k][l] = k == l ? sqrtf(value) : value / R[l][l];
+                }
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k)
+                #pragma unroll 1
+                for (int l = k + 1; l < 5; ++l) R[k][l] = 0.0f;
+            // K <- R^-1 K R^-T and g <- R^-1 g by forward substitution on columns, then rows.
+            #pragma unroll 1
+            for (int j = 0; j < 5; ++j) {
+                float column[5];
+                #pragma unroll 1
+                for (int k = 0; k < 5; ++k) column[k] = K[k][j];
+                lower(R, column);
+                #pragma unroll 1
+                for (int k = 0; k < 5; ++k) K[k][j] = column[k];
+            }
+            #pragma unroll 1
+            for (int i = 0; i < 5; ++i) lower(R, K[i]);
+            lower(R, g);
+            // T = B' R^-T: row k of T solves R t = B[:, k].
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k) {
+                float column[5];
+                #pragma unroll 1
+                for (int i = 0; i < 5; ++i) column[i] = B[i][k];
+                lower(R, column);
+                #pragma unroll 1
+                for (int i = 0; i < 5; ++i) T[k][i] = column[i];
+            }
+        }
+
+        // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows into y; true when the minimizer is interior.
+        // Dependent rows defeat the Cholesky pass; the problem is then whitened over the independent rows and
+        // solved again.
         static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
             bool interior = false;
             if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
-            return eigen_ball(H, c, active, load, y);
+            float T[5][5], K[5][5], g[5], mu[5];
+            bool independent[5];
+            whiten(H, c, active, T, K, g, independent);
+            cholesky_ball(K, g, independent, load, mu, &interior);
+            #pragma unroll 1
+            for (int k = 0; k < 5; ++k) {
+                y[k] = 0.0f;
+                for (int i = 0; i < 5; ++i) y[k] += T[k][i] * mu[i];
+            }
+            return interior;
         }
 
         // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
