@@ -19,7 +19,7 @@ def layout(folder):
     panels = [(folder / "overview-render/overview-96/frame_0000.png", (24, 24, 3600, 2400))]
     panels.extend(
         (folder / "miniatures" / name / "frame_0000.png", (3648, 24 + i * 810, 1248, 780))
-        for i, name in enumerate(("07-lighter-contact", "06-knife-insertion", "08-plate-rack"))
+        for i, name in enumerate(("07-lighter-contact", "04-hardware-bin", "08-plate-rack"))
     )
     for path, (x, y, w, h) in panels:
         image = mpimg.imread(path)
@@ -37,9 +37,11 @@ def layout(folder):
                 "height": height,
                 "scene_tiles": 96,
                 "panels": [str(path.resolve()) for path, _ in panels],
-                "right_column": ["Contact-only lighter", "Knife insertion", "Plate placement"],
+                "right_column": ["Contact-only lighter", "Bolts sweep", "Plate placement"],
                 "source": "Replicated accepted CUDA recordings with render-only layout and material variation",
                 "simultaneous_heterogeneous_batch": False,
+                "overview_renderer": "Blender Cycles, linked full-resolution source meshes",
+                "overview_mesh_simplification": False,
                 "labels": False,
             },
             indent=2,

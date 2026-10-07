@@ -188,15 +188,41 @@ unchanged close-ups are reused without re-encoding.
 `expand_replay_still.py --source METAL_EXPORT --output DIR` creates a
 single-frame, seeded 12x8 arrangement of 96 replicas from the accepted
 recordings. It balances template counts, varies recorded action phases,
-whole-tile yaw/placement, and table finishes. Every pose is transformed
+whole-tile placement and table finishes. Tables remain aligned by default;
+`--yaw-range` optionally adds rotation. Every pose is transformed
 rigidly as a whole scene; inverse-transform assertions preserve the source
 configuration. This is a presentation of recorded replicas, not validation
 of a new 96-world simultaneous simulation.
 
-The distant overview uses simplified display meshes; the three close-ups
-retain the original detailed meshes. Dependencies are available with
+The optional display-mesh reduction uses dependencies available with
 `uv run --with fast-simplification --with scipy`.
 
 `layout_paper_teaser.py FOLDER` assembles the 3600x2400 overview and three
 1600x1000 manipulation renders into a 4920x2448 PNG and SVG with a clean
 right-hand column. It uses Matplotlib and adds no labels or overlays.
+
+Overview reduction welds duplicated hard-normal seams before simplifying.
+If a reduced material region retains less than 90% of source surface area,
+or exceeds 108%, its original mesh is preserved. This prevents disconnected
+export triangles and thin regions from becoming incomplete robot skins.
+`validate_overview_meshes.py --source SOURCE --overview OVERVIEW` checks
+robot and gripper surface coverage against the original detailed export;
+it fails on the damaged reduction and passes after correction.
+
+For a full-resolution instanced paper still, use Blender's
+`render_instanced_paper.py` importer. Each replica links the same original
+mesh datablocks; only body transforms and table material slots vary.
+The final overview and close-ups use Cycles with Metal acceleration,
+adaptive sampling, and denoising. AgX at gamma 1 receives scene-linear
+material colors converted from the exported sRGB palette.
+No overview simplification is used. Triangle corner normals preserve the
+source hard edges and avoid Blender's custom-normal seam failure. Textures
+are resolved absolutely and packed into the saved `.blend` file.
+
+The revised paper layout uses a tightly framed overview whose tile grid
+continues beyond the image edges, with lighter, bolts sweep, and plate
+placement stacked in the right-hand column. The sweep is captured earlier
+while hardware remains ahead of the pusher; the lighter uses teal enamel
+and warm yellow metallic trim. `render_cycles_teaser.py` renders each
+close-up directly from the recorded poses selected by
+`cycles-miniatures.json`, using the same Cycles configuration.

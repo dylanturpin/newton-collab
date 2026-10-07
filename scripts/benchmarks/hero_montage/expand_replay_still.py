@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 
-def expand(source, output, count=96, seed=96):
+def expand(source, output, count=96, seed=96, yaw_range=0.0):
     import fast_simplification
     from scipy.spatial import cKDTree
     from scipy.spatial.transform import Rotation
@@ -46,12 +46,32 @@ def expand(source, output, count=96, seed=96):
             faces = faces.reshape(-1, 3)
             # Overview LOD only; close-up exports retain original meshes.
             if len(faces) > 1600:
+                original_attrs, original_faces = attrs, faces
+
+                def surface_area(points, triangles):
+                    xyz = points[triangles]
+                    return np.linalg.norm(np.cross(xyz[:, 1] - xyz[:, 0], xyz[:, 2] - xyz[:, 0]), axis=1).sum()
+
+                # Exported hard-normal seams duplicate positions. Weld them
+                # before reduction so the simplifier sees a connected surface,
+                # rather than deleting disconnected triangles independently.
+                _, first, welded = np.unique(
+                    np.round(attrs[:, :3], decimals=8), axis=0, return_index=True, return_inverse=True
+                )
                 xyz, faces = fast_simplification.simplify(
-                    attrs[:, :3].astype("f8"), faces, target_count=min(1600, max(300, len(faces) // 6))
+                    attrs[first, :3].astype("f8"),
+                    welded[faces],
+                    target_count=min(1600, max(300, len(faces) // 6)),
                 )
                 nearest = cKDTree(attrs[:, :3]).query(xyz)[1]
                 attrs = attrs[nearest].copy()
                 attrs[:, :3] = xyz
+                original_area = surface_area(original_attrs[:, :3], original_faces)
+                reduced_area = surface_area(attrs[:, :3], faces)
+                if original_area > 1e-9 and not 0.9 <= reduced_area / original_area <= 1.08:
+                    # Keep thin/open material regions intact when reduction
+                    # cannot preserve their surface coverage.
+                    attrs, faces = original_attrs, original_faces
             geometry[wi].append((mesh, attrs, faces.ravel()))
         print(f"Prepared overview geometry {world['id']}", flush=True)
     nv, ni, body_start = 0, 0, 0
@@ -66,7 +86,7 @@ def expand(source, output, count=96, seed=96):
                 ]
             )
             offset[:2] += rng.uniform(-0.085, 0.085, 2)
-            yaw = float(rng.uniform(-0.12, 0.12))
+            yaw = float(rng.uniform(-yaw_range, yaw_range))
             rotation = Rotation.from_euler("z", yaw)
             frame = int(rng.integers(40, min(meta["sample_count"], 276)))
             sb, nb = world["body_start"], world["body_count"]
@@ -136,6 +156,7 @@ def expand(source, output, count=96, seed=96):
         "replicated_recorded_worlds": True,
         "simultaneous_heterogeneous_batch": False,
         "replication_seed": seed,
+        "replication_yaw_range": yaw_range,
         "replica_provenance": provenance,
         "overview_geometry_lod": True,
         "trace_sha256": hashlib.sha256(poses.tobytes() + quats.tobytes()).hexdigest(),
@@ -150,5 +171,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--count", type=int, default=96)
     parser.add_argument("--seed", type=int, default=96)
+    parser.add_argument(
+        "--yaw-range", type=float, default=0.0, help="Optional whole-tile yaw in radians; aligned by default"
+    )
     args = parser.parse_args()
-    expand(args.source, args.output, args.count, args.seed)
+    expand(args.source, args.output, args.count, args.seed, args.yaw_range)
