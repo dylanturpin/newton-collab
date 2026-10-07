@@ -24,12 +24,11 @@ import newton
 import newton.examples
 from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
 
-# The fixed MPM grid is sized once from the bed (2 x 2 x 0.5 m) plus this padding, i.e. to |x|, |y| <= 8.55 m and
-# z <= 8.05 m; it holds the boxes' 5.2 m drop height. A grain leaving the grid gets runaway velocities, so cap grain
-# speed (the boxes never exceed 6.4 m/s) such that any ballistic grain stays inside: apex 0.5 + v^2 / 2g = 3.8 m and
-# range 1 + v^2 / g = 7.5 m at 8 m/s.
-_GRID_PADDING = 150
-_PARTICLE_MAX_VELOCITY = 8.0
+# A grain that leaves the fixed MPM grid gets runaway velocities, so cap grain speed just above the boxes' 6.4 m/s
+# and pad the grid to contain any ballistic grain: from the bed (|x| <= 1, z <= 0.5) or the stack top (|x| <= 0.45,
+# z <= 3.11) it reaches |x| <= 7.2 m and z <= 5.3 m, inside the padded grid's |x|, |y| <= 7.3 m and z <= 6.8 m.
+_GRID_PADDING = 125
+_PARTICLE_MAX_VELOCITY = 6.5
 
 
 def _add_rigid_solver_arg(parser) -> None:
