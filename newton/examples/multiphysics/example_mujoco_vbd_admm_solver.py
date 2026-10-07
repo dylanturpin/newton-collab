@@ -226,7 +226,7 @@ class Example:
                 rho=50,
                 gamma=0.1,
                 baumgarte=0.01,
-                # FeatherPGS integrates only joints inside its articulations, so it cannot carry joint proxies.
+                # FeatherPGS does not carry ADMM joint proxies; with them on, its result is unchanged.
                 joint_proximal_bodies=args.joint_proximal_bodies and self.rigid_solver != "featherpgs",
                 joint_proximal_destination_entries=(rigid_name,),
             ),

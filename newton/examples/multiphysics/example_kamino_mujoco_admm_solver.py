@@ -179,6 +179,8 @@ class Example:
                 joint_angular_stiffness=args.joint_stiffness,
                 joint_damping=args.joint_damping,
                 joint_angular_damping=args.joint_damping,
+                # FeatherPGS warns on and ignores the revolute joint proxies, so only Kamino carries them.
+                joint_proximal_destination_entries=("kamino",) if args.rigid_solver == "featherpgs" else None,
             ),
         )
 
