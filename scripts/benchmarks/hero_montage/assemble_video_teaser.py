@@ -48,6 +48,15 @@ def prepare_left(root, output):
     camera.update(name="teaser-left", duration=24, playbackSpeed=0.25)
     end = json.loads((root / "paper-teaser/overview.json").read_text())[0]
     meta = json.loads((root / "hq-clips-no-drills/16-final-zoom-out/snapshot/scene.json").read_text())
+    opening = json.loads((root / "hq-clips-no-drills/05-wrecking-ball/camera.json").read_text())[0]
+    offset = np.array(meta["worlds"][78]["display_offset"]) - [0, 0, 0.805]
+    opening_target = np.array(opening["target"]) + offset
+    opening_position = opening_target + (np.array(opening["position"]) - opening["target"]) * (
+        np.tan(np.deg2rad(opening["fov"] / 2)) / np.tan(np.deg2rad(12 / 2))
+    )
+    for keyframe in camera["keyframes"][:2]:
+        keyframe.update(position=opening_position.tolist(), target=opening_target.tolist(), fov=12)
+    camera.update(position=opening_position.tolist(), target=opening_target.tolist(), fov=12)
     target = np.array([0.0, 0.0, 1.2])
     direction = np.array(end["position"]) - end["target"]
     direction /= np.linalg.norm(direction)

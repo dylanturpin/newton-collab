@@ -406,7 +406,7 @@ reveals the 96-table layout with a frame-filling crop, retaining the accepted
 viewing direction and avoiding a large empty floor border. Its fixed near plane is 1 m; the replay renderer
 extends the far plane to cover the full camera path and scene bounds.
 `prepare_realtime_overview.py FULL DRESSED OUTPUT` retains full geometry for
-the opening plate tile and validated overview meshes for distant tiles. It
+the opening wrecking-ball tile and validated overview meshes for distant tiles. It
 also merges identical material references so repeated geometry can be shared
 by the ray tracer. This avoids the full 96-tile export's memory bottleneck.
 The video teaser reuses the completed 24-second wide clip via a central crop
