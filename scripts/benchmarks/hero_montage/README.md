@@ -411,3 +411,21 @@ also merges identical material references so repeated geometry can be shared
 by the ray tracer. This avoids the full 96-tile export's memory bottleneck.
 The video teaser reuses the completed 24-second wide clip via a central crop
 and downsampling instead of rendering the pullback a second time.
+
+## CUDA Cycles replay clips
+
+`export_cycles_replays.py` runs inside Blender and packs the accepted replay
+geometry, materials, UVs, and original 50 Hz pose arrays. Shared meshes attach
+to per-body controllers. The overview instances 96 dressed worlds four times
+on a 24 by 16 grid, with the outer border outside the final camera frustum.
+The pullback starts on a central wrecking-ball scene.
+
+`render_cycles_replay.py` uses Cycles OptiX at 1920 by 1080: 16 samples for
+close-ups and 8 for the overview, GPU denoising, persistent data, and six
+maximum bounces. It interpolates recorded translations and quaternion SLERP;
+no physics steps run during rendering. Each output carries its trace hash,
+actual frame timings, camera settings, and a full video decode check.
+`assemble_cycles_montage.py` composes the separate clips into a 1920 by 956
+teaser with the slow pullback and three staggered close-up panels, without
+upscaling the source images. The overview stretches six seconds of composite
+recordings to 24 seconds; the close-ups retain real-time playback.
