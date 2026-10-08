@@ -41,6 +41,7 @@ def ball(
     tilt=0.0,
     enable=True,
     cone="pyramidal",
+    joint_friction=None,
     **solver_overrides,
 ):
     """Build a unit-mass solid sphere on the ground, articulated by slide x/z and hinge y/z joints.
@@ -75,6 +76,8 @@ def ball(
     state = model.state()
     state.joint_qd.assign(np.array([speed, 0.0, speed / radius if rolling else 0.0, spin], np.float32))
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    if joint_friction is not None:
+        model.joint_friction.assign(np.asarray(joint_friction, np.float32))
     options = dict(SOLVER_OPTIONS)
     options.update(solver_overrides)
     solver = SolverFeatherPGS(
@@ -416,6 +419,28 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 expected = mu_torsional * GRAVITY / (0.4 * radius * radius)
                 self.assertAlmostEqual(rate, expected, delta=0.005 * expected)
 
+    def test_joint_friction_and_torsional_friction_share_the_spin_dof(self):
+        """Joint dry-friction rows and torsional rows on one DOF add their decelerations."""
+        radius, mu_torsional, joint_friction = 0.1, 0.005, 0.002
+        inertia = 0.4 * radius * radius
+        for cone in ("pyramidal", "elliptic"):
+            with self.subTest(cone=cone):
+                scene = ball(
+                    radius=radius,
+                    mu_torsional=mu_torsional,
+                    mu_rolling=0.0,
+                    speed=0.0,
+                    spin=5.0,
+                    cone=cone,
+                    joint_friction=[0.0, 0.0, 0.0, joint_friction],
+                    enable_joint_friction=True,
+                )
+                qd = scene.run(160)
+                t = np.arange(1, 161) * DT
+                rate = -np.polyfit(t[8:], qd[8:, 3], 1)[0]
+                expected = (mu_torsional * GRAVITY + joint_friction) / inertia
+                self.assertAlmostEqual(rate, expected, delta=0.005 * expected)
+
     def test_creep_speed_softens_stiction_by_load_fraction(self):
         """Below the bound the coefficient times the angular rate settles at creep speed times the load fraction."""
         creep_speed, mu_torsional = 2.0e-3, 0.02
@@ -716,6 +741,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
             {"pgs_schedule": "contact_then_internal"},
             {"contact_torsion_radius": 0.01},
             {"enable_sleeping": True},
+            {"contact_compliance": True},
         )
         for overrides in rejected:
             with self.subTest(**overrides), self.assertRaises(ValueError):

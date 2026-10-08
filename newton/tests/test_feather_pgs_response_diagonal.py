@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_feather_pgs_module
 from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -16,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
+    PGS_LOCAL_SOLVE_OWNER_SINGLE,
     accumulate_group_diag_worlds,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
@@ -233,6 +235,108 @@ def _assert_owner_parity(test, general, local):
                 atol=2.0e-6,
                 err_msg=f"{label} differed at step {step}",
             )
+
+
+def _build_diagonal_mass_local_model(device):
+    """Build two local-owner worlds whose only articulation has a diagonal mass matrix.
+
+    World 0 rests a prismatic sphere on the ground beside a distant free box (paired owner); world 1 holds a
+    contactless hinge against its upper limit (single owner).
+    """
+    world_builders = []
+    sphere = newton.ModelBuilder()
+    sphere_xform = wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity())
+    sphere_body = sphere.add_link(xform=sphere_xform)
+    sphere.add_shape_sphere(
+        sphere_body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / (4.0 / 3.0 * np.pi * 0.05**3))
+    )
+    sphere.add_articulation(
+        [sphere.add_joint_prismatic(parent=-1, child=sphere_body, axis=newton.Axis.Z, parent_xform=sphere_xform)]
+    )
+    box = sphere.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+    sphere.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    world_builders.append(sphere)
+
+    hinge = newton.ModelBuilder()
+    hinge_body = hinge.add_link(
+        com=wp.vec3(0.2, 0.0, 0.0), mass=0.5, inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3), lock_inertia=True
+    )
+    hinge.add_articulation(
+        [
+            hinge.add_joint_revolute(
+                parent=-1,
+                child=hinge_body,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 2.0, 1.0), wp.quat_identity()),
+                limit_lower=-1.0,
+                limit_upper=0.0,
+            )
+        ]
+    )
+    world_builders.append(hinge)
+
+    scene = newton.ModelBuilder()
+    scene.rigid_gap = 0.005
+    for world_builder in world_builders:
+        scene.add_world(world_builder)
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
+    """Record dense rows and joint coordinates per step for one H-inverse implementation."""
+    model = _build_diagonal_mass_local_model("cuda:0")
+    overrides = {} if kernel is None else {"hinv_jt_kernel": kernel}
+    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", overrides):
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=iterations,
+            enable_joint_limits=True,
+            joint_limit_activation_gap=0.0,
+            friction_anchor_beta=0.0,
+            dense_max_constraints=32,
+            mf_max_constraints=32,
+        )
+    model.rigid_contact_max = 32
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    contacts = pipeline.contacts()
+    control = model.control()
+    states = [model.state(), model.state()]
+    newton.eval_fk(model, model.joint_q, model.joint_qd, states[0])
+
+    def step():
+        for _ in range(2):
+            states[0].clear_forces()
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, 0.005)
+            states.reverse()
+
+    def sample():
+        count = solver.constraint_count.numpy()
+        return (
+            count.copy(),
+            [solver.diag.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
+            [solver.row_type.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
+            solver._local_solve_owner.numpy().copy(),
+            states[0].joint_q.numpy().copy(),
+        )
+
+    step()
+    samples = [sample()]
+    captured = None
+    if graph:
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.seed_double_buffer_events()
+            step()
+        captured = capture.graph
+    for _ in range(steps // 2 - 1):
+        if captured is None:
+            step()
+        else:
+            wp.capture_launch(captured)
+        samples.append(sample())
+    return solver, samples
 
 
 _ARMATURE = (9.0, 4.0, 2.0, 0.5, 1.5, 3.0)
@@ -1171,6 +1275,67 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[0.0]._local_internal_fast_path)
         self.assertTrue(solvers[0.01]._contact_torsion_enabled)
         self.assertFalse(solvers[0.01]._local_internal_fast_path)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local owners require CUDA")
+    def test_local_owners_are_limited_to_small_world_counts(self):
+        """Select local owners only up to one world per SM; larger models solve exactly as the general owner."""
+        limit = wp.get_device("cuda:0").sm_count
+        kwargs = {"pgs_mode": "matrix_free", "dense_max_constraints": 32, "mf_max_constraints": 32}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+            for world_count, expected in ((limit, True), (limit + 1, False)):
+                model = _build_mixed_response_model("cuda:0", world_count=world_count)
+                solver = SolverFeatherPGS(model, **kwargs)
+                self.assertEqual(solver._local_internal_fast_path, expected, f"world_count={world_count}")
+
+        # The two-world diagonal-mass scene is local by default, gated with no worlds per SM, ineligible without DOFs.
+        trajectories = {}
+        for label, attribute, value in (
+            ("local", "_LOCAL_SOLVE_WORLDS_PER_SM", 1),
+            ("gated", "_LOCAL_SOLVE_WORLDS_PER_SM", 0),
+            ("ineligible", "_LOCAL_INTERNAL_MAX_DOF", 0),
+        ):
+            with mock.patch.object(solver_feather_pgs_module, attribute, value):
+                solver, samples = _run_diagonal_mass_local(None, iterations=4, graph=False, steps=8)
+            self.assertEqual(solver._local_internal_fast_path, label == "local", label)
+            trajectories[label] = np.stack([sample[4] for sample in samples])
+        np.testing.assert_array_equal(trajectories["gated"], trajectories["ineligible"])
+        np.testing.assert_allclose(trajectories["local"], trajectories["gated"], rtol=0.0, atol=1.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local owners require CUDA")
+    def test_local_owners_match_general_for_diagonal_mass_articulations(self):
+        """Count the response once in local owners whose articulation uses the diagonal-mass H-inverse."""
+        for iterations in (1, 8):
+            for graph in (False, True):
+                with self.subTest(iterations=iterations, graph=graph):
+                    general_solver, general = _run_diagonal_mass_local("tiled", iterations=iterations, graph=graph)
+                    local_solver, local = _run_diagonal_mass_local(None, iterations=iterations, graph=graph)
+                    self.assertFalse(general_solver._local_internal_fast_path)
+                    self.assertTrue(local_solver._local_internal_fast_path)
+                    self.assertTrue(local_solver._hinv_jt_writes_world)
+                    self.assertIn(1, local_solver._hinv_jt_diag_sizes)
+                    owners = np.stack([sample[3] for sample in local])
+                    counts = np.stack([sample[0] for sample in local])
+                    self.assertTrue((counts > 0).all(axis=1).sum() >= len(local) - 1, "worlds generated no rows")
+                    self.assertTrue(
+                        np.isin(
+                            owners[counts[:, 0] > 0, 0],
+                            (PGS_LOCAL_SOLVE_OWNER_PAIR, PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL),
+                        ).all()
+                    )
+                    np.testing.assert_array_equal(owners[counts[:, 1] > 0, 1], PGS_LOCAL_SOLVE_OWNER_SINGLE)
+                    for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+                        np.testing.assert_array_equal(actual[0], expected[0], err_msg=f"row counts at step {step}")
+                        for world in range(2):
+                            np.testing.assert_array_equal(actual[2][world], expected[2][world])
+                            np.testing.assert_allclose(
+                                actual[1][world],
+                                expected[1][world],
+                                rtol=1.0e-5,
+                                err_msg=f"world {world} diagonal at step {step}",
+                            )
+                        np.testing.assert_allclose(
+                            actual[4], expected[4], rtol=0.0, atol=1.0e-6, err_msg=f"joint_q at step {step}"
+                        )
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):

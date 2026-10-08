@@ -51,6 +51,10 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 # directions, unbounded lambda, Baumgarte drift correction.
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_TORSION = 7
+# Joint dry-friction row: ``J = e_dof`` with zero target velocity and no bias.
+# The accumulated impulse is boxed to ``[-f dt, f dt]`` (bound stored in the
+# row's ``mu`` slot), so the DOF sticks until the required impulse saturates.
+PGS_CONSTRAINT_TYPE_JOINT_FRICTION = 8
 # Per-contact torsional and rolling friction rows (one spin row about the normal, two rolling rows about the
 # tangents) contiguous after the contact's sliding pair, bounded by the shape torsional/rolling coefficients.
 PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION = 9
