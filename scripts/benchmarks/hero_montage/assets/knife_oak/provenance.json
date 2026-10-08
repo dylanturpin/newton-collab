@@ -1,0 +1,9 @@
+{
+  "source_repository": "https://github.com/LuckyIYI/proc-gen-3d",
+  "source_commit": "45739ebfef8a8e933ba08b0c087618cd14dc54c9",
+  "material_function": "scripts/render_detailed.py:material",
+  "material": "oak",
+  "bake": "Blender Cycles diffuse color only, 1024px, smart UV atlas, 12px padding",
+  "geometry": "Existing adapted knife_block_task and knife_source_task visual surfaces",
+  "scope": "Holder visuals only; existing blue/green handle colors and contact geometry unchanged"
+}

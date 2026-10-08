@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from prepare_metal_paper_view import prepare
+from texture_knife_holders import apply as texture_knife_holders
 
 
 def read(path):
@@ -147,6 +148,7 @@ def prepare_clips(root, dressed, output):
         camera_path.write_text(json.dumps([camera], indent=2) + "\n")
         data = snapshot.parent / "data"
         prepare(source, snapshot, camera_path, data)
+        texture_knife_holders(data)
         assert not any("drill" in m["name"].lower() for m in read(data / "scene.json")["meshes"])
         plan.append(
             {
@@ -240,6 +242,7 @@ def prepare_finale(source, dressed, output, original, arrangement):
     end_path.write_text(json.dumps(culling_views, indent=2) + "\n")
     data = snapshot.parent / "data"
     prepare(source, snapshot, end_path, data)
+    texture_knife_holders(data)
     exported = read(data / "scene.json")
     assert any(m["world"] == 38 for m in exported["meshes"])
     assert not any("drill" in m["name"].lower() for m in exported["meshes"])

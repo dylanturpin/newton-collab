@@ -13,6 +13,7 @@ from pathlib import Path
 import imageio_ffmpeg
 import numpy as np
 from prepare_metal_paper_view import prepare
+from texture_knife_holders import apply as texture_knife_holders
 
 # Each row lasts 24 seconds. All 15 task types appear, with drawer opening
 # and placement joined into one shot. Cuts never align across the three rows.
@@ -66,6 +67,7 @@ def prepare_left(root, output):
     culling = output / "left-culling.json"
     culling.write_text(json.dumps(views, indent=2) + "\n")
     prepare(root / "finale-data", root / "hq-clips-no-drills/16-final-zoom-out/snapshot", culling, output / "left-data")
+    texture_knife_holders(output / "left-data")
 
 
 def assemble(root, renderer, *, wait=False):

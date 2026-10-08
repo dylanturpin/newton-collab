@@ -383,3 +383,11 @@ Three 624x390 rows show every task at normal speed with staggered 4–5-second
 cuts. Drawer opening and placement are joined into one shot. The final video
 is 2460x1224 at 30 fps, with white gutters and no labels or overlays.
 `timeline.json` and `teaser-report.json` retain edit timings and provenance.
+
+Knife-holder wood is baked from proc-gen's original `render_detailed.material`
+oak shader. Run Blender with `bake_knife_oak.py -- PROC_GEN_CHECKOUT` to rebuild
+the two UV atlases in `assets/knife_oak`. `texture_knife_holders.py EXPORT...`
+applies them to replay visuals, preserving pose buffers and the existing blue
+and green handle materials. Editorial replay preparation applies this finish
+automatically. The bake contains base color; AVBD uses a satin roughness of
+0.38 rather than the source Blender shader's procedural bump and clearcoat.
