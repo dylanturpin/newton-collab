@@ -217,6 +217,52 @@ def test_refinement_unconverged_query_separation(test, device):
     test_refinement_failed_query_separation(test, device, unconverged=True)
 
 
+def test_refinement_resting_box_stack(test, device):
+    """Report face contacts for centered, nearly aligned resting cubes.
+
+    Centered support ties make MPR's region tests evaluate to float32 noise and
+    accept a sliver portal that misses the origin ray, which used to report a
+    single tilted contact 0.155 m deep.
+    """
+    lower = wp.transform(
+        wp.vec3(-1.2568341e-03, -4.8650557e-04, 1.2503407e00),
+        wp.quat(1.9415199e-04, -4.9863686e-04, 2.3975765e-05, 9.9999988e-01),
+    )
+    upper = wp.transform(
+        wp.vec3(-1.7543929e-03, -6.8072625e-04, 1.7503396e00),
+        wp.quat(1.9580426e-04, -4.9785688e-04, 2.5186999e-05, 9.9999988e-01),
+    )
+    for split, swap in product((False, True) if device.is_cuda else (False,), (False, True)):
+        with test.subTest(split=split, swap=swap):
+            builder = newton.ModelBuilder()
+            for pose in (upper, lower) if swap else (lower, upper):
+                body = builder.add_body(xform=pose)
+                builder.add_shape_box(body, hx=0.25, hy=0.25, hz=0.25)
+            model = builder.finalize(device)
+            threshold = 0 if split else 10**9
+            with patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", threshold):
+                pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+            test.assertEqual(pipeline.narrow_phase.split_gjk_mpr, split)
+            contacts = pipeline.contacts()
+            state = model.state()
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertGreaterEqual(count, 4)
+            body_q = state.body_q.numpy()
+            shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+            shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+            points0 = contacts.rigid_contact_point0.numpy()[:count]
+            points1 = contacts.rigid_contact_point1.numpy()[:count]
+            normals = contacts.rigid_contact_normal.numpy()[:count]
+            for i in range(count):
+                pa = np.asarray(wp.transform_point(wp.transform(*body_q[shape0[i]]), wp.vec3(points0[i])))
+                pb = np.asarray(wp.transform_point(wp.transform(*body_q[shape1[i]]), wp.vec3(points1[i])))
+                # Normals point from shape 0 to shape 1, so the lower cube decides the sign.
+                up = 1.0 if body_q[shape0[i]][2] < body_q[shape1[i]][2] else -1.0
+                test.assertGreater(float(normals[i][2] * up), 0.99)
+                test.assertAlmostEqual(float(np.dot(pb - pa, normals[i])), 0.0, delta=1.0e-4)
+
+
 class TestConvexRefinementRegressions(unittest.TestCase):
     pass
 
@@ -226,6 +272,7 @@ for function in (
     test_refinement_source_topology,
     test_refinement_failed_query_separation,
     test_refinement_unconverged_query_separation,
+    test_refinement_resting_box_stack,
 ):
     add_function_test(TestConvexRefinementRegressions, function.__name__, function, devices=get_test_devices())
 
