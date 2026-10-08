@@ -40,6 +40,14 @@ for name in ["knife_block_task", "knife_source_task"]:
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
     mat = material("oak", v["color"] + [1])
+    # Fine longitudinal grain and restrained neutral ash tones suit the
+    # montage better than the catalog's broad, high-contrast oak fields.
+    for shader in mat.node_tree.nodes:
+        if shader.bl_idname == "ShaderNodeVectorMath" and shader.operation == "MULTIPLY":
+            shader.inputs[1].default_value = (190, 190, 2.5)
+        elif shader.bl_idname == "ShaderNodeValToRGB":
+            shader.color_ramp.elements[0].color = (0.37, 0.295, 0.215, 1)
+            shader.color_ramp.elements[1].color = (0.43, 0.35, 0.26, 1)
     mesh.materials.append(mat)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")

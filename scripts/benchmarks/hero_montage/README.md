@@ -391,3 +391,6 @@ applies them to replay visuals, preserving pose buffers and the existing blue
 and green handle materials. Editorial replay preparation applies this finish
 automatically. The bake contains base color; AVBD uses a satin roughness of
 0.38 rather than the source Blender shader's procedural bump and clearcoat.
+The approved-style refinement uses finer longitudinal mapping and a restrained
+neutral color ramp, removing broad cloudy bands. Texture refreshes preserve
+the original UV atlas, geometry, and blue/green handle materials.

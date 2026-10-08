@@ -19,6 +19,10 @@ def apply(folder):
     indices = np.memmap(folder / "indices.bin", dtype="<u4", mode="r")
     changes = []
     for mesh in meta["meshes"]:
+        if mesh["name"].endswith("/oak-finish"):
+            name = mesh["name"].split("/")[-2]
+            shutil.copy2(ASSETS / (name + ".png"), folder / "textures" / (name + "-oak.png"))
+            continue
         name = mesh["name"].split("/")[-1]
         if name not in ("knife_block_task", "knife_source_task"):
             continue
