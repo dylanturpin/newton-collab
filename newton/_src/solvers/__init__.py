@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import feather_pgs, style3d
-    from .feather_pgs import SolverFeatherPGS
+    from .feather_pgs.solver_feather_pgs import SolverFeatherPGS
     from .featherstone import SolverFeatherstone
     from .implicit_mpm import SolverImplicitMPM
     from .kamino import SolverKamino
@@ -38,7 +38,7 @@ __all__ = [
 # not pay the import cost of every solver backend.
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "SolverBase": (".solver", "SolverBase"),
-    "SolverFeatherPGS": (".feather_pgs", "SolverFeatherPGS"),
+    "SolverFeatherPGS": (".feather_pgs.solver_feather_pgs", "SolverFeatherPGS"),
     "SolverFeatherstone": (".featherstone", "SolverFeatherstone"),
     "SolverImplicitMPM": (".implicit_mpm", "SolverImplicitMPM"),
     "SolverKamino": (".kamino", "SolverKamino"),

@@ -114,8 +114,8 @@ class SmoothContactLaw:
     """
 
     stiffness: float
-    """Spring stiffness k [N/m]. For a single closed contact on mass m the explicit update needs
-    ``dt**2 * k / m + 2 * dt * c / m < 4``; coupled contacts and articulations need more margin."""
+    """Spring stiffness k [N/m]. In an isolated linearized closed-contact model on mass m the explicit update
+    needs ``dt**2 * k / m + 2 * dt * c / m < 4``; this is a guide, and coupled contacts need more margin."""
     damping: float = 0.0
     """Dashpot c [N s/m], gated smoothly to closed gaps; zero gives an elastic contact."""
     softness: float = 1.0e-3

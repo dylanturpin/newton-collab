@@ -19,9 +19,7 @@ Use :class:`~newton.solvers.SolverFeatherPGS` as the canonical public solver cla
 """
 
 from .differentiable import SmoothContactLaw
-from .solver_feather_pgs import SolverFeatherPGS
 
 __all__ = [
     "SmoothContactLaw",
-    "SolverFeatherPGS",
 ]

@@ -19,4 +19,3 @@ Use :class:`~newton.solvers.SolverFeatherPGS` as the canonical public solver cla
 .. rubric:: Classes
 
 .. autoclass:: SmoothContactLaw
-
