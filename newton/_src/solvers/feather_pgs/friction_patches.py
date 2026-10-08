@@ -1087,6 +1087,63 @@ def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shape
         prev.valid[c] = 0
 
 
+# Fields of the previous frame that _store_history writes and later steps read.
+_CARRIED_HISTORY_FIELDS = frozenset(
+    (
+        "keys",
+        "indices",
+        "normal",
+        "displacement",
+        "mu",
+        "body_a",
+        "body_b",
+        "owner",
+        "shape_a",
+        "shape_b",
+        "anchor_a",
+        "anchor_b",
+        "surface_a",
+        "surface_b",
+        "valid",
+        "tangent_impulse",
+    )
+)
+
+
+@wp.kernel(enable_backward=False)
+def _copy_carried_history(
+    src: _PatchFrame,
+    src_world: wp.array[int],
+    src_q: wp.array[wp.transform],
+    dst: _PatchFrame,
+    dst_world: wp.array[int],
+    dst_q: wp.array[wp.transform],
+):
+    """Copy the carried patch history written by _store_history."""
+    c = wp.tid()
+    if c < src_q.shape[0]:
+        dst_q[c] = src_q[c]
+    if c >= src_world.shape[0]:
+        return
+    dst.keys[c] = src.keys[c]
+    dst.indices[c] = src.indices[c]
+    dst.normal[c] = src.normal[c]
+    dst.displacement[c] = src.displacement[c]
+    dst.mu[c] = src.mu[c]
+    dst.body_a[c] = src.body_a[c]
+    dst.body_b[c] = src.body_b[c]
+    dst.owner[c] = src.owner[c]
+    dst.shape_a[c] = src.shape_a[c]
+    dst.shape_b[c] = src.shape_b[c]
+    dst.anchor_a[c] = src.anchor_a[c]
+    dst.anchor_b[c] = src.anchor_b[c]
+    dst.surface_a[c] = src.surface_a[c]
+    dst.surface_b[c] = src.surface_b[c]
+    dst.valid[c] = src.valid[c]
+    dst.tangent_impulse[c] = src.tangent_impulse[c]
+    dst_world[c] = src_world[c]
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
@@ -1101,6 +1158,7 @@ class _FrictionPatchState:
         self.view.next_contact = wp.full(n, -1, dtype=int, device=device)
         self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
+        self._history_snapshot = None
         if not enabled:
             return
         self.body_world = model.body_world
@@ -1305,6 +1363,40 @@ class _FrictionPatchState:
             device=model.device,
         )
 
+    def reserve_history_snapshot(self):
+        """Allocate the buffers :meth:`snapshot_history` writes; call outside graph capture."""
+        if self.view.enabled and self._history_snapshot is None:
+            device = self.previous_q.device
+            frame = _PatchFrame()
+            for name in _PatchFrame.vars:
+                count = self.capacity if name in _CARRIED_HISTORY_FIELDS else 0
+                setattr(frame, name, wp.empty(count, dtype=getattr(self.previous, name).dtype, device=device))
+            self._history_snapshot = (frame, wp.empty_like(self.previous_world), wp.empty_like(self.previous_q))
+
+    def snapshot_history(self):
+        """Save the carried history so a repeated solve of the same step can restore it."""
+        if not self.view.enabled:
+            return
+        self.reserve_history_snapshot()
+        frame, world, q = self._history_snapshot
+        self._copy_history(self.previous, self.previous_world, self.previous_q, frame, world, q)
+
+    def restore_history(self):
+        """Restore the history saved by :meth:`snapshot_history`."""
+        if not self.view.enabled or self._history_snapshot is None:
+            return
+        frame, world, q = self._history_snapshot
+        self._copy_history(frame, world, q, self.previous, self.previous_world, self.previous_q)
+
+    def _copy_history(self, src, src_world, src_q, dst, dst_world, dst_q):
+        wp.launch(
+            _copy_carried_history,
+            dim=max(self.capacity, src_q.shape[0]),
+            inputs=[src, src_world, src_q],
+            outputs=[dst, dst_world, dst_q],
+            device=src_q.device,
+        )
+
     def store(self, state):
         wp.launch(
             _store_history,
@@ -1405,28 +1497,27 @@ def seed_patch_impulses(
     impulses: wp.array2d[float],
     scale: float,
 ):
-    """Transport cached patch impulses after all contact normals have been seeded.
+    """Transport cached patch impulses and project every anchor's seed onto its patch cone.
 
-    Anchors without patch history keep whatever the contact-matched warm start
-    seeded; only carried anchors overwrite their friction rows.
+    Anchors without patch history keep the contact-matched warm start, bounded by the region's load.
     """
     c = wp.tid()
     if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
         return
-    source = frame.source[c]
-    if source < 0:
-        return
-    tangent = prev.tangent_impulse[source] * scale
-    if frame.body_a[c] >= 0:
-        tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
-    n = frame.normal[c]
-    if frame.flipped[c] != 0:
-        n = -n
-        tangent = -tangent
-    t0, t1 = contact_tangent_basis(n)
-    value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
     w = world[c]
     s = slot[c]
+    value = wp.vec2(impulses[w, s + 1], impulses[w, s + 2])
+    source = frame.source[c]
+    if source >= 0:
+        tangent = prev.tangent_impulse[source] * scale
+        if frame.body_a[c] >= 0:
+            tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
+        n = frame.normal[c]
+        if frame.flipped[c] != 0:
+            n = -n
+            tangent = -tangent
+        t0, t1 = contact_tangent_basis(n)
+        value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
     radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
     magnitude = wp.length(value)
     if magnitude > radius and magnitude > 0.0:

@@ -1,0 +1,1 @@
+The rigid/MPM coupled example pads its fixed MPM grid using a conservative single-flight estimate for grains thrown by the box impacts, and caps MPM particle advection speed: grains that left the former grid got runaway velocities that launched the boxes and made the sand non-finite.

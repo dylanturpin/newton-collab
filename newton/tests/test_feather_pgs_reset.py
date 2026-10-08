@@ -111,7 +111,7 @@ class TestFeatherPGSReset(unittest.TestCase):
         solver.impulses.fill_(17.0)
         before = solver.impulses.numpy().copy()
 
-        invalid_mask = wp.ones(3, dtype=wp.bool, device=model.device)
+        invalid_mask = wp.ones(4, dtype=wp.bool, device=model.device)
         with self.assertRaisesRegex(ValueError, "expected 2"):
             solver.reset(model.state(), invalid_mask)
 
