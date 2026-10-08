@@ -51,6 +51,7 @@ struct CameraDescription: Decodable {
     let worlds: [String]
     let startTime: Double
     let duration: Double
+    let playbackSpeed: Double?
     let position: [Float]
     let target: [Float]
     let fov: Float
@@ -466,7 +467,9 @@ struct HeroHQReplay {
             var drawCount = 0
             for (index, t) in frameTimes.enumerated() {
                 let cameraPose = camera.pose(at: t)
-                scene.setTime(camera.startTime + t)
+                let playbackSpeed = camera.playbackSpeed ?? 1
+                precondition(playbackSpeed.isFinite && playbackSpeed > 0)
+                scene.setTime(camera.startTime + t * playbackSpeed)
                 if resetEveryFrame && requestedNearClip == nil {
                     // Independently accumulated frames can adapt the near
                     // plane throughout a long zoom without temporal history.
@@ -502,7 +505,7 @@ struct HeroHQReplay {
                 "renderer": "avbd-metal GPUSimRenderer HQ", "device": device.name, "lighting": lighting,
                 "shot": camera.name, "worlds": camera.worlds, "trace_sha256": description.traceSha256,
                 "simulation_steps_executed": 0, "source_start_s": camera.startTime,
-                "duration_s": camera.duration, "output_fps": 30, "playback_speed": 1,
+                "duration_s": camera.duration, "output_fps": 30, "playback_speed": camera.playbackSpeed ?? 1,
                 "pose_interpolation": "linear translation and quaternion SLERP from 50 Hz trace",
                 "width": width, "height": height, "quality": quality,
                 "reconstruction_scale": 1, "denoising": renderer.options.rayTracingDenoising,

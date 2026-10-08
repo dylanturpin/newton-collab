@@ -373,3 +373,13 @@ The original crop contained 14 of 15 task types; the revised crop contains all
 15, with the humanoid still visible on the left. Use this arrangement for the
 overview and final zoom-out. The inset cameras and individual clips are
 unchanged. The revised Cycles teaser is under `final-cycles-visible-tasks`.
+
+`assemble_video_teaser.py ROOT RENDERER --wait-for-clips` waits for the 17
+decode-validated editorial exports, then assembles a 24-second video teaser.
+The left panel is a dedicated 1800x1200 native HQ replay ending at the paper
+camera; `playbackSpeed: 0.25` in its camera JSON slows the recorded motion
+independently of the camera path. The default replay speed remains 1.
+Three 624x390 rows show every task at normal speed with staggered 4–5-second
+cuts. Drawer opening and placement are joined into one shot. The final video
+is 2460x1224 at 30 fps, with white gutters and no labels or overlays.
+`timeline.json` and `teaser-report.json` retain edit timings and provenance.
