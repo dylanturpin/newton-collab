@@ -71,12 +71,15 @@ def render(source, output, ffmpeg):
     scene.render.use_persistent_data = True
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.compression = 10
-    frames = round(camera["duration"] * 30)
+    total_frames = round(camera["duration"] * 30)
+    first_frame = int(os.environ.get("CYCLES_FIRST_FRAME", "0"))
+    frames = int(os.environ.get("CYCLES_FRAME_COUNT", str(total_frames - first_frame)))
+    assert frames > 0 and 0 <= first_frame < total_frames and first_frame + frames <= total_frames
     folder = output / "frames"
     folder.mkdir(exist_ok=True)
     setup = time.monotonic() - started
     times = []
-    for frame in range(frames):
+    for frame in range(first_frame, first_frame + frames):
         tick = time.monotonic()
         t = frame / 30
         sample = (camera.get("startTime", 0) + t * camera.get("playbackSpeed", 1)) * meta["recording_fps"]
@@ -109,7 +112,7 @@ def render(source, output, ffmpeg):
         bpy.ops.render.render(write_still=True)
         times.append(time.monotonic() - tick)
         if frame % 30 == 0:
-            print(f"PROGRESS {source.name} {frame + 1}/{frames} {times[-1]:.3f}s", flush=True)
+            print(f"PROGRESS {source.name} {frame + 1}/{total_frames} {times[-1]:.3f}s", flush=True)
     destination = output / (source.name + ".mp4")
     subprocess.run(
         [
@@ -119,8 +122,12 @@ def render(source, output, ffmpeg):
             "-y",
             "-framerate",
             "30",
+            "-start_number",
+            str(first_frame),
             "-i",
             str(folder / "%04d.png"),
+            "-frames:v",
+            str(frames),
             "-c:v",
             "libx264",
             "-preset",
@@ -139,6 +146,8 @@ def render(source, output, ffmpeg):
     report = dict(
         meta,
         frames=frames,
+        first_frame=first_frame,
+        total_frames=total_frames,
         fps=30,
         width=1920,
         height=1080,
