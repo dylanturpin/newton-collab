@@ -76,7 +76,7 @@ def package(spec, output):
         "width": 2560,
         "height": 1440,
         "fps": 30,
-        "playback_speed": 1,
+        "playback_speed": "per_clip_render_report",
         "upscaling": False,
         "overlays": False,
         "simulation_steps_executed_during_render": 0,
@@ -86,7 +86,7 @@ def package(spec, output):
     lines = [
         "# Separate montage clips",
         "",
-        "Native 2560x1440, 30 fps, real-time playback. No titles or overlays.",
+        "Native 2560x1440, 30 fps. Action clips play at real time; the 24-second overview stretches the six-second recording. No titles or overlays.",
         "",
         "The final overview combines recorded worlds from several CUDA runs; it is not a new simultaneous batch run.",
         "The lighter is the specifically accepted contact-only take (about 65° opening); it does not pass the full-open/repeatability gate.",

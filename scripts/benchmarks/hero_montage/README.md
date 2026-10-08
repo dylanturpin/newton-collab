@@ -399,3 +399,15 @@ Replay material decoding must forward optional `transmission` and `ior`
 fields to AVBD's `previewOptics`. Omitting them turns the pouring jar opaque
 despite the export retaining its glass settings. Missing fields default to
 opaque materials at IOR 1.5; the pouring jar uses transmission 0.98, IOR 1.47.
+
+For composition iterations, use the realtime ray-tracing preset, four passes,
+one diffuse sample, and retained temporal history. The 24-second pullback now
+reveals the 96-table layout with a frame-filling crop, retaining the accepted
+viewing direction and avoiding a large empty floor border. Its fixed near plane is 1 m; the replay renderer
+extends the far plane to cover the full camera path and scene bounds.
+`prepare_realtime_overview.py FULL DRESSED OUTPUT` retains full geometry for
+the opening plate tile and validated overview meshes for distant tiles. It
+also merges identical material references so repeated geometry can be shared
+by the ray tracer. This avoids the full 96-tile export's memory bottleneck.
+The video teaser reuses the completed 24-second wide clip via a central crop
+and downsampling instead of rendering the pullback a second time.

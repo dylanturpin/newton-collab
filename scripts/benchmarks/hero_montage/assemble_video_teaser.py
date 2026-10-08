@@ -13,6 +13,7 @@ from pathlib import Path
 import imageio_ffmpeg
 import numpy as np
 from prepare_metal_paper_view import prepare
+from prepare_realtime_overview import prepare as prepare_overview
 from texture_knife_holders import apply as texture_knife_holders
 
 # Each row lasts 24 seconds. All 15 task types appear, with drawer opening
@@ -46,6 +47,32 @@ def prepare_left(root, output):
     camera = json.loads((root / "hq-clips-no-drills/16-final-zoom-out/camera.json").read_text())[0]
     camera.update(name="teaser-left", duration=24, playbackSpeed=0.25)
     end = json.loads((root / "paper-teaser/overview.json").read_text())[0]
+    meta = json.loads((root / "hq-clips-no-drills/16-final-zoom-out/snapshot/scene.json").read_text())
+    target = np.array([0.0, 0.0, 1.2])
+    direction = np.array(end["position"]) - end["target"]
+    direction /= np.linalg.norm(direction)
+    forward = -direction
+    right = np.cross(forward, [0, 0, 1])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    points = (
+        np.array(
+            [
+                np.array(world["display_offset"]) + np.array([x, y, z])
+                for world in meta["worlds"]
+                for x in (-1.25, 1.25)
+                for y in (-1.25, 1.25)
+                for z in (-0.805, 2.6)
+            ]
+        )
+        - target
+    )
+    tangent = np.tan(np.deg2rad(end["fov"] / 2))
+    distance = np.max(
+        np.maximum(abs(points @ right) / (tangent * 1.5 * 0.94), abs(points @ up) / (tangent * 0.94)) - points @ forward
+    )
+    distance *= 0.76  # Fill the frame instead of leaving an empty floor border.
+    end.update(position=(target + direction * distance).tolist(), target=target.tolist())
     for keyframe, time_value in zip(camera["keyframes"], (0, 1.2, 22, 24), strict=True):
         keyframe["time"] = time_value
         if time_value >= 22:
@@ -66,8 +93,10 @@ def prepare_left(root, output):
     ]
     culling = output / "left-culling.json"
     culling.write_text(json.dumps(views, indent=2) + "\n")
-    prepare(root / "finale-data", root / "hq-clips-no-drills/16-final-zoom-out/snapshot", culling, output / "left-data")
-    texture_knife_holders(output / "left-data")
+    full = output / "full-left-data"
+    prepare(root / "finale-data", root / "hq-clips-no-drills/16-final-zoom-out/snapshot", culling, full)
+    texture_knife_holders(full)
+    prepare_overview(full, root / "paper-teaser/decor-study/visible-tasks-scene-96", output / "left-data")
 
 
 def assemble(root, renderer, *, wait=False):
@@ -160,38 +189,46 @@ def assemble(root, renderer, *, wait=False):
             ]
         )
         print(f"Encoded staggered row {index + 1}/3", flush=True)
-    print("Rendering the dedicated 24-second pullback", flush=True)
-    subprocess.run(
-        [
-            str(renderer),
-            "--data",
-            str(output / "left-data"),
-            "--cameras",
-            str(output / "left-camera.json"),
-            "--output",
-            str(output / "native-render"),
-            "--width",
-            "1800",
-            "--height",
-            "1200",
-            "--quality",
-            "high",
-            "--accumulation",
-            "4",
-            "--samples-per-frame",
-            "4",
-            "--diffuse-samples",
-            "8",
-            "--lighting",
-            "soft-studio",
-            "--reset-history-per-frame",
-            "--direct-video",
-        ],
-        check=True,
-    )
-    left = output / "native-render/teaser-left/video.mp4"
-    render_report = json.loads((left.parent / "render-report.json").read_text())
-    assert render_report["frames"] == 720 and render_report["playback_speed"] == 0.25
+    wide = next(item for item in manifest["clips"] if item["name"] == "16-final-zoom-out")
+    if wide["frames"] == 720:
+        left = output / "left-from-wide.mp4"
+        encode(["-i", clips / wide["file"], "-vf", "crop=2160:1440,scale=1800:1200,setsar=1", *codec, left])
+        render_report = {**wide["render"], "left_panel_crop": [2160, 1440], "left_panel_size": [1800, 1200]}
+        print("Reused the validated wide pullback for the left panel", flush=True)
+    else:
+        print("Rendering the dedicated 24-second pullback", flush=True)
+        subprocess.run(
+            [
+                str(renderer),
+                "--data",
+                str(output / "left-data"),
+                "--cameras",
+                str(output / "left-camera.json"),
+                "--output",
+                str(output / "native-render"),
+                "--width",
+                "1800",
+                "--height",
+                "1200",
+                "--quality",
+                "realtime",
+                "--accumulation",
+                "4",
+                "--samples-per-frame",
+                "4",
+                "--diffuse-samples",
+                "1",
+                "--lighting",
+                "soft-studio",
+                "--near-clip",
+                "10",
+                "--direct-video",
+            ],
+            check=True,
+        )
+        left = output / "native-render/teaser-left/video.mp4"
+        render_report = json.loads((left.parent / "render-report.json").read_text())
+        assert render_report["frames"] == 720 and render_report["playback_speed"] == 0.25
     destination = output / "hero-teaser.mp4"
     encode(
         [

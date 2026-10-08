@@ -465,6 +465,10 @@ struct HeroHQReplay {
                 let pose = camera.pose(at: Double(frame) / 30)
                 return length(pose.position - pose.target)
             }.min()!
+            let farthestEye = (0...totalFrames).map { frame -> Float in
+                length(camera.pose(at: Double(frame) / 30).position - center)
+            }.max()!
+            renderer.farClipDistance = max(450, (farthestEye + scene.renderContentBounds!.radius * 2) / renderer.sceneLengthScale)
             renderer.nearClipDistance = requestedNearClip ?? max(0.5, min(20, closestFocus * 0.2))
             let started = Date()
             var finalPassGPUMS = 0.0, totalGPUMS = 0.0, outputSeconds = 0.0
