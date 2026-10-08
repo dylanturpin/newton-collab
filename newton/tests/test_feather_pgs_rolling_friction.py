@@ -254,20 +254,20 @@ def block_impulses(cone, jacobian, velocity, mu, load):
 
         @wp.func_native(snippet)
         def block(
-            jacobian: wp.array(dtype=float),
-            velocity: wp.array(dtype=float),
-            coefficients: wp.array(dtype=float),
+            jacobian: wp.array[float],
+            velocity: wp.array[float],
+            coefficients: wp.array[float],
             load: float,
-            out: wp.array(dtype=float),
+            out: wp.array[float],
         ): ...
 
         @wp.kernel(enable_backward=False, module="unique")
         def probe(
-            jacobian: wp.array(dtype=float),
-            velocity: wp.array(dtype=float),
-            coefficients: wp.array(dtype=float),
+            jacobian: wp.array[float],
+            velocity: wp.array[float],
+            coefficients: wp.array[float],
             load: float,
-            out: wp.array(dtype=float),
+            out: wp.array[float],
         ):
             block(jacobian, velocity, coefficients, load, out)
 
