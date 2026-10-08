@@ -3204,7 +3204,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         from it, along with dense, matrix-free, and propagation impulse history,
         the carried friction anchors, and overflow status, is cleared. Mass
         factors for selected worlds refresh on the next step after a teleport;
-        other worlds retain their normal refresh cadence.
+        other worlds retain their normal refresh cadence. A full reset (``world_mask=None``)
+        also restarts the step cadence, so the next step matches a freshly constructed solver.
 
         Args:
             state: Simulation state, which is left unchanged.
@@ -3214,6 +3215,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        if world_mask is None:
+            # A full reset restarts the step cadence, so the next step repeats a fresh solver's first step.
+            self._step = 0
+            self._last_step_dt = None
+            self._ws_prev_dt = 0.0
+            if self._H_bufs is not None:
+                self._buf_idx = 0
+            self._ws_history_generation.fill_(CONTACT_GENERATION_NONE)
+            self._ws_history_stream.zero_()
         # A reset distribution is not a repeated solve: unselected worlds keep their live history.
         self._coupling_patch_history_saved = False
         self._coupling_patch_history_restore_pending = False
@@ -15756,6 +15766,8 @@ def _get_pgs_solve_paired_factor_kernel(
                 if ((row_type == {contact_type} || row_type == {joint_limit_type}) && new_impulse < 0.0f)
                     new_impulse = 0.0f;
                 const float delta = new_impulse - old_impulse;
+                // Every lane has read this row's impulse before any lane overwrites it.
+                __syncwarp(MASK);
                 s_lam[i] = new_impulse;
                 if (delta != 0.0f) {{
                     iteration_changed = 1;
@@ -15783,6 +15795,7 @@ def _get_pgs_solve_paired_factor_kernel(
                         + omega * (-( __shfl_sync(MASK, normal_sum, 0) + s_rhs[normal]) / normal_denom);
                     if (new_normal < 0.0f) new_normal = 0.0f;
                     const float normal_delta = new_normal - old_normal;
+                    __syncwarp(MASK);
                     s_lam[normal] = new_normal;
                     if (normal_delta != 0.0f) {{
                         iteration_changed = 1;
@@ -15805,10 +15818,9 @@ def _get_pgs_solve_paired_factor_kernel(
                 const float radius = fmaxf(s_contact_mu[contact] * lambda_n, 0.0f);
                 const float old_tangent1 = s_lam[tangent1];
                 const float old_tangent2 = s_lam[tangent2];
-                if (radius <= 0.0f && old_tangent1 == 0.0f && old_tangent2 == 0.0f) {{
-                    __syncwarp(MASK);
-                    continue;
-                }}
+                // Every lane has read the patch load and tangent pair before any lane overwrites them.
+                __syncwarp(MASK);
+                if (radius <= 0.0f && old_tangent1 == 0.0f && old_tangent2 == 0.0f) continue;
                 if (global_iter < friction_start_iteration) {{
                     s_lam[tangent1] = 0.0f;
                     s_lam[tangent2] = 0.0f;
@@ -15894,6 +15906,7 @@ def _get_pgs_solve_paired_factor_kernel(
             float new_impulse = old_impulse + omega * raw_delta;
             float delta_impulse = 0.0f;
             float sibling_delta = 0.0f;
+            float new_sibling_impulse = 0.0f;
             if (row_type == {contact_type} || row_type == {joint_limit_type}) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
                 delta_impulse = new_impulse - old_impulse;
@@ -15929,13 +15942,15 @@ def _get_pgs_solve_paired_factor_kernel(
                 const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
                 const float scale = magnitude > radius ? radius / magnitude : 1.0f;
                 new_impulse = pair.x * scale;
-                const float new_sibling_impulse = pair.y * scale;
+                new_sibling_impulse = pair.y * scale;
                 sibling_delta = new_sibling_impulse - sibling_impulse;
-                s_lam[sibling] = new_sibling_impulse;
                 delta_impulse = new_impulse - old_impulse;
             }} else {{
                 delta_impulse = new_impulse - old_impulse;
             }}
+            // Every lane has read this row's and its sibling's impulses before any lane overwrites them.
+            __syncwarp(MASK);
+            if (sibling >= 0) s_lam[sibling] = new_sibling_impulse;
             s_lam[i] = new_impulse;
 
             if (sibling_delta != 0.0f) {{
@@ -16240,10 +16255,8 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     for (int iter = 0; iter < iterations; iter++) {{
         int global_iter = iteration_offset + iter;
         for (int i = 0; i < m; i++) {{
-            // NOTE: single-warp kernel; __syncwarp here is typically unnecessary unless divergence occurs
-            // before the dot. If you want max perf, try removing it after verifying correctness.
-            // __syncwarp();
-
+            // Every lane wrote the previous row's impulses; order those writes before this row's reads.
+            __syncwarp();
             {dot_code}
 
             // Warp reduce my_sum
@@ -16262,6 +16275,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             float new_impulse = s_lam[i] + omega * delta;
             int row_type = s_rtype[i];
             if (row_type == 2 && global_iter < friction_start_iteration) {{
+                __syncwarp();
                 s_lam[i] = 0.0f;
                 continue;
             }}
@@ -16274,6 +16288,8 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             // [-qdot_max, +qdot_max] box is active at a time.
             if (row_type == 0 || row_type == 3 || row_type == 4) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
+                // Every lane has read this row's impulse before any lane overwrites it.
+                __syncwarp();
                 s_lam[i] = new_impulse;
             }} else if (row_type == 2) {{
                 int parent_idx = s_parent[i];
@@ -16300,13 +16316,16 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
                 float b = pair.y;
                 float mag = sqrtf(a * a + b * b);
                 float scale = mag > radius ? radius / mag : 1.0f;
+                __syncwarp();
                 s_lam[i] = a * scale;
                 s_lam[sib] = b * scale;
             }} else {{
+                __syncwarp();
                 s_lam[i] = new_impulse;
             }}
         }}
     }}
+    __syncwarp();
 
 {store_code}
 #endif
@@ -19914,6 +19933,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                         float scale = mag > radius ? radius / mag : 1.0f;
                         new_impulse = a * scale;
                         float sib_delta = b * scale - s_lam_dense[sib];
+                        __syncwarp(MASK);
                         s_lam_dense[sib] = b * scale;
                         for (int d = lane; d < __D__; d += 32)
                             s_v[d] += Y_world.data[sib_row_base + d] * sib_delta;
@@ -19923,6 +19943,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     delta_impulse = new_impulse - old_impulse;
                 }
 
+                // Every lane has read this row's impulse before lane 0 overwrites it.
+                __syncwarp(MASK);
                 if (lane == 0) s_lam_dense[i] = new_impulse;
                 delta_impulse = __shfl_sync(MASK, delta_impulse, 0);
                 if (delta_impulse != 0.0f) {
@@ -20050,6 +20072,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             float scale = mag > radius ? radius / mag : 1.0f;
                             new_impulse = a * scale;
                             float sib_delta = b * scale - s_lam_mf[sib];
+                            __syncwarp(MASK);
                             s_lam_mf[sib] = b * scale;
                             if (lane < 6 && dof_a >= 0)
                                 s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
@@ -20059,6 +20082,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     }
 
                     if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
+                    // Every lane has read this row's impulse before lane 0 overwrites it.
+                    __syncwarp(MASK);
                     if (lane == 0) s_lam_mf[i] = new_impulse;
                     delta_impulse = __shfl_sync(MASK, delta_impulse, 0);
                     if (delta_impulse != 0.0f) {
@@ -22819,6 +22844,7 @@ def _get_pgs_solve_local_owned_kernel(
                     new_impulse = pair.x * pair_scale;
                     const float sibling_new = pair.y * pair_scale;
                     const float sibling_delta = sibling_new - sibling_old;
+                    __syncwarp();
                     s_lambda[sibling] = sibling_new;
                     if (sibling_delta != 0.0f) {{
                         changed = 1;
@@ -23033,7 +23059,6 @@ def _get_pgs_solve_local_owned_kernel(
         if dense_response_matrix
         else ""
     )
-    row_sync = "            __syncwarp();" if contact_capable else ""
     early_exit = (
         """        // Friction rows may intentionally remain inactive until a later
         // iteration. Do not mistake a stationary pre-friction sweep for the
@@ -23243,6 +23268,7 @@ def _get_pgs_solve_local_owned_kernel(
                     new_impulse_mf = pair_mf.x * pair_scale_mf;
                     const float sibling_new_mf = pair_mf.y * pair_scale_mf;
                     const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
+                    __syncwarp();
                     s_mf_lambda[sibling_mf] = sibling_new_mf;
                     if (sibling_delta_mf != 0.0f) {{
                         changed = 1;
@@ -23252,6 +23278,7 @@ def _get_pgs_solve_local_owned_kernel(
             }}
 
             const float delta_impulse_mf = new_impulse_mf - old_impulse_mf;
+            __syncwarp();
             s_mf_lambda[mf_row] = new_impulse_mf;
             if (delta_impulse_mf != 0.0f) {{
                 changed = 1;
@@ -23366,12 +23393,14 @@ def _get_pgs_solve_local_owned_kernel(
             float new_impulse = old_impulse + omega * (delta * w_row - (1.0f - w_row) * old_impulse);
 {impulse_projection}
             const float delta_impulse = new_impulse - old_impulse;
+            // Every lane has read this row's impulse and residual before any lane updates them.
+            __syncwarp();
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
                 changed = 1;
                 {main_state_update}
             }}
-{row_sync}
+            __syncwarp();
         }}
 {mf_solve}
 {early_exit}
@@ -24251,6 +24280,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 new_impulse = pair.x * scale;
                 const float sibling_new = pair.y * scale;
                 const float sibling_delta = sibling_new - sibling_old;
+                // Every lane has read both tangents and their velocities before any lane updates them.
+                __syncwarp(MASK);
                 s_lambda[sibling] = sibling_new;
                 if (sibling_delta != 0.0f) {{
                     iteration_changed = 1;
@@ -24260,6 +24291,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             }}
 
             const float delta_impulse = new_impulse - old_impulse;
+            // Every lane has read this row's impulse and velocity before any lane updates them.
+            __syncwarp(MASK);
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
                 iteration_changed = 1;
