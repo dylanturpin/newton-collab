@@ -467,6 +467,11 @@ struct HeroHQReplay {
             for (index, t) in frameTimes.enumerated() {
                 let cameraPose = camera.pose(at: t)
                 scene.setTime(camera.startTime + t)
+                if resetEveryFrame && requestedNearClip == nil {
+                    // Independently accumulated frames can adapt the near
+                    // plane throughout a long zoom without temporal history.
+                    renderer.nearClipDistance = max(0.5, min(20, length(cameraPose.position - cameraPose.target) * 0.2))
+                }
                 renderer.verticalFieldOfView = cameraPose.fov
                 renderer.setCamera(position: cameraPose.position, target: cameraPose.target, resetTemporalHistory: resetEveryFrame || !video || index == 0)
                 try await videoWriter?.prepare()

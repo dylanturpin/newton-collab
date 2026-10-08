@@ -303,9 +303,9 @@ def dress(source, output):
                 "insert": ["cutting_board", "kitchen_crock", "pantry_pair"],
                 "drawer": ["mixing_bowl", "pantry_pair", "kitchen_crock"],
                 "gear": ["toy_excavator", "toy_dump_truck", "construction_stock"],
-                "pile": ["crate_vented", "drill", "tote_lidded"],
-                "lift": ["crate_vented", "tote_lidded", "drill"],
-                "kit": ["toy_gear_kit", "drill", "crate_vented"],
+                "pile": ["crate_vented", None, "tote_lidded"],
+                "lift": ["crate_vented", "tote_lidded", None],
+                "kit": ["toy_gear_kit", None, "crate_vented"],
                 "toy": ["toy_train", "toy_puzzle", "brick_bin"],
                 "spill": ["brick_bin", "toy_train", "tote_lidded"],
                 "stack": ["book_stack", None, "clock_twin"],
@@ -336,7 +336,7 @@ def dress(source, output):
                 angle = float(rng.uniform(-0.15, 0.15))
                 style = plans[world["kind"]][slots_filled]
                 slots_filled += 1
-                # Reserve the removed pyramid's slot and random draw so the
+                # Reserve removed props' slots and random draws so the
                 # remaining approved decorations keep their exact placement.
                 occupied.append((lo, hi))
                 if style is not None:

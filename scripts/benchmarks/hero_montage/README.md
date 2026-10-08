@@ -345,3 +345,22 @@ change and zero afterward, against a higher-precision clipping reference.
 This leaves the tote geometry and normals unchanged. `--near-clip` overrides
 the automatic setting in renderer units (scaled by `sceneLengthScale=0.1`);
 render reports record the actual world-space clipping distances.
+
+## Decorated editorial rerenders
+
+`prepare_edit_replays.py ROOT DRESSED OUTPUT` applies the approved decorated
+table variants to the 16 accepted individual takes and the final 96-tile
+zoom-out. It preserves each source recording's time window and rotations,
+and verifies body translations against that recording. Removed decorative
+drills have empty reserved slots, so other props retain their positions.
+The Blender teaser without drills is under `final-cycles-no-drills`.
+
+The exported `render-plan.json` gives each clip's data, camera, frame count,
+and recording provenance. Render with native 2560x1440 AVBD HQ, four samples
+per frame, eight diffuse samples, `--reset-history-per-frame`, and
+`--direct-video`; package with `package_edit_clips.py` for a full decode check.
+The continuous final replay replicates accepted recordings across 96 tiles;
+it is not a new simultaneous simulation. Camera culling covers the complete
+zoom path, and its fixed focal length avoids overshooting the final layout.
+Independent-frame rendering adapts the near plane throughout the pullback
+to retain precision on distant thin surfaces.

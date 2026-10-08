@@ -14,21 +14,24 @@ import numpy as np
 def prepare(original, dressed, camera_path, output):
     source = json.loads((original / "scene.json").read_text())
     meta = json.loads((dressed / "scene.json").read_text())
-    camera = json.loads(camera_path.read_text())[0]
-    position, target = np.array(camera["position"]), np.array(camera["target"])
-    forward = target - position
-    forward /= np.linalg.norm(forward)
-    right = np.cross(forward, [0, 0, 1])
-    right /= np.linalg.norm(right)
-    up = np.cross(right, forward)
-    tangent = np.tan(np.deg2rad(camera["fov"] / 2))
-    selected = []
-    for wi, world in enumerate(meta["worlds"]):
-        p = np.asarray(world["display_offset"], dtype=float) + np.array([0, 0, 0.45]) - position
-        z = p @ forward
-        # Two metres of padding retain edge geometry and nearby shadow casters.
-        if abs(p @ right) < z * tangent * 1.5 + 2 and abs(p @ up) < z * tangent + 2:
-            selected.append(wi)
+    cameras = json.loads(camera_path.read_text())
+    camera = cameras[0]
+    selected = set()
+    for view in cameras:
+        position, target = np.array(view["position"]), np.array(view["target"])
+        forward = target - position
+        forward /= np.linalg.norm(forward)
+        right = np.cross(forward, [0, 0, 1])
+        right /= np.linalg.norm(right)
+        up = np.cross(right, forward)
+        tangent = np.tan(np.deg2rad(view["fov"] / 2))
+        for wi, world in enumerate(meta["worlds"]):
+            p = np.asarray(world["display_offset"], dtype=float) + np.array([0, 0, 0.45]) - position
+            z = p @ forward
+            # Union sampled camera views for a move; padding retains nearby
+            # edge geometry and shadow casters between those samples.
+            if abs(p @ right) < z * tangent * view.get("aspect", 1.5) + 2 and abs(p @ up) < z * tangent + 2:
+                selected.add(wi)
     sv = np.memmap(original / "vertices.bin", dtype="<f4", mode="r").reshape(-1, 16)
     si = np.memmap(original / "indices.bin", dtype="<u4", mode="r")
     dv = np.memmap(dressed / "vertices.bin", dtype="<f4", mode="r").reshape(-1, 16)
@@ -85,6 +88,7 @@ def prepare(original, dressed, camera_path, output):
         overview_geometry_lod=False,
         visible_tile_count=len(selected),
         view_culling_camera=camera,
+        view_culling_samples=len(cameras),
         offscreen_tile_culling_margin=2,
     )
     (output / "scene.json").write_text(json.dumps(meta, indent=2) + "\n")

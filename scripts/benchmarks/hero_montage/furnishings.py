@@ -240,7 +240,6 @@ def dress(b, kind, variant, info, color):
         asset(b, "office_clipboard", (0.70, -0.58, 0.002), angle=-0.2, scale=0.70)
     elif kind == "pile":
         asset(b, "tool_rail", (0.03, 0.98, 0), scale=0.85)
-        asset(b, "drill", (0.72, -0.54, 0.048), angle=0.45, scale=0.8)
         asset(b, "fastener_set", (0.73, 0.62, 0.002), scale=0.75)
     elif kind == "gear":
         asset(b, "parts_tray", (0.68, 0.67, 0), angle=math.pi / 2, scale=0.8)
