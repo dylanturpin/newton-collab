@@ -420,7 +420,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 self.assertAlmostEqual(rate, expected, delta=0.005 * expected)
 
     def test_joint_friction_and_torsional_friction_share_the_spin_dof(self):
-        """Joint dry-friction rows and torsional rows on one DOF add their decelerations."""
+        """Check that joint dry-friction rows and torsional rows on one DOF add their decelerations."""
         radius, mu_torsional, joint_friction = 0.1, 0.005, 0.002
         inertia = 0.4 * radius * radius
         for cone in ("pyramidal", "elliptic"):
