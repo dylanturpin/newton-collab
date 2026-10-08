@@ -235,6 +235,9 @@ def dress(source, output):
                     continue
                 if "/furnishing/" in mesh["name"]:
                     item = mesh["name"].split("/furnishing/")[1].split("/")[0]
+                    if world["kind"] == "pile" and item == "tool_rail":
+                        removed += 1
+                        continue
                     if not item.startswith("bench_") and item not in ("skin", "hockey", "stage", "tool_rail"):
                         removed += 1
                         continue
@@ -305,7 +308,7 @@ def dress(source, output):
                 "kit": ["toy_gear_kit", "drill", "crate_vented"],
                 "toy": ["toy_train", "toy_puzzle", "brick_bin"],
                 "spill": ["brick_bin", "toy_train", "tote_lidded"],
-                "stack": ["book_stack", "ring_stack", "clock_twin"],
+                "stack": ["book_stack", None, "clock_twin"],
                 "sort": ["clock_twin", "parts_box", "book_stack"],
                 "hand": ["desk_fan", "toy_gear_kit", "book_stack"],
                 "shadow": ["clock_mantel", "book_stack", "desk_task_lamp"],
@@ -318,8 +321,9 @@ def dress(source, output):
             ]
             rng.shuffle(candidates)
             clusters = []
+            slots_filled = 0
             for x, y in candidates:
-                if len(clusters) >= 3:
+                if slots_filled >= len(plans[world["kind"]]):
                     break
                 half = np.array([0.24, 0.21])
                 lo = np.array([x, y]) - half
@@ -330,10 +334,19 @@ def dress(source, output):
                 if any(np.all(hi > a) and np.all(lo < b) for a, b in occupied):
                     continue
                 angle = float(rng.uniform(-0.15, 0.15))
-                style = plans[world["kind"]][len(clusters)]
-                cluster(wi, style, x, y, angle)
+                style = plans[world["kind"]][slots_filled]
+                slots_filled += 1
+                # Reserve the removed pyramid's slot and random draw so the
+                # remaining approved decorations keep their exact placement.
                 occupied.append((lo, hi))
-                clusters.append({"style": style, "position": [x, y], "angle": angle})
+                if style is not None:
+                    prop_x, prop_y = x, y
+                    if wi == 38 and style == "kitchen_toaster":
+                        # Keep the plate-shot appliance visible to the left of
+                        # the wrist while preserving all other sampled slots.
+                        prop_x, prop_y = -0.50, 0.48
+                    cluster(wi, style, prop_x, prop_y, angle)
+                    clusters.append({"style": style, "position": [prop_x, prop_y], "angle": angle})
             if world["kind"] in ("hand", "shadow"):
                 # Painted corner guides and converging stripes highlight the
                 # small floating hand without altering its physical scale.

@@ -349,7 +349,9 @@ struct HeroHQReplay {
         let renderer = try GPUSimRenderer(device: device, materials: library)
         renderer.automaticallyFramesScene = false
         renderer.sceneLengthScale = 0.1
-        renderer.nearClipDistance = 0.5
+        let requestedNearClip = CommandLine.arguments.contains("--near-clip")
+            ? Float(option("--near-clip", default: "0.5"))! : nil
+        if let requestedNearClip { precondition(requestedNearClip.isFinite && requestedNearClip > 0 && requestedNearClip < 450) }
         renderer.farClipDistance = 450
         renderer.options = .qualityBeta
         renderer.options.reconstructionScale = 1
@@ -449,6 +451,16 @@ struct HeroHQReplay {
             let endFrame = frameCount > 0 ? min(totalFrames, firstFrame + frameCount) : totalFrames
             precondition(firstFrame >= 0 && firstFrame < endFrame)
             let frameTimes = video ? (firstFrame..<endFrame).map { Double($0) / 30 } : (frameCount == 1 ? [0.0] : [0.15, 0.6, 0.95].map { $0 * camera.duration })
+            // The renderer scales clipping distances by sceneLengthScale.
+            // A fixed 5 cm near plane loses depth precision on distant thin
+            // shells. Use 2% of the closest focus distance for this shot, with
+            // the original close-up minimum. Keep it constant during motion
+            // so changing the projection does not invalidate temporal history.
+            let closestFocus = (0...totalFrames).map { frame -> Float in
+                let pose = camera.pose(at: Double(frame) / 30)
+                return length(pose.position - pose.target)
+            }.min()!
+            renderer.nearClipDistance = requestedNearClip ?? max(0.5, min(20, closestFocus * 0.2))
             let started = Date()
             var finalPassGPUMS = 0.0, totalGPUMS = 0.0, outputSeconds = 0.0
             var drawCount = 0
@@ -489,6 +501,8 @@ struct HeroHQReplay {
                 "pose_interpolation": "linear translation and quaternion SLERP from 50 Hz trace",
                 "width": width, "height": height, "quality": quality,
                 "reconstruction_scale": 1, "denoising": renderer.options.rayTracingDenoising,
+                "near_clip_world": renderer.nearClipDistance * renderer.sceneLengthScale,
+                "far_clip_world": renderer.farClipDistance * renderer.sceneLengthScale,
                 "frames": frameTimes.count, "wall_s": Date().timeIntervalSince(started),
                 "mean_final_frame_gpu_ms": finalPassGPUMS / Double(frameTimes.count), "samples_per_frame": samplesPerFrame,
                 "gpu_passes": drawCount, "gpu_total_ms": totalGPUMS,

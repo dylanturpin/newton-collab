@@ -4544,7 +4544,9 @@
         "shade_belly": 1.140990237782123,
         "arc_reach": 0.12430365460286984,
         "arc_bow": 0.33327252040115735,
-        "tripod_spread": 1.118190796548088
+        "tripod_spread": 1.118190796548088,
+        "render_support_rise": 0.14,
+        "render_omit_springs": true
       },
       "regions": [
         {
@@ -4554,18 +4556,8 @@
             0.065,
             0.073
           ],
-          "vertices": 2377,
-          "triangles": 3278
-        },
-        {
-          "material": "chrome",
-          "color": [
-            0.42,
-            0.48,
-            0.51
-          ],
-          "vertices": 3891,
-          "triangles": 7434
+          "vertices": 2417,
+          "triangles": 3342
         },
         {
           "material": "ivory",
@@ -4576,6 +4568,16 @@
           ],
           "vertices": 26476,
           "triangles": 37020
+        },
+        {
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ],
+          "vertices": 179,
+          "triangles": 210
         }
       ],
       "bounds": [
@@ -4587,7 +4589,7 @@
         [
           0.2797386332894972,
           0.15973863328949725,
-          0.6900000000000001
+          0.8300000000000001
         ]
       ]
     }

@@ -15,6 +15,26 @@ from pathlib import Path
 import numpy as np
 
 
+def repair_lamp_support(program):
+    """Route the static lamp support above the shade with a vertical mount."""
+    program.parts[:] = [
+        part
+        for part in program.parts
+        if not part.name.startswith(("upper_link.", "pivot.2", "tension_spring.", "spring_coil."))
+    ]
+    height = program.parameters["height"]
+    elbow = np.array([-0.22, 0, height * 0.5])
+    pivot = np.array([0.12, 0, height + 0.14])
+    for side, y in enumerate((-0.025, 0.025)):
+        offset = np.array([0, y, 0])
+        program.beam(f"upper_link.{side}", elbow + offset, pivot + offset, 0.014, 0.008, "black")
+    axle = np.array([0, 0.046, 0])
+    program.rod("pivot.2", pivot - axle, pivot + axle, 0.010, "black")
+    program.rod("raised_shade_mount", pivot, (0.12, 0, height - 0.01), 0.006, "black")
+    program.parameters["render_support_rise"] = 0.14
+    program.parameters["render_omit_springs"] = True
+
+
 def main():
     import trimesh
 
@@ -183,6 +203,8 @@ def main():
             )
             p["phase"] = 0.0
         program = plugin.build_program(p, quality="standard")
+        if name == "desk_task_lamp":
+            repair_lamp_support(program)
         if name in ("hex_key", "fastener_set"):
             program.place_since(0, rotation=(90, 0, 0))
         save(name, program, align)

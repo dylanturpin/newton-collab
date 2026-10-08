@@ -327,3 +327,21 @@ Cycles uses 128 adaptive samples, Metal acceleration, and denoising. The
 overview is 3600x2400, each inset 1600x1000, and the assembled figure
 4920x2448. Pass `--renderer` to `layout_paper_teaser.py` to record the actual
 renderer in the figure manifest. The saved Cycles files pack their textures.
+
+The subsequent `cleaned` exports retain all 194 table material regions and
+the recorded pose buffers unchanged. They remove the sweep pegboard and
+Jenga ring-stack decoration. The desk lamp's upper pivot is raised 14 cm in
+the source asset and connects vertically through the shade's top opening.
+Boolean intersection of the support and shade is zero; the original support
+intersected 1.37e-6 cubic metres of the shade.
+The `refined` revision also omits the gray decorative spring rods/collars on
+the lower lamp arm and shifts only the plate inset's toaster left of the wrist.
+
+The native replay chooses a constant near plane per shot at 2% of its closest
+focus distance, bounded to 5 cm–2 m. The previous fixed 5 cm near plane caused
+white depth artifacts on distant thin containers. A distant tote regression
+found 6,981 overly bright pixels in a 94,352-pixel body region before this
+change and zero afterward, against a higher-precision clipping reference.
+This leaves the tote geometry and normals unchanged. `--near-clip` overrides
+the automatic setting in renderer units (scaled by `sceneLengthScale=0.1`);
+render reports record the actual world-space clipping distances.
