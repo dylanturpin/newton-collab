@@ -10,6 +10,7 @@ stores every intermediate in buffers owned by the output state, so a
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -100,22 +101,32 @@ def validate_differentiable_model(solver: SolverFeatherPGS) -> None:
 
 @dataclass(frozen=True)
 class SmoothContactLaw:
-    """Smooth explicit spring-damper normal law; a forward-changing surrogate, not FeatherPGS parity.
+    """Smooth explicit spring-damper normal law for ``SolverFeatherPGS(differentiable=True)``.
 
-    Each normal row applies ``dt * k * s * softplus(-(phi + (c / k) * sigmoid(-phi / s) * u) / s)`` from the
-    step's gap ``phi`` and predicted separating velocity ``u``; it tends to ``dt * max(0, -k phi - c u)`` as s -> 0.
+    .. experimental::
+
+        A forward-changing surrogate, not FeatherPGS contact parity. Each normal row applies
+        ``dt * k * s * softplus(-(phi + (c / k) * sigmoid(-phi / s) * u) / s)``, computed once per step from the
+        gap ``phi`` and predicted separating velocity ``u``. As ``s -> 0`` the impulse tends to
+        ``dt * max(0, -k phi - c u)`` for ``phi < 0``, to 0 for ``phi > 0``, and to ``dt * max(0, -c u / 2)`` at
+        ``phi = 0``. The parameters are fixed host configuration, not differentiable inputs; rebuild captured
+        graphs after changing them.
     """
 
     stiffness: float
-    """Spring stiffness k [N/m]; the explicit update is stable for ``dt * sqrt(k / m) < 2``."""
+    """Spring stiffness k [N/m]. For a single closed contact on mass m the explicit update needs
+    ``dt**2 * k / m + 2 * dt * c / m < 4``; coupled contacts and articulations need more margin."""
     damping: float = 0.0
     """Dashpot c [N s/m], gated smoothly to closed gaps; zero gives an elastic contact."""
     softness: float = 1.0e-3
-    """Activation length s [m]; keep it well below the collision margin so rows enter the set with ~zero force."""
+    """Activation length s [m]; small values approach a hard spring but sharpen the activation."""
 
     def __post_init__(self):
-        if not (self.stiffness > 0.0 and self.damping >= 0.0 and self.softness > 0.0):
-            raise ValueError(f"SmoothContactLaw needs k > 0, c >= 0, s > 0; got {self}")
+        values = (self.stiffness, self.damping, self.softness)
+        if not all(math.isfinite(v) for v in values) or not (
+            self.stiffness > 0.0 and self.damping >= 0.0 and self.softness > 0.0
+        ):
+            raise ValueError(f"SmoothContactLaw needs finite k > 0, c >= 0, s > 0; got {self}")
 
 
 class DifferentiableStep:
@@ -1889,8 +1900,9 @@ def _smooth_contact_impulse(
     value = float(0.0)
     if row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
         phi = row_phi[world, i]
+        # Same branch as compute_world_contact_bias, so the bias and its derivative cancel at phi == 0.
         geometric_bias = contact_speculative_scale * phi / dt
-        if phi < 0.0:
+        if phi <= 0.0:
             geometric_bias = row_beta[world, i] * phi / dt
         separating_velocity = rhs[world, i] - geometric_bias
         gate = _sigmoid(-phi / softness)
@@ -1901,7 +1913,10 @@ def _smooth_contact_impulse(
 
 @wp.func
 def _softplus(x: float):
-    return wp.max(x, 0.0) + wp.log(1.0 + wp.exp(-wp.abs(x)))
+    # One branch per side keeps exp's argument non-positive and gives the exact derivative 0.5 at x == 0.
+    if x > 0.0:
+        return x + wp.log(1.0 + wp.exp(-x))
+    return wp.log(1.0 + wp.exp(x))
 
 
 @wp.func

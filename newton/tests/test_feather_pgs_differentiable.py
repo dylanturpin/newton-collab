@@ -1,15 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import unittest
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.differentiable import SmoothContactLaw, _dense_pgs_sweep, _friction_pair
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-from newton.solvers import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.differentiable import _dense_pgs_sweep, _friction_pair, _smooth_contact_impulse
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    compute_world_contact_bias,
+)
+from newton.solvers import SolverFeatherPGS, feather_pgs
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 _DT = 1.0 / 120.0
@@ -1285,13 +1290,70 @@ def test_free_body_rows_use_dense_capacity(test, device):
 
 def test_smooth_contact_rejects_unsupported_configs(test, device):
     model = _build_free_body(device)
-    law = SmoothContactLaw(stiffness=1.0e4)
+    law = feather_pgs.SmoothContactLaw(stiffness=1.0e4)
     with test.assertRaises(ValueError):
         SolverFeatherPGS(model, smooth_contact=law, enable_restitution=False)
     with test.assertRaises(ValueError):
         SolverFeatherPGS(model, differentiable=True, smooth_contact=law)
-    with test.assertRaises(ValueError):
-        SmoothContactLaw(stiffness=1.0e4, softness=0.0)
+    for bad in ({"softness": 0.0}, {"stiffness": math.inf}, {"damping": math.inf}, {"softness": math.inf}):
+        with test.assertRaises(ValueError):
+            feather_pgs.SmoothContactLaw(**{"stiffness": 1.0e4, **bad})
+
+
+@wp.kernel
+def _add_separating_velocity(bias: wp.array2d[float], velocity: float, rhs: wp.array2d[float]):
+    rhs[0, 0] = bias[0, 0] + velocity
+
+
+def _smooth_zero_gap_impulse(device, gap, velocity, damping, beta, grad=False):
+    """One contact row through compute_world_contact_bias and the smooth impulse; return the impulse or d/dgap."""
+
+    def array(values, dtype=float):
+        return wp.array(values, dtype=dtype, device=device, requires_grad=dtype is float)
+
+    phi, row_beta, target = array([[gap]]), array([[beta]]), array([[0.0]])
+    count, kind = array([1], int), array([[PGS_CONSTRAINT_TYPE_CONTACT]], int)
+    bias, row_w, rhs, impulse = (wp.zeros((1, 1), device=device, requires_grad=True) for _ in range(4))
+    dt, speculative = 0.01, 1.0
+    tape = wp.Tape()
+    with tape:
+        wp.launch(
+            compute_world_contact_bias,
+            1,
+            inputs=[count, phi, row_beta, kind, target, dt, 1.0, speculative, 1.0, 1.0],
+            outputs=[bias, row_w],
+            device=device,
+        )
+        wp.launch(_add_separating_velocity, 1, inputs=[bias, velocity], outputs=[rhs], device=device)
+        wp.launch(
+            _smooth_contact_impulse,
+            (1, 1),
+            inputs=[count, phi, row_beta, kind, rhs, dt, speculative, 1000.0, damping, 1.0e-3],
+            outputs=[impulse],
+            device=device,
+        )
+    if not grad:
+        return float(impulse.numpy()[0, 0])
+    tape.backward(grads={impulse: wp.ones_like(impulse)})
+    return float(phi.grad.numpy()[0, 0])
+
+
+def test_smooth_contact_zero_gap_activation_gradient(test, device):
+    """At phi == 0 with no damping the impulse slope is -dt * k * sigmoid(0), on the activation branch point."""
+    for gap in (-1.0e-6, 0.0, 1.0e-6):
+        slope = _smooth_zero_gap_impulse(device, gap, 0.0, damping=0.0, beta=0.2, grad=True)
+        test.assertAlmostEqual(slope, -5.0, delta=1.0e-2)
+
+
+def test_smooth_contact_damped_zero_gap_gradient_matches_finite_difference(test, device):
+    """Damped zero-gap row with beta != speculative scale: the bias builder and the smooth law cancel exactly."""
+    eps = 1.0e-5
+    tape_slope = _smooth_zero_gap_impulse(device, 0.0, 0.1, damping=10.0, beta=0.2, grad=True)
+    fd_slope = (
+        _smooth_zero_gap_impulse(device, eps, 0.1, damping=10.0, beta=0.2)
+        - _smooth_zero_gap_impulse(device, -eps, 0.1, damping=10.0, beta=0.2)
+    ) / (2.0 * eps)
+    test.assertAlmostEqual(tape_slope, fd_slope, delta=1.0e-2 * abs(fd_slope))
 
 
 def test_smooth_contact_bounce_gradient_converges_across_eps(test, device):
@@ -1304,7 +1366,7 @@ def test_smooth_contact_bounce_gradient_converges_across_eps(test, device):
     builder.add_ground_plane(cfg=cfg)
     model = builder.finalize(device=device, requires_grad=True)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
-    law = SmoothContactLaw(stiffness=1.0e4, softness=1.0e-2)
+    law = feather_pgs.SmoothContactLaw(stiffness=1.0e4, softness=1.0e-2)
     options = {"friction_anchor_beta": 0.0, "enable_restitution": False, "pgs_iterations": 8, "smooth_contact": law}
     steps = 40
     dt = 1.0 / 240.0
@@ -1384,6 +1446,8 @@ for _device in get_test_devices():
         test_pgs_kernel_selection,
         test_free_body_rows_use_dense_capacity,
         test_smooth_contact_rejects_unsupported_configs,
+        test_smooth_contact_zero_gap_activation_gradient,
+        test_smooth_contact_damped_zero_gap_gradient_matches_finite_difference,
         test_smooth_contact_bounce_gradient_converges_across_eps,
     ):
         add_function_test(TestFeatherPGSDifferentiable, _test.__name__, _test, devices=[_device])

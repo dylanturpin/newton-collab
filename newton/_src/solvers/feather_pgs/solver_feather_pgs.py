@@ -1333,9 +1333,11 @@ class SolverFeatherPGS(SolverBase):
 
                     ``differentiable=True`` and its supported combinations may change without prior notice.
             smooth_contact: Experimental, forward-changing contact law for ``differentiable=True``: a smooth
-                explicit spring-damper replaces the hard normal rows and restitution, and point friction is
-                solved by PGS against that normal impulse. It is a surrogate model, not FeatherPGS contact
-                parity. Requires ``enable_restitution=False``. See :class:`SmoothContactLaw`. Defaults to None.
+                explicit spring-damper, evaluated once per step from the predicted velocity, replaces the hard
+                normal rows, restitution and the depenetration clamp; point friction is still solved by PGS
+                against that normal impulse. It is a surrogate model, not FeatherPGS contact parity. Requires
+                ``enable_restitution=False``. See :class:`~newton.solvers.feather_pgs.SmoothContactLaw`.
+                Defaults to None.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.

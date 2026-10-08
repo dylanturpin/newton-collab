@@ -21,11 +21,13 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :hidden:
 
    newton_solvers_experimental
+   newton_solvers_feather_pgs
    newton_solvers_style3d
 
 .. rubric:: Submodules
 
 - :doc:`newton.solvers.experimental <newton_solvers_experimental>`
+- :doc:`newton.solvers.feather_pgs <newton_solvers_feather_pgs>`
 - :doc:`newton.solvers.style3d <newton_solvers_style3d>`
 
 .. rubric:: Classes
