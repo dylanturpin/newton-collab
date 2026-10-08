@@ -8,7 +8,31 @@ import sys
 from pathlib import Path
 
 import imageio_ffmpeg
-from assemble_video_teaser import ROWS
+
+# First demonstrations share a six-second window; later cuts show variety.
+ROWS = [
+    [
+        ("07-lighter-contact", 0, 4.5, 6),
+        ("drawer", 2.5, 2, 2),
+        ("06-knife-insertion", 1, 2, 2),
+        ("13-toy-assembly", 1, 2, 2),
+        ("15-quadruped", 1, 2, 2),
+    ],
+    [
+        ("04-hardware-bin", 0, 6, 6),
+        ("05-wrecking-ball", 3, 2, 2),
+        ("10-hockey", 1, 2, 2),
+        ("02-balance-scale", 1, 2, 2),
+        ("14-humanoid", 1, 2, 2),
+    ],
+    [
+        ("08-plate-rack", 0, 6, 6),
+        ("01-allegro", 1, 2, 2),
+        ("12-brick-chutes", 1.5, 2, 2),
+        ("11-jenga", 2, 2, 2),
+        ("09-toy-truck", 1, 2, 2),
+    ],
+]
 
 
 def assemble(root):
@@ -52,10 +76,10 @@ def assemble(root):
     )
     for i, row in enumerate(ROWS):
         inputs, filters = [], []
-        for j, (name, start, duration) in enumerate(row):
+        for j, (name, start, duration, screen_duration) in enumerate(row):
             inputs.extend(["-i", drawer if name == "drawer" else clip(name)])
             filters.append(
-                f"[{j}:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS,scale=486:304:force_original_aspect_ratio=increase,crop=486:304,setsar=1[v{j}]"
+                f"[{j}:v]trim=start={start}:duration={duration},setpts=(PTS-STARTPTS)*{screen_duration / duration},fps=30,scale=486:304:force_original_aspect_ratio=increase,crop=486:304,setsar=1[v{j}]"
             )
         filters.append("".join(f"[v{j}]" for j in range(len(row))) + f"concat=n={len(row)}:v=1:a=0[row]")
         encode(
@@ -82,7 +106,7 @@ def assemble(root):
             "-map",
             "[out]",
             "-frames:v",
-            "720",
+            "420",
             "-r",
             "30",
             *codec,
@@ -93,7 +117,7 @@ def assemble(root):
     reader = imageio_ffmpeg.read_frames(str(destination))
     metadata = next(reader)
     frames = sum(1 for _ in reader)
-    assert frames == 720 and metadata["size"] == (1920, 956)
+    assert frames == 420 and metadata["size"] == (1920, 956)
     (output / "report.json").write_text(
         json.dumps(
             {

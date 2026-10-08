@@ -88,6 +88,11 @@ def export(data, camera, output, layout=None):
             bodies[body] = obj
         ix = indices[record["first_index"] : record["first_index"] + record["index_count"]]
         attrs = np.asarray(vertices[ix])
+        if record["name"].endswith("/oak-finish"):
+            # The baked Blender atlas was flipped for Metal's texture origin.
+            # Restore its original UVs when importing it back into Blender.
+            attrs = attrs.copy()
+            attrs[:, 13] = 1 - attrs[:, 13]
         points = attrs[:, :3].reshape(-1, 3, 3)
         valid = np.linalg.norm(np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]), axis=1) > 1e-12
         attrs = attrs.reshape(-1, 3, 16)[valid].reshape(-1, 16)
@@ -204,5 +209,10 @@ if __name__ == "__main__":
                 key.update(position=eye.tolist(), target=target.tolist(), fov=12)
             for key in camera["keyframes"][-2:]:
                 key.update(position=end["position"], target=end["target"], fov=end["fov"])
+            duration_scale = 14 / camera["duration"]
+            for key in camera["keyframes"]:
+                key["time"] *= duration_scale
+            camera["playbackSpeed"] /= duration_scale
+            camera["duration"] = 14
             camera.update(position=eye.tolist(), target=target.tolist(), fov=12)
         export(data, camera, dest, layout)

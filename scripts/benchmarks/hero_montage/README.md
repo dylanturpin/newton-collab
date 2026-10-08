@@ -426,6 +426,11 @@ maximum bounces. It interpolates recorded translations and quaternion SLERP;
 no physics steps run during rendering. Each output carries its trace hash,
 actual frame timings, camera settings, and a full video decode check.
 `assemble_cycles_montage.py` composes the separate clips into a 1920 by 956
-teaser with the slow pullback and three staggered close-up panels, without
-upscaling the source images. The overview stretches six seconds of composite
-recordings to 24 seconds; the close-ups retain real-time playback.
+14-second teaser without upscaling the source images. The opening three
+close-ups share a six-second window, followed by four two-second groups of
+other tasks. The lighter's 4.5-second demonstration plays over six seconds;
+the remaining close-ups retain real-time playback. The overview stretches
+six seconds of composite recordings over the full 14-second pullback.
+
+The baked knife-holder atlases restore their original Blender UV orientation
+on import; the Metal replay stores their vertical texture coordinates flipped.
