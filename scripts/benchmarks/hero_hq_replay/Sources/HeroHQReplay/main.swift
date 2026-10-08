@@ -10,6 +10,8 @@ struct MaterialDescription: Decodable {
     let roughness: Float
     let metallic: Float
     let texture: String?
+    let transmission: Float?
+    let ior: Float?
 }
 
 struct MeshDescription: Decodable {
@@ -337,6 +339,8 @@ struct HeroHQReplay {
             material.baseColor = SIMD3(linear(source.color[0]), linear(source.color[1]), linear(source.color[2]))
             material.roughness = source.roughness
             material.metallic = source.metallic
+            material.previewOptics.transmission = source.transmission ?? 0
+            material.previewOptics.indexOfRefraction = source.ior ?? 1.5
             if let name = source.texture {
                 if textureCache[name] == nil {
                     textureCache[name] = try GPUSimMaterialLibrary.loadTexture(device: device, url: input.appendingPathComponent(name), sRGB: true)

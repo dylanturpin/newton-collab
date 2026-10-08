@@ -394,3 +394,8 @@ automatically. The bake contains base color; AVBD uses a satin roughness of
 The approved-style refinement uses finer longitudinal mapping and a restrained
 neutral color ramp, removing broad cloudy bands. Texture refreshes preserve
 the original UV atlas, geometry, and blue/green handle materials.
+
+Replay material decoding must forward optional `transmission` and `ior`
+fields to AVBD's `previewOptics`. Omitting them turns the pouring jar opaque
+despite the export retaining its glass settings. Missing fields default to
+opaque materials at IOR 1.5; the pouring jar uses transmission 0.98, IOR 1.47.
