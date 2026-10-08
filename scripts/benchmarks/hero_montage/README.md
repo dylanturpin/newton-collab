@@ -364,3 +364,12 @@ it is not a new simultaneous simulation. Camera culling covers the complete
 zoom path, and its fixed focal length avoids overshooting the final layout.
 Independent-frame rendering adapts the near plane throughout the pullback
 to retain precision on distant thin surfaces.
+
+The `visible-tasks` layout swaps drawer tile 13 with humanoid tile 58 to bring
+the open drawer into the central crop. `swap_paper_tiles.py SOURCE OUTPUT
+CAMERA 13 58` preserves all tile-relative transforms and material assignments,
+checks eight-direction neighbor separation, and writes a visibility audit.
+The original crop contained 14 of 15 task types; the revised crop contains all
+15, with the humanoid still visible on the left. Use this arrangement for the
+overview and final zoom-out. The inset cameras and individual clips are
+unchanged. The revised Cycles teaser is under `final-cycles-visible-tasks`.
