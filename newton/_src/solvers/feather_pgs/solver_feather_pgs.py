@@ -31,10 +31,11 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...geometry.flags import ShapeFlags
+from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
-from ...sim.articulation import eval_fk
+from ...sim.articulation import eval_fk, eval_jacobian
 from ...sim.enums import BodyFlags, JointType
+from ..coupled.interface import CouplingInterface
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -385,6 +386,39 @@ def _finalize_constraint_status(
         or reduction_overflow[0] != 0
     ):
         overflow[world] = True
+
+
+def _quat_to_matrix_host(q_xyzw: np.ndarray) -> np.ndarray:
+    """Return the rotation matrix of an ``(x, y, z, w)`` quaternion on the host."""
+    x, y, z, w = (float(c) for c in q_xyzw)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+@wp.kernel
+def _zero_disabled_gravity_acceleration(disable_gravity: wp.array[wp.bool], acceleration: wp.array[wp.vec3]):
+    body = wp.tid()
+    if disable_gravity[body]:
+        acceleration[body] = wp.vec3(0.0)
+
+
+@wp.kernel
+def _solver_world_reset_mask(
+    base_mask: wp.array[wp.bool],
+    has_global_articulation: int,
+    solver_mask: wp.array[wp.bool],
+):
+    """Map a ``(model.world_count + 1,)`` reset mask onto solver worlds; globals solve in world 0."""
+    world = wp.tid()
+    selected = base_mask[world]
+    if world == 0 and has_global_articulation != 0:
+        selected = selected or base_mask[base_mask.shape[0] - 1]
+    solver_mask[world] = selected
 
 
 @wp.kernel
@@ -1018,7 +1052,7 @@ class _FeatherPGSExecutionPlan:
         return size in self.hinv_jt_fused_sizes
 
 
-class SolverFeatherPGS(SolverBase):
+class SolverFeatherPGS(SolverBase, CouplingInterface):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
     based on Featherstone's composite rigid body algorithm (CRBA).
@@ -2934,6 +2968,19 @@ class SolverFeatherPGS(SolverBase):
             if enable_sleeping
             else None
         )
+        # Coupled resets pass the SolverBase mask, shape (model.world_count + 1,); it is
+        # translated into this solver-world mask so masked resets stay capturable.
+        self._base_reset_world_mask = wp.zeros(max(self.world_count, 1), dtype=wp.bool, device=model.device)
+        self._coupling_patch_history_saved = False
+        self._coupling_patch_history_restore_pending = False
+        self._has_active_particles = bool(
+            model.particle_count and np.any((model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) != 0)
+        )
+        self._has_global_articulation = bool(
+            model.articulation_count
+            and model.articulation_world is not None
+            and np.any(model.articulation_world.numpy() < 0)
+        )
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
@@ -3068,6 +3115,8 @@ class SolverFeatherPGS(SolverBase):
         """
         if self.sleeping is not None:
             self.sleeping.notify(flags)
+        self._coupling_patch_history_saved = False
+        self._coupling_patch_history_restore_pending = False
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -3156,16 +3205,33 @@ class SolverFeatherPGS(SolverBase):
 
         Args:
             state: Simulation state, which is left unchanged.
-            world_mask: Optional per-world reset mask. ``None`` resets every world.
+            world_mask: Optional per-world reset mask. ``None`` resets every world. Either one entry per
+                solver world, or the :meth:`SolverBase.reset` layout of shape ``(model.world_count + 1,)``
+                whose final entry selects global articulations, which this solver solves in world 0.
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        # A reset distribution is not a repeated solve: unselected worlds keep their live history.
+        self._coupling_patch_history_saved = False
+        self._coupling_patch_history_restore_pending = False
         if self._compliance is not None:
             self._compliance.counts.zero_()
         if world_mask is not None and world_mask.shape[0] != self.world_count:
-            raise ValueError(
-                f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
-            )
+            if world_mask.shape[0] != self.model.world_count + 1:
+                raise ValueError(
+                    f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per "
+                    f"solver world) or {self.model.world_count + 1} (model.world_count + 1)."
+                )
+            self._normalize_reset_world_mask(world_mask)
+            if self.world_count:
+                wp.launch(
+                    _solver_world_reset_mask,
+                    dim=self.world_count,
+                    inputs=[world_mask, int(self._has_global_articulation)],
+                    outputs=[self._base_reset_world_mask],
+                    device=self.model.device,
+                )
+            world_mask = self._base_reset_world_mask
         if self.sleeping is not None:
             self.sleeping.wake(world_mask)
         if self.world_count == 0:
@@ -3201,6 +3267,242 @@ class SolverFeatherPGS(SolverBase):
             self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
+
+    # ------------------------------------------------------------------
+    # Coupling hooks (experimental)
+    # ------------------------------------------------------------------
+
+    @override
+    def coupling_notify_input_state_update(
+        self,
+        state: State,
+        flags: StateFlags | int,
+        *,
+        iteration_restart: bool = False,
+        dt: float = 0.0,
+    ) -> None:
+        """Invalidate cached kinematics and rewind friction-patch history for coupler state writes.
+
+        A fresh kinematic distribution saves the carried patch history; an iteration restart restores it
+        before the next step, so repeated solves of one coupled step start from the previous step's history.
+        """
+        del state, dt
+        self._require_coupling_support()
+        kinematic = int(flags) & int(StateFlags.BODY_Q | StateFlags.BODY_QD | StateFlags.JOINT_Q | StateFlags.JOINT_QD)
+        if self._friction_anchors_enabled:
+            if iteration_restart:
+                # Deferred to step(): a reset that follows this notification cancels it.
+                self._coupling_patch_history_restore_pending = True
+            elif kinematic and not self._coupling_patch_history_saved:
+                self._friction_patches.snapshot_history()
+            # Until the next step, reset or model change, the carried history equals the saved copy.
+            self._coupling_patch_history_saved |= bool(iteration_restart or kinematic)
+        if kinematic or iteration_restart:
+            self.notify_state_changed()
+
+    @override
+    def coupling_eval_gravity_acceleration(
+        self,
+        out_body_acceleration: wp.array[wp.vec3] | None,
+        out_particle_acceleration: wp.array[wp.vec3] | None,
+    ) -> None:
+        """Evaluate gravity acceleration, omitting bodies with ``body_disable_gravity`` set."""
+        super().coupling_eval_gravity_acceleration(out_body_acceleration, out_particle_acceleration)
+        model = self.model
+        if out_body_acceleration is None or out_body_acceleration.shape[0] == 0 or model.body_disable_gravity is None:
+            return
+        wp.launch(
+            _zero_disabled_gravity_acceleration,
+            dim=out_body_acceleration.shape[0],
+            inputs=[model.body_disable_gravity],
+            outputs=[out_body_acceleration],
+            device=model.device,
+        )
+
+    @override
+    def coupling_eval_effective_mass(
+        self,
+        endpoint_kind: wp.array[int],
+        endpoint_index: wp.array[int],
+        endpoint_local_pos: wp.array[wp.vec3],
+        out: wp.array[float],
+    ) -> None:
+        """Evaluate articulated effective masses for coupling endpoints.
+
+        See :meth:`coupling_eval_effective_mass_block`. Evaluated on the host; call outside graph capture.
+        """
+        super().coupling_eval_effective_mass(endpoint_kind, endpoint_index, endpoint_local_pos, out)
+        weights = self._coupling_articulated_inverse_weights(endpoint_kind, endpoint_index, endpoint_local_pos)
+        if weights is not None:
+            rows, inv_mass, _inv_rot = weights
+            mass = out.numpy()
+            mass[rows] = 1.0 / inv_mass
+            out.assign(mass)
+
+    @override
+    def coupling_eval_effective_mass_block(
+        self,
+        endpoint_kind: wp.array[int],
+        endpoint_index: wp.array[int],
+        endpoint_local_pos: wp.array[wp.vec3],
+        out_mass: wp.array[float],
+        out_inertia: wp.array[wp.mat33] | None = None,
+    ) -> None:
+        """Evaluate articulated effective mass and inertia for coupling endpoints.
+
+        A body endpoint's mass is the inverse of the axis mean of ``J_p H^-1 J_p^T``: ``J_p`` is the point
+        Jacobian at ``endpoint_local_pos``, measured from the body COM in the body frame, and ``H`` the
+        tree-only joint-space mass matrix with armature at ``model.joint_q``; loop-closing joints, drives,
+        limits and contacts are excluded.
+        The inertia scales the body inertia by the ratio of free to articulated mean angular compliance,
+        never below the body inertia. Bodies without mobile joint DOFs keep the generic estimate.
+        Evaluated on the host; call outside graph capture.
+        """
+        if out_inertia is None or out_inertia.shape[0] == 0:
+            self.coupling_eval_effective_mass(endpoint_kind, endpoint_index, endpoint_local_pos, out_mass)
+            return
+        super().coupling_eval_effective_mass(endpoint_kind, endpoint_index, endpoint_local_pos, out_mass)
+        kind = endpoint_kind.numpy()
+        body = endpoint_index.numpy()
+        is_body = (kind == int(CouplingInterface.EndpointKind.BODY)) & (body >= 0) & (body < self.model.body_count)
+        inertia = np.zeros((kind.shape[0], 3, 3), dtype=np.float32)
+        inertia[is_body] = self.model.body_inertia.numpy()[body[is_body]]
+        weights = self._coupling_articulated_inverse_weights(endpoint_kind, endpoint_index, endpoint_local_pos)
+        if weights is not None:
+            rows, inv_mass, inv_rot = weights
+            mass = out_mass.numpy()
+            mass[rows] = 1.0 / inv_mass
+            out_mass.assign(mass)
+            for row, articulated_inv_rot in zip(rows, inv_rot, strict=True):
+                tensor = inertia[row]
+                if articulated_inv_rot > 0.0 and abs(np.linalg.det(tensor)) > 1.0e-30:
+                    free_inv_rot = np.trace(np.linalg.inv(tensor)) / 3.0
+                    inertia[row] = tensor * max(free_inv_rot / articulated_inv_rot, 1.0)
+        out_inertia.assign(inertia)
+
+    def _coupling_articulated_inverse_weights(
+        self,
+        endpoint_kind: wp.array[int],
+        endpoint_index: wp.array[int],
+        endpoint_local_pos: wp.array[wp.vec3],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return articulated endpoint rows with their mean inverse translational and rotational weights."""
+        self._require_coupling_support()
+        model = self.model
+        if endpoint_kind.shape[0] == 0 or not model.articulation_count:
+            return None
+        if self._friction_anchors_enabled:
+            # Coupler setup queries effective masses before any capture.
+            self._friction_patches.reserve_history_snapshot()
+        kind = endpoint_kind.numpy()
+        body = endpoint_index.numpy()
+        local_pos = endpoint_local_pos.numpy().astype(np.float64)
+        # Only the kinematic-tree prefix of each articulation counts; trailing loop-closing joints do not.
+        articulation_start = model.articulation_start.numpy()
+        tree_end = self._model_plan.articulation_joint_end
+        joint_child = model.joint_child.numpy()
+        body_joint = np.full(model.body_count, -1, dtype=np.int64)
+        for art in range(model.articulation_count):
+            tree_joints = np.arange(int(articulation_start[art]), int(tree_end[art]))
+            body_joint[joint_child[tree_joints]] = tree_joints
+        rows = np.nonzero((kind == int(CouplingInterface.EndpointKind.BODY)) & (body >= 0) & (body < model.body_count))[
+            0
+        ]
+        rows = rows[body_joint[body[rows]] >= 0]
+        rows = rows[(model.body_flags.numpy()[body[rows]] & int(BodyFlags.KINEMATIC)) == 0]
+        if rows.shape[0] == 0:
+            return None
+
+        state = model.state()
+        eval_fk(model, model.joint_q, model.joint_qd, state)
+        jacobian = eval_jacobian(model, state).numpy()
+        joint_articulation = model.joint_articulation.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+        armature = model.joint_armature.numpy()
+        body_q = state.body_q.numpy()
+        body_mass = model.body_mass.numpy()
+        body_inertia = model.body_inertia.numpy()
+
+        inverse_mass_matrix: dict[int, np.ndarray] = {}
+        weights = []
+        for row in rows:
+            joint = int(body_joint[body[row]])
+            art = int(joint_articulation[joint])
+            first_joint = int(articulation_start[art])
+            dof_start = int(joint_qd_start[first_joint])
+            dof_count = int(joint_qd_start[int(tree_end[art])]) - dof_start
+            if dof_count == 0:
+                continue
+            if art not in inverse_mass_matrix:
+                # H = sum over tree links of J^T M J, with COM-referenced world-frame spatial inertia.
+                h = np.diag(armature[dof_start : dof_start + dof_count]).astype(np.float64)
+                for tree_joint in range(first_joint, int(tree_end[art])):
+                    child = int(joint_child[tree_joint])
+                    link_rows = 6 * (tree_joint - first_joint)
+                    link_jacobian = jacobian[art, link_rows : link_rows + 6, :dof_count].astype(np.float64)
+                    rotation = _quat_to_matrix_host(body_q[child, 3:7])
+                    spatial = np.zeros((6, 6))
+                    spatial[:3, :3] = body_mass[child] * np.eye(3)
+                    spatial[3:, 3:] = rotation @ body_inertia[child] @ rotation.T
+                    h += link_jacobian.T @ spatial @ link_jacobian
+                inverse_mass_matrix[art] = np.linalg.inv(h)
+            h_inv = inverse_mass_matrix[art]
+            link = 6 * (joint - first_joint)
+            linear, angular = jacobian[art, link : link + 3, :dof_count], jacobian[art, link + 3 : link + 6, :dof_count]
+            x, y, z = _quat_to_matrix_host(body_q[body[row], 3:7]) @ local_pos[row]
+            point = linear - np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]]) @ angular
+            inv_mass = np.trace(point @ h_inv @ point.T) / 3.0
+            if inv_mass > 0.0:
+                weights.append((row, inv_mass, np.trace(angular @ h_inv @ angular.T) / 3.0))
+        if not weights:
+            return None
+        rows, inv_mass, inv_rot = (np.asarray(column) for column in zip(*weights, strict=True))
+        return rows, inv_mass, inv_rot
+
+    @override
+    def coupling_prepare_proxy_contacts(self, state, contacts, *, contacts_freshly_detected=False):
+        """Reject use as a proxy destination."""
+        raise NotImplementedError("SolverFeatherPGS cannot be a proxy coupling destination.")
+
+    @override
+    def coupling_rewind_proxy_body(
+        self, body_local_to_proxy_global, state, coupling_forces, body_gravity_acceleration, dt
+    ):
+        """Reject use as a proxy destination."""
+        raise NotImplementedError("SolverFeatherPGS cannot be a proxy coupling destination.")
+
+    @override
+    def coupling_rewind_proxy_particle(
+        self, particle_local_to_proxy_global, state, coupling_forces, particle_gravity_acceleration, dt
+    ):
+        """Reject use as a proxy destination."""
+        raise NotImplementedError("SolverFeatherPGS cannot be a proxy coupling destination.")
+
+    @override
+    def coupling_harvest_proxy_wrenches(self, body_local_to_proxy_global, out_body_f, **kwargs):
+        """Reject use as a proxy destination."""
+        raise NotImplementedError("SolverFeatherPGS cannot be a proxy coupling destination.")
+
+    @override
+    def coupling_harvest_proxy_particle_forces(self, particle_local_to_proxy_global, out_particle_f, **kwargs):
+        """Reject use as a proxy destination."""
+        raise NotImplementedError("SolverFeatherPGS cannot be a proxy coupling destination.")
+
+    def _require_coupling_support(self) -> None:
+        """Reject solver options that are not validated inside a coupled simulation."""
+        unsupported = [
+            name
+            for name, enabled in (
+                ("enable_sleeping", self.sleeping is not None),
+                ("pgs_warmstart/mf_warmstart", self.pgs_warmstart),
+                ("contact_compliance", self.contact_compliance),
+                ("contact_torsion_radius", self._contact_torsion_enabled),
+                ("owning particles", self._has_active_particles),
+            )
+            if enabled
+        ]
+        if unsupported:
+            raise NotImplementedError(f"SolverFeatherPGS coupling does not support {', '.join(unsupported)}.")
 
     def _contact_stream(self, contacts: Contacts | None) -> int:
         """Return the warm-start stream id of a contact buffer; 0 for no contacts."""
@@ -8711,6 +9013,10 @@ class SolverFeatherPGS(SolverBase):
                 )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
+        if self._coupling_patch_history_restore_pending:
+            self._friction_patches.restore_history()
+            self._coupling_patch_history_restore_pending = False
+        self._coupling_patch_history_saved = False
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:

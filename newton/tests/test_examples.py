@@ -1448,10 +1448,26 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_rigid_soft_contact",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 2, "solver": "coupled", "rigid-solver": "featherpgs", "vbd-iterations": 1},
+    use_viewer=True,
+    test_suffix="coupled_featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_vbd_admm_solver",
     devices=test_devices,
     test_options={"num-frames": 30},
     use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_vbd_admm_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 30, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1462,10 +1478,34 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_admm_contact_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "tray-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_admm_contact_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "tray-solver": "mujoco"},
+    use_viewer=True,
+    test_suffix="mujoco",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_kamino_mujoco_admm_solver",
     devices=["cpu"],
     test_options={"num-frames": 30, "world-count": 4},
     use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_kamino_mujoco_admm_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 30, "world-count": 4, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1492,10 +1532,75 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_franka_vbd_cable_admm_solver",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 2,
+        "world-count": 1,
+        "substeps": 1,
+        "admm-iterations": 1,
+        "payload-kind": "vbd-cable",
+        "payload-segments": 3,
+        "vbd-iterations": 2,
+        "rigid-solver": "featherpgs",
+        "graph-capture": False,
+    },
+    use_viewer=True,
+    test_suffix="featherpgs",
+    allow_output_regexes=[(_WARP_SDF_CONSTANT_CONVERSION_WARNING_RE, "stderr")],
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_cable_ik_pick_place",
+    devices=cuda_test_devices,
+    test_options={"rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_cloth_block",
+    devices=cuda_test_devices,
+    test_options={},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_cloth_block",
+    devices=cuda_test_devices,
+    test_options={"rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_shirt_fold_stack",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 600},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_shirt_fold_stack",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 600, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_mpm_coupled_solver",
     devices=cuda_test_devices,
     test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1},
     use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_mpm_coupled_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1506,6 +1611,14 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_vbd_coupled_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_xpbd_coupled_solver",
     devices=test_devices,
     test_options={"num-frames": 2, "proxy-iterations": 1},
@@ -1513,10 +1626,26 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_xpbd_coupled_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_proxy_joint_gripper",
     devices=test_devices,
     test_options={"num-frames": 120},
     use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_proxy_joint_gripper",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "rigid-solver": "featherpgs"},
+    use_viewer=True,
+    test_suffix="featherpgs",
 )
 add_example_test(
     TestMultiphysicsExamples,

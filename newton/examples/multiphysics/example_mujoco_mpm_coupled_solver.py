@@ -22,7 +22,13 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverImplicitMPM, SolverKamino, SolverMuJoCo
+from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
+
+# A grain that leaves the fixed MPM grid gets runaway velocities. The cap clips MPM advection velocity (not collider
+# impulses), and the padding is a conservative single-flight estimate: a grain launched at the cap from the bed or the
+# settled stack top lands within |x| <= 7.2 m and peaks below z = 5.3 m, inside |x|, |y| <= 7.3 m and z <= 6.8 m.
+_GRID_PADDING = 125
+_PARTICLE_MAX_VELOCITY = 6.5
 
 
 def _add_rigid_solver_arg(parser) -> None:
@@ -30,7 +36,7 @@ def _add_rigid_solver_arg(parser) -> None:
         "--rigid-solver",
         help="Rigid-body solver used by the coupled path.",
         type=str,
-        choices=["mujoco", "kamino"],
+        choices=["mujoco", "kamino", "featherpgs"],
         default="mujoco",
     )
 
@@ -64,6 +70,8 @@ def _rigid_solver_entry_args(
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
+    if rigid_solver == "featherpgs":
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 
@@ -110,12 +118,13 @@ class Example:
         voxel_size = 0.05
         self._emit_particles(builder, voxel_size)
 
+        builder.particle_max_velocity = _PARTICLE_MAX_VELOCITY
         self.model = builder.finalize()
 
         mpm_config = SolverImplicitMPM.Config()
         mpm_config.voxel_size = voxel_size
         mpm_config.grid_type = "fixed"
-        mpm_config.grid_padding = 50
+        mpm_config.grid_padding = _GRID_PADDING
         mpm_config.max_active_cell_count = 1 << 15
         mpm_config.strain_basis = "P0"
         mpm_config.max_iterations = 50

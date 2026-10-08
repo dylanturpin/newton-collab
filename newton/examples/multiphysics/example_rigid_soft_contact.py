@@ -7,6 +7,7 @@
 # Shows how to set up a rigid sphere colliding with a soft FEM beam.
 #
 # Command: uv run -m newton.examples rigid_soft_contact
+#          uv run -m newton.examples rigid_soft_contact --solver coupled --rigid-solver featherpgs
 #
 ###########################################################################
 
@@ -16,7 +17,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverKamino, SolverMuJoCo, SolverSemiImplicit, SolverVBD, SolverXPBD
+from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo, SolverSemiImplicit, SolverVBD, SolverXPBD
 from newton.viewer import ViewerBase
 
 GRID_DIM_X = 20
@@ -73,6 +74,8 @@ def _rigid_solver_entry_args(rigid_solver: str):
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mjc":
         return "mjc", SolverMuJoCo, {"use_mujoco_contacts": False, "njmax": 64}
+    if rigid_solver == "featherpgs":
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver {rigid_solver!r}")
 
 
@@ -362,7 +365,7 @@ class Example:
             "--rigid-solver",
             help="Rigid solver used by --solver coupled",
             type=str,
-            choices=["mjc", "mujoco", "kamino", "vbd"],
+            choices=["mjc", "mujoco", "kamino", "vbd", "featherpgs"],
             default="mjc",
         )
         parser.add_argument(
