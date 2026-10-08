@@ -24545,6 +24545,24 @@ def _get_pgs_solve_mf_gs_kernel(
                 }}""")
     dense_sib_v_code = "\n".join(dense_sib_v_parts)
 
+    # Friction pair: the sibling row's J . v and the pair's cross term J_i . Y_sib in one
+    # sweep, reusing row i's prefetched J; each sum keeps its own accumulation order.
+    dense_pair_dot_parts = []
+    for k in range(ELEMS_PER_LANE):
+        d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+        dense_pair_dot_parts.append(f"""
+                    if ({d_expr} < {D}) {{
+                        sibling_residual += {dense_j_read("sib_row_base", d_expr)} * s_v[{d_expr}];
+                        cross += cur_dJ_{k} * Y_world.data[sib_row_base + {d_expr}];
+                    }}""")
+    dense_pair_dot_code = "\n".join(dense_pair_dot_parts)
+    # The pair solve at the first friction row also writes the second, so that row is a no-op.
+    dense_second_friction_skip = (
+        f"if (row_type == 2 && i != ((s_meta_dense[i] >> {_DENSE_META_ROW_TYPE_BITS}) - 1) + 1) continue;"
+        if friction_mode == "current"
+        else ""
+    )
+
     # Dense friction-row projection.  The dense rows carry articulated
     # contacts such as finger/cube; leaving them on the legacy per-row
     # projection while MF rows use a block Coulomb solve leaves the most
@@ -24725,16 +24743,13 @@ def _get_pgs_solve_mf_gs_kernel(
                         lambda_n += s_lam_dense[patch_row];
                     float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
                     float sibling_residual = 0.0f;
-                    for (int d = lane; d < {D}; d += 32)
-                        sibling_residual += J_world.data[sib_row_base + d] * s_v[d];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
                     float cross = 0.0f;
-                    for (int d = lane; d < {D}; d += 32)
-                        cross += J_world.data[jy_world_base + i * {D} + d] * Y_world.data[sib_row_base + d];
-                    for (int offset = 16; offset > 0; offset >>= 1)
+                    {dense_pair_dot_code}
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
                         cross += __shfl_down_sync(MASK, cross, offset);
+                    }}
+                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
                     cross = __shfl_sync(MASK, cross, 0);
                     float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
                         residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
@@ -25285,22 +25300,22 @@ def _get_pgs_solve_mf_gs_kernel(
                     // Zero load gives a zero disk; avoid unused tangent reductions.
                     if (radius > 0.0f) {
                         float sibling_residual = 0.0f;
-                        if (lane < 6 && dof_a >= 0)
+                        float cross = 0.0f;
+                        if (lane < 6 && dof_a >= 0) {
                             sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
-                        if (lane >= 6 && lane < 12 && dof_b >= 0)
+                            cross = cur_Ja * mf_MiJt_a.data[sib_mf6 + lane];
+                        }
+                        if (lane >= 6 && lane < 12 && dof_b >= 0) {
                             sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
-                        for (int offset = 16; offset > 0; offset >>= 1)
+                            cross = cur_Jb * mf_MiJt_b.data[sib_mf6 + lane - 6];
+                        }
+                        for (int offset = 16; offset > 0; offset >>= 1) {
                             sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                            cross += __shfl_down_sync(MASK, cross, offset);
+                        }
                         sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
                             + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
                         float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
-                        float cross = 0.0f;
-                        if (lane < 6 && dof_a >= 0)
-                            cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
-                        if (lane >= 6 && lane < 12 && dof_b >= 0)
-                            cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
-                        for (int offset = 16; offset > 0; offset >>= 1)
-                            cross += __shfl_down_sync(MASK, cross, offset);
                         cross = __shfl_sync(MASK, cross, 0);
                         pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
                             residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
@@ -25604,6 +25619,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 continue;
             }}
 
+            {dense_second_friction_skip}
             float denom = s_diag_dense[i];
             if (denom <= 0.0f{" && row_type != 2" if friction_mode == "current" else ""}) continue;
 

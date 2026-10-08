@@ -1,0 +1,1 @@
+Speed up FeatherPGS's matrix-free Gauss-Seidel kernel for coupled friction pairs by skipping the second friction row's no-op visit and computing the pair's sibling residual and cross term in one fused reduction; results are bitwise unchanged.
