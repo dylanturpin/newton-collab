@@ -1545,9 +1545,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 debug, contact compliance, contact torsion radius, sleeping, or differentiation. Positive
                 coefficients on shapes that can reach the matrix-free free-rigid route (free bodies, and
                 static or zero-DOF articulated shapes when free bodies exist) raise ``ValueError``.
-                Construction-only: it selects a specialized solve kernel. Coefficient edits take effect
-                after :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; recapture graphs after
-                replacing the arrays. Reported contact forces exclude the angular impulses.
+                Construction-only: it selects a specialized solve kernel. Coefficient edits, in place or by
+                replacing the arrays, take effect after :meth:`notify_model_changed` with
+                ``SHAPE_PROPERTIES``, in eager and captured steps alike. Reported contact forces exclude the angular impulses.
             torsional_rolling_friction_cone: Experimental friction cone over coefficient-normalized
                 sliding, torsional and rolling impulses. ``"elliptic"`` bounds their Euclidean norm, as
                 MuJoCo's elliptic cone does. ``"pyramidal"`` bounds the sum of the three block norms, with a
@@ -3123,6 +3123,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.shape_material_restitution = wp.zeros(
             material_count, dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
         )
+        self._shape_mu_torsional = wp.zeros(material_count, dtype=wp.float32, device=model.device)
+        self._shape_mu_rolling = wp.zeros(material_count, dtype=wp.float32, device=model.device)
         self._refresh_shape_materials()
 
         self._init_double_buffer_stream()
@@ -3154,7 +3156,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             if enable_sleeping
             else None
         )
-        self._refresh_angular_friction_coefficients()
         if self.enable_torsional_rolling_friction:
             validate_torsional_rolling_friction_mode(self)
             if self._pgs_solve_mf_gs_kernel is None:
@@ -3174,14 +3175,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and model.articulation_world is not None
             and np.any(model.articulation_world.numpy() < 0)
         )
-
-    def _refresh_angular_friction_coefficients(self) -> None:
-        model = self.model
-        if model.shape_material_mu_torsional is None or model.shape_material_mu_rolling is None:
-            self._shape_mu_torsional = self._shape_mu_rolling = wp.zeros(1, dtype=wp.float32, device=model.device)
-        else:
-            self._shape_mu_torsional = model.shape_material_mu_torsional
-            self._shape_mu_rolling = model.shape_material_mu_rolling
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
@@ -3320,8 +3313,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         mass matrix, since augmented drive gains enter its diagonal, and re-validate joint friction.
         Reference poses are read every step. Constraint changes re-check the MuJoCo equality rows:
         enabling one that is not converted to a Newton loop joint or mimic constraint raises
-        :class:`NotImplementedError`. Joint damping and shape friction and restitution
-        coefficients are copied into solver-owned buffers, so model arrays modified in place or
+        :class:`NotImplementedError`. Joint damping and shape friction, restitution, torsional and
+        rolling coefficients are copied into solver-owned buffers, so model arrays modified in place or
         replaced take effect at the matching notification, in eager and captured steps alike.
         """
         if flags & ModelFlags.CONSTRAINT_PROPERTIES:
@@ -3331,7 +3324,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self.sleeping is not None:
             self.sleeping.notify(flags)
         if flags & ModelFlags.SHAPE_PROPERTIES:
-            self._refresh_angular_friction_coefficients()
             validate_torsional_rolling_friction_coefficients(self)
         self._coupling_patch_history_saved = False
         self._coupling_patch_history_restore_pending = False
@@ -4665,12 +4657,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             wp.copy(self._passive_joint_damping, damping, count=self.model.joint_dof_count)
 
     def _refresh_shape_materials(self) -> None:
-        """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
+        """Copy the model's current friction, restitution, torsional and rolling coefficients into fixed buffers."""
         # Users may replace the model arrays; captured graphs keep these buffers' addresses.
         model = self.model
         for buffer, values in (
             (self.shape_material_mu, model.shape_material_mu),
             (self.shape_material_restitution, model.shape_material_restitution),
+            (self._shape_mu_torsional, model.shape_material_mu_torsional),
+            (self._shape_mu_rolling, model.shape_material_mu_rolling),
         ):
             if values is not None and model.shape_count:
                 wp.copy(buffer, values, count=model.shape_count)

@@ -864,6 +864,48 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(wrenches[0], wrenches[1])
         self.assertGreater(float(np.abs(velocities[0] - velocities[1]).max()), 1.0e-3)
 
+    def test_coefficient_edits_reach_captured_graphs_at_notify(self):
+        """Assigned or replaced torsional/rolling arrays take effect at the notify, in a graph captured before the edit."""
+        cases = {
+            "shape_material_mu_torsional": ({"speed": 0.0, "rolling": False, "spin": 20.0, "mu_rolling": 0.0}, 3, 0.02),
+            "shape_material_mu_rolling": ({"mu_rolling": 0.0}, 0, MU_ROLLING),
+        }
+        for field, (start, dof, value) in cases.items():
+            for replace in (False, True):
+                with self.subTest(field=field, replace=replace):
+                    runs = {}
+                    for mode in ("control", "eager", "graph"):
+                        scene = ball(**start)
+                        graph = None
+                        if mode == "graph":
+                            with wp.ScopedCapture(device=scene.model.device) as capture:
+                                scene.step()
+                                scene.step()
+                            graph = capture.graph
+
+                        def advance(pairs, scene=scene, graph=graph, dof=dof):
+                            out = []
+                            for _ in range(pairs):
+                                if graph is None:
+                                    scene.step()
+                                    scene.step()
+                                else:
+                                    wp.capture_launch(graph)
+                                out.append(scene.state.joint_qd.numpy()[dof])
+                            return np.array(out)
+
+                        before = advance(5)
+                        if mode != "control":
+                            values = np.full(scene.model.shape_count, value, np.float32)
+                            if replace:
+                                setattr(scene.model, field, wp.array(values, device=scene.model.device))
+                            else:
+                                getattr(scene.model, field).assign(values)
+                            scene.solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+                        runs[mode] = np.concatenate([before, advance(20)])
+                    np.testing.assert_array_equal(runs["graph"], runs["eager"])
+                    self.assertLess(abs(runs["eager"][-1]), abs(runs["control"][-1]) - 0.02 * abs(runs["control"][4]))
+
     def test_zero_coefficients_allocate_no_rows(self):
         scene = ball(mu_torsional=0.0, mu_rolling=0.0)
         scene.step()
