@@ -1271,6 +1271,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def __init__(
         self,
         model: Model,
+        *,
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         enable_contact_friction: bool = True,
@@ -1328,7 +1329,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
-        *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
@@ -9021,6 +9021,59 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         Returns:
             ``state_out``.
         """
+        if self._sparse_mass_matrix_size is not None and (
+            self.pgs_mode != "matrix_free"
+            or self.pgs_schedule != "interleaved"
+            or self.articulated_contact_response != "immediate"
+            or self.drive_mode != "augmented"
+            or self.friction_mode != "current"
+            or self.pgs_warmstart
+            or self.pgs_debug
+            or self.pgs_velocity_iterations != 0
+            or self.enable_joint_velocity_limits
+            or self.enable_joint_friction
+            or self._contact_torsion_enabled
+            or self.contact_compliance
+        ):
+            raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
+        if self.contact_compliance:
+            # Reject incompatible contact preprocessing before it can mutate the stream.
+            _contact_compliance.validate_step(self)
+            # The material law is validated on unreduced contacts only. A captured step also
+            # leases the buffer so no reducer graph can compact it behind replay.
+            self._require_unreduced_contacts(
+                contacts,
+                supports_body_pair_reduced_contacts=False,
+                configuration="contact_compliance=True",
+            )
+        self.validate_observables(observables, contacts)
+        if self._contact_torsion_enabled:
+            validate_torsion_step(self)
+            if getattr(self, "_device_torsion", None) is not None:
+                self._device_torsion.begin_step(state_in, state_out)
+        if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
+            raise ValueError(
+                "FeatherPGS contact capacity mismatch: received "
+                f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
+                f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
+            )
+        if self.pgs_warmstart:
+            # A reduced stream is valid when it carries retained identities.
+            # Preserve the reader lease for an unreduced captured stream: a
+            # later producer must not change its layout behind graph replay.
+            self._require_unreduced_contacts(
+                contacts,
+                supports_body_pair_reduced_contacts=bool(
+                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
+                ),
+                configuration="pgs_warmstart=True",
+            )
+            if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
+                raise NotImplementedError(
+                    "FeatherPGS contact warm start requires a Contacts buffer created with "
+                    "contact_matching enabled (rigid_contact_match_index is None). Build the "
+                    'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
+                )
         body_parent_f = state_out.body_parent_f
         if observables is not None and observables.is_requested(SolverObservableFlags.BODY_PARENT_F):
             body_parent_f = observables.body_parent_f
@@ -9135,60 +9188,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         observables: SolverObservables | None,
         body_parent_f: wp.array | None,
     ):
-        """Run :meth:`step` after its observable outputs are resolved."""
-        if self._sparse_mass_matrix_size is not None and (
-            self.pgs_mode != "matrix_free"
-            or self.pgs_schedule != "interleaved"
-            or self.articulated_contact_response != "immediate"
-            or self.drive_mode != "augmented"
-            or self.friction_mode != "current"
-            or self.pgs_warmstart
-            or self.pgs_debug
-            or self.pgs_velocity_iterations != 0
-            or self.enable_joint_velocity_limits
-            or self.enable_joint_friction
-            or self._contact_torsion_enabled
-            or self.contact_compliance
-        ):
-            raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
-        if self.contact_compliance:
-            # Reject incompatible contact preprocessing before it can mutate the stream.
-            _contact_compliance.validate_step(self)
-            # The material law is validated on unreduced contacts only. A captured step also
-            # leases the buffer so no reducer graph can compact it behind replay.
-            self._require_unreduced_contacts(
-                contacts,
-                supports_body_pair_reduced_contacts=False,
-                configuration="contact_compliance=True",
-            )
-        self.validate_observables(observables, contacts)
-        if self._contact_torsion_enabled:
-            validate_torsion_step(self)
-            if getattr(self, "_device_torsion", None) is not None:
-                self._device_torsion.begin_step(state_in, state_out)
-        if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
-            raise ValueError(
-                "FeatherPGS contact capacity mismatch: received "
-                f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
-                f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
-            )
-        if self.pgs_warmstart:
-            # A reduced stream is valid when it carries retained identities.
-            # Preserve the reader lease for an unreduced captured stream: a
-            # later producer must not change its layout behind graph replay.
-            self._require_unreduced_contacts(
-                contacts,
-                supports_body_pair_reduced_contacts=bool(
-                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
-                ),
-                configuration="pgs_warmstart=True",
-            )
-            if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
-                raise NotImplementedError(
-                    "FeatherPGS contact warm start requires a Contacts buffer created with "
-                    "contact_matching enabled (rigid_contact_match_index is None). Build the "
-                    'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
-                )
+        """Run :meth:`step` after its inputs are validated and its observable outputs are resolved."""
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._coupling_patch_history_restore_pending:
