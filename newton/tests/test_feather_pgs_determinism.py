@@ -211,10 +211,10 @@ def _sample(state):
     return digest.hexdigest(), finite
 
 
-def _run_hashes(model, options, steps, graph=False):
+def _run_hashes(model, options, steps, graph=False, collision_options=None):
     """Simulate with deterministic collision and solver; return (hash, finite) per step or per graph replay."""
     solver = SolverFeatherPGS(model, deterministic=True, **options)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, **(collision_options or {}))
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
@@ -323,6 +323,44 @@ def test_deterministic_runs_are_bitwise_identical(test, device):
         with test.subTest(name):
             first = _run_hashes(model, options, 60, graph=graph)
             second = _run_hashes(model, options, 60, graph=graph)
+            test.assertEqual(first, second)
+            test.assertTrue(all(finite for _, finite in first))
+
+
+def _build_scaled_sdf_mesh_scene(device, scale, worlds=4):
+    """Texture-SDF mesh cubes dropped on a heightfield in every world, at mesh ``scale``."""
+    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    cube.build_sdf(max_resolution=32, device=device)
+    n = 17
+    xs = np.linspace(-1.0, 1.0, n)
+    elevation = (0.5 + 0.5 * np.sin(3.0 * xs)[None, :] * np.cos(2.0 * xs)[:, None]).astype(np.float32)
+    env = newton.ModelBuilder()
+    rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.2, 1.0)), 0.4)
+    for i in range(6):
+        body = env.add_body(xform=wp.transform((-0.4 + 0.16 * i, 0.1 * (i % 2), 0.12 + 0.03 * i), rotation))
+        env.add_shape_mesh(body=body, mesh=cube, scale=scale, cfg=newton.ModelBuilder.ShapeConfig(density=300.0))
+    builder = newton.ModelBuilder()
+    builder.replicate(env, worlds)
+    builder.add_shape_heightfield(
+        heightfield=newton.Heightfield(data=elevation, nrow=n, ncol=n, hx=1.0, hy=1.0, min_z=0.0, max_z=0.04)
+    )
+    return builder.finalize(device=device)
+
+
+def test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical(test, device):
+    """Texture-SDF meshes rescaled after construction under ``dynamic_shape_scale`` repeat bitwise."""
+    model = _build_scaled_sdf_mesh_scene(device, (1.0, 1.0, 1.0))
+    rescaled = _build_scaled_sdf_mesh_scene(device, (1.6, 1.4, 1.2))
+    for name in ("shape_scale", "shape_collision_radius", "shape_collision_aabb_lower", "shape_collision_aabb_upper"):
+        getattr(model, name).assign(getattr(rescaled, name))
+    collision_options = {"dynamic_shape_scale": True}
+    options = {**SPLIT_SOLVER_OPTIONS, "mf_max_constraints": 2048}
+    pipeline = newton.CollisionPipeline(model, deterministic=True, **collision_options)
+    test.assertFalse(pipeline.narrow_phase.mesh_sdf_identity_scale_only)
+    for graph in (False, True):
+        with test.subTest(graph=graph):
+            first = _run_hashes(model, options, 60, graph=graph, collision_options=collision_options)
+            second = _run_hashes(model, options, 60, graph=graph, collision_options=collision_options)
             test.assertEqual(first, second)
             test.assertTrue(all(finite for _, finite in first))
 
@@ -566,6 +604,12 @@ for _device in get_test_devices():
             TestFeatherPGSDeterminism,
             "test_deterministic_launches_replay_identically",
             test_deterministic_launches_replay_identically,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical",
+            test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical,
             devices=[_device],
         )
         add_function_test(
