@@ -3123,7 +3123,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._body_prescribed.assign(prescribed)
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, world_mask: wp.array | None = None) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
         ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES``
@@ -3134,6 +3134,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
+
+        Args:
+            flags: Bitmask of :class:`~newton.ModelFlags` naming the changed model data.
+            world_mask: Optional mask of the worlds whose model data changed, in either
+                :meth:`reset` layout. Impulse warm-start history is cleared only for these
+                worlds; ``None`` clears every world. Cached model data is refreshed for every world.
         """
         if self.sleeping is not None:
             self.sleeping.notify(flags)
@@ -3190,7 +3196,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             | ModelFlags.JOINT_DOF_PROPERTIES
             | ModelFlags.SHAPE_PROPERTIES
         ):
-            self._clear_warmstart_history(None)
+            self._clear_warmstart_history(self._solver_world_mask(world_mask))
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -3243,22 +3249,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._coupling_patch_history_restore_pending = False
         if self._compliance is not None:
             self._compliance.counts.zero_()
-        if world_mask is not None and world_mask.shape[0] != self.world_count:
-            if world_mask.shape[0] != self.model.world_count + 1:
-                raise ValueError(
-                    f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per "
-                    f"solver world) or {self.model.world_count + 1} (model.world_count + 1)."
-                )
-            self._normalize_reset_world_mask(world_mask)
-            if self.world_count:
-                wp.launch(
-                    _solver_world_reset_mask,
-                    dim=self.world_count,
-                    inputs=[world_mask, int(self._has_global_articulation)],
-                    outputs=[self._base_reset_world_mask],
-                    device=self.model.device,
-                )
-            world_mask = self._base_reset_world_mask
+        world_mask = self._solver_world_mask(world_mask)
         if self.sleeping is not None:
             self.sleeping.wake(world_mask)
         if self.world_count == 0:
@@ -3294,6 +3285,26 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
+
+    def _solver_world_mask(self, world_mask: wp.array | None) -> wp.array | None:
+        """Map a per-solver-world or ``model.world_count + 1`` mask to one entry per solver world."""
+        if world_mask is None or world_mask.shape[0] == self.world_count:
+            return world_mask
+        if world_mask.shape[0] != self.model.world_count + 1:
+            raise ValueError(
+                f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per "
+                f"solver world) or {self.model.world_count + 1} (model.world_count + 1)."
+            )
+        self._normalize_reset_world_mask(world_mask)
+        if self.world_count:
+            wp.launch(
+                _solver_world_reset_mask,
+                dim=self.world_count,
+                inputs=[world_mask, int(self._has_global_articulation)],
+                outputs=[self._base_reset_world_mask],
+                device=self.model.device,
+            )
+        return self._base_reset_world_mask
 
     # ------------------------------------------------------------------
     # Coupling hooks (experimental)
