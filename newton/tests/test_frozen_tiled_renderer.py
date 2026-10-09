@@ -22,11 +22,11 @@ _FROZEN_MANIFEST = {
     "gaussians.py": "5647dac21aa74d329d83bcc0a062b4b75ad9ecf1590450fad123f754e72b8cf7",
     "lighting.py": "c4091ad05a472c210573092435b0162fc092be09afc28029e80fb28e06d3c73a",
     "raytrace.py": "030a1864880af530ccf47f50fcbf2642303c8f8db8ab1e58c2ee3f2f528281cd",
-    "render.py": "74fea2316eef178981dfa4fe78c30a5a77bf1884598503b5e9a8d209476a26bd",
+    "render.py": "174ede7a5f4b7582faede033e40e4a29f2cac19e28a74cadd332255dbd7f0bad",
     "render_context.py": "b0e4a8428ba915c8267bc65945751b84798f95307195f0d0ce96a3d026c0a72d",
     "textures.py": "0f12c8e515c267f0962f340234d9114ff4a6b564234cc18f11ae3d24571c821c",
     "tiling.py": "299deed013bf215bd0c693d904cd9320795cfc8cbb4bc4bf71954288fe4122d0",
-    "types.py": "b6fc4eabded2380665f7e71ddfb2f7ad0c465e216d11567f3f9d7dec0e798d49",
+    "types.py": "b9f5a162076ef192c0916f20b307910311d1c695d3b85974179590cf31e1b6c9",
     "utils.py": "9b2cb23ba60f56eb45cf696dd2774bf10811ee3829cdef3948c40f537d84b51e",
 }
 

@@ -448,7 +448,7 @@ def _build_box_rod(device, *, box_z=0.15, box_xy=(0.0, 0.0), box_joint_qd=None, 
 
 
 def _admm(model, box, rod_bodies, rod_joints, rigid_factory=_fpgs, *, iterations=3, gamma=0.001):
-    model.rigid_contact_max = max(model.rigid_contact_max, 4096)
+    model.rigid_contact_max = max(model.rigid_contact_max or 0, 4096)
     return SolverCoupledADMM(
         model=model,
         entries=[

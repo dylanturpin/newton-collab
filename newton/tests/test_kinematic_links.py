@@ -478,7 +478,11 @@ def test_kinematic_free_base_prescribed_motion(
             device, kinematic_first=kinematic_first
         )
         solver = solver_fn(model)
-        if isinstance(solver, newton.solvers.SolverFeatherPGS) and solver.pgs_mode == "matrix_free":
+        if (
+            isinstance(solver, newton.solvers.SolverFeatherPGS)
+            and solver.pgs_mode == "matrix_free"
+            and solver.articulated_contact_response == "immediate"
+        ):
             body_to_articulation = solver.body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
@@ -916,15 +920,15 @@ for device in devices:
             solver_fn=solver_fn,
             check_reversed_order=solver_name == "feather_pgs_matrix_free",
         )
-        if solver_name.startswith("feather_pgs"):
+        if solver_name == "feather_pgs_matrix_free":
+            # FeatherPGS elides prescribed free bodies only with the matrix-free immediate response.
             add_function_test(
                 TestKinematicLinksCanonical,
-                f"test_kinematic_prescribed_response_lifetime_{solver_name}",
+                "test_kinematic_prescribed_response_lifetime_feather_pgs_matrix_free",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
-        if solver_name == "feather_pgs_matrix_free":
             add_function_test(
                 TestKinematicLinksCanonical,
                 "test_kinematic_free_base_drives_dense_articulation_feather_pgs_matrix_free",
