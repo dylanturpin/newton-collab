@@ -60,6 +60,7 @@ def _check_rows(test, contacts, contact_f, legacy):
 def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **options):
     """Report the legacy update_contacts force per contact, and each box's weight at rest."""
     model, pipeline = _stacked_boxes(device)
+    options.setdefault("pgs_mode", "matrix_free")
     solver = SolverFeatherPGS(model, pgs_iterations=32, **options)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     test.assertEqual(observables.contact_f.shape[0], model.rigid_contact_max + model.soft_contact_max)
@@ -105,7 +106,7 @@ def test_unrequested_contact_f_is_left_untouched(test, device):
 def test_contact_f_in_a_captured_graph(test, device):
     """Write the observable from the replayed step's impulses in a captured graph."""
     model, pipeline = _stacked_boxes(device)
-    solver = SolverFeatherPGS(model, pgs_iterations=32)
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=32)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
     states = [model.state(), model.state()]
@@ -135,6 +136,7 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(
         model,
+        pgs_mode="matrix_free",
         pgs_iterations=32,
         enable_sleeping=True,
         sleep_quiet_time=0.05,
@@ -195,7 +197,13 @@ def test_contact_f_of_compliant_hydroelastic_rows(test, device):
             ),
         )
         solver = SolverFeatherPGS(
-            model, contact_compliance=True, friction_anchor_beta=0.0, pgs_iterations=64, mf_max_constraints=2048
+            model,
+            pgs_mode="matrix_free",
+            contact_compliance=True,
+            enable_restitution=False,
+            friction_anchor_beta=0.0,
+            pgs_iterations=64,
+            mf_max_constraints=2048,
         )
         observables = solver.observables({SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
@@ -268,6 +276,8 @@ def test_contact_force_kernel_reads_only_rigid_rows(test, device):
 
     impulses = wp.array([[3.0]], dtype=wp.float32, device=device)
     row_count = wp.array([1], dtype=wp.int32, device=device)
+    row_type = wp.zeros((1, 1), dtype=wp.int32, device=device)
+    row_parent = wp.zeros((1, 1), dtype=wp.int32, device=device)
     contact_f = wp.full(rows, wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL), device=device)
     wp.launch(
         newton._src.solvers.feather_pgs.kernels.compute_contact_spatial_force_from_impulses,
@@ -278,13 +288,19 @@ def test_contact_force_kernel_reads_only_rigid_rows(test, device):
             rigid_view([0] * rows, wp.int32),
             rigid_view([0] * rows, wp.int32),
             rigid_view([0] * rows, wp.int32),
-            rigid_view([1] * rows, wp.int32),
             impulses,
             impulses,
             impulses,
             row_count,
             row_count,
             row_count,
+            row_type,
+            row_parent,
+            row_type,
+            row_parent,
+            row_type,
+            row_parent,
+            0,
             10.0,
             rigid_capacity,
         ],
@@ -317,6 +333,8 @@ add_function_test(
 )
 for _suffix, _options in (
     ("propagation", {"articulated_contact_response": "propagation"}),
+    ("propagation_fused", {"articulated_contact_response": "propagation-fused"}),
+    ("propagation_colored", {"articulated_contact_response": "propagation-colored"}),
     ("point_friction", {"friction_anchor_beta": 0.0}),
     ("torsion", {"contact_torsion_radius": 0.01}),
     ("device_torsion", {"contact_torsion_radius": 0.01, "contact_torsion_device": True}),

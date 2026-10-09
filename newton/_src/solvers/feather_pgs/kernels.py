@@ -1724,6 +1724,37 @@ def _compute_body_net_wrench(
     return body_fb_s[child] + f_t_s - f_ext_origin
 
 
+@wp.kernel
+def compute_body_parent_f(
+    body_to_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_fb_s: wp.array[wp.spatial_vector],
+    body_ft_s: wp.array[wp.spatial_vector],
+    body_f_ext: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    body_parent_f: wp.array[wp.spatial_vector],
+):
+    """Publish the inverse-dynamics wrench transmitted through each body's inbound joint.
+
+    The backward pass leaves the net wrench of a body's subtree, referenced to the
+    articulation origin, in ``body_fb_s + body_ft_s - f_ext``. Translate it to the body's
+    center of mass in world frame (linear force first, torque second).
+    """
+    body = wp.tid()
+    articulation = body_to_articulation[body]
+    if articulation < 0:
+        body_parent_f[body] = wp.spatial_vector()
+        return
+    origin = articulation_origin[articulation]
+    f_s = _compute_body_net_wrench(body, body_ft_s[body], origin, body_fb_s, body_f_ext, body_flags, body_q, body_com)
+    force = wp.spatial_top(f_s)
+    com_rel = wp.transform_point(body_q[body], body_com[body]) - origin
+    body_parent_f[body] = wp.spatial_vector(force, wp.spatial_bottom(f_s) - wp.cross(com_rel, force))
+
+
 @wp.func
 def accumulate_articulation_tau(
     index: int,
@@ -2622,9 +2653,9 @@ def reset_friction_anchor_history(
     prev_valid[c] = 0
 
 
-@wp.kernel
-def compute_contact_linear_force_from_impulses(
-    contact_count: wp.array[wp.int32],
+@wp.func
+def contact_linear_force_from_impulses(
+    c: int,
     contact_normal: wp.array[wp.vec3],
     contact_world: wp.array[wp.int32],
     contact_slot: wp.array[wp.int32],
@@ -2643,15 +2674,11 @@ def compute_contact_linear_force_from_impulses(
     propagation_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
-    # outputs
-    rigid_contact_force: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces."""
-    c = wp.tid()
-    total_contacts = contact_count[0]
-    if c >= total_contacts:
-        return
+    """Return the world-frame force on shape 0's body from contact ``c``'s solved impulses.
 
+    Contacts whose rows were dropped report zero; contacts without friction rows report their normal force only.
+    """
     force = wp.vec3(0.0)
     slot = contact_slot[c]
     path = contact_path[c]
@@ -2711,8 +2738,114 @@ def compute_contact_linear_force_from_impulses(
             tangent0, tangent1 = contact_tangent_basis(normal)
             force += lam_t0 * tangent0 + lam_t1 * tangent1
         force *= inv_dt
+    return force
 
-    rigid_contact_force[c] = force
+
+@wp.kernel
+def compute_contact_linear_force_from_impulses(
+    contact_count: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    enable_friction: int,
+    inv_dt: float,
+    # outputs
+    rigid_contact_force: wp.array[wp.vec3],
+):
+    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    rigid_contact_force[c] = contact_linear_force_from_impulses(
+        c,
+        contact_normal,
+        contact_world,
+        contact_slot,
+        contact_path,
+        world_impulses,
+        mf_impulses,
+        propagation_impulses,
+        world_constraint_count,
+        mf_constraint_count,
+        propagation_constraint_count,
+        world_row_type,
+        world_row_parent,
+        mf_row_type,
+        mf_row_parent,
+        propagation_row_type,
+        propagation_row_parent,
+        enable_friction,
+        inv_dt,
+    )
+
+
+@wp.kernel
+def compute_contact_spatial_force_from_impulses(
+    contact_count: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    enable_friction: int,
+    inv_dt: float,
+    rigid_contact_max: int,
+    # outputs
+    contact_f: wp.array[wp.spatial_vector],
+):
+    """Write every row of a ``CONTACT_F`` observable: the linear force of live rigid contacts, zero elsewhere.
+
+    The collision count can exceed the rigid capacity, so rigid rows stop at the capacity.
+    """
+    c = wp.tid()
+    force = wp.vec3(0.0)
+    if c < wp.min(contact_count[0], rigid_contact_max):
+        force = contact_linear_force_from_impulses(
+            c,
+            contact_normal,
+            contact_world,
+            contact_slot,
+            contact_path,
+            world_impulses,
+            mf_impulses,
+            propagation_impulses,
+            world_constraint_count,
+            mf_constraint_count,
+            propagation_constraint_count,
+            world_row_type,
+            world_row_parent,
+            mf_row_type,
+            mf_row_parent,
+            propagation_row_type,
+            propagation_row_parent,
+            enable_friction,
+            inv_dt,
+        )
+    contact_f[c] = wp.spatial_vector(force, wp.vec3(0.0))
 
 
 @wp.kernel

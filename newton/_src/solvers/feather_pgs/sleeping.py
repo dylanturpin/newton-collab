@@ -69,6 +69,9 @@ class _SleepState:
         self.last_body_q = wp.clone(model.body_q)
         self.last_body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
         self.last_gravity = wp.clone(model.gravity)
+        # Joint wrenches computed every step, and the published history sleeping bodies keep.
+        self.parent_wrenches = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
+        self.last_parent_wrenches = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
         gravity_world = model.articulation_world.numpy().copy()
         gravity_world[gravity_world < 0] = model.gravity.size - 1
         self.gravity_world = wp.array(gravity_world, dtype=int, device=device)
@@ -520,6 +523,23 @@ class _SleepState:
             ],
             device=device,
         )
+        if model.body_count:
+            # A frozen body keeps the joint wrench published before it fell asleep.
+            wp.launch(
+                _freeze_parent_wrenches,
+                model.body_count,
+                [
+                    self.body_nodes,
+                    self.parent,
+                    self.art_awake,
+                    self.step_asleep,
+                    self.root_veto,
+                    self.last_parent_wrenches,
+                    self.parent_wrenches,
+                ],
+                device=device,
+            )
+            wp.copy(self.last_parent_wrenches, self.parent_wrenches)
         wp.copy(self.last_q, state_out.joint_q)
         wp.copy(self.last_qd, state_out.joint_qd)
         wp.copy(self.last_body_q, state_out.body_q)
@@ -944,6 +964,22 @@ def _publish_components(
 def _frozen(node: int, parent: wp.array[int], awake: wp.array[int], step_asleep: wp.array[int], veto: wp.array[int]):
     # A step sleeper keeps its frozen state even if it wakes now, unless its own trial output vetoed it.
     return awake[node] == 0 or (step_asleep[node] != 0 and veto[parent[node]] == 0)
+
+
+@wp.kernel(enable_backward=False)
+def _freeze_parent_wrenches(
+    nodes: wp.array[int],
+    parent: wp.array[int],
+    awake: wp.array[int],
+    step_asleep: wp.array[int],
+    veto: wp.array[int],
+    source: wp.array[wp.spatial_vector],
+    target: wp.array[wp.spatial_vector],
+):
+    i = wp.tid()
+    node = nodes[i]
+    if node >= 0 and _frozen(node, parent, awake, step_asleep, veto):
+        target[i] = source[i]
 
 
 @wp.kernel(enable_backward=False)
