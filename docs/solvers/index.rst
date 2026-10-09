@@ -161,7 +161,7 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverFeatherPGS`'s public API and behavior may change without prior notice.
-    Its default ``pgs_mode="matrix_free"`` requires a CUDA device; ``pgs_mode="split"`` runs on CPU and CUDA with the base feature set.
+    Its default ``pgs_mode="split"`` runs on CPU and CUDA; ``pgs_mode="matrix_free"`` requires a CUDA device.
 
 .. experimental::
     :class:`~newton.solvers.SolverKamino`'s public API and behavior may change without prior notice.
