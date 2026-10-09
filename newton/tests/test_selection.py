@@ -415,7 +415,7 @@ class TestSelection(unittest.TestCase):
 
         # Selecting unlike topology under one view remains illegal; heterogeneity is
         # represented by separate sparse views, one per articulation type.
-        with self.assertRaisesRegex(ValueError, "Articulations are not identical"):
+        with self.assertRaisesRegex(ValueError, "layout is unavailable"):
             ArticulationView(model, "robot_*", verbose=False)
 
         # Alternating heterogeneous worlds are sparse by world ID but retain a regular
@@ -1720,7 +1720,8 @@ class TestSelection(unittest.TestCase):
     def test_get_attribute_extended_state(self):
         """Test that get_attribute works for extended state attributes."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        builder.request_state_attributes("body_qdd", "body_parent_f", "mujoco:qfrc_actuator")
+        with self.assertWarns(DeprecationWarning):
+            builder.request_state_attributes("body_qdd", "body_parent_f", "mujoco:qfrc_actuator")
 
         link = builder.add_link()
         builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
@@ -2437,6 +2438,30 @@ class TestSelectionMuJoCoActuators(unittest.TestCase):
 </mujoco>
 """
 
+    def test_partial_layout_preserves_builtin_access_with_unequal_actuator_counts(self):
+        """Keep uniform joint data available when custom row counts differ."""
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(self.ACTUATOR_MJCF)
+        builder.add_mjcf(
+            self.ACTUATOR_MJCF.replace('model="actuated"', 'model="unactuated"').replace(
+                '<motor name="drive" joint="hinge"/>', ""
+            )
+        )
+        model = builder.finalize()
+        control = model.control()
+
+        with self.assertRaisesRegex(ValueError, "different row counts for custom frequency 'mujoco:actuator'"):
+            ArticulationView(model, "*actuated")
+
+        view = ArticulationView(model, "*actuated", allow_partial_layouts=True)
+        self.assertEqual(view.get_attribute("joint_type", model).shape, (1, 2, 1))
+        self.assertIsNone(view.custom_frequency_counts["mujoco:actuator"])
+        self.assertIsNone(view.custom_frequency_labels["mujoco:actuator"])
+        with self.assertRaises(AttributeError):
+            view.get_attribute("mujoco.ctrl", control)
+        with self.assertRaises(AttributeError):
+            view.set_attribute("mujoco.ctrl", control, wp.zeros((1, 2, 1)))
+
     def test_actuator_frequency_uses_declared_articulation_owner(self):
         """Expose MuJoCo actuator controls through their declared owner metadata."""
         robot = newton.ModelBuilder()
@@ -2470,6 +2495,182 @@ class TestSelectionMuJoCoActuators(unittest.TestCase):
         model = scene.finalize()
 
         assert_np_equal(model.custom_frequency_articulation["mujoco:actuator"].numpy(), np.arange(6))
+
+
+# ========================================================================================
+# Shape rows interleaved with other shapes
+
+
+def _make_interleaved_robot_model(device, varied=True, owner_swap=False):
+    """Build three worlds of a two-link robot whose shapes interleave with another body's shape.
+
+    With ``varied``, the other body's shape sits at a different position between the robot's shapes
+    in world 1. With ``owner_swap``, world 1 also adds its robot shapes to the links in a different order.
+    """
+    scene = newton.ModelBuilder()
+    for world in range(3):
+        builder = newton.ModelBuilder()
+        root = builder.add_link(label="robot/root")
+        tip = builder.add_link(label="robot/tip")
+        other = builder.add_link(label="other/link")
+        builder.add_articulation(
+            [builder.add_joint_free(child=root), builder.add_joint_revolute(parent=root, child=tip)], label="robot"
+        )
+        builder.add_articulation([builder.add_joint_free(child=other)], label="other")
+        order = [root, other, tip, root, tip]
+        if varied and world == 1:
+            order = [tip, root, other, tip, root] if owner_swap else [root, tip, other, root, tip]
+        for body in order:
+            builder.add_shape_sphere(body, radius=0.1)
+        scene.add_world(builder)
+    return scene.finalize(device=device)
+
+
+def _make_interleaved_object_model(device, per_world):
+    """Build three free objects whose shape rows are (0, 2), (3, 4) and (6, 8), interleaved with another body's."""
+    scene = newton.ModelBuilder()
+    target = scene
+    for index in range(3):
+        if per_world:
+            target = newton.ModelBuilder()
+        obj = target.add_link(label=f"object_{index}/body")
+        other = target.add_link(label=f"other_{index}/body")
+        target.add_articulation([target.add_joint_free(child=obj)], label=f"object_{index}")
+        target.add_articulation([target.add_joint_free(child=other)], label=f"other_{index}")
+        for body in [obj, obj, other] if index == 1 else [obj, other, obj]:
+            target.add_shape_sphere(body, radius=0.1)
+        if per_world:
+            scene.add_world(target)
+    return scene.finalize(device=device)
+
+
+def _owned_shape_rows(model, view):
+    """Return each selected articulation's shape rows, ordered by ID, computed from the model topology."""
+    shape_body = model.shape_body.numpy()
+    starts, ends = model.articulation_start.numpy(), model.articulation_end.numpy()
+    children = model.joint_child.numpy()
+    rows = []
+    for articulation in view.articulation_ids.numpy().reshape(-1):
+        bodies = children[starts[articulation] : ends[articulation]]
+        rows.append(np.flatnonzero(np.isin(shape_body, bodies)))
+    return np.stack(rows).reshape(view.world_count, view.count_per_world, -1)
+
+
+def _check_shape_rows(test, model, view, device):
+    """Check gathered shape values and masked scatters against the topology's shape rows."""
+    rows = _owned_shape_rows(model, view)
+    layout = view.frequency_layouts[newton.Model.AttributeFrequency.SHAPE]
+    test.assertTrue(layout.uses_explicit_model_indices)
+    test.assertFalse(view.shapes_contiguous)
+    assert_np_equal(layout.get_model_indices().numpy(), rows)
+    assert_np_equal(layout.get_absolute_indices(view.world_count, view.count_per_world), rows)
+
+    margins = np.arange(model.shape_count, dtype=np.float32) + 1.0
+    model.shape_margin.assign(margins)
+    assert_np_equal(view.get_attribute("shape_margin", model).numpy(), margins[rows])
+
+    for mask in (
+        wp.array([index == 1 for index in range(view.world_count)], dtype=bool, device=device),
+        wp.array(
+            [
+                [(world * view.count_per_world + articulation) == 1 for articulation in range(view.count_per_world)]
+                for world in range(view.world_count)
+            ],
+            dtype=bool,
+            device=device,
+        ),
+    ):
+        with test.subTest(mask_ndim=mask.ndim):
+            model.shape_margin.assign(margins)
+            values = np.full(rows.shape, -1.0, dtype=np.float32)
+            view.set_attribute("shape_margin", model, values, mask=mask)
+            expected = margins.copy()
+            selected = mask.numpy()
+            if selected.ndim == 1:
+                selected = np.repeat(selected[:, None], view.count_per_world, axis=1)
+            expected[rows[selected].reshape(-1)] = -1.0
+            assert_np_equal(model.shape_margin.numpy(), expected)
+
+
+def test_interleaved_shape_rows_differ_between_worlds(test, device):
+    """Address robot shapes whose rows interleave differently with another body's shapes in each world."""
+    model = _make_interleaved_robot_model(device)
+    view = ArticulationView(model, "robot", verbose=False)
+    for frequency in ("JOINT", "JOINT_DOF", "JOINT_COORD", "BODY"):
+        layout = view.frequency_layouts[getattr(newton.Model.AttributeFrequency, frequency)]
+        test.assertFalse(layout.uses_explicit_model_indices, frequency)
+    test.assertEqual(view.shape_count, 4)
+    test.assertEqual(view.link_shapes, [[0, 2], [1, 3]])
+    assert_np_equal(_owned_shape_rows(model, view)[:, 0], np.array([[0, 2, 3, 4], [5, 6, 8, 9], [10, 12, 13, 14]]))
+    _check_shape_rows(test, model, view, device)
+
+    # joint coordinates stay a zero-copy view of the state despite the explicit shape rows
+    state = model.state()
+    coord_layout = view.frequency_layouts[newton.Model.AttributeFrequency.JOINT_COORD]
+    positions = view.get_dof_positions(state)
+    test.assertEqual(positions.ptr, state.joint_q.ptr + coord_layout.offset * state.joint_q.strides[0])
+
+    # uniform interleaving keeps a regular shape layout
+    uniform = ArticulationView(_make_interleaved_robot_model(device, varied=False), "robot", verbose=False)
+    test.assertFalse(uniform.frequency_layouts[newton.Model.AttributeFrequency.SHAPE].uses_explicit_model_indices)
+
+
+def test_interleaved_shape_rows_of_grouped_objects(test, device):
+    """Address free objects that own shape rows (0, 2), (3, 4) and (6, 8)."""
+    for per_world in (True, False):
+        with test.subTest(per_world=per_world):
+            model = _make_interleaved_object_model(device, per_world)
+            ids = [index for index, label in enumerate(model.articulation_label) if label.startswith("object_")]
+            view = ArticulationView(model, ids, verbose=False)
+            assert_np_equal(_owned_shape_rows(model, view).reshape(3, 2), np.array([[0, 2], [3, 4], [6, 8]]))
+            _check_shape_rows(test, model, view, device)
+
+
+def test_interleaved_shape_rows_require_matching_owners(test, device):
+    """Reject shape rows whose owning links differ, even though every row could be addressed."""
+    model = _make_interleaved_robot_model(device, owner_swap=True)
+    with test.assertRaisesRegex(ValueError, "SHAPE layout is unavailable"):
+        ArticulationView(model, "robot", verbose=False)
+    view = ArticulationView(model, "robot", verbose=False, allow_partial_layouts=True)
+    test.assertIsNone(view.shapes_contiguous)
+    test.assertEqual(view.get_dof_positions(model).shape, (3, 1, 8))
+    with test.assertRaises(AttributeError):
+        view.get_attribute("shape_margin", model)
+
+
+def test_interleaved_shape_rows_capture_cold(test, device):
+    """Gather and scatter explicit shape rows inside a cold CUDA graph capture."""
+    if not wp.is_mempool_enabled(device):
+        test.skipTest("CUDA graph capture of allocations requires the mempool")
+    model = _make_interleaved_robot_model(device)
+    view = ArticulationView(model, "robot", verbose=False)
+    rows = _owned_shape_rows(model, view)
+    values = wp.full(rows.shape, -1.0, dtype=float, device=device)
+    margins = wp.zeros(rows.shape, dtype=float, device=device)
+    with wp.ScopedCapture(device) as capture:
+        wp.copy(margins, view.get_attribute("shape_margin", model))
+        view.set_attribute("shape_margin", model, values, mask=[False, True, False])
+    for offset in (1.0, 2.0):
+        source = np.arange(model.shape_count, dtype=np.float32) + offset
+        model.shape_margin.assign(source)
+        wp.capture_launch(capture.graph)
+        assert_np_equal(margins.numpy(), source[rows])
+        expected = source.copy()
+        expected[rows[1].reshape(-1)] = -1.0
+        assert_np_equal(model.shape_margin.numpy(), expected)
+
+
+class TestSelectionShapeRows(unittest.TestCase):
+    pass
+
+
+for _test, _devices in (
+    (test_interleaved_shape_rows_differ_between_worlds, get_test_devices()),
+    (test_interleaved_shape_rows_of_grouped_objects, get_test_devices()),
+    (test_interleaved_shape_rows_require_matching_owners, get_test_devices()),
+    (test_interleaved_shape_rows_capture_cold, get_cuda_test_devices()),
+):
+    add_function_test(TestSelectionShapeRows, _test.__name__, _test, devices=_devices)
 
 
 if __name__ == "__main__":

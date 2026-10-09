@@ -798,7 +798,7 @@ def _clear_active_kernel(
     write adjacent elements of each slot-major value array. The active count is
     shared by the launch, so every thread follows the same branch.
 
-    Thread 0 also zeros contact_count and ht_insert_failures (no other thread in this
+    Thread 0 also zeros contact_count, ht_insert_failures and buffer_overflows (no other thread in this
     kernel reads them, so there is no race). The active-slots count stored at
     ``ht_active_slots[ht_capacity]`` must NOT be reset here: every thread reads it
     at the top of the kernel and we have no cross-block barrier, so a follow-up
@@ -1028,6 +1028,8 @@ class GlobalContactReducer:
             self.reclaimed_contact_cursor = wp.zeros(0, dtype=wp.int32, device=device)
         # Count failed hashtable inserts (e.g., table full)
         self.ht_insert_failures = wp.zeros(1, dtype=wp.int32, device=device)
+        # Count contacts dropped because the contact buffer was full. The reservation in
+        # export_contact_to_buffer is rolled back, so contact_count alone never shows the loss.
         self.buffer_overflows = wp.zeros(1, dtype=wp.int32, device=device)
 
         # Hashtable sizing: keep the historical default at capacity / 4 for
@@ -1092,7 +1094,7 @@ class GlobalContactReducer:
 
         1. ``_clear_active_kernel`` clears hashtable keys, values, hydroelastic
            aggregates, and per-step counters (``contact_count``,
-           ``ht_insert_failures``).
+           ``ht_insert_failures``, ``buffer_overflows``).
         2. ``_zero_active_count_kernel`` zeroes ``ht_active_slots[ht_capacity]``.
 
         The second kernel is needed because every thread of the first kernel
