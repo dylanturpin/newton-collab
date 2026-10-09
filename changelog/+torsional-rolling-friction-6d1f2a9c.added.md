@@ -1,0 +1,1 @@
+Add experimental per-contact torsional and rolling friction to ``SolverFeatherPGS`` (``enable_torsional_rolling_friction``), using ``Model.shape_material_mu_torsional`` and ``Model.shape_material_mu_rolling`` in a joint elliptic or block-L1 cone with sliding friction, plus an optional creep speed.
