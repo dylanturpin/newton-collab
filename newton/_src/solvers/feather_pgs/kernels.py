@@ -55,7 +55,10 @@ PGS_CONSTRAINT_TYPE_TORSION = 7
 # The accumulated impulse is boxed to ``[-f dt, f dt]`` (bound stored in the
 # row's ``mu`` slot), so the DOF sticks until the required impulse saturates.
 PGS_CONSTRAINT_TYPE_JOINT_FRICTION = 8
-PGS_CONSTRAINT_TYPE_COUNT = 9
+# Per-contact torsional and rolling friction rows (one spin row about the normal, two rolling rows about the
+# tangents) contiguous after the contact's sliding pair, bounded by the shape torsional/rolling coefficients.
+PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION = 9
+PGS_CONSTRAINT_TYPE_COUNT = 10
 
 # Keep launch-geometry-specific dynamics kernels out of the large general
 # kernel module. Warp compiles one whole module variant per block dimension.
@@ -2622,6 +2625,12 @@ def reset_friction_anchor_history(
     prev_valid[c] = 0
 
 
+@wp.func
+def _is_sliding_row_type(row_type: int):
+    """Dense sliding rows are friction rows, or angular-friction rows when the contact has angular friction."""
+    return row_type == PGS_CONSTRAINT_TYPE_FRICTION or row_type == PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+
+
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
     contact_count: wp.array[wp.int32],
@@ -2672,9 +2681,9 @@ def compute_contact_linear_force_from_impulses(
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and _is_sliding_row_type(world_row_type[world, slot + 1])
                 and world_row_parent[world, slot + 1] == slot
-                and world_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and _is_sliding_row_type(world_row_type[world, slot + 2])
                 and world_row_parent[world, slot + 2] == slot
             ):
                 lam_t0 = world_impulses[world, slot + 1]
@@ -4129,6 +4138,35 @@ def populate_joint_velocity_limit_J_for_size(
 
 
 @wp.func
+def contact_angular_friction_coefficients(
+    shape_a: int,
+    shape_b: int,
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
+):
+    """Return the pair torsional and rolling coefficients [m], the mean of the shapes like sliding mu."""
+    torsional = float(0.0)
+    rolling = float(0.0)
+    count = int(0)
+    if shape_a >= 0:
+        torsional += shape_material_mu_torsional[shape_a]
+        rolling += shape_material_mu_rolling[shape_a]
+        count += 1
+    if shape_b >= 0:
+        torsional += shape_material_mu_torsional[shape_b]
+        rolling += shape_material_mu_rolling[shape_b]
+        count += 1
+    if count > 0:
+        torsional /= float(count)
+        rolling /= float(count)
+    if not wp.isfinite(torsional) or torsional < 0.0:
+        torsional = 0.0
+    if not wp.isfinite(rolling) or rolling < 0.0:
+        rolling = 0.0
+    return torsional, rolling
+
+
+@wp.func
 def _allocate_world_contact_slot(
     c: int,
     contact_shape0: wp.array[int],
@@ -4160,6 +4198,9 @@ def _allocate_world_contact_slot(
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
     friction_patches: FrictionPatches,
+    angular_friction_enabled: int,
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -4337,6 +4378,13 @@ def _allocate_world_contact_slot(
         add_friction = add_friction and friction_patches.weight[c] > 0.0
     if add_friction:
         slots_needed = 3
+        # Torsional/rolling rows follow the sliding pair of dense contacts only.
+        if angular_friction_enabled != 0 and is_mf == 0 and is_propagation == 0:
+            torsional, rolling = contact_angular_friction_coefficients(
+                shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+            )
+            if torsional > 0.0 or rolling > 0.0:
+                slots_needed = 6
     contact_slots_needed[c] = slots_needed
 
     if is_mf != 0:
@@ -4420,6 +4468,9 @@ def allocate_world_contact_slots(
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
     friction_patches: FrictionPatches,
+    angular_friction_enabled: int,
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -4494,6 +4545,9 @@ def allocate_world_contact_slots(
             contact_friction_gap_threshold,
             contact_friction_articulation_pairs_only,
             friction_patches,
+            angular_friction_enabled,
+            shape_material_mu_torsional,
+            shape_material_mu_rolling,
             contact_world,
             contact_slot,
             contact_art_a,
@@ -5743,6 +5797,146 @@ def populate_world_J_for_size(
             world_target_velocity,
             world_row_restitution,
         )
+
+
+@wp.func
+def accumulate_angular_jacobian_row_world(
+    body_index: int,
+    sign: float,
+    axis: wp.vec3,
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    art_dof_start: int,
+    n_dofs: int,
+    group_idx: int,
+    row: int,
+    J_group: wp.array3d[float],
+):
+    """Accumulate one body's angular velocity about ``axis`` by walking up the kinematic tree."""
+    if body_index < 0:
+        return
+    curr_joint = body_to_joint[body_index]
+    while curr_joint >= 0:
+        for global_dof in range(joint_qd_start[curr_joint], joint_qd_start[curr_joint + 1]):
+            S = joint_S_s[global_dof]
+            local_dof = global_dof - art_dof_start
+            if local_dof >= 0 and local_dof < n_dofs:
+                J_group[group_idx, row, local_dof] += sign * wp.dot(axis, wp.vec3(S[3], S[4], S[5]))
+        curr_joint = joint_ancestor[curr_joint]
+
+
+@wp.kernel
+def populate_world_angular_friction_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    target_size: int,
+    articulation_response_dof_count: wp.array[int],
+    art_group_idx: wp.array[int],
+    art_dof_start: wp.array[int],
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    shape_body: wp.array[int],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
+    pgs_cfm: float,
+    write_metadata: int,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
+):
+    """Fill the spin and rolling rows that allocation reserved after a dense contact's sliding pair.
+
+    Launch once per size group with ``write_metadata`` set on exactly one launch.
+    """
+    total_contacts = wp.min(contact_count[0], contact_normal.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        slot = contact_slot[c]
+        if contact_path[c] != 0 or slot < 0 or contact_slots_needed[c] != 6:
+            continue
+        world = contact_world[c]
+        shape_a = contact_shape0[c]
+        shape_b = contact_shape1[c]
+        normal = -contact_normal[c]
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        for k in range(3):
+            axis = normal
+            if k == 1:
+                axis = tangent0
+            elif k == 2:
+                axis = tangent1
+            row = slot + 3 + k
+            target = float(0.0)
+            for side in range(2):
+                shape = shape_a
+                art = contact_art_a[c]
+                sign = float(1.0)
+                if side == 1:
+                    shape = shape_b
+                    art = contact_art_b[c]
+                    sign = -1.0
+                if shape < 0 or art < 0:
+                    continue
+                body = shape_body[shape]
+                if body < 0:
+                    continue
+                if prescribed_articulation[art] != 0:
+                    target -= sign * wp.dot(axis, wp.spatial_bottom(body_v_s[body]))
+                elif articulation_response_dof_count[art] == target_size:
+                    accumulate_angular_jacobian_row_world(
+                        body,
+                        sign,
+                        axis,
+                        body_to_joint,
+                        joint_ancestor,
+                        joint_qd_start,
+                        joint_S_s,
+                        art_dof_start[art],
+                        target_size,
+                        art_group_idx[art],
+                        row,
+                        J_group,
+                    )
+            if write_metadata != 0 and k == 0:
+                # The block solve owns the contact's sliding pair too, so it runs from the angular row type.
+                world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+                world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+            if write_metadata != 0:
+                torsional, rolling = contact_angular_friction_coefficients(
+                    shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+                )
+                world_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+                world_row_parent[world, row] = slot
+                coefficient = rolling
+                if k == 0:
+                    coefficient = torsional
+                world_row_mu[world, row] = coefficient
+                world_row_beta[world, row] = 0.0
+                world_row_cfm[world, row] = pgs_cfm
+                world_phi[world, row] = 0.0
+                world_target_velocity[world, row] = target
+                world_row_restitution[world, row] = 0.0
 
 
 @wp.kernel
