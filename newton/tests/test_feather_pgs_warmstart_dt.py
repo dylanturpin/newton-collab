@@ -93,7 +93,7 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.full((1, max_c), 100.0, dtype=wp.float32),
                 0.75,
-                4.0,
+                wp.array([4.0], dtype=wp.float32),
                 max_c,
             ],
             outputs=[impulses],

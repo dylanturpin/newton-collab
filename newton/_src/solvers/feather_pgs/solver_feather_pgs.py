@@ -36,6 +36,8 @@ from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, St
 from ...sim.articulation import eval_fk, eval_jacobian
 from ...sim.enums import BodyFlags, JointType
 from ..coupled.interface import CouplingInterface
+from ..coupled.model_view import ModelView
+from ..observables import SolverObservableFlags, SolverObservables
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -115,10 +117,12 @@ from .kernels import (
     clear_sparse_diagonal_response_prefix,
     collect_propagation_units,
     compact_local_pair_candidates,
+    compute_body_parent_f,
     compute_com_transforms,
     compute_compact_diagonal_inverse_mass,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
+    compute_contact_spatial_force_from_impulses,
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
@@ -190,6 +194,7 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    record_warmstart_dt,
     refine_same_articulation_propagation_rows,
     refresh_masked_body_inertia,
     refresh_propagation_free_body_qd_from_vout,
@@ -209,6 +214,7 @@ from .kernels import (
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
+    warmstart_dt_scale,
 )
 from .sleeping import _SleepState
 from .sparse_contact import (
@@ -858,6 +864,107 @@ _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
 
 
+def _unprojected_equality_constraints(model: Model) -> np.ndarray:
+    """Return the enabled MuJoCo equality rows that no Newton loop joint or mimic enforces.
+
+    The MJCF and USD importers convert MuJoCo equalities to Newton loop joints or mimic
+    constraints by default and keep the original row in ``model.mujoco.equality_constraint_*``
+    with a ``target_kind`` / ``target`` link to the projected entity. Such a row is enforced
+    (or rejected) through that entity. A row without a valid link is MuJoCo-only physics.
+
+    A link is valid only when the target is structurally the row's projection, as the importers
+    build it: a CONNECT or WELD row links a ball or fixed joint outside any articulation that
+    joins the row's two bodies (or its body and the world), and a JOINT row links a mimic
+    constraint between the row's two joints. Anchors and coefficients are not compared.
+    """
+    from ..mujoco.enums import EqType  # noqa: PLC0415
+    from ..mujoco.equality import MjcEqualityTargetKind  # noqa: PLC0415
+
+    mujoco = getattr(model, "mujoco", None)
+    count = int(getattr(mujoco, "equality_constraint_count", 0) or 0) if mujoco is not None else 0
+    enabled = getattr(mujoco, "equality_constraint_enabled", None) if count else None
+    if enabled is None:
+        return np.zeros(0, dtype=np.int32)
+    enabled = enabled.numpy().astype(bool)
+    target_kind = getattr(mujoco, "equality_constraint_target_kind", None)
+    target = getattr(mujoco, "equality_constraint_target", None)
+    projected = np.zeros(count, dtype=bool)
+    if target_kind is not None and target is not None:
+        target_kind = target_kind.numpy()
+        target = target.numpy()
+
+        def field(name: str) -> np.ndarray:
+            values = getattr(mujoco, f"equality_constraint_{name}", None)
+            return values.numpy() if values is not None else np.full(count, -2, dtype=np.int32)
+
+        eq_type = field("type")
+        body1, body2 = field("body1"), field("body2")
+        joint1, joint2 = field("joint1"), field("joint2")
+        joint_count = int(model.joint_count)
+        joint_type = model.joint_type.numpy() if joint_count else None
+        joint_parent = model.joint_parent.numpy() if joint_count else None
+        joint_child = model.joint_child.numpy() if joint_count else None
+        joint_articulation = (
+            model.joint_articulation.numpy() if joint_count and model.joint_articulation is not None else None
+        )
+        mimic_count = int(getattr(model, "constraint_mimic_count", 0) or 0)
+        mimic_joint0 = model.constraint_mimic_joint0.numpy() if mimic_count else None
+        mimic_joint1 = model.constraint_mimic_joint1.numpy() if mimic_count else None
+        loop_joint_type = {int(EqType.CONNECT): int(JointType.BALL), int(EqType.WELD): int(JointType.FIXED)}
+        for row in range(count):
+            kind, index = int(target_kind[row]), int(target[row])
+            if kind == int(MjcEqualityTargetKind.JOINT) and 0 <= index < joint_count:
+                expected_type = loop_joint_type.get(int(eq_type[row]))
+                in_tree = joint_articulation is not None and int(joint_articulation[index]) >= 0
+                # The importers make body1 the parent and body2 the child, or the world the
+                # parent of body1; compare the endpoints as a set so either order is accepted.
+                rows_bodies = {int(body1[row]), int(body2[row])}
+                joint_bodies = {int(joint_parent[index]), int(joint_child[index])}
+                projected[row] = (
+                    expected_type is not None
+                    and int(joint_type[index]) == expected_type
+                    and not in_tree
+                    and int(joint_child[index]) >= 0
+                    and joint_bodies == rows_bodies
+                )
+            elif kind == int(MjcEqualityTargetKind.MIMIC) and 0 <= index < mimic_count:
+                projected[row] = (
+                    int(eq_type[row]) == int(EqType.JOINT)
+                    and int(mimic_joint0[index]) == int(joint1[row])
+                    and int(mimic_joint1[index]) == int(joint2[row])
+                )
+    return np.flatnonzero(enabled & ~projected).astype(np.int32)
+
+
+def _validate_equality_constraints(model: Model) -> None:
+    """Reject enabled MuJoCo equality constraints that this solver would silently ignore."""
+    rows = _unprojected_equality_constraints(model)
+    if rows.size:
+        raise NotImplementedError(
+            f"SolverFeatherPGS does not enforce MuJoCo equality constraints: model.mujoco.equality_constraint "
+            f"rows {rows[:16].tolist()} are enabled and not converted to a Newton loop joint or mimic "
+            "constraint. Import with convert_mjc_equality_constraints=True, model the constraint with Newton "
+            "joints, or disable the rows (equality_constraint_enabled)."
+        )
+
+
+def _validate_tree_joints_enabled(model: Model) -> None:
+    """Reject disabled articulation-tree joints, which the solver would simulate as enabled."""
+    if not model.joint_count or model.joint_enabled is None:
+        return
+    disabled = ~model.joint_enabled.numpy().astype(bool)
+    if model.joint_articulation is not None:
+        # A disabled loop-closing joint is a released closure, see set_loop_joint_enabled().
+        disabled &= model.joint_articulation.numpy() >= 0
+    if isinstance(model, ModelView):
+        # Another coupled entry or the coupling algorithm simulates these joints.
+        disabled[model.coupling_disabled_joints.numpy()] = False
+    if np.any(disabled):
+        raise NotImplementedError(
+            "SolverFeatherPGS does not support disabled joints in an articulation tree (Model.joint_enabled)."
+        )
+
+
 def _replace_once(source: str, old: str, new: str) -> str:
     """Replace one required generated-source fragment."""
     if source.count(old) != 1:
@@ -1152,7 +1259,34 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     articulation. Dense-factor chains and unsupported features retain the
     existing representation. Selection uses topology and resources, not task names.
 
+    Solver observables:
+        :attr:`~newton.solvers.SolverObservables.body_parent_f` is populated when
+        :attr:`~newton.solvers.SolverObservableFlags.BODY_PARENT_F` is requested from
+        :meth:`~newton.solvers.SolverBase.observables`, or when the deprecated
+        :attr:`~newton.State.body_parent_f` is allocated. As in
+        :class:`~newton.solvers.SolverFeatherstone`, it is the per-body net spatial wrench of
+        the inverse-dynamics backward pass at the start of the step, translated to the body's
+        center of mass (linear force [N] first, torque [N·m] second, world frame). It does not
+        include constraint or contact impulses of the step: joint limits, joint friction,
+        mimic and loop-closure rows, and PGS drive rows are not part of it. With sleeping
+        enabled the solver computes the wrench every step into its own history, so a sleeping
+        body reports its last awake wrench in whichever output the caller passes.
+
+        :attr:`~newton.solvers.SolverObservables.contact_f` is populated when
+        :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` is requested. Each live rigid
+        contact row holds the force [N] on shape 0's body, in world frame, from the solved
+        normal and friction impulses of the step divided by ``dt``, the same forces
+        :meth:`update_contacts` reports; the torque part is zero (torsional and rolling
+        friction are not reported). Compliant contact rows report their solved impulse like
+        rigid rows. Contacts whose rows were dropped for capacity, contacts of sleeping
+        islands whose rows are skipped (``sleep_skip_constraints``), rows beyond the contact
+        count or the rigid capacity, and soft-contact rows report zero. A zero force under a
+        sleeping body does not mean the contact was lost; pass
+        ``sleep_skip_constraints=False`` (or leave sleeping off) to keep the solved forces.
+
     """
+
+    SUPPORTED_OBSERVABLE_FLAGS = frozenset({SolverObservableFlags.BODY_PARENT_F, SolverObservableFlags.CONTACT_F})
 
     # The default configuration is conformance-tested against body-pair-reduced
     # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
@@ -1824,6 +1958,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.contact_compliance = bool(contact_compliance)
         self._compliance = None
         super().__init__(model)
+        _validate_equality_constraints(model)
+        _validate_tree_joints_enabled(model)
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -2040,7 +2176,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._mf_warmstart_decay = self.pgs_warmstart_decay
         # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
         self._ws_prev_mf_impulses = None
-        self._ws_prev_dt = 0.0
+        # Device-resident so a captured step rescales the history by the step ratio at replay.
+        self._ws_prev_dt = wp.zeros(1, dtype=float, device=model.device)
+        self._ws_dt_scale = wp.ones(1, dtype=float, device=model.device)
         # Contact buffer and generation the previous step solved, on the device so a
         # captured graph replays them. Generations count collision passes per buffer, so
         # each buffer gets its own nonzero stream id (0: no contacts).
@@ -2267,6 +2405,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._fk_id_cache = None
         # Per-entity dynamics activity; sleeping clears the entries of islands that sleep through a step.
         self._dynamics_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
+        self._parent_wrench_scratch: tuple[wp.array, wp.array] | None = None
         self._dynamics_art_mask = wp.ones(model.articulation_count, dtype=wp.bool, device=model.device)
         self._dynamics_joint_active = wp.ones(model.joint_count, dtype=wp.int32, device=model.device)
         self._dynamics_dof_active = wp.ones(model.joint_dof_count, dtype=wp.int32, device=model.device)
@@ -2929,18 +3068,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._row_dropped_mf = self._row_dropped_all[1]
         self._row_dropped_propagation = self._row_dropped_all[2]
 
-        if model.shape_material_mu is not None:
-            self.shape_material_mu = model.shape_material_mu
-        else:
-            self.shape_material_mu = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
-        if model.shape_material_restitution is not None:
-            self.shape_material_restitution = model.shape_material_restitution
-        else:
-            self.shape_material_restitution = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
+        material_count = max(model.shape_count, 1)
+        self.shape_material_mu = wp.zeros(
+            material_count, dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+        )
+        self.shape_material_restitution = wp.zeros(
+            material_count, dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+        )
+        self._refresh_shape_materials()
 
         self._init_double_buffer_stream()
 
@@ -3115,7 +3250,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
+
+        The narrow joint DOF flags are handled like :attr:`~newton.ModelFlags.JOINT_DOF_PROPERTIES`
+        for what they cover: DOF inertial changes (armature) re-read armature, refresh the mass
+        matrix and discard warm-start impulses; DOF force changes re-read joint damping, refresh the
+        mass matrix, since augmented drive gains enter its diagonal, and re-validate joint friction.
+        Reference poses are read every step. Constraint changes re-check the MuJoCo equality rows:
+        enabling one that is not converted to a Newton loop joint or mimic constraint raises
+        :class:`NotImplementedError`. Joint damping and shape friction and restitution
+        coefficients are copied into solver-owned buffers, so model arrays modified in place or
+        replaced take effect at the matching notification, in eager and captured steps alike.
         """
+        if flags & ModelFlags.CONSTRAINT_PROPERTIES:
+            _validate_equality_constraints(self.model)
+        dof_inertial = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+        dof_force = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
         if self.sleeping is not None:
             self.sleeping.notify(flags)
         self._coupling_patch_history_saved = False
@@ -3126,20 +3275,29 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._friction_patches.update_geometry(self.model)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
+            | dof_inertial
+            | dof_force
+            | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
             | ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
             | ModelFlags.MODEL_PROPERTIES
         ):
             self._fk_id_cache_valid.zero_()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+        if flags & (ModelFlags.BODY_PROPERTIES | dof_inertial):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
             self._mass_update_requested.fill_(1)
+        if flags & dof_force:
+            self._refresh_passive_joint_damping()
+        if flags & ModelFlags.JOINT_DOF_FORCE_PROPERTIES:
+            # Augmented drive gains enter the factored mass-matrix diagonal.
+            self._mass_update_requested.fill_(1)
+        if flags & ModelFlags.SHAPE_PROPERTIES:
+            self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
-        if self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES:
+        if self.enable_joint_friction and flags & dof_force:
             self._validate_joint_friction()
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia
@@ -3163,10 +3321,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if flags & (
             ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
+            | dof_inertial
             | ModelFlags.SHAPE_PROPERTIES
         ):
             self._clear_warmstart_history(None)
+
+    def _warmstart_dt_scale(self, dt: float) -> wp.array:
+        """Return the device scalar that rescales carried impulses from the previous step size to ``dt``."""
+        wp.launch(
+            warmstart_dt_scale,
+            dim=1,
+            inputs=[float(dt), self._ws_prev_dt],
+            outputs=[self._ws_dt_scale],
+            device=self.model.device,
+        )
+        return self._ws_dt_scale
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -4419,11 +4588,26 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._passive_spring_stiffness = spring_k
             self._passive_spring_ref = spring_ref
 
-        damping = getattr(model, "joint_damping", None)
-        if damping is None:
-            self._passive_joint_damping = _zeros()
-        else:
-            self._passive_joint_damping = damping
+        self._passive_joint_damping = wp.zeros(max(n_dofs, 1), dtype=wp.float32, device=device)
+        self._refresh_passive_joint_damping()
+
+    def _refresh_passive_joint_damping(self) -> None:
+        """Copy the model's current joint damping into the solver's fixed damping buffer."""
+        # Users may replace model.joint_damping; captured graphs keep this buffer's address.
+        damping = self.model.joint_damping
+        if damping is not None and self.model.joint_dof_count:
+            wp.copy(self._passive_joint_damping, damping, count=self.model.joint_dof_count)
+
+    def _refresh_shape_materials(self) -> None:
+        """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
+        # Users may replace the model arrays; captured graphs keep these buffers' addresses.
+        model = self.model
+        for buffer, values in (
+            (self.shape_material_mu, model.shape_material_mu),
+            (self.shape_material_restitution, model.shape_material_restitution),
+        ):
+            if values is not None and model.shape_count:
+                wp.copy(buffer, values, count=model.shape_count)
 
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -5653,14 +5837,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     requires_grad=requires_grad,
                 )
 
-        max_contacts = int(model.rigid_contact_max)
-        if max_contacts <= 0:
-            # Unified collision pipeline manages its own contact capacity and may
-            # leave model.rigid_contact_max unset. Use the same estimator as collide.py.
+        max_contacts = model.rigid_contact_max
+        if max_contacts is None:
+            # No collision pipeline has published a capacity yet; use the pipeline's estimator.
             from ...sim.collide import _estimate_rigid_contact_max  # noqa: PLC0415
 
-            max_contacts = int(_estimate_rigid_contact_max(model))
-        max_contacts = max(max_contacts, 1)
+            max_contacts = _estimate_rigid_contact_max(model)
+        max_contacts = max(int(max_contacts), 1)
         self._max_contacts_alloc = max_contacts
         # Row builders always receive a zero phi view when patch friction is off.
         # Persistent state is owned by the body-pair patch builder, independently
@@ -8961,7 +9144,23 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         contacts: Contacts,
         dt: float,
         collide_done_event=None,
+        *,
+        observables: SolverObservables | None = None,
     ):
+        """Advance the simulation by one time step.
+
+        Args:
+            state_in: State at the start of the step.
+            state_out: State written at the end of the step.
+            control: Control inputs; ``None`` uses the model's defaults.
+            contacts: Contacts of ``state_in``, or ``None``.
+            dt: Time step [s].
+            collide_done_event: Optional CUDA event the step waits on before it reads contacts.
+            observables: Optional solver observable arrays allocated by :meth:`observables`.
+
+        Returns:
+            ``state_out``.
+        """
         if self._sparse_mass_matrix_size is not None and (
             self.pgs_mode != "matrix_free"
             or self.pgs_schedule != "interleaved"
@@ -8987,6 +9186,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 supports_body_pair_reduced_contacts=False,
                 configuration="contact_compliance=True",
             )
+        self.validate_observables(observables, contacts)
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if getattr(self, "_device_torsion", None) is not None:
@@ -9014,6 +9214,121 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     "contact_matching enabled (rigid_contact_match_index is None). Build the "
                     'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
                 )
+        body_parent_f = state_out.body_parent_f
+        if observables is not None and observables.is_requested(SolverObservableFlags.BODY_PARENT_F):
+            body_parent_f = observables.body_parent_f
+        self._step_stages(state_in, state_out, control, contacts, dt, collide_done_event, observables, body_parent_f)
+        self._publish_parent_wrenches(state_out, body_parent_f)
+        if observables is not None and observables.is_requested(SolverObservableFlags.CONTACT_F):
+            # Rows are built only for articulated models; without joints every contact reports zero.
+            inv_dt = 1.0 / dt if self.model.joint_count else 0.0
+            wp.launch(
+                compute_contact_spatial_force_from_impulses,
+                dim=observables.contact_f.shape[0],
+                inputs=[*self._contact_force_inputs(contacts, inv_dt), contacts.rigid_contact_max],
+                outputs=[observables.contact_f],
+                device=self.model.device,
+            )
+        return state_out
+
+    def _compute_parent_wrenches(
+        self, state_in: State, state_aug: State, control: Control, body_parent_f: wp.array
+    ) -> None:
+        """Write each body's inverse-dynamics joint wrench at the start of the step.
+
+        Runs its own backward pass into solver scratch, so every stage-1 inverse-dynamics path
+        (tree, direct-branch, asynchronous) reports the same wrench.
+        """
+        model = self.model
+        if not model.articulation_count:
+            body_parent_f.zero_()
+            return
+        if self._parent_wrench_scratch is None:
+            self._parent_wrench_scratch = (
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.zeros(max(model.joint_dof_count, 1), dtype=float, device=model.device),
+            )
+        body_ft_s, joint_tau = self._parent_wrench_scratch
+        body_ft_s.zero_()
+        body_f = state_in.body_f if state_in.body_count else None
+        wp.launch(
+            eval_rigid_tau,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_articulation,
+                model.joint_qd_start,
+                model.joint_q_start,
+                model.joint_dof_dim,
+                control.joint_f,
+                state_in.joint_q,
+                state_in.joint_qd,
+                self._passive_spring_stiffness,
+                self._passive_spring_ref,
+                self._passive_joint_damping,
+                state_aug.joint_S_s,
+                state_aug.body_f_s,
+                body_f,
+                model.body_flags,
+                state_in.body_q,
+                model.body_com,
+                self.articulation_origin,
+                self._dynamics_art_active,
+            ],
+            outputs=[body_ft_s, joint_tau],
+            block_dim=self.serial_kernel_block_dim,
+            device=model.device,
+        )
+        wp.launch(
+            compute_body_parent_f,
+            dim=model.body_count,
+            inputs=[
+                self.body_to_articulation,
+                self.articulation_origin,
+                state_aug.body_f_s,
+                body_ft_s,
+                body_f,
+                model.body_flags,
+                state_in.body_q,
+                model.body_com,
+            ],
+            outputs=[body_parent_f],
+            device=model.device,
+        )
+
+    def _publish_parent_wrenches(self, state_out: State, body_parent_f: wp.array | None) -> None:
+        """Copy the step's joint wrenches to each caller output that did not receive them directly."""
+        targets = {}
+        for target in (body_parent_f, state_out.body_parent_f):
+            if target is not None:
+                targets[target.ptr] = target
+        if not targets:
+            return
+        if not self.model.joint_count:
+            for target in targets.values():
+                target.zero_()
+            return
+        computed = self.sleeping.parent_wrenches if self.sleeping is not None else body_parent_f
+        for target in targets.values():
+            if target.ptr != computed.ptr:
+                target.assign(computed)
+
+    def _step_stages(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts,
+        dt: float,
+        collide_done_event,
+        observables: SolverObservables | None,
+        body_parent_f: wp.array | None,
+    ):
+        """Run :meth:`step` after its inputs are validated and its observable outputs are resolved."""
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._coupling_patch_history_restore_pending:
@@ -9085,6 +9400,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 )
             else:
                 inverse_dynamics_ready = None
+            # With sleeping, wrenches go to solver-owned history first, so frozen bodies never read a caller buffer.
+            computed_parent_f = self.sleeping.parent_wrenches if self.sleeping is not None else body_parent_f
+            if computed_parent_f is not None:
+                self._compute_parent_wrenches(state_in, state_aug, control, computed_parent_f)
 
             self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
         # ══════════════════════════════════════════════════════════════
@@ -9296,7 +9615,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._ws_prev_contact_normal,
                         self.row_mu,
                         self.pgs_warmstart_decay,
-                        dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                        self._warmstart_dt_scale(dt),
                         self.dense_max_constraints,
                     ],
                     outputs=[self.impulses],
@@ -9322,7 +9641,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             parents,
                             mu,
                             impulses,
-                            decay * (dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0),
+                            decay,
+                            self._warmstart_dt_scale(dt),
                         ],
                         device=model.device,
                     )
@@ -9807,7 +10127,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._ws_history_generation, self._ws_history_stream],
                 device=model.device,
             )
-            self._ws_prev_dt = float(dt)
+            wp.launch(record_warmstart_dt, dim=1, inputs=[float(dt)], outputs=[self._ws_prev_dt], device=model.device)
 
         # Double-buffer: fork the maintenance stream to clear the current
         # buffer for reuse. The compact path snapshots this solve's row counts
@@ -10097,7 +10417,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         }
 
     @override
-    def update_contacts(self, contacts: Contacts) -> None:
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Populate linear contact forces from the last FeatherPGS solve.
 
         This path reports linear force only: the torque components of
@@ -10105,63 +10425,24 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         body0's center of mass. With persistent patches, normal and friction
         rows can act at different points, so crossing the current contact point
         with the combined force does not recover the solved torque. This export
-        is not suitable for contact-wrench sensing.
+        is not suitable for contact-wrench sensing. The
+        :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` observable reports the same
+        forces from :meth:`step`.
+
+        Args:
+            contacts: The contacts passed to the last :meth:`step`.
+            state: Unused.
         """
+        del state
         if contacts is None or contacts.rigid_contact_count is None:
             return
 
         dt = self._last_step_dt
         inv_dt = 0.0 if dt is None or dt <= 0.0 else 1.0 / dt
-        enable_friction_flag = 1 if self.enable_contact_friction else 0
-        mf_impulses = getattr(self, "mf_impulses", None)
-        if mf_impulses is None:
-            mf_impulses = self._dummy_contact_impulses
-        mf_constraint_count = getattr(self, "mf_constraint_count", None)
-        if mf_constraint_count is None:
-            mf_constraint_count = self._dummy_contact_count
-        mf_row_type = getattr(self, "mf_row_type", None)
-        if mf_row_type is None:
-            mf_row_type = self._dummy_contact_row_type
-        mf_row_parent = getattr(self, "mf_row_parent", None)
-        if mf_row_parent is None:
-            mf_row_parent = self._dummy_contact_row_parent
-        propagation_impulses = getattr(self, "propagation_impulses", None)
-        if propagation_impulses is None:
-            propagation_impulses = self._dummy_contact_impulses
-        propagation_constraint_count = getattr(self, "propagation_constraint_count", None)
-        if propagation_constraint_count is None:
-            propagation_constraint_count = self._dummy_contact_count
-        propagation_row_type = getattr(self, "propagation_row_type", None)
-        if propagation_row_type is None:
-            propagation_row_type = self._dummy_contact_row_type
-        propagation_row_parent = getattr(self, "propagation_row_parent", None)
-        if propagation_row_parent is None:
-            propagation_row_parent = self._dummy_contact_row_parent
-
         wp.launch(
             compute_contact_linear_force_from_impulses,
             dim=contacts.rigid_contact_max,
-            inputs=[
-                contacts.rigid_contact_count,
-                contacts.rigid_contact_normal,
-                self.contact_world,
-                self.contact_slot,
-                self.contact_path,
-                self.impulses,
-                mf_impulses,
-                propagation_impulses,
-                self.constraint_count,
-                mf_constraint_count,
-                propagation_constraint_count,
-                self.row_type,
-                self.row_parent,
-                mf_row_type,
-                mf_row_parent,
-                propagation_row_type,
-                propagation_row_parent,
-                enable_friction_flag,
-                inv_dt,
-            ],
+            inputs=self._contact_force_inputs(contacts, inv_dt),
             outputs=[contacts.rigid_contact_force],
             device=self.model.device,
         )
@@ -10177,6 +10458,35 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[contacts.force],
                 device=self.model.device,
             )
+
+    def _contact_force_inputs(self, contacts: Contacts, inv_dt: float) -> list:
+        """Return the inputs shared by the contact-force kernels."""
+
+        def solved(name: str, dummy: wp.array) -> wp.array:
+            array = getattr(self, name, None)
+            return dummy if array is None else array
+
+        return [
+            contacts.rigid_contact_count,
+            contacts.rigid_contact_normal,
+            self.contact_world,
+            self.contact_slot,
+            self.contact_path,
+            self.impulses,
+            solved("mf_impulses", self._dummy_contact_impulses),
+            solved("propagation_impulses", self._dummy_contact_impulses),
+            self.constraint_count,
+            solved("mf_constraint_count", self._dummy_contact_count),
+            solved("propagation_constraint_count", self._dummy_contact_count),
+            self.row_type,
+            self.row_parent,
+            solved("mf_row_type", self._dummy_contact_row_type),
+            solved("mf_row_parent", self._dummy_contact_row_parent),
+            solved("propagation_row_type", self._dummy_contact_row_type),
+            solved("propagation_row_parent", self._dummy_contact_row_parent),
+            1 if self.enable_contact_friction else 0,
+            inv_dt,
+        ]
 
     def _prepare_augmented_state(
         self,
@@ -11883,6 +12193,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     friction_gap=self.contact_friction_gap_threshold,
                     friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
                     frozen_bodies=self.sleeping.patch_frozen_bodies if self.sleeping is not None else None,
+                    shape_material_mu=self.shape_material_mu,
                 )
 
             wp.launch(
@@ -12422,7 +12733,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             self._ws_prev_contact_normal,
                             self.propagation_row_mu,
                             self.pgs_warmstart_decay,
-                            dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                            self._warmstart_dt_scale(dt),
                             self.propagation_max_constraints,
                         ],
                         outputs=[self.propagation_impulses],
@@ -12558,7 +12869,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
-                            dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                            self._warmstart_dt_scale(dt),
                             self.mf_max_constraints,
                         ],
                         outputs=[self.mf_impulses],

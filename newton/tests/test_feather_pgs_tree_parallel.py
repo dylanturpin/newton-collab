@@ -329,6 +329,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                         previous_tau = overwritten
                     model.joint_damping.zero_()
                     for index, solver in enumerate(solvers):
+                        solver._refresh_passive_joint_damping()
                         solver._launch_rigid_tau(states[index], solver, controls[index])
                         np.testing.assert_allclose(
                             previous_tau - solver.joint_tau.numpy(),

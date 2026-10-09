@@ -632,6 +632,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 mu,
                 impulses,
                 1.0,
+                wp.ones(1, dtype=float, device="cpu"),
             ],
             device="cpu",
         )
@@ -668,6 +669,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         mu,
                         impulses,
                         1.0,
+                        wp.ones(1, dtype=float, device="cpu"),
                     ],
                     device="cpu",
                 )

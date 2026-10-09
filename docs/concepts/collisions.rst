@@ -443,7 +443,7 @@ Newton supports the following geometry types via :class:`~GeoType`:
    * - ``ELLIPSOID``
      - Ellipsoid
    * - ``MESH``
-     - Triangle mesh (arbitrary, including non-convex)
+     - Triangle mesh (arbitrary, including non-convex; :class:`~newton.solvers.SolverMuJoCo` collides its convex hull, see :doc:`/solvers/mujoco`)
    * - ``CONVEX_MESH``
      - Convex hull mesh
 
@@ -1021,6 +1021,13 @@ worlds, but it is not a guaranteed worst-case bound. When the estimate implies a
 and the inputs that produced it. Pass an explicit ``rigid_contact_max`` to select the
 memory budget and silence the warning. Optional collision features and solvers may
 allocate additional per-contact memory.
+
+Pipeline construction publishes the resolved rigid and soft capacities as
+``model.rigid_contact_max`` and ``model.soft_contact_max``. Before collision
+setup these are ``None``; zero is a valid empty capacity. Contact-indexed
+:ref:`solver_observables` use these capacities for eager allocation and freeze them
+once allocated. Construct the pipeline before calling ``solver.observables()`` for
+contact diagnostics; the live contact counts are not needed during allocation.
 
 .. _Mesh Collisions:
 
@@ -1704,24 +1711,34 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
    * - ``soft_contact_normal``
      - Contact normal.
 
-**Extended contact attributes** (see :ref:`extended_contact_attributes`):
+**Contact-force solver observable** (see :ref:`solver_observables`):
 
 .. list-table::
    :header-rows: 1
    :widths: 22 78
 
-   * - Attribute
+   * - Observable
      - Description
-   * - :attr:`~Contacts.force`
+   * - ``SolverObservableFlags.CONTACT_F`` / ``SolverObservables.contact_f``
      - Contact spatial forces (used by :class:`~sensors.SensorContact`).
-       Populated by :meth:`~solvers.SolverBase.update_contacts`.
+       Bind the observable allocation to the contacts buffer and pass it to the
+       solver step.
 
 .. note::
 
    :class:`~solvers.SolverXPBD` with ``rigid_contact_con_weighting`` enabled
    (the default) does not conserve momentum at contacts.  The per-contact
-   forces written by :meth:`~solvers.SolverXPBD.update_contacts` are
+   forces written to ``SolverObservables.contact_f`` are
    approximate -- see that method's documentation for details.
+
+.. note::
+
+   :class:`~solvers.SolverVBD` populates the rigid-contact rows of
+   :attr:`~solvers.SolverObservables.contact_f` when it integrates the rigid bodies, and the
+   soft-contact rows (row ``rigid_contact_max + i`` for soft contact ``i``) for
+   rigid-soft particle, edge, and face records. With an external rigid solver, VBD's
+   rigid rows are zero; consume that solver's forces from its own observables.
+   See :ref:`vbd_contact_forces` for the sign and torque convention.
 
 Example usage:
 
@@ -2293,7 +2310,9 @@ argument on :class:`~CollisionPipeline` selects one of three modes:
 - ``"sticky"`` — match like ``"latest"``, then overwrite
   each matched contact's body-frame contact points (``point0``/``point1``),
   offsets (``offset0``/``offset1``), and world-frame ``normal`` with the
-  saved previous-frame values.  The remaining contact fields
+  saved previous-frame values when the contact is penetrating and the saved
+  witnesses remain within the position threshold of the fresh witnesses.
+  The remaining contact fields
   (``shape0``/``shape1``, ``margin0``/``margin1``) are either key-derived
   or per-shape constants and so are already identical for a matched
   contact — no extra state is kept for them.  Unmatched contacts pass
@@ -2354,9 +2373,11 @@ impulse between different shape pairs, even when reduction groups them together.
 
 **Thresholds**
 
-- ``contact_matching_pos_threshold`` — maximum world-space distance [m] between
-  the previous and current midpoints. Contacts exceeding it are broken. Defaults
-  to ``0.0005`` m.
+- ``contact_matching_pos_threshold`` — maximum world-space distance [m]
+  between the previous and current contact midpoints for a match.  Contacts
+  that moved more than this between frames are considered broken.  In sticky
+  mode, this also bounds each saved witness's distance from its fresh contact
+  point under the current body transforms.  Defaults to ``0.0005`` m.
 - ``contact_matching_normal_dot_threshold`` — minimum dot product between old
   and new contact normals.  Below this the contact is reported as broken even
   if the key and position match.
@@ -2366,12 +2387,27 @@ impulse between different shape pairs, even when reduction groups them together.
 Replay of the matched previous-frame geometry happens after the deterministic
 sort, so ``match_index`` already addresses the final sorted layout.  Unmatched
 rows are left untouched, so new and threshold-broken contacts keep their fresh
-narrow-phase geometry.  Because
-matching bounds midpoint displacement and normal change, replay uses a nearby
-geometry approximation. Validate its effect on contact forces and stability.
-Both enabled modes own the previous midpoint and normal independently of
-sorter scratch. Sticky mode additionally stores two points and two offsets and runs the replay
-kernel; disabled matching allocates no matching history.
+narrow-phase geometry.  Matched contacts also keep fresh geometry if the
+fresh contact is separated, or if either saved witness, transformed by the
+current body pose, lies farther than ``contact_matching_pos_threshold`` from
+its corresponding fresh witness.  This prevents a rotating surface from
+replaying a stale material point even when its geometric contact midpoint
+stays put.  These contacts retain their match indices and reports, and the
+fresh geometry becomes the saved history for the next frame.  The extra
+per-contact buffers (four ``vec3`` columns for the body-frame points and
+offsets) are only allocated when the mode is ``"sticky"``; ``"latest"`` and
+``"disabled"`` pay zero additional memory and launch no additional kernels.
+
+**Memory**
+
+Both enabled modes keep the previous frame's sorted keys, uniqueness claims,
+contact midpoints and normals in buffers owned by the pipeline: 40 bytes per
+``rigid_contact_max`` slot.  ``"sticky"`` adds 48 bytes per slot and
+``contact_report=True`` adds 4.  ``"disabled"`` allocates no matching history.
+
+The deterministic pipeline's sorter omits the unused simple-layout scratch,
+saving 48 bytes per ``rigid_contact_max`` slot. This more than offsets the
+additional matcher-owned midpoint and normal history.
 
 .. _Contact Reports:
 
