@@ -314,6 +314,110 @@ def test_graph_capture_matches_eager(test, device):
     np.testing.assert_allclose(results[1][60:], results[0][60:], atol=1.0e-3)
 
 
+def _build_rolling_sphere(device):
+    """Build an articulated sphere rolling and spinning on the ground, next to a cloth sheet."""
+    radius = 0.02
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    material = newton.ModelBuilder.ShapeConfig(mu=0.8, mu_torsional=0.005)
+    builder.add_ground_plane(cfg=material)
+    pose = wp.transform(wp.vec3(0.0, 0.0, radius), wp.quat_identity())
+    tiny = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-8)
+    carriers = [builder.add_link(xform=pose, mass=1.0e-4, inertia=tiny) for _ in range(3)]
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.4 * radius * radius)
+    sphere = builder.add_link(xform=pose, mass=1.0, inertia=inertia)
+    identity = wp.transform_identity()
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(-1, carriers[0], parent_xform=pose, child_xform=identity, axis=(1.0, 0.0, 0.0)),
+            builder.add_joint_prismatic(
+                carriers[0], carriers[1], parent_xform=identity, child_xform=identity, axis=(0.0, 0.0, 1.0)
+            ),
+            builder.add_joint_revolute(
+                carriers[1], carriers[2], parent_xform=identity, child_xform=identity, axis=(0.0, 1.0, 0.0)
+            ),
+            builder.add_joint_revolute(
+                carriers[2], sphere, parent_xform=identity, child_xform=identity, axis=(0.0, 0.0, 1.0)
+            ),
+        ]
+    )
+    builder.add_shape_sphere(
+        sphere, radius=radius, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.8, mu_torsional=0.005)
+    )
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.5, -0.5, 2.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=2,
+        dim_y=2,
+        cell_x=0.5,
+        cell_y=0.5,
+        mass=0.1,
+        fix_left=True,
+        fix_right=True,
+        tri_ke=1.0e4,
+        tri_ka=1.0e4,
+        tri_kd=10.0,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    model.joint_qd.assign(np.array([1.0, 0.0, 1.0 / radius, 1.0], dtype=np.float32))
+    return model
+
+
+def test_articulated_graph_capture_matches_eager(test, device):
+    """Graph replay of an articulated source matches eager stepping across proxy iterations and friction models."""
+    options = {
+        "pgs_mode": "matrix_free",
+        "articulated_contact_response": "immediate",
+        "pgs_iterations": 16,
+        "angular_damping": 0.0,
+        "dense_max_constraints": 32,
+        "mf_max_constraints": 16,
+        "double_buffer": False,
+    }
+    cases = [
+        ("point", {"friction_anchor_beta": 0.0}, (1, 3)),
+        ("patch", {}, (1, 3)),
+        ("bisection", {"friction_anchor_beta": 0.0, "friction_mode": "bisection"}, (3,)),
+        ("coulomb_newton", {"friction_anchor_beta": 0.0, "friction_mode": "coulomb_newton"}, (3,)),
+    ]
+    for friction, friction_options, iteration_counts in cases:
+        for iterations in iteration_counts:
+            with test.subTest(friction=friction, iterations=iterations):
+                trajectories = []
+                for use_graph in (False, True):
+                    model = _build_rolling_sphere(device)
+                    rollout = _Rollout(
+                        model,
+                        _coupled(
+                            model,
+                            None,
+                            lambda view, kw=friction_options: SolverFeatherPGS(view, **options, **kw),
+                            iterations=iterations,
+                        ),
+                    )
+                    for _ in range(12):
+                        rollout.step()
+                    graph = None
+                    if use_graph:
+                        # Both buffers must swap back to the captured layout, so capture two steps.
+                        with wp.ScopedCapture(device) as capture:
+                            rollout.step()
+                            rollout.step()
+                        graph = capture.graph
+                    trajectory = []
+                    for _ in range(10):
+                        if graph is None:
+                            rollout.step()
+                            rollout.step()
+                        else:
+                            wp.capture_launch(graph)
+                        trajectory.append(rollout.state_0.joint_q.numpy().copy())
+                    trajectories.append(np.asarray(trajectory))
+                test.assertGreater(trajectories[0][-1, 0] - trajectories[0][0, 0], 0.0)
+                np.testing.assert_allclose(trajectories[1], trajectories[0], atol=1.0e-6)
+
+
 def test_unsupported_options_raise(test, device):
     """Options that are not validated in coupled use fail explicitly."""
     for kwargs in (
@@ -648,6 +752,7 @@ for _name, _func in (
     ("test_worlds_are_isolated", test_worlds_are_isolated),
     ("test_masked_reset", test_masked_reset),
     ("test_graph_capture_matches_eager", test_graph_capture_matches_eager),
+    ("test_articulated_graph_capture_matches_eager", test_articulated_graph_capture_matches_eager),
     ("test_unsupported_options_raise", test_unsupported_options_raise),
     ("test_articulated_effective_mass", test_articulated_effective_mass),
     ("test_offset_contact_turns_hinge", test_offset_contact_turns_hinge),
