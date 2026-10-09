@@ -861,6 +861,104 @@ _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
 
 
+def _unprojected_equality_constraints(model: Model) -> np.ndarray:
+    """Return the enabled MuJoCo equality rows that no Newton loop joint or mimic enforces.
+
+    The MJCF and USD importers convert MuJoCo equalities to Newton loop joints or mimic
+    constraints by default and keep the original row in ``model.mujoco.equality_constraint_*``
+    with a ``target_kind`` / ``target`` link to the projected entity. Such a row is enforced
+    (or rejected) through that entity. A row without a valid link is MuJoCo-only physics.
+
+    A link is valid only when the target is structurally the row's projection, as the importers
+    build it: a CONNECT or WELD row links a ball or fixed joint outside any articulation that
+    joins the row's two bodies (or its body and the world), and a JOINT row links a mimic
+    constraint between the row's two joints. Anchors and coefficients are not compared.
+    """
+    from ..mujoco.enums import EqType  # noqa: PLC0415
+    from ..mujoco.equality import MjcEqualityTargetKind  # noqa: PLC0415
+
+    mujoco = getattr(model, "mujoco", None)
+    count = int(getattr(mujoco, "equality_constraint_count", 0) or 0) if mujoco is not None else 0
+    enabled = getattr(mujoco, "equality_constraint_enabled", None) if count else None
+    if enabled is None:
+        return np.zeros(0, dtype=np.int32)
+    enabled = enabled.numpy().astype(bool)
+    target_kind = getattr(mujoco, "equality_constraint_target_kind", None)
+    target = getattr(mujoco, "equality_constraint_target", None)
+    projected = np.zeros(count, dtype=bool)
+    if target_kind is not None and target is not None:
+        target_kind = target_kind.numpy()
+        target = target.numpy()
+
+        def field(name: str) -> np.ndarray:
+            values = getattr(mujoco, f"equality_constraint_{name}", None)
+            return values.numpy() if values is not None else np.full(count, -2, dtype=np.int32)
+
+        eq_type = field("type")
+        body1, body2 = field("body1"), field("body2")
+        joint1, joint2 = field("joint1"), field("joint2")
+        joint_count = int(model.joint_count)
+        joint_type = model.joint_type.numpy() if joint_count else None
+        joint_parent = model.joint_parent.numpy() if joint_count else None
+        joint_child = model.joint_child.numpy() if joint_count else None
+        joint_articulation = (
+            model.joint_articulation.numpy() if joint_count and model.joint_articulation is not None else None
+        )
+        mimic_count = int(getattr(model, "constraint_mimic_count", 0) or 0)
+        mimic_joint0 = model.constraint_mimic_joint0.numpy() if mimic_count else None
+        mimic_joint1 = model.constraint_mimic_joint1.numpy() if mimic_count else None
+        loop_joint_type = {int(EqType.CONNECT): int(JointType.BALL), int(EqType.WELD): int(JointType.FIXED)}
+        for row in range(count):
+            kind, index = int(target_kind[row]), int(target[row])
+            if kind == int(MjcEqualityTargetKind.JOINT) and 0 <= index < joint_count:
+                expected_type = loop_joint_type.get(int(eq_type[row]))
+                in_tree = joint_articulation is not None and int(joint_articulation[index]) >= 0
+                # The importers make body1 the parent and body2 the child, or the world the
+                # parent of body1; compare the endpoints as a set so either order is accepted.
+                rows_bodies = {int(body1[row]), int(body2[row])}
+                joint_bodies = {int(joint_parent[index]), int(joint_child[index])}
+                projected[row] = (
+                    expected_type is not None
+                    and int(joint_type[index]) == expected_type
+                    and not in_tree
+                    and int(joint_child[index]) >= 0
+                    and joint_bodies == rows_bodies
+                )
+            elif kind == int(MjcEqualityTargetKind.MIMIC) and 0 <= index < mimic_count:
+                projected[row] = (
+                    int(eq_type[row]) == int(EqType.JOINT)
+                    and int(mimic_joint0[index]) == int(joint1[row])
+                    and int(mimic_joint1[index]) == int(joint2[row])
+                )
+    return np.flatnonzero(enabled & ~projected).astype(np.int32)
+
+
+def _validate_equality_constraints(model: Model) -> None:
+    """Reject enabled MuJoCo equality constraints that this solver would silently ignore."""
+    rows = _unprojected_equality_constraints(model)
+    if rows.size:
+        raise NotImplementedError(
+            f"SolverFeatherPGS does not enforce MuJoCo equality constraints: model.mujoco.equality_constraint "
+            f"rows {rows[:16].tolist()} are enabled and not converted to a Newton loop joint or mimic "
+            "constraint. Import with convert_mjc_equality_constraints=True, model the constraint with Newton "
+            "joints, or disable the rows (equality_constraint_enabled)."
+        )
+
+
+def _validate_tree_joints_enabled(model: Model) -> None:
+    """Reject disabled articulation-tree joints, which the solver would simulate as enabled."""
+    if not model.joint_count or model.joint_enabled is None:
+        return
+    disabled = ~model.joint_enabled.numpy().astype(bool)
+    if model.joint_articulation is not None:
+        # A disabled loop-closing joint is a released closure, see set_loop_joint_enabled().
+        disabled &= model.joint_articulation.numpy() >= 0
+    if np.any(disabled):
+        raise NotImplementedError(
+            "SolverFeatherPGS does not support disabled joints in an articulation tree (Model.joint_enabled)."
+        )
+
+
 def _replace_once(source: str, old: str, new: str) -> str:
     """Replace one required generated-source fragment."""
     if source.count(old) != 1:
@@ -1854,6 +1952,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.contact_compliance = bool(contact_compliance)
         self._compliance = None
         super().__init__(model)
+        _validate_equality_constraints(model)
+        _validate_tree_joints_enabled(model)
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -3147,10 +3247,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         for what they cover: DOF inertial changes (armature) re-read armature, refresh the mass
         matrix and discard warm-start impulses; DOF force changes re-read joint damping, refresh the
         mass matrix, since augmented drive gains enter its diagonal, and re-validate joint friction.
-        Reference poses are read every step. Joint damping and shape friction and restitution
+        Reference poses are read every step. Constraint changes re-check the MuJoCo equality rows:
+        enabling one that is not converted to a Newton loop joint or mimic constraint raises
+        :class:`NotImplementedError`. Joint damping and shape friction and restitution
         coefficients are copied into solver-owned buffers, so model arrays modified in place or
         replaced take effect at the matching notification, in eager and captured steps alike.
         """
+        if flags & ModelFlags.CONSTRAINT_PROPERTIES:
+            _validate_equality_constraints(self.model)
         dof_inertial = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
         dof_force = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
         if self.sleeping is not None:
