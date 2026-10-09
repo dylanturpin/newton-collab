@@ -950,13 +950,15 @@ def _validate_equality_constraints(model: Model) -> None:
 
 def _validate_tree_joints_enabled(model: Model) -> None:
     """Reject disabled articulation-tree joints, which the solver would simulate as enabled."""
-    # A coupled view disables the joints another solver entry owns and simulates.
-    if not model.joint_count or model.joint_enabled is None or isinstance(model, ModelView):
+    if not model.joint_count or model.joint_enabled is None:
         return
     disabled = ~model.joint_enabled.numpy().astype(bool)
     if model.joint_articulation is not None:
         # A disabled loop-closing joint is a released closure, see set_loop_joint_enabled().
         disabled &= model.joint_articulation.numpy() >= 0
+    if isinstance(model, ModelView):
+        # Another coupled solver entry owns and simulates these joints.
+        disabled[model.coupling_disabled_joints.numpy()] = False
     if np.any(disabled):
         raise NotImplementedError(
             "SolverFeatherPGS does not support disabled joints in an articulation tree (Model.joint_enabled)."

@@ -79,6 +79,7 @@ class ModelView:
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_overrides", {})
         object.__setattr__(self, "_cache", {})
+        object.__setattr__(self, "_coupling_disabled_joints", wp.zeros(0, dtype=int, device=parent.device))
 
     # ------------------------------------------------------------------
     # Attribute delegation
@@ -143,6 +144,15 @@ class ModelView:
     def joint_target_q_start(self) -> wp.array | None:
         """View-local start indices for :attr:`~newton.Model.joint_target_q`."""
         return self.joint_q_start if self.use_coord_layout_targets else self.joint_qd_start
+
+    @property
+    def coupling_disabled_joints(self) -> wp.array[int]:
+        """View-local joints disabled because another coupled solver entry owns and simulates them."""
+        return object.__getattribute__(self, "_coupling_disabled_joints")
+
+    def mark_coupling_disabled_joints(self, joint_indices: wp.array[int]) -> None:
+        """Record the view-local joints another coupled solver entry owns; they stay disabled here."""
+        object.__setattr__(self, "_coupling_disabled_joints", joint_indices)
 
     @property
     def overrides(self) -> dict[str, object]:

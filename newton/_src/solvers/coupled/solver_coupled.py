@@ -721,6 +721,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     wp.array([global_id for _, global_id in owned_pairs], dtype=int, device=device),
                 )
 
+            view.mark_coupling_disabled_joints(joint_dynamics_disabled_local_indices)
             solver = cfg.solver(view)
             _require_supports_coupling(solver)
             self._entries[cfg.name] = SolverEntry(

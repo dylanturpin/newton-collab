@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -1025,6 +1026,81 @@ def test_disabled_tree_joints_raise(test, device):
     test.assertIn(loop, solver._connect_joint_to_index)
 
 
+def _build_prismatic_links(device, enabled: tuple[bool, ...]):
+    """Build one 1 kg prismatic link per entry of ``enabled``, each in its own world."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for joint_enabled in enabled:
+        builder.begin_world()
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_prismatic(-1, body, axis=newton.Axis.X, enabled=joint_enabled)])
+        builder.end_world()
+    return builder.finalize(device=device)
+
+
+def _push_joints(model, solver):
+    """Step once with a 1 N force on every joint DOF and return the joint coordinates and velocities."""
+    state_in, state_out = model.state(), model.state()
+    control = model.control()
+    control.joint_f.fill_(1.0)
+    solver.step(state_in, state_out, control, None, 0.01)
+    return state_out.joint_q.numpy(), state_out.joint_qd.numpy()
+
+
+def _fpgs_entry(name, joint, configure_view=None):
+    return SolverCoupled.Entry(
+        name=name,
+        solver=lambda view: SolverFeatherPGS(view, pgs_mode="split"),
+        bodies=[joint],
+        joints=[joint],
+        configure_view=configure_view,
+    )
+
+
+def test_caller_disabled_joints_raise_through_views(test, device):
+    """A joint the caller disabled raises whether FeatherPGS gets a model, a view, or a coupled entry view."""
+    enabled = _build_prismatic_links(device, (True,))
+    q, qd = _push_joints(enabled, SolverFeatherPGS(enabled, pgs_mode="split"))
+    np.testing.assert_allclose(q, [1.0e-4], rtol=1.0e-5)
+    np.testing.assert_allclose(qd, [1.0e-2], rtol=1.0e-5)
+
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(_build_prismatic_links(device, (False,)), pgs_mode="split")
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(ModelView(_build_prismatic_links(device, (False,)), "standalone"), pgs_mode="split")
+    view = ModelView(_build_prismatic_links(device, (True,)), "view_disabled")
+    view.disable_joints(wp.array([0], dtype=int, device=device))
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(view, pgs_mode="split")
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(model=_build_prismatic_links(device, (False,)), entries=[_fpgs_entry("owned", 0)])
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(
+            model=_build_prismatic_links(device, (True,)),
+            entries=[_fpgs_entry("owned", 0, lambda v: v.disable_joints(wp.array([0], dtype=int, device=device)))],
+        )
+
+
+def test_coupled_views_accept_joints_other_entries_own(test, device):
+    """Each coupled FeatherPGS entry accepts the joint the other entry owns and simulates its own as enabled."""
+    # One link per world leaves each entry's view on the full layout, so both disabled joints are visible.
+    model = _build_prismatic_links(device, (True, True))
+    solver = SolverCoupled(model=model, entries=[_fpgs_entry("first", 0), _fpgs_entry("second", 1)])
+    for name, foreign in (("first", 1), ("second", 0)):
+        view = solver._entries[name].view
+        test.assertEqual(view.coupling_disabled_joints.numpy().tolist(), [foreign])
+        test.assertFalse(bool(view.joint_enabled.numpy()[foreign]))
+    q, qd = _push_joints(model, solver)
+    np.testing.assert_allclose(q, [1.0e-4, 1.0e-4], rtol=1.0e-5)
+    np.testing.assert_allclose(qd, [1.0e-2, 1.0e-2], rtol=1.0e-5)
+
+    # A caller-disabled joint still raises when another entry owns a different disabled joint.
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(
+            model=_build_prismatic_links(device, (False, True)),
+            entries=[_fpgs_entry("first", 0), _fpgs_entry("second", 1)],
+        )
+
+
 def _build_box_with_equality(device, *, enabled: bool, target_kind: int = 0, target: int = -1):
     """Build a free box held to the world by a MuJoCo CONNECT equality row."""
     builder = newton.ModelBuilder()
@@ -1210,6 +1286,8 @@ class TestFeatherPGSUnsupportedPhysics(unittest.TestCase):
 
 for _test in (
     test_disabled_tree_joints_raise,
+    test_caller_disabled_joints_raise_through_views,
+    test_coupled_views_accept_joints_other_entries_own,
     test_unconverted_equality_constraints_raise,
     test_equality_link_must_name_the_projected_constraint,
     test_enabling_equality_constraint_at_runtime_raises,
