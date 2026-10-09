@@ -13,6 +13,7 @@ one-step, frictionless scenes so the expected velocity and energy are
 closed-form rather than inferred from a later bounce height.
 """
 
+import itertools
 import unittest
 from unittest import mock
 
@@ -20,7 +21,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
+from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 RADIUS = 0.05
 CONTACT_GAP = 0.1
@@ -840,7 +841,9 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
         enable_restitution=False,
         restitution_velocity_threshold=0.75,
     )
-    test.assertIs(solver.shape_material_restitution, model.shape_material_restitution)
+    np.testing.assert_array_equal(
+        solver.shape_material_restitution.numpy()[: model.shape_count], model.shape_material_restitution.numpy()
+    )
     test.assertAlmostEqual(solver.restitution_velocity_threshold, 0.75)
     test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
 
@@ -1123,6 +1126,51 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     test.assertAlmostEqual(graph_velocity, eager_velocity, delta=1.0e-6, msg="captured and eager steps diverged")
 
 
+def test_notify_reads_replaced_and_in_place_restitution(test, device, pgs_mode="matrix_free"):
+    """Match a fresh solver after a SHAPE_PROPERTIES notify, eagerly and in a captured graph."""
+    speed = 3.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    # Graph capture needs a CUDA device.
+    captures = (False, True) if wp.get_device(device).is_cuda else (False,)
+    for scene, old, replace, capture in itertools.product(("free", "articulated"), (0.0, 1.0), (False, True), captures):
+        new = 1.0 - old
+        label = f"{scene} e={old}->{new} {'replaced' if replace else 'in place'} {'captured' if capture else 'eager'}"
+        with test.subTest(label):
+            model, body = _build_plane_model(device, separation=separation, restitution=old, scene=scene)
+            solver = _make_solver(model, pgs_mode=pgs_mode)
+            state_in, state_out = model.state(), model.state()
+            _reset_state(model, state_in, -speed)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            contacts = pipeline.contacts()
+            control = model.control()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, DEFAULT_DT)
+            if capture:
+                with wp.ScopedCapture(device) as graph:
+                    pipeline.collide(state_in, contacts)
+                    solver.step(state_in, state_out, control, contacts, DEFAULT_DT)
+            if replace:
+                model.shape_material_restitution = wp.full(model.shape_count, new, dtype=float, device=device)
+            else:
+                model.shape_material_restitution.fill_(new)
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+            if capture:
+                wp.capture_launch(graph.graph)
+            else:
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, DEFAULT_DT)
+
+            reference = model.state()
+            _make_solver(model, pgs_mode=pgs_mode).step(state_in, reference, control, contacts, DEFAULT_DT)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            test.assertEqual(count, 1, f"{label}: expected one contact")
+            test.assertEqual(paths, EXPECTED_PATHS[(scene, "immediate")], f"{label}: wrong route")
+            expected = float(reference.body_qd.numpy()[body][2])
+            _assert_velocity(test, expected, new * speed if new else -separation / DEFAULT_DT, speed, label)
+            test.assertAlmostEqual(float(state_out.body_qd.numpy()[body][2]), expected, delta=2.0e-5, msg=label)
+
+
 devices = get_selected_cuda_test_devices()
 
 
@@ -1151,8 +1199,16 @@ for _fn in (
     test_redundant_box_contacts_do_not_multiply_restitution_energy,
     test_articulated_redundant_manifold_preserves_symmetric_rebound,
     test_cuda_graph_replay_reads_current_restitution_and_matches_eager,
+    test_notify_reads_replaced_and_in_place_restitution,
 ):
     add_function_test(TestFeatherPGSRestitution, _fn.__name__, _fn, devices=devices)
+add_function_test(
+    TestFeatherPGSRestitution,
+    "test_notify_reads_replaced_and_in_place_restitution_split",
+    test_notify_reads_replaced_and_in_place_restitution,
+    devices=get_test_devices(),
+    pgs_mode="split",
+)
 
 
 if __name__ == "__main__":

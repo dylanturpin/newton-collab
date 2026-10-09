@@ -2960,18 +2960,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._row_dropped_mf = self._row_dropped_all[1]
         self._row_dropped_propagation = self._row_dropped_all[2]
 
-        if model.shape_material_mu is not None:
-            self.shape_material_mu = model.shape_material_mu
-        else:
-            self.shape_material_mu = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
-        if model.shape_material_restitution is not None:
-            self.shape_material_restitution = model.shape_material_restitution
-        else:
-            self.shape_material_restitution = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
+        material_count = max(model.shape_count, 1)
+        self.shape_material_mu = wp.zeros(
+            material_count, dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+        )
+        self.shape_material_restitution = wp.zeros(
+            material_count, dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+        )
+        self._refresh_shape_materials()
 
         self._init_double_buffer_stream()
 
@@ -3149,9 +3145,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         The narrow joint DOF flags are handled like :attr:`~newton.ModelFlags.JOINT_DOF_PROPERTIES`
         for what they cover: DOF inertial changes (armature) re-read armature, refresh the mass
-        matrix and discard warm-start impulses; DOF force changes refresh the mass matrix, since
-        augmented drive gains enter its diagonal, and re-validate joint friction. Reference poses
-        are read every step.
+        matrix and discard warm-start impulses; DOF force changes re-read joint damping, refresh the
+        mass matrix, since augmented drive gains enter its diagonal, and re-validate joint friction.
+        Reference poses are read every step. Joint damping and shape friction and restitution
+        coefficients are copied into solver-owned buffers, so model arrays modified in place or
+        replaced take effect at the matching notification, in eager and captured steps alike.
         """
         dof_inertial = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
         dof_force = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
@@ -3177,9 +3175,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
             self._mass_update_requested.fill_(1)
+        if flags & dof_force:
+            self._refresh_passive_joint_damping()
         if flags & ModelFlags.JOINT_DOF_FORCE_PROPERTIES:
             # Augmented drive gains enter the factored mass-matrix diagonal.
             self._mass_update_requested.fill_(1)
+        if flags & ModelFlags.SHAPE_PROPERTIES:
+            self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
@@ -4463,11 +4465,26 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._passive_spring_stiffness = spring_k
             self._passive_spring_ref = spring_ref
 
-        damping = getattr(model, "joint_damping", None)
-        if damping is None:
-            self._passive_joint_damping = _zeros()
-        else:
-            self._passive_joint_damping = damping
+        self._passive_joint_damping = wp.zeros(max(n_dofs, 1), dtype=wp.float32, device=device)
+        self._refresh_passive_joint_damping()
+
+    def _refresh_passive_joint_damping(self) -> None:
+        """Copy the model's current joint damping into the solver's fixed damping buffer."""
+        # Users may replace model.joint_damping; captured graphs keep this buffer's address.
+        damping = self.model.joint_damping
+        if damping is not None and self.model.joint_dof_count:
+            wp.copy(self._passive_joint_damping, damping, count=self.model.joint_dof_count)
+
+    def _refresh_shape_materials(self) -> None:
+        """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
+        # Users may replace the model arrays; captured graphs keep these buffers' addresses.
+        model = self.model
+        for buffer, values in (
+            (self.shape_material_mu, model.shape_material_mu),
+            (self.shape_material_restitution, model.shape_material_restitution),
+        ):
+            if values is not None and model.shape_count:
+                wp.copy(buffer, values, count=model.shape_count)
 
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -12052,6 +12069,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     friction_gap=self.contact_friction_gap_threshold,
                     friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
                     frozen_bodies=self.sleeping.patch_frozen_bodies if self.sleeping is not None else None,
+                    shape_material_mu=self.shape_material_mu,
                 )
 
             wp.launch(

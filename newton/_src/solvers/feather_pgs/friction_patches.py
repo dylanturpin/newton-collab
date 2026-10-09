@@ -1277,6 +1277,7 @@ class _FrictionPatchState:
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
         frozen_bodies=None,
+        shape_material_mu=None,
     ):
         wp.launch(
             _prepare,
@@ -1291,7 +1292,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
                 model.shape_body,
-                model.shape_material_mu,
+                model.shape_material_mu if shape_material_mu is None else shape_material_mu,
                 model.shape_gap,
                 self.body_radius,
                 state.body_q,
