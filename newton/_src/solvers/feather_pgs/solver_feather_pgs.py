@@ -3146,7 +3146,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
+
+        The narrow joint DOF flags are handled like :attr:`~newton.ModelFlags.JOINT_DOF_PROPERTIES`
+        for what they cover: DOF inertial changes (armature) re-read armature, refresh the mass
+        matrix and discard warm-start impulses; DOF force changes refresh the mass matrix, since
+        augmented drive gains enter its diagonal, and re-validate joint friction. Reference poses
+        are read every step.
         """
+        dof_inertial = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+        dof_force = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
         if self.sleeping is not None:
             self.sleeping.notify(flags)
         self._coupling_patch_history_saved = False
@@ -3157,20 +3165,25 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._friction_patches.update_geometry(self.model)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
+            | dof_inertial
+            | dof_force
+            | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
             | ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
             | ModelFlags.MODEL_PROPERTIES
         ):
             self._fk_id_cache_valid.zero_()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+        if flags & (ModelFlags.BODY_PROPERTIES | dof_inertial):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
+            self._mass_update_requested.fill_(1)
+        if flags & ModelFlags.JOINT_DOF_FORCE_PROPERTIES:
+            # Augmented drive gains enter the factored mass-matrix diagonal.
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
-        if self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES:
+        if self.enable_joint_friction and flags & dof_force:
             self._validate_joint_friction()
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia
@@ -3194,7 +3207,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if flags & (
             ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
+            | dof_inertial
             | ModelFlags.SHAPE_PROPERTIES
         ):
             self._clear_warmstart_history(None)
