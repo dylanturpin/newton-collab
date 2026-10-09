@@ -90,7 +90,7 @@ class TestFeatherPGSReset(unittest.TestCase):
                 specs = _history_specs(solver)
                 _poison(specs)
                 world_mask = wp.array(mask, dtype=wp.bool, device=model.device)
-                solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES, world_mask)
+                solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES, world_mask=world_mask)
                 _assert_worlds(self, specs, (False, True))
 
     def test_reset_clears_enabled_histories_by_scope(self):

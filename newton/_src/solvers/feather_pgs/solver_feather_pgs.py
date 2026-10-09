@@ -1545,12 +1545,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 the friction and then slides against it. The rows use the articulated response, so
                 coupled inertia, armature, augmented drives, limits and contacts act jointly; their
                 impulses cold-start each step. After editing or replacing the coefficients, call
-                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)``: it validates the values and
-                wakes sleeping islands whose friction changed (a sleeping articulation builds no rows).
-                Coefficients are read on the device every step, including on graph replay; recapture
-                CUDA graphs after replacing the array. Nonzero friction on BALL,
-                FREE, DISTANCE or CABLE joints, and non-finite or negative values, raise
-                :class:`ValueError`. Requires ``pgs_mode="matrix_free"`` on CUDA and is not supported
+                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)``: an eager call validates the
+                values and wakes sleeping islands whose friction changed (a sleeping articulation builds
+                no rows). A notify captured in a CUDA graph skips validation, so the caller must write
+                valid coefficients before each replay. Coefficients are read on the device every step,
+                including on graph replay; recapture CUDA graphs after replacing the array. Nonzero
+                friction on BALL, FREE, DISTANCE or CABLE joints, and non-finite or negative values,
+                raise :class:`ValueError` at construction and on eager notify. Requires ``pgs_mode="matrix_free"`` on CUDA and is not supported
                 with ``contact_compliance``, bilateral pre-elimination or ``model.requires_grad``;
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
@@ -3123,13 +3124,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._body_prescribed.assign(prescribed)
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int, world_mask: wp.array | None = None) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
         ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES``
         and ``SHAPE_PROPERTIES`` run on the device and may be captured in a CUDA graph,
         unless sleeping is enabled. ``BODY_PROPERTIES`` reads ``body_flags`` on the host.
-        Under capture, ``JOINT_DOF_PROPERTIES`` skips the host check of ``joint_friction``.
+        Under capture, ``JOINT_DOF_PROPERTIES`` skips the host check of ``joint_friction``,
+        so captured replays use the coefficients as written; the caller must keep them valid.
         Material-equivalence changes also require
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
@@ -3286,7 +3288,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
 
-    def _solver_world_mask(self, world_mask: wp.array | None) -> wp.array | None:
+    def _solver_world_mask(self, world_mask: wp.array[wp.bool] | None) -> wp.array[wp.bool] | None:
         """Map a per-solver-world or ``model.world_count + 1`` mask to one entry per solver world."""
         if world_mask is None or world_mask.shape[0] == self.world_count:
             return world_mask

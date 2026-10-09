@@ -105,6 +105,20 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         np.testing.assert_array_equal(patches.previous.valid.numpy(), expected_valid)
         self.assertLess(np.count_nonzero(expected_valid), np.count_nonzero(valid_before))
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
+    def test_joint_friction_is_validated_only_on_eager_notify(self):
+        """Replay a captured notify without checking friction; the next eager notify rejects it."""
+        device = wp.get_device("cuda:0")
+        model = _build_model(device)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        model.joint_friction.fill_(-1.0)
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+
 
 def _build_model(device):
     """Worlds with a free sphere, a 3-link and a 2-link revolute chain: three response sizes."""
