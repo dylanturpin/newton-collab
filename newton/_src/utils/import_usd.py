@@ -75,6 +75,10 @@ logger = logging.getLogger("newton")
 AttributeFrequency = Model.AttributeFrequency
 
 _NEWTON_SRC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir)) + os.sep
+_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG = (
+    "add_usd(physx_missing_inertia_fallback=...) is deprecated in Newton 1.7 and has no effect; "
+    "it will be removed in a future release, so drop the argument."
+)
 
 # `UsdPreviewSurface`'s schema default for `diffuseColor`. A visual shape whose prim binds no
 # material is given this rather than left for ModelBuilder's per-shape debug palette, which
@@ -177,7 +181,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
-    physx_missing_inertia_fallback: bool = False,
+    physx_missing_inertia_fallback: bool | None = None,
     legacy_margin_gap: bool = False,
     return_deformable_results: bool = False,
 ) -> dict[str, Any]:
@@ -310,9 +314,10 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
-        physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
-            inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
-            intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
+        physx_missing_inertia_fallback: Ignored.
+
+            .. deprecated:: 1.7
+                Has no effect and will be removed; drop the argument.
         legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
             where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
             Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -440,6 +445,8 @@ def parse_usd(
             * - ``"actuator_count"``
               - Number of external actuators parsed from the USD stage
     """
+    if physx_missing_inertia_fallback is not None:
+        warnings.warn(_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
     first_imported_joint = builder.joint_count
@@ -2061,6 +2068,10 @@ def parse_usd(
             elif not has_effective_mass:
                 i_diag_np = np.array(cmp_i_diag, dtype=np.float32)
                 principal_axes = cmp_principal_axes
+            elif builder.body_mass[body_id] == 0.0 and np.all(np.isfinite(cmp_i_diag)) and min(cmp_i_diag) > 0.0:
+                # No collider mass: use OpenUSD's small-sphere inertia, as PhysX does; its principal axes are undefined.
+                i_diag_np = np.array(cmp_i_diag, dtype=np.float32)
+                principal_axes = Gf.Quatf(1.0, 0.0, 0.0, 0.0)
             else:
                 # Mass authored, inertia not: keep accumulated inertia and scale
                 # to match authored mass in the mass block below.
@@ -2094,10 +2105,7 @@ def parse_usd(
                     )
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
-                use_physx_missing_inertia_fallback = (
-                    not has_effective_inertia and mass > 0.0 and (mass_compute_failed or physx_missing_inertia_fallback)
-                )
-                if use_physx_missing_inertia_fallback:
+                if not has_effective_inertia and mass > 0.0 and mass_compute_failed:
                     radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
                     inertia_val = 0.4 * mass * radius * radius
                     inertia = wp.mat33(np.eye(3, dtype=np.float32) * inertia_val)

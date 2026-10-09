@@ -4094,7 +4094,7 @@ class ModelBuilder:
         force_position_velocity_actuation: bool = False,
         convert_mjc_equality_constraints: bool = True,
         override_root_xform: bool = False,
-        physx_missing_inertia_fallback: bool = False,
+        physx_missing_inertia_fallback: bool | None = None,
         legacy_margin_gap: bool = False,
         return_deformable_results: bool = False,
     ) -> dict[str, Any]:
@@ -4226,9 +4226,10 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
-            physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
-                inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
-                intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
+            physx_missing_inertia_fallback: Ignored.
+
+                .. deprecated:: 1.7
+                    Has no effect and will be removed; drop the argument.
             legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
                 where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
                 Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -4356,7 +4357,10 @@ class ModelBuilder:
                 * - ``"actuator_count"``
                   - Number of external actuators parsed from the USD stage
         """
-        from ..utils.import_usd import parse_usd  # noqa: PLC0415
+        from ..utils.import_usd import _PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG, parse_usd  # noqa: PLC0415
+
+        if physx_missing_inertia_fallback is not None:
+            warnings.warn(_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
 
         return parse_usd(
             self,
@@ -4388,7 +4392,6 @@ class ModelBuilder:
             force_position_velocity_actuation=force_position_velocity_actuation,
             convert_mjc_equality_constraints=convert_mjc_equality_constraints,
             override_root_xform=override_root_xform,
-            physx_missing_inertia_fallback=physx_missing_inertia_fallback,
             legacy_margin_gap=legacy_margin_gap,
             return_deformable_results=return_deformable_results,
         )

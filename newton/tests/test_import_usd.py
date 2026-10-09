@@ -7213,32 +7213,96 @@ def Xform "Articulation" (
         np.testing.assert_allclose(inertia @ inv_inertia, np.eye(3), atol=1e-5, rtol=1e-5)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
-    def test_massapi_authored_mass_without_inertia_can_use_physx_fallback(self):
-        """IsaacLab can request PhysX's small-sphere fallback for authored mass with missing inertia."""
-        from pxr import Usd, UsdGeom, UsdPhysics
+    def test_massapi_authored_mass_without_colliders_uses_small_sphere_inertia(self):
+        """Authored mass without inertia or colliders gets OpenUSD's small-sphere inertia.
+
+        Bodies with colliders keep the collider inertia scaled to the authored mass.
+        """
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)
         UsdPhysics.Scene.Define(stage, "/physicsScene")
-
-        body = UsdGeom.Xform.Define(stage, "/World/Body")
-        body_prim = body.GetPrim()
-        UsdPhysics.RigidBodyAPI.Apply(body_prim)
-        UsdPhysics.MassAPI.Apply(body_prim).CreateMassAttr().Set(1.0)
-
-        collider = UsdGeom.Cube.Define(stage, "/World/Body/Collider")
-        collider.CreateSizeAttr().Set(2.0)
-        UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
+        for name, mass, geometry, diagonal_inertia in (
+            ("Bare", 2.0, None, None),
+            ("VisualOnly", 1.0, "visual", None),
+            ("Cube", 1.0, "collider", None),
+            ("Authored", 1.0, None, Gf.Vec3f(1.0, 2.0, 3.0)),
+        ):
+            body = UsdGeom.Xform.Define(stage, f"/World/{name}")
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            mass_api = UsdPhysics.MassAPI.Apply(body.GetPrim())
+            mass_api.CreateMassAttr().Set(mass)
+            if diagonal_inertia is not None:
+                mass_api.CreateDiagonalInertiaAttr().Set(diagonal_inertia)
+            if geometry is not None:
+                cube = UsdGeom.Cube.Define(stage, f"/World/{name}/Geom")
+                cube.CreateSizeAttr().Set(2.0)
+                if geometry == "collider":
+                    UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
 
         builder = newton.ModelBuilder()
-        result = builder.add_usd(stage, physx_missing_inertia_fallback=True)
-        body_idx = result["path_body_map"]["/World/Body"]
+        result = builder.add_usd(stage)
 
-        inertia = np.array(builder.body_inertia[body_idx]).reshape(3, 3)
-        expected_diag = np.array([0.004, 0.004, 0.004], dtype=np.float32)
-        np.testing.assert_allclose(np.diag(inertia), expected_diag, atol=1e-7, rtol=1e-6)
-        np.testing.assert_allclose(inertia - np.diag(np.diag(inertia)), np.zeros((3, 3)), atol=1e-7)
+        def inertia(name):
+            return np.array(builder.body_inertia[result["path_body_map"][f"/World/{name}"]]).reshape(3, 3)
+
+        # Solid sphere of radius 0.1 m: I = 0.4 * m * r**2.
+        np.testing.assert_allclose(inertia("Bare"), np.eye(3) * 0.4 * 2.0 * 0.1**2, rtol=1e-6)
+        np.testing.assert_allclose(inertia("VisualOnly"), np.eye(3) * 0.4 * 1.0 * 0.1**2, rtol=1e-6)
+        # Solid cube of unit mass and edge 2: I = m * s**2 / 6.
+        np.testing.assert_allclose(inertia("Cube"), np.eye(3) * 2.0**2 / 6.0, rtol=1e-5)
+        np.testing.assert_allclose(np.diag(inertia("Authored")), [1.0, 2.0, 3.0], rtol=1e-6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_missing_inertia_fallback_is_deprecated_and_ignored(self):
+        """The deprecated keyword warns once per call and leaves the imported inertia unchanged."""
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        from newton._src.utils.import_usd import parse_usd  # noqa: PLC0415
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        for name, has_collider in (("Bare", False), ("Cube", True)):
+            body = UsdGeom.Xform.Define(stage, f"/World/{name}")
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            UsdPhysics.MassAPI.Apply(body.GetPrim()).CreateMassAttr().Set(1.0)
+            if has_collider:
+                cube = UsdGeom.Cube.Define(stage, f"/World/{name}/Collider")
+                cube.CreateSizeAttr().Set(2.0)
+                UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+        def import_inertia(import_fn, **kwargs):
+            builder = newton.ModelBuilder()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = import_fn(builder, stage, **kwargs)
+            deprecations = [w for w in caught if "physx_missing_inertia_fallback" in str(w.message)]
+            inertia = {
+                name: np.array(builder.body_inertia[result["path_body_map"][f"/World/{name}"]])
+                for name in ("Bare", "Cube")
+            }
+            return inertia, deprecations
+
+        def add_usd(builder, source, **kwargs):
+            return builder.add_usd(source, **kwargs)
+
+        expected, deprecations = import_inertia(add_usd)
+        self.assertEqual(deprecations, [])
+
+        for import_fn in (add_usd, parse_usd):
+            for value in (True, False):
+                with self.subTest(import_fn=import_fn.__name__, value=value):
+                    inertia, deprecations = import_inertia(import_fn, physx_missing_inertia_fallback=value)
+                    self.assertEqual(len(deprecations), 1)
+                    self.assertIs(deprecations[0].category, DeprecationWarning)
+                    self.assertIn("has no effect", str(deprecations[0].message))
+                    self.assertEqual(deprecations[0].filename, __file__)
+                    for name in ("Bare", "Cube"):
+                        np.testing.assert_array_equal(inertia[name], expected[name])
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_massapi_authored_mass_without_inertia_scales_to_uniform_density(self):

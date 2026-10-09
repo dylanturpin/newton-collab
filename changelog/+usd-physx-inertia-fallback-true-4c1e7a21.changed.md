@@ -1,0 +1,1 @@
+Passing `physx_missing_inertia_fallback=True` to `ModelBuilder.add_usd()` no longer applies the small-sphere inertia to bodies with colliders; such bodies now keep their collider inertia scaled to the authored mass, which matches PhysX. This numerical change takes effect immediately; only the keyword itself is kept for one release.
