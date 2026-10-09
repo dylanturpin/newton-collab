@@ -5225,7 +5225,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._mimic_world_index = None
         self._connect_world_index = None
         self._rigid_velocity_limit_world_index = None
-        if not self.deterministic:
+        self._world_groups_by_size = {}
+        if not self.deterministic or self.art_to_world is None:
             return
 
         def world_index(element_world):
@@ -5239,10 +5240,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 wp.array(elements.astype(np.int32), dtype=wp.int32, device=device),
             )
 
-        art_world = self.art_to_world.numpy() if self.art_to_world is not None else np.zeros(0, dtype=np.int32)
+        art_world = self.art_to_world.numpy()
         self._articulation_world_index = world_index(art_world)
-        self._mimic_world_index = world_index(self._mimic_world.numpy()) if self._mimic_count > 0 else None
-        self._connect_world_index = world_index(self._connect_world.numpy()) if self._connect_count > 0 else None
+        # Mimic and connect rows are solved in their articulation's world, which a global constraint's
+        # own world (-1) does not name.
+        if self._mimic_count > 0:
+            mimic_art_start = self._mimic_art_start.numpy()
+            mimic_world = np.full(self._mimic_count, -1, dtype=np.int64)
+            for art, rows in enumerate(np.split(self._mimic_art_list.numpy(), mimic_art_start[1:-1])):
+                mimic_world[rows] = art_world[art]
+            self._mimic_world_index = world_index(mimic_world)
+        if self._connect_count > 0:
+            connect_art = self._connect_art.numpy()
+            self._connect_world_index = world_index(
+                np.where(connect_art >= 0, art_world[np.maximum(connect_art, 0)], -1)
+            )
         cursor_size = max(len(art_world), self._mimic_count, self._connect_count, 1)
         if self._free_rigid_body_count > 0:
             body_art = self.body_to_articulation.numpy()[self.free_rigid_body_indices.numpy()]
@@ -5252,7 +5264,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             cursor_size = max(cursor_size, self._free_rigid_body_count)
         self._row_cursor = wp.zeros(cursor_size, dtype=wp.int32, device=device)
 
-        self._world_groups_by_size = {}
         for size in self.size_groups:
             group_world = art_world[self.group_to_art[size].numpy()]
             self._world_groups_by_size[size] = world_index(group_world)
