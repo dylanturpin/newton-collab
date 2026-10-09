@@ -227,30 +227,78 @@ def certified_pyramidal_minimum(delassus, velocity, mu, load):
 
 _BLOCK_KERNELS = {}
 
+# Single-lane shims for running the emitted CUDA block solve through Warp's CPU backend.
+_CPU_SHIMS = """#define __device__
+#define __noinline__
+#define __forceinline__
+#define __syncwarp(...)
+#define __shfl_down_sync(mask, value, offset) 0.0f
+#define __shfl_sync(mask, value, lane) (value)
+#define fmaxf(a, b) ([](float x, float y) { return x > y || y != y ? x : y; }((a), (b)))
+"""
 
-def block_impulses(cone, jacobian, velocity, mu, load):
-    """Run the emitted friction block once in a single warp on rows ``jacobian`` (5 x 3) with unit inverse mass."""
-    if cone not in _BLOCK_KERNELS:
+
+def block_visits(device, cone, jacobian, response, normal_jacobian, normal_response, velocity, mu, load, visits):
+    """Alternate the normal row (cfm 1e-6) and the emitted friction block on a batch of contacts, one warp each.
+
+    Shapes are (n, 5, dofs), (n, 5, dofs), (n, dofs), (n, dofs), (n, dofs), (n, 5) and (n,) for the initial normal
+    impulse; a zero normal Jacobian keeps that load. Returns the velocity after each normal update and each friction
+    visit, (n, visits, 2, dofs), the loads (n, visits) and the friction impulses (n, visits, 5), cold-started.
+    """
+    count, _, dofs = np.shape(jacobian)
+    cuda = wp.get_device(device).is_cuda
+    key = (cone, dofs, cuda)
+    if key not in _BLOCK_KERNELS:
+        helpers = angular_friction_gs_sources(cone, 0.0, dofs)["helpers"]
+        stride = 32 if cuda else 1
+        if not cuda:
+            helpers = _CPU_SHIMS + helpers.replace("d += 32", "d += 1")
         snippet = (
-            "#if defined(__CUDA_ARCH__)\n"
-            + angular_friction_gs_sources(cone, 0.0, 3)["helpers"]
-            + """
-    int lane = static_cast<int>(threadIdx.x) & 31;
-    __shared__ float v[3], lam[5], mu[5], rhs[5];
-    if (lane < 3) v[lane] = velocity.data[lane];
-    if (lane < 5) {
-        lam[lane] = 0.f;
-        rhs[lane] = 0.f;
-        mu[lane] = coefficients.data[lane];
-    }
-    __syncwarp();
+            (
+                "#if defined(__CUDA_ARCH__)\n    int lane = static_cast<int>(threadIdx.x) & 31;\n"
+                if cuda
+                else "#if !defined(__CUDA_ARCH__)\n    int lane = 0;\n"
+            )
+            + helpers
+            + f"""
+    const unsigned MASK = 0xffffffffu;
+    const float* J = jacobian.data + index * {5 * dofs};
+    const float* Y = response.data + index * {5 * dofs};
+    const float* Jn = normal_jacobian.data + index * {dofs};
+    const float* Yn = normal_response.data + index * {dofs};
+    float* v = velocity.data + index * {dofs};
+    const float* mu = coefficients.data + index * 5;
+    float lam[5] = {{0.f, 0.f, 0.f, 0.f, 0.f}}, rhs[5] = {{0.f, 0.f, 0.f, 0.f, 0.f}}, normal = loads.data[index];
+    float p = 0.f;
+    for (int d = lane; d < {dofs}; d += {stride}) p += Jn[d] * Yn[d];
+    for (int offset = 16; offset > 0; offset >>= 1) p += __shfl_down_sync(MASK, p, offset);
+    float denom = __shfl_sync(MASK, p, 0) + 1.0e-6f;
     int changed = 0;
-    float first = AngularFrictionBlock::solve(
-        v, lam, mu, rhs, jacobian.data, jacobian.data, lane, 0xffffffffu, load, 1.f, &changed);
-    __syncwarp();
-    if (lane == 0) lam[0] = first;
-    __syncwarp();
-    if (lane < 5) out.data[lane] = lam[lane];
+    for (int visit = 0; visit < visits; ++visit) {{
+        p = 0.f;
+        for (int d = lane; d < {dofs}; d += {stride}) p += Jn[d] * v[d];
+        for (int offset = 16; offset > 0; offset >>= 1) p += __shfl_down_sync(MASK, p, offset);
+        float next = fmaxf(normal - __shfl_sync(MASK, p, 0) / denom, 0.0f);
+        __syncwarp(MASK);
+        for (int d = lane; d < {dofs}; d += {stride}) {{
+            v[d] += Yn[d] * (next - normal);
+            history.data[(index * visits + visit) * {2 * dofs} + d] = v[d];
+        }}
+        normal = next;
+        __syncwarp(MASK);
+        float old = lam[0];
+        lam[0] = AngularFrictionBlock::solve(v, lam, mu, rhs, J, Y, lane, MASK, normal, 1.f, &changed);
+        __syncwarp(MASK);
+        for (int d = lane; d < {dofs}; d += {stride}) {{
+            v[d] += Y[d] * (lam[0] - old);
+            history.data[(index * visits + visit) * {2 * dofs} + {dofs} + d] = v[d];
+        }}
+        if (lane == 0) {{
+            normals.data[index * visits + visit] = normal;
+            for (int k = 0; k < 5; ++k) impulses.data[(index * visits + visit) * 5 + k] = lam[k];
+        }}
+        __syncwarp(MASK);
+    }}
 #endif
 """
         )
@@ -258,27 +306,145 @@ def block_impulses(cone, jacobian, velocity, mu, load):
         @wp.func_native(snippet)
         def block(
             jacobian: wp.array[float],
+            response: wp.array[float],
+            normal_jacobian: wp.array[float],
+            normal_response: wp.array[float],
             velocity: wp.array[float],
             coefficients: wp.array[float],
-            load: float,
-            out: wp.array[float],
+            loads: wp.array[float],
+            visits: int,
+            index: int,
+            history: wp.array[float],
+            normals: wp.array[float],
+            impulses: wp.array[float],
         ): ...
 
         @wp.kernel(enable_backward=False, module="unique")
         def probe(
             jacobian: wp.array[float],
+            response: wp.array[float],
+            normal_jacobian: wp.array[float],
+            normal_response: wp.array[float],
             velocity: wp.array[float],
             coefficients: wp.array[float],
-            load: float,
-            out: wp.array[float],
+            loads: wp.array[float],
+            visits: int,
+            lanes: int,
+            history: wp.array[float],
+            normals: wp.array[float],
+            impulses: wp.array[float],
         ):
-            block(jacobian, velocity, coefficients, load, out)
+            block(
+                jacobian,
+                response,
+                normal_jacobian,
+                normal_response,
+                velocity,
+                coefficients,
+                loads,
+                visits,
+                wp.tid() // lanes,
+                history,
+                normals,
+                impulses,
+            )
 
-        _BLOCK_KERNELS[cone] = probe
-    out = wp.zeros(5, dtype=float, device="cuda:0")
-    arrays = [wp.array(np.asarray(a, np.float32).ravel(), device="cuda:0") for a in (jacobian, velocity, mu)]
-    wp.launch(_BLOCK_KERNELS[cone], dim=32, block_dim=32, inputs=[*arrays, float(load), out], device="cuda:0")
-    return out.numpy().astype(float)
+        _BLOCK_KERNELS[key] = probe
+    inputs = [
+        wp.array(np.asarray(a, np.float32).ravel(), dtype=float, device=device)
+        for a in (jacobian, response, normal_jacobian, normal_response, velocity, mu, load)
+    ]
+    history = wp.zeros(count * visits * 2 * dofs, dtype=float, device=device)
+    normals = wp.zeros(count * visits, dtype=float, device=device)
+    impulses = wp.zeros(count * visits * 5, dtype=float, device=device)
+    lanes = 32 if cuda else 1
+    wp.launch(
+        _BLOCK_KERNELS[key],
+        dim=count * lanes,
+        block_dim=lanes if cuda else 256,
+        inputs=[*inputs, visits, lanes, history, normals, impulses],
+        device=device,
+    )
+    return (
+        history.numpy().astype(float).reshape(count, visits, 2, dofs),
+        normals.numpy().astype(float).reshape(count, visits),
+        impulses.numpy().astype(float).reshape(count, visits, 5),
+    )
+
+
+def block_impulses(cone, jacobian, velocity, mu, load):
+    """Run the emitted friction block once on rows ``jacobian`` (5 x 3) with unit inverse mass and a fixed load."""
+    jacobian = np.asarray(jacobian, float)[None]
+    zero = np.zeros((1, jacobian.shape[2]))
+    _, _, impulses = block_visits(
+        "cuda:0", cone, jacobian, jacobian, zero, zero, np.asarray(velocity)[None], np.asarray(mu)[None], [load], 1
+    )
+    return impulses[0, 0]
+
+
+def friction_visit_gains(cone, response, mu, mass, history, normals, impulses):
+    """Kinetic energy after each friction visit minus that of its starting impulses moved into the visit's cone."""
+    count, visits, _, _ = history.shape
+    gains = np.zeros((count, visits))
+    for i in range(count):
+        previous = np.zeros(5)
+        for visit in range(visits):
+            start = project_cone(previous / mu[i], normals[i, visit], cone, BLOCK_GROUPS) * mu[i]
+            before = history[i, visit, 0] + response[i].astype(float).T @ (start - previous)
+            after = history[i, visit, 1]
+            gains[i, visit] = 0.5 * after @ mass[i] @ after - 0.5 * before @ mass[i] @ before
+            previous = impulses[i, visit]
+    return gains
+
+
+def rigid_contacts(seed, count, dofs):
+    """Off-center contacts on a rigid body: about a ball joint's fixed pivot (3 DOFs) or free (6 DOFs).
+
+    Principal inertias span up to 1e4, contact offsets 1e-3 to 1e-1 in random directions, normals are random, and
+    torsional and rolling coefficients range over 1e-4 to 1e-1. The body approaches with one unit of normal impulse.
+    Returns float32 rows, responses and velocities with the float64 coefficients and generalized mass.
+    """
+    rng = np.random.default_rng(seed)
+
+    def rotation():
+        q, r = np.linalg.qr(rng.normal(size=(3, 3)))
+        return q * np.sign(np.diag(r))
+
+    out = {name: [] for name in ("J", "Y", "Jn", "Yn", "v", "mu", "mass")}
+    for _ in range(count):
+        principal = 10.0 ** rng.uniform(-4.0, 0.0, size=3)
+        axes = rotation()
+        offset = rotation()[:, 0] * 10.0 ** rng.uniform(-3.0, -1.0)
+        normal = rotation()[:, 0]
+        t0 = np.cross(normal, (1.0, 0.0, 0.0)) if abs(normal[0]) < 1.0 - 1.0e-6 else np.cross(normal, (0.0, 1.0, 0.0))
+        t0 /= np.linalg.norm(t0)
+        t1 = np.cross(normal, t0)
+        rows = np.array([np.cross(offset, t0), np.cross(offset, t1), normal, t0, t1])
+        normal_row = np.cross(offset, normal)
+        inertia = axes @ np.diag(principal) @ axes.T
+        inverse = axes @ np.diag(1.0 / principal) @ axes.T
+        if dofs == 6:
+            m = 10.0 ** rng.uniform(-1.0, 1.0)
+            rows = np.hstack([np.array([t0, t1, np.zeros(3), np.zeros(3), np.zeros(3)]), rows])
+            normal_row = np.concatenate([normal, normal_row])
+            inertia = np.block([[m * np.eye(3), np.zeros((3, 3))], [np.zeros((3, 3)), inertia]])
+            inverse = np.block([[np.eye(3) / m, np.zeros((3, 3))], [np.zeros((3, 3)), inverse]])
+        J = rows.astype(np.float32)
+        Y = J @ inverse.astype(np.float32)
+        Jn = normal_row.astype(np.float32)
+        Yn = Jn @ inverse.astype(np.float32)
+        v = np.linalg.cholesky(inverse) @ rng.normal(size=dofs) * 10.0 ** rng.uniform(-4.0, 0.0)
+        v = (v - Yn * (Jn @ v) / (Jn @ Yn)).astype(np.float32) - Yn
+        sliding, spin, rolling = rng.uniform(0.2, 1.5), *(10.0 ** rng.uniform(-4.0, -1.0, size=2))
+        for name, value in zip(
+            out, (J, Y, Jn, Yn, v, [sliding, sliding, spin, rolling, rolling], inertia), strict=True
+        ):
+            out[name].append(value)
+    return {name: np.array(value) for name, value in out.items()}
+
+
+def devices():
+    return ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
 
 
 class Scene:
@@ -320,7 +486,7 @@ def project_cone(y, load, cone, groups):
     theta = 0.0
     for k in range(len(ordered)):
         candidate = (ordered[: k + 1].sum() - load) / (k + 1)
-        if ordered[k] - candidate > 0.0:
+        if ordered[k] - candidate >= 0.0:
             theta = candidate
     out = y.copy()
     for g, norm in zip(groups, norms, strict=True):
@@ -780,6 +946,81 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 model.shape_material_mu_rolling.assign(rolling)
                 with self.assertRaises(ValueError):
                     solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+
+
+class TestFeatherPGSAngularFrictionBlock(unittest.TestCase):
+    """Run the emitted friction block on the CPU, and on CUDA when available, against the kinetic energy it changes."""
+
+    def test_off_center_ball_joint_contact_stops_without_gaining_energy(self):
+        """An off-center contact on a ball-jointed body, whose stopping impulse lies inside both cones, loses its
+        energy and never gains any."""
+        principal = np.array([0.0009087130361371299, 0.1, 0.10090871303613713])
+        axes = np.array(
+            [
+                [-0.29702703703288535, -0.1784369493775102, -0.9380486098109803],
+                [0.9020758170058639, -0.3745632638563419, -0.2143865241625219],
+                [-0.3131040715874967, -0.9098695601382277, 0.27221907333836765],
+            ]
+        )
+        rx, ry, rz = 0.005242330836890978, 0.0041898143292664084, 0.0018544005835015218
+        mu = np.array([0.8, 0.8, 0.0005484633425010389, 0.07270315887818246, 0.07270315887818246])
+        seed = np.array([-0.00022417971789122183, 0.001579519377004289, -0.0001815279526704816])
+        inverse = (axes @ np.diag(1.0 / principal) @ axes.T).astype(np.float32)
+        jacobian = np.array([[0, rz, -ry], [-rz, 0, rx], [0, 0, 1], [1, 0, 0], [0, 1, 0]], np.float32)
+        response = jacobian @ inverse
+        normal_jacobian = np.array([ry, -rx, 0], np.float32)
+        normal_response = normal_jacobian @ inverse
+        velocity = (axes @ np.diag(principal**-0.5) @ seed).astype(np.float32)
+        velocity -= normal_response * (normal_jacobian @ velocity) / (normal_jacobian @ normal_response)
+        velocity -= normal_response
+        mass = axes @ np.diag(principal) @ axes.T
+        for device in devices():
+            for cone in ("elliptic", "pyramidal"):
+                with self.subTest(device=device, cone=cone):
+                    history, normals, impulses = block_visits(
+                        device,
+                        cone,
+                        jacobian[None],
+                        response[None],
+                        normal_jacobian[None],
+                        normal_response[None],
+                        velocity[None],
+                        mu[None],
+                        [0.0],
+                        128,
+                    )
+                    start = 0.5 * history[0, 0, 0] @ mass @ history[0, 0, 0]
+                    gains = friction_visit_gains(cone, response[None], mu[None], mass[None], history, normals, impulses)
+                    self.assertLessEqual(gains.max(), 1.0e-6 * start)
+                    for visit in (0, 15, 127):
+                        self.assertLess(0.5 * history[0, visit, 1] @ mass @ history[0, visit, 1], 1.0e-6 * start)
+
+    def test_random_rigid_contacts_never_gain_energy(self):
+        """No friction visit raises kinetic energy above that of its starting impulses moved into the cone."""
+        for device in devices():
+            for dofs in (3, 6):
+                contacts = rigid_contacts(seed=dofs, count=200, dofs=dofs)
+                for cone in ("elliptic", "pyramidal"):
+                    with self.subTest(device=device, dofs=dofs, cone=cone):
+                        history, normals, impulses = block_visits(
+                            device,
+                            cone,
+                            contacts["J"],
+                            contacts["Y"],
+                            contacts["Jn"],
+                            contacts["Yn"],
+                            contacts["v"],
+                            contacts["mu"],
+                            np.zeros(len(contacts["v"])),
+                            16,
+                        )
+                        self.assertTrue(np.isfinite(history).all())
+                        start = 0.5 * np.einsum("ci,cij,cj->c", history[:, 0, 0], contacts["mass"], history[:, 0, 0])
+                        gains = friction_visit_gains(
+                            cone, contacts["Y"], contacts["mu"], contacts["mass"], history, normals, impulses
+                        )
+                        # Float32 velocities carry relative energy error of about eps times the inertia ratio, 1e4.
+                        np.testing.assert_array_less(gains.max(axis=1), 1.0e-4 * start)
 
 
 if __name__ == "__main__":

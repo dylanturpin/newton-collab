@@ -15,11 +15,9 @@ when it lies inside the cone.
 - ``"elliptic"``: ``(|f_t| / mu)^2 + (tau_s / mu_s)^2 + (|tau_r| / mu_r)^2 <= lambda_n^2``.
   The block is a trust-region subproblem. Newton on its multiplier runs over a Cholesky
   factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
-  collapsed bracket, or 40 steps), the block is solved again with each dependent row written
-  over the independent ones, which keeps the least-norm impulses and a definite system; unless
-  that pass converges to a finite result, the first pass's result is kept. A finite result is rescaled into the
-  ball. Convergence of the second pass does not certify optimality for the original block: its
-  rank reduction is approximate and it drops gradient components along dependent directions.
+  collapsed bracket, or 40 steps), the block is solved again with a proximal term
+  ``0.5 rho (y - y_0)' diag(H) (y - y_0)`` about the current impulses, raising ``rho`` until
+  it converges. The term vanishes at the optimum, so repeated visits still converge to it.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
@@ -27,6 +25,11 @@ when it lies inside the cone.
   approximate: a block left off the face is not revived, and badly coupled blocks can land
   away from the optimum. The optimum may share the budget between blocks or stick inside
   the cone; in quadruped locomotion tests pivoting stance feet put most of it on rolling.
+
+Either cone's answer then passes an exact line search from the current impulses, moved into
+the cone, whose curvature is evaluated through the rows' Jacobian and response rather than
+the float32 block matrix. A visit therefore never raises the block objective (the kinetic
+energy, without creep or targets) beyond rounding of the step itself.
 
 An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
 bound the coefficient times the relative angular rate settles at ``s`` times the load
@@ -316,16 +319,17 @@ _PYRAMIDAL_CONSTRAINED = """
                             total += norm[g];
                         }
                         if (!(total > 0.0f)) break;
-                        float r[5], cr[5];
+                        float r[5], cr[5], previous[5];
                         for (int g = 0; g < 3; ++g)
                             for (int k = first[g]; k < first[g] + count[g]; ++k) {
                                 r[k] = sqrtf(norm[g] / total);
                                 cr[k] = r[k] * c[k];
+                                previous[k] = y[k];
                             }
                         // Groups off the face get zero weight, which removes their rows from the solve.
                         for (int k = 0; k < 5; ++k)
                             for (int l = 0; l < 5; ++l) Hu[k][l] = r[k] * r[l] * H[k][l];
-                        trust_region(Hu, cr, active, load, y);
+                        trust_region(Hu, cr, active, load, previous, r, y);
                         for (int k = 0; k < 5; ++k) y[k] *= r[k];
                     }"""
 
@@ -428,163 +432,132 @@ __PROJECT__
             return converged;
         }
 
-        // Rewrites the ball subproblem for dependent rows, those whose Cholesky pivot keeps under 1e-6 of their
-        // diagonal. Each is a combination of earlier independent rows, row_d = sum_i B_id row_i, and impulses
-        // y = B' lambda are the least-norm ones for their effect, so |y| = |lambda|_N with N = B B' = R R'. With
-        // mu = R' lambda the subproblem is again a Euclidean ball: K = R^-1 B H B' R^-T, g = R^-1 B c on the
-        // independent rows; y = T mu with T = B' R^-T. False when the rewrite is not finite.
-        static __device__ bool whiten(
-            const Row* H, const float* c, const bool* active, Row* T, Row* K, float* g, bool* independent) {
-            float B[5][5], R[5][5], L[5][5];
-            #pragma unroll 1
-            for (int k = 0; k < 5; ++k) {
-                independent[k] = live(H, active, k);
-                #pragma unroll 1
-                for (int l = 0; l < 5; ++l) {
-                    L[k][l] = 0.0f;
-                    B[k][l] = k == l && independent[k] ? 1.0f : 0.0f;
-                }
-            }
-            #pragma unroll 1
-            for (int k = 0; k < 5; ++k) {
-                if (!independent[k]) continue;
-                #pragma unroll 1
-                for (int l = 0; l < k; ++l) {
-                    if (!independent[l]) continue;
-                    float value = H[k][l];
-                    #pragma unroll 1
-                    for (int m = 0; m < l; ++m) value -= L[k][m] * L[l][m];
-                    L[k][l] = value / L[l][l];
-                }
-                float pivot = H[k][k];
-                #pragma unroll 1
-                for (int m = 0; m < k; ++m) pivot -= L[k][m] * L[k][m];
-                if (pivot > 1.0e-6f * H[k][k]) {
-                    L[k][k] = sqrtf(pivot);
-                    continue;
-                }
-                // Dependent: solve L_I' a = L[k][I] for its coefficients over the earlier independent rows.
-                independent[k] = false;
-                #pragma unroll 1
-                for (int m = k - 1; m >= 0; --m) {
-                    if (!independent[m]) continue;
-                    float value = L[k][m];
-                    #pragma unroll 1
-                    for (int j = m + 1; j < k; ++j) value -= independent[j] ? L[j][m] * B[j][k] : 0.0f;
-                    B[m][k] = value / L[m][m];
-                }
-                #pragma unroll 1
-                for (int m = 0; m < 5; ++m) L[k][m] = 0.0f;
-            }
-            // Reduced problem over lambda: K = B H B', g = B c, on the independent rows.
-            #pragma unroll 1
-            for (int i = 0; i < 5; ++i) {
-                g[i] = 0.0f;
-                #pragma unroll 1
-                for (int k = 0; k < 5; ++k) g[i] += B[i][k] * (active[k] ? c[k] : 0.0f);
-                #pragma unroll 1
-                for (int j = 0; j < 5; ++j) {
-                    float h = 0.0f;
-                    #pragma unroll 1
-                    for (int k = 0; k < 5; ++k)
-                        #pragma unroll 1
-                        for (int l = 0; l < 5; ++l) h += B[i][k] * H[k][l] * B[j][l];
-                    K[i][j] = h;
-                }
-            }
-            // N = I + sum_d b_d b_d' over the dependent columns b_d of B, factored N = R R' by rank-one updates of the
-            // identity, each a Givens rotation; forming N would round its identity away when coefficients are large.
-            #pragma unroll 1
-            for (int k = 0; k < 5; ++k)
-                #pragma unroll 1
-                for (int l = 0; l < 5; ++l) R[k][l] = k == l ? 1.0f : 0.0f;
-            #pragma unroll 1
-            for (int d = 0; d < 5; ++d) {
-                if (independent[d] || !live(H, active, d)) continue;
-                float x[5];
-                #pragma unroll 1
-                for (int i = 0; i < 5; ++i) x[i] = independent[i] ? B[i][d] : 0.0f;
-                #pragma unroll 1
-                for (int k = 0; k < 5; ++k) {
-                    if (x[k] == 0.0f) continue;
-                    float r = hypotf(R[k][k], x[k]), cs = R[k][k] / r, sn = x[k] / r;
-                    R[k][k] = r;
-                    #pragma unroll 1
-                    for (int i = k + 1; i < 5; ++i) {
-                        float old = R[i][k];
-                        R[i][k] = cs * old + sn * x[i];
-                        x[i] = cs * x[i] - sn * old;
-                    }
-                }
-            }
-            #pragma unroll 1
-            for (int k = 0; k < 5; ++k)
-                if (!isfinite(R[k][k])) return false;
-            // K <- R^-1 K R^-T and g <- R^-1 g by forward substitution on columns, then rows.
-            #pragma unroll 1
-            for (int j = 0; j < 5; ++j) {
-                float column[5];
-                #pragma unroll 1
-                for (int k = 0; k < 5; ++k) column[k] = K[k][j];
-                lower(R, column);
-                #pragma unroll 1
-                for (int k = 0; k < 5; ++k) K[k][j] = column[k];
-            }
-            #pragma unroll 1
-            for (int i = 0; i < 5; ++i) lower(R, K[i]);
-            lower(R, g);
-            // T = B' R^-T: row k of T solves R t = B[:, k].
-            #pragma unroll 1
-            for (int k = 0; k < 5; ++k) {
-                float column[5];
-                #pragma unroll 1
-                for (int i = 0; i < 5; ++i) column[i] = B[i][k];
-                lower(R, column);
-                #pragma unroll 1
-                for (int i = 0; i < 5; ++i) T[k][i] = column[i];
-            }
-            return true;
-        }
-
         // Minimize 0.5 y'Hy + c'y over |y| <= load on the active rows into y; true when the minimizer is interior.
-        // Dependent rows defeat the Cholesky pass; the problem is then whitened over the independent rows and
-        // solved again. The first pass's result stands unless the second converges to a finite result.
-        static __device__ bool trust_region(const Row* H, const float* c, const bool* active, float load, float* y) {
+        // When dependent rows defeat the Cholesky pass, a proximal pass about center / scale solves it again; the
+        // center is read only then, so it may be the sweep's shared impulses.
+        static __device__ bool trust_region(
+            const Row* H, const float* c, const bool* active, float load, const float* center, const float* scale,
+            float* y) {
             bool interior = false;
             if (cholesky_ball(H, c, active, load, y, &interior)) return interior;
             // Copies keep the operands of the common path out of the call's memory.
             Row H_copy[5];
-            float c_copy[5], y_copy[5];
+            float c_copy[5], center_copy[5], y_copy[5];
             bool active_copy[5];
             for (int k = 0; k < 5; ++k) {
                 for (int l = 0; l < 5; ++l) H_copy[k][l] = H[k][l];
                 c_copy[k] = c[k];
+                center_copy[k] = active[k] && scale[k] > 0.0f ? center[k] / scale[k] : 0.0f;
                 y_copy[k] = y[k];
                 active_copy[k] = active[k];
             }
-            interior = dependent_pass(H_copy, c_copy, active_copy, load, y_copy, interior);
+            interior = proximal_pass(H_copy, c_copy, active_copy, load, center_copy, y_copy, interior);
             for (int k = 0; k < 5; ++k) y[k] = y_copy[k];
             return interior;
         }
 
-        // The whitened second pass; y keeps the first pass's result unless this one converges to a finite result.
+        // Adds 0.5 rho (y - center)' diag(H) (y - center), which keeps the fixed point and makes the block definite,
+        // and raises rho until the ball solve converges. y keeps the first pass's result if none does.
         // Out of line, so the sweep that inlines the block solve keeps its register budget.
-        static __device__ __noinline__ bool dependent_pass(
-            const Row* H, const float* c, const bool* active, float load, float* y, bool interior) {
-            float T[5][5], K[5][5], g[5], mu[5], reduced[5];
-            bool independent[5], reduced_interior = false;
-            if (!whiten(H, c, active, T, K, g, independent)) return interior;
-            if (!cholesky_ball(K, g, independent, load, mu, &reduced_interior)) return interior;
-            bool finite = true;
+        static __device__ __noinline__ bool proximal_pass(
+            const Row* H, const float* c, const bool* active, float load, const float* center, float* y, bool interior) {
+            float K[5][5], g[5], trial[5];
             #pragma unroll 1
-            for (int k = 0; k < 5; ++k) {
-                reduced[k] = 0.0f;
-                for (int i = 0; i < 5; ++i) reduced[k] += T[k][i] * mu[i];
-                finite = finite && isfinite(reduced[k]);
+            for (float rho = 1.0e-5f; rho < 100.0f; rho *= 100.0f) {
+                #pragma unroll 1
+                for (int k = 0; k < 5; ++k) {
+                    float weight = live(H, active, k) ? rho * H[k][k] : 0.0f;
+                    for (int l = 0; l < 5; ++l) K[k][l] = H[k][l];
+                    K[k][k] += weight;
+                    g[k] = c[k] - weight * center[k];
+                }
+                bool trial_interior = false;
+                if (!cholesky_ball(K, g, active, load, trial, &trial_interior)) continue;
+                bool finite = true;
+                for (int k = 0; k < 5; ++k) finite = finite && isfinite(trial[k]);
+                if (!finite) continue;
+                for (int k = 0; k < 5; ++k) y[k] = trial[k];
+                return trial_interior;
             }
-            if (!finite) return interior;
-            for (int k = 0; k < 5; ++k) y[k] = reduced[k];
-            return reduced_interior;
+            return interior;
+        }
+
+        struct Update {
+            float first;
+            bool changed;
+        };
+
+        // Relax the cone answer y by omega, line-search it, apply rows 1..4 to v and lam, and return row 0.
+        // Out of line, with the sweep's impulses reread from shared memory, so the inlined solve keeps its registers.
+        static __device__ __noinline__ Update apply(
+            float* v, float* lam, const float* mu_rows, const float* rhs_rows, const float* J, const float* Y, int lane,
+            unsigned MASK, float load, float omega, const bool* active, float* y) {
+            const float unit[3] = {1.0f, 1.0f, 1.0f};
+            Update update = {0.0f, false};
+            __syncwarp(MASK);
+            float shift[5], step[5];
+            for (int k = 0; k < 5; ++k) {
+                float mu_k = fmaxf(mu_rows[k], 0.0f);
+                step[k] = lam[k] + omega * (mu_k * y[k] - lam[k]);
+            }
+            if (omega != 1.0f) {
+                for (int k = 0; k < 5; ++k) y[k] = active[k] ? step[k] / mu_rows[k] : 0.0f;
+                project(y, unit, load);
+                for (int k = 0; k < 5; ++k) step[k] = fmaxf(mu_rows[k], 0.0f) * y[k];
+            }
+            // Exact line search toward that answer from the current impulses moved into the cone. Its slope and
+            // curvature come from J, Y and v rather than the rounded 5x5 block, so the visit cannot raise the
+            // block objective.
+            for (int k = 0; k < 5; ++k) y[k] = active[k] ? lam[k] / mu_rows[k] : 0.0f;
+            project(y, unit, load);
+            for (int k = 0; k < 5; ++k) {
+                float base = fmaxf(mu_rows[k], 0.0f) * y[k];
+                shift[k] = base - lam[k];
+                step[k] -= base;
+            }
+            float slope = 0.0f, curvature = 0.0f;
+            #pragma unroll 1
+            for (int d = lane; d < __DOFS__; d += 32) {
+                float j_shift = 0.0f, j_step = 0.0f, y_step = 0.0f;
+                for (int k = 0; k < 5; ++k) {
+                    float jk = J[k * __DOFS__ + d];
+                    j_shift += jk * shift[k];
+                    j_step += jk * step[k];
+                    y_step += Y[k * __DOFS__ + d] * step[k];
+                }
+                slope += j_step * v[d] + j_shift * y_step;
+                curvature += j_step * y_step;
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                slope += __shfl_down_sync(MASK, slope, offset);
+                curvature += __shfl_down_sync(MASK, curvature, offset);
+            }
+            slope = __shfl_sync(MASK, slope, 0);
+            curvature = __shfl_sync(MASK, curvature, 0);
+            for (int k = 0; k < 5; ++k) {
+                float mu_k = fmaxf(mu_rows[k], 0.0f);
+                float compliance = k >= 2 && active[k] && load > 0.0f ? __CREEP__ / (mu_k * mu_k * load) : 0.0f;
+                slope += (rhs_rows[k] + compliance * (lam[k] + shift[k])) * step[k];
+                curvature += compliance * step[k] * step[k];
+            }
+            float t = slope < 0.0f ? (curvature > -slope ? -slope / curvature : 1.0f) : 0.0f;
+            float x[5];
+            for (int k = 0; k < 5; ++k) {
+                shift[k] += t > 0.0f ? t * step[k] : 0.0f;
+                x[k] = lam[k] + shift[k];
+            }
+            // Every lane has read the impulses before any writes them back.
+            __syncwarp(MASK);
+            for (int k = 1; k < 5; ++k) {
+                if (shift[k] != 0.0f) {
+                    update.changed = true;
+                    for (int d = lane; d < __DOFS__; d += 32)
+                        v[d] += Y[k * __DOFS__ + d] * shift[k];
+                }
+                lam[k] = x[k];
+            }
+            update.first = x[0];
+            return update;
         }
 
         // Minimize the five-row block quadratic over the cone; update velocities and rows 1..4, return row 0.
@@ -650,31 +623,15 @@ __PROJECT__
                     c[k] = active[k] ? c[k] : 0.0f;
                 }
                 // The ball's minimizer is the elliptic answer; inside the cone it is also the pyramidal one.
-                bool sticking = trust_region(H, c, active, load, y) && cone_norm(y) <= load;
+                bool sticking = trust_region(H, c, active, load, lam, mu_rows, y) && cone_norm(y) <= load;
                 const float unit[3] = {1.0f, 1.0f, 1.0f};
                 if (!sticking) {
 __CONSTRAINED__
                     project(y, unit, load);
                 }
-                float x[5];
-                for (int k = 0; k < 5; ++k) x[k] = x0[k] + omega * (mu[k] * y[k] - x0[k]);
-                if (omega != 1.0f) {
-                    for (int k = 0; k < 5; ++k) y[k] = active[k] ? x[k] / mu[k] : 0.0f;
-                    project(y, unit, load);
-                    for (int k = 0; k < 5; ++k) x[k] = mu[k] * y[k];
-                }
-                // Every lane has read the impulses before any writes them back.
-                __syncwarp(MASK);
-                for (int k = 1; k < 5; ++k) {
-                    float block_delta = x[k] - x0[k];
-                    if (block_delta != 0.0f) {
-                        *changed = 1;
-                        for (int d = lane; d < __DOFS__; d += 32)
-                            v[d] += Y[k * __DOFS__ + d] * block_delta;
-                    }
-                    lam[k] = x[k];
-                }
-                return x[0];
+                Update update = apply(v, lam, mu_rows, rhs_rows, J, Y, lane, MASK, load, omega, active, y);
+                if (update.changed) *changed = 1;
+                return update.first;
         }
     };
 """
