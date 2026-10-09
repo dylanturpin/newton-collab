@@ -1091,10 +1091,10 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
             wp.copy(state_in.joint_q, state_out.joint_q)
             wp.copy(state_in.joint_qd, state_out.joint_qd)
 
-        return model, body, state_in, contacts, one_step
+        return model, solver, body, state_in, contacts, one_step
 
-    graph_model, graph_body, graph_state, graph_contacts, graph_step = make_fixture()
-    eager_model, eager_body, eager_state, eager_contacts, eager_step = make_fixture()
+    graph_model, graph_solver, graph_body, graph_state, graph_contacts, graph_step = make_fixture()
+    eager_model, eager_solver, eager_body, eager_state, eager_contacts, eager_step = make_fixture()
 
     # Warm both fixtures through the same history. Besides compiling kernels,
     # this keeps the solver's double-buffer phase identical for the comparison.
@@ -1110,9 +1110,10 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
 
     # Change restitution from zero after capture. Row storage is independent
     # of construction-time values, and the coefficient must come from the
-    # device array rather than a captured host scalar.
-    graph_model.shape_material_restitution.fill_(0.75)
-    eager_model.shape_material_restitution.fill_(0.75)
+    # solver's device buffer rather than a captured host scalar.
+    for model, solver in ((graph_model, graph_solver), (eager_model, eager_solver)):
+        model.shape_material_restitution.fill_(0.75)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
     wp.capture_launch(capture.graph)
     eager_step()
 
