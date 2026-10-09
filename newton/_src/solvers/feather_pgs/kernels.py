@@ -1724,6 +1724,12 @@ def _compute_body_net_wrench(
     return body_fb_s[child] + f_t_s - f_ext_origin
 
 
+@wp.kernel
+def subtract_arrays(a: wp.array[float], b: wp.array[float], out: wp.array[float]):
+    i = wp.tid()
+    out[i] = a[i] - b[i]
+
+
 @wp.func
 def _add_point_force(
     body: int,
@@ -1903,6 +1909,8 @@ def eval_post_solve_parent_wrenches(
     joint_dof_dim: wp.array2d[int],
     joint_S_s: wp.array[wp.spatial_vector],
     joint_qdd: wp.array[float],
+    prescale: wp.array[float],
+    inv_dt: float,
     body_fb_s: wp.array[wp.spatial_vector],
     body_f_ext: wp.array[wp.spatial_vector],
     body_contact_wrench: wp.array[wp.spatial_vector],
@@ -1921,9 +1929,10 @@ def eval_post_solve_parent_wrenches(
 ):
     """Publish each body's incoming joint wrench consistent with the step's solved accelerations.
 
-    Inverse dynamics runs with the post-solve ``joint_qdd`` on top of the start-of-step bias
-    wrench ``body_fb_s`` and subtracts the applied and solved contact wrenches, so the result
-    includes joint drives, limits and every contact impulse acting on the subtree.
+    Inverse dynamics runs with the post-solve acceleration, measured from the velocities the
+    dynamics start from (``prescale`` holds what velocity-limit prescaling removed), on top of
+    the start-of-step bias wrench ``body_fb_s``, and subtracts the applied and solved contact
+    wrenches, so the result includes joint drives, limits and every contact impulse on the subtree.
     """
     articulation = wp.tid()
     if articulation_active[articulation] == 0:
@@ -1939,7 +1948,10 @@ def eval_post_solve_parent_wrenches(
             a_s = body_a_s[parent]
         dof_start = joint_qd_start[i]
         for dof in range(dof_start, dof_start + joint_dof_dim[i, 0] + joint_dof_dim[i, 1]):
-            a_s += joint_S_s[dof] * joint_qdd[dof]
+            qdd = joint_qdd[dof]
+            if prescale:
+                qdd += prescale[dof] * inv_dt
+            a_s += joint_S_s[dof] * qdd
         body_a_s[child] = a_s
         body_ft_s[child] = wp.spatial_vector()
     for offset in range(end - start):

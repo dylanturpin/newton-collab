@@ -484,6 +484,31 @@ def test_parent_wrench_includes_spin_rows(test, device):
     test.assertAlmostEqual(wrench[ids["grip"], 5], 0.3, delta=1.0e-3)
 
 
+def test_parent_wrench_excludes_velocity_limit_prescaling(test, device):
+    """A disk spun past its velocity limit is rescaled before the dynamics; the rescale transmits no wrench."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    hub = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+    hub_joint = builder.add_joint_revolute(-1, hub, axis=(0.0, 0.0, 1.0))
+    disk = builder.add_link(mass=1.0, inertia=wp.mat33(np.diag([0.01, 0.01, 0.02])), lock_inertia=True)
+    disk_joint = builder.add_joint_revolute(
+        hub,
+        disk,
+        axis=(0.0, 0.0, 1.0),
+        parent_xform=wp.transform((0.3, 0.0, 0.0), wp.quat_identity()),
+        velocity_limit=1.0,
+    )
+    builder.add_articulation([hub_joint, disk_joint])
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True, angular_damping=0.0)
+    observables = solver.observables(FLAGS)
+    state_in, state_out = model.state(), model.state()
+    state_in.joint_qd.assign(np.array([0.0, 10.0], dtype=np.float32))
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    solver.step(state_in, state_out, None, None, CONTACT_DT, observables=observables)
+    test.assertAlmostEqual(float(state_out.joint_qd.numpy()[1]), 1.0, places=4)
+    np.testing.assert_allclose(observables.body_parent_f.numpy(), 0.0, atol=1.0e-4)
+
+
 class TestFeatherPGSParentWrench(unittest.TestCase):
     pass
 
@@ -507,6 +532,7 @@ for _name in (
     "test_parent_wrench_reports_a_commanded_push",
     "test_parent_wrench_carries_a_pinched_load",
     "test_parent_wrench_includes_spin_rows",
+    "test_parent_wrench_excludes_velocity_limit_prescaling",
 ):
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_cuda_test_devices())
 

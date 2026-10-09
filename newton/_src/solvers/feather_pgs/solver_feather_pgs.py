@@ -212,6 +212,7 @@ from .kernels import (
     snapshot_warmstart_history,
     solve_compact_diagonal_mass,
     solve_diagonal_mass,
+    subtract_arrays,
     trisolve_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
@@ -1268,7 +1269,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :attr:`~newton.State.body_parent_f` is allocated. As with ``cfrc_int`` in
         :class:`~newton.solvers.SolverMuJoCo`, it is the wrench the parent applies to each body
         through its inbound joint, consistent with the step's solved motion: inverse dynamics
-        with the post-solve joint accelerations, less gravity, :attr:`~newton.State.body_f` and
+        with the post-solve joint accelerations (taken from the velocities the dynamics start
+        from, after any velocity-limit prescaling), less gravity, :attr:`~newton.State.body_f` and
         the solved contact, friction and spin impulses of the subtree divided by ``dt``. Linear
         force [N] first, torque [N·m] about the body's center of mass second, world frame.
         Joint-space rows (drives, limits, joint friction, mimic) enter through the accelerations.
@@ -2414,7 +2416,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Per-entity dynamics activity; sleeping clears the entries of islands that sleep through a step.
         self._dynamics_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
         self._parent_wrench_scratch: tuple[wp.array, ...] | None = None
-        self._parent_wrench_request: tuple[wp.array, Contacts | None] | None = None
+        self._parent_wrench_request: tuple[wp.array, Contacts | None, wp.array | None] | None = None
+        self._parent_wrench_prescale: wp.array | None = None
         self._dynamics_art_mask = wp.ones(model.articulation_count, dtype=wp.bool, device=model.device)
         self._dynamics_joint_active = wp.ones(model.joint_count, dtype=wp.int32, device=model.device)
         self._dynamics_dof_active = wp.ones(model.joint_dof_count, dtype=wp.int32, device=model.device)
@@ -9250,7 +9253,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if request is None:
             return
         self._parent_wrench_request = None
-        body_parent_f, contacts = request
+        body_parent_f, contacts, prescale = request
         model = self.model
         if not model.articulation_count:
             body_parent_f.zero_()
@@ -9329,6 +9332,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 model.joint_dof_dim,
                 state_aug.joint_S_s,
                 state_aug.joint_qdd,
+                prescale,
+                inv_dt,
                 state_aug.body_f_s,
                 state_in.body_f if state_in.body_count else None,
                 contact_wrench,
@@ -9452,7 +9457,20 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             computed_parent_f = self.sleeping.parent_wrenches if self.sleeping is not None else body_parent_f
             if computed_parent_f is not None:
                 # Published after the solve, from the accelerations and impulses it commits to.
-                self._parent_wrench_request = (computed_parent_f, contacts)
+                prescale = None
+                if stage3_qd is not state_in.joint_qd:
+                    # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.
+                    if self._parent_wrench_prescale is None:
+                        self._parent_wrench_prescale = wp.empty_like(stage3_qd)
+                    wp.launch(
+                        subtract_arrays,
+                        dim=model.joint_dof_count,
+                        inputs=[state_in.joint_qd, stage3_qd],
+                        outputs=[self._parent_wrench_prescale],
+                        device=model.device,
+                    )
+                    prescale = self._parent_wrench_prescale
+                self._parent_wrench_request = (computed_parent_f, contacts, prescale)
 
             self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
         # ══════════════════════════════════════════════════════════════
