@@ -1357,10 +1357,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 contact inputs in an identical order, repeated runs are bitwise identical on the same GPU model,
                 driver and Warp build. ``CollisionPipeline(deterministic=True)`` supplies that order within its
                 own limits (sort-key ties, which contacts survive a contact-buffer overflow). A world's
-                contact rows take their slots in contact-buffer order. On overflow the world keeps the rows of
-                its earliest contacts, drops the rest, sets its ``constraint_overflow`` entry and warns as in the
-                default mode; while its contacts and joint rows are unchanged it drops the same contacts every
-                step. Overflowed steps are invalid physics in either mode: size the row capacities to avoid them.
+                contact rows, with each contact's torsional and rolling friction rows, take their slots in
+                contact-buffer order. On overflow the world keeps the rows of its earliest contacts, drops the
+                rest, sets its ``constraint_overflow`` entry and warns as in the default mode; while its contacts
+                and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
+                physics in either mode: size the row capacities to avoid them.
                 Requires ``articulated_contact_response="immediate"``. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the

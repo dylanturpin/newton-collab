@@ -11,7 +11,11 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_LIMIT, crba_fill_par_dof
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    crba_fill_par_dof,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
@@ -132,6 +136,14 @@ ROBOT_SOLVER_OPTIONS = {
     "warn_constraint_overflow": False,
 }
 
+# Torsional and rolling rows ride on the robot options; their capacity fits, so no world overflows.
+ANGULAR_FRICTION_SOLVER_OPTIONS = {
+    **ROBOT_SOLVER_OPTIONS,
+    "enable_torsional_rolling_friction": True,
+    "friction_anchor_beta": 0.0,
+    "dense_max_constraints": 512,
+}
+
 SPLIT_SOLVER_OPTIONS = {
     "pgs_mode": "split",
     "enable_joint_limits": True,
@@ -171,6 +183,14 @@ def _build_contact_scene(device, worlds=4, boxes=6, ants=2):
     friction = np.zeros(model.joint_dof_count, dtype=np.float32)
     friction[revolute_dofs] = 0.01
     model.joint_friction.assign(friction)
+    return model
+
+
+def _build_angular_friction_scene(device, worlds=4):
+    """Three floating ants per world with torsional and rolling friction on every shape."""
+    model = _build_contact_scene(device, worlds=worlds, boxes=0, ants=3)
+    model.shape_material_mu_torsional.fill_(0.02)
+    model.shape_material_mu_rolling.fill_(0.01)
     return model
 
 
@@ -257,12 +277,13 @@ def test_deterministic_launches_replay_identically(test, device):
     """Every solver ``wp.launch``/``wp.launch_tiled`` reproduces its outputs bitwise when rerun from the same inputs.
 
     The native contact radix sort is outside this interception."""
-    model = _build_contact_scene(device, worlds=8)
-    for options in (
-        ROBOT_SOLVER_OPTIONS,
-        SPLIT_SOLVER_OPTIONS,
+    robot_model = _build_contact_scene(device, worlds=8)
+    for name, model, options in (
+        ("matrix_free", robot_model, ROBOT_SOLVER_OPTIONS),
+        ("split", robot_model, SPLIT_SOLVER_OPTIONS),
+        ("angular_friction", _build_angular_friction_scene(device, worlds=8), ANGULAR_FRICTION_SOLVER_OPTIONS),
     ):
-        with test.subTest(pgs_mode=options["pgs_mode"]):
+        with test.subTest(name):
             solver = SolverFeatherPGS(model, deterministic=True, **options)
             pipeline = newton.CollisionPipeline(model, deterministic=True)
             contacts = pipeline.contacts()
@@ -279,20 +300,26 @@ def test_deterministic_launches_replay_identically(test, device):
                 ):
                     solver.step(state_0, state_1, control, contacts, 0.005)
                 state_0, state_1 = state_1, state_0
-            test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertGreater(count, 0)
+            if options.get("enable_torsional_rolling_friction"):
+                test.assertTrue((solver.contact_slots_needed.numpy()[:count] == 6).any())
             test.assertEqual(varied, set())
 
 
 def test_deterministic_runs_are_bitwise_identical(test, device):
     """Two runs produce identical finite states at every eager step and every two-step CUDA graph boundary."""
-    model = _build_contact_scene(device)
-    configurations = [("split", SPLIT_SOLVER_OPTIONS, False)]
+    robot_model = _build_contact_scene(device)
+    configurations = [("split", robot_model, SPLIT_SOLVER_OPTIONS, False)]
     if wp.get_device(device).is_cuda:
+        angular_model = _build_angular_friction_scene(device)
         configurations += [
-            ("matrix_free", ROBOT_SOLVER_OPTIONS, False),
-            ("matrix_free_graph", ROBOT_SOLVER_OPTIONS, True),
+            ("matrix_free", robot_model, ROBOT_SOLVER_OPTIONS, False),
+            ("matrix_free_graph", robot_model, ROBOT_SOLVER_OPTIONS, True),
+            ("angular_friction", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, False),
+            ("angular_friction_graph", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, True),
         ]
-    for name, options, graph in configurations:
+    for name, model, options, graph in configurations:
         with test.subTest(name):
             first = _run_hashes(model, options, 60, graph=graph)
             second = _run_hashes(model, options, 60, graph=graph)
@@ -436,6 +463,60 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
         )
 
 
+def test_deterministic_angular_friction_rows_follow_their_contact(test, device):
+    """A contact's torsional and rolling rows follow its sliding pair, and on overflow it keeps or drops all six."""
+    model = _build_angular_friction_scene(device)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state, state_next = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    settle = SolverFeatherPGS(model, **ANGULAR_FRICTION_SOLVER_OPTIONS)
+    # Settle the ants onto the ground so every world has dense contacts.
+    for _ in range(40):
+        pipeline.collide(state, contacts)
+        settle.step(state, state_next, model.control(), contacts, 0.005)
+        state, state_next = state_next, state
+    pipeline.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+
+    def route(capacity):
+        options = {**ANGULAR_FRICTION_SOLVER_OPTIONS, "dense_max_constraints": capacity}
+        solver = SolverFeatherPGS(model, deterministic=True, **options)
+        solver.step(state, model.state(), model.control(), contacts, 0.005)
+        return (
+            solver.contact_world.numpy()[:count],
+            solver.contact_slot.numpy()[:count],
+            solver.contact_path.numpy()[:count],
+            solver.contact_slots_needed.numpy()[:count],
+            solver.row_type.numpy(),
+            solver.row_parent.numpy(),
+            solver._row_dropped_dense.numpy(),
+            solver.constraint_overflow.numpy(),
+        )
+
+    world, slot, path, needed, row_type, row_parent, _, overflow = route(512)
+    test.assertFalse(overflow.any())
+    small_world, small_slot, small_path, _, _, _, dropped, small_overflow = route(192)
+    angular = []
+    for w in range(model.world_count):
+        routed = np.nonzero((path == 0) & (world == w))[0]
+        test.assertTrue((needed[routed] == 6).any())
+        np.testing.assert_array_equal(
+            slot[routed], slot[routed[0]] + np.concatenate(([0], np.cumsum(needed[routed])[:-1]))
+        )
+        for c in routed[needed[routed] == 6]:
+            rows = slot[c] + np.arange(1, 6)
+            angular.append(row_type[w, rows])
+            np.testing.assert_array_equal(row_parent[w, rows], slot[c])
+        kept = np.nonzero((small_path == 0) & (small_world == w))[0]
+        test.assertGreater(len(routed), len(kept))
+        np.testing.assert_array_equal(kept, routed[: len(kept)])
+        np.testing.assert_array_equal(small_slot[kept], slot[kept])
+        test.assertEqual(dropped[w], int(needed[routed[len(kept) :]].sum()))
+        test.assertTrue(small_overflow[w])
+    np.testing.assert_array_equal(np.array(angular), PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
+
+
 class TestFeatherPGSDeterminism(unittest.TestCase):
     pass
 
@@ -485,6 +566,12 @@ for _device in get_test_devices():
             TestFeatherPGSDeterminism,
             "test_deterministic_launches_replay_identically",
             test_deterministic_launches_replay_identically,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_angular_friction_rows_follow_their_contact",
+            test_deterministic_angular_friction_rows_follow_their_contact,
             devices=[_device],
         )
         add_function_test(
