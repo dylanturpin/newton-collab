@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.tests.test_feather_pgs_connect import _build_carried_load, _build_four_bar, _prescribe_carrier
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 120.0
@@ -509,6 +510,87 @@ def test_parent_wrench_excludes_velocity_limit_prescaling(test, device):
     np.testing.assert_allclose(observables.body_parent_f.numpy(), 0.0, atol=1.0e-4)
 
 
+def test_parent_wrench_includes_loop_closure_reactions(test, device):
+    """Loop-closure forces reach both closure links: an undriven joint in a four-bar transmits no axis torque."""
+    builder = _build_four_bar()
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, angular_damping=0.0)
+    observables = solver.observables(FLAGS)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    targets = model.joint_target_q.numpy().copy()
+    targets[0] = 0.6
+    control.joint_target_q.assign(targets)
+    for step in range(120):
+        state_in = state_0
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0, observables=observables)
+        state_0, state_1 = state_1, state_0
+        if step % 20 == 19:
+            wrench = observables.body_parent_f.numpy()
+            test.assertGreater(np.abs(wrench).max(), 0.5)
+            torques = _revolute_wrench_torques(model, state_in, wrench)
+            # Joint 0 is the driven crank; the coupler and rocker joints are undriven.
+            for joint in (1, 2):
+                test.assertAlmostEqual(torques[joint], 0.0, delta=2.0e-3)
+
+
+def test_parent_wrench_of_a_load_held_by_closures(test, device):
+    """A FREE load hung from the world or a moving kinematic carrier by closures transmits nothing through its free joint."""
+    for world_parent in (True, False):
+        with test.subTest(world_parent=world_parent):
+            builder, carrier, load, _joints = _build_carried_load(world_parent=world_parent)
+            model = builder.finalize(device=device)
+            solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.2)
+            observables = solver.observables(FLAGS)
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            articulation = None
+            if not world_parent:
+                articulation = wp.array(
+                    [int(solver.body_to_articulation.numpy()[carrier])], dtype=wp.int32, device=device
+                )
+            dt = 1.0 / 240.0
+            for i in range(120):
+                if articulation is not None:
+                    _prescribe_carrier(
+                        model,
+                        solver,
+                        state_0,
+                        articulation,
+                        i * dt,
+                        np.array([0.3, 0.0, 0.1]),
+                        np.array([0.0, 0.0, 1.5]),
+                    )
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, None, dt, observables=observables)
+                state_0, state_1 = state_1, state_0
+            np.testing.assert_allclose(observables.body_parent_f.numpy()[load], 0.0, atol=2.0e-3)
+
+
+def test_parent_wrench_warns_without_preeliminated_closures(test, device):
+    """Pre-eliminated loop closures have no stored impulses, so requesting the wrench warns once."""
+    model = _build_four_bar().finalize(device=device)
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_bilateral_preelimination=True)
+    observables = solver.observables(FLAGS)
+    state_0, state_1 = model.state(), model.state()
+    with test.assertWarnsRegex(UserWarning, "pre-eliminated loop-closure"):
+        solver.step(state_0, state_1, None, None, 1.0 / 240.0, observables=observables)
+
+
+def test_unattached_body_reports_zero(test, device):
+    """A body outside every articulation overwrites its row with zero."""
+    builder = newton.ModelBuilder()
+    root = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    builder.add_articulation([builder.add_joint_revolute(-1, root, axis=(0.0, 1.0, 0.0))])
+    builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    observables = solver.observables(FLAGS)
+    observables.body_parent_f.fill_(wp.spatial_vector(123.0, 123.0, 123.0, 123.0, 123.0, 123.0))
+    solver.step(model.state(), model.state(), None, None, DT, observables=observables)
+    np.testing.assert_array_equal(observables.body_parent_f.numpy()[1], 0.0)
+
+
 class TestFeatherPGSParentWrench(unittest.TestCase):
     pass
 
@@ -523,6 +605,12 @@ for _name in (
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_cuda_test_devices())
 add_function_test(
     TestFeatherPGSParentWrench,
+    "test_unattached_body_reports_zero",
+    test_unattached_body_reports_zero,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSParentWrench,
     "test_parent_wrench_matches_inverse_dynamics_on_every_path",
     test_parent_wrench_matches_inverse_dynamics_on_every_path,
     devices=get_test_devices(),
@@ -533,6 +621,9 @@ for _name in (
     "test_parent_wrench_carries_a_pinched_load",
     "test_parent_wrench_includes_spin_rows",
     "test_parent_wrench_excludes_velocity_limit_prescaling",
+    "test_parent_wrench_includes_loop_closure_reactions",
+    "test_parent_wrench_of_a_load_held_by_closures",
+    "test_parent_wrench_warns_without_preeliminated_closures",
 ):
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_cuda_test_devices())
 

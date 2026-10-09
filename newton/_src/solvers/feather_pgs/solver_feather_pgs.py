@@ -92,6 +92,7 @@ from .kernels import (
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_articulation_tau,
+    accumulate_connect_wrenches_from_impulses,
     accumulate_contact_wrenches_from_impulses,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
@@ -226,6 +227,7 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
     warmstart_dt_scale,
+    zero_unattached_parent_wrenches,
 )
 from .sleeping import _SleepState
 from .sparse_contact import (
@@ -1274,21 +1276,30 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :attr:`~newton.solvers.SolverObservables.body_parent_f` is populated when
         :attr:`~newton.solvers.SolverObservableFlags.BODY_PARENT_F` is requested from
         :meth:`~newton.solvers.SolverBase.observables`, or when the deprecated
-        :attr:`~newton.State.body_parent_f` is allocated. As with ``cfrc_int`` in
-        :class:`~newton.solvers.SolverMuJoCo`, it is the wrench the parent applies to each body
-        through its inbound joint, consistent with the step's solved motion: inverse dynamics
-        with the post-solve joint accelerations (taken from the velocities the dynamics start
-        from, after any velocity-limit prescaling), less gravity, :attr:`~newton.State.body_f` and
-        the solved contact, friction and spin impulses of the subtree divided by ``dt``. Linear
-        force [N] first, torque [N·m] about the body's center of mass second, world frame.
+        :attr:`~newton.State.body_parent_f` is allocated. It is the wrench the parent applies to
+        each body through its inbound joint, accounted from the step's solved motion: inverse
+        dynamics with the post-solve joint accelerations (taken from the velocities the dynamics
+        start from, after any velocity-limit prescaling), less gravity,
+        :attr:`~newton.State.body_f`, and the solved impulses divided by ``dt`` of the subtree's
+        contact normal, friction, spin, torsional and rolling rows and its loop-closure rows.
+        Linear force [N] first, torque [N·m] about the body's center of mass second, world frame.
         Joint-space rows (drives, limits, joint friction, mimic) enter through the accelerations.
-        Loop-closure rows act between two links of one articulation: they cancel at every joint
-        whose subtree holds both links, such as a gripper's flange, and are missing from the
-        joints between them. A body whose inbound joint is FREE reports the residual of its
-        momentum balance, which is zero up to solver tolerance. Contact wrenches are summed with
-        atomics, so the last bits can differ run to run. With sleeping enabled the solver
-        computes the wrench every step into its own history, so a sleeping body reports its last
-        awake wrench in whichever output the caller passes.
+        Bodies outside every articulation report zero.
+
+        The accounting has these limits:
+
+        - With ``enable_bilateral_preelimination`` the loop-closure reactions are not stored and
+          are left out; requesting the wrench warns once.
+        - A body whose inbound joint is FREE reports the residual of its discrete momentum
+          balance. Its force part is zero up to solver tolerance. The stabilized gyroscopic update
+          of single-body FREE articulations is not the inverse dynamics' ``v x* (I v)`` term, so a
+          spinning body with anisotropic inertia can report a torque residual.
+        - Coupled-solver forces that do not arrive through :attr:`~newton.State.body_f` are not
+          included.
+        - Contact wrenches are summed with atomics, so the last bits can differ run to run.
+
+        With sleeping enabled the solver computes the wrench every step into its own history, so
+        a sleeping body reports its last awake wrench in whichever output the caller passes.
 
         :attr:`~newton.solvers.SolverObservables.contact_f` is populated when
         :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` is requested. Each live rigid
@@ -2464,6 +2475,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._parent_wrench_scratch: tuple[wp.array, ...] | None = None
         self._parent_wrench_request: tuple[wp.array, Contacts | None, wp.array | None] | None = None
         self._parent_wrench_prescale: wp.array | None = None
+        self._parent_wrench_preelim_warned = False
         self._dynamics_art_mask = wp.ones(model.articulation_count, dtype=wp.bool, device=model.device)
         self._dynamics_joint_active = wp.ones(model.joint_count, dtype=wp.int32, device=model.device)
         self._dynamics_dof_active = wp.ones(model.joint_dof_count, dtype=wp.int32, device=model.device)
@@ -9386,6 +9398,34 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     outputs=[contact_wrench],
                     device=model.device,
                 )
+        if self._connect_count and self.connect_slot is not None:
+            wp.launch(
+                accumulate_connect_wrenches_from_impulses,
+                dim=self._connect_count,
+                inputs=[
+                    self.connect_slot,
+                    self._connect_art,
+                    self._connect_body_p,
+                    self._connect_body_c,
+                    self._connect_anchor_p,
+                    self._connect_anchor_c,
+                    self._connect_parent_prescribed,
+                    self.art_to_world,
+                    state_in.body_q,
+                    self.body_to_joint,
+                    model.joint_ancestor,
+                    model.joint_qd_start,
+                    state_aug.joint_S_s,
+                    self.body_to_articulation,
+                    self.articulation_origin,
+                    self.constraint_count,
+                    self.row_type,
+                    self.impulses,
+                    inv_dt,
+                ],
+                outputs=[contact_wrench],
+                device=model.device,
+            )
         wp.launch(
             eval_post_solve_parent_wrenches,
             dim=model.articulation_count,
@@ -9415,6 +9455,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             ],
             outputs=[body_parent_f],
             block_dim=self.serial_kernel_block_dim,
+            device=model.device,
+        )
+        wp.launch(
+            zero_unattached_parent_wrenches,
+            dim=model.body_count,
+            inputs=[self.body_to_articulation],
+            outputs=[body_parent_f],
             device=model.device,
         )
 
@@ -9523,6 +9570,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             computed_parent_f = self.sleeping.parent_wrenches if self.sleeping is not None else body_parent_f
             if computed_parent_f is not None:
                 # Published after the solve, from the accelerations and impulses it commits to.
+                if self._preelim_active and self._connect_count and not self._parent_wrench_preelim_warned:
+                    self._parent_wrench_preelim_warned = True
+                    warnings.warn(
+                        "BODY_PARENT_F leaves out pre-eliminated loop-closure reactions; "
+                        "set enable_bilateral_preelimination=False to include them.",
+                        stacklevel=3,
+                    )
                 prescale = None
                 if stage3_qd is not state_in.joint_qd:
                     # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.

@@ -1815,9 +1815,33 @@ def accumulate_contact_wrenches_from_impulses(
         propagation_row_parent,
         enable_friction,
     )
-    if contact_path[c] == 0 and contact_slot[c] >= 0:
-        dense_slot_contact[contact_world[c], contact_slot[c]] = c
-    if lam[0] == 0.0 and lam[1] == 0.0 and lam[2] == 0.0:
+    slot = contact_slot[c]
+    angular = wp.vec3(0.0)
+    if contact_path[c] == 0 and slot >= 0:
+        world = contact_world[c]
+        dense_slot_contact[world, slot] = c
+        # Torsional/rolling rows about the normal and both tangents follow a dense contact's sliding pair.
+        if slot + 5 < world_constraint_count[world]:
+            angular_rows = int(1)
+            for k in range(3):
+                row = slot + 3 + k
+                if (
+                    world_row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+                    or world_row_parent[world, row] != slot
+                ):
+                    angular_rows = 0
+            if angular_rows != 0:
+                angular = wp.vec3(
+                    world_impulses[world, slot + 3], world_impulses[world, slot + 4], world_impulses[world, slot + 5]
+                )
+    if (
+        lam[0] == 0.0
+        and lam[1] == 0.0
+        and lam[2] == 0.0
+        and angular[0] == 0.0
+        and angular[1] == 0.0
+        and angular[2] == 0.0
+    ):
         return
     shape_a = contact_shape0[c]
     shape_b = contact_shape1[c]
@@ -1860,6 +1884,11 @@ def accumulate_contact_wrenches_from_impulses(
     _add_point_force(
         body_b, -friction_force, friction_b, body_to_articulation, articulation_origin, body_contact_wrench
     )
+    torque = (angular[0] * normal + angular[1] * tangent0 + angular[2] * tangent1) * inv_dt
+    if body_a >= 0:
+        wp.atomic_add(body_contact_wrench, body_a, wp.spatial_vector(wp.vec3(0.0), torque))
+    if body_b >= 0:
+        wp.atomic_add(body_contact_wrench, body_b, wp.spatial_vector(wp.vec3(0.0), -torque))
 
 
 @wp.kernel
@@ -1900,6 +1929,104 @@ def accumulate_torsion_wrenches_from_impulses(
         wp.atomic_add(body_contact_wrench, shape_body[contact_shape0[c]], wp.spatial_vector(wp.vec3(0.0), torque))
     if contact_shape1[c] >= 0 and shape_body[contact_shape1[c]] >= 0:
         wp.atomic_add(body_contact_wrench, shape_body[contact_shape1[c]], wp.spatial_vector(wp.vec3(0.0), -torque))
+
+
+@wp.func
+def _connect_row_point_term(axis: wp.vec3, motion: wp.spatial_vector, rel: wp.vec3):
+    return wp.dot(axis, wp.spatial_top(motion) + wp.cross(wp.spatial_bottom(motion), rel))
+
+
+@wp.kernel
+def accumulate_connect_wrenches_from_impulses(
+    connect_slot: wp.array[wp.int32],
+    connect_art: wp.array[wp.int32],
+    connect_body_p: wp.array[wp.int32],
+    connect_body_c: wp.array[wp.int32],
+    connect_anchor_p: wp.array[wp.vec3],
+    connect_anchor_c: wp.array[wp.vec3],
+    connect_parent_prescribed: wp.array[wp.int32],
+    art_to_world: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_to_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    world_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    inv_dt: float,
+    # outputs
+    body_contact_wrench: wp.array[wp.spatial_vector],
+):
+    """Add each loop closure's solved point-coincidence force to its parent and child bodies.
+
+    The rows are ``e_k . (v(p_A) - v(p_B))`` normalized by their generalized norm, which is rebuilt here from the
+    same motion subspaces, so the impulse maps back to a force along ``e_k`` at each anchor.
+    """
+    k = wp.tid()
+    base_slot = connect_slot[k]
+    if base_slot < 0:
+        return
+    art = connect_art[k]
+    world = art_to_world[art]
+    body_p = connect_body_p[k]
+    body_c = connect_body_c[k]
+    prescribed = connect_parent_prescribed[k] != 0
+    p_a = connect_anchor_p[k]
+    if body_p >= 0:
+        p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+    p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
+    origin = articulation_origin[art]
+    rel_a = p_a - origin
+    rel_b = p_b - origin
+    for axis_index in range(3):
+        slot = base_slot + axis_index
+        if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
+            continue
+        axis = wp.vec3(0.0)
+        axis[axis_index] = 1.0
+        # |J|^2 = |J_p|^2 + |J_c|^2 - 2 J_p.J_c, where the cross term runs over shared ancestor joints.
+        norm_sq = float(0.0)
+        if not prescribed:
+            parent_joint = body_to_joint[body_p]
+            while parent_joint != -1:
+                shared = int(0)
+                child_joint = body_to_joint[body_c]
+                while child_joint != -1:
+                    if child_joint == parent_joint:
+                        shared = 1
+                    child_joint = joint_ancestor[child_joint]
+                for d in range(joint_qd_start[parent_joint], joint_qd_start[parent_joint + 1]):
+                    a = _connect_row_point_term(axis, joint_S_s[d], rel_a)
+                    norm_sq += a * a
+                    if shared != 0:
+                        norm_sq -= 2.0 * a * _connect_row_point_term(axis, joint_S_s[d], rel_b)
+                parent_joint = joint_ancestor[parent_joint]
+        child_joint = body_to_joint[body_c]
+        while child_joint != -1:
+            for d in range(joint_qd_start[child_joint], joint_qd_start[child_joint + 1]):
+                b = _connect_row_point_term(axis, joint_S_s[d], rel_b)
+                norm_sq += b * b
+            child_joint = joint_ancestor[child_joint]
+        if norm_sq <= 1.0e-8:
+            continue
+        force = axis * (world_impulses[world, slot] * inv_dt / wp.sqrt(norm_sq))
+        _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
+
+
+@wp.kernel
+def zero_unattached_parent_wrenches(
+    body_to_articulation: wp.array[int],
+    # outputs
+    body_parent_f: wp.array[wp.spatial_vector],
+):
+    """Bodies outside every articulation have no inbound joint and transmit nothing."""
+    body = wp.tid()
+    if body_to_articulation[body] < 0:
+        body_parent_f[body] = wp.spatial_vector()
 
 
 @wp.kernel
