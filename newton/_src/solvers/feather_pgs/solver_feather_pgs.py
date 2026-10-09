@@ -1271,7 +1271,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def __init__(
         self,
         model: Model,
-        *,
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         enable_contact_friction: bool = True,
@@ -1329,6 +1328,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
+        *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
