@@ -36,6 +36,7 @@ from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, St
 from ...sim.articulation import eval_fk, eval_jacobian
 from ...sim.enums import BodyFlags, JointType
 from ..coupled.interface import CouplingInterface
+from ..coupled.model_view import ModelView
 from ..observables import SolverObservableFlags, SolverObservables
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
@@ -947,7 +948,8 @@ def _validate_equality_constraints(model: Model) -> None:
 
 def _validate_tree_joints_enabled(model: Model) -> None:
     """Reject disabled articulation-tree joints, which the solver would simulate as enabled."""
-    if not model.joint_count or model.joint_enabled is None:
+    # A coupled view disables the joints another solver entry owns and simulates.
+    if not model.joint_count or model.joint_enabled is None or isinstance(model, ModelView):
         return
     disabled = ~model.joint_enabled.numpy().astype(bool)
     if model.joint_articulation is not None:
