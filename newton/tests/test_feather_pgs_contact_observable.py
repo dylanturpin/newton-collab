@@ -73,7 +73,8 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **op
         solver.step(states[0], states[1], control, contacts, DT, observables=observables)
         states.reverse()
     contact_f = observables.contact_f.numpy()
-    solver.update_contacts(contacts)
+    # The SolverBase signature, which also passes the state.
+    solver.update_contacts(contacts, states[0])
     _check_rows(test, contacts, contact_f, contacts.rigid_contact_force.numpy())
     if options.get("mf_max_constraints") is not None:
         # Rows beyond the capacity were dropped; those contacts report zero.

@@ -10276,7 +10276,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         }
 
     @override
-    def update_contacts(self, contacts: Contacts) -> None:
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Populate linear contact forces from the last FeatherPGS solve.
 
         This path reports linear force only: the torque components of
@@ -10287,7 +10287,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         is not suitable for contact-wrench sensing. The
         :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` observable reports the same
         forces from :meth:`step`.
+
+        Args:
+            contacts: The contacts passed to the last :meth:`step`.
+            state: Unused.
         """
+        del state
         if contacts is None or contacts.rigid_contact_count is None:
             return
 
