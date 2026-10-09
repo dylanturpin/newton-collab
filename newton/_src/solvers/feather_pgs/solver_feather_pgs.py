@@ -1326,12 +1326,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         Args:
             model (Model): the model to be simulated.
             deterministic: Reserve constraint rows in a fixed order, not in the order GPU threads reach the
-                per-world atomic counters, and sum split-mode right-hand sides in a fixed order. With contacts
-                that also arrive in a fixed order (``CollisionPipeline(deterministic=True)``), repeated runs from
-                identical inputs are bitwise identical on the same GPU model, driver and Warp build. A world's
+                per-world atomic counters, and sum split-mode right-hand sides in a fixed order. Given identical
+                contact inputs in an identical order, repeated runs are bitwise identical on the same GPU model,
+                driver and Warp build. ``CollisionPipeline(deterministic=True)`` supplies that order within its
+                own limits (sort-key ties, which contacts survive a contact-buffer overflow). A world's
                 contact rows take their slots in contact-buffer order; on overflow the world keeps its earliest
-                rows, drops the rest and sets its ``constraint_overflow`` entry. Requires
-                ``articulated_contact_response="immediate"``. Adds a per-step sort of the contacts by world.
+                rows, drops the rest and sets its ``constraint_overflow`` entry, so a persistent overflow drops
+                the same contacts every step. Requires ``articulated_contact_response="immediate"``. Adds a
+                per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.

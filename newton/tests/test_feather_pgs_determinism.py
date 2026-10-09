@@ -179,15 +179,19 @@ def _actuate(model, control):
     control.joint_f.assign(torques)
 
 
-def _hash(*arrays):
+def _sample(state):
+    """Hash of the state and whether every value in it is finite."""
     digest = hashlib.sha256()
-    for array in arrays:
-        digest.update(np.ascontiguousarray(array.numpy()).tobytes())
-    return digest.hexdigest()
+    finite = True
+    for array in (state.body_q, state.body_qd, state.joint_q, state.joint_qd):
+        values = np.ascontiguousarray(array.numpy())
+        digest.update(values.tobytes())
+        finite = finite and bool(np.isfinite(values).all())
+    return digest.hexdigest(), finite
 
 
 def _run_hashes(model, options, steps, graph=False):
-    """Simulate with deterministic collision and solver; return one state hash per step."""
+    """Simulate with deterministic collision and solver; return (hash, finite) per step or per graph replay."""
     solver = SolverFeatherPGS(model, deterministic=True, **options)
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
@@ -207,12 +211,12 @@ def _run_hashes(model, options, steps, graph=False):
             step(state_1, state_0)
         for _ in range(steps // 2):
             wp.capture_launch(capture.graph)
-            hashes.append(_hash(state_0.body_q, state_0.body_qd, state_0.joint_q, state_0.joint_qd))
+            hashes.append(_sample(state_0))
         return hashes
     for _ in range(steps):
         step(state_0, state_1)
         state_0, state_1 = state_1, state_0
-        hashes.append(_hash(state_0.body_q, state_0.body_qd, state_0.joint_q, state_0.joint_qd))
+        hashes.append(_sample(state_0))
     return hashes
 
 
@@ -249,7 +253,9 @@ def _replaying(original, replays, varied):
 
 
 def test_deterministic_launches_replay_identically(test, device):
-    """Every solver launch reproduces its outputs bitwise when rerun from the same inputs."""
+    """Every solver ``wp.launch``/``wp.launch_tiled`` reproduces its outputs bitwise when rerun from the same inputs.
+
+    The native contact radix sort is outside this interception."""
     model = _build_contact_scene(device, worlds=8)
     for options in (
         ROBOT_SOLVER_OPTIONS,
@@ -277,7 +283,7 @@ def test_deterministic_launches_replay_identically(test, device):
 
 
 def test_deterministic_runs_are_bitwise_identical(test, device):
-    """Two runs from the same model produce identical states at every step, eagerly and in a CUDA graph."""
+    """Two runs produce identical finite states at every eager step and every two-step CUDA graph boundary."""
     model = _build_contact_scene(device)
     configurations = [("split", SPLIT_SOLVER_OPTIONS, False)]
     if wp.get_device(device).is_cuda:
@@ -290,6 +296,7 @@ def test_deterministic_runs_are_bitwise_identical(test, device):
             first = _run_hashes(model, options, 60, graph=graph)
             second = _run_hashes(model, options, 60, graph=graph)
             test.assertEqual(first, second)
+            test.assertTrue(all(finite for _, finite in first))
 
 
 def test_deterministic_overflow_keeps_earliest_contacts(test, device):
