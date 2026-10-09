@@ -103,6 +103,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 friction_gap_threshold,
                 0,
                 patches,
+                0,
             ],
             outputs=[
                 contact_world,
@@ -248,6 +249,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 0.0,
                 0,
                 FrictionPatches(),
+                0,
             ],
             outputs=[
                 wp.zeros((capacity,), dtype=wp.int32, device=device),

@@ -106,6 +106,7 @@ def _launch_contact_allocator(
             friction_gap,
             int(friction_pairs_only),
             FrictionPatches(),
+            0,
         ],
         outputs=[
             outputs["world"],
@@ -188,6 +189,7 @@ def _launch_articulation_pair_contact_allocator(
             friction_gap,
             int(friction_pairs_only),
             FrictionPatches(),
+            0,
         ],
         outputs=[
             wp.full((1,), -9, dtype=wp.int32, device=device),
