@@ -194,6 +194,7 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    record_warmstart_dt,
     refine_same_articulation_propagation_rows,
     refresh_masked_body_inertia,
     refresh_propagation_free_body_qd_from_vout,
@@ -213,6 +214,7 @@ from .kernels import (
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
+    warmstart_dt_scale,
 )
 from .sleeping import _SleepState
 from .sparse_contact import (
@@ -2172,7 +2174,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._mf_warmstart_decay = self.pgs_warmstart_decay
         # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
         self._ws_prev_mf_impulses = None
-        self._ws_prev_dt = 0.0
+        # Device-resident so a captured step rescales the history by the step ratio at replay.
+        self._ws_prev_dt = wp.zeros(1, dtype=float, device=model.device)
+        self._ws_dt_scale = wp.ones(1, dtype=float, device=model.device)
         # Contact buffer and generation the previous step solved, on the device so a
         # captured graph replays them. Generations count collision passes per buffer, so
         # each buffer gets its own nonzero stream id (0: no contacts).
@@ -3319,6 +3323,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             | ModelFlags.SHAPE_PROPERTIES
         ):
             self._clear_warmstart_history(None)
+
+    def _warmstart_dt_scale(self, dt: float) -> wp.array:
+        """Return the device scalar that rescales carried impulses from the previous step size to ``dt``."""
+        wp.launch(
+            warmstart_dt_scale,
+            dim=1,
+            inputs=[float(dt), self._ws_prev_dt],
+            outputs=[self._ws_dt_scale],
+            device=self.model.device,
+        )
+        return self._ws_dt_scale
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -9598,7 +9613,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._ws_prev_contact_normal,
                         self.row_mu,
                         self.pgs_warmstart_decay,
-                        dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                        self._warmstart_dt_scale(dt),
                         self.dense_max_constraints,
                     ],
                     outputs=[self.impulses],
@@ -9624,7 +9639,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             parents,
                             mu,
                             impulses,
-                            decay * (dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0),
+                            decay,
+                            self._warmstart_dt_scale(dt),
                         ],
                         device=model.device,
                     )
@@ -10109,7 +10125,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._ws_history_generation, self._ws_history_stream],
                 device=model.device,
             )
-            self._ws_prev_dt = float(dt)
+            wp.launch(record_warmstart_dt, dim=1, inputs=[float(dt)], outputs=[self._ws_prev_dt], device=model.device)
 
         # Double-buffer: fork the maintenance stream to clear the current
         # buffer for reuse. The compact path snapshots this solve's row counts
@@ -12715,7 +12731,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             self._ws_prev_contact_normal,
                             self.propagation_row_mu,
                             self.pgs_warmstart_decay,
-                            dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                            self._warmstart_dt_scale(dt),
                             self.propagation_max_constraints,
                         ],
                         outputs=[self.propagation_impulses],
@@ -12851,7 +12867,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
-                            dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
+                            self._warmstart_dt_scale(dt),
                             self.mf_max_constraints,
                         ],
                         outputs=[self.mf_impulses],

@@ -1497,6 +1497,7 @@ def seed_patch_impulses(
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
     scale: float,
+    dt_scale: wp.array[float],
 ):
     """Transport cached patch impulses and project every anchor's seed onto its patch cone.
 
@@ -1510,7 +1511,7 @@ def seed_patch_impulses(
     value = wp.vec2(impulses[w, s + 1], impulses[w, s + 2])
     source = frame.source[c]
     if source >= 0:
-        tangent = prev.tangent_impulse[source] * scale
+        tangent = prev.tangent_impulse[source] * (scale * dt_scale[0])
         if frame.body_a[c] >= 0:
             tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
         n = frame.normal[c]
