@@ -4,7 +4,6 @@
 import gc
 import unittest
 import warnings
-import weakref
 from collections import Counter
 from enum import IntFlag, auto
 from unittest import mock
@@ -508,31 +507,57 @@ def test_sdf_pipeline_garbage_collected_during_capture(test, device):
     pipeline = newton.CollisionPipeline(model)
     pipeline.collide(model.state(), pipeline.contacts())
     test.assertIsNotNone(pipeline._unit_scale_sdf_rescaled_host)
-    textures = [weakref.ref(texture) for texture in model._texture_sdf_coarse_textures if texture is not None]
-    test.assertGreater(len(textures), 0)
+    textures = [
+        texture
+        for texture in model._texture_sdf_coarse_textures + model._texture_sdf_subgrid_textures
+        if texture is not None
+    ]
+    texture_handles = {texture._tex_handle for texture in textures}
+    test.assertEqual(len(texture_handles), len(textures))
+    pinned_ptr = pipeline._unit_scale_sdf_rescaled_host.ptr
+    del textures
+
+    # Record the native releases of exactly these resources, and whether a capture was active at each.
+    native = wp._src.context.runtime.core
+    released = []
+
+    def recording(name):
+        original = getattr(native, name)
+
+        def release(*args):
+            handle = args[1] if name == "wp_texture_object_destroy_device" else args[0]
+            if handle in texture_handles or handle == pinned_ptr:
+                released.append((handle, wp.get_device(device).is_capturing))
+            return original(*args)
+
+        return mock.patch.object(native, name, release)
 
     values = wp.zeros(1, dtype=wp.int32, device=device)
     gc_was_enabled = gc.isenabled()
     gc.disable()
     try:
-        # Only the cyclic collector can free the textures and pinned flag, and it runs inside the capture.
-        garbage = [mesh, model, pipeline]
-        garbage.append(garbage)
-        del mesh, builder, model, pipeline, garbage
-        with wp.ScopedCapture(device=device) as capture:
+        with recording("wp_texture_object_destroy_device"), recording("wp_free_pinned"):
+            # Only the cyclic collector can free the textures and pinned flag, and it runs inside the capture.
+            garbage = [mesh, model, pipeline]
+            garbage.append(garbage)
+            del mesh, builder, model, pipeline, garbage
+            with wp.ScopedCapture(device=device) as capture:
+                gc.collect()
+                test.assertGreater(len(capture_release._pending_releases), 0)
+                values.fill_(1)
+            test.assertEqual(released, [])
+
+            wp.capture_launch(capture.graph)
+            test.assertEqual(int(values.numpy()[0]), 1)
+            # The next collection outside a capture runs the deferred native releases, each once.
             gc.collect()
-            test.assertGreater(len(capture_release._pending_releases), 0)
-            values.fill_(1)
     finally:
         if gc_was_enabled:
             gc.enable()
 
-    wp.capture_launch(capture.graph)
-    test.assertEqual(int(values.numpy()[0]), 1)
-    # The next collection outside a capture runs the deferred releases.
-    gc.collect()
     test.assertEqual(len(capture_release._pending_releases), 0)
-    test.assertTrue(all(texture() is None for texture in textures))
+    test.assertEqual(sorted(handle for handle, _ in released), sorted([*texture_handles, pinned_ptr]))
+    test.assertFalse(any(capturing for _, capturing in released))
 
 
 add_function_test(
