@@ -10,7 +10,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.contact_angular_friction import angular_friction_gs_sources
-from newton.solvers import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+from newton.solvers import SolverFeatherPGS, SolverObservableFlags
 
 GRAVITY = 9.81
 DT = 0.00125
@@ -460,9 +461,9 @@ class Scene:
         self.pipeline = newton.CollisionPipeline(model, rigid_contact_max=16, broad_phase="explicit")
         self.contacts = self.pipeline.contacts()
 
-    def step(self):
+    def step(self, observables=None):
         self.pipeline.collide(self.state, self.contacts)
-        self.solver.step(self.state, self.next, self.control, self.contacts, self.dt)
+        self.solver.step(self.state, self.next, self.control, self.contacts, self.dt, observables=observables)
         self.state, self.next = self.next, self.state
 
     def run(self, steps):
@@ -829,15 +830,39 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(baseline, ball(enable=False, mu_rolling=0.5).run(60))
 
     def test_contact_force_reports_the_sliding_pair(self):
-        """Angular contacts still report their normal and sliding force; the angular impulses are not reported."""
+        """CONTACT_F and the legacy force report the normal and sliding force; the angular couples stay out of both."""
         scene = ball(speed=1.0, rolling=False)
-        scene.model.request_contact_attributes("force")
+        observables = scene.solver.observables({SolverObservableFlags.CONTACT_F})
+        with self.assertWarns(DeprecationWarning):
+            scene.model.request_contact_attributes("force")
         scene.contacts = scene.pipeline.contacts()
-        scene.step()
+        scene.step(observables)
+        # The sliding pair carries the angular row type, so the readers must accept it.
+        row_type = scene.solver.row_type.numpy()[0, 1:6]
+        np.testing.assert_array_equal(row_type, PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
         scene.solver.update_contacts(scene.contacts)
-        force = scene.contacts.force.numpy()[0, :3]
-        self.assertAlmostEqual(abs(float(force[2])), GRAVITY * 1.0003, delta=0.01)
-        self.assertAlmostEqual(float(np.linalg.norm(force[:2])), MU * GRAVITY * 1.0003, delta=0.02)
+        count = int(scene.contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(count, 1)
+        contact_f = observables.contact_f.numpy()
+        for wrench in (scene.contacts.force.numpy()[0], contact_f[0]):
+            self.assertAlmostEqual(abs(float(wrench[2])), GRAVITY * 1.0003, delta=0.01)
+            self.assertAlmostEqual(float(np.linalg.norm(wrench[:2])), MU * GRAVITY * 1.0003, delta=0.02)
+            np.testing.assert_array_equal(wrench[3:], 0.0)
+        np.testing.assert_array_equal(contact_f[0], scene.contacts.force.numpy()[0])
+        np.testing.assert_array_equal(contact_f[count:], 0.0)
+
+    def test_body_parent_f_is_unchanged_by_angular_rows(self):
+        """BODY_PARENT_F is start-of-step inverse dynamics, so the angular rows change the step but not the wrench."""
+        wrenches, velocities = [], []
+        for enable in (False, True):
+            scene = ball(enable=enable)
+            observables = scene.solver.observables({SolverObservableFlags.BODY_PARENT_F})
+            scene.step(observables)
+            wrenches.append(observables.body_parent_f.numpy())
+            velocities.append(scene.state.joint_qd.numpy())
+        self.assertGreater(float(np.abs(wrenches[1]).max()), 1.0)
+        np.testing.assert_array_equal(wrenches[0], wrenches[1])
+        self.assertGreater(float(np.abs(velocities[0] - velocities[1]).max()), 1.0e-3)
 
     def test_zero_coefficients_allocate_no_rows(self):
         scene = ball(mu_torsional=0.0, mu_rolling=0.0)
