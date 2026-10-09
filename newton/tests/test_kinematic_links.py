@@ -854,6 +854,7 @@ def test_kinematic_prescribed_response_lifetime(
     device,
     solver_fn,
 ):
+    """Drop a newly kinematic free body from the response and reject a kinematic body turning dynamic."""
     model, kinematic_body, probe_body, _kinematic_joint = _build_free_root_scene(device)
     solver = solver_fn(model)
     body_to_articulation = solver.body_to_articulation.numpy()
@@ -881,6 +882,12 @@ solvers = {
     "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
         model, angular_damping=0.0, pgs_mode="matrix_free"
     ),
+    "feather_pgs_propagation": lambda model: newton.solvers.SolverFeatherPGS(
+        model, angular_damping=0.0, pgs_mode="matrix_free", articulated_contact_response="propagation"
+    ),
+    "feather_pgs_propagation_fused": lambda model: newton.solvers.SolverFeatherPGS(
+        model, angular_damping=0.0, pgs_mode="matrix_free", articulated_contact_response="propagation-fused"
+    ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
@@ -891,7 +898,12 @@ for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name == "mujoco_warp":
+        if device.is_cpu and solver_name in (
+            "mujoco_warp",
+            "feather_pgs_matrix_free",
+            "feather_pgs_propagation",
+            "feather_pgs_propagation_fused",
+        ):
             continue
         if device.is_cpu and solver_name == "feather_pgs_matrix_free":
             continue
@@ -904,14 +916,15 @@ for device in devices:
             solver_fn=solver_fn,
             check_reversed_order=solver_name == "feather_pgs_matrix_free",
         )
-        if solver_name == "feather_pgs_matrix_free":
+        if solver_name.startswith("feather_pgs"):
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_feather_pgs_matrix_free",
+                f"test_kinematic_prescribed_response_lifetime_{solver_name}",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
+        if solver_name == "feather_pgs_matrix_free":
             add_function_test(
                 TestKinematicLinksCanonical,
                 "test_kinematic_free_base_drives_dense_articulation_feather_pgs_matrix_free",
