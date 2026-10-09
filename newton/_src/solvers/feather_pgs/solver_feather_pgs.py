@@ -447,6 +447,15 @@ def _reset_solver_status(
             mass_update_requested[tid] = 1
 
 
+@wp.func
+def _print_deterministic_overflow_note():
+    wp.printf(
+        "FeatherPGS deterministic mode: each world keeps the rows of its earliest contacts in contact-buffer order. "
+        "While its contacts and joint rows are unchanged it drops the same contacts every step; otherwise it drops "
+        "the tail of the new contact order.\n"
+    )
+
+
 @wp.kernel
 def _warn_constraint_row_overflow(
     dense_raw_counts: wp.array[wp.int32],
@@ -460,6 +469,7 @@ def _warn_constraint_row_overflow(
     propagation_dropped_contact_rows: wp.array[wp.int32],
     propagation_capacity: int,
     propagation_active: int,
+    deterministic: int,
     warning_emitted: wp.array[wp.int32],
 ):
     """Emit one device-side warning per overflowing FeatherPGS row family."""
@@ -476,6 +486,8 @@ def _warn_constraint_row_overflow(
             dense_capacity,
             dense_dropped,
         )
+        if deterministic != 0:
+            _print_deterministic_overflow_note()
 
     if mf_active != 0:
         mf_dropped = mf_dropped_contact_rows[world]
@@ -489,6 +501,8 @@ def _warn_constraint_row_overflow(
                 mf_capacity,
                 mf_dropped,
             )
+            if deterministic != 0:
+                _print_deterministic_overflow_note()
 
     if propagation_active != 0:
         propagation_dropped = propagation_dropped_contact_rows[world]
@@ -503,6 +517,8 @@ def _warn_constraint_row_overflow(
                 propagation_capacity,
                 propagation_dropped,
             )
+            if deterministic != 0:
+                _print_deterministic_overflow_note()
 
 
 @dataclass(frozen=True)
@@ -1330,9 +1346,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 contact inputs in an identical order, repeated runs are bitwise identical on the same GPU model,
                 driver and Warp build. ``CollisionPipeline(deterministic=True)`` supplies that order within its
                 own limits (sort-key ties, which contacts survive a contact-buffer overflow). A world's
-                contact rows take their slots in contact-buffer order; on overflow the world keeps its earliest
-                rows, drops the rest and sets its ``constraint_overflow`` entry, so a persistent overflow drops
-                the same contacts every step. Requires ``articulated_contact_response="immediate"``. Adds a
+                contact rows take their slots in contact-buffer order. On overflow the world keeps the rows of
+                its earliest contacts, drops the rest, sets its ``constraint_overflow`` entry and warns as in the
+                default mode; while its contacts and joint rows are unchanged it drops the same contacts every
+                step. Overflowed steps are invalid physics in either mode: size the row capacities to avoid them.
+                Requires ``articulated_contact_response="immediate"``. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -1675,7 +1693,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense,
                 matrix-free, or propagation row family exceeds its configured per-world capacity. The warning
                 reports the world, requested rows, row limit, and dropped contact/friction rows without a host
-                synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
+                synchronization, so it remains compatible with CUDA graph capture. With ``deterministic=True``
+                it adds which contacts deterministic mode drops. Defaults to True.
             mf_warmstart (bool, optional): Legacy compatibility alias for ``pgs_warmstart``
                 (this option was historically matrix-free-only). New callers should use
                 ``pgs_warmstart``. Defaults to False.
@@ -12995,6 +13014,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._row_dropped_propagation,
                     self.propagation_max_constraints,
                     1 if propagation_active else 0,
+                    int(self.deterministic),
                     self._row_overflow_warning_emitted,
                 ],
                 device=model.device,
