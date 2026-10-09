@@ -3205,7 +3205,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         the carried friction anchors, and overflow status, is cleared. Mass
         factors for selected worlds refresh on the next step after a teleport;
         other worlds retain their normal refresh cadence. A full reset (``world_mask=None``)
-        also restarts the step cadence, so the next step matches a freshly constructed solver.
+        also restarts the host-side step cadence for subsequent :meth:`step` calls. CUDA graphs
+        captured before the reset keep their captured cadence and buffer schedule.
 
         Args:
             state: Simulation state, which is left unchanged.
@@ -3216,7 +3217,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """
         del flags
         if world_mask is None:
-            # A full reset restarts the step cadence, so the next step repeats a fresh solver's first step.
+            # Restart the host-side cadence; graphs captured earlier keep the values baked into them.
             self._step = 0
             self._last_step_dt = None
             self._ws_prev_dt = 0.0

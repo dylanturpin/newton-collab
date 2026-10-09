@@ -97,7 +97,7 @@ def _simulate(model, solver, steps):
 
 
 def test_full_reset_matches_fresh_solver(test, device):
-    """After a full reset, a solver replays a fresh solver's trajectory bit for bit."""
+    """After a full reset, eager steps replay a fresh solver's trajectory bit for bit."""
     for interval in (1, 3):
         with test.subTest(update_mass_matrix_interval=interval):
             model = _build_pendulum_model(device)
