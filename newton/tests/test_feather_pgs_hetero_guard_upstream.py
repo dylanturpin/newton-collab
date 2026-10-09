@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""SolverFeatherPGS on multi-world models whose worlds have different DOF counts."""
+
+import unittest
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton.solvers import SolverFeatherPGS
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+
+
+def _make_chain_world(n_links: int, root_height: float = 1.0, free_box: bool = False) -> newton.ModelBuilder:
+    """A fixed-base serial chain of ``n_links`` revolute links (n_links DOFs), optionally with a free box."""
+    builder = newton.ModelBuilder()
+    joints = []
+    prev = -1
+    for _ in range(n_links):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.15, hy=0.03, hz=0.03)
+        if prev == -1:
+            parent_xform = wp.transform(p=wp.vec3(0.0, 0.0, root_height), q=wp.quat_identity())
+        else:
+            parent_xform = wp.transform(p=wp.vec3(0.15, 0.0, 0.0), q=wp.quat_identity())
+        joints.append(
+            builder.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=parent_xform,
+                child_xform=wp.transform(p=wp.vec3(-0.15, 0.0, 0.0), q=wp.quat_identity()),
+            )
+        )
+        prev = link
+    builder.add_articulation(joints)
+    if free_box:
+        body = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    return builder
+
+
+def _build_model(world_link_counts: list[int], device, root_height: float = 1.0, free_box=None) -> newton.Model:
+    """One chain world per entry in ``world_link_counts``, plus a ground plane."""
+    scene = newton.ModelBuilder()
+    for world, n_links in enumerate(world_link_counts):
+        scene.add_world(_make_chain_world(n_links, root_height, free_box is not None and free_box[world]))
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+def _final_joint_q(model, steps=60, pgs_mode="matrix_free", response="immediate", from_fk=False):
+    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, dense_max_constraints=64, articulated_contact_response=response)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    if from_fk:
+        # Start from the joint-space pose instead of the builder's body placement.
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+    return state_0.joint_q.numpy()
+
+
+def test_homogeneous_matrix_free_constructs(test, device):
+    """Construct on worlds with identical DOF counts."""
+    solver = SolverFeatherPGS(_build_model([3, 3, 3, 3], device), pgs_mode="matrix_free")
+    np.testing.assert_array_equal(solver.world_dof_count.numpy(), [3, 3, 3, 3])
+
+
+def test_homogeneous_split_constructs(test, device):
+    """Construct the split solve on worlds with identical DOF counts."""
+    solver = SolverFeatherPGS(_build_model([3, 3, 3, 3], device), pgs_mode="split")
+    test.assertEqual(solver.pgs_mode, "split")
+    test.assertEqual(solver.size_groups, [3])
+
+
+def test_hetero_worlds_match_isolated_worlds(test, device, pgs_mode="matrix_free"):
+    """Simulate each world of a heterogeneous model exactly as it simulates alone."""
+    combined = _final_joint_q(_build_model([1, 3], device), pgs_mode=pgs_mode)
+    single = _final_joint_q(_build_model([1], device), pgs_mode=pgs_mode)
+    triple = _final_joint_q(_build_model([3], device), pgs_mode=pgs_mode)
+    np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-5)
+
+
+class TestFeatherPGSHeteroGuard(unittest.TestCase):
+    pass
+
+
+devices = get_cuda_test_devices()
+add_function_test(
+    TestFeatherPGSHeteroGuard,
+    "test_homogeneous_matrix_free_constructs",
+    test_homogeneous_matrix_free_constructs,
+    devices=devices,
+)
+add_function_test(
+    TestFeatherPGSHeteroGuard,
+    "test_hetero_worlds_match_isolated_worlds",
+    test_hetero_worlds_match_isolated_worlds,
+    devices=devices,
+)
+split_devices = get_test_devices()
+add_function_test(
+    TestFeatherPGSHeteroGuard,
+    "test_homogeneous_split_constructs",
+    test_homogeneous_split_constructs,
+    devices=split_devices,
+)
+add_function_test(
+    TestFeatherPGSHeteroGuard,
+    "test_hetero_worlds_match_isolated_worlds_split",
+    test_hetero_worlds_match_isolated_worlds,
+    devices=split_devices,
+    pgs_mode="split",
+)
+
+
+if __name__ == "__main__":
+    unittest.main()
