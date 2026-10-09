@@ -132,6 +132,7 @@ from .kernels import (
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
     compute_delta_and_accumulate,
+    compute_effective_joint_armature,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -165,9 +166,11 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     find_contact_world_segments,
+    flag_invalid_joint_friction,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
     gather_dense_warmstart,
+    gather_group_armature,
     gather_JY_to_world,
     gather_mf_warmstart,
     gather_propagation_unit_meta,
@@ -1154,6 +1157,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     :meth:`check_constraint_capacity` outside capture at an observation boundary
     to reject incomplete physics. Ordinary stepping does not synchronize it.
 
+    ``joint_friction_invalid`` is the matching device boolean array for invalid
+    :attr:`~newton.Model.joint_friction` written before a notify, including one
+    replayed from a CUDA graph. Each entry is the solver world that owns the
+    DOF, loop-closing joints included. It persists across :meth:`reset` until
+    :meth:`check_joint_friction` reports and clears it; reporting acknowledges the
+    error and leaves the coefficients and the affected trajectory as they were,
+    so treat a raised check as a reason to discard or repair those worlds.
+
     Global (world ``-1``) articulations are solved in world 0. With
     ``pgs_mode="matrix_free"`` and ``articulated_contact_response="immediate"``
     a kinematic global free body (for example a moving floor) is a prescribed
@@ -1620,12 +1631,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 the friction and then slides against it. The rows use the articulated response, so
                 coupled inertia, armature, augmented drives, limits and contacts act jointly; their
                 impulses cold-start each step. After editing or replacing the coefficients, call
-                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)``: it validates the values and
-                wakes sleeping islands whose friction changed (a sleeping articulation builds no rows).
-                Coefficients are read on the device every step, including on graph replay; recapture
-                CUDA graphs after replacing the array. Nonzero friction on BALL,
-                FREE, DISTANCE or CABLE joints, and non-finite or negative values, raise
-                :class:`ValueError`. Requires ``pgs_mode="matrix_free"`` on CUDA and is not supported
+                ``notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)``: it checks the values on the
+                device and wakes sleeping islands whose friction changed (a sleeping articulation builds
+                no rows). Coefficients are read on the device every step, including on graph replay;
+                recapture CUDA graphs after replacing the array. Nonzero friction on BALL, FREE,
+                DISTANCE or CABLE joints, and non-finite or negative values, are invalid: such a DOF
+                builds no friction row, every notify (also when captured) latches its world in
+                :attr:`joint_friction_invalid`, and construction, an eager notify and
+                :meth:`check_joint_friction` raise :class:`ValueError`. Requires
+                ``pgs_mode="matrix_free"`` on CUDA and is not supported
                 with ``contact_compliance``, bilateral pre-elimination or ``model.requires_grad``;
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
@@ -2394,6 +2408,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
         if self.enable_joint_friction:
             self._validate_joint_friction()
+            self._init_joint_friction_check(model)
         if self._has_loop_joints and self.articulated_contact_response != "immediate":
             raise ValueError(
                 "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
@@ -2940,7 +2955,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             else wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         )
         self._allocate_debug_buffers(model)
-        self._scatter_armature_to_groups()
+        self._update_effective_armature()
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
@@ -3014,6 +3029,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._row_overflow_propagation_world_steps = None
 
         self.constraint_overflow = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
+        self.joint_friction_invalid = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
         self._row_dropped_all = wp.zeros((3, max(self.world_count, 1)), dtype=wp.int32, device=model.device)
         self._row_dropped_dense = self._row_dropped_all[0]
         self._row_dropped_mf = self._row_dropped_all[1]
@@ -3148,9 +3164,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         return 0 if self._compliance is None else _contact_compliance.counts(self)[1]
 
     def _update_kinematic_state(self) -> None:
-        """Refresh cached kinematic flags and effective joint armature."""
+        """Refresh cached kinematic flags from the host copy of ``body_flags``."""
         model = self.model
-        armature = model.joint_armature.numpy().copy()
         joint_mask = np.zeros(model.joint_count, dtype=np.int32)
         dof_mask = np.zeros(model.joint_dof_count, dtype=np.int32)
 
@@ -3162,12 +3177,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 if not kinematic_bodies[joint_child[joint]]:
                     continue
                 joint_mask[joint] = 1
-                dof_start = joint_qd_start[joint]
-                dof_end = joint_qd_start[joint + 1]
-                if dof_end <= dof_start:
-                    continue
-                dof_mask[dof_start:dof_end] = 1
-                armature[dof_start:dof_end] = 1.0e10
+                dof_mask[joint_qd_start[joint] : joint_qd_start[joint + 1]] = 1
 
         if self._model_plan is not None:
             selected = np.nonzero(self._model_plan.prescribed_articulation != 0)[0]
@@ -3180,13 +3190,35 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         "reconstruct the solver and recapture its CUDA graph."
                     )
 
-        self._joint_armature_effective = armature
-        if armature.size:
-            self._joint_armature_device.assign(armature.astype(np.float32))
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
         self._refresh_body_prescribed()
+
+    def _update_effective_armature(self) -> None:
+        """Rebuild the effective joint armature and its size-grouped copies on the device."""
+        model = self.model
+        if model.joint_dof_count:
+            wp.launch(
+                compute_effective_joint_armature,
+                model.joint_dof_count,
+                inputs=[model.joint_armature, self._kinematic_dof_mask],
+                outputs=[self._joint_armature_device],
+                device=model.device,
+            )
+        for size in self.size_groups:
+            wp.launch(
+                gather_group_armature,
+                (self.n_arts_by_size[size], size),
+                inputs=[
+                    self.group_to_art[size],
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    self._joint_armature_device,
+                ],
+                outputs=[self.R_by_size[size]],
+                device=model.device,
+            )
 
     def _refresh_body_prescribed(self) -> None:
         """Mark bodies whose propagation response is identically zero.
@@ -3210,16 +3242,25 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._body_prescribed.assign(prescribed)
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
-        With patch friction enabled, shape-property notifications copy geometry
-        to the host and synchronize with the device; issue them outside CUDA graph
-        capture. Ordinary simulation steps do not perform those host copies.
+        ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES``
+        and ``SHAPE_PROPERTIES`` run on the device and may be captured in a CUDA graph,
+        unless sleeping is enabled. ``BODY_PROPERTIES`` reads ``body_flags`` on the host.
+        With joint friction enabled, ``JOINT_DOF_PROPERTIES`` latches worlds with invalid
+        ``joint_friction`` in :attr:`joint_friction_invalid`; an eager call then reports them
+        through :meth:`check_joint_friction`, after all other updates are applied.
         Material-equivalence changes also require
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
+
+        Args:
+            flags: Bitmask of :class:`~newton.ModelFlags` naming the changed model data.
+            world_mask: Optional mask of the worlds whose model data changed, in either
+                :meth:`reset` layout. Impulse warm-start history is cleared only for these
+                worlds; ``None`` clears every world. Cached model data is refreshed for every world.
         """
         if self.sleeping is not None:
             self.sleeping.notify(flags)
@@ -3240,15 +3281,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             | ModelFlags.MODEL_PROPERTIES
         ):
             self._fk_id_cache_valid.zero_()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+        if flags & ModelFlags.BODY_PROPERTIES:
             self._update_kinematic_state()
-            self._scatter_armature_to_groups()
+        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+            self._update_effective_armature()
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
-        if self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES:
-            self._validate_joint_friction()
+        check_friction = self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES
+        if check_friction:
+            self._flag_invalid_joint_friction()
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia
             # in _allocate_common_buffers so runtime CoM/mass randomization
@@ -3274,7 +3317,41 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             | ModelFlags.JOINT_DOF_PROPERTIES
             | ModelFlags.SHAPE_PROPERTIES
         ):
-            self._clear_warmstart_history(None)
+            self._clear_warmstart_history(self._solver_world_mask(world_mask))
+        if check_friction and not wp.get_stream(self.model.device).is_capturing:
+            self.check_joint_friction()
+
+    def check_joint_friction(self) -> None:
+        """Raise :class:`ValueError` if a notify flagged :attr:`joint_friction_invalid`, then clear the flag.
+
+        Call outside CUDA graph capture, after captured notify replays. An eager notify calls it itself.
+        """
+        if self.model.device.is_cuda and self.model.device.is_capturing:
+            raise RuntimeError("check_joint_friction() must run outside CUDA graph capture")
+        if not self.enable_joint_friction:
+            return
+        worlds = np.flatnonzero(self.joint_friction_invalid.numpy())
+        if worlds.size == 0:
+            return
+        self.joint_friction_invalid.zero_()
+        self._validate_joint_friction()
+        raise ValueError(f"joint_friction was invalid at a captured notify in worlds {worlds[:16].tolist()}")
+
+    def _flag_invalid_joint_friction(self) -> None:
+        """Latch :attr:`joint_friction_invalid` for worlds with coefficients the friction rows cannot represent."""
+        model = self.model
+        if model.joint_friction.shape != (model.joint_dof_count,):
+            raise ValueError(
+                f"joint_friction has shape {model.joint_friction.shape}, expected ({model.joint_dof_count},)"
+            )
+        if model.joint_dof_count and self.world_count:
+            wp.launch(
+                flag_invalid_joint_friction,
+                model.joint_dof_count,
+                inputs=[model.joint_friction, self._friction_dof_supported, self._friction_dof_world],
+                outputs=[self.joint_friction_invalid],
+                device=model.device,
+            )
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -3298,6 +3375,28 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             raise ValueError(
                 f"joint_friction is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
             )
+
+    def _init_joint_friction_check(self, model) -> None:
+        """Upload the per-DOF support mask and world of :meth:`_validate_joint_friction` for the device check."""
+        joint_qd_start = model.joint_qd_start.numpy()
+        joint_dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
+        supported = np.isin(
+            model.joint_type.numpy(), (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
+        )
+        supported &= self._model_plan.loop_joint_articulation < 0
+        # A loop joint belongs to the articulation that closes it; other unowned joints keep their model world.
+        joint_articulation = model.joint_articulation.numpy()
+        joint_articulation = np.where(
+            joint_articulation >= 0, joint_articulation, self._model_plan.loop_joint_articulation
+        )
+        joint_world = model.joint_world.numpy().astype(np.int32)
+        joint_world[(joint_world < 0) | (joint_world >= self._model_plan.world_count)] = 0
+        owned = joint_articulation >= 0
+        joint_world[owned] = self._model_plan.articulation_world[joint_articulation[owned]]
+        self._friction_dof_supported = wp.array(
+            supported[joint_dof_joint].astype(np.int32), dtype=wp.int32, device=model.device
+        )
+        self._friction_dof_world = wp.array(joint_world[joint_dof_joint], dtype=wp.int32, device=model.device)
 
     @override
     def reset(
@@ -3338,22 +3437,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._coupling_patch_history_restore_pending = False
         if self._compliance is not None:
             self._compliance.counts.zero_()
-        if world_mask is not None and world_mask.shape[0] != self.world_count:
-            if world_mask.shape[0] != self.model.world_count + 1:
-                raise ValueError(
-                    f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per "
-                    f"solver world) or {self.model.world_count + 1} (model.world_count + 1)."
-                )
-            self._normalize_reset_world_mask(world_mask)
-            if self.world_count:
-                wp.launch(
-                    _solver_world_reset_mask,
-                    dim=self.world_count,
-                    inputs=[world_mask, int(self._has_global_articulation)],
-                    outputs=[self._base_reset_world_mask],
-                    device=self.model.device,
-                )
-            world_mask = self._base_reset_world_mask
+        world_mask = self._solver_world_mask(world_mask)
         if self.sleeping is not None:
             self.sleeping.wake(world_mask)
         if self.world_count == 0:
@@ -3389,6 +3473,26 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
+
+    def _solver_world_mask(self, world_mask: wp.array[wp.bool] | None) -> wp.array[wp.bool] | None:
+        """Map a per-solver-world or ``model.world_count + 1`` mask to one entry per solver world."""
+        if world_mask is None or world_mask.shape[0] == self.world_count:
+            return world_mask
+        if world_mask.shape[0] != self.model.world_count + 1:
+            raise ValueError(
+                f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per "
+                f"solver world) or {self.model.world_count + 1} (model.world_count + 1)."
+            )
+        self._normalize_reset_world_mask(world_mask)
+        if self.world_count:
+            wp.launch(
+                _solver_world_reset_mask,
+                dim=self.world_count,
+                inputs=[world_mask, int(self._has_global_articulation)],
+                outputs=[self._base_reset_world_mask],
+                device=self.model.device,
+            )
+        return self._base_reset_world_mask
 
     # ------------------------------------------------------------------
     # Coupling hooks (experimental)
@@ -6805,29 +6909,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._diag_dummy_jacobian = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device)
         self._diag_dummy_body_index = wp.full((worlds, 1), -1, dtype=wp.int32, device=device)
         self._diag_dummy_body_qd = wp.zeros((1, 6), dtype=wp.float32, device=device)
-
-    def _scatter_armature_to_groups(self):
-        """Copy armature from model (DOF-ordered) to size-grouped storage."""
-        if not self.size_groups:
-            return
-
-        armature_np = self._joint_armature_effective
-        art_dof_start_np = self._model_plan.articulation_dof_start
-        art_H_rows_np = self._model_plan.articulation_dof_count
-
-        # R_by_size is sized to actual DOF count (matches H_by_size allocation)
-        for size in self.size_groups:
-            n_arts = self.n_arts_by_size[size]
-            R_np = np.zeros((n_arts, size), dtype=np.float32)
-
-            group_to_art_np = np.flatnonzero(self._model_plan.response_dof_count == size)
-            for group_idx in range(n_arts):
-                art_idx = group_to_art_np[group_idx]
-                dof_start = art_dof_start_np[art_idx]
-                dof_count = art_H_rows_np[art_idx]
-                R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
-
-            self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
@@ -14584,9 +14665,11 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
         int active = 0;
         if (local_dof < {size} && friction_dof_eligible.data[dof] != 0 && kinematic_dof_mask.data[dof] == 0) {{
             // Honor the stride: callers may replace Model.joint_friction with a strided view.
-            bound = *reinterpret_cast<const float*>(
-                reinterpret_cast<const char*>(joint_friction.data) + dof * joint_friction.strides[0]) * dt;
-            active = bound > 0.0f;
+            const float friction = *reinterpret_cast<const float*>(
+                reinterpret_cast<const char*>(joint_friction.data) + dof * joint_friction.strides[0]);
+            bound = friction * dt;
+            // Non-finite or negative coefficients build no row; notify flags them.
+            active = bound > 0.0f && isfinite(friction);
         }}
 
         const unsigned active_mask = __ballot_sync(MASK, active != 0);

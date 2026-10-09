@@ -81,6 +81,18 @@ class TestFeatherPGSReset(unittest.TestCase):
                 _assert_worlds(self, specs, (True, True))
                 self.assertTrue(solver.constraint_overflow.numpy().all())
 
+    def test_model_change_world_mask_limits_impulse_invalidation(self):
+        """Invalidate impulses only in the masked worlds, in either mask layout."""
+        model = _build_two_world_free_model("cpu")
+        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        for mask in ((False, True), (False, True, False)):
+            with self.subTest(mask=mask):
+                specs = _history_specs(solver)
+                _poison(specs)
+                world_mask = wp.array(mask, dtype=wp.bool, device=model.device)
+                solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES, world_mask=world_mask)
+                _assert_worlds(self, specs, (False, True))
+
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
             ("dense selected", "split", True, False, (True, False)),
