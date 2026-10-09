@@ -953,7 +953,7 @@ class TestFeatherPGSAngularFrictionBlock(unittest.TestCase):
 
     def test_off_center_ball_joint_contact_stops_without_gaining_energy(self):
         """An off-center contact on a ball-jointed body, whose stopping impulse lies inside both cones, loses its
-        energy and never gains any."""
+        energy, and no friction visit ends above its starting impulses moved into the cone."""
         principal = np.array([0.0009087130361371299, 0.1, 0.10090871303613713])
         axes = np.array(
             [

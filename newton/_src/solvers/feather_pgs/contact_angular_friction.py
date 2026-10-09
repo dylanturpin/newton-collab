@@ -17,7 +17,7 @@ when it lies inside the cone.
   factorization to a 1e-5 relative boundary residual. When that fails (dependent rows, a
   collapsed bracket, or 40 steps), the block is solved again with a proximal term
   ``0.5 rho (y - y_0)' diag(H) (y - y_0)`` about the current impulses, raising ``rho`` until
-  it converges. The term vanishes at the optimum, so repeated visits still converge to it.
+  it converges. The term vanishes at the optimum, so an optimum of the block stays a fixed point.
 - ``"pyramidal"``: ``|f_t| / mu + |tau_s| / mu_s + |tau_r| / mu_r <= lambda_n``, an L1 norm
   over the three blocks with a disk inside the sliding and rolling blocks. This is not
   MuJoCo's component-wise pyramid. Accelerated projected gradient in group-scaled
@@ -28,8 +28,9 @@ when it lies inside the cone.
 
 Either cone's answer then passes an exact line search from the current impulses, moved into
 the cone, whose curvature is evaluated through the rows' Jacobian and response rather than
-the float32 block matrix. A visit therefore never raises the block objective (the kinetic
-energy, without creep or targets) beyond rounding of the step itself.
+the float32 block matrix. The block objective (the kinetic energy, without creep or targets)
+therefore never ends above its value at the starting impulses moved into the cone, beyond
+rounding of the step itself.
 
 An optional creep speed ``s`` [m/s] adds a compliance to the angular rows: below the
 bound the coefficient times the relative angular rate settles at ``s`` times the load
@@ -506,8 +507,8 @@ __PROJECT__
                 for (int k = 0; k < 5; ++k) step[k] = fmaxf(mu_rows[k], 0.0f) * y[k];
             }
             // Exact line search toward that answer from the current impulses moved into the cone. Its slope and
-            // curvature come from J, Y and v rather than the rounded 5x5 block, so the visit cannot raise the
-            // block objective.
+            // curvature come from J, Y and v rather than the rounded 5x5 block, so the result cannot raise the
+            // block objective above its value at that projected start.
             for (int k = 0; k < 5; ++k) y[k] = active[k] ? lam[k] / mu_rows[k] : 0.0f;
             project(y, unit, load);
             for (int k = 0; k < 5; ++k) {
