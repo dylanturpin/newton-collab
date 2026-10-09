@@ -1127,8 +1127,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     ``joint_friction_invalid`` is the matching device boolean array for invalid
     :attr:`~newton.Model.joint_friction` written before a notify, including one
-    replayed from a CUDA graph. It persists across :meth:`reset` until
-    :meth:`check_joint_friction` reports it.
+    replayed from a CUDA graph. Each entry is the solver world that owns the
+    DOF, loop-closing joints included. It persists across :meth:`reset` until
+    :meth:`check_joint_friction` reports and clears it; reporting acknowledges the
+    error and leaves the coefficients and the affected trajectory as they were,
+    so treat a raised check as a reason to discard or repair those worlds.
 
     Global (world ``-1``) articulations are solved in world 0. With
     ``pgs_mode="matrix_free"`` and ``articulated_contact_response="immediate"``
@@ -3273,10 +3276,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             model.joint_type.numpy(), (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
         )
         supported &= self._model_plan.loop_joint_articulation < 0
+        # A loop joint belongs to the articulation that closes it; other unowned joints keep their model world.
         joint_articulation = model.joint_articulation.numpy()
-        joint_world = np.zeros(model.joint_count, dtype=np.int32)
-        in_articulation = joint_articulation >= 0
-        joint_world[in_articulation] = self._model_plan.articulation_world[joint_articulation[in_articulation]]
+        joint_articulation = np.where(
+            joint_articulation >= 0, joint_articulation, self._model_plan.loop_joint_articulation
+        )
+        joint_world = model.joint_world.numpy().astype(np.int32)
+        joint_world[(joint_world < 0) | (joint_world >= self._model_plan.world_count)] = 0
+        owned = joint_articulation >= 0
+        joint_world[owned] = self._model_plan.articulation_world[joint_articulation[owned]]
         self._friction_dof_supported = wp.array(
             supported[joint_dof_joint].astype(np.int32), dtype=wp.int32, device=model.device
         )
@@ -14318,10 +14326,11 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
         int active = 0;
         if (local_dof < {size} && friction_dof_eligible.data[dof] != 0 && kinematic_dof_mask.data[dof] == 0) {{
             // Honor the stride: callers may replace Model.joint_friction with a strided view.
-            bound = *reinterpret_cast<const float*>(
-                reinterpret_cast<const char*>(joint_friction.data) + dof * joint_friction.strides[0]) * dt;
+            const float friction = *reinterpret_cast<const float*>(
+                reinterpret_cast<const char*>(joint_friction.data) + dof * joint_friction.strides[0]);
+            bound = friction * dt;
             // Non-finite or negative coefficients build no row; notify flags them.
-            active = bound > 0.0f && isfinite(bound);
+            active = bound > 0.0f && isfinite(friction);
         }}
 
         const unsigned active_mask = __ballot_sync(MASK, active != 0);

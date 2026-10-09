@@ -265,6 +265,11 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
                 _, qd = _advance(solver, states, control, 5)
                 np.testing.assert_array_equal(qd, frictionless)
 
+    def test_finite_coefficient_with_unrepresentable_bound_still_sticks(self):
+        """Keep the row of a finite coefficient whose impulse bound overflows to infinity."""
+        model = _single_dof_model("revolute", friction=float(np.finfo(np.float32).max))
+        np.testing.assert_array_equal(_run(model, effort=2.5, steps=3, dt=2.0), 0.0)
+
     def test_captured_notify_replay_matches_eager(self):
         """Replay per-world friction writes, notify and steps bit-identically to the eager sequence."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))

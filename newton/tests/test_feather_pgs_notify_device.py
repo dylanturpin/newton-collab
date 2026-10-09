@@ -191,6 +191,53 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.joint_friction.zero_()
         solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free joint friction requires CUDA")
+    def test_invalid_joint_friction_flags_the_owning_world(self):
+        """Attribute loop-closing and global DOFs to their solver world in a sparse layout."""
+        device = wp.get_device("cuda:0")
+        model, dofs = _build_loop_model(device)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        self.assertEqual(solver.world_count, 3)
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        cases = (
+            (dofs["loop"], 0.5, 2, "loop joint"),
+            (dofs["chain"], -1.0, 2, "finite and non-negative"),
+            (dofs["global"], -1.0, 0, "finite and non-negative"),
+        )
+        for dof, value, world, message in cases:
+            with self.subTest(dof=dof, value=value):
+                friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+                friction[dof] = value
+                model.joint_friction.assign(friction)
+                wp.capture_launch(capture.graph)
+                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(3) == world)
+                with self.assertRaisesRegex(ValueError, message):
+                    solver.check_joint_friction()
+                model.joint_friction.zero_()
+                solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+
+
+def _build_loop_model(device):
+    """Loop-closed chains of different sizes in worlds 0 and 2, static geometry in world 1, and a global chain."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for link_count in (3, 0, 2):
+        builder.begin_world()
+        if link_count == 0:
+            builder.add_shape_box(-1, hx=0.1, hy=0.1, hz=0.1)
+        else:
+            links = [builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3))) for _ in range(link_count)]
+            joints = [builder.add_joint_revolute(-1, link, axis=newton.Axis.Y) for link in links]
+            builder.add_articulation(joints)
+            loop = builder.add_joint_ball(links[0], links[-1])
+        builder.end_world()
+    global_link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, global_link, axis=newton.Axis.Y)])
+    model = builder.finalize(device=device)
+    joint_qd_start = model.joint_qd_start.numpy()
+    joint_dofs = {"loop": loop, "chain": joints[1], "global": model.joint_count - 1}
+    return model, {name: int(joint_qd_start[joint]) for name, joint in joint_dofs.items()}
+
 
 def _build_model(device):
     """Worlds with a free sphere, a 3-link and a 2-link revolute chain: three response sizes."""
