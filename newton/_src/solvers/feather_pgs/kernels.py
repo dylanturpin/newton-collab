@@ -177,6 +177,20 @@ def gather_group_armature(
 
 
 @wp.kernel
+def flag_invalid_joint_friction(
+    joint_friction: wp.array[float],
+    friction_dof_supported: wp.array[wp.int32],
+    dof_world: wp.array[wp.int32],
+    # outputs
+    joint_friction_invalid: wp.array[wp.bool],
+):
+    dof = wp.tid()
+    friction = joint_friction[dof]
+    if not wp.isfinite(friction) or friction < 0.0 or (friction > 0.0 and friction_dof_supported[dof] == 0):
+        joint_friction_invalid[dof_world[dof]] = True
+
+
+@wp.kernel
 def clamp_free_root_velocity_limits(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],

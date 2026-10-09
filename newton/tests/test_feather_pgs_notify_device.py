@@ -106,18 +106,90 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         self.assertLess(np.count_nonzero(expected_valid), np.count_nonzero(valid_before))
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
-    def test_joint_friction_is_validated_only_on_eager_notify(self):
-        """Replay a captured notify without checking friction; the next eager notify rejects it."""
+    def test_captured_notify_flags_invalid_joint_friction(self):
+        """Latch the world of each invalid coefficient on replay and report it outside capture."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
         solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
-        model.joint_friction.fill_(-1.0)
+        revolute, free = _friction_dofs(model)
+        cases = (
+            (revolute[1], -1.0, "finite and non-negative"),
+            (revolute[2], float("nan"), "finite and non-negative"),
+            (revolute[0], float("inf"), "finite and non-negative"),
+            (free[1], 0.5, "FREE"),
+        )
+        for dof, value, message in cases:
+            with self.subTest(value=value, unsupported=dof in free.values()):
+                friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+                friction[dof] = value
+                model.joint_friction.assign(friction)
+                wp.capture_launch(capture.graph)
+                expected = _dof_world(model)[dof] == np.arange(WORLD_COUNT)
+                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), expected)
+                with self.assertRaisesRegex(ValueError, message):
+                    solver.check_joint_friction()
+                self.assertFalse(solver.joint_friction_invalid.numpy().any())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
+    def test_invalid_joint_friction_stays_latched_until_reported(self):
+        """Keep the flag through later valid replays and resets until the host reports it once."""
+        device = wp.get_device("cuda:0")
+        model = _build_model(device)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        revolute, _ = _friction_dofs(model)
+        friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+        friction[revolute[1]] = -1.0
+        model.joint_friction.assign(friction)
         wp.capture_launch(capture.graph)
-        wp.synchronize_device(device)
+        model.joint_friction.zero_()
+        wp.capture_launch(capture.graph)
+        solver.reset(model.state())
+        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), [False, True, False])
+        with self.assertRaisesRegex(ValueError, r"captured notify in worlds \[1\]"):
+            solver.check_joint_friction()
+        solver.check_joint_friction()
+        solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
+    def test_valid_joint_friction_replays_without_flags(self):
+        """Leave the flag clear for valid coefficients, including zero and supported nonzero values."""
+        device = wp.get_device("cuda:0")
+        model = _build_model(device)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        revolute, _ = _friction_dofs(model)
+        rng = np.random.default_rng(3)
+        for _ in range(3):
+            friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+            dofs = np.flatnonzero(_revolute_dof_mask(model))
+            friction[dofs] = rng.uniform(0.0, 2.0, dofs.size).astype(np.float32)
+            friction[revolute[0]] = 0.0
+            model.joint_friction.assign(friction)
+            wp.capture_launch(capture.graph)
+            self.assertFalse(solver.joint_friction_invalid.numpy().any())
+        solver.check_joint_friction()
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free joint friction requires CUDA")
+    def test_eager_notify_raises_for_invalid_joint_friction(self):
+        """Raise from an eager notify after applying it, and accept the next valid notify."""
+        model = _build_model(wp.get_device("cuda:0"))
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        revolute, _ = _friction_dofs(model)
+        model.joint_armature.fill_(0.3)
+        friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+        friction[revolute[2]] = -1.0
+        model.joint_friction.assign(friction)
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        self.assertFalse(solver.joint_friction_invalid.numpy().any())
+        self.assertTrue(np.all(solver._joint_armature_device.numpy() == np.float32(0.3)))
+        model.joint_friction.zero_()
+        solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
 
 
 def _build_model(device):
@@ -148,6 +220,26 @@ def _build_model(device):
             builder.add_articulation(joints)
         builder.end_world()
     return builder.finalize(device=device)
+
+
+def _dof_world(model):
+    joint_world = model.joint_world.numpy()
+    return np.repeat(joint_world, np.diff(model.joint_qd_start.numpy()))
+
+
+def _revolute_dof_mask(model):
+    joint_type = model.joint_type.numpy()
+    return np.repeat(joint_type == int(newton.JointType.REVOLUTE), np.diff(model.joint_qd_start.numpy()))
+
+
+def _friction_dofs(model):
+    """First revolute DOF and first free-joint DOF of each world."""
+    world = _dof_world(model)
+    free = np.repeat(model.joint_type.numpy() == int(newton.JointType.FREE), np.diff(model.joint_qd_start.numpy()))
+    revolute = _revolute_dof_mask(model)
+    return tuple(
+        {w: int(np.flatnonzero(mask & (world == w))[0]) for w in range(WORLD_COUNT)} for mask in (revolute, free)
+    )
 
 
 def _assert_armature_matches(test, solver, fresh):
