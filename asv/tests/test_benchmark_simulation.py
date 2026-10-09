@@ -165,7 +165,7 @@ class TestSimulationBenchmarks(unittest.TestCase):
         """Cover selector crossovers, duplicate-heavy hulls, and every convex type."""
         self.assertEqual(
             tuple(bench_contacts.FastConvexCollision.params[0]),
-            (("hulls", 56), ("hulls_duplicate", 192), ("mixed", 191)),
+            (("hulls", 56), ("hulls_duplicate", 192), ("mixed", 64), ("mixed", 153), ("mixed", 191)),
         )
         self.assertEqual(
             {shape for pair in bench_contacts.MIXED_CONVEX_PAIR_TYPES for shape in pair},
