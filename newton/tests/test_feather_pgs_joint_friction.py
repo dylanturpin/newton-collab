@@ -252,6 +252,62 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
         wp.capture_launch(capture.graph)
         self.assertAlmostEqual(float(states[0].joint_qd.numpy()[0]), before - 0.5 / INERTIA * 4 * DT, delta=1.0e-5)
 
+    def test_invalid_coefficients_build_no_rows(self):
+        """Step an invalid coefficient as frictionless."""
+        frictionless = _run(_single_dof_model("revolute", friction=0.0), effort=2.5, steps=5)
+        for value in (float("inf"), float("nan"), -1.0):
+            with self.subTest(value=value):
+                model = _single_dof_model("revolute", friction=0.0)
+                solver = _solver(model)
+                states, control = [model.state(), model.state()], model.control()
+                control.joint_f.assign([2.5])
+                model.joint_friction.assign([value])
+                _, qd = _advance(solver, states, control, 5)
+                np.testing.assert_array_equal(qd, frictionless)
+
+    def test_finite_coefficient_with_unrepresentable_bound_still_sticks(self):
+        """Keep the row of a finite coefficient whose impulse bound overflows to infinity."""
+        model = _single_dof_model("revolute", friction=float(np.finfo(np.float32).max))
+        np.testing.assert_array_equal(_run(model, effort=2.5, steps=3, dt=2.0), 0.0)
+
+    def test_captured_notify_replay_matches_eager(self):
+        """Replay per-world friction writes, notify and steps bit-identically to the eager sequence."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for _ in range(2):
+            builder.add_world(_single_dof_builder("revolute", friction=0.0))
+        rng = np.random.default_rng(4)
+        coefficients = rng.uniform(0.0, 3.0, (4, 2)).astype(np.float32)
+        runs = []
+        for captured in (False, True):
+            model = builder.finalize()
+            solver = _solver(model)
+            states, control = [model.state(), model.state()], model.control()
+            control.joint_f.assign([2.0, -2.0])
+            states[0].joint_qd.assign([0.5, -0.5])
+            _advance(solver, states, control, 2)
+
+            def episode(solver=solver, states=states, control=control):
+                solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+                for _ in range(2):
+                    solver.step(states[0], states[1], control, None, DT)
+                    solver.step(states[1], states[0], control, None, DT)
+
+            if captured:
+                with wp.ScopedCapture(device=model.device) as capture:
+                    solver.seed_double_buffer_events()
+                    episode()
+            qd = []
+            for row in coefficients:
+                model.joint_friction.assign(row)
+                if captured:
+                    wp.capture_launch(capture.graph)
+                else:
+                    episode()
+                qd.append(states[0].joint_qd.numpy().copy())
+            self.assertFalse(solver.joint_friction_invalid.numpy().any())
+            runs.append(np.array(qd))
+        np.testing.assert_array_equal(runs[1], runs[0])
+
     def test_reset_starts_from_cold_rows(self):
         """Reproduce a fresh trajectory after a full or masked reset and state rewrite."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
