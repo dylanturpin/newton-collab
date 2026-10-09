@@ -678,8 +678,8 @@ def _check_layout(slots, offsets, owners, origins, world_count, count_per_world,
     """Check one frequency of every selected articulation against the first one.
 
     Each articulation (slot) must select the same number of values, with the same offsets from its
-    origin and the same owning joint or link, and origins must be uniformly strided within worlds.
-    Origins that are not uniformly strided between worlds yield a layout with explicit model indices.
+    origin and the same owning joint or link. Origins that are not uniformly strided yield a layout
+    with explicit model indices.
 
     With ``explicit_values``, matching counts and owners suffice: when the offsets differ between
     articulations or the origins are irregular within worlds, the layout records the absolute row
@@ -720,14 +720,9 @@ def _check_layout(slots, offsets, owners, origins, world_count, count_per_world,
                 world_count, count_per_world, count
             )
         elif misplaced.any():
-            if regular_within:
-                # Sparse or uneven worlds: rows are regular within every world but the worlds are not
-                # evenly spaced (e.g. other articulation types occupy the worlds in between). Address
-                # them through explicit absolute row maps (gather/scatter) instead of one strided view.
-                model_starts = grid.tolist()
-            else:
-                reasons.append("start indices are not uniformly strided")
-                failed |= misplaced.ravel()
+            # Sparse, uneven, or interleaved worlds (e.g. other articulation types between the selected
+            # ones): address every articulation through its absolute first row (gather/scatter).
+            model_starts = grid.tolist()
     if reasons:
         world, articulation = divmod(int(np.argmax(failed)), count_per_world)
         return None, f"{'; '.join(reasons)} (first at world {world}, articulation {articulation})", uniform_count
@@ -1346,6 +1341,7 @@ class ArticulationView:
             value_extent = template_rows[-1] - offset + 1
             starts = [[rows[0] for rows in world_rows] for world_rows in articulation_rows]
             reason = None
+            # Non-uniform strides fall back to explicit absolute row maps, as for model entities.
             frequency_explicit = False
 
             if count_per_world > 1:
@@ -1354,16 +1350,14 @@ class ArticulationView:
                     for world in range(world_count)
                     for articulation in range(1, count_per_world)
                 ]
-                if not all_equal(inner_strides):
-                    reason = f"Non-uniform strides within worlds for custom frequency '{frequency}' are not supported"
+                frequency_explicit = not all_equal(inner_strides)
                 inner_stride = inner_strides[0]
             else:
                 inner_stride = value_extent
 
             if world_count > 1:
                 outer_strides = [starts[world][0] - starts[world - 1][0] for world in range(1, world_count)]
-                # Uneven world spacing falls back to explicit absolute row maps, as for model entities.
-                frequency_explicit = not all_equal(outer_strides)
+                frequency_explicit |= not all_equal(outer_strides)
                 outer_stride = outer_strides[0]
             else:
                 outer_stride = inner_stride * count_per_world
