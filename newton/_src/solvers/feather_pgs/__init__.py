@@ -13,8 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .solver_feather_pgs import SolverFeatherPGS
+"""FeatherPGS solver module.
+
+Use :class:`~newton.solvers.SolverFeatherPGS` as the canonical public solver class.
+"""
+
+from .differentiable import SmoothContactLaw
 
 __all__ = [
-    "SolverFeatherPGS",
+    "SmoothContactLaw",
 ]
