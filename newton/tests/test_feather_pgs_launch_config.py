@@ -1110,8 +1110,8 @@ def test_coupled_view_rejects_unowned_disabled_joint(test, device):
         SolverCoupled(model=_build_prismatic_links(device, (True, False)), entries=[entry])
 
 
-def _build_admm_ball_chain(device, *, cross_joint_enabled: bool):
-    """Build a prismatic parent with a ball-jointed child in world 0 and a lone prismatic link in world 1."""
+def _build_admm_cross_chain(device, *, cross_joint: str = "ball", cross_joint_enabled: bool = True):
+    """Build a prismatic parent with a ``cross_joint`` child in world 0 and a lone prismatic link in world 1."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.begin_world()
     parent = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
@@ -1121,13 +1121,18 @@ def _build_admm_ball_chain(device, *, cross_joint_enabled: bool):
         inertia=wp.mat33(np.eye(3) * 0.01),
     )
     slide = builder.add_joint_prismatic(-1, parent, axis=newton.Axis.X)
-    ball = builder.add_joint_ball(
-        parent,
-        child,
-        child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
-        enabled=cross_joint_enabled,
-    )
-    builder.add_articulation([slide, ball])
+    if cross_joint == "ball":
+        joint = builder.add_joint_ball(
+            parent,
+            child,
+            child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
+            enabled=cross_joint_enabled,
+        )
+    elif cross_joint == "free":
+        joint = builder.add_joint_free(child, parent=parent)
+    else:
+        joint = builder.add_joint_distance(parent, child, min_distance=0.0, max_distance=0.305)
+    builder.add_articulation([slide, joint])
     builder.end_world()
     builder.begin_world()
     builder.add_articulation(
@@ -1141,11 +1146,11 @@ def _build_admm_ball_chain(device, *, cross_joint_enabled: bool):
     return builder.finalize(device=device)
 
 
-def _admm_ball_chain_solver(model):
+def _admm_cross_chain_solver(model):
     def fpgs(view):
         return SolverFeatherPGS(view, pgs_mode="split")
 
-    # The world-1 link makes both entries heterogeneous, so their views keep the full layout and the ball joint.
+    # The world-1 link makes both entries heterogeneous, so their views keep the full layout and the cross joint.
     return SolverCoupledADMM(
         model=model,
         entries=[
@@ -1165,8 +1170,8 @@ def _admm_ball_chain_solver(model):
 
 def test_admm_views_accept_cross_solver_joints(test, device):
     """FeatherPGS entries accept the unowned cross-solver joint that ADMM enforces, and only while it is enabled."""
-    model = _build_admm_ball_chain(device, cross_joint_enabled=True)
-    solver = _admm_ball_chain_solver(model)
+    model = _build_admm_cross_chain(device)
+    solver = _admm_cross_chain_solver(model)
     for name, marked in (("parent", [1, 2]), ("child", [0, 1])):
         test.assertEqual(solver.view(name).coupling_disabled_joints.numpy().tolist(), marked)
 
@@ -1182,7 +1187,15 @@ def test_admm_views_accept_cross_solver_joints(test, device):
     test.assertAlmostEqual(float(body_x[1] - body_x[0]), 0.3, delta=1.0e-3)
 
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
-        _admm_ball_chain_solver(_build_admm_ball_chain(device, cross_joint_enabled=False))
+        _admm_cross_chain_solver(_build_admm_cross_chain(device, cross_joint_enabled=False))
+
+
+def test_admm_views_reject_unattached_cross_solver_joints(test, device):
+    """FREE and DISTANCE cross-solver joints get no ADMM attachment, so no one advances them and FeatherPGS raises."""
+    for cross_joint in ("free", "distance"):
+        with test.subTest(cross_joint=cross_joint):
+            with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+                _admm_cross_chain_solver(_build_admm_cross_chain(device, cross_joint=cross_joint))
 
 
 def _build_box_with_equality(device, *, enabled: bool, target_kind: int = 0, target: int = -1):
@@ -1374,6 +1387,7 @@ for _test in (
     test_coupled_views_accept_joints_other_entries_own,
     test_coupled_view_rejects_unowned_disabled_joint,
     test_admm_views_accept_cross_solver_joints,
+    test_admm_views_reject_unattached_cross_solver_joints,
     test_unconverted_equality_constraints_raise,
     test_equality_link_must_name_the_projected_constraint,
     test_enabling_equality_constraint_at_runtime_raises,
