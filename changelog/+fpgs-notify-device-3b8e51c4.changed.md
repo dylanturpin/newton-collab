@@ -1,0 +1,1 @@
+Run ``SolverFeatherPGS.notify_model_changed`` for ``JOINT_DOF_PROPERTIES`` (armature) and ``SHAPE_PROPERTIES`` (patch-friction geometry) on the device, so these notifications no longer copy model arrays to the host and can be captured in a CUDA graph.

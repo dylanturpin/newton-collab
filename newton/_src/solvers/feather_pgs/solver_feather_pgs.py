@@ -120,6 +120,7 @@ from .kernels import (
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
     compute_delta_and_accumulate,
+    compute_effective_joint_armature,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -154,6 +155,7 @@ from .kernels import (
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
     gather_dense_warmstart,
+    gather_group_armature,
     gather_JY_to_world,
     gather_mf_warmstart,
     gather_propagation_unit_meta,
@@ -2851,7 +2853,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             else wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         )
         self._allocate_debug_buffers(model)
-        self._scatter_armature_to_groups()
+        self._update_effective_armature()
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
@@ -3043,9 +3045,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         return 0 if self._compliance is None else _contact_compliance.counts(self)[1]
 
     def _update_kinematic_state(self) -> None:
-        """Refresh cached kinematic flags and effective joint armature."""
+        """Refresh cached kinematic flags from the host copy of ``body_flags``."""
         model = self.model
-        armature = model.joint_armature.numpy().copy()
         joint_mask = np.zeros(model.joint_count, dtype=np.int32)
         dof_mask = np.zeros(model.joint_dof_count, dtype=np.int32)
 
@@ -3057,12 +3058,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 if not kinematic_bodies[joint_child[joint]]:
                     continue
                 joint_mask[joint] = 1
-                dof_start = joint_qd_start[joint]
-                dof_end = joint_qd_start[joint + 1]
-                if dof_end <= dof_start:
-                    continue
-                dof_mask[dof_start:dof_end] = 1
-                armature[dof_start:dof_end] = 1.0e10
+                dof_mask[joint_qd_start[joint] : joint_qd_start[joint + 1]] = 1
 
         if self._model_plan is not None:
             selected = np.nonzero(self._model_plan.prescribed_articulation != 0)[0]
@@ -3075,13 +3071,35 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         "reconstruct the solver and recapture its CUDA graph."
                     )
 
-        self._joint_armature_effective = armature
-        if armature.size:
-            self._joint_armature_device.assign(armature.astype(np.float32))
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
         self._refresh_body_prescribed()
+
+    def _update_effective_armature(self) -> None:
+        """Rebuild the effective joint armature and its size-grouped copies on the device."""
+        model = self.model
+        if model.joint_dof_count:
+            wp.launch(
+                compute_effective_joint_armature,
+                model.joint_dof_count,
+                inputs=[model.joint_armature, self._kinematic_dof_mask],
+                outputs=[self._joint_armature_device],
+                device=model.device,
+            )
+        for size in self.size_groups:
+            wp.launch(
+                gather_group_armature,
+                (self.n_arts_by_size[size], size),
+                inputs=[
+                    self.group_to_art[size],
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    self._joint_armature_device,
+                ],
+                outputs=[self.R_by_size[size]],
+                device=model.device,
+            )
 
     def _refresh_body_prescribed(self) -> None:
         """Mark bodies whose propagation response is identically zero.
@@ -3108,9 +3126,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
-        With patch friction enabled, shape-property notifications copy geometry
-        to the host and synchronize with the device; issue them outside CUDA graph
-        capture. Ordinary simulation steps do not perform those host copies.
+        ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES``
+        and ``SHAPE_PROPERTIES`` run on the device and may be captured in a CUDA graph,
+        unless sleeping is enabled. ``BODY_PROPERTIES`` reads ``body_flags`` on the host.
+        Under capture, ``JOINT_DOF_PROPERTIES`` skips the host check of ``joint_friction``.
         Material-equivalence changes also require
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
@@ -3132,14 +3151,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             | ModelFlags.MODEL_PROPERTIES
         ):
             self._fk_id_cache_valid.zero_()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+        if flags & ModelFlags.BODY_PROPERTIES:
             self._update_kinematic_state()
-            self._scatter_armature_to_groups()
+        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+            self._update_effective_armature()
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.JOINT_PROPERTIES:
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
-        if self.enable_joint_friction and flags & ModelFlags.JOINT_DOF_PROPERTIES:
+        if (
+            self.enable_joint_friction
+            and flags & ModelFlags.JOINT_DOF_PROPERTIES
+            and not wp.get_stream(self.model.device).is_capturing
+        ):
             self._validate_joint_friction()
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia
@@ -6554,29 +6578,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._diag_dummy_jacobian = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device)
         self._diag_dummy_body_index = wp.full((worlds, 1), -1, dtype=wp.int32, device=device)
         self._diag_dummy_body_qd = wp.zeros((1, 6), dtype=wp.float32, device=device)
-
-    def _scatter_armature_to_groups(self):
-        """Copy armature from model (DOF-ordered) to size-grouped storage."""
-        if not self.size_groups:
-            return
-
-        armature_np = self._joint_armature_effective
-        art_dof_start_np = self._model_plan.articulation_dof_start
-        art_H_rows_np = self._model_plan.articulation_dof_count
-
-        # R_by_size is sized to actual DOF count (matches H_by_size allocation)
-        for size in self.size_groups:
-            n_arts = self.n_arts_by_size[size]
-            R_np = np.zeros((n_arts, size), dtype=np.float32)
-
-            group_to_art_np = np.flatnonzero(self._model_plan.response_dof_count == size)
-            for group_idx in range(n_arts):
-                art_idx = group_to_art_np[group_idx]
-                dof_start = art_dof_start_np[art_idx]
-                dof_count = art_H_rows_np[art_idx]
-                R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
-
-            self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
