@@ -456,26 +456,61 @@ __PROJECT__
             return interior;
         }
 
+        // The ball solve of the proximal problem about center. Out of line, so the pass keeps its arrays in memory.
+        static __device__ __noinline__ bool proximal_step(
+            const Row* K, const float* c, const float* weight, const bool* active, float load, const float* center,
+            float* y, bool* interior) {
+            float g[5];
+            for (int k = 0; k < 5; ++k) g[k] = c[k] - weight[k] * center[k];
+            return cholesky_ball(K, g, active, load, y, interior);
+        }
+
+        static __device__ float objective(const Row* H, const float* c, const float* y) {
+            float value = 0.0f;
+            for (int k = 0; k < 5; ++k) {
+                float half = 0.5f * H[k][k] * y[k] + c[k];
+                for (int l = 0; l < k; ++l) half += H[k][l] * y[l];
+                value += half * y[k];
+            }
+            return value;
+        }
+
         // Adds 0.5 rho (y - center)' diag(H) (y - center), which keeps the fixed point and makes the block definite,
-        // and raises rho until the ball solve converges. y keeps the first pass's result if none does.
-        // Out of line, so the sweep that inlines the block solve keeps its register budget.
+        // raising rho until the ball solve converges, then repeats it about each answer: every repeat shrinks the
+        // remaining error along a direction of curvature lambda by rho / (rho + lambda). y keeps the first pass's
+        // result if no rho converges. Out of line, so the sweep that inlines the block solve keeps its registers.
         static __device__ __noinline__ bool proximal_pass(
             const Row* H, const float* c, const bool* active, float load, const float* center, float* y, bool interior) {
-            float K[5][5], g[5], trial[5];
+            float K[5][5], weight[5], trial[5], next[5];
             #pragma unroll 1
             for (float rho = 1.0e-5f; rho < 100.0f; rho *= 100.0f) {
                 #pragma unroll 1
                 for (int k = 0; k < 5; ++k) {
-                    float weight = live(H, active, k) ? rho * H[k][k] : 0.0f;
+                    weight[k] = live(H, active, k) ? rho * H[k][k] : 0.0f;
                     for (int l = 0; l < 5; ++l) K[k][l] = H[k][l];
-                    K[k][k] += weight;
-                    g[k] = c[k] - weight * center[k];
+                    K[k][k] += weight[k];
+                    trial[k] = center[k];
                 }
-                bool trial_interior = false;
-                if (!cholesky_ball(K, g, active, load, trial, &trial_interior)) continue;
-                bool finite = true;
-                for (int k = 0; k < 5; ++k) finite = finite && isfinite(trial[k]);
-                if (!finite) continue;
+                bool converged = false, trial_interior = false;
+                #pragma unroll 1
+                for (int repeat = 0; repeat < 8; ++repeat) {
+                    bool next_interior = false;
+                    // A repeat whose boundary Newton stalls is kept when it still lowers the block objective.
+                    bool solved = proximal_step(K, c, weight, active, load, trial, next, &next_interior);
+                    if (!solved && (repeat == 0 || !(objective(H, c, next) < objective(H, c, trial)))) break;
+                    float change = 0.0f;
+                    bool finite = true;
+                    for (int k = 0; k < 5; ++k) {
+                        finite = finite && isfinite(next[k]);
+                        change = fmaxf(change, fabsf(next[k] - trial[k]));
+                    }
+                    if (!finite) break;
+                    for (int k = 0; k < 5; ++k) trial[k] = next[k];
+                    converged = true;
+                    trial_interior = next_interior;
+                    if (change <= 1.0e-6f * load) break;
+                }
+                if (!converged) continue;
                 for (int k = 0; k < 5; ++k) y[k] = trial[k];
                 return trial_interior;
             }
