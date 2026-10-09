@@ -952,6 +952,21 @@ class SolverCoupledADMM(SolverCoupled):
     def _entry_proxy_joint_keep_indices(self, name: str) -> set[int]:
         return set(self._admm_joint_proxy_joint_keep.get(name, ()))
 
+    def _coupling_managed_joint_indices(self) -> set[int]:
+        """Return the enabled cross-solver joints that ADMM attachments enforce."""
+        if self.model.joint_count == 0:
+            return set()
+        joint_enabled = self.model.joint_enabled.numpy()
+        joint_parent = self.model.joint_parent.numpy()
+        joint_child = self.model.joint_child.numpy()
+        return {
+            joint
+            for joint in range(self.model.joint_count)
+            if bool(joint_enabled[joint])
+            and self._joint_owner[joint] < 0
+            and self._cross_solver_joint_entries(joint, int(joint_parent[joint]), int(joint_child[joint])) is not None
+        }
+
     def _after_entries_constructed(self) -> None:
         self._refresh_admm_joint_proxy_view_maps()
         self._cache_admm_joint_proxy_effective_masses()

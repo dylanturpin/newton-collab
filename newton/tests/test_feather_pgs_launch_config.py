@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.solvers.experimental.coupled import ModelView, SolverCoupled
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -1101,6 +1101,90 @@ def test_coupled_views_accept_joints_other_entries_own(test, device):
         )
 
 
+def test_coupled_view_rejects_unowned_disabled_joint(test, device):
+    """A caller-disabled joint that no entry owns raises even when the entry owns its child body."""
+    entry = SolverCoupled.Entry(
+        name="fpgs", solver=lambda view: SolverFeatherPGS(view, pgs_mode="split"), bodies=[0, 1], joints=[0]
+    )
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(model=_build_prismatic_links(device, (True, False)), entries=[entry])
+
+
+def _build_admm_ball_chain(device, *, cross_joint_enabled: bool):
+    """Build a prismatic parent with a ball-jointed child in world 0 and a lone prismatic link in world 1."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.begin_world()
+    parent = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+    child = builder.add_link(
+        xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3) * 0.01),
+    )
+    slide = builder.add_joint_prismatic(-1, parent, axis=newton.Axis.X)
+    ball = builder.add_joint_ball(
+        parent,
+        child,
+        child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
+        enabled=cross_joint_enabled,
+    )
+    builder.add_articulation([slide, ball])
+    builder.end_world()
+    builder.begin_world()
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(
+                -1, builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01)), axis=newton.Axis.X
+            )
+        ]
+    )
+    builder.end_world()
+    return builder.finalize(device=device)
+
+
+def _admm_ball_chain_solver(model):
+    def fpgs(view):
+        return SolverFeatherPGS(view, pgs_mode="split")
+
+    # The world-1 link makes both entries heterogeneous, so their views keep the full layout and the ball joint.
+    return SolverCoupledADMM(
+        model=model,
+        entries=[
+            SolverCoupled.Entry(name="parent", solver=fpgs, bodies=[0], joints=[0]),
+            SolverCoupled.Entry(name="child", solver=fpgs, bodies=[1, 2], joints=[2]),
+        ],
+        coupling=SolverCoupledADMM.Config(
+            iterations=12,
+            rho=40.0,
+            baumgarte=0.5,
+            joint_stiffness=500.0,
+            joint_angular_stiffness=50.0,
+            joint_proximal_bodies=False,
+        ),
+    )
+
+
+def test_admm_views_accept_cross_solver_joints(test, device):
+    """FeatherPGS entries accept the unowned cross-solver joint that ADMM enforces, and only while it is enabled."""
+    model = _build_admm_ball_chain(device, cross_joint_enabled=True)
+    solver = _admm_ball_chain_solver(model)
+    for name, marked in (("parent", [1, 2]), ("child", [0, 1])):
+        test.assertEqual(solver.view(name).coupling_disabled_joints.numpy().tolist(), marked)
+
+    state_in, state_out = model.state(), model.state()
+    control = model.control()
+    control.joint_f.assign(np.array([1.0] + [0.0] * (model.joint_dof_count - 1), dtype=np.float32))
+    for _ in range(60):
+        solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+        state_in, state_out = state_out, state_in
+    body_x = state_in.body_q.numpy()[:, 0]
+    # The ball attachment drags the 1 kg child along, halving the parent's 1 N acceleration.
+    test.assertAlmostEqual(float(body_x[0]), 0.0625, delta=0.005)
+    test.assertAlmostEqual(float(body_x[1] - body_x[0]), 0.3, delta=1.0e-3)
+
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        _admm_ball_chain_solver(_build_admm_ball_chain(device, cross_joint_enabled=False))
+
+
 def _build_box_with_equality(device, *, enabled: bool, target_kind: int = 0, target: int = -1):
     """Build a free box held to the world by a MuJoCo CONNECT equality row."""
     builder = newton.ModelBuilder()
@@ -1288,6 +1372,8 @@ for _test in (
     test_disabled_tree_joints_raise,
     test_caller_disabled_joints_raise_through_views,
     test_coupled_views_accept_joints_other_entries_own,
+    test_coupled_view_rejects_unowned_disabled_joint,
+    test_admm_views_accept_cross_solver_joints,
     test_unconverted_equality_constraints_raise,
     test_equality_link_must_name_the_projected_constraint,
     test_enabling_equality_constraint_at_runtime_raises,

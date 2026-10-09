@@ -147,11 +147,11 @@ class ModelView:
 
     @property
     def coupling_disabled_joints(self) -> wp.array[int]:
-        """View-local joints disabled because another coupled solver entry owns and simulates them."""
+        """View-local joints disabled here because another entry or the coupling algorithm simulates them."""
         return object.__getattribute__(self, "_coupling_disabled_joints")
 
     def mark_coupling_disabled_joints(self, joint_indices: wp.array[int]) -> None:
-        """Record the view-local joints another coupled solver entry owns; they stay disabled here."""
+        """Record the view-local joints another entry or the coupling algorithm simulates."""
         object.__setattr__(self, "_coupling_disabled_joints", joint_indices)
 
     @property

@@ -957,7 +957,7 @@ def _validate_tree_joints_enabled(model: Model) -> None:
         # A disabled loop-closing joint is a released closure, see set_loop_joint_enabled().
         disabled &= model.joint_articulation.numpy() >= 0
     if isinstance(model, ModelView):
-        # Another coupled solver entry owns and simulates these joints.
+        # Another coupled entry or the coupling algorithm simulates these joints.
         disabled[model.coupling_disabled_joints.numpy()] = False
     if np.any(disabled):
         raise NotImplementedError(
