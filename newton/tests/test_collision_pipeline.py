@@ -4,6 +4,7 @@
 import gc
 import unittest
 import warnings
+import weakref
 from collections import Counter
 from enum import IntFlag, auto
 from unittest import mock
@@ -507,6 +508,8 @@ def test_sdf_pipeline_garbage_collected_during_capture(test, device):
     pipeline = newton.CollisionPipeline(model)
     pipeline.collide(model.state(), pipeline.contacts())
     test.assertIsNotNone(pipeline._unit_scale_sdf_rescaled_host)
+    textures = [weakref.ref(texture) for texture in model._texture_sdf_coarse_textures if texture is not None]
+    test.assertGreater(len(textures), 0)
 
     values = wp.zeros(1, dtype=wp.int32, device=device)
     gc_was_enabled = gc.isenabled()
@@ -526,8 +529,10 @@ def test_sdf_pipeline_garbage_collected_during_capture(test, device):
 
     wp.capture_launch(capture.graph)
     test.assertEqual(int(values.numpy()[0]), 1)
-    capture_release.release_deferred()
+    # The next collection outside a capture runs the deferred releases.
+    gc.collect()
     test.assertEqual(len(capture_release._pending_releases), 0)
+    test.assertTrue(all(texture() is None for texture in textures))
 
 
 add_function_test(
