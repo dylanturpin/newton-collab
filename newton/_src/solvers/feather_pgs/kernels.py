@@ -1931,11 +1931,6 @@ def accumulate_torsion_wrenches_from_impulses(
         wp.atomic_add(body_contact_wrench, shape_body[contact_shape1[c]], wp.spatial_vector(wp.vec3(0.0), -torque))
 
 
-@wp.func
-def _connect_row_point_term(axis: wp.vec3, motion: wp.spatial_vector, rel: wp.vec3):
-    return wp.dot(axis, wp.spatial_top(motion) + wp.cross(wp.spatial_bottom(motion), rel))
-
-
 @wp.kernel
 def accumulate_connect_wrenches_from_impulses(
     connect_slot: wp.array[wp.int32],
@@ -1944,13 +1939,9 @@ def accumulate_connect_wrenches_from_impulses(
     connect_body_c: wp.array[wp.int32],
     connect_anchor_p: wp.array[wp.vec3],
     connect_anchor_c: wp.array[wp.vec3],
-    connect_parent_prescribed: wp.array[wp.int32],
+    connect_row_inv_norm: wp.array2d[float],
     art_to_world: wp.array[int],
     body_q: wp.array[wp.transform],
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
     body_to_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     world_constraint_count: wp.array[wp.int32],
@@ -1962,57 +1953,30 @@ def accumulate_connect_wrenches_from_impulses(
 ):
     """Add each loop closure's solved point-coincidence force to its parent and child bodies.
 
-    The rows are ``e_k . (v(p_A) - v(p_B))`` normalized by their generalized norm, which is rebuilt here from the
-    same motion subspaces, so the impulse maps back to a force along ``e_k`` at each anchor.
+    The rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse maps
+    back to a force along ``e_k`` at each anchor.
     """
     k = wp.tid()
     base_slot = connect_slot[k]
     if base_slot < 0:
         return
-    art = connect_art[k]
-    world = art_to_world[art]
+    world = art_to_world[connect_art[k]]
     body_p = connect_body_p[k]
     body_c = connect_body_c[k]
-    prescribed = connect_parent_prescribed[k] != 0
     p_a = connect_anchor_p[k]
     if body_p >= 0:
         p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
     p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
-    origin = articulation_origin[art]
-    rel_a = p_a - origin
-    rel_b = p_b - origin
     for axis_index in range(3):
         slot = base_slot + axis_index
         if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
             continue
+        inv_norm = connect_row_inv_norm[k, axis_index]
+        if inv_norm == 0.0:
+            continue
         axis = wp.vec3(0.0)
         axis[axis_index] = 1.0
-        # |J|^2 = |J_p|^2 + |J_c|^2 - 2 J_p.J_c, where the cross term runs over shared ancestor joints.
-        norm_sq = float(0.0)
-        if not prescribed:
-            parent_joint = body_to_joint[body_p]
-            while parent_joint != -1:
-                shared = int(0)
-                child_joint = body_to_joint[body_c]
-                while child_joint != -1:
-                    if child_joint == parent_joint:
-                        shared = 1
-                    child_joint = joint_ancestor[child_joint]
-                for d in range(joint_qd_start[parent_joint], joint_qd_start[parent_joint + 1]):
-                    a = _connect_row_point_term(axis, joint_S_s[d], rel_a)
-                    norm_sq += a * a
-                    if shared != 0:
-                        norm_sq -= 2.0 * a * _connect_row_point_term(axis, joint_S_s[d], rel_b)
-                parent_joint = joint_ancestor[parent_joint]
-        child_joint = body_to_joint[body_c]
-        while child_joint != -1:
-            for d in range(joint_qd_start[child_joint], joint_qd_start[child_joint + 1]):
-                b = _connect_row_point_term(axis, joint_S_s[d], rel_b)
-                norm_sq += b * b
-            child_joint = joint_ancestor[child_joint]
-        if norm_sq <= 1.0e-8:
-            continue
-        force = axis * (world_impulses[world, slot] * inv_dt / wp.sqrt(norm_sq))
+        force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
         _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
         _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
 
@@ -4055,6 +4019,7 @@ def populate_connect_J_for_size(
     world_row_cfm: wp.array2d[float],
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
+    connect_row_inv_norm: wp.array2d[float],
 ):
     """Populate Jacobian and metadata for connect (loop-closure) rows.
 
@@ -4151,6 +4116,7 @@ def populate_connect_J_for_size(
             for d in range(n_dofs):
                 norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
             phi_axis = delta[axis]
+            inv_norm = float(0.0)
             if norm_sq > 1.0e-8:
                 inv_norm = 1.0 / wp.sqrt(norm_sq)
                 for d in range(n_dofs):
@@ -4162,6 +4128,8 @@ def populate_connect_J_for_size(
                     J_group[group_idx, slot, d] = 0.0
                 phi_axis = 0.0
                 target = 0.0
+            # The joint wrench maps solved impulses back to forces with this exact scale.
+            connect_row_inv_norm[k, axis] = inv_norm
 
             world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
             world_row_parent[world, slot] = -1

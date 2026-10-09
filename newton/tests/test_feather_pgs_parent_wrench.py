@@ -10,6 +10,10 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import (
+    accumulate_connect_wrenches_from_impulses,
+    populate_connect_J_for_size,
+)
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
 from newton.tests.test_feather_pgs_connect import _build_carried_load, _build_four_bar, _prescribe_carrier
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
@@ -567,6 +571,130 @@ def test_parent_wrench_of_a_load_held_by_closures(test, device):
             np.testing.assert_allclose(observables.body_parent_f.numpy()[load], 0.0, atol=2.0e-3)
 
 
+NEAR_REDUNDANT_LEVERS = (0.02, 0.001, 0.0002, 0.00015)
+
+
+def test_closure_force_uses_the_row_builder_norm(test, device):
+    """A closure row whose shared-ancestor terms cancel maps its impulse back with the builder's own norm."""
+
+    def ints(values):
+        return wp.array(values, dtype=wp.int32, device=device)
+
+    for lever in NEAR_REDUNDANT_LEVERS:
+        with test.subTest(lever=lever):
+            zero = ints([0])
+            anchor = wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
+            body_q = wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device)
+            # A shared root hinge plus a child hinge whose closure anchor sits `lever` from its axis.
+            motion = wp.array(
+                [[0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0, -(1.0 - lever), 0.0, 0.0, 0.0, 1.0]],
+                dtype=wp.spatial_vector,
+                device=device,
+            )
+            body_to_joint, ancestor, qd_start = ints([0, 1]), ints([-1, 0]), ints([0, 1, 2])
+            origin = wp.zeros(1, dtype=wp.vec3, device=device)
+            J = wp.zeros((1, 3, 2), dtype=float, device=device)
+            row_type, row_parent = ints([[0, 0, 0]]), ints([[0, 0, 0]])
+            row_fields = [wp.zeros((1, 3), dtype=float, device=device) for _ in range(5)]
+            inv_norm = wp.zeros((1, 3), dtype=float, device=device)
+            wp.launch(
+                populate_connect_J_for_size,
+                dim=1,
+                inputs=[
+                    zero,
+                    zero,
+                    zero,
+                    2,
+                    zero,
+                    zero,
+                    zero,
+                    ints([1]),
+                    anchor,
+                    anchor,
+                    zero,
+                    body_q,
+                    wp.zeros(2, dtype=wp.spatial_vector, device=device),
+                    wp.zeros(2, dtype=wp.vec3, device=device),
+                    body_to_joint,
+                    ancestor,
+                    qd_start,
+                    motion,
+                    origin,
+                    0.1,
+                    0.0,
+                ],
+                outputs=[J, row_type, row_parent, *row_fields, inv_norm],
+                device=device,
+            )
+            wrench = wp.zeros(2, dtype=wp.spatial_vector, device=device)
+            impulses = wp.array([[0.0, 1.0, 0.0]], dtype=wp.float32, device=device)
+            wp.launch(
+                accumulate_connect_wrenches_from_impulses,
+                dim=1,
+                inputs=[
+                    zero,
+                    zero,
+                    zero,
+                    ints([1]),
+                    anchor,
+                    anchor,
+                    inv_norm,
+                    zero,
+                    body_q,
+                    ints([0, 0]),
+                    origin,
+                    ints([3]),
+                    row_type,
+                    impulses,
+                    1.0,
+                ],
+                outputs=[wrench],
+                device=device,
+            )
+            np.testing.assert_allclose(J.numpy()[0, 1], [0.0, -1.0], atol=1.0e-6)
+            float32_lever = 1.0 + float(motion.numpy()[1, 1])
+            force = wrench.numpy()[:, 1]
+            np.testing.assert_allclose(force, [1.0 / float32_lever, -1.0 / float32_lever], rtol=1.0e-5)
+
+
+def test_parent_wrench_of_a_near_redundant_closure(test, device):
+    """A child hinge braced by a closure anchored just off its axis reports the torque applied to it."""
+    torque = 0.01
+    for lever in NEAR_REDUNDANT_LEVERS:
+        with test.subTest(lever=lever):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            root = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            root_joint = builder.add_joint_revolute(-1, root, axis=(0.0, 0.0, 1.0), armature=0.0)
+            carrier = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            carrier_joint = builder.add_joint_fixed(root, carrier)
+            child = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            child_joint = builder.add_joint_revolute(
+                carrier,
+                child,
+                axis=(0.0, 0.0, 1.0),
+                parent_xform=wp.transform((1.0 - lever, 0.0, 0.0), wp.quat_identity()),
+                armature=0.0,
+            )
+            builder.add_articulation([root_joint, carrier_joint, child_joint])
+            builder.add_joint_ball(
+                root,
+                child,
+                parent_xform=wp.transform((1.0, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((lever, 0.0, 0.0), wp.quat_identity()),
+            )
+            model = builder.finalize(device=device)
+            solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, pgs_iterations=64, pgs_cfm=0.0)
+            state = model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            control = model.control()
+            joint_f = np.zeros(model.joint_dof_count, dtype=np.float32)
+            joint_f[model.joint_qd_start.numpy()[child_joint]] = torque
+            control.joint_f.assign(joint_f)
+            wrench, _state_out = _first_step(model, state, control, solver)
+            test.assertFalse(bool(solver.constraint_overflow.numpy().any()))
+            test.assertAlmostEqual(_revolute_wrench_torques(model, state, wrench)[child_joint], torque, delta=1.0e-5)
+
+
 def test_parent_wrench_warns_without_preeliminated_closures(test, device):
     """Pre-eliminated loop closures have no stored impulses, so requesting the wrench warns once."""
     model = _build_four_bar().finalize(device=device)
@@ -609,6 +737,8 @@ add_function_test(
     test_unattached_body_reports_zero,
     devices=get_test_devices(),
 )
+for _name in ("test_closure_force_uses_the_row_builder_norm", "test_parent_wrench_of_a_near_redundant_closure"):
+    add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_test_devices())
 add_function_test(
     TestFeatherPGSParentWrench,
     "test_parent_wrench_matches_inverse_dynamics_on_every_path",

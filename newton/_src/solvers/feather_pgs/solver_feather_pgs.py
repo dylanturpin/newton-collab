@@ -4382,6 +4382,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._connect_valid = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_enabled = wp.array(self._connect_enabled_np, dtype=wp.int32, device=device)
         self.connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 3), dtype=float, device=device)
         self._connect_count = n
 
     def _connect_index(self, joint: int) -> int:
@@ -9409,13 +9410,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._connect_body_c,
                     self._connect_anchor_p,
                     self._connect_anchor_c,
-                    self._connect_parent_prescribed,
+                    self._connect_row_inv_norm,
                     self.art_to_world,
                     state_in.body_q,
-                    self.body_to_joint,
-                    model.joint_ancestor,
-                    model.joint_qd_start,
-                    state_aug.joint_S_s,
                     self.body_to_articulation,
                     self.articulation_origin,
                     self.constraint_count,
@@ -12072,6 +12069,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self.row_cfm,
                         self.phi,
                         self.target_velocity,
+                        self._connect_row_inv_norm,
                     ],
                     device=model.device,
                 )
