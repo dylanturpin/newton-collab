@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import unittest
 import warnings
 from collections import Counter
@@ -13,6 +14,7 @@ import warp.examples
 
 import newton
 from newton import GeoType
+from newton._src.core import capture_release
 from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
@@ -488,6 +490,50 @@ add_function_test(
     TestCollisionPipeline,
     "test_collision_pipeline_first_call_capture",
     test_collision_pipeline_first_call_capture,
+    devices=get_cuda_test_devices(mode="basic"),
+)
+
+
+def test_sdf_pipeline_garbage_collected_during_capture(test, device):
+    """A dropped SDF model and pipeline finalized inside another graph capture leave the capture valid."""
+    mesh = newton.Mesh.create_box(
+        0.5, 0.5, 0.5, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+    )
+    mesh.build_sdf(max_resolution=32, device=device)
+    builder = newton.ModelBuilder()
+    for x in (-1.0, 1.0):
+        builder.add_shape_mesh(builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.0))), mesh=mesh)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    pipeline.collide(model.state(), pipeline.contacts())
+    test.assertIsNotNone(pipeline._unit_scale_sdf_rescaled_host)
+
+    values = wp.zeros(1, dtype=wp.int32, device=device)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        # Only the cyclic collector can free the textures and pinned flag, and it runs inside the capture.
+        garbage = [mesh, model, pipeline]
+        garbage.append(garbage)
+        del mesh, builder, model, pipeline, garbage
+        with wp.ScopedCapture(device=device) as capture:
+            gc.collect()
+            test.assertGreater(len(capture_release._pending_releases), 0)
+            values.fill_(1)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    wp.capture_launch(capture.graph)
+    test.assertEqual(int(values.numpy()[0]), 1)
+    capture_release.release_deferred()
+    test.assertEqual(len(capture_release._pending_releases), 0)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_sdf_pipeline_garbage_collected_during_capture",
+    test_sdf_pipeline_garbage_collected_during_capture,
     devices=get_cuda_test_devices(mode="basic"),
 )
 
