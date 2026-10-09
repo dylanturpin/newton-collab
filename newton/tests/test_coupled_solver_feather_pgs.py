@@ -381,6 +381,7 @@ def test_articulated_graph_capture_matches_eager(test, device):
         ("bisection", {"friction_anchor_beta": 0.0, "friction_mode": "bisection"}, (3,)),
         ("coulomb_newton", {"friction_anchor_beta": 0.0, "friction_mode": "coulomb_newton"}, (3,)),
     ]
+    fields = ("joint_q", "joint_qd", "particle_q", "particle_qd")
     for friction, friction_options, iteration_counts in cases:
         for iterations in iteration_counts:
             with test.subTest(friction=friction, iterations=iterations):
@@ -405,17 +406,24 @@ def test_articulated_graph_capture_matches_eager(test, device):
                             rollout.step()
                             rollout.step()
                         graph = capture.graph
-                    trajectory = []
+                    trajectory = {name: [] for name in fields}
                     for _ in range(10):
                         if graph is None:
                             rollout.step()
                             rollout.step()
                         else:
                             wp.capture_launch(graph)
-                        trajectory.append(rollout.state_0.joint_q.numpy().copy())
-                    trajectories.append(np.asarray(trajectory))
-                test.assertGreater(trajectories[0][-1, 0] - trajectories[0][0, 0], 0.0)
-                np.testing.assert_allclose(trajectories[1], trajectories[0], atol=1.0e-6)
+                        for name in fields:
+                            trajectory[name].append(getattr(rollout.state_0, name).numpy().copy())
+                    trajectories.append({name: np.asarray(values) for name, values in trajectory.items()})
+                eager, replay = trajectories
+                # The slide along x and the roll about y both advance while the sphere rolls.
+                motion = eager["joint_q"][-1] - eager["joint_q"][0]
+                test.assertTrue(np.all(motion[[0, 2]] > 0.0), motion)
+                for name in fields:
+                    test.assertTrue(np.isfinite(eager[name]).all(), name)
+                    test.assertTrue(np.isfinite(replay[name]).all(), name)
+                    np.testing.assert_allclose(replay[name], eager[name], atol=1.0e-6, err_msg=name)
 
 
 def test_unsupported_options_raise(test, device):
