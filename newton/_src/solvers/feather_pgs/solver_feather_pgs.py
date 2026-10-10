@@ -3393,9 +3393,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         Reference poses are read every step. Constraint changes re-check the MuJoCo equality rows on
         the host: enabling one that is not converted to a Newton loop joint or mimic constraint raises
         :class:`NotImplementedError`. Joint damping and shape friction, restitution, torsional and
-        rolling coefficients are copied on the device into solver-owned buffers, so model arrays
-        modified in place or replaced take effect at the matching notification, in eager and
-        captured steps alike.
+        rolling coefficients are copied on the device into solver-owned buffers that eager and captured
+        steps read, so in-place edits take effect at the matching notification. A captured notification
+        copies from the arrays it was captured with; after replacing one, notify eagerly or recapture.
 
         Args:
             flags: Bitmask of :class:`~newton.ModelFlags` naming the changed model data.
