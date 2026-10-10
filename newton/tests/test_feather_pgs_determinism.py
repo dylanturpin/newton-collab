@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     crba_fill_par_dof,
 )
-from newton.solvers import SolverFeatherPGS
+from newton.solvers import SolverFeatherPGS, SolverObservableFlags
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
 # Free root, then two ball joints: every joint has several DOFs.
@@ -239,6 +239,41 @@ def _run_hashes(model, options, steps, graph=False, collision_options=None):
         state_0, state_1 = state_1, state_0
         hashes.append(_sample(state_0))
     return hashes
+
+
+def test_warm_started_full_reset_matches_fresh_solver(test, device):
+    """After a full reset, warm-started deterministic steps replay a fresh solver's states and contact forces."""
+    model = _build_contact_scene(device, worlds=2, boxes=3, ants=1)
+    configurations = {"split": SPLIT_SOLVER_OPTIONS}
+    if wp.get_device(device).is_cuda:
+        configurations["matrix_free"] = ROBOT_SOLVER_OPTIONS
+
+    def simulate(solver, steps):
+        pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
+        contacts = pipeline.contacts()
+        observables = solver.observables({SolverObservableFlags.CONTACT_F})
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        _actuate(model, control)
+        for _ in range(steps):
+            state_0.clear_forces()
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 0.005, observables=observables)
+            state_0, state_1 = state_1, state_0
+        return _sample(state_0), observables.contact_f.numpy()
+
+    for name, base_options in configurations.items():
+        with test.subTest(name):
+            options = {**base_options, "pgs_warmstart": True}
+            reused = SolverFeatherPGS(model, deterministic=True, **options)
+            simulate(reused, 5)
+            reused.reset(model.state())
+            (state_hash, finite), contact_f = simulate(reused, 7)
+            (fresh_hash, _), fresh_contact_f = simulate(SolverFeatherPGS(model, deterministic=True, **options), 7)
+            test.assertTrue(finite)
+            test.assertEqual(state_hash, fresh_hash)
+            test.assertTrue(np.abs(contact_f).max() > 0.0)
+            np.testing.assert_array_equal(contact_f, fresh_contact_f)
 
 
 def _struct_arrays(value):
@@ -570,6 +605,12 @@ for _device in get_test_devices():
         TestFeatherPGSDeterminism,
         "test_full_reset_matches_fresh_solver",
         test_full_reset_matches_fresh_solver,
+        devices=[_device],
+    )
+    add_function_test(
+        TestFeatherPGSDeterminism,
+        "test_warm_started_full_reset_matches_fresh_solver",
+        test_warm_started_full_reset_matches_fresh_solver,
         devices=[_device],
     )
     add_function_test(
