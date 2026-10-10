@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    ROW_SLOTS_ATOMIC,
     build_joint_limit_rows_for_size,
 )
 from newton.solvers import SolverFeatherPGS
@@ -62,6 +63,8 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
             world_row_cfm,
             world_phi,
             world_target_velocity,
+            ROW_SLOTS_ATOMIC,
+            wp.zeros(1, dtype=wp.int32, device=device),
         ],
         device=device,
     )

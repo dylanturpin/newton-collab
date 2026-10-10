@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.sim.enums import JointType
-from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
+from newton._src.solvers.feather_pgs.kernels import ROW_SLOTS_ATOMIC, build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
 
 
@@ -68,7 +68,7 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
                 0.2,
                 1.0e-6,
             ],
-            outputs=list(scalar),
+            outputs=[*scalar, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
             device=device,
         )
 
@@ -92,7 +92,7 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
                 0.2,
                 1.0e-6,
             ],
-            outputs=list(parallel),
+            outputs=[*parallel, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
             block_dim=32 * warps_per_block,
             device=device,
         )

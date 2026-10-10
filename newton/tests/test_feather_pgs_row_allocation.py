@@ -84,6 +84,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
         ],
         outputs=[
             contact_world,
