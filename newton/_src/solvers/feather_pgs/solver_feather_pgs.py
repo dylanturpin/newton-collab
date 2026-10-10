@@ -3376,6 +3376,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES`` and its narrow inertial and force flags,
         ``BODY_INERTIAL_PROPERTIES`` and ``SHAPE_PROPERTIES`` run on the device and may be captured
         in a CUDA graph, unless sleeping is enabled. ``BODY_PROPERTIES`` reads ``body_flags`` on the host.
+        With torsional/rolling friction enabled and free rigid bodies present, ``SHAPE_PROPERTIES`` validates
+        their coefficients on the host and cannot be captured.
         With joint friction enabled, ``JOINT_DOF_PROPERTIES`` or ``JOINT_DOF_FORCE_PROPERTIES`` latches worlds with invalid
         ``joint_friction`` in :attr:`joint_friction_invalid`; an eager call then reports them
         through :meth:`check_joint_friction`, after all other updates are applied.
