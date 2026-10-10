@@ -8,6 +8,7 @@ import warp as wp
 import newton
 from newton._src.sim.enums import BodyFlags, JointType
 from newton._src.solvers.feather_pgs.kernels import (
+    ROW_SLOTS_ATOMIC,
     allocate_joint_velocity_limit_slots,
     allocate_rigid_velocity_limit_slots,
 )
@@ -39,7 +40,13 @@ def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: flo
             8,
             wp.ones(1, dtype=wp.int32, device=device),
         ],
-        outputs=[velocity_limit_slot, velocity_limit_sign, world_slot_counter],
+        outputs=[
+            velocity_limit_slot,
+            velocity_limit_sign,
+            world_slot_counter,
+            ROW_SLOTS_ATOMIC,
+            wp.zeros(1, dtype=wp.int32, device=device),
+        ],
         device=device,
     )
     return (
@@ -72,7 +79,13 @@ def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 
             64,
             wp.ones(1, dtype=wp.int32, device=device),
         ],
-        outputs=[rigid_velocity_limit_slot, rigid_velocity_limit_sign, mf_slot_counter],
+        outputs=[
+            rigid_velocity_limit_slot,
+            rigid_velocity_limit_sign,
+            mf_slot_counter,
+            ROW_SLOTS_ATOMIC,
+            wp.zeros(1, dtype=wp.int32, device=device),
+        ],
         device=device,
     )
     return (

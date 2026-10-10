@@ -441,8 +441,16 @@ def _get_sparse_contact_response_kernel(
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
         const int active_count = __popc(active_mask);
         int first_slot = 0;
-        if (lane == 0 && active_count != 0)
-            first_slot = atomicAdd(&slot_counter.data[world], active_count);
+        if (lane == 0 && active_count != 0) {
+            if (row_slot_mode == 0) {
+                first_slot = atomicAdd(&slot_counter.data[world], active_count);
+            } else {
+                // One warp owns the articulation; see scan_world_row_requests.
+                first_slot = element_row_cursor.data[art];
+                element_row_cursor.data[art] = first_slot + active_count;
+                if (row_slot_mode == 1) first_slot = 1 << 30;
+            }
+        }
         first_slot = __shfl_sync(MASK, first_slot, 0);
         // Visit the ballot in lane order, matching the existing lower/upper DOF order.
         unsigned pending = active_mask;
@@ -525,6 +533,8 @@ def _build_sparse_joint_limit_rows(
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
+    row_slot_mode: int,
+    element_row_cursor: wp.array[int],
 ): ...
 
 
@@ -558,6 +568,8 @@ def build_sparse_joint_limit_rows(
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
+    row_slot_mode: int,
+    element_row_cursor: wp.array[int],
 ):
     """Build ordered limit rows and sparse responses with one CUDA warp per articulation.
 
@@ -595,6 +607,8 @@ def build_sparse_joint_limit_rows(
         row_factor,
         row_incident,
         diagonal,
+        row_slot_mode,
+        element_row_cursor,
     )
 
 
