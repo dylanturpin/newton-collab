@@ -78,7 +78,6 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
         or solver.contact_compliance
         or solver._contact_torsion_enabled
         or solver.sleeping is not None
-        or not solver.enable_contact_friction
     ):
         raise ValueError(
             "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "

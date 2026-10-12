@@ -111,7 +111,6 @@ def _validate_torsion_mode(solver):
         or solver.pgs_schedule != "interleaved"
         or solver.pgs_warmstart
         or solver.contact_compliance
-        or not solver.enable_contact_friction
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"

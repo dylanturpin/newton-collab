@@ -2908,7 +2908,6 @@ def contact_linear_force_from_impulses(
     mf_row_parent: wp.array2d[wp.int32],
     propagation_row_type: wp.array2d[wp.int32],
     propagation_row_parent: wp.array2d[wp.int32],
-    enable_friction: int,
     inv_dt: float,
 ):
     """Return the world-frame force on shape 0's body from contact ``c``'s solved impulses.
@@ -2933,8 +2932,7 @@ def contact_linear_force_from_impulses(
             lam_n = world_impulses[world, slot]
             count = world_constraint_count[world]
             if (
-                enable_friction != 0
-                and slot + 2 < count
+                slot + 2 < count
                 and _is_sliding_row_type(world_row_type[world, slot + 1])
                 and world_row_parent[world, slot + 1] == slot
                 and _is_sliding_row_type(world_row_type[world, slot + 2])
@@ -2946,8 +2944,7 @@ def contact_linear_force_from_impulses(
             lam_n = mf_impulses[world, slot]
             count = mf_constraint_count[world]
             if (
-                enable_friction != 0
-                and slot + 2 < count
+                slot + 2 < count
                 and mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
                 and mf_row_parent[world, slot + 1] == slot
                 and mf_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
@@ -2959,8 +2956,7 @@ def contact_linear_force_from_impulses(
             lam_n = propagation_impulses[world, slot]
             count = propagation_constraint_count[world]
             if (
-                enable_friction != 0
-                and slot + 2 < count
+                slot + 2 < count
                 and propagation_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
                 and propagation_row_parent[world, slot + 1] == slot
                 and propagation_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
@@ -2970,9 +2966,8 @@ def contact_linear_force_from_impulses(
                 lam_t1 = propagation_impulses[world, slot + 2]
 
         force = lam_n * normal
-        if enable_friction != 0:
-            tangent0, tangent1 = contact_tangent_basis(normal)
-            force += lam_t0 * tangent0 + lam_t1 * tangent1
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        force += lam_t0 * tangent0 + lam_t1 * tangent1
         force *= inv_dt
     return force
 
@@ -2996,7 +2991,6 @@ def compute_contact_spatial_force_from_impulses(
     mf_row_parent: wp.array2d[wp.int32],
     propagation_row_type: wp.array2d[wp.int32],
     propagation_row_parent: wp.array2d[wp.int32],
-    enable_friction: int,
     inv_dt: float,
     rigid_contact_max: int,
     # outputs
@@ -3027,7 +3021,6 @@ def compute_contact_spatial_force_from_impulses(
             mf_row_parent,
             propagation_row_type,
             propagation_row_parent,
-            enable_friction,
             inv_dt,
         )
     contact_f[c] = wp.spatial_vector(force, wp.vec3(0.0))
@@ -4501,7 +4494,6 @@ def _allocate_world_contact_slot(
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
     friction_patches: FrictionPatches,
@@ -4679,7 +4671,7 @@ def _allocate_world_contact_slot(
 
     # Every normal survives; only the selected patch anchors receive tangent rows.
     slots_needed = 1
-    add_friction = enable_friction != 0 and contact_friction_eligible(
+    add_friction = contact_friction_eligible(
         phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
     )
     if friction_patches.enabled != 0:
@@ -4786,7 +4778,6 @@ def allocate_world_contact_slots(
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
     friction_patches: FrictionPatches,
@@ -4867,7 +4858,6 @@ def allocate_world_contact_slots(
             max_constraints,
             mf_max_constraints,
             propagation_max_constraints,
-            enable_friction,
             contact_friction_gap_threshold,
             contact_friction_articulation_pairs_only,
             friction_patches,
@@ -5662,7 +5652,6 @@ def _populate_world_J_for_size_contact(
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_articulation_pairs_only: int,
@@ -5757,7 +5746,7 @@ def _populate_world_J_for_size_contact(
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+    will_add_friction = contact_friction_eligible(
         phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
     )
     if friction_patches.enabled != 0:
@@ -6049,7 +6038,6 @@ def populate_world_J_for_size(
     shape_transform: wp.array[wp.transform],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_articulation_pairs_only: int,
@@ -6103,7 +6091,6 @@ def populate_world_J_for_size(
             prescribed_articulation,
             shape_material_mu,
             shape_material_restitution,
-            enable_friction,
             contact_friction_gap_threshold,
             contact_friction_shared_anchor,
             contact_friction_articulation_pairs_only,
@@ -6911,7 +6898,6 @@ def _build_mf_contact_row(
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_articulation_pairs_only: int,
@@ -7010,7 +6996,7 @@ def _build_mf_contact_row(
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+    will_add_friction = contact_friction_eligible(
         phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
     )
     if friction_patches.enabled != 0:
@@ -7127,7 +7113,6 @@ def build_mf_contact_rows(
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_articulation_pairs_only: int,
@@ -7173,7 +7158,6 @@ def build_mf_contact_rows(
             has_target_velocity,
             shape_material_mu,
             shape_material_restitution,
-            enable_friction,
             contact_friction_gap_threshold,
             contact_friction_shared_anchor,
             contact_friction_articulation_pairs_only,
@@ -7215,7 +7199,6 @@ def build_propagation_contact_rows(
     is_free_rigid: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_articulation_pairs_only: int,
@@ -7317,7 +7300,7 @@ def build_propagation_contact_rows(
     friction_mu = mu * contact_friction_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+    will_add_friction = contact_friction_eligible(
         phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
     )
     if friction_patches.enabled != 0:

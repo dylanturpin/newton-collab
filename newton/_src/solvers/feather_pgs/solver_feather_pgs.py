@@ -1437,7 +1437,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         model: Model,
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
-        enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
         contact_friction_shared_anchor: bool = False,
@@ -2063,7 +2062,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
-        self.enable_contact_friction = enable_contact_friction
         self.contact_friction_gap_threshold = contact_friction_gap_threshold
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
@@ -2564,7 +2562,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # uniform normal/tangent/tangent triples; keep the triple schedule for point friction only.
         self._sparse_diagonal_contact_triples = bool(
             self._sparse_diagonal_contact_solve
-            and self.enable_contact_friction
             and self.contact_friction_gap_threshold == math.inf
             and not self._friction_anchors_enabled
         )
@@ -2980,7 +2977,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # normal rows instead.
         self._factor_coordinate_contact_triples = bool(
             self._paired_factor_coordinates
-            and self.enable_contact_friction
             and self.contact_friction_gap_threshold == math.inf
             and not self._friction_anchors_enabled
         )
@@ -4748,7 +4744,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and self.use_parallel_streams
             and self.pgs_velocity_iterations == 0
             and self.friction_mode == "current"
-            and self.enable_contact_friction
             and not self.enable_joint_velocity_limits
             and not self.enable_joint_friction
             and not self.pgs_warmstart
@@ -10192,7 +10187,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             solved("mf_row_parent", self._dummy_contact_row_parent),
             solved("propagation_row_type", self._dummy_contact_row_type),
             solved("propagation_row_parent", self._dummy_contact_row_parent),
-            1 if self.enable_contact_friction else 0,
             inv_dt,
         ]
 
@@ -11911,7 +11905,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and getattr(contacts, "rigid_contact_count", None) is not None
             and contacts.rigid_contact_max > 0
         ):
-            enable_friction_flag = 1 if self.enable_contact_friction else 0
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
 
             if self._friction_anchors_enabled:
@@ -11967,7 +11960,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,
-                    enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     1 if self.contact_friction_articulation_pairs_only else 0,
                     self._friction_patches.view,
@@ -12247,7 +12239,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             model.shape_transform,
                             self.shape_material_mu,
                             self.shape_material_restitution,
-                            enable_friction_flag,
                             self.contact_friction_gap_threshold,
                             int(self.contact_friction_shared_anchor),
                             1 if self.contact_friction_articulation_pairs_only else 0,
@@ -12305,7 +12296,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         int(self._has_prescribed_response),
                         self.shape_material_mu,
                         self.shape_material_restitution,
-                        enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         1 if self.contact_friction_articulation_pairs_only else 0,
@@ -12417,7 +12407,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         is_free_rigid,
                         self.shape_material_mu,
                         self.shape_material_restitution,
-                        enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         1 if self.contact_friction_articulation_pairs_only else 0,
