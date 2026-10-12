@@ -110,13 +110,12 @@ def _validate_torsion_mode(solver):
         or solver.friction_mode != "current"
         or solver.pgs_schedule != "interleaved"
         or solver.pgs_warmstart
-        or solver.pgs_debug
         or solver.contact_compliance
         or not solver.enable_contact_friction
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
-            "interleaved, without warmstart, compliance, or debug"
+            "interleaved, without warmstart or compliance"
         )
     if solver.pgs_velocity_iterations > 0 and solver.enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")

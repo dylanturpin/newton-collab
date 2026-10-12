@@ -99,7 +99,6 @@ def validate_configuration(model, settings):
         "pgs_warmstart": False,
         "enable_restitution": False,
         "pgs_contact_regularization": 0.0,
-        "pgs_debug": False,
         "contact_friction_position_iterations": -1,
         "friction_mode": "current",
         "contact_friction_shared_anchor": False,

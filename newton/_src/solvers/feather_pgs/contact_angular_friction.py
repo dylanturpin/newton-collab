@@ -75,7 +75,6 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
         or solver._friction_anchors_enabled
         or solver.pgs_warmstart
         or solver.pgs_velocity_iterations != 0
-        or solver.pgs_debug
         or solver.contact_compliance
         or solver._contact_torsion_enabled
         or solver.sleeping is not None
@@ -84,7 +83,7 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
         raise ValueError(
             "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "
             "solving with friction_mode='current', point friction (friction_anchor_beta=0), and no warm start, "
-            "velocity iterations, debug, contact compliance, contact torsion radius, or sleeping"
+            "velocity iterations, contact compliance, contact torsion radius, or sleeping"
         )
 
 
