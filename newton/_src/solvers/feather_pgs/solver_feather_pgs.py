@@ -1245,6 +1245,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
+    Loop-closing BALL joints (joints outside the articulation tree whose child belongs to
+    an articulation) are enforced by three bilateral rows. The rows read
+    :attr:`~newton.Model.joint_enabled` and the translations of
+    :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step, so a
+    closure is released, engaged or re-anchored by editing those arrays in place, also
+    from a kernel between CUDA graph replays. An eager step reads a replaced array; a
+    captured graph keeps the arrays it was captured with, so recapture after replacing
+    one.
+
     Example
     -------
 
@@ -10590,15 +10599,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """Raise for worlds invalidated by contact or constraint capacity exhaustion.
 
         Also raises if a step saw a joint of an articulation tree disabled in
-        :attr:`~newton.Model.joint_enabled`; only loop-closing joints can be disabled.
-        Re-enable the joint and :meth:`reset` the affected worlds. With
+        :attr:`~newton.Model.joint_enabled`; only loop-closing joints can be disabled. That
+        error is not a capacity loss: the flagged steps ignored the disabled joint, so discard
+        their output, re-enable the joint and :meth:`reset` the affected worlds. A check that
+        passes after the reset does not validate the earlier output. With
         ``contact_torsion_device``, also raises if contact torsion rejected its input since
         the last :meth:`reset`; that step published its input state unchanged.
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
         maintained, including when ``row_watermark=False``; GPU consumers can
-        inspect it without host synchronization. Status remains set until
+        inspect it without host synchronization; it holds only the capacity flags. Status remains set until
         :meth:`reset` clears the affected worlds. Increasing capacity requires
         constructing a solver and recapturing graphs before restarting the
         invalidated transition.
