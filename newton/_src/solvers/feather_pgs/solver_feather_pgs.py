@@ -25,7 +25,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
-from typing import ClassVar, Literal
+from typing import Literal
 
 import numpy as np
 import warp as wp
@@ -50,6 +50,7 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
+from ._testing import current_kernel_overrides
 from .contact_angular_friction import (
     angular_friction_gs_sources,
     configure_torsional_rolling_friction,
@@ -1374,11 +1375,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     that grows with the body's distance from the world origin.
     """
 
-    # Test hook: pin a kernel implementation regardless of the size heuristic
-    # (keys: cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel).
-    # sparse_mass_matrix=False retains the existing representation for comparisons.
-    _kernel_overrides: ClassVar[dict[str, str | bool]] = {}
-
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
         """Register PhysX rigid-body attributes consumed by FeatherPGS."""
@@ -1475,15 +1471,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
         # Dense-path PGS kernel (matrix_free solves through the fused MF-GS kernel)
-        pgs_kernel: str = "tiled_row",
-        pgs_chunk_size: int | None = None,
         # Parallelism options
         use_parallel_streams: bool = True,
         double_buffer: bool = True,
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
-        serial_kernel_block_dim: int = 256,
-        tile_threads: int = 64,
         row_watermark: bool = False,
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
@@ -2081,6 +2073,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
+        # Kernel selection is automatic; the overrides pin one implementation for tests and tuning.
+        self._kernel_overrides = current_kernel_overrides()
+        pgs_kernel = self._kernel_overrides.get("pgs_kernel", "tiled_row")
         # pgs_kernel only runs in split mode on CUDA; CPU resolves to the scalar loop below.
         effective_pgs_kernel = "loop" if model.device.is_cpu or pgs_mode == "matrix_free" else pgs_kernel
         if friction_anchor_beta is None:
@@ -2421,8 +2416,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # ``True`` and ``pgs_mode == "matrix_free"``.
         self._pgs_ncp_residual_log: list[np.ndarray] = []
 
-        # Kernel selection is automatic; _kernel_overrides is a test hook that pins
-        # one implementation regardless of the articulation-size heuristic.
         cholesky_kernel = self._kernel_overrides.get("cholesky_kernel", "auto")
         trisolve_kernel = self._kernel_overrides.get("trisolve_kernel", "auto")
         hinv_jt_kernel = self._kernel_overrides.get("hinv_jt_kernel", "auto")
@@ -2465,21 +2458,23 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             delassus_kernel = "par_row_col"
             pgs_kernel = "loop"
 
-        self.serial_kernel_block_dim = int(serial_kernel_block_dim)
+        self.serial_kernel_block_dim = int(self._kernel_overrides.get("serial_kernel_block_dim", 256))
         if self.serial_kernel_block_dim <= 0 or self.serial_kernel_block_dim % 32 != 0:
             raise ValueError(
-                f"serial_kernel_block_dim must be a positive multiple of 32, got {serial_kernel_block_dim!r}"
+                f"serial_kernel_block_dim must be a positive multiple of 32, got {self.serial_kernel_block_dim!r}"
             )
-        self.tile_threads = int(tile_threads)
+        self.tile_threads = int(self._kernel_overrides.get("tile_threads", 64))
         if self.tile_threads not in (32, 64, 128, 256):
-            raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
+            raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {self.tile_threads!r}")
 
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
         self.hinv_jt_kernel = hinv_jt_kernel
         self.delassus_kernel = delassus_kernel
         self.pgs_kernel = pgs_kernel
-        self.pgs_chunk_size = pgs_chunk_size if pgs_chunk_size is not None else 1
+        self.pgs_chunk_size = int(self._kernel_overrides.get("pgs_chunk_size", 1))
+        if self.pgs_chunk_size < 1:
+            raise ValueError("pgs_chunk_size must be positive")
         self.small_dof_threshold = small_dof_threshold
         self.use_parallel_streams = use_parallel_streams
 
