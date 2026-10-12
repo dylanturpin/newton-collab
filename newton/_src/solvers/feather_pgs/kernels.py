@@ -3835,8 +3835,8 @@ def invalidate_fk_id_cache_for_articulations(
 
 @wp.kernel
 def allocate_connect_slots(
-    connect_valid: wp.array[int],
-    connect_enabled: wp.array[int],
+    connect_joint: wp.array[int],
+    joint_enabled: wp.array[bool],
     connect_world: wp.array[int],
     max_constraints: int,
     # outputs
@@ -3845,14 +3845,14 @@ def allocate_connect_slots(
     row_slot_mode: int,
     element_row_cursor: wp.array[int],
 ):
-    """Allocate three consecutive dense slots per enabled, valid loop closure.
+    """Allocate three consecutive dense slots per loop closure enabled in ``Model.joint_enabled``.
 
     Launched with ``dim = n_connect``. If the buffer cannot hold all three rows the
     closure is dropped whole (``connect_slot = -1``) rather than partially enforced.
     """
     k = wp.tid()
     connect_slot[k] = -1
-    if connect_valid[k] == 0 or connect_enabled[k] == 0:
+    if not joint_enabled[connect_joint[k]]:
         return
     slot = reserve_world_rows(row_slot_mode, world_slot_counter, connect_world[k], 3, element_row_cursor, k)
     if slot + 2 < max_constraints:
@@ -3867,10 +3867,11 @@ def populate_connect_J_for_size(
     n_dofs: int,
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
+    connect_joint: wp.array[int],
     connect_body_p: wp.array[int],
     connect_body_c: wp.array[int],
-    connect_anchor_p: wp.array[wp.vec3],
-    connect_anchor_c: wp.array[wp.vec3],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
     connect_parent_prescribed: wp.array[int],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -3899,7 +3900,8 @@ def populate_connect_J_for_size(
     rows: for world axis ``e_k``, ``phi = (p_A - p_B) . e_k`` and
     ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
     walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
-    diagonal makes the sweep skip it.
+    diagonal makes the sweep skip it. The anchors are the translations of the closure
+    joint's ``joint_X_p`` / ``joint_X_c``, read every step.
 
     A closure whose parent is prescribed (``connect_parent_prescribed[k] != 0``: a
     kinematic body outside the child's articulation, or the world when
@@ -3923,10 +3925,12 @@ def populate_connect_J_for_size(
         body_p = connect_body_p[k]
         body_c = connect_body_c[k]
         prescribed = connect_parent_prescribed[k] != 0
-        p_a = connect_anchor_p[k]
+        joint = connect_joint[k]
+        anchor_p = wp.transform_get_translation(joint_X_p[joint])
+        p_a = anchor_p
         v_a = wp.vec3(0.0, 0.0, 0.0)
         if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+            p_a = wp.transform_point(body_q[body_p], anchor_p)
             if prescribed:
                 # Prescribed parent: the anchor velocity comes from the body twist
                 # (v_com_world, omega_world) rather than from tree DOFs.
@@ -3935,7 +3939,7 @@ def populate_connect_J_for_size(
                 omega = wp.spatial_bottom(twist)
                 x_com = wp.transform_point(body_q[body_p], body_com[body_p])
                 v_a = v_com + wp.cross(omega, p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
+        p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
         origin = articulation_origin[art]
         rel_a = p_a - origin
         rel_b = p_b - origin

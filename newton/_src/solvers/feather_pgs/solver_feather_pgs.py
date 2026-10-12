@@ -452,16 +452,31 @@ def _reset_solver_status(
     articulation_world: wp.array[int],
     mass_update_requested: wp.array[int],
     overflow: wp.array[wp.bool],
+    disabled_tree_joint: wp.array[wp.bool],
 ):
     """Clear selected world status and request only its articulation factors."""
     tid = wp.tid()
     if tid < overflow.shape[0]:
         if not world_mask or world_mask[tid] != 0:
             overflow[tid] = False
+            disabled_tree_joint[tid] = False
     if tid < mass_update_requested.shape[0]:
         world = articulation_world[tid]
         if not world_mask or world_mask[world] != 0:
             mass_update_requested[tid] = 1
+
+
+@wp.kernel
+def _flag_disabled_tree_joints(
+    joint_enabled: wp.array[bool],
+    tree_joint_world: wp.array[int],
+    disabled_tree_joint: wp.array[wp.bool],
+):
+    """Flag the solver world of every disabled joint in an articulation tree."""
+    j = wp.tid()
+    world = tree_joint_world[j]
+    if world >= 0 and not joint_enabled[j]:
+        disabled_tree_joint[world] = True
 
 
 @wp.func
@@ -989,7 +1004,7 @@ def _validate_tree_joints_enabled(model: Model) -> None:
         return
     disabled = ~model.joint_enabled.numpy().astype(bool)
     if model.joint_articulation is not None:
-        # A disabled loop-closing joint is a released closure, see set_loop_joint_enabled().
+        # A disabled loop-closing joint is a released closure.
         disabled &= model.joint_articulation.numpy() >= 0
     if isinstance(model, ModelView):
         # Another coupled entry or the coupling algorithm simulates these joints.
@@ -3168,6 +3183,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._row_overflow_propagation_world_steps = None
 
         self.constraint_overflow = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
+        # Tree joints disabled after construction, which the solver does not simulate.
+        self._disabled_tree_joint = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
+        self._tree_joint_world = self._build_tree_joint_world(model)
         self.joint_friction_invalid = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
         self._row_dropped_all = wp.zeros((3, max(self.world_count, 1)), dtype=wp.int32, device=model.device)
         self._row_dropped_dense = self._row_dropped_all[0]
@@ -3610,7 +3628,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         wp.launch(
             _reset_solver_status,
             dim=max(self.world_count, self.model.articulation_count),
-            inputs=[world_mask, self.art_to_world, self._mass_update_requested, self.constraint_overflow],
+            inputs=[
+                world_mask,
+                self.art_to_world,
+                self._mass_update_requested,
+                self.constraint_overflow,
+                self._disabled_tree_joint,
+            ],
             device=self.model.device,
         )
         if self._friction_anchors_enabled:
@@ -4418,6 +4442,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.mimic_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._mimic_count = n
 
+    def _build_tree_joint_world(self, model) -> wp.array[int] | None:
+        """Return the solver world of each tree joint the step checks for disabling, ``-1`` elsewhere."""
+        if not model.joint_count or model.joint_articulation is None or self.art_to_world is None:
+            return None
+        joint_articulation = model.joint_articulation.numpy()
+        tree_joint = (joint_articulation >= 0) & (self._model_plan.loop_joint_articulation < 0)
+        if isinstance(model, ModelView):
+            # Another coupled entry or the coupling algorithm simulates these joints.
+            tree_joint[model.coupling_disabled_joints.numpy()] = False
+        if not np.any(tree_joint):
+            return None
+        world = np.full(model.joint_count, -1, dtype=np.int32)
+        world[tree_joint] = self._model_plan.articulation_world[joint_articulation[tree_joint]]
+        return wp.array(world, dtype=wp.int32, device=model.device)
+
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
@@ -4426,8 +4465,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         pinning the joint's parent/child anchors together. Their stored owner comes from
         the child body's tree articulation, independent of joint ordering. FIXED (weld)
         loop joints warn and are ignored for now. All buffers are allocated once
-        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init and may be changed
-        later through :meth:`set_loop_joint_enabled`.
+        (CUDA-graph-safe). The rows read the joint's enabled flag in
+        :attr:`~newton.Model.joint_enabled` and the translations of its
+        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step.
 
         A closure's parent may live outside the child's articulation when it is
         prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
@@ -4437,7 +4477,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """
         self._connect_count = 0
         self.connect_slot = None
-        self._connect_joint_to_index: dict[int, int] = {}
         if not self._has_loop_joints:
             self._connect_world_np = None
             return
@@ -4445,25 +4484,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         joint_type = model.joint_type.numpy()
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
-        joint_X_p = model.joint_X_p.numpy()
-        joint_X_c = model.joint_X_c.numpy()
-        joint_enabled_arr = getattr(model, "joint_enabled", None)
-        joint_enabled = joint_enabled_arr.numpy() if joint_enabled_arr is not None else None
         articulation_world = self._model_plan.articulation_world
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self.body_to_articulation.numpy() if self.body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
 
-        art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab, prescribed_l = (
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-        )
+        art_l, body_p, body_c, world_l, joint_l, prescribed_l = [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
             if int(joint_type[j]) != int(JointType.BALL):
@@ -4487,84 +4513,27 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     )
                     continue
                 prescribed = 1
-            self._connect_joint_to_index[int(j)] = len(art_l)
             art_l.append(art)
             body_p.append(parent)
             body_c.append(int(joint_child[j]))
-            anchors_p.append(joint_X_p[j][:3])
-            anchors_c.append(joint_X_c[j][:3])
             world_l.append(int(articulation_world[art]))
-            enab.append(1 if (joint_enabled is None or joint_enabled[j]) else 0)
+            joint_l.append(int(j))
             prescribed_l.append(prescribed)
 
         n = len(art_l)
         if n == 0:
             self._connect_world_np = None
-            self._connect_joint_to_index = {}
             return
         self._connect_world_np = np.asarray(world_l, dtype=np.int32)
-        self._connect_valid_np = np.asarray(enab, dtype=np.int32)
         self._connect_parent_prescribed_np = np.asarray(prescribed_l, dtype=np.int32)
-        self._connect_enabled_np = self._connect_valid_np.copy()
-        self._connect_anchor_p_np = np.asarray(anchors_p, dtype=np.float32).reshape(n, 3)
-        self._connect_anchor_c_np = np.asarray(anchors_c, dtype=np.float32).reshape(n, 3)
+        self._connect_joint = wp.array(np.asarray(joint_l, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_art = wp.array(np.asarray(art_l, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_body_p = wp.array(np.asarray(body_p, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_body_c = wp.array(np.asarray(body_c, dtype=np.int32), dtype=wp.int32, device=device)
-        self._connect_anchor_p = wp.array(self._connect_anchor_p_np, dtype=wp.vec3, device=device)
-        self._connect_anchor_c = wp.array(self._connect_anchor_c_np, dtype=wp.vec3, device=device)
         self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
-        self._connect_valid = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32, device=device)
-        self._connect_enabled = wp.array(self._connect_enabled_np, dtype=wp.int32, device=device)
         self.connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_count = n
-
-    def _connect_index(self, joint: int) -> int:
-        index = getattr(self, "_connect_joint_to_index", {}).get(int(joint))
-        if index is None:
-            raise ValueError(
-                f"SolverFeatherPGS: joint {joint} is not an enforced loop-closing BALL joint of this solver."
-            )
-        return index
-
-    def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
-        """Enable or disable the connect rows of a loop-closing BALL joint at runtime.
-
-        The closure keeps its allocated capacity, so toggling is CUDA-graph-safe and
-        takes effect on the next :meth:`step`. Closures disabled through
-        :attr:`~newton.Model.joint_enabled` at construction still count as capacity.
-
-        Args:
-            joint: Model joint index of a loop-closing BALL joint.
-            enabled: ``True`` to enforce the closure, ``False`` to release it.
-        """
-        index = self._connect_index(joint)
-        self._connect_enabled_np[index] = 1 if enabled else 0
-        self._connect_enabled.assign(self._connect_enabled_np)
-
-    def set_loop_joint_anchors(self, joint: int, parent_anchor, child_anchor) -> None:
-        """Move the anchors of a loop-closing BALL joint at runtime.
-
-        Both anchors are body-local points [m] (world-frame for a world parent). Use it
-        to re-target a closure before enabling it, for example to attach a body to a
-        prescribed hand at the relative pose measured at acquisition.
-
-        Args:
-            joint: Model joint index of a loop-closing BALL joint.
-            parent_anchor: Anchor in the parent body frame [m].
-            child_anchor: Anchor in the child body frame [m].
-        """
-        index = self._connect_index(joint)
-        self._connect_anchor_p_np[index] = np.asarray(parent_anchor, dtype=np.float32)
-        self._connect_anchor_c_np[index] = np.asarray(child_anchor, dtype=np.float32)
-        self._connect_anchor_p.assign(self._connect_anchor_p_np)
-        self._connect_anchor_c.assign(self._connect_anchor_c_np)
-
-    def loop_joint_anchors(self, joint: int) -> tuple[np.ndarray, np.ndarray]:
-        """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
-        index = self._connect_index(joint)
-        return self._connect_anchor_p_np[index].copy(), self._connect_anchor_c_np[index].copy()
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
@@ -4925,8 +4894,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
             np.add.at(per_world, in_range, 1)
         if has_connect_rows and self._connect_world_np is not None:
-            valid_worlds = self._connect_world_np[self._connect_valid_np != 0]
-            in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
+            # Model.joint_enabled can engage any closure at runtime, so each one counts.
+            connect_worlds = self._connect_world_np
+            in_range = connect_worlds[(connect_worlds >= 0) & (connect_worlds < per_world.shape[0])]
             np.add.at(per_world, in_range, 3)
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
@@ -9712,6 +9682,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self.integrate_particles(model, state_in, state_out, dt)
             self._step += 1
             return state_out
+        if self._tree_joint_world is not None:
+            wp.launch(
+                _flag_disabled_tree_joints,
+                dim=model.joint_count,
+                inputs=[model.joint_enabled, self._tree_joint_world],
+                outputs=[self._disabled_tree_joint],
+                device=model.device,
+            )
 
         # Double-buffer: select the buffer set; its clear was joined when the previous step returned.
         if self._memset_stream is not None:
@@ -10668,6 +10646,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def check_constraint_capacity(self) -> None:
         """Raise for worlds invalidated by contact or constraint capacity exhaustion.
 
+        Also raises if a step saw a joint of an articulation tree disabled in
+        :attr:`~newton.Model.joint_enabled`; only loop-closing joints can be disabled.
+        Re-enable the joint and :meth:`reset` the affected worlds.
+
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
         maintained, including when ``row_watermark=False``; GPU consumers can
@@ -10678,6 +10660,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
+        disabled = np.flatnonzero(self._disabled_tree_joint.numpy())
+        if disabled.size:
+            raise RuntimeError(
+                f"FeatherPGS: Model.joint_enabled disables an articulation tree joint in solver worlds "
+                f"{disabled[:16].tolist()}; only loop-closing joints can be disabled."
+            )
         worlds = np.flatnonzero(self.constraint_overflow.numpy())
         if worlds.size:
             raise RuntimeError(
@@ -12171,8 +12159,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     allocate_connect_slots,
                     dim=self._connect_count,
                     inputs=[
-                        self._connect_valid,
-                        self._connect_enabled,
+                        self._connect_joint,
+                        model.joint_enabled,
                         self._connect_world,
                         max_constraints,
                     ],
@@ -12197,10 +12185,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         size,
                         self.connect_slot,
                         self._connect_art,
+                        self._connect_joint,
                         self._connect_body_p,
                         self._connect_body_c,
-                        self._connect_anchor_p,
-                        self._connect_anchor_c,
+                        model.joint_X_p,
+                        model.joint_X_c,
                         self._connect_parent_prescribed,
                         state_in.body_q,
                         state_in.body_qd,
