@@ -107,7 +107,6 @@ def run(
         pgs_iterations=32,
         pgs_beta=0.05,
         pgs_warmstart=warmstart,
-        mf_warmstart=warmstart,
         **({"friction_anchor_beta": beta} if beta is not None else {}),
         dense_max_constraints=32,
         mf_max_constraints=max(256, 12 * tiles * tiles),

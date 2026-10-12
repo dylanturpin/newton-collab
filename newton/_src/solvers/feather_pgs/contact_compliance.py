@@ -97,7 +97,6 @@ def validate_configuration(model, settings):
         "pgs_schedule": "interleaved",
         "pgs_velocity_iterations": 0,
         "pgs_warmstart": False,
-        "mf_warmstart": False,
         "enable_restitution": False,
         "pgs_contact_regularization": 0.0,
         "pgs_debug": False,

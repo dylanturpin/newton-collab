@@ -1456,8 +1456,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
-        mf_warmstart: bool = False,
-        mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
         articulated_contact_response: Literal[
             "immediate", "propagation", "propagation-fused", "propagation-colored"
@@ -1899,11 +1897,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 reports the world, requested rows, row limit, and dropped contact/friction rows without a host
                 synchronization, so it remains compatible with CUDA graph capture. With ``deterministic=True``
                 it adds which contacts deterministic mode drops. Defaults to True.
-            mf_warmstart (bool, optional): Legacy compatibility alias for ``pgs_warmstart``
-                (this option was historically matrix-free-only). New callers should use
-                ``pgs_warmstart``. Defaults to False.
-            mf_warmstart_decay (float, optional): Legacy decay alias used when
-                ``mf_warmstart`` enables the unified mode. Defaults to 1.0.
             pgs_mode (str, optional): PGS mode. "split" solves articulated contact rows through the dense
                 Delassus system and free rigid body contacts through a matrix-free PGS path; it is the
                 only mode available on CPU. "matrix_free" is CUDA-only; CPU construction raises
@@ -2052,7 +2045,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     "pgs_iterations": pgs_iterations,
                     "pgs_velocity_iterations": pgs_velocity_iterations,
                     "pgs_warmstart": pgs_warmstart,
-                    "mf_warmstart": mf_warmstart,
                     "enable_restitution": enable_restitution,
                     "pgs_contact_regularization": pgs_contact_regularization,
                     "pgs_debug": pgs_debug,
@@ -2258,24 +2250,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             "propagation",
             "propagation-colored",
         )
-        # ``mf_warmstart`` and its environment switch predate the unified
-        # contact-warm-start contract. Keep them as compatibility aliases, but
-        # map them onto the one all-route mode rather than retaining a second
-        # MF-only behavior.
-        _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
-        legacy_mf_warmstart = bool(mf_warmstart) or _env_ws
-        try:
-            legacy_mf_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
-        except (TypeError, ValueError):
-            legacy_mf_decay = float(mf_warmstart_decay)
-        if not math.isfinite(legacy_mf_decay) or legacy_mf_decay < 0.0:
-            raise ValueError(f"mf_warmstart_decay must be finite and non-negative, got {legacy_mf_decay!r}")
-
         requested_pgs_decay = float(pgs_warmstart_decay)
         if not math.isfinite(requested_pgs_decay) or requested_pgs_decay < 0.0:
             raise ValueError(f"pgs_warmstart_decay must be finite and non-negative, got {pgs_warmstart_decay!r}")
-        self.pgs_warmstart = bool(pgs_warmstart) or legacy_mf_warmstart
-        self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
+        self.pgs_warmstart = bool(pgs_warmstart)
+        self.pgs_warmstart_decay = requested_pgs_decay
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
         self._ws_prev_dense_row_parent = None
@@ -3879,7 +3858,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             name
             for name, enabled in (
                 ("enable_sleeping", self.sleeping is not None),
-                ("pgs_warmstart/mf_warmstart", self.pgs_warmstart),
+                ("pgs_warmstart", self.pgs_warmstart),
                 ("contact_compliance", self.contact_compliance),
                 ("contact_torsion_radius", self._contact_torsion_enabled),
                 ("owning particles", self._has_active_particles),
