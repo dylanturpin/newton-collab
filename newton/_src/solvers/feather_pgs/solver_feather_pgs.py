@@ -254,6 +254,8 @@ from .sparse_pgs import _get_pgs_solve_sparse_kernel
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
 # kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can
 # be replayed/profiled in isolation on the target GPU. Zero overhead when off.
+# NVTX ranges around the stages of SolverFeatherPGS.step() when NEWTON_PROFILE is set.
+PROFILE_ENABLED = os.environ.get("NEWTON_PROFILE", "0") != "0"
 _FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
 _FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
@@ -1472,7 +1474,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Parallelism options
         use_parallel_streams: bool = True,
         double_buffer: bool = True,
-        nvtx: bool = False,
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
         serial_kernel_block_dim: int = 256,
@@ -2400,7 +2401,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self.propagation_max_constraints < 1:
             raise ValueError("propagation_max_constraints must be positive")
         self._double_buffer = double_buffer
-        self._nvtx = nvtx
+        self._nvtx = PROFILE_ENABLED
         self.pgs_debug = pgs_debug
         # The position/velocity split needs only v_out_snap. Full row snapshots
         # are diagnostics and can consume several GB in large batched models.
@@ -10329,7 +10330,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._friction_patches.previous.valid.zero_()
 
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
-            with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 wp.copy(self._ws_prev_dense_impulses, self.impulses)
                 wp.copy(self._ws_prev_dense_row_type, self.row_type)
                 wp.copy(self._ws_prev_dense_row_parent, self.row_parent)
@@ -10338,7 +10339,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._ws_prev_dense_row_parent.fill_(-1)
 
         if self._mf_warmstart_enabled and self._has_free_rigid_bodies:
-            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
                 wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
@@ -10348,7 +10349,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         if self._ws_prev_propagation_impulses is not None:
             with wp.ScopedTimer(
-                "S7_Propagation_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx
+                "S7_Propagation_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=False
             ):
                 wp.copy(self._ws_prev_propagation_impulses, self.propagation_impulses)
                 wp.copy(self._ws_prev_propagation_row_type, self.propagation_row_type)
