@@ -20,6 +20,8 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
 def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
@@ -998,6 +1000,399 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertGreater(fused_rows, 0)
         self.assertLess(fused_rows, dedicated_rows)
         self.assertEqual(dedicated_rows - fused_rows, 2 * num_links)
+
+
+def test_disabled_tree_joints_raise(test, device):
+    """Reject a disabled articulation-tree joint, which would otherwise be simulated as enabled."""
+    disabled = newton.ModelBuilder()
+    body = disabled.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    disabled.add_articulation([disabled.add_joint_revolute(-1, body, axis=newton.Axis.Y, enabled=False)])
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(disabled.finalize(device=device))
+
+    # A disabled loop-closing joint is a released closure and constructs.
+    released = newton.ModelBuilder()
+    root = released.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    tip = released.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    released.add_articulation(
+        [
+            released.add_joint_revolute(-1, root, axis=newton.Axis.Y),
+            released.add_joint_revolute(root, tip, axis=newton.Axis.Y),
+        ]
+    )
+    loop = released.add_joint_ball(-1, tip, enabled=False)
+    model = released.finalize(device=device)
+    solver = SolverFeatherPGS(model)
+    test.assertIn(loop, solver._connect_joint_to_index)
+
+
+def _build_prismatic_links(device, enabled: tuple[bool, ...]):
+    """Build one 1 kg prismatic link per entry of ``enabled``, each in its own world."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for joint_enabled in enabled:
+        builder.begin_world()
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_prismatic(-1, body, axis=newton.Axis.X, enabled=joint_enabled)])
+        builder.end_world()
+    return builder.finalize(device=device)
+
+
+def _push_joints(model, solver):
+    """Step once with a 1 N force on every joint DOF and return the joint coordinates and velocities."""
+    state_in, state_out = model.state(), model.state()
+    control = model.control()
+    control.joint_f.fill_(1.0)
+    solver.step(state_in, state_out, control, None, 0.01)
+    return state_out.joint_q.numpy(), state_out.joint_qd.numpy()
+
+
+def _fpgs_entry(name, joint, configure_view=None):
+    return SolverCoupled.Entry(
+        name=name,
+        solver=lambda view: SolverFeatherPGS(view, pgs_mode="split"),
+        bodies=[joint],
+        joints=[joint],
+        configure_view=configure_view,
+    )
+
+
+def test_caller_disabled_joints_raise_through_views(test, device):
+    """A joint the caller disabled raises whether FeatherPGS gets a model, a view, or a coupled entry view."""
+    enabled = _build_prismatic_links(device, (True,))
+    q, qd = _push_joints(enabled, SolverFeatherPGS(enabled, pgs_mode="split"))
+    np.testing.assert_allclose(q, [1.0e-4], rtol=1.0e-5)
+    np.testing.assert_allclose(qd, [1.0e-2], rtol=1.0e-5)
+
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(_build_prismatic_links(device, (False,)), pgs_mode="split")
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(ModelView(_build_prismatic_links(device, (False,)), "standalone"), pgs_mode="split")
+    view = ModelView(_build_prismatic_links(device, (True,)), "view_disabled")
+    view.disable_joints(wp.array([0], dtype=int, device=device))
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverFeatherPGS(view, pgs_mode="split")
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(model=_build_prismatic_links(device, (False,)), entries=[_fpgs_entry("owned", 0)])
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(
+            model=_build_prismatic_links(device, (True,)),
+            entries=[_fpgs_entry("owned", 0, lambda v: v.disable_joints(wp.array([0], dtype=int, device=device)))],
+        )
+
+
+def test_coupled_views_accept_joints_other_entries_own(test, device):
+    """Each coupled FeatherPGS entry accepts the joint the other entry owns and simulates its own as enabled."""
+    # One link per world leaves each entry's view on the full layout, so both disabled joints are visible.
+    model = _build_prismatic_links(device, (True, True))
+    solver = SolverCoupled(model=model, entries=[_fpgs_entry("first", 0), _fpgs_entry("second", 1)])
+    for name, foreign in (("first", 1), ("second", 0)):
+        view = solver._entries[name].view
+        test.assertEqual(view.coupling_disabled_joints.numpy().tolist(), [foreign])
+        test.assertFalse(bool(view.joint_enabled.numpy()[foreign]))
+    q, qd = _push_joints(model, solver)
+    np.testing.assert_allclose(q, [1.0e-4, 1.0e-4], rtol=1.0e-5)
+    np.testing.assert_allclose(qd, [1.0e-2, 1.0e-2], rtol=1.0e-5)
+
+    # A caller-disabled joint still raises when another entry owns a different disabled joint.
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(
+            model=_build_prismatic_links(device, (False, True)),
+            entries=[_fpgs_entry("first", 0), _fpgs_entry("second", 1)],
+        )
+
+
+def test_coupled_view_rejects_unowned_disabled_joint(test, device):
+    """A caller-disabled joint that no entry owns raises even when the entry owns its child body."""
+    entry = SolverCoupled.Entry(
+        name="fpgs", solver=lambda view: SolverFeatherPGS(view, pgs_mode="split"), bodies=[0, 1], joints=[0]
+    )
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        SolverCoupled(model=_build_prismatic_links(device, (True, False)), entries=[entry])
+
+
+def _build_admm_cross_chain(device, *, cross_joint: str = "ball", cross_joint_enabled: bool = True):
+    """Build a prismatic parent with a ``cross_joint`` child in world 0 and a lone prismatic link in world 1."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.begin_world()
+    parent = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+    child = builder.add_link(
+        xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3) * 0.01),
+    )
+    slide = builder.add_joint_prismatic(-1, parent, axis=newton.Axis.X)
+    if cross_joint == "ball":
+        joint = builder.add_joint_ball(
+            parent,
+            child,
+            child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
+            enabled=cross_joint_enabled,
+        )
+    elif cross_joint == "free":
+        joint = builder.add_joint_free(child, parent=parent)
+    else:
+        joint = builder.add_joint_distance(parent, child, min_distance=0.0, max_distance=0.305)
+    builder.add_articulation([slide, joint])
+    builder.end_world()
+    builder.begin_world()
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(
+                -1, builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01)), axis=newton.Axis.X
+            )
+        ]
+    )
+    builder.end_world()
+    return builder.finalize(device=device)
+
+
+def _admm_cross_chain_solver(model):
+    def fpgs(view):
+        return SolverFeatherPGS(view, pgs_mode="split")
+
+    # The world-1 link makes both entries heterogeneous, so their views keep the full layout and the cross joint.
+    return SolverCoupledADMM(
+        model=model,
+        entries=[
+            SolverCoupled.Entry(name="parent", solver=fpgs, bodies=[0], joints=[0]),
+            SolverCoupled.Entry(name="child", solver=fpgs, bodies=[1, 2], joints=[2]),
+        ],
+        coupling=SolverCoupledADMM.Config(
+            iterations=12,
+            rho=40.0,
+            baumgarte=0.5,
+            joint_stiffness=500.0,
+            joint_angular_stiffness=50.0,
+            joint_proximal_bodies=False,
+        ),
+    )
+
+
+def test_admm_views_accept_cross_solver_joints(test, device):
+    """FeatherPGS entries accept the unowned cross-solver joint that ADMM enforces, and only while it is enabled."""
+    model = _build_admm_cross_chain(device)
+    solver = _admm_cross_chain_solver(model)
+    for name, marked in (("parent", [1, 2]), ("child", [0, 1])):
+        test.assertEqual(solver.view(name).coupling_disabled_joints.numpy().tolist(), marked)
+
+    state_in, state_out = model.state(), model.state()
+    control = model.control()
+    control.joint_f.assign(np.array([1.0] + [0.0] * (model.joint_dof_count - 1), dtype=np.float32))
+    for _ in range(60):
+        solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+        state_in, state_out = state_out, state_in
+    body_x = state_in.body_q.numpy()[:, 0]
+    # The ball attachment drags the 1 kg child along, halving the parent's 1 N acceleration.
+    test.assertAlmostEqual(float(body_x[0]), 0.0625, delta=0.005)
+    test.assertAlmostEqual(float(body_x[1] - body_x[0]), 0.3, delta=1.0e-3)
+
+    with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+        _admm_cross_chain_solver(_build_admm_cross_chain(device, cross_joint_enabled=False))
+
+
+def test_admm_views_reject_unattached_cross_solver_joints(test, device):
+    """FREE and DISTANCE cross-solver joints get no ADMM attachment, so no one advances them and FeatherPGS raises."""
+    for cross_joint in ("free", "distance"):
+        with test.subTest(cross_joint=cross_joint):
+            with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
+                _admm_cross_chain_solver(_build_admm_cross_chain(device, cross_joint=cross_joint))
+
+
+def _build_box_with_equality(device, *, enabled: bool, target_kind: int = 0, target: int = -1):
+    """Build a free box held to the world by a MuJoCo CONNECT equality row."""
+    builder = newton.ModelBuilder()
+    body = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    builder.add_custom_values(
+        **{
+            "mujoco:equality_constraint_type": 0,
+            "mujoco:equality_constraint_objtype": 1,
+            "mujoco:equality_constraint_body1": body,
+            "mujoco:equality_constraint_body2": -1,
+            "mujoco:equality_constraint_anchor": wp.vec3(0.0, 0.0, 1.0),
+            "mujoco:equality_constraint_enabled": enabled,
+            "mujoco:equality_constraint_target_kind": target_kind,
+            "mujoco:equality_constraint_target": target,
+        }
+    )
+    return builder.finalize(device=device)
+
+
+def test_unconverted_equality_constraints_raise(test, device):
+    """Reject an enabled MuJoCo equality row instead of letting the body fall through it."""
+    with test.assertRaisesRegex(NotImplementedError, r"equality_constraint rows \[0\]"):
+        SolverFeatherPGS(_build_box_with_equality(device, enabled=True))
+    # A link to a projected entity that does not exist does not make the row enforced.
+    for target_kind in (1, 2):
+        with test.assertRaisesRegex(NotImplementedError, "equality"):
+            SolverFeatherPGS(_build_box_with_equality(device, enabled=True, target_kind=target_kind, target=7))
+
+    # Imported equalities are converted to Newton loop joints by default; those rows are
+    # enforced through the loop joint (see test_feather_pgs_connect). Unconverted, they raise.
+    mjcf = """
+    <mujoco>
+      <worldbody>
+        <body name="link" pos="0 0 1">
+          <joint name="hinge" type="hinge" axis="0 1 0"/>
+          <geom type="box" size="0.1 0.1 0.1"/>
+        </body>
+      </worldbody>
+      <equality><connect body1="link" anchor="0.1 0 0"/></equality>
+    </mujoco>
+    """
+    builder = newton.ModelBuilder()
+    builder.add_mjcf(mjcf, convert_mjc_equality_constraints=False)
+    imported = builder.finalize(device=device)
+    test.assertEqual(imported.mujoco.equality_constraint_count, 1)
+    with test.assertRaisesRegex(NotImplementedError, "equality"):
+        SolverFeatherPGS(imported)
+
+    # A disabled row constructs and has no effect.
+    model = _build_box_with_equality(device, enabled=False)
+    solver = SolverFeatherPGS(model)
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(10):
+        solver.step(state_0, state_1, model.control(), None, 0.01)
+        state_0, state_1 = state_1, state_0
+    test.assertLess(float(state_0.body_q.numpy()[0, 2]), 0.95)
+
+
+def test_equality_link_must_name_the_projected_constraint(test, device):
+    """Reject an equality row whose projection link names an entity that does not enforce it."""
+    # A CONNECT row holding a free box to the world that claims the box's own free joint: the
+    # joint is in range but is not a loop joint, so the box would fall through the constraint.
+    with test.assertRaisesRegex(NotImplementedError, r"equality_constraint rows \[0\]"):
+        SolverFeatherPGS(_build_box_with_equality(device, enabled=True, target_kind=1, target=0))
+
+    def build_pendulum_with_connect(eq_type: int, joint_kind: str, row_names_world: bool):
+        builder = newton.ModelBuilder()
+        link = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+        hinge = builder.add_joint_revolute(-1, link, axis=newton.Axis.Y)
+        builder.add_articulation([hinge])
+        other = builder.add_body(xform=wp.transform((0.5, 0.0, 1.0), wp.quat_identity()))
+        builder.add_shape_box(other, hx=0.1, hy=0.1, hz=0.1)
+        add_joint = builder.add_joint_ball if joint_kind == "ball" else builder.add_joint_fixed
+        loop = add_joint(link, other)
+        builder.add_custom_values(
+            **{
+                "mujoco:equality_constraint_type": eq_type,
+                "mujoco:equality_constraint_objtype": 1,
+                "mujoco:equality_constraint_body1": link,
+                "mujoco:equality_constraint_body2": -1 if row_names_world else other,
+                "mujoco:equality_constraint_enabled": True,
+                "mujoco:equality_constraint_target_kind": 1,
+                "mujoco:equality_constraint_target": loop,
+            }
+        )
+        return builder.finalize(device=device)
+
+    # Mismatched projections: a WELD row linking a ball joint, and a row whose bodies are not
+    # the linked joint's endpoints. Each is an unenforced equality, not a loop joint.
+    for eq_type, joint_kind, row_names_world in ((1, "ball", False), (0, "ball", True)):
+        with test.subTest(eq_type=eq_type, joint_kind=joint_kind, row_names_world=row_names_world):
+            with test.assertRaisesRegex(NotImplementedError, "equality"):
+                SolverFeatherPGS(build_pendulum_with_connect(eq_type, joint_kind, row_names_world))
+    # A tree joint between the row's bodies is not a projection either: the row's anchor is
+    # not enforced by it.
+    builder = newton.ModelBuilder()
+    root = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+    tip = builder.add_link(xform=wp.transform((0.5, 0.0, 1.0), wp.quat_identity()))
+    for body in (root, tip):
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    hinge = builder.add_joint_revolute(-1, root, axis=newton.Axis.Y)
+    ball = builder.add_joint_ball(root, tip, parent_xform=wp.transform((0.5, 0.0, 0.0), wp.quat_identity()))
+    builder.add_articulation([hinge, ball])
+    builder.add_custom_values(
+        **{
+            "mujoco:equality_constraint_type": 0,
+            "mujoco:equality_constraint_objtype": 1,
+            "mujoco:equality_constraint_body1": root,
+            "mujoco:equality_constraint_body2": tip,
+            "mujoco:equality_constraint_enabled": True,
+            "mujoco:equality_constraint_target_kind": 1,
+            "mujoco:equality_constraint_target": ball,
+        }
+    )
+    with test.subTest(target="tree ball joint"):
+        with test.assertRaisesRegex(NotImplementedError, "equality"):
+            SolverFeatherPGS(builder.finalize(device=device))
+    # The matching projection is judged through its loop joint instead: these closures join a
+    # dynamic body outside the articulation (or weld), which this solver warns about and skips.
+    for eq_type, joint_kind in ((0, "ball"), (1, "fixed")):
+        with test.subTest(eq_type=eq_type, joint_kind=joint_kind, matching=True):
+            with test.assertWarnsRegex(UserWarning, "loop joint"):
+                SolverFeatherPGS(build_pendulum_with_connect(eq_type, joint_kind, False))
+
+    # A JOINT row linking a mimic between other joints is likewise unenforced; the importer's
+    # own projection is enforced through its mimic constraint.
+    mjcf = """
+    <mujoco>
+      <worldbody>
+        <body name="a" pos="0 0 1">
+          <joint name="ja" type="hinge" axis="0 1 0"/>
+          <geom type="box" size="0.1 0.1 0.1"/>
+          <body name="b" pos="0.3 0 0">
+            <joint name="jb" type="hinge" axis="0 1 0"/>
+            <geom type="box" size="0.1 0.1 0.1"/>
+            <body name="c" pos="0.3 0 0">
+              <joint name="jc" type="hinge" axis="0 1 0"/>
+              <geom type="box" size="0.1 0.1 0.1"/>
+            </body>
+          </body>
+        </body>
+      </worldbody>
+      <equality><joint joint1="jb" joint2="ja"/></equality>
+    </mujoco>
+    """
+    for swap in (False, True):
+        with test.subTest(mimic_joints_swapped=swap):
+            builder = newton.ModelBuilder()
+            builder.add_mjcf(mjcf)
+            model = builder.finalize(device=device)
+            test.assertEqual(int(model.mujoco.equality_constraint_target_kind.numpy()[0]), 2)
+            if swap:
+                joint0 = model.constraint_mimic_joint0.numpy()
+                joint1 = model.constraint_mimic_joint1.numpy()
+                model.constraint_mimic_joint0.assign(joint1)
+                model.constraint_mimic_joint1.assign(joint0)
+                with test.assertRaisesRegex(NotImplementedError, "equality"):
+                    SolverFeatherPGS(model)
+            else:
+                SolverFeatherPGS(model)
+
+
+def test_enabling_equality_constraint_at_runtime_raises(test, device):
+    """Re-check the MuJoCo equality rows when constraint properties change."""
+    model = _build_box_with_equality(device, enabled=False)
+    solver = SolverFeatherPGS(model)
+    # Other notifications do not re-read the constraint rows.
+    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    model.mujoco.equality_constraint_enabled.assign(np.array([True]))
+    with test.assertRaisesRegex(NotImplementedError, "equality"):
+        solver.notify_model_changed(newton.ModelFlags.CONSTRAINT_PROPERTIES)
+    with test.assertRaisesRegex(NotImplementedError, "equality"):
+        solver.notify_model_changed(newton.ModelFlags.ALL)
+    model.mujoco.equality_constraint_enabled.assign(np.array([False]))
+    solver.notify_model_changed(newton.ModelFlags.CONSTRAINT_PROPERTIES)
+
+
+class TestFeatherPGSUnsupportedPhysics(unittest.TestCase):
+    pass
+
+
+for _test in (
+    test_disabled_tree_joints_raise,
+    test_caller_disabled_joints_raise_through_views,
+    test_coupled_views_accept_joints_other_entries_own,
+    test_coupled_view_rejects_unowned_disabled_joint,
+    test_admm_views_accept_cross_solver_joints,
+    test_admm_views_reject_unattached_cross_solver_joints,
+    test_unconverted_equality_constraints_raise,
+    test_equality_link_must_name_the_projected_constraint,
+    test_enabling_equality_constraint_at_runtime_raises,
+):
+    add_function_test(TestFeatherPGSUnsupportedPhysics, _test.__name__, _test, devices=get_test_devices())
 
 
 if __name__ == "__main__":

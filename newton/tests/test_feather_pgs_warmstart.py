@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     gather_propagation_warmstart,
     prepare_world_impulses,
 )
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
 
 def _build_press():
@@ -146,7 +147,7 @@ def _gather_dense_rows(
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
             decay,
-            dt_scale,
+            wp.array([dt_scale], dtype=wp.float32, device="cpu"),
             max_c,
         ],
         outputs=[impulses],
@@ -261,7 +262,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
                 1.0,
-                1.0,
+                wp.ones(1, dtype=wp.float32, device="cpu"),
                 4,
             ],
             outputs=[mf_impulses],
@@ -291,7 +292,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
                 1.0,
-                1.0,
+                wp.ones(1, dtype=wp.float32, device="cpu"),
                 4,
             ],
             outputs=[propagation_impulses],
@@ -706,6 +707,88 @@ class TestFeatherPGSWarmstartProvenance(unittest.TestCase):
                 seeded = _seeded_sphere_impulses(solver, contacts, shapes, model, articulated, state_in, state_out)
                 for got, want in zip(seeded, solved, strict=True):
                     self.assertAlmostEqual(got, want, delta=1.0e-6 * max(1.0, abs(want)))
+
+
+def _resting_box_rows(device, articulated: bool):
+    """Settle a box on the ground with warm start; return the model, pipeline, contacts, solver and states.
+
+    ``articulated`` mounts the box on a vertical prismatic joint, so its contacts are dense
+    rows; otherwise it is a free body on the free-body rows.
+    """
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+    xform = wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity())
+    if articulated:
+        body = builder.add_link(xform=xform)
+        joint = builder.add_joint_prismatic(-1, body, axis=wp.vec3(0.0, 0.0, 1.0), parent_xform=xform)
+        builder.add_articulation([joint])
+    else:
+        body = builder.add_body(xform=xform)
+    builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
+    contacts = pipeline.contacts()
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=12)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    control = model.control()
+    for _ in range(60):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+    return model, pipeline, contacts, solver, state_0, state_1, control
+
+
+def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device):
+    """Rescale carried impulses by the step ratio once in captured steps, as in eager steps.
+
+    The previous step lives on the device. A ratio fixed at capture would rescale the
+    history again on every replay: after settling at 1/120 s, replays at 1/240 s would
+    seed 0.5, 0.25 and 0.125 of the settled load instead of 0.5 each time.
+    """
+    for articulated in (True, False):
+        ratios = {}
+        for captured in (False, True):
+            _model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(device, articulated)
+            impulses, row_type = (
+                (solver.impulses, solver.row_type) if articulated else (solver.mf_impulses, solver.mf_row_type)
+            )
+
+            def normal_load(impulses=impulses, row_type=row_type):
+                return float(impulses.numpy()[row_type.numpy() == PGS_CONSTRAINT_TYPE_CONTACT].sum())
+
+            settled = normal_load()
+            test.assertGreater(settled, 0.0)
+            # Without a sweep the solved impulses are the seeds.
+            solver.pgs_iterations = 0
+            pipeline.collide(state_0, contacts)
+            if captured:
+                with wp.ScopedCapture(device) as capture:
+                    solver.step(state_0, state_1, control, contacts, 0.5 / 120.0)
+            values = []
+            for _ in range(3):
+                if captured:
+                    wp.capture_launch(capture.graph)
+                else:
+                    solver.step(state_0, state_1, control, contacts, 0.5 / 120.0)
+                values.append(normal_load() / settled)
+            ratios[captured] = values
+        with test.subTest(articulated=articulated):
+            np.testing.assert_allclose(ratios[False], [0.5, 0.5, 0.5], rtol=1.0e-5)
+            np.testing.assert_allclose(ratios[True], ratios[False], rtol=1.0e-5)
+
+
+class TestFeatherPGSWarmstartReplay(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestFeatherPGSWarmstartReplay,
+    "test_graph_replay_rescales_history_once_after_a_timestep_change",
+    test_graph_replay_rescales_history_once_after_a_timestep_change,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":

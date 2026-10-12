@@ -1344,6 +1344,7 @@ class _FrictionPatchState:
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
         frozen_bodies=None,
+        shape_material_mu=None,
     ):
         wp.launch(
             _prepare,
@@ -1358,7 +1359,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
                 model.shape_body,
-                model.shape_material_mu,
+                model.shape_material_mu if shape_material_mu is None else shape_material_mu,
                 model.shape_gap,
                 self.body_radius,
                 state.body_q,
@@ -1563,6 +1564,7 @@ def seed_patch_impulses(
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
     scale: float,
+    dt_scale: wp.array[float],
 ):
     """Transport cached patch impulses and project every anchor's seed onto its patch cone.
 
@@ -1576,7 +1578,7 @@ def seed_patch_impulses(
     value = wp.vec2(impulses[w, s + 1], impulses[w, s + 2])
     source = frame.source[c]
     if source >= 0:
-        tangent = prev.tangent_impulse[source] * scale
+        tangent = prev.tangent_impulse[source] * (scale * dt_scale[0])
         if frame.body_a[c] >= 0:
             tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
         n = frame.normal[c]

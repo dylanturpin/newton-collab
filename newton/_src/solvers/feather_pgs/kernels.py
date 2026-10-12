@@ -1954,6 +1954,37 @@ def _compute_body_net_wrench(
     return body_fb_s[child] + f_t_s - f_ext_origin
 
 
+@wp.kernel
+def compute_body_parent_f(
+    body_to_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_fb_s: wp.array[wp.spatial_vector],
+    body_ft_s: wp.array[wp.spatial_vector],
+    body_f_ext: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    body_parent_f: wp.array[wp.spatial_vector],
+):
+    """Publish the inverse-dynamics wrench transmitted through each body's inbound joint.
+
+    The backward pass leaves the net wrench of a body's subtree, referenced to the
+    articulation origin, in ``body_fb_s + body_ft_s - f_ext``. Translate it to the body's
+    center of mass in world frame (linear force first, torque second).
+    """
+    body = wp.tid()
+    articulation = body_to_articulation[body]
+    if articulation < 0:
+        body_parent_f[body] = wp.spatial_vector()
+        return
+    origin = articulation_origin[articulation]
+    f_s = _compute_body_net_wrench(body, body_ft_s[body], origin, body_fb_s, body_f_ext, body_flags, body_q, body_com)
+    force = wp.spatial_top(f_s)
+    com_rel = wp.transform_point(body_q[body], body_com[body]) - origin
+    body_parent_f[body] = wp.spatial_vector(force, wp.spatial_bottom(f_s) - wp.cross(com_rel, force))
+
+
 @wp.func
 def accumulate_articulation_tau(
     index: int,
@@ -2858,9 +2889,9 @@ def _is_sliding_row_type(row_type: int):
     return row_type == PGS_CONSTRAINT_TYPE_FRICTION or row_type == PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
 
 
-@wp.kernel
-def compute_contact_linear_force_from_impulses(
-    contact_count: wp.array[wp.int32],
+@wp.func
+def contact_linear_force_from_impulses(
+    c: int,
     contact_normal: wp.array[wp.vec3],
     contact_world: wp.array[wp.int32],
     contact_slot: wp.array[wp.int32],
@@ -2879,15 +2910,11 @@ def compute_contact_linear_force_from_impulses(
     propagation_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
-    # outputs
-    rigid_contact_force: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces."""
-    c = wp.tid()
-    total_contacts = contact_count[0]
-    if c >= total_contacts:
-        return
+    """Return the world-frame force on shape 0's body from contact ``c``'s solved impulses.
 
+    Contacts whose rows were dropped report zero; contacts without friction rows report their normal force only.
+    """
     force = wp.vec3(0.0)
     slot = contact_slot[c]
     path = contact_path[c]
@@ -2947,8 +2974,114 @@ def compute_contact_linear_force_from_impulses(
             tangent0, tangent1 = contact_tangent_basis(normal)
             force += lam_t0 * tangent0 + lam_t1 * tangent1
         force *= inv_dt
+    return force
 
-    rigid_contact_force[c] = force
+
+@wp.kernel
+def compute_contact_linear_force_from_impulses(
+    contact_count: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    enable_friction: int,
+    inv_dt: float,
+    # outputs
+    rigid_contact_force: wp.array[wp.vec3],
+):
+    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    rigid_contact_force[c] = contact_linear_force_from_impulses(
+        c,
+        contact_normal,
+        contact_world,
+        contact_slot,
+        contact_path,
+        world_impulses,
+        mf_impulses,
+        propagation_impulses,
+        world_constraint_count,
+        mf_constraint_count,
+        propagation_constraint_count,
+        world_row_type,
+        world_row_parent,
+        mf_row_type,
+        mf_row_parent,
+        propagation_row_type,
+        propagation_row_parent,
+        enable_friction,
+        inv_dt,
+    )
+
+
+@wp.kernel
+def compute_contact_spatial_force_from_impulses(
+    contact_count: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    enable_friction: int,
+    inv_dt: float,
+    rigid_contact_max: int,
+    # outputs
+    contact_f: wp.array[wp.spatial_vector],
+):
+    """Write every row of a ``CONTACT_F`` observable: the linear force of live rigid contacts, zero elsewhere.
+
+    The collision count can exceed the rigid capacity, so rigid rows stop at the capacity.
+    """
+    c = wp.tid()
+    force = wp.vec3(0.0)
+    if c < wp.min(contact_count[0], rigid_contact_max):
+        force = contact_linear_force_from_impulses(
+            c,
+            contact_normal,
+            contact_world,
+            contact_slot,
+            contact_path,
+            world_impulses,
+            mf_impulses,
+            propagation_impulses,
+            world_constraint_count,
+            mf_constraint_count,
+            propagation_constraint_count,
+            world_row_type,
+            world_row_parent,
+            mf_row_type,
+            mf_row_parent,
+            propagation_row_type,
+            propagation_row_parent,
+            enable_friction,
+            inv_dt,
+        )
+    contact_f[c] = wp.spatial_vector(force, wp.vec3(0.0))
 
 
 @wp.kernel
@@ -7445,7 +7578,7 @@ def gather_mf_warmstart(
     previous_normal: wp.array[wp.vec3],
     mf_row_mu: wp.array2d[float],
     decay: float,
-    dt_scale: float,
+    dt_scale: wp.array[float],
     mf_max_c: int,
     # in-out
     mf_impulses: wp.array2d[float],
@@ -7459,7 +7592,7 @@ def gather_mf_warmstart(
     each writes only its own disjoint slot range, so unmatched / cold contacts
     keep the zero left by the memset and no stale slot survives.
 
-    ``dt_scale`` = dt_now / dt_prev rescales carried impulses across step-size
+    ``dt_scale[0]`` = dt_now / dt_prev rescales carried impulses across step-size
     changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
     :func:`warmstart_previous_index` gives the contact's index in the contact set the
@@ -7500,7 +7633,7 @@ def gather_mf_warmstart(
         and mf_row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
+        mf_impulses[world, new_slot] = decay * dt_scale[0] * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
     # Friction rows (offsets 1..2): only if THIS step allocated them here and
@@ -7517,7 +7650,7 @@ def gather_mf_warmstart(
                     and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
                     and prev_mf_row_parent[world, prev_r] == prev_slot
                 ):
-                    mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
+                    mf_impulses[world, new_r] = decay * dt_scale[0] * prev_mf_impulses[world, prev_r]
                 # else: leave 0
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
@@ -7586,7 +7719,7 @@ def gather_dense_warmstart(
     previous_normal: wp.array[wp.vec3],
     world_row_mu: wp.array2d[float],
     decay: float,
-    dt_scale: float,
+    dt_scale: wp.array[float],
     max_constraints: int,
     # in-out
     world_impulses: wp.array2d[float],
@@ -7634,7 +7767,7 @@ def gather_dense_warmstart(
         and prev_dense_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
         if world_row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_impulses[world, new_slot] = decay * dt_scale * prev_dense_impulses[world, prev_slot]
+            world_impulses[world, new_slot] = decay * dt_scale[0] * prev_dense_impulses[world, prev_slot]
 
     # Friction rows (offsets 1, 2): only if THIS step allocated them here.
     for r in range(1, 3):
@@ -7652,7 +7785,7 @@ def gather_dense_warmstart(
                     and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
                     and prev_dense_row_parent[world, prev_r] == prev_slot
                 ):
-                    world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
+                    world_impulses[world, new_r] = decay * dt_scale[0] * prev_dense_impulses[world, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
         _transport_warmstart_contact(
@@ -7691,7 +7824,7 @@ def gather_propagation_warmstart(
     previous_normal: wp.array[wp.vec3],
     row_mu: wp.array2d[float],
     decay: float,
-    dt_scale: float,
+    dt_scale: wp.array[float],
     max_constraints: int,
     # in-out
     impulses: wp.array2d[float],
@@ -7721,7 +7854,7 @@ def gather_propagation_warmstart(
         and row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and prev_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        impulses[world, new_slot] = decay * dt_scale * prev_impulses[world, prev_slot]
+        impulses[world, new_slot] = decay * dt_scale[0] * prev_impulses[world, prev_slot]
 
     for r in range(1, 3):
         new_r = new_slot + r
@@ -7736,7 +7869,7 @@ def gather_propagation_warmstart(
             and prev_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
             and prev_row_parent[world, prev_r] == prev_slot
         ):
-            impulses[world, new_r] = decay * dt_scale * prev_impulses[world, prev_r]
+            impulses[world, new_r] = decay * dt_scale[0] * prev_impulses[world, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
         _transport_warmstart_contact(
@@ -12458,3 +12591,15 @@ def collect_propagation_units(
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b
     unit_len[base + idx] = contact_slots_needed[c]
+
+
+@wp.kernel(enable_backward=False)
+def warmstart_dt_scale(dt: float, prev_dt: wp.array[float], dt_scale: wp.array[float]):
+    """Write the carried-impulse rescale ``dt / prev_dt``; 1 before the first warm-started step."""
+    dt_scale[0] = dt / prev_dt[0] if prev_dt[0] > 0.0 else 1.0
+
+
+@wp.kernel(enable_backward=False)
+def record_warmstart_dt(dt: float, prev_dt: wp.array[float]):
+    """Record the step size the carried impulses were solved at."""
+    prev_dt[0] = dt

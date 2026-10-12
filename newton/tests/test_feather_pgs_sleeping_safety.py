@@ -215,9 +215,10 @@ class TestFeatherPGSSleepingSafety(unittest.TestCase):
                 np.testing.assert_array_equal(state_in.joint_q.numpy(), before)
 
     def test_extended_state_outputs_are_accepted(self):
-        """Sleep with requested acceleration and joint-wrench outputs, which FeatherPGS leaves untouched."""
+        """Sleep with requested acceleration and joint-wrench outputs."""
         model = _boxes(1)
-        model.request_state_attributes("body_qdd", "body_parent_f")
+        with self.assertWarns(DeprecationWarning):
+            model.request_state_attributes("body_qdd", "body_parent_f")
         pipeline, solver, state_in, state_out, control = _runtime(model)
         self.assertIsNotNone(state_in.body_parent_f)
         contacts = pipeline.contacts()

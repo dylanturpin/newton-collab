@@ -106,6 +106,47 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         self.assertLess(np.count_nonzero(expected_valid), np.count_nonzero(valid_before))
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
+    def test_narrow_dof_flags_and_material_copies_capture_into_a_graph(self):
+        """Replay a captured narrow-flag notify and pick up armature, damping, friction and materials edited in place."""
+        device = wp.get_device("cuda:0")
+        model = _build_model(device)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        flags = (
+            ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+            | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+            | ModelFlags.SHAPE_PROPERTIES
+        )
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(flags)
+        rng = np.random.default_rng(3)
+        model.joint_armature.assign(rng.uniform(0.0, 0.5, model.joint_dof_count).astype(np.float32))
+        damping = rng.uniform(0.1, 1.0, model.joint_dof_count).astype(np.float32)
+        model.joint_damping.assign(damping)
+        materials = {
+            "shape_material_mu": solver.shape_material_mu,
+            "shape_material_restitution": solver.shape_material_restitution,
+            "shape_material_mu_torsional": solver._shape_mu_torsional,
+            "shape_material_mu_rolling": solver._shape_mu_rolling,
+        }
+        edited = {}
+        for name in materials:
+            edited[name] = rng.uniform(0.01, 0.9, model.shape_count).astype(np.float32)
+            getattr(model, name).assign(edited[name])
+        fresh = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        revolute, _ = _friction_dofs(model)
+        friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+        friction[revolute[2]] = -1.0
+        model.joint_friction.assign(friction)
+        wp.capture_launch(capture.graph)
+        _assert_armature_matches(self, solver, fresh)
+        np.testing.assert_array_equal(solver._passive_joint_damping.numpy()[: model.joint_dof_count], damping)
+        for name, buffer in materials.items():
+            np.testing.assert_array_equal(buffer.numpy()[: model.shape_count], edited[name], err_msg=name)
+        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(WORLD_COUNT) == 2)
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            solver.check_joint_friction()
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
     def test_captured_notify_flags_invalid_joint_friction(self):
         """Latch the world of each invalid coefficient on replay and report it outside capture."""
         device = wp.get_device("cuda:0")
