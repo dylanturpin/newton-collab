@@ -150,7 +150,6 @@ def run(
         step(s0, s1)
         step(s1, s0)
     with wp.ScopedCapture(device=model.device) as capture:
-        solver.seed_double_buffer_events()
         step(s0, s1)
         step(s1, s0)
     before = s0.body_q.numpy().copy()

@@ -145,7 +145,6 @@ class Example:
             # Odd substep counts alternate the captured input and output buffers.
             for _ in range(2 if self.sim_substeps % 2 else 1):
                 with wp.ScopedCapture(device=self.model.device) as capture:
-                    self.solver.seed_double_buffer_events()
                     self.simulate()
                 self.graphs.append(capture.graph)
 

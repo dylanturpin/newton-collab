@@ -415,8 +415,6 @@ class Example:
             self.state_1.assign(initial)
             self.solver.reset(self.state_0)
         with wp.ScopedCapture() as capture:
-            if self.solver_type == "featherpgs":
-                self.solver.seed_double_buffer_events()
             self.simulate()
         self.graph = capture.graph
 

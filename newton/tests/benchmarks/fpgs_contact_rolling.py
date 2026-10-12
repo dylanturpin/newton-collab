@@ -114,7 +114,6 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     wp.synchronize()
     # One writer graph owns this stateful pipeline. No eager solve follows it.
     with wp.ScopedCapture() as capture:
-        solver.seed_double_buffer_events()
         step(True)
         step(True)
     samples = []

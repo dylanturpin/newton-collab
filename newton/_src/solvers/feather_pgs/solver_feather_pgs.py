@@ -7677,9 +7677,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._memset_stream = wp.Stream(self.model.device)
         self._j_active_counts = [wp.zeros_like(self.constraint_count), wp.zeros_like(self.constraint_count)]
 
-    def seed_double_buffer_events(self):
-        """Accept the pre-capture call; ``step()`` joins its maintenance stream before returning."""
-
     def _contact_friction_start_iteration(self, iterations: int, *, velocity_pass: bool = False) -> int:
         """Return the first local PGS iteration that should solve friction rows.
 
