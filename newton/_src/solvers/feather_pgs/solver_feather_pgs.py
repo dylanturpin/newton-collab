@@ -1582,12 +1582,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             contact_torsion_device: Experimental opt-in device-resident torsion preparation.
                 False retains the host reference implementation. True preserves the
                 grouping and friction law while using preallocated GPU buffers.
-                Eager stepping checks errors synchronously. For CUDA graph capture,
-                first call :meth:`prepare_contact_torsion_capture` outside capture,
-                then call :meth:`validate_contact_torsion` after every replay batch
-                before consuming results. Errors latch permanently; recreate the
-                solver rather than continuing an invalid graph. No effect when the
-                torsion radius is zero. The host reference cannot be captured.
+                It supports CUDA graph capture of :meth:`step`. Invalid torsion input
+                (for example rows beyond the capacity or hydroelastic contacts) makes the
+                failing step publish its input state unchanged. An eager step raises when
+                it returns; after graph replays, :meth:`check_constraint_capacity` raises,
+                and :meth:`reset` clears the error. No effect when the torsion radius is
+                zero. The host reference cannot be captured.
                 Grouping currently runs serially within each world with worst-case
                 quadratic contact-count cost. Many small worlds can benefit, but
                 a single contact-dense world may be slower than host preparation;
@@ -3222,10 +3222,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
 
         self.contact_torsion_device = bool(contact_torsion_device)
+        self._device_torsion = None
         if self._contact_torsion_enabled and self.contact_torsion_device:
             from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
 
-            enable_device_torsion(self)
+            enable_device_torsion(self, deferred_errors=True)
 
         self.sleeping = (
             _SleepState(self, sleep_linear_threshold, sleep_angular_threshold, sleep_quiet_time, sleep_skip_constraints)
@@ -3251,40 +3252,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and model.articulation_world is not None
             and np.any(model.articulation_world.numpy() < 0)
         )
-
-    def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
-        """Prepare experimental torsion rollback buffers before CUDA graph capture.
-
-        Requires ``contact_torsion_device=True`` when torsion is active. Call
-        outside capture with the state layouts used by the graph. Subsequent
-        graph replay requires :meth:`validate_contact_torsion` at every batch
-        boundary before results are consumed. Eager steps continue to validate
-        automatically. This method does not advance physics.
-        """
-        if not self._contact_torsion_enabled:
-            return
-        preparation = getattr(self, "_device_torsion", None)
-        if preparation is None:
-            raise RuntimeError("Contact torsion graph capture requires contact_torsion_device=True")
-        if wp.get_stream(self.model.device).is_capturing:
-            raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
-        preparation.validate()
-        preparation.deferred_errors = True
-        preparation.begin_step(state_in, state_out)
-
-    def validate_contact_torsion(self) -> None:
-        """Raise latched torsion errors after every experimental graph replay batch.
-
-        This synchronous status check must run before consuming captured results.
-        Invalid input suppresses incomplete contact solving and restores published
-        dynamic state, but internal caches are not rolled back: recreate the solver
-        after correcting invalid input. No-op without device torsion preparation.
-        """
-        preparation = getattr(self, "_device_torsion", None)
-        if preparation is not None:
-            if wp.get_stream(self.model.device).is_capturing:
-                raise RuntimeError("Validate contact torsion outside CUDA graph capture")
-            preparation.validate()
 
     def validate_contact_compliance(self) -> None:
         """Raise the first latched contact-compliance error, then clear it.
@@ -3593,7 +3560,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         from it, along with dense, matrix-free, and propagation impulse history,
         the carried friction anchors, and overflow status, is cleared. Mass
         factors for selected worlds refresh on the next step after a teleport;
-        other worlds retain their normal refresh cadence. A full reset (``world_mask=None``)
+        other worlds retain their normal refresh cadence. Any reset also clears the solver-wide
+        contact torsion error and the disabled-tree-joint status of the selected worlds. A full reset (``world_mask=None``)
         also restarts the host-side step cadence for subsequent :meth:`step` calls. CUDA graphs
         captured before the reset keep their captured cadence and buffer schedule.
 
@@ -3619,6 +3587,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._coupling_patch_history_restore_pending = False
         if self._compliance is not None:
             self._compliance.counts.zero_()
+        if self._device_torsion is not None:
+            # The torsion status is solver-wide; a cause that persists latches again on the next step.
+            self._device_torsion.clear_status()
         world_mask = self._solver_world_mask(world_mask)
         if self.sleeping is not None:
             self.sleeping.wake(world_mask)
@@ -9492,7 +9463,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self.validate_observables(observables, contacts)
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
-            if getattr(self, "_device_torsion", None) is not None:
+            if self._device_torsion is not None:
                 self._device_torsion.begin_step(state_in, state_out)
         validate_torsional_rolling_friction_mode(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
@@ -10563,10 +10534,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     device=contact_counts.device,
                 )
 
-        if self._contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
+        if self._device_torsion is not None:
             self._device_torsion.end_step(state_out)
-            if self._device_torsion.deferred_errors and not wp.get_stream(self.model.device).is_capturing:
-                self.validate_contact_torsion()
+            if not wp.get_stream(self.model.device).is_capturing:
+                self._device_torsion.validate()
         self._step += 1
         return state_out
 
@@ -10648,7 +10619,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         Also raises if a step saw a joint of an articulation tree disabled in
         :attr:`~newton.Model.joint_enabled`; only loop-closing joints can be disabled.
-        Re-enable the joint and :meth:`reset` the affected worlds.
+        Re-enable the joint and :meth:`reset` the affected worlds. With
+        ``contact_torsion_device``, also raises if contact torsion rejected its input since
+        the last :meth:`reset`; that step published its input state unchanged.
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
@@ -10660,6 +10633,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
+        if self._device_torsion is not None:
+            try:
+                self._device_torsion.validate()
+            except (RuntimeError, ValueError) as error:
+                raise RuntimeError(f"FeatherPGS contact torsion rejected its input: {error}") from error
         disabled = np.flatnonzero(self._disabled_tree_joint.numpy())
         if disabled.size:
             raise RuntimeError(
