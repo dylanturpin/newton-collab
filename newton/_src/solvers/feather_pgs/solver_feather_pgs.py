@@ -133,7 +133,6 @@ from .kernels import (
     compute_com_transforms,
     compute_compact_diagonal_inverse_mass,
     compute_composite_inertia,
-    compute_contact_linear_force_from_impulses,
     compute_contact_spatial_force_from_impulses,
     compute_delta_and_accumulate,
     compute_effective_joint_armature,
@@ -189,7 +188,6 @@ from .kernels import (
     jcalc_tau,
     local_solve_launch_gate,
     mul_com_spatial_inertia,
-    pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
@@ -1335,8 +1333,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :attr:`~newton.solvers.SolverObservables.contact_f` is populated when
         :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` is requested. Each live rigid
         contact row holds the force [N] on shape 0's body, in world frame, from the solved
-        normal and friction impulses of the step divided by ``dt``, the same forces
-        :meth:`update_contacts` reports; the torque part is zero (torsional and rolling
+        normal and friction impulses of the step divided by ``dt``; the torque part is zero (torsional and rolling
         friction are not reported). Compliant contact rows report their solved impulse like
         rigid rows. Contacts whose rows were dropped for capacity, contacts of sleeping
         islands whose rows are skipped (``sleep_skip_constraints``), rows beyond the contact
@@ -10348,9 +10345,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._ws_prev_mf_row_parent.fill_(-1)
 
         if self._ws_prev_propagation_impulses is not None:
-            with wp.ScopedTimer(
-                "S7_Propagation_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=False
-            ):
+            with wp.ScopedTimer("S7_Propagation_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 wp.copy(self._ws_prev_propagation_impulses, self.propagation_impulses)
                 wp.copy(self._ws_prev_propagation_row_type, self.propagation_row_type)
                 wp.copy(self._ws_prev_propagation_row_parent, self.propagation_row_parent)
@@ -10692,49 +10687,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             else 0,
             "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
         }
-
-    @override
-    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
-        """Populate linear contact forces from the last FeatherPGS solve.
-
-        This path reports linear force only: the torque components of
-        ``contacts.force`` are zero placeholders, not a solved wrench about
-        body0's center of mass. With persistent patches, normal and friction
-        rows can act at different points, so crossing the current contact point
-        with the combined force does not recover the solved torque. This export
-        is not suitable for contact-wrench sensing. The
-        :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` observable reports the same
-        forces from :meth:`step`.
-
-        Args:
-            contacts: The contacts passed to the last :meth:`step`.
-            state: Unused.
-        """
-        del state
-        if contacts is None or contacts.rigid_contact_count is None:
-            return
-
-        dt = self._last_step_dt
-        inv_dt = 0.0 if dt is None or dt <= 0.0 else 1.0 / dt
-        wp.launch(
-            compute_contact_linear_force_from_impulses,
-            dim=contacts.rigid_contact_max,
-            inputs=self._contact_force_inputs(contacts, inv_dt),
-            outputs=[contacts.rigid_contact_force],
-            device=self.model.device,
-        )
-
-        if contacts.force is not None:
-            wp.launch(
-                pack_contact_linear_force_as_spatial,
-                dim=contacts.rigid_contact_max,
-                inputs=[
-                    contacts.rigid_contact_count,
-                    contacts.rigid_contact_force,
-                ],
-                outputs=[contacts.force],
-                device=self.model.device,
-            )
 
     def _contact_force_inputs(self, contacts: Contacts, inv_dt: float) -> list:
         """Return the inputs shared by the contact-force kernels."""
