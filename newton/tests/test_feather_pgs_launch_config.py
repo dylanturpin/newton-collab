@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 )
 from newton.solvers import SolverFeatherPGS
 from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -627,27 +628,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     )
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal contact response requires CUDA")
-    def test_sparse_diagonal_owner_yields_to_contact_torsion(self):
-        """Keep torsion-enabled worlds on the general owner, which solves the appended torsion row."""
-        model = _build_sparse_diagonal_pair_model(device="cuda:0")
-        solvers = {
-            radius: SolverFeatherPGS(
-                model,
-                solve_mode="matrix_free",
-                articulation_constraint_max=64,
-                free_body_constraint_max=32,
-                iterations=8,
-                enable_joint_limits=True,
-                contact_torsion_radius=radius,
-            )
-            for radius in (0.0, 0.01)
-        }
-        self.assertTrue(solvers[0.0]._sparse_diagonal_contact_solve)
-        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
-        self.assertFalse(solvers[0.01]._sparse_diagonal_contact_solve)
-        self.assertFalse(solvers[0.01]._sparse_diagonal_contact_triples)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "direct compact diagonal inertia requires CUDA")
     def test_direct_diagonal_inertia_refreshes_masked_inertial_changes(self):
         """Refresh the compact inertia terms when an inertial model change lands on a mass-reuse step."""
         model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)

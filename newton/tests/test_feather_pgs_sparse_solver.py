@@ -12,6 +12,7 @@ import newton
 from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 from newton.tests.test_feather_pgs_propagation_free_root_warp import _build_model as _build_chain
 
 DT = 1.0 / 400.0
@@ -510,12 +511,14 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assertIsNone(_make_solver(chain, True)._sparse_mass_matrix_size)
         model = _build_model()
         for options in (
-            {"contact_torsion_radius": 0.01},
+            {"torsion_radius": 0.01},
             {"enable_joint_velocity_limits": True},
             {"contact_warmstart": True},
             {"articulation_constraint_max": 2048},
         ):
             with self.subTest(options=options):
+                options = dict(options)
+                set_torsion_radius(model, options.pop("torsion_radius", 0.0))
                 solver = _make_solver(model, True, **options)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertGreater(solver._J_by_size[9].size, 1)

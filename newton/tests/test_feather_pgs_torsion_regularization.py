@@ -86,7 +86,7 @@ class TestTorsionRegularization(unittest.TestCase):
         """Preserve excluded/radius-zero controls and forbid spin without compressive load."""
         for regularization in (0.0, 0.01, 0.02):
             base, *_ = fixture(0.0, contact_regularization=regularization)
-            excluded, *_ = fixture(0.01, contact_regularization=regularization, contact_torsion_shape_indices=())
+            excluded, *_ = fixture(0.01, contact_regularization=regularization, torsion_shapes=())
             for name in base:
                 np.testing.assert_array_equal(base[name], excluded[name], err_msg=name)
             for options in ({"closing": 0.0}, {"mu": 0.0}):

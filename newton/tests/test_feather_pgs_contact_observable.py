@@ -12,6 +12,7 @@ import newton
 import newton._src.solvers.feather_pgs.kernels
 from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 120.0
@@ -57,9 +58,11 @@ def _check_rows(test, contacts, contact_f):
     np.testing.assert_array_equal(contact_f[count:], 0.0)
 
 
-def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **options):
+def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, torsion_radius=None, **options):
     """Report linear-only per-contact forces that sum to each box's weight at rest."""
     model, pipeline = _stacked_boxes(device)
+    if torsion_radius is not None:
+        set_torsion_radius(model, torsion_radius)
     options.setdefault("solve_mode", "matrix_free")
     solver = SolverFeatherPGS(model, iterations=32, **options)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
@@ -332,8 +335,8 @@ for _suffix, _options in (
     ("propagation_fused", {"articulated_contact_response": "propagation_fused"}),
     ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
     ("point_friction", {"friction_anchor_beta": 0.0}),
-    ("torsion", {"contact_torsion_radius": 0.01}),
-    ("device_torsion", {"contact_torsion_radius": 0.01, "contact_torsion_device": True}),
+    ("torsion", {"torsion_radius": 0.01}),
+    ("device_torsion", {"torsion_radius": 0.01, "contact_torsion_device": True}),
     ("double_buffer", {"double_buffer": True}),
     ("row_overflow", {"free_body_constraint_max": 6, "warn_constraint_overflow": False}),
 ):

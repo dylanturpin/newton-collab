@@ -31,6 +31,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_pgs_solve_sparse_diagonal_kernel,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 
 
 def _build_mixed_response_model(
@@ -1019,6 +1020,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         solvers = {}
         with kernel_overrides({"hinv_jt_kernel": "auto"}):
             for radius in (0.0, 0.01):
+                set_torsion_radius(model, radius)
                 solvers[radius] = SolverFeatherPGS(
                     model,
                     solve_mode="matrix_free",
@@ -1027,8 +1029,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     iterations=8,
                     articulation_constraint_max=96,
                     free_body_constraint_max=32,
-                    contact_torsion_radius=radius,
                 )
+            set_torsion_radius(model, 0.0)
             point = SolverFeatherPGS(
                 model,
                 solve_mode="matrix_free",
@@ -1262,6 +1264,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         solvers = {}
         with kernel_overrides({"hinv_jt_kernel": "par_row"}):
             for radius in (0.0, 0.01):
+                set_torsion_radius(model, radius)
                 solvers[radius] = SolverFeatherPGS(
                     model,
                     solve_mode="matrix_free",
@@ -1270,7 +1273,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     iterations=8,
                     articulation_constraint_max=32,
                     free_body_constraint_max=32,
-                    contact_torsion_radius=radius,
                 )
         self.assertTrue(solvers[0.0]._local_internal_fast_path)
         self.assertTrue(solvers[0.01]._contact_torsion_enabled)

@@ -12,6 +12,7 @@ import newton
 from newton._src.solvers.feather_pgs.contact_angular_friction import angular_friction_gs_sources
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 
 GRAVITY = 9.81
 DT = 0.00125
@@ -42,6 +43,7 @@ def ball(
     enable=True,
     cone="pyramidal",
     joint_friction=None,
+    torsion_radius=None,
     **solver_overrides,
 ):
     """Build a unit-mass solid sphere on the ground, articulated by slide x/z and hinge y/z joints.
@@ -78,6 +80,8 @@ def ball(
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     if joint_friction is not None:
         model.joint_friction.assign(np.asarray(joint_friction, np.float32))
+    if torsion_radius is not None:
+        set_torsion_radius(model, torsion_radius)
     options = dict(SOLVER_OPTIONS)
     options.update(solver_overrides)
     solver = SolverFeatherPGS(
@@ -966,7 +970,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
             {"velocity_iterations": 2},
             {"friction_mode": "bisection"},
             {"row_schedule": "contact_then_internal"},
-            {"contact_torsion_radius": 0.01},
+            {"torsion_radius": 0.01},
             {"enable_sleeping": True},
             {"contact_compliance": True},
         )

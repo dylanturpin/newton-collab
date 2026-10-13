@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_TORSION
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 
 _PROFILE = {
     "solve_mode": "matrix_free",
@@ -23,7 +24,6 @@ _PROFILE = {
     "contact_friction_shared_anchor": True,
     "friction_anchor_beta": 0.2,
     "contact_friction_gap_max": 0.001,
-    "contact_torsion_radius": 0.01,
     "contact_torsion_device": True,
     "articulation_constraint_max": 512,
     "free_body_constraint_max": 512,
@@ -285,7 +285,7 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 box = builder.add_body(xform=wp.transform((2.0, 0.0, 0.1), wp.quat_identity()))
                 builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
                 model = builder.finalize(device="cuda:0")
-                solver = _solver(self, model, contact_torsion_radius=0.0)
+                solver = _solver(self, model, torsion_radius=0.0)
                 self.assertGreater(solver._mimic_count, 0)
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
                 _advance(pipeline, solver, [model.state(), model.state()], model.control(), 400)
@@ -370,8 +370,9 @@ def _two_world_boxes(test):
     return model, pipeline, solver, [model.state(), model.state()]
 
 
-def _solver(test, model, **overrides):
+def _solver(test, model, torsion_radius=0.01, **overrides):
     """Construct the profile solver, which warns that patch friction keeps shared anchors on normal rows only."""
+    set_torsion_radius(model, torsion_radius)
     return _expect_one_warning(
         test,
         UserWarning,

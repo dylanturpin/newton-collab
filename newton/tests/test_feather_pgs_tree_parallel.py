@@ -13,6 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSTreePlan
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 from newton.tests.test_feather_pgs_leaf_publication import (
     _build_branched_model,
     _build_contact_model,
@@ -254,12 +255,12 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
         for device in devices:
             with self.subTest(device=str(device)):
                 model = _build_contact_model(device)
+                set_torsion_radius(model, 0.01)
                 solver = SolverFeatherPGS(
                     model,
                     solve_mode="matrix_free",
                     parallel_tree=True,
                     contact_torsion_device=True,
-                    contact_torsion_radius=0.01,
                     friction_anchor_beta=0.0,
                     use_parallel_streams=False,
                 )
@@ -310,7 +311,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                                 for scratch in solver._tree_net_wrenches:
                                     scratch.fill_(-123.25)
                                 solver._launch_rigid_tau(state, solver, controls[index], add_to_existing=additive)
-                            for name in ("body_ft_s", "joint_tau"):
+                            for name in ("_body_ft_s", "_joint_tau"):
                                 np.testing.assert_allclose(
                                     getattr(solvers[1], name).numpy(),
                                     getattr(solvers[0], name).numpy(),

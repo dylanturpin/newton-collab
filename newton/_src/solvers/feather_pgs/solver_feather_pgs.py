@@ -1433,7 +1433,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register the per-body attributes consumed by FeatherPGS in the ``physx`` namespace.
+        """Register the body and shape attributes consumed by FeatherPGS in the ``physx`` namespace.
 
         Each attribute maps to the matching PhysX rigid-body USD attribute:
 
@@ -1446,6 +1446,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
         - ``physx:max_depenetration_velocity`` [m/s] bounds the contact correction velocity
           of free bodies (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
+
+        One per-shape attribute enables contact torsion, see ``contact_torsion_device``:
+
+        - ``physx:min_torsional_patch_radius`` [m] is the effective spin radius of the
+          shape's contacts (``physxCollision:minTorsionalPatchRadius``, default 0, no
+          torsion). PhysX also scales a radius with the penetration depth through
+          ``physxCollision:torsionalPatchRadius``; this solver does not.
 
         The solver reads them from the model at every step, for example
         ``model.physx.max_linear_velocity``. Models built without these attributes use the defaults.
@@ -1494,6 +1501,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 default=float("inf"),
                 usd_attribute_name="physxRigidBody:maxAngularVelocity",
                 usd_value_transformer=_angular_velocity_deg_to_rad,
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="min_torsional_patch_radius",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.SHAPE,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                usd_attribute_name="physxCollision:minTorsionalPatchRadius",
             )
         )
         builder.add_custom_attribute(
@@ -1552,19 +1570,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         return self._velocity_limits_fused
 
     @property
-    def contact_torsion_radius(self) -> float:
-        """Experimental construction-only effective spin radius [m]."""
-        return self._contact_torsion_radius
-
-    @property
-    def contact_torsion_shape_indices(self) -> tuple[int, ...] | None:
-        """Experimental construction-only global shape selection."""
-        return self._contact_torsion_shape_indices
-
-    @property
-    def contact_torsion_shape_patterns(self) -> tuple[str, ...] | None:
-        """Experimental construction-only shape-label regular expressions."""
-        return self._contact_torsion_shape_patterns
+    def _contact_torsion_shape_radius(self) -> wp.array | None:
+        """The model's per-shape torsion radius [m], or ``None`` when it is not registered."""
+        return self._physx_attribute("min_torsional_patch_radius")
 
     def __init__(
         self,
@@ -1616,9 +1624,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
-        contact_torsion_radius: float = 0.0,
-        contact_torsion_shape_indices: tuple[int, ...] | None = None,
-        contact_torsion_shape_patterns: tuple[str, ...] | None = None,
         contact_torsion_device: bool = False,
         enable_torsional_rolling_friction: bool = False,
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
@@ -1664,45 +1669,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 specialized joint-limit rows, carry their friction-patch history instead of rebuilding it,
                 and skip their articulated dynamics for steps they sleep through. When False, sleeping
                 islands keep their rows and dynamics and only their published state is frozen.
-            contact_torsion_radius: Experimental effective spin radius [m], zero disables.
-                Explicit material/footprint assumption: for uniform pressure on a disk
-                of radius R, the effective radius is 2*R/3. Does not consume the generic
-                material torsion default. Sliding and spin share one Coulomb budget.
-                Currently supports dense articulated contacts in CUDA matrix-free,
-                immediate/current/interleaved mode without warmstarting,
-                hydroelastic contact, contact compliance,
-                or debug mode. Velocity post-passes require bilateral preelimination
-                disabled; they preserve accumulated impulses and use the unbiased
-                angular target. Initially touching groups remain eligible through
-                rebound, using the end-gap slop as the initial touching tolerance;
-                groups outside this tolerance use the position solve's end-gap
-                admission test. Final normal load always bounds the friction budget.
-                Radius and selectors are
-                construction-only; recreate the solver to change them. With point
-                friction, one spin row bounds each coplanar exact-shape-pair group. With
-                persistent friction patches (the default ``friction_anchor_beta``), one
-                spin row bounds each patch region by the region's pooled normal load
-                times the undivided friction coefficient, less the tangent impulses of
-                its anchor rows; normal rows stay independent. Contact regularization
-                softens the position solve's normal rows; velocity cleanup is
-                unregularized. Spin uses the final solved normal load without
-                applying a second regularization factor. Capacity
-                exhaustion raises even when optional overflow diagnostics are off. Host
-                grouping is diagnostic, not optimized for throughput. This experimental
-                parameter may change without the normal deprecation policy.
-            contact_torsion_shape_indices: Optional global shape indices selecting
-                contacts with at least one selected collider. Supported geometry is
-                sphere, box, capsule, cylinder, cone, ellipsoid, plane, and convex mesh.
-                Explicitly selecting unsupported geometry raises; without selectors,
-                contacts involving unsupported geometry are skipped. None selects all shapes;
-                an empty tuple selects none. Mutually exclusive with shape patterns.
-                Experimental, with the same compatibility limitations as the radius.
-            contact_torsion_shape_patterns: Optional regex patterns, full-matched against
-                finalized model.shape_label at construction. For substring matching use
-                an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
-                unmatched nonempty patterns raise ValueError. Experimental, with the
-                same compatibility limitations as the radius.
-            contact_torsion_device: Experimental opt-in device-resident torsion preparation.
+            contact_torsion_device: Experimental contact torsion is enabled at construction
+                when any shape has a positive ``physx:min_torsional_patch_radius`` (see
+                :meth:`register_custom_attributes`). It adds one angular row per contact group
+                of an articulated body, about the group's normal, bounded by
+                ``r * (mu * N - sliding)``: sliding and spin share one Coulomb budget, ``N`` is
+                the final solved load of the group's normal rows, and ``r`` is the larger
+                radius of the group's shape pair (contacts whose pair has no positive radius
+                get no torsion). With point friction a group is a coplanar cluster of touching
+                contacts of one shape pair; with friction patches it is one patch region,
+                budgeted by its pooled load and undivided friction coefficient. The radius is
+                an effective footprint, not derived from the geometry: for uniform pressure on
+                a disk of radius ``R`` it is ``2 * R / 3``. Rows are rebuilt every step and
+                carry no spin history; free-body contacts get none. Supported geometry is
+                sphere, box, capsule, cylinder, cone, ellipsoid, plane and convex mesh.
+                ``contact_torsion_device`` selects the experimental device-resident torsion preparation.
                 False retains the host reference implementation. True preserves the
                 grouping and friction law while using preallocated GPU buffers.
                 It supports CUDA graph capture of :meth:`step`. Invalid torsion input
@@ -1813,7 +1794,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
                 a single-anchor region has no independent torsional stiction constraint
-                unless ``contact_torsion_radius`` adds one bounded spin row per region.
+                unless contact torsion adds one bounded spin row per region.
                 For uniform pad-friction randomization, sample one coefficient per pad
                 and assign it to all constituent convex shapes. Different coefficients
                 define separate regions and are not pooled across material boundaries.
@@ -2660,11 +2641,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._compute_world_response_dof_mapping(model)
         self._setup_fused_diagonal_joint_limits(model)
         # The sparse owner does not solve the appended torsion row; torsion is configured later in
-        # construction, so gate on the requested radius here.
+        # construction, so gate on the shapes' radii here.
+        shape_torsion_radius = self._contact_torsion_shape_radius
+        contact_torsion_requested = shape_torsion_radius is not None and bool(
+            np.any(shape_torsion_radius.numpy() > 0.0)
+        )
         # Nor does it apply the compliant residual, which only the general and paired-factor owners carry.
         sparse_diagonal_pair = (
             None
-            if float(contact_torsion_radius) > 0.0 or self._enable_torsional_rolling_friction or contact_compliance
+            if contact_torsion_requested or self._enable_torsional_rolling_friction or contact_compliance
             else self._select_sparse_diagonal_response_pair()
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
@@ -2754,8 +2739,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and self._local_solve_max_rows > 0
             and self._world_count <= _LOCAL_SOLVE_WORLDS_PER_SM * int(model.device.sm_count)
             # The local owners do not solve the appended torsion row; torsion is configured later in
-            # construction, so gate on the requested radius here.
-            and float(contact_torsion_radius) <= 0.0
+            # construction, so gate on the shapes' radii here.
+            and not contact_torsion_requested
             and not self._enable_torsional_rolling_friction
             # The local owners rebuild the response diagonal inside the solve, after compliant rows replace it.
             and not contact_compliance
@@ -2993,9 +2978,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
-        configure_contact_torsion(
-            self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
-        )
+        configure_contact_torsion(self)
         if self._solve_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -3049,6 +3032,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             -1,
             dtype=wp.int32,
             device=model.device,
+        )
+        # Effective spin radius [m] of each torsion row, the larger of its shape pair's radii.
+        self._torsion_row_radius = wp.zeros(
+            self._row_parent.shape if self._contact_torsion_enabled else (1, 1), dtype=wp.float32, device=model.device
         )
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
@@ -3930,7 +3917,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 ("enable_sleeping", self._sleeping is not None),
                 ("contact_warmstart", self._contact_warmstart),
                 ("contact_compliance", self._contact_compliance),
-                ("contact_torsion_radius", self._contact_torsion_enabled),
+                ("contact torsion", self._contact_torsion_enabled),
                 ("owning particles", self._has_active_particles),
             )
             if enabled
@@ -7827,7 +7814,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             "max_world_dofs": int(self._max_world_dofs),
                             "friction_mode": str(self._friction_mode),
                             "contact_torsion": self._contact_torsion_enabled,
-                            "contact_torsion_radius": self._contact_torsion_radius,
                             "has_drive_rows": self._drive_mode == "rows",
                             "has_dense_velocity_limit_rows": bool(self._enable_joint_velocity_limits),
                             "fuse_vel_limits": bool(self._velocity_limits_fused),
@@ -7944,7 +7930,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._row_parent,
                         self._row_mu,
                         self._contact_torsion_group,
-                        self._contact_torsion_radius,
+                        self._torsion_row_radius,
                         self._drive_target_vel_bias,
                         self._drive_vel_multiplier,
                         self._drive_impulse_multiplier,
@@ -26246,7 +26232,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
         world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
+        torsion_row_radius: wp.array2d[float],
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -26297,7 +26283,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
         world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
+        torsion_row_radius: wp.array2d[float],
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -26352,7 +26338,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 world_row_parent,
                 world_row_mu,
                 world_torsion_group,
-                contact_torsion_radius,
+                torsion_row_radius,
                 world_drive_target_vel_bias,
                 world_drive_vel_multiplier,
                 world_drive_impulse_multiplier,

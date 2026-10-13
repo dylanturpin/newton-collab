@@ -42,7 +42,6 @@ class TestSleepWorkSkipping(unittest.TestCase):
                     solve_mode="matrix_free",
                     iterations=8,
                     friction_anchor_beta=0.0,
-                    contact_torsion_radius=0.0,
                     articulation_constraint_max=256,
                     free_body_constraint_max=256,
                 )

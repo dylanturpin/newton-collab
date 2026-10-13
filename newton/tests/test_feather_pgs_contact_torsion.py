@@ -21,6 +21,25 @@ from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 PATCH_OPTIONS = {"friction_anchor_beta": 0.2, "contact_shared_anchor": False, "contact_friction_shared_anchor": False}
 
 
+def set_torsion_radius(model, radius, shapes=None):
+    """Set ``physx:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
+
+    ``radius`` may also be one value per selected shape.
+    """
+    radii = np.zeros(model.shape_count, dtype=np.float32)
+    radii[slice(None) if shapes is None else list(shapes)] = radius
+    namespace = getattr(model, "physx", None)
+    if namespace is not None and getattr(namespace, "min_torsional_patch_radius", None) is not None:
+        namespace.min_torsional_patch_radius.assign(radii)
+    else:
+        model.add_attribute(
+            "min_torsional_patch_radius",
+            wp.array(radii, dtype=wp.float32, device=model.device),
+            frequency=newton.Model.AttributeFrequency.SHAPE,
+            namespace="physx",
+        )
+
+
 def fixture(
     radius=None,
     *,
@@ -37,12 +56,15 @@ def fixture(
     row_limit=None,
     model_arrays=None,
     step=True,
+    torsion_shapes=None,
     **solver_overrides,
 ):
     """Solve two equal articulated rectangular pads touching face to face.
 
     ``model_arrays`` maps model attribute names to values assigned before the solver is built.
-    With ``step=False`` the solver is returned before its first step, without a result.
+    ``radius`` is the torsion radius of ``torsion_shapes`` (both pads for ``None``); ``()`` builds the
+    torsion solver and then clears every radius, so no contact is admitted. With ``step=False`` the
+    solver is returned before its first step, without a result.
     """
     b = newton.ModelBuilder(gravity=(0, 0, 0))
     for side in (-1, 1):
@@ -108,8 +130,9 @@ def fixture(
         "free_body_constraint_max": 16,
         "row_watermark": True,
     }
+    admit_none = torsion_shapes == ()
     if radius is not None:
-        kwargs["contact_torsion_radius"] = radius
+        set_torsion_radius(model, radius, None if admit_none else torsion_shapes)
     kwargs.update(solver_overrides)
     tuning = {key: kwargs.pop(key) for key in ("pgs_kernel",) if key in kwargs}
     with kernel_overrides(tuning):
@@ -117,6 +140,9 @@ def fixture(
     solver._rigid_body_angular_damping.zero_()
     if row_limit is not None:
         solver._articulation_constraint_max = row_limit
+    if admit_none:
+        # Torsion stays enabled, but no shape pair has a radius left to admit.
+        set_torsion_radius(model, 0.0)
     if not step:
         return None, solver, model, a, contacts
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
@@ -150,9 +176,9 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         body, hx=half, hy=half, hz=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=0)
     )
     model = b.finalize(device="cuda:0")
+    set_torsion_radius(model, radius)
     solver = SolverFeatherPGS(
         model,
-        contact_torsion_radius=radius,
         solve_mode="matrix_free",
         articulated_contact_response="immediate",
         iterations=64,
@@ -207,7 +233,7 @@ def patch_rows(points, *, slots, slots_needed, row_type, parents, mu, patches_en
         _constraint_count=wp.array([len(row_type)], dtype=int, device="cpu"),
         _friction_anchors_enabled=patches_enabled,
         _friction_patches=patches,
-        _contact_torsion_shape_set=None,
+        _contact_torsion_shape_radius=wp.full(model.shape_body.shape[0], 0.01, dtype=float, device="cpu"),
     )
     if patches_enabled:
         wp.launch(
@@ -336,9 +362,9 @@ class TestContactTorsion(unittest.TestCase):
     """Exercise an explicitly assumed uniform-disk effective spin radius."""
 
     def test_default_off_equivalent(self):
-        """Keep the zero-radius option exactly equivalent to prefeature output."""
-        reference, *_ = fixture(0.0)
-        actual, *_ = fixture(0.01, contact_torsion_shape_indices=())
+        """Keep a model without torsion radii exactly equivalent to the zero-radius output."""
+        reference, *_ = fixture(None)
+        actual, *_ = fixture(0.0)
         for key in reference:
             np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)
 
@@ -435,15 +461,23 @@ class TestContactTorsion(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
             fixture(0.01, center_only=True, row_limit=int(baseline["count"][0]))
 
-    def test_public_shape_selection(self):
-        """Resolve public index and regex scopes without private model patches."""
+    def test_per_shape_radius_selects_contacts(self):
+        """Apply torsion when either shape of the pair has a radius, using the larger one."""
         baseline, *_ = fixture(0.0, center_only=True)
-        excluded, *_ = fixture(0.01, center_only=True, contact_torsion_shape_indices=())
+        self.assertLess(0.01, float(np.max(np.abs(baseline["body_qd"][:, 5]))))
+        excluded, *_ = fixture(0.01, center_only=True, torsion_shapes=())
         np.testing.assert_array_equal(baseline["body_qd"], excluded["body_qd"])
-        for selection in ({"contact_torsion_shape_indices": (0,)}, {"contact_torsion_shape_patterns": (".*",)}):
-            result, solver, *_ = fixture(0.01, center_only=True, **selection)
-            self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
-            self.assertEqual(solver._torsion_stats["rows"], 1)
+        for shapes in ((0,), (1,), (0, 1)):
+            with self.subTest(shapes=shapes):
+                result, solver, *_ = fixture(0.01, center_only=True, torsion_shapes=shapes)
+                self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
+                self.assertEqual(solver._torsion_stats["rows"], 1)
+                self.assertEqual(solver._torsion_stats["groups"][0]["effective_radius_m"], np.float32(0.01))
+        # A pair uses the larger radius, so a smaller second radius gives the same rows.
+        reference, *_ = fixture(0.01, center_only=True)
+        mixed, *_ = fixture(np.array([0.01, 1.0e-4], dtype=np.float32), center_only=True)
+        for key in reference:
+            np.testing.assert_array_equal(mixed[key], reference[key], err_msg=key)
 
     def test_invalid_input_and_unsupported_modes(self):
         """Reject invalid scopes and modes rather than silently ignoring spin friction."""
@@ -451,11 +485,6 @@ class TestContactTorsion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fixture(radius)
         for options in (
-            {"contact_torsion_shape_indices": (-1,)},
-            {"contact_torsion_shape_indices": (True,)},
-            {"contact_torsion_shape_patterns": ("[",)},
-            {"contact_torsion_shape_patterns": ("missing-label",)},
-            {"contact_torsion_shape_indices": (), "contact_torsion_shape_patterns": ()},
             {"contact_warmstart": True},
             {"velocity_iterations": 1, "enable_bilateral_preelimination": True},
             {"articulated_contact_response": "propagation"},
@@ -466,7 +495,7 @@ class TestContactTorsion(unittest.TestCase):
 
     def test_compliance_combination_rejected_at_construction(self):
         """Fail before stepping when both experimental responses are requested."""
-        with self.assertRaisesRegex(ValueError, "contact_torsion_radius.*contact_compliance"):
+        with self.assertRaisesRegex(ValueError, "torsion.*contact_compliance"):
             fixture(
                 0.01,
                 contact_compliance=True,

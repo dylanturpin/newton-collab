@@ -23,7 +23,7 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_sphere(body, radius=0.05)
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion_radius=0.0)
+        solver = SolverFeatherPGS(model, contact_compliance=False)
         self.assertEqual(solver._friction_anchor_beta, 0.2)
         self.assertTrue(solver._friction_anchors_enabled)
 

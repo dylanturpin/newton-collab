@@ -93,7 +93,7 @@ def _gather(
     has_stiffness: int,
     shape_body: wp.array[int],
     supported: wp.array[int],
-    selected: wp.array[int],
+    shape_radius: wp.array[float],
     poses: wp.array[wp.transform],
     row_type: wp.array2d[int],
     parents: wp.array2d[int],
@@ -133,7 +133,7 @@ def _gather(
     b = shape_b[c]
     if a < 0 or b < 0 or a >= shape_body.shape[0] or b >= shape_body.shape[0]:
         return
-    if selected[a] == 0 and selected[b] == 0:
+    if wp.max(shape_radius[a], shape_radius[b]) <= 0.0:
         return
     if supported[a] == 0 or supported[b] == 0:
         return
@@ -401,6 +401,8 @@ def _apply_rows(
     target: wp.array2d[float],
     restitution: wp.array2d[float],
     membership: wp.array2d[int],
+    shape_radius: wp.array[float],
+    row_radius: wp.array2d[float],
 ):
     c = wp.tid()
     if work.status[0] != 0:
@@ -421,6 +423,7 @@ def _apply_rows(
     mu[world, row] = work.coefficient[rep]
     beta[world, row] = 0.0
     cfm[world, row] = pgs_cfm
+    row_radius[world, row] = wp.max(shape_radius[work.shape_a[lead]], shape_radius[work.shape_b[lead]])
     phi[world, row] = 0.0
     restitution[world, row] = 0.0
     velocity = float(0.0)
@@ -544,12 +547,6 @@ class DeviceTorsionPreparation:
         w.patch_indices = wp.empty(2 * self.capacity, dtype=int, device=device)
         w.rejected = wp.empty(self.capacity, dtype=int, device=device)
         w.spin_row.fill_(-1)
-        selected = solver._contact_torsion_shape_set
-        self.selected = wp.array(
-            np.array([selected is None or i in selected for i in range(solver.model.shape_count)], dtype=np.int32),
-            dtype=int,
-            device=device,
-        )
         self.supported = wp.array(
             np.isin(solver.model.shape_type.numpy(), _SUPPORTED_TYPES).astype(np.int32), dtype=int, device=device
         )
@@ -664,7 +661,7 @@ class DeviceTorsionPreparation:
                 int(stiffness is not None),
                 s.model.shape_body,
                 self.supported,
-                self.selected,
+                s._contact_torsion_shape_radius,
                 state.body_q,
                 s._row_type,
                 s._row_parent,
@@ -728,6 +725,8 @@ class DeviceTorsionPreparation:
                 s._target_velocity,
                 s._row_restitution,
                 s._contact_torsion_group,
+                s._contact_torsion_shape_radius,
+                s._torsion_row_radius,
             ],
             device=device,
         )
@@ -765,7 +764,7 @@ def enable_device_torsion(solver, *, deferred_errors=False):
     state of the failing step instead of raising during preparation.
     """
     if not solver._contact_torsion_enabled:
-        raise ValueError("Enable a positive contact_torsion_radius before device preparation")
+        raise ValueError("Give a shape a positive physx:min_torsional_patch_radius before device preparation")
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Configure device torsion before CUDA graph capture")
     solver._device_torsion = DeviceTorsionPreparation(solver, deferred_errors=deferred_errors)
