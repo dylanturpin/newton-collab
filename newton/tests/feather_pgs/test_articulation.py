@@ -20,9 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONNECT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_MIMIC,
-    apply_free_root_transport_to_predictor,
     integrate_generalized_joints,
-    remove_free_root_transport_from_qdd,
 )
 from newton._src.solvers.featherstone.kernels import eval_fk_with_velocity_conversion
 from newton.solvers import SolverFeatherPGS, SolverFeatherstone, SolverMuJoCo, SolverObservableFlags
@@ -2289,59 +2287,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         solver = SolverFeatherPGS(model)
         np.testing.assert_array_equal(solver._free_root_joint_indices.numpy(), (joint_a, joint_b))
-
-    def test_zero_transport_keeps_nonzero_gradient(self):
-        """Differentiate both corrections through an exact-zero transport value."""
-        device = wp.get_device()
-        root_indices = wp.array((0,), dtype=wp.int32, device=device)
-        qd_starts = wp.array((0,), dtype=wp.int32, device=device)
-        kinematic_mask = wp.zeros(1, dtype=wp.int32, device=device)
-        seed = wp.array((0.0, 1.0, 0.0, 0.0, 0.0, 0.0), dtype=wp.float32, device=device)
-
-        qd_predictor = wp.array((0.0, 0.0, 0.0, 0.0, 0.0, 3.0), dtype=wp.float32, device=device, requires_grad=True)
-        v_hat = wp.zeros(6, dtype=wp.float32, device=device, requires_grad=True)
-        with wp.Tape() as predictor_tape:
-            wp.launch(
-                apply_free_root_transport_to_predictor,
-                dim=1,
-                inputs=[
-                    root_indices,
-                    qd_starts,
-                    kinematic_mask,
-                    qd_predictor,
-                    DT_free_root_predictor,
-                    wp.ones(1, dtype=wp.int32, device=device),
-                ],
-                outputs=[v_hat],
-                device=device,
-            )
-        predictor_tape.backward(grads={v_hat: seed})
-        expected_predictor_grad = np.zeros(6, dtype=np.float32)
-        expected_predictor_grad[0] = 3.0 * DT_free_root_predictor
-        np.testing.assert_array_equal(v_hat.numpy(), np.zeros(6, dtype=np.float32))
-        np.testing.assert_allclose(qd_predictor.grad.numpy(), expected_predictor_grad, rtol=1e-6, atol=1e-7)
-
-        qd_conversion = wp.array((0.0, 0.0, 0.0, 0.0, 0.0, 3.0), dtype=wp.float32, device=device, requires_grad=True)
-        qdd = wp.zeros(6, dtype=wp.float32, device=device, requires_grad=True)
-        with wp.Tape() as conversion_tape:
-            wp.launch(
-                remove_free_root_transport_from_qdd,
-                dim=1,
-                inputs=[
-                    root_indices,
-                    qd_starts,
-                    kinematic_mask,
-                    qd_conversion,
-                    wp.ones(1, dtype=wp.int32, device=device),
-                ],
-                outputs=[qdd],
-                device=device,
-            )
-        conversion_tape.backward(grads={qdd: seed})
-        expected_conversion_grad = np.zeros(6, dtype=np.float32)
-        expected_conversion_grad[0] = -3.0
-        np.testing.assert_array_equal(qdd.numpy(), np.zeros(6, dtype=np.float32))
-        np.testing.assert_allclose(qd_conversion.grad.numpy(), expected_conversion_grad, rtol=1e-6, atol=1e-7)
 
     def test_final_velocity_conversion_stores_transport_adjusted_qdd(self):
         """Keep the final velocity-postpass conversion observable and wired."""

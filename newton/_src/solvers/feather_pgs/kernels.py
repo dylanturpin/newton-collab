@@ -2661,7 +2661,6 @@ def apply_free_root_velocity_corrections(
     cholesky: wp.array3d[float],
     joint_qd: wp.array[float],
     dt: float,
-    requires_grad: bool,
     joint_active: wp.array[int],
     v_hat: wp.array[float],
 ):
@@ -2684,33 +2683,29 @@ def apply_free_root_velocity_corrections(
     if is_free_rigid[art] == 0:
         return
     predicted_world = wp.vec3(v_hat[d + 3], v_hat[d + 4], v_hat[d + 5])
-    if not requires_grad:
-        # A stationary angular predictor has no gyroscopic work to do.
-        if (
-            w[0] == 0.0
-            and w[1] == 0.0
-            and w[2] == 0.0
-            and predicted_world[0] == 0.0
-            and predicted_world[1] == 0.0
-            and predicted_world[2] == 0.0
-        ):
-            return
+    # A stationary angular predictor has no gyroscopic work to do.
+    if (
+        w[0] == 0.0
+        and w[1] == 0.0
+        and w[2] == 0.0
+        and predicted_world[0] == 0.0
+        and predicted_world[1] == 0.0
+        and predicted_world[2] == 0.0
+    ):
+        return
     inertia = body_inertia[body]
-    if not requires_grad:
-        # Isotropic inertia has identically zero gyroscopic bias. Preserve
-        # its predictor exactly and avoid local solves for spheres and cubes.
-        # The derivative with respect to inertia need not vanish here.
-        if (
-            inertia[0, 0] == inertia[1, 1]
-            and inertia[1, 1] == inertia[2, 2]
-            and inertia[0, 1] == 0.0
-            and inertia[0, 2] == 0.0
-            and inertia[1, 0] == 0.0
-            and inertia[1, 2] == 0.0
-            and inertia[2, 0] == 0.0
-            and inertia[2, 1] == 0.0
-        ):
-            return
+    # Isotropic inertia has identically zero gyroscopic bias: keep the predictor exact.
+    if (
+        inertia[0, 0] == inertia[1, 1]
+        and inertia[1, 1] == inertia[2, 2]
+        and inertia[0, 1] == 0.0
+        and inertia[0, 2] == 0.0
+        and inertia[1, 0] == 0.0
+        and inertia[1, 2] == 0.0
+        and inertia[2, 0] == 0.0
+        and inertia[2, 1] == 0.0
+    ):
+        return
     group = art_group_index[art]
     # At the root COM, translation and rotation decouple. The angular
     # Cholesky block includes armature and the factorization's pivot floor.

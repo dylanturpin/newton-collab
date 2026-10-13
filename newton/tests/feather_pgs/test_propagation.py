@@ -2360,7 +2360,7 @@ class TestLeafPublication(unittest.TestCase):
                     )
 
 
-def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False, requires_grad=False):
+def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False):
     """Build four four-joint fingers per moving palm, plus an optional serial tree."""
     builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
     inertia = wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5)
@@ -2415,7 +2415,7 @@ def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged
                 )
                 parent = child
         builder.add_articulation(joints)
-    model = builder.finalize(device=device, requires_grad=requires_grad)
+    model = builder.finalize(device=device)
     model.joint_q.assign(np.linspace(-0.3, 0.4, model.joint_coord_count, dtype=np.float32))
     model.joint_qd.assign(np.linspace(-0.7, 0.8, model.joint_dof_count, dtype=np.float32))
     return model
@@ -2449,7 +2449,7 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
                 np.testing.assert_array_equal(getattr(states[0], name).numpy(), getattr(states[1], name).numpy())
 
     def test_explicit_parallel_preserves_eligibility_fallback(self):
-        """Admit CUDA branches while retaining CPU, differentiable and serial-tree fallback."""
+        """Admit CUDA branches while retaining CPU and serial-tree fallback."""
         for device in (wp.get_device("cpu"), *wp.get_cuda_devices()):
             with self.subTest(device=str(device), topology="branched"):
                 model = _build_fingers(device, articulations=1)
@@ -2461,14 +2461,6 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
                     self.assertTrue(any(group.lanes > 1 for group in solver._tree_plan.groups))
                     self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
                 else:
-                    build.assert_not_called()
-                    self.assertIsNone(solver._tree_plan)
-                    self.assertEqual(solver._tree_net_wrenches, ())
-            if device.is_cuda:
-                with self.subTest(device=str(device), requires_grad=True):
-                    model = _build_fingers(device, articulations=1, requires_grad=True)
-                    with patch.object(_FeatherPGSTreePlan, "build", wraps=_FeatherPGSTreePlan.build) as build:
-                        solver = SolverFeatherPGS(model, parallel_tree=True, use_parallel_streams=False)
                     build.assert_not_called()
                     self.assertIsNone(solver._tree_plan)
                     self.assertEqual(solver._tree_net_wrenches, ())

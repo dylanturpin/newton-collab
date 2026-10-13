@@ -1674,7 +1674,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 Driven articulations and articulations with mimic or loop constraints stay awake.
                 Construction raises ``ValueError`` unless ``articulated_contact_response="immediate"``
                 (so it does not compose with ``propagation_colored``), the model has at least one
-                articulation, no particles and ``requires_grad=False``, and warmstarting, contact
+                articulation and no particles, and warmstarting, contact
                 compliance and velocity post-passes (``velocity_iterations``) are off.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
                 solver spends work on settled scenes rather than describing the scene.
@@ -1899,7 +1899,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 :attr:`joint_friction_invalid`, and construction, an eager notify and
                 :meth:`check_joint_friction` raise :class:`ValueError`. Requires
                 ``solve_mode="matrix_free"`` on CUDA and is not supported
-                with ``contact_compliance``, bilateral pre-elimination or ``model.requires_grad``;
+                with ``contact_compliance`` or bilateral pre-elimination;
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
 
@@ -2392,11 +2392,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._solve_mode = solve_mode
         if self._enable_joint_velocity_limits and self._solve_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires solve_mode='matrix_free'")
+        if model.requires_grad:
+            raise NotImplementedError("SolverFeatherPGS does not support gradients (model.requires_grad=True).")
         if self._enable_joint_friction:
             if self._solve_mode != "matrix_free":
                 raise NotImplementedError("enable_joint_friction=True currently requires solve_mode='matrix_free'")
-            if model.requires_grad:
-                raise NotImplementedError("enable_joint_friction=True does not support model.requires_grad")
             if self._contact_compliance:
                 raise NotImplementedError("enable_joint_friction=True does not support contact_compliance")
             if self._enable_bilateral_preelimination:
@@ -3028,9 +3028,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._setup_sparse_mass_matrix(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
-        if not model.requires_grad:
-            # These buffers carry the FK/ID cache between steps; a graph that allocates them frees them on relaunch.
-            self._allocate_state_aux_vars(model, self, False)
+        # These buffers carry the FK/ID cache between steps; a graph that allocates them frees them on relaunch.
+        self._allocate_state_aux_vars(model, self)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
         # Torsion must never reinterpret it, including when patch PRs are merged.
         self._contact_torsion_group = wp.full(
@@ -10233,53 +10232,28 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         state_out: State,
         control: Control,
     ) -> State:
-        requires_grad = state_in.requires_grad
-        state_aug = state_out if requires_grad else self
-        model = self.model
+        if not getattr(self, "_featherstone_augmented", False):
+            self._allocate_state_aux_vars(self.model, self)
+        return self
 
-        if not getattr(state_aug, "_featherstone_augmented", False):
-            self._allocate_state_aux_vars(model, state_aug, requires_grad)
-
-        return state_aug
-
-    def _allocate_state_aux_vars(self, model, target, requires_grad):
+    def _allocate_state_aux_vars(self, model, target):
         # allocate auxiliary variables that vary with state
         if model.body_count:
             # joints
-            target._joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
-            target._joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
-            if requires_grad:
-                # used in the custom grad implementation of trisolve_loop
-                target._joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
-            else:
-                target._joint_solve_tmp = None
-            target._joint_S_s = wp.empty(
-                (model.joint_dof_count,),
-                dtype=wp.spatial_vector,
-                device=model.device,
-                requires_grad=requires_grad,
-            )
+            target._joint_qdd = wp.zeros_like(model.joint_qd)
+            target._joint_tau = wp.empty_like(model.joint_qd)
+            target._joint_S_s = wp.empty((model.joint_dof_count,), dtype=wp.spatial_vector, device=model.device)
 
             # derived rigid body data (maximal coordinates)
-            target._body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
-            target._body_I_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
-            )
-            target._body_v_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target._body_a_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
+            target._body_q_com = wp.empty_like(model.body_q)
+            target._body_I_s = wp.empty((model.body_count,), dtype=wp.spatial_matrix, device=model.device)
+            target._body_v_s = wp.empty((model.body_count,), dtype=wp.spatial_vector, device=model.device)
+            target._body_a_s = wp.empty((model.body_count,), dtype=wp.spatial_vector, device=model.device)
             # Allocate without a memset: the first step may run inside a CUDA graph capture, and a captured
             # memset would erase the cached body forces on every replay while the FK/ID cache stays valid.
             # Stage 1 fully writes body_f_s before it is read.
-            target._body_f_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target._body_ft_s = wp.zeros(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
+            target._body_f_s = wp.empty((model.body_count,), dtype=wp.spatial_vector, device=model.device)
+            target._body_ft_s = wp.zeros((model.body_count,), dtype=wp.spatial_vector, device=model.device)
 
             target._featherstone_augmented = True
 
@@ -11304,7 +11278,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._L_by_size[6],
                     stage3_qd,
                     dt,
-                    model.requires_grad,
                     self._dynamics_joint_active,
                 ],
                 outputs=[self._v_hat],
