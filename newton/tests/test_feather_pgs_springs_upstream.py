@@ -77,7 +77,7 @@ def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve
     state_0, state_1 = model.state(), model.state()
     state_0.joint_qd.fill_(1.0)
     solver.step(state_0, state_1, model.control(), None, DT)
-    np.testing.assert_allclose(solver.joint_tau.numpy(), [-3.0], atol=1.0e-6)
+    np.testing.assert_allclose(solver._joint_tau.numpy(), [-3.0], atol=1.0e-6)
 
 
 def test_registration_adds_no_spring_attributes(test, device):

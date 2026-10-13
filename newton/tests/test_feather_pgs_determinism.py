@@ -338,7 +338,7 @@ def test_deterministic_launches_replay_identically(test, device):
             count = int(contacts.rigid_contact_count.numpy()[0])
             test.assertGreater(count, 0)
             if options.get("enable_torsional_rolling_friction"):
-                test.assertTrue((solver.contact_slots_needed.numpy()[:count] == 6).any())
+                test.assertTrue((solver._contact_slots_needed.numpy()[:count] == 6).any())
             test.assertEqual(varied, set())
 
 
@@ -420,10 +420,10 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
         )
         solver.step(state, model.state(), model.control(), contacts, 0.005)
         return (
-            solver.contact_world.numpy()[:count],
-            solver.contact_slot.numpy()[:count],
-            solver.contact_path.numpy()[:count],
-            solver.contact_slots_needed.numpy()[:count],
+            solver._contact_world.numpy()[:count],
+            solver._contact_slot.numpy()[:count],
+            solver._contact_path.numpy()[:count],
+            solver._contact_slots_needed.numpy()[:count],
             solver._row_dropped_mf.numpy(),
             solver.constraint_overflow.numpy(),
         )
@@ -467,7 +467,7 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                 paths = []
                 for _ in range(2):
                     solver.step(state, model.state(), model.control(), contacts, 0.005)
-                    paths.append(solver.contact_path.numpy())
+                    paths.append(solver._contact_path.numpy())
                 wp.synchronize_device(device)
             finally:
                 output = capture.end()
@@ -526,10 +526,10 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
     solver.step(state, model.state(), model.control(), None, 0.005)
 
     order = np.arange(arts_per_world)
-    drive_slot = solver.drive_slot.numpy().reshape(2, arts_per_world)
-    velocity_limit_slot = solver.velocity_limit_slot.numpy().reshape(2, arts_per_world, 2)
-    row_type = solver.row_type.numpy()
-    phi = solver.phi.numpy()
+    drive_slot = solver._drive_slot.numpy().reshape(2, arts_per_world)
+    velocity_limit_slot = solver._velocity_limit_slot.numpy().reshape(2, arts_per_world, 2)
+    row_type = solver._row_type.numpy()
+    phi = solver._phi.numpy()
     for world in range(2):
         np.testing.assert_array_equal(drive_slot[world], order)
         limit_rows = np.nonzero(row_type[world] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)[0]
@@ -561,12 +561,12 @@ def test_deterministic_angular_friction_rows_follow_their_contact(test, device):
         solver = SolverFeatherPGS(model, deterministic=True, **options)
         solver.step(state, model.state(), model.control(), contacts, 0.005)
         return (
-            solver.contact_world.numpy()[:count],
-            solver.contact_slot.numpy()[:count],
-            solver.contact_path.numpy()[:count],
-            solver.contact_slots_needed.numpy()[:count],
-            solver.row_type.numpy(),
-            solver.row_parent.numpy(),
+            solver._contact_world.numpy()[:count],
+            solver._contact_slot.numpy()[:count],
+            solver._contact_path.numpy()[:count],
+            solver._contact_slots_needed.numpy()[:count],
+            solver._row_type.numpy(),
+            solver._row_parent.numpy(),
             solver._row_dropped_dense.numpy(),
             solver.constraint_overflow.numpy(),
         )

@@ -123,8 +123,8 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         damping = rng.uniform(0.1, 1.0, model.joint_dof_count).astype(np.float32)
         model.joint_damping.assign(damping)
         materials = {
-            "shape_material_mu": solver.shape_material_mu,
-            "shape_material_restitution": solver.shape_material_restitution,
+            "shape_material_mu": solver._shape_mu,
+            "shape_material_restitution": solver._shape_restitution,
             "shape_material_mu_torsional": solver._shape_mu_torsional,
             "shape_material_mu_rolling": solver._shape_mu_rolling,
         }
@@ -142,7 +142,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         np.testing.assert_array_equal(solver._passive_joint_damping.numpy()[: model.joint_dof_count], damping)
         for name, buffer in materials.items():
             np.testing.assert_array_equal(buffer.numpy()[: model.shape_count], edited[name], err_msg=name)
-        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(WORLD_COUNT) == 2)
+        np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), np.arange(WORLD_COUNT) == 2)
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             solver.check_joint_friction()
 
@@ -168,10 +168,10 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
                 model.joint_friction.assign(friction)
                 wp.capture_launch(capture.graph)
                 expected = _dof_world(model)[dof] == np.arange(WORLD_COUNT)
-                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), expected)
+                np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), expected)
                 with self.assertRaisesRegex(ValueError, message):
                     solver.check_joint_friction()
-                self.assertFalse(solver.joint_friction_invalid.numpy().any())
+                self.assertFalse(solver._joint_friction_invalid.numpy().any())
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
     def test_invalid_joint_friction_stays_latched_until_reported(self):
@@ -189,7 +189,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.joint_friction.zero_()
         wp.capture_launch(capture.graph)
         solver.reset(model.state())
-        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), [False, True, False])
+        np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), [False, True, False])
         with self.assertRaisesRegex(ValueError, r"captured notify in worlds \[1\]"):
             solver.check_joint_friction()
         solver.check_joint_friction()
@@ -212,7 +212,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
             friction[revolute[0]] = 0.0
             model.joint_friction.assign(friction)
             wp.capture_launch(capture.graph)
-            self.assertFalse(solver.joint_friction_invalid.numpy().any())
+            self.assertFalse(solver._joint_friction_invalid.numpy().any())
         solver.check_joint_friction()
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free joint friction requires CUDA")
@@ -227,7 +227,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.joint_friction.assign(friction)
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
-        self.assertFalse(solver.joint_friction_invalid.numpy().any())
+        self.assertFalse(solver._joint_friction_invalid.numpy().any())
         self.assertTrue(np.all(solver._joint_armature_device.numpy() == np.float32(0.3)))
         model.joint_friction.zero_()
         solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
@@ -238,7 +238,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model, dofs = _build_loop_model(device)
         solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
-        self.assertEqual(solver.world_count, 3)
+        self.assertEqual(solver._world_count, 3)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         cases = (
@@ -252,7 +252,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
                 friction[dof] = value
                 model.joint_friction.assign(friction)
                 wp.capture_launch(capture.graph)
-                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(3) == world)
+                np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), np.arange(3) == world)
                 with self.assertRaisesRegex(ValueError, message):
                     solver.check_joint_friction()
                 model.joint_friction.zero_()
@@ -342,14 +342,14 @@ def _assert_armature_matches(test, solver, fresh):
     np.testing.assert_array_equal(solver._joint_armature_device.numpy(), armature)
     np.testing.assert_array_equal(solver._joint_armature_device.numpy(), fresh._joint_armature_device.numpy())
     plan = solver._model_plan
-    test.assertEqual(len(solver.size_groups), 3)
-    for size in solver.size_groups:
-        expected = np.zeros((solver.n_arts_by_size[size], size), dtype=np.float32)
+    test.assertEqual(len(solver._size_groups), 3)
+    for size in solver._size_groups:
+        expected = np.zeros((solver._n_arts_by_size[size], size), dtype=np.float32)
         for group, art in enumerate(np.flatnonzero(plan.response_dof_count == size)):
             start, count = plan.articulation_dof_start[art], plan.articulation_dof_count[art]
             expected[group, :count] = armature[start : start + count]
-        np.testing.assert_array_equal(solver.R_by_size[size].numpy(), expected)
-        np.testing.assert_array_equal(solver.R_by_size[size].numpy(), fresh.R_by_size[size].numpy())
+        np.testing.assert_array_equal(solver._R_by_size[size].numpy(), expected)
+        np.testing.assert_array_equal(solver._R_by_size[size].numpy(), fresh._R_by_size[size].numpy())
 
 
 def _randomize_history(patches, model, rng):

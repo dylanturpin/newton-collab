@@ -55,29 +55,29 @@ def configure_torsional_rolling_friction(solver, enabled: bool, cone: str, creep
     creep_speed = float(creep_speed)
     if not np.isfinite(creep_speed) or creep_speed < 0.0:
         raise ValueError("torsional_rolling_friction_creep_speed must be finite and non-negative [m/s]")
-    solver.enable_torsional_rolling_friction = bool(enabled)
-    solver.torsional_rolling_friction_cone = cone
-    solver.torsional_rolling_friction_creep_speed = creep_speed
+    solver._enable_torsional_rolling_friction = bool(enabled)
+    solver._torsional_rolling_friction_cone = cone
+    solver._torsional_rolling_friction_creep_speed = creep_speed
 
 
 def validate_torsional_rolling_friction_mode(solver) -> None:
     """Reject solver options whose row routes do not solve the angular friction rows."""
-    if not solver.enable_torsional_rolling_friction:
+    if not solver._enable_torsional_rolling_friction:
         return
     model = solver.model
     if (
         not model.device.is_cuda
         or model.requires_grad
-        or solver.solve_mode != "matrix_free"
-        or solver.articulated_contact_response != "immediate"
-        or solver.row_schedule != "interleaved"
-        or solver.friction_mode != "fixed_normal"
+        or solver._solve_mode != "matrix_free"
+        or solver._articulated_contact_response != "immediate"
+        or solver._row_schedule != "interleaved"
+        or solver._friction_mode != "fixed_normal"
         or solver._friction_anchors_enabled
-        or solver.contact_warmstart
-        or solver.velocity_iterations != 0
-        or solver.contact_compliance
+        or solver._contact_warmstart
+        or solver._velocity_iterations != 0
+        or solver._contact_compliance
         or solver._contact_torsion_enabled
-        or solver.sleeping is not None
+        or solver._sleeping is not None
     ):
         raise ValueError(
             "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "
@@ -88,7 +88,7 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
 
 def validate_torsional_rolling_friction_coefficients(solver) -> None:
     """Reject positive coefficients that could reach the matrix-free free-rigid contact route."""
-    if not solver.enable_torsional_rolling_friction or not solver._has_free_rigid_bodies:
+    if not solver._enable_torsional_rolling_friction or not solver._has_free_rigid_bodies:
         return
     model = solver.model
     if not model.shape_count:
@@ -98,9 +98,9 @@ def validate_torsional_rolling_friction_coefficients(solver) -> None:
         np.nan_to_num(model.shape_material_mu_rolling.numpy(), nan=0.0, posinf=0.0),
     )
     shape_body = model.shape_body.numpy()
-    body_art = solver.body_to_articulation.numpy()
-    free = solver.is_free_rigid.numpy()
-    response_dofs = solver.articulation_response_dof_count.numpy()
+    body_art = solver._body_to_articulation.numpy()
+    free = solver._is_free_rigid.numpy()
+    response_dofs = solver._articulation_response_dof_count.numpy()
     art = np.where(shape_body >= 0, body_art[np.maximum(shape_body, 0)], -1)
     safe_art = np.maximum(art, 0)
     # The allocator's matrix-free compatibility: no articulation, no response DOFs (e.g. fixed), or free rigid.
@@ -115,7 +115,7 @@ def validate_torsional_rolling_friction_coefficients(solver) -> None:
 def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads: int) -> None:
     """Fill the reserved spin and rolling rows for every size group after the contact rows."""
     model = solver.model
-    for index, size in enumerate(solver.size_groups):
+    for index, size in enumerate(solver._size_groups):
         wp.launch(
             populate_world_angular_friction_rows,
             dim=threads,
@@ -125,38 +125,38 @@ def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads:
                 contacts.rigid_contact_normal,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
-                solver.contact_world,
-                solver.contact_slot,
-                solver.contact_art_a,
-                solver.contact_art_b,
-                solver.contact_path,
-                solver.contact_slots_needed,
+                solver._contact_world,
+                solver._contact_slot,
+                solver._contact_art_a,
+                solver._contact_art_b,
+                solver._contact_path,
+                solver._contact_slots_needed,
                 size,
-                solver.articulation_response_dof_count,
-                solver.art_group_idx,
-                solver.articulation_dof_start,
-                solver.body_to_joint,
+                solver._articulation_response_dof_count,
+                solver._art_group_idx,
+                solver._articulation_dof_start,
+                solver._body_to_joint,
                 model.joint_ancestor,
                 model.joint_qd_start,
-                state_aug.joint_S_s,
+                state_aug._joint_S_s,
                 model.shape_body,
-                state_aug.body_v_s,
+                state_aug._body_v_s,
                 solver._prescribed_articulation,
                 solver._shape_mu_torsional,
                 solver._shape_mu_rolling,
-                solver.cfm,
+                solver._cfm,
                 int(index == 0),
             ],
             outputs=[
-                solver.J_by_size[size],
-                solver.row_type,
-                solver.row_parent,
-                solver.row_mu,
-                solver.row_beta,
-                solver.row_cfm,
-                solver.phi,
-                solver.target_velocity,
-                solver.row_restitution,
+                solver._J_by_size[size],
+                solver._row_type,
+                solver._row_parent,
+                solver._row_mu,
+                solver._row_beta,
+                solver._row_cfm,
+                solver._phi,
+                solver._target_velocity,
+                solver._row_restitution,
             ],
             device=model.device,
         )

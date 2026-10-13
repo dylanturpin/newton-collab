@@ -102,8 +102,7 @@ def _launch_contact_allocator(
             8,
             8,
             8,
-            int(enable_friction),
-            friction_gap,
+            friction_gap if enable_friction else -float("inf"),  # no friction rows
             int(friction_pairs_only),
             FrictionPatches(),
             0,
@@ -188,8 +187,7 @@ def _launch_articulation_pair_contact_allocator(
             8,
             8,
             8,
-            int(enable_friction),
-            friction_gap,
+            friction_gap if enable_friction else -float("inf"),  # no friction rows
             int(friction_pairs_only),
             FrictionPatches(),
             0,
@@ -455,7 +453,6 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             shape_transform,
             material_mu,
             material_restitution,
-            1,
             1.0,
             1,
             0,
@@ -548,19 +545,19 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         """Expose legacy-preserving defaults through the public constructor."""
         solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
 
-        self.assertEqual(solver.contact_speculative_scale, 1.0)
-        self.assertEqual(solver.contact_gap_gate, 0.0)
-        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
-        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.0)
-        self.assertFalse(solver.contact_friction_articulation_pairs_only)
-        self.assertTrue(solver.warn_constraint_overflow)
+        self.assertEqual(solver._contact_speculative_scale, 1.0)
+        self.assertEqual(solver._contact_gap_gate, 0.0)
+        self.assertEqual(solver._same_articulation_contact_gap_gate, 0.0)
+        self.assertEqual(solver._articulation_pair_contact_gap_gate, 0.0)
+        self.assertFalse(solver._contact_friction_articulation_pairs_only)
+        self.assertTrue(solver._warn_constraint_overflow)
         self.assertTrue(solver._track_row_capacity)
         self.assertFalse(solver._row_watermark)
         quiet_solver = SolverFeatherPGS(
             newton.ModelBuilder().finalize(device="cpu"),
             warn_constraint_overflow=False,
         )
-        self.assertFalse(quiet_solver.warn_constraint_overflow)
+        self.assertFalse(quiet_solver._warn_constraint_overflow)
         self.assertFalse(quiet_solver._track_row_capacity)
         self.assertIsNone(quiet_solver._row_overflow_warning_emitted)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
@@ -598,11 +595,11 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             articulation_pair_contact_gap_gate=0.003,
             contact_friction_articulation_pairs_only=True,
         )
-        self.assertEqual(solver.contact_speculative_scale, 0.0)
-        self.assertEqual(solver.contact_gap_gate, 0.001)
-        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.002)
-        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.003)
-        self.assertTrue(solver.contact_friction_articulation_pairs_only)
+        self.assertEqual(solver._contact_speculative_scale, 0.0)
+        self.assertEqual(solver._contact_gap_gate, 0.001)
+        self.assertEqual(solver._same_articulation_contact_gap_gate, 0.002)
+        self.assertEqual(solver._articulation_pair_contact_gap_gate, 0.003)
+        self.assertTrue(solver._contact_friction_articulation_pairs_only)
 
         for name in (
             "contact_speculative_scale",

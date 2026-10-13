@@ -28,12 +28,12 @@ def test_anchored_articulations_sleep_and_wake(test, device):
     """Drop every row of a settled scene and restore the anchored rows of a force-woken articulation."""
     model, pipeline, solver, states, control = _articulations(device)
     _advance(pipeline, solver, states, control, 5)
-    awake_rows = int(solver.constraint_count.numpy()[0])
+    awake_rows = int(solver._constraint_count.numpy()[0])
     test.assertGreater(awake_rows, 0)
     _advance(pipeline, solver, states, control, 400)
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
-    np.testing.assert_array_equal(solver.constraint_count.numpy(), [0])
-    np.testing.assert_array_equal(solver.mf_constraint_count.numpy(), [0])
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0, 0, 0])
+    np.testing.assert_array_equal(solver._constraint_count.numpy(), [0])
+    np.testing.assert_array_equal(solver._mf_constraint_count.numpy(), [0])
     frozen = states[0].body_q.numpy().copy()
     _advance(pipeline, solver, states, control, 20)
     np.testing.assert_array_equal(states[0].body_q.numpy(), frozen)
@@ -44,13 +44,13 @@ def test_anchored_articulations_sleep_and_wake(test, device):
     for _ in range(5):
         states[0].body_f.assign(force)
         _advance(pipeline, solver, states, control, 1, clear=False)
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1, 0, 0])
-    test.assertEqual(int(solver.constraint_count.numpy()[0]), awake_rows // 2)
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1, 0, 0])
+    test.assertEqual(int(solver._constraint_count.numpy()[0]), awake_rows // 2)
     test.assertGreater(states[0].body_q.numpy()[0, 0], frozen[0, 0])
     np.testing.assert_array_equal(states[0].body_q.numpy()[2:], frozen[2:])
 
     _advance(pipeline, solver, states, control, 600)
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0, 0, 0])
     test.assertFalse(np.any(solver.constraint_overflow.numpy()))
 
 
@@ -67,11 +67,11 @@ def test_graph_replay_sleeps_and_wakes(test, device):
             states.reverse()
     for _ in range(200):
         wp.capture_launch(capture.graph)
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
-    np.testing.assert_array_equal(solver.constraint_count.numpy(), [0])
-    solver.sleeping.wake()
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0, 0, 0])
+    np.testing.assert_array_equal(solver._constraint_count.numpy(), [0])
+    solver._sleeping.wake()
     wp.capture_launch(capture.graph)
-    test.assertGreater(int(solver.constraint_count.numpy()[0]), 0)
+    test.assertGreater(int(solver._constraint_count.numpy()[0]), 0)
 
 
 def test_frozen_patch_carry_copies_the_previous_history(test, device):
@@ -79,8 +79,8 @@ def test_frozen_patch_carry_copies_the_previous_history(test, device):
     _model, pipeline, solver, states, control = _articulations(device)
     contacts = pipeline.contacts()
     _advance(pipeline, solver, states, control, 400, contacts=contacts)
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
-    test.assertTrue(np.all(solver.sleeping.frozen_bodies.numpy() == 1))
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0, 0, 0])
+    test.assertTrue(np.all(solver._sleeping.frozen_bodies.numpy() == 1))
     current = solver._friction_patches.current
     count = int(contacts.rigid_contact_count.numpy()[0])
     names = ("valid", "displacement", "tangent_impulse", "anchor_a", "anchor_b", "owner")

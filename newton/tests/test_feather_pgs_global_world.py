@@ -81,7 +81,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
                 v, contacts = _step_once(model, solver)
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 self.assertGreater(count, 0)
-                np.testing.assert_array_equal(solver.contact_path.numpy()[:count] >= 0, True)
+                np.testing.assert_array_equal(solver._contact_path.numpy()[:count] >= 0, True)
                 np.testing.assert_allclose(v[:2], static_v, atol=1.0e-5)
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False])
 
@@ -102,7 +102,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
         solver = _construct(self, model, True, solve_mode="split", warn_constraint_overflow=False)
         _, contacts = _step_once(model, solver)
         count = int(contacts.rigid_contact_count.numpy()[0])
-        paths = solver.contact_path.numpy()[:count]
+        paths = solver._contact_path.numpy()[:count]
         shape0 = contacts.rigid_contact_shape0.numpy()[:count]
         shape1 = contacts.rigid_contact_shape1.numpy()[:count]
         world1 = (shape0 == 1) | (shape1 == 1)
@@ -124,7 +124,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
                 _, contacts = _step_once(model, solver)
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 self.assertGreater(count, 0)
-                np.testing.assert_array_equal(solver.contact_path.numpy()[:count], -1)
+                np.testing.assert_array_equal(solver._contact_path.numpy()[:count], -1)
                 # The global body is solved in world 0, so both worlds are flagged.
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True, True])
 

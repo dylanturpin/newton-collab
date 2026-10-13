@@ -188,7 +188,7 @@ def test_mimic_row_overflow_is_reported(test, device):
     solver = SolverFeatherPGS(model, solve_mode="matrix_free", **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
-    test.assertEqual(int(solver.mimic_slot.numpy()[0]), 0)
+    test.assertEqual(int(solver._mimic_slot.numpy()[0]), 0)
     test.assertFalse(bool(solver.constraint_overflow.numpy()[0]))
 
     with warnings.catch_warnings():
@@ -199,7 +199,7 @@ def test_mimic_row_overflow_is_reported(test, device):
     solver = SolverFeatherPGS(model, solve_mode="matrix_free", **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
-    test.assertEqual(int(solver.constraint_count.numpy()[0]), 1)
+    test.assertEqual(int(solver._constraint_count.numpy()[0]), 1)
     test.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
     with test.assertRaises(RuntimeError):
         solver.check_constraint_capacity()

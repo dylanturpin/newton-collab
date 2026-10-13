@@ -33,8 +33,8 @@ def _make_solver(model, *, solve_mode: str, dense_warmstart: bool, mf_warmstart:
 
 def _history_specs(solver):
     specs = []
-    if solver.contact_warmstart:
-        specs.append(("dense impulses", solver.impulses, 7.0, 0.0))
+    if solver._contact_warmstart:
+        specs.append(("dense impulses", solver._impulses, 7.0, 0.0))
     if solver._ws_prev_mf_impulses is not None:
         specs.extend(
             (
@@ -116,8 +116,8 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_reset_validates_mask_before_disabled_noop(self):
         model = _build_two_world_free_model("cpu")
         solver = _make_solver(model, solve_mode="split", dense_warmstart=False, mf_warmstart=False)
-        solver.impulses.fill_(17.0)
-        before = solver.impulses.numpy().copy()
+        solver._impulses.fill_(17.0)
+        before = solver._impulses.numpy().copy()
 
         invalid_mask = wp.ones(4, dtype=wp.bool, device=model.device)
         with self.assertRaisesRegex(ValueError, "expected 2"):
@@ -125,7 +125,7 @@ class TestFeatherPGSReset(unittest.TestCase):
 
         valid_mask = wp.array((True, False), dtype=wp.bool, device=model.device)
         solver.reset(model.state(), valid_mask)
-        np.testing.assert_array_equal(solver.impulses.numpy(), before)
+        np.testing.assert_array_equal(solver._impulses.numpy(), before)
         self.assertIsNone(solver._ws_prev_mf_impulses)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph reset test requires CUDA")

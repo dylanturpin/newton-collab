@@ -156,27 +156,27 @@ class TestTorsionVelocitySolve(unittest.TestCase):
             0.01, spin=100.0, center_only=True, velocity_iterations=4, **PATCH_OPTIONS
         )
         group = solver._torsion_stats["groups"][0]
-        count = int(solver.constraint_count.numpy()[0])
-        before_lambda = solver.impulses.numpy()[0, :count].copy()
+        count = int(solver._constraint_count.numpy()[0])
+        before_lambda = solver._impulses.numpy()[0, :count].copy()
         self.assertGreater(abs(float(before_lambda[group["row"]])), 1e-8)
-        before_velocity = solver.v_out.numpy().copy()
-        phi = solver.phi.numpy()
+        before_velocity = solver._v_out.numpy().copy()
+        phi = solver._phi.numpy()
         phi[0, group["normal_rows"]] = 0.01
-        solver.phi.assign(phi)
-        solver.v_out_snap.zero_()
+        solver._phi.assign(phi)
+        solver._v_out_snap.zero_()
         solver._conclude_matrix_free_position_problem(0.0025)
-        self.assertEqual(float(solver.row_mu.numpy()[0, group["row"]]), group["mu"])
+        self.assertEqual(float(solver._row_mu.numpy()[0, group["row"]]), group["mu"])
         self.assertEqual(
             int(solver._contact_torsion_group.numpy()[0, group["row"]]), contact_torsion._TORSION_SPIN_RETIRED
         )
         # Eligibility changes the admissible set, not the already-applied load.
-        np.testing.assert_array_equal(solver.impulses.numpy()[0, :count], before_lambda)
+        np.testing.assert_array_equal(solver._impulses.numpy()[0, :count], before_lambda)
         solver._run_matrix_free_velocity_post_solve()
-        after_lambda = solver.impulses.numpy()[0, :count]
+        after_lambda = solver._impulses.numpy()[0, :count]
         self.assertLess(abs(float(after_lambda[group["row"]])), 1e-9)
         np.testing.assert_allclose(
-            solver.v_out.numpy() - before_velocity,
-            solver.Y_world.numpy()[0, :count].T @ (after_lambda - before_lambda),
+            solver._v_out.numpy() - before_velocity,
+            solver._Y_world.numpy()[0, :count].T @ (after_lambda - before_lambda),
             atol=2e-5,
         )
         # A new position solve must restore admission rather than inherit the
@@ -185,7 +185,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         solver.step(state, output, model.control(), contacts, 0.0025)
         group = solver._torsion_stats["groups"][0]
         self.assertEqual(int(solver._contact_torsion_group.numpy()[0, group["row"]]), -1)
-        self.assertGreater(abs(float(solver.impulses.numpy()[0, group["row"]])), 1e-8)
+        self.assertGreater(abs(float(solver._impulses.numpy()[0, group["row"]])), 1e-8)
         np.testing.assert_allclose(output.body_qd.numpy(), original["body_qd"], atol=2e-5)
 
     def test_internal_timestep_export_uses_final_linear_impulse(self):
@@ -199,10 +199,10 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                 for _ in range(4):
                     output = model.state()
                     solver.step(initial, output, model.control(), contacts, dt, observables=observables)
-                    row = int(solver.contact_slot.numpy()[0])
+                    row = int(solver._contact_slot.numpy()[0])
                     normal = contacts.rigid_contact_normal.numpy()[0]
                     force = observables.contact_f.numpy()[0]
-                    expected = max(float(solver.impulses.numpy()[0, row]), 0.0) / dt
+                    expected = max(float(solver._impulses.numpy()[0, row]), 0.0) / dt
                     self.assertAlmostEqual(abs(float(np.dot(force[:3], normal))), expected, delta=1e-4)
                     # Torque slots are deliberately placeholders, not solved spin wrench.
                     np.testing.assert_array_equal(force[3:], 0.0)
@@ -219,7 +219,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_runtime_incompatible_mutation_rejected(self):
         """Reject unsupported mutation before stepping an allocated torsion solver."""
         _, solver, model, state, contacts = fixture(0.01, velocity_iterations=4)
-        solver.contact_warmstart = True
+        solver._contact_warmstart = True
         with self.assertRaisesRegex(ValueError, "warmstart"):
             solver.step(state, model.state(), model.control(), contacts, 0.0025)
 

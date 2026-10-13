@@ -32,9 +32,9 @@ class TestPreeliminationSignature(unittest.TestCase):
         """Bind a legacy positional gap without silently coercing it to a boolean."""
         signature = inspect.signature(newton.solvers.SolverFeatherPGS)
         positional = [p for p in signature.parameters.values() if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
-        self.assertEqual(len(positional), 54)
-        self.assertEqual(positional[11].name, "joint_limit_activation_gap")
-        arguments = [object()] + [p.default for p in positional[1:11]] + [0.123]
+        self.assertEqual(len(positional), 45)
+        self.assertEqual(positional[10].name, "joint_limit_activation_gap")
+        arguments = [object()] + [p.default for p in positional[1:10]] + [0.123]
         bound = signature.bind_partial(*arguments, bilateral_preelimination_include_mimics=False)
         self.assertEqual(bound.arguments["joint_limit_activation_gap"], 0.123)
         self.assertIs(bound.arguments["bilateral_preelimination_include_mimics"], False)
@@ -105,11 +105,11 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
                 self.assertTrue(np.isfinite(a).all())
                 np.testing.assert_array_equal(a, b)
         for solver in solvers:
-            self.assertTrue(solver.bilateral_preelimination_include_mimics)
+            self.assertTrue(solver._bilateral_preelimination_include_mimics)
             self.assertTrue(solver._preelim_active)
             count = int(solver._preelim_nB.numpy()[0])
             slots = solver._preelim_slots.numpy()[:count]
-            selected_types = solver.row_type.numpy()[0, slots]
+            selected_types = solver._row_type.numpy()[0, slots]
             self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
             self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
@@ -147,10 +147,10 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertGreater(int(solver._preelim_nB.numpy()[0]), 0)
         self.assertLessEqual(int(solver._preelim_nB.numpy()[0]), 3)
         selected = solver._preelim_slots.numpy()[: int(solver._preelim_nB.numpy()[0])]
-        selected_types = solver.row_type.numpy()[0, selected]
+        selected_types = solver._row_type.numpy()[0, selected]
         np.testing.assert_array_equal(selected_types, np.full(len(selected), PGS_CONSTRAINT_TYPE_CONNECT))
-        counts = solver.constraint_count.numpy()
-        rows = solver.row_type.numpy()
+        counts = solver._constraint_count.numpy()
+        rows = solver._row_type.numpy()
         seen = {int(row) for world in range(rows.shape[0]) for row in rows[world, : counts[world]]}
         self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
         self.assertIn(int(PGS_CONSTRAINT_TYPE_MIMIC), seen)
@@ -216,23 +216,23 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
 
-        count = int(solver.constraint_count.numpy()[0])
-        contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        count = int(solver._constraint_count.numpy()[0])
+        contact_rows = solver._row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
         self.assertTrue(contact_rows.any())
-        cache_peak = np.max(solver.impulses.numpy()[0, :count][contact_rows])
+        cache_peak = np.max(solver._impulses.numpy()[0, :count][contact_rows])
         self.assertGreater(cache_peak, 1.0e-4, "loaded contact cache stayed empty")
-        previous_predictor = solver.v_hat.numpy().copy()
+        previous_predictor = solver._v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
-        solver.iterations = 0
+        solver._iterations = 0
         pipeline.collide(state_0, contacts)
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         gap = _loop_anchor_gap(model, state_1)
         self.assertTrue(solver._preelim_active)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
-        self.assertGreater(np.max(solver.impulses.numpy()), 1.0e-4)
-        self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
+        self.assertGreater(np.max(solver._impulses.numpy()), 1.0e-4)
+        self.assertGreater(np.linalg.norm(solver._v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
 
     def test_propagation_uses_iterative_bilateral_fallback(self):
@@ -259,8 +259,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
     def test_rows_remain_allocated(self):
         """B rows keep their dense slots (layout/warm-start stability); they are neutralized, not removed."""
         solver, _, _, _ = _run_four_bar(steps=60, enable_bilateral_preelimination=True)
-        counts = solver.constraint_count.numpy()
-        rows = solver.row_type.numpy()
+        counts = solver._constraint_count.numpy()
+        rows = solver._row_type.numpy()
         seen = set()
         for w in range(rows.shape[0]):
             seen.update(rows[w, : counts[w]].tolist())

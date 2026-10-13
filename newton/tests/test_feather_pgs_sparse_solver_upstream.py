@@ -77,7 +77,7 @@ class TestFeatherPGSSparseSelectionGuard(unittest.TestCase):
             with self.subTest(label):
                 solver = SolverFeatherPGS(_build_y_tree("cuda:0", **kwargs), solve_mode="matrix_free")
                 self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertGreater(solver.J_by_size[3].size, 1)
+                self.assertGreater(solver._J_by_size[3].size, 1)
 
 
 if __name__ == "__main__":

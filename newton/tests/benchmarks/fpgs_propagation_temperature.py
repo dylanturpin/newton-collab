@@ -231,7 +231,7 @@ def run_point(
     ms, final_state = _timed_loop(model, solver, contacts, initial, repeats=repeats, warmups=warmups, dt=dt)
     row_mib = _row_solver_bytes(solver) / (1024.0 * 1024.0)
     prop_extra_mib = _propagation_extra_bytes(solver) / (1024.0 * 1024.0)
-    prop_rows = getattr(solver, "propagation_constraint_count", None)
+    prop_rows = getattr(solver, "_propagation_constraint_count", None)
     prop_rows_total = int(np.sum(prop_rows.numpy())) if prop_rows is not None else 0
     del solver
 

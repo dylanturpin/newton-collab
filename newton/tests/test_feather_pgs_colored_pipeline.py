@@ -83,8 +83,8 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
                     solver = _solver(model, env, regularization)
                     results[name] = self._run(solver, model, contacts, control, start, 1)
                     if name == "straight line":
-                        n = int(solver.color_world_offsets.numpy()[-1])
-                        kinds = solver.color_unit_meta.numpy().reshape(-1, PROPAGATION_UNIT_META)[:n]
+                        n = int(solver._color_world_offsets.numpy()[-1])
+                        kinds = solver._color_unit_meta.numpy().reshape(-1, PROPAGATION_UNIT_META)[:n]
                         kinds = kinds[:, 6 + PROPAGATION_UNIT_RING]
                         self.assertGreater(int(np.sum(kinds == 1)), n // 2, "few units took the straight-line path")
                 for label, got, want in zip(
@@ -117,7 +117,7 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
         for _ in range(steps):
             solver.step(a, b, control, contacts, 1.0 / 240.0)
             a, b = b, a
-        return a.body_q.numpy(), a.body_qd.numpy(), solver.propagation_impulses.numpy()
+        return a.body_q.numpy(), a.body_qd.numpy(), solver._propagation_impulses.numpy()
 
     def _check_variants(self, regularization):
         """Prefetched and shared-memory-staged sweeps reproduce the reference unit body.
@@ -160,7 +160,7 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
                 # Staging needs cp.async (SM80+); older devices take the unstaged packed
                 # kernel, which must match as well.
                 staged = _colored_staging_supported(
-                    int(model.device.arch), 1, solver.world_count, int(solver.max_propagation_bodies)
+                    int(model.device.arch), 1, solver._world_count, int(solver._max_propagation_bodies)
                 )
                 tag = "_pf1_st1" if staged else "_pf1_st0_pk1"
             self.assertIn(tag, kernel.key, f"{name} did not build its kernel variant")
@@ -171,7 +171,7 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
             for _ in range(5):
                 solver.step(a, b, control, contacts, 1.0 / 240.0)
                 a, b = b, a
-            results[name] = (a.body_q.numpy(), a.body_qd.numpy(), solver.propagation_impulses.numpy())
+            results[name] = (a.body_q.numpy(), a.body_qd.numpy(), solver._propagation_impulses.numpy())
 
         ref = results["reference"]
         self.assertTrue(all(np.isfinite(x).all() for x in ref))

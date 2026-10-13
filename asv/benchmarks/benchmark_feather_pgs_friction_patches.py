@@ -158,8 +158,8 @@ def run(
     wp.synchronize()
     elapsed = time.perf_counter() - start
     after = s0.body_q.numpy()
-    types = solver.mf_row_type.numpy()
-    counts = solver.mf_constraint_count.numpy()
+    types = solver._mf_row_type.numpy()
+    counts = solver._mf_constraint_count.numpy()
     normal_rows = sum(int(np.count_nonzero(types[w, : counts[w]] == 0)) for w in range(worlds))
     friction_rows = sum(int(np.count_nonzero(types[w, : counts[w]] == 2)) for w in range(worlds))
     result = {
@@ -167,7 +167,7 @@ def run(
         "warp": wp.__version__,
         "worlds": worlds,
         "tiles": tiles,
-        "beta": solver.friction_anchor_beta,
+        "beta": solver._friction_anchor_beta,
         "steps": steps,
         "warmstart": warmstart,
         "frozen_contacts": frozen_contacts,

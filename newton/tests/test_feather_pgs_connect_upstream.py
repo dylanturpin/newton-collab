@@ -203,13 +203,13 @@ def test_disabled_loop_joint_starts_released(test, device):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
     test.assertGreater(z0 - float(state_0.body_q.numpy()[load, 2]), 0.15)
-    test.assertEqual(solver.connect_slot.numpy().tolist(), [-1, -1, -1])
+    test.assertEqual(solver._connect_slot.numpy().tolist(), [-1, -1, -1])
 
     flags = model.joint_enabled.numpy()
     flags[np.asarray(joints, dtype=np.int64)] = True
     model.joint_enabled.assign(flags)
     solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
-    test.assertTrue(np.all(solver.connect_slot.numpy() >= 0))
+    test.assertTrue(np.all(solver._connect_slot.numpy() >= 0))
 
 
 def test_imported_connect_equality_is_enforced(test, device):

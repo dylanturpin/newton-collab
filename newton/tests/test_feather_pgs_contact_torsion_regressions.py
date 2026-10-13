@@ -32,7 +32,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
         """Reject stale tangent metadata when a later step admits only a normal."""
         _, solver, model, initial, contacts = fixture(0.01, center_only=True)
         self.assertEqual(solver._torsion_stats["rows"], 1)
-        solver.contact_friction_gap_threshold = -1.0
+        solver._contact_friction_gap_threshold = -1.0
         solver.step(initial, model.state(), model.control(), contacts, 0.0025)
         self.assertEqual(solver._torsion_stats["rows"], 0)
 
@@ -43,11 +43,11 @@ class TestContactTorsionRegressions(unittest.TestCase):
                 _, solver, _model, initial, contacts = fixture(0.01, center_only=True)
                 row = solver._torsion_stats["groups"][0]["normal_rows"][0]
                 if invalid == "count":
-                    counts = solver.constraint_count.numpy()
+                    counts = solver._constraint_count.numpy()
                     counts[0] = row + 2
-                    solver.constraint_count.assign(counts)
+                    solver._constraint_count.assign(counts)
                 else:
-                    array = solver.row_type if invalid == "type" else solver.row_parent
+                    array = solver._row_type if invalid == "type" else solver._row_parent
                     values = array.numpy()
                     values[0, row + 2] = -1
                     array.assign(values)
@@ -72,7 +72,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
         result, solver, *_ = fixture(0.01, center_only=True, cfm=0.0007)
         active = result["row_type"] == 7
         self.assertGreater(np.count_nonzero(active), 0)
-        np.testing.assert_allclose(solver.row_cfm.numpy()[active], 0.0007)
+        np.testing.assert_allclose(solver._row_cfm.numpy()[active], 0.0007)
 
     def test_torsion_respects_relaxation(self):
         """Apply half the unconstrained spin correction at omega one half."""
@@ -127,7 +127,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
                     velocity_iterations=velocity_iterations,
                     contact_torsion_device=preparation != "host",
                 )
-                self.assertTrue(solver.fuse_joint_velocity_limits)
+                self.assertTrue(solver._velocity_limits_fused)
                 qd = _step_spinning_pad(solver, model, initial, contacts, preparation)
                 self.assertEqual(_row_count(solver, PGS_CONSTRAINT_TYPE_JOINT_TARGET), 1)
                 self.assertEqual(_row_count(solver, PGS_CONSTRAINT_TYPE_TORSION), int(radius > 0.0))
@@ -197,7 +197,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
                 )
                 qd = _step(solver, model, initial, contacts, preparation)
                 self.assertEqual(_row_count(solver, PGS_CONSTRAINT_TYPE_TORSION), int(radius > 0.0))
-                self.assertGreater(int(solver.mf_constraint_count.numpy()[0]), 0)
+                self.assertGreater(int(solver._mf_constraint_count.numpy()[0]), 0)
                 self.assertLessEqual(abs(float(qd[11])), _VELOCITY_LIMIT * (1.0 + 1e-5))
                 if radius > 0.0:
                     self.assertLess(float(qd[5]), 9.0)
@@ -255,8 +255,8 @@ def _step(solver, model, initial, contacts, preparation):
 
 
 def _row_count(solver, row_type):
-    count = int(solver.constraint_count.numpy()[0])
-    return int(np.count_nonzero(solver.row_type.numpy()[0, :count] == row_type))
+    count = int(solver._constraint_count.numpy()[0])
+    return int(np.count_nonzero(solver._row_type.numpy()[0, :count] == row_type))
 
 
 if __name__ == "__main__":

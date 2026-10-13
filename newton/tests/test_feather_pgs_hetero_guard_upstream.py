@@ -72,14 +72,14 @@ def _final_joint_q(model, steps=60, solve_mode="matrix_free", response="immediat
 def test_homogeneous_matrix_free_constructs(test, device):
     """Construct on worlds with identical DOF counts."""
     solver = SolverFeatherPGS(_build_model([3, 3, 3, 3], device), solve_mode="matrix_free")
-    np.testing.assert_array_equal(solver.world_dof_count.numpy(), [3, 3, 3, 3])
+    np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
 
 def test_homogeneous_split_constructs(test, device):
     """Construct the split solve on worlds with identical DOF counts."""
     solver = SolverFeatherPGS(_build_model([3, 3, 3, 3], device), solve_mode="split")
-    test.assertEqual(solver.solve_mode, "split")
-    test.assertEqual(solver.size_groups, [3])
+    test.assertEqual(solver._solve_mode, "split")
+    test.assertEqual(solver._size_groups, [3])
 
 
 def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="matrix_free"):

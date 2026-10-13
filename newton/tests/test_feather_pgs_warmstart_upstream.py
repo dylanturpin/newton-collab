@@ -38,7 +38,7 @@ def test_substeps_reuse_contacts_with_their_own_history(test, device):
     dt = 1.0 / 240.0
 
     def step(iterations):
-        solver.iterations = iterations
+        solver._iterations = iterations
         solver.step(states[0], states[1], control, contacts, dt)
         states.reverse()
 
@@ -46,8 +46,8 @@ def test_substeps_reuse_contacts_with_their_own_history(test, device):
         count = int(contacts.rigid_contact_count.numpy()[0])
         shape0 = contacts.rigid_contact_shape0.numpy()[:count]
         shape1 = contacts.rigid_contact_shape1.numpy()[:count]
-        slots = solver.contact_slot.numpy()[:count]
-        impulses = solver.mf_impulses.numpy()[0]
+        slots = solver._contact_slot.numpy()[:count]
+        impulses = solver._mf_impulses.numpy()[0]
         result = {}
         for name, shape in (("a", shape_a), ("b", shape_b)):
             index = np.flatnonzero((shape0 == shape) | (shape1 == shape))
@@ -134,15 +134,15 @@ def test_both_row_families_seed_impulses_scaled_by_the_step_ratio(test, device):
         with test.subTest(articulated=articulated):
             _model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(device, articulated)
             if articulated:
-                impulses, row_type, count = solver.impulses, solver.row_type, solver.constraint_count
+                impulses, row_type, count = solver._impulses, solver._row_type, solver._constraint_count
             else:
-                impulses, row_type, count = solver.mf_impulses, solver.mf_row_type, solver.mf_constraint_count
+                impulses, row_type, count = solver._mf_impulses, solver._mf_row_type, solver._mf_constraint_count
             n = int(count.numpy()[0])
             normal = row_type.numpy()[0, :n] == PGS_CONSTRAINT_TYPE_CONTACT
             previous = impulses.numpy()[0, :n][normal]
             test.assertGreater(float(previous.sum()), 0.0)
 
-            solver.iterations = 0
+            solver._iterations = 0
             pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, 0.5 / 120.0)
             test.assertEqual(int(count.numpy()[0]), n)

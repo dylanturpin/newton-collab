@@ -207,11 +207,11 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             solver.step(s0, s1, control, contacts, 0.005)
             s0, s1 = s1, s0
         self.assertEqual(float(np.abs(solver._friction_patches.view.phi.numpy()).max()), 0.0)
-        row_type = solver.row_type.numpy()
+        row_type = solver._row_type.numpy()
         friction = row_type == PGS_CONSTRAINT_TYPE_FRICTION
         self.assertGreater(int(friction.sum()), 0)
-        self.assertEqual(float(np.abs(solver.phi.numpy()[friction]).max()), 0.0)
-        self.assertEqual(float(np.abs(solver.row_beta.numpy()[friction]).max()), 0.0)
+        self.assertEqual(float(np.abs(solver._phi.numpy()[friction]).max()), 0.0)
+        self.assertEqual(float(np.abs(solver._row_beta.numpy()[friction]).max()), 0.0)
 
     def test_anchors_do_not_require_contact_matching(self):
         """Keep patch history owned by the solver, independently of collision matching."""
@@ -298,21 +298,21 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             n = int(contacts.rigid_contact_count.numpy()[0])
             self.assertGreater(n, 0)
             fa = solver._friction_patches.view.phi.numpy()[:n]
-            slot = solver.contact_slot.numpy()[:n]
-            path = solver.contact_path.numpy()[:n]
+            slot = solver._contact_slot.numpy()[:n]
+            path = solver._contact_path.numpy()[:n]
             checked = {0: 0, 1: 0, 2: 0}
             for c in range(n):
                 if slot[c] < 0 or path[c] < 0:
                     continue
                 if path[c] == 0:
-                    rt, ph, rb = solver.row_type.numpy()[0], solver.phi.numpy()[0], solver.row_beta.numpy()[0]
+                    rt, ph, rb = solver._row_type.numpy()[0], solver._phi.numpy()[0], solver._row_beta.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph = (solver.mf_phi if path[c] == 1 else solver.propagation_phi).numpy()[0]
-                    rt = (solver.mf_row_type if path[c] == 1 else solver.propagation_row_type).numpy()[0]
+                    ph = (solver._mf_phi if path[c] == 1 else solver._propagation_phi).numpy()[0]
+                    rt = (solver._mf_row_type if path[c] == 1 else solver._propagation_row_type).numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)
@@ -553,7 +553,7 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
             articulation_constraint_max=4,
             free_body_constraint_max=4,
         )
-        self.assertFalse(solver.contact_warmstart)
+        self.assertFalse(solver._contact_warmstart)
         n = solver._friction_patches.previous.valid.shape[0]
         worlds = np.arange(n, dtype=np.int32) % 2
         for mask, expect_cleared in (

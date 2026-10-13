@@ -149,9 +149,9 @@ def _run_one_step(
 
 
 def _count_rows(solver: SolverFeatherPGS) -> tuple[int, int, int]:
-    dense = int(np.sum(solver.constraint_count.numpy()))
-    mf = int(np.sum(solver.mf_constraint_count.numpy()))
-    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    dense = int(np.sum(solver._constraint_count.numpy()))
+    mf = int(np.sum(solver._mf_constraint_count.numpy()))
+    propagation_count_array = getattr(solver, "_propagation_constraint_count", None)
     propagation = 0 if propagation_count_array is None else int(np.sum(propagation_count_array.numpy()))
     return dense, mf, propagation
 

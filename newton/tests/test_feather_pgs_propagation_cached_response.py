@@ -224,9 +224,9 @@ def _active_body_qd(solver) -> dict[int, np.ndarray]:
     bodies, and every pass setup force-refreshes all bodies from v_out), so
     only active entries are comparable across paths.
     """
-    qd = solver.propagation_body_qd.numpy()
-    counts = solver.propagation_body_count.numpy()
-    body_list = solver.propagation_body_list.numpy()
+    qd = solver._propagation_body_qd.numpy()
+    counts = solver._propagation_body_count.numpy()
+    body_list = solver._propagation_body_list.numpy()
     out: dict[int, np.ndarray] = {}
     for world in range(body_list.shape[0]):
         n = min(int(counts[world]), body_list.shape[1])
@@ -292,7 +292,7 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
             diff = float(np.max(np.abs(getattr(test_out, key).numpy() - getattr(ref_out, key).numpy())))
             stats.max_diffs[key] = max(stats.max_diffs[key], diff)
         stats.max_diffs["v_out"] = max(
-            stats.max_diffs["v_out"], float(np.max(np.abs(test.v_out.numpy() - ref.v_out.numpy())))
+            stats.max_diffs["v_out"], float(np.max(np.abs(test._v_out.numpy() - ref._v_out.numpy())))
         )
         ref_body_qd = _active_body_qd(ref)
         test_body_qd = _active_body_qd(test)
@@ -301,9 +301,9 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
             diff = float(np.max(np.abs(test_body_qd[body] - ref_qd)))
             stats.max_diffs["active_body_qd"] = max(stats.max_diffs["active_body_qd"], diff)
 
-        counts = ref.propagation_body_count.numpy()
+        counts = ref._propagation_body_count.numpy()
         stats.max_active_bodies = max(stats.max_active_bodies, int(counts.max()))
-        stats.total_rows += int(ref.propagation_constraint_count.numpy().sum())
+        stats.total_rows += int(ref._propagation_constraint_count.numpy().sum())
 
         # advance the shared trajectory along the reference solve
         state_in, ref_out = ref_out, state_in
@@ -326,26 +326,26 @@ class TestPropagationCachedResponse(unittest.TestCase):
         solver = _make_solver(self.model_multi, "propagation_colored", cached=True)
         self.assertTrue(solver._propagation_cached_response_active)
         self.assertIsNotNone(solver._propagation_cached_gemv_kernel)
-        self.assertIsNotNone(solver.propagation_cache_R)
-        self.assertIsNotNone(solver.propagation_cache_B)
-        self.assertIsNotNone(solver.propagation_cache_qd_base)
-        self.assertIsNotNone(solver.propagation_cache_world_flag)
+        self.assertIsNotNone(solver._propagation_cache_R)
+        self.assertIsNotNone(solver._propagation_cache_B)
+        self.assertIsNotNone(solver._propagation_cache_qd_base)
+        self.assertIsNotNone(solver._propagation_cache_world_flag)
         self.assertEqual(
-            solver.propagation_cache_max_bodies,
-            min(solver.max_propagation_bodies, solver.propagation_cached_response_body_max),
+            solver._propagation_cache_max_bodies,
+            min(solver._max_propagation_bodies, solver._propagation_cached_response_body_max),
         )
-        sizes = [int(s) for s in solver.size_groups if solver.n_arts_by_size[s] > 0]
+        sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
         for size in sizes:
             self.assertIsNotNone(
                 solver._cached_response_tree_warp_kernels_by_size.get(size),
                 f"no cached-response kernel for size group {size}",
             )
         # eligibility must exclude nothing here: all arts are free-root trees
-        self.assertTrue(np.all(solver.propagation_cache_art_eligible.numpy() == 1))
+        self.assertTrue(np.all(solver._propagation_cache_art_eligible.numpy() == 1))
 
         off = _make_solver(self.model_multi, "propagation_colored", cached=False)
         self.assertFalse(off._propagation_cached_response_active)
-        self.assertIsNone(off.propagation_cache_R)
+        self.assertIsNone(off._propagation_cache_R)
 
     def _assert_stats(self, stats, *, expect_min_bodies):
         self.assertGreater(stats.total_rows, 0, "no propagation contact rows produced")
@@ -360,13 +360,13 @@ class TestPropagationCachedResponse(unittest.TestCase):
     def test_lockstep_multi_contact_bodies(self):
         """Three contact spheres per articulation: cross blocks B_ab are live."""
         stats, _, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40)
-        self.assertTrue(np.all(test.propagation_cache_world_flag.numpy() == 1))
+        self.assertTrue(np.all(test._propagation_cache_world_flag.numpy() == 1))
         self._assert_stats(stats, expect_min_bodies=2)
 
     def test_lockstep_second_size_group(self):
         """Two articulations per world -> two DOF-size groups, both cached."""
         stats, _, test = _run_lockstep(self, self.model_two_groups, "propagation_colored", 40)
-        sizes = [int(s) for s in test.size_groups if test.n_arts_by_size[s] > 0]
+        sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 2, f"expected two size groups, got {sizes}")
         for size in sizes:
             self.assertIsNotNone(test._cached_response_tree_warp_kernels_by_size.get(size))
@@ -388,7 +388,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         explicitly against the tree walk on the same contact-rich scene.
         """
         stats, _, test = _run_lockstep(self, self.model_fixed, "propagation_colored", 40)
-        sizes = [int(s) for s in test.size_groups if test.n_arts_by_size[s] > 0]
+        sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
         for size in sizes:
             # A fully single-DOF group takes the plain fixed-base extraction
             # variant (the kernel factories receive has_free_root=not
@@ -399,7 +399,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
                 f"size group {size} did not take the fixed-base single-DOF variant",
             )
             self.assertIsNotNone(test._cached_response_tree_warp_kernels_by_size.get(size))
-        self.assertTrue(np.all(test.propagation_cache_world_flag.numpy() == 1))
+        self.assertTrue(np.all(test._propagation_cache_world_flag.numpy() == 1))
         self._assert_stats(stats, expect_min_bodies=2)
 
     def test_overflow_falls_back_to_tree_walk(self):
@@ -407,9 +407,9 @@ class TestPropagationCachedResponse(unittest.TestCase):
         the device-side tree-walk fallback and match the cached=False run."""
         stats, ref, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40, cache_max_bodies=2)
         self.assertTrue(test._propagation_cached_response_active)
-        self.assertEqual(test.propagation_cache_max_bodies, 2)
-        flags = test.propagation_cache_world_flag.numpy()
-        counts = ref.propagation_body_count.numpy()
+        self.assertEqual(test._propagation_cache_max_bodies, 2)
+        flags = test._propagation_cache_world_flag.numpy()
+        counts = ref._propagation_body_count.numpy()
         self.assertTrue(np.all(counts > 2), f"scene must overflow the cap, got counts {counts}")
         self.assertTrue(np.all(flags == 0), f"overflowing worlds must clear the cache flag, got {flags}")
         self._assert_stats(stats, expect_min_bodies=3)
@@ -433,22 +433,22 @@ class TestPropagationCachedResponse(unittest.TestCase):
             self, model, "propagation_colored", 40, cache_max_bodies=4, articulation_constraint_max=128
         )
         self.assertTrue(test._propagation_cached_response_active)
-        counts = ref.propagation_body_count.numpy()
+        counts = ref._propagation_body_count.numpy()
         self.assertTrue(np.all(counts > 4), f"scene must overflow the TOTAL active-body count, got {counts}")
-        eligible_counts = test.propagation_cache_body_count.numpy()
+        eligible_counts = test._propagation_cache_body_count.numpy()
         self.assertTrue(
             np.all((eligible_counts >= 2) & (eligible_counts <= 4)),
             f"expected 2..4 eligible arm bodies per world, got {eligible_counts}",
         )
         self.assertTrue(
-            np.all(test.propagation_cache_world_flag.numpy() == 1),
+            np.all(test._propagation_cache_world_flag.numpy() == 1),
             "clutter must not evict the arm from the cached path",
         )
         # Partition invariant: cache-eligible bodies occupy the slot prefix.
-        art_eligible = test.propagation_cache_art_eligible.numpy()
-        body_to_art = test.body_to_articulation.numpy()
-        body_list = test.propagation_body_list.numpy()
-        test_counts = test.propagation_body_count.numpy()
+        art_eligible = test._propagation_cache_art_eligible.numpy()
+        body_to_art = test._body_to_articulation.numpy()
+        body_list = test._propagation_body_list.numpy()
+        test_counts = test._propagation_body_count.numpy()
         for world in range(body_list.shape[0]):
             n_elig = int(eligible_counts[world])
             for slot in range(min(int(test_counts[world]), body_list.shape[1])):
@@ -487,13 +487,13 @@ class TestPropagationCachedResponse(unittest.TestCase):
             state_in, state_out = state_out, state_in
         wp.synchronize()
 
-        counts = solver.propagation_body_count.numpy()
-        body_list = solver.propagation_body_list.numpy()
-        body_to_art = solver.body_to_articulation.numpy()
-        flags = solver.propagation_cache_world_flag.numpy()
+        counts = solver._propagation_body_count.numpy()
+        body_list = solver._propagation_body_list.numpy()
+        body_to_art = solver._body_to_articulation.numpy()
+        flags = solver._propagation_cache_world_flag.numpy()
         art_dof_start = solver.model.joint_qd_start.numpy()[solver.model.articulation_start.numpy()[:-1]]
-        R = solver.propagation_cache_R.numpy()
-        B = solver.propagation_cache_B.numpy()
+        R = solver._propagation_cache_R.numpy()
+        B = solver._propagation_cache_B.numpy()
 
         checked_pairs = 0
         for world in range(min(2, body_list.shape[0])):
@@ -510,7 +510,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
                     imp = np.zeros(6)
                     imp[basis] = 1.0
                     v_ref, body_qd_ref = _ref_propagate(
-                        ti, {body_b: imp}, np.zeros(solver.v_out.shape[0], dtype=np.float64)
+                        ti, {body_b: imp}, np.zeros(solver._v_out.shape[0], dtype=np.float64)
                     )
                     got_R = R[world, slot_b, :n_dofs, basis]
                     ref_R = v_ref[dof0 : dof0 + n_dofs]
@@ -552,7 +552,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
             solver.step(state_in, state_out, control, contacts, DT)
             state_in, state_out = state_out, state_in
         wp.synchronize()
-        self.assertEqual(float(np.max(np.abs(solver.propagation_body_impulses.numpy()))), 0.0)
+        self.assertEqual(float(np.max(np.abs(solver._propagation_body_impulses.numpy()))), 0.0)
 
 
 if __name__ == "__main__":

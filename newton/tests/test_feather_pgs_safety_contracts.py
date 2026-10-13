@@ -41,19 +41,19 @@ class TestFeatherPGSSafety(unittest.TestCase):
                     solver = SolverFeatherPGS(model, solve_mode="split", articulation_constraint_max=capacity)
                 initial = np.zeros((3, capacity), dtype=np.float32)
                 initial[2] = 1234.0  # Inactive world must remain untouched.
-                solver.constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))
-                solver.impulses.assign(initial)
-                solver.diag.fill_(2.0)
-                solver.C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (3, 1, 1)))
-                solver.rhs.fill_(-1.0)
-                solver.row_type.zero_()
-                solver.row_parent.zero_()
-                solver.row_mu.zero_()
+                solver._constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))
+                solver._impulses.assign(initial)
+                solver._diag.fill_(2.0)
+                solver._C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (3, 1, 1)))
+                solver._rhs.fill_(-1.0)
+                solver._row_type.zero_()
+                solver._row_parent.zero_()
+                solver._row_mu.zero_()
                 solver._dispatch_dense_pgs_solve(iterations=1, friction_start_iteration=0)
                 expected = initial.copy()
                 expected[0] = 0.5
                 expected[1, 0] = 0.5
-                np.testing.assert_array_equal(solver.impulses.numpy(), expected)
+                np.testing.assert_array_equal(solver._impulses.numpy(), expected)
 
     def test_partial_reset_refreshes_only_selected_mass_factors(self):
         """Preserve factor reuse in worlds outside a partial episode reset."""
@@ -68,19 +68,19 @@ class TestFeatherPGSSafety(unittest.TestCase):
                 mask = wp.array([True, False], dtype=wp.bool, device=device)
                 solver.reset(state, mask)
                 solver.step(state, output, control, None, 0.01)
-                np.testing.assert_array_equal(solver.mass_update_mask.numpy(), [1, 0])
+                np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [1, 0])
                 if wp.get_device(device).is_cuda:
-                    first_mask = wp.empty_like(solver.mass_update_mask)
+                    first_mask = wp.empty_like(solver._mass_update_mask)
                     with wp.ScopedCapture(device=device) as capture:
                         solver.reset(state, mask)
                         solver.step(state, output, control, None, 0.01)
-                        wp.copy(first_mask, solver.mass_update_mask)
+                        wp.copy(first_mask, solver._mass_update_mask)
                         solver.step(state, output, control, None, 0.01)
                     mask.assign(np.array([False, True]))
                     wp.capture_launch(capture.graph)
                     np.testing.assert_array_equal(first_mask.numpy(), [0, 1])
                     # The request is consumed by the first step; the next reuses both factors.
-                    np.testing.assert_array_equal(solver.mass_update_mask.numpy(), [0, 0])
+                    np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [0, 0])
 
     def test_unmatched_pipeline_clears_stale_contact_identity(self):
         """Cold-start a matched buffer when its current producer disables matching."""

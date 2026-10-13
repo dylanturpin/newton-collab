@@ -78,7 +78,7 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **op
     if options.get("free_body_constraint_max") is not None:
         # Rows beyond the capacity were dropped; those contacts report zero.
         count = int(contacts.rigid_contact_count.numpy()[0])
-        dropped = solver.contact_slot.numpy()[:count] < 0
+        dropped = solver._contact_slot.numpy()[:count] < 0
         test.assertTrue(dropped.any())
         np.testing.assert_array_equal(contact_f[:count][dropped], 0.0)
     else:
@@ -153,7 +153,7 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
         pipeline.collide(states[0], contacts)
         solver.step(states[0], states[1], control, contacts, DT, observables=observables)
         states.reverse()
-    np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
     contact_f = observables.contact_f.numpy()
     _check_rows(test, contacts, contact_f)
     net = _net_body_forces(model, contacts, contact_f)
@@ -297,7 +297,6 @@ def test_contact_force_kernel_reads_only_rigid_rows(test, device):
             row_parent,
             row_type,
             row_parent,
-            0,
             10.0,
             rigid_capacity,
         ],

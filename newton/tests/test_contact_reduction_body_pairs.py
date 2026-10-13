@@ -1162,14 +1162,14 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                         **kwargs,
                     )
                     if iters is None:
-                        self.assertEqual(solver.iterations, 12)
+                        self.assertEqual(solver._iterations, 12)
                     if row_path == "propagation":
                         self.assertTrue(
                             solver._propagation_contacts_enabled(),
                             f"{response} test scene did not enable propagation contacts",
                         )
                     if response == "propagation_fused":
-                        self.assertTrue(solver.propagation_full_fused_iterations)
+                        self.assertTrue(solver._propagation_full_fused_iterations)
                     return solver
 
                 self._compare(
@@ -1216,18 +1216,18 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             propagation_same_articulation_rows=True,
             row_watermark=True,
         )
-        self.assertEqual(solver.iterations, 12)
+        self.assertEqual(solver._iterations, 12)
         self.assertTrue(solver._propagation_contacts_enabled())
         solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
         self.assertTrue(np.isfinite(state_1.body_qd.numpy()).all())
         rows = solver.constraint_row_watermarks()
         self.assertGreater(rows["propagation_high_water"], 0)
-        active_paths = solver.contact_path.numpy()[:reduced_count]
+        active_paths = solver._contact_path.numpy()[:reduced_count]
         routed = np.flatnonzero(active_paths == FPGS_PROPAGATION_PATH)
         self.assertGreater(routed.size, 0, "no reduced contact was routed to the propagation path")
         shape_body = model.shape_body.numpy()
-        body_art = solver.body_to_articulation.numpy()
+        body_art = solver._body_to_articulation.numpy()
         shape0 = reduced_contacts.rigid_contact_shape0.numpy()[:reduced_count]
         shape1 = reduced_contacts.rigid_contact_shape1.numpy()[:reduced_count]
         for contact in routed:

@@ -302,7 +302,7 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
                 else:
                     episode()
                 qd.append(states[0].joint_qd.numpy().copy())
-            self.assertFalse(solver.joint_friction_invalid.numpy().any())
+            self.assertFalse(solver._joint_friction_invalid.numpy().any())
             runs.append(np.array(qd))
         np.testing.assert_array_equal(runs[1], runs[0])
 
@@ -344,11 +344,11 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
         states, control = [model.state(), model.state()], model.control()
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
         _advance(solver, states, control, 30)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
         model.joint_friction.assign([0.0])
         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
         _, qd = _advance(solver, states, control, 3)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
         self.assertGreater(abs(float(qd[-1])), 1.0e-2)
 
     def test_schedules_routes_and_velocity_pass_agree(self):

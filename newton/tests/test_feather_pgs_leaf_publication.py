@@ -176,18 +176,21 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
 
 def _fields(solver, state):
     cache = solver._fk_id_cache
-    dynamics = solver if cache is None else cache
+
+    def dynamics(name):
+        return getattr(solver, f"_{name}") if cache is None else getattr(cache, name)
+
     return {
         "body_q": state.body_q,
         "body_qd": state.body_qd,
-        "body_q_com": dynamics.body_q_com,
-        "origin": dynamics.articulation_origin,
-        "S": dynamics.joint_S_s,
-        "v": dynamics.body_v_s,
-        "a": dynamics.body_a_s,
-        "I": dynamics.body_I_s,
-        "terms": solver._body_inertia_terms if cache is None else cache.body_inertia_terms,
-        "f": dynamics.body_f_s,
+        "body_q_com": dynamics("body_q_com"),
+        "origin": dynamics("articulation_origin"),
+        "S": dynamics("joint_S_s"),
+        "v": dynamics("body_v_s"),
+        "a": dynamics("body_a_s"),
+        "I": dynamics("body_I_s"),
+        "terms": dynamics("body_inertia_terms"),
+        "f": dynamics("body_f_s"),
         "valid": solver._fk_id_cache_valid,
     }
 
@@ -407,7 +410,7 @@ class TestLeafPublication(unittest.TestCase):
                 controls[index].joint_f.assign(np.linspace(-0.1, 0.2, model.joint_dof_count, dtype=np.float32))
                 solver.step(current, following, controls[index], contacts[index], 1.0 / 240.0)
                 if velocity_limits and step == 0:
-                    self.assertGreater(float(np.max(np.abs(solver.qd_work.numpy() - current.joint_qd.numpy()))), 0.01)
+                    self.assertGreater(float(np.max(np.abs(solver._qd_work.numpy() - current.joint_qd.numpy()))), 0.01)
                 states[index] = [following, current]
             for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
                 np.testing.assert_allclose(
@@ -417,11 +420,11 @@ class TestLeafPublication(unittest.TestCase):
                     atol=2e-6,
                     err_msg=f"step {step} {name}",
                 )
-            np.testing.assert_allclose(solvers[1].v_hat.numpy(), solvers[0].v_hat.numpy(), rtol=1e-5, atol=2e-6)
-            for size in solvers[0].L_by_size:
+            np.testing.assert_allclose(solvers[1]._v_hat.numpy(), solvers[0]._v_hat.numpy(), rtol=1e-5, atol=2e-6)
+            for size in solvers[0]._L_by_size:
                 np.testing.assert_allclose(
-                    solvers[1].L_by_size[size].numpy(),
-                    solvers[0].L_by_size[size].numpy(),
+                    solvers[1]._L_by_size[size].numpy(),
+                    solvers[0]._L_by_size[size].numpy(),
                     rtol=1e-5,
                     atol=2e-6,
                 )

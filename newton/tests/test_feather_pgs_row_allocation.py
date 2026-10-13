@@ -77,7 +77,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             row_capacity,
             row_capacity,
             row_capacity,
-            1,
             0.0,
             0,
             FrictionPatches(),
@@ -179,7 +178,7 @@ class TestFeatherPGSRowAllocation(unittest.TestCase):
             articulation_constraint_max=320,
             free_body_constraint_max=256,
         )
-        self.assertEqual(int(dense_routed.articulation_constraint_max), 320)
+        self.assertEqual(int(dense_routed._articulation_constraint_max), 320)
         propagation_routed = newton.solvers.SolverFeatherPGS(
             model,
             solve_mode="matrix_free",
@@ -188,7 +187,7 @@ class TestFeatherPGSRowAllocation(unittest.TestCase):
             free_body_constraint_max=256,
             propagation_same_articulation_rows=True,
         )
-        self.assertLess(int(propagation_routed.articulation_constraint_max), 320)
+        self.assertLess(int(propagation_routed._articulation_constraint_max), 320)
 
 
 if __name__ == "__main__":

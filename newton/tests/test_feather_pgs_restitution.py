@@ -206,7 +206,7 @@ def _step_plane(
     solver.step(state_in, state_out, model.control(), contacts, dt)
 
     count = int(contacts.rigid_contact_count.numpy()[0])
-    active_paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+    active_paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
     qd = state_out.body_qd.numpy()[body].astype(np.float64)
     q = state_out.body_q.numpy()[body].astype(np.float64)
     return {
@@ -569,7 +569,7 @@ def _step_two_spheres(
     qd = state_out.body_qd.numpy()
     q = state_out.body_q.numpy()
     count = int(contacts.rigid_contact_count.numpy()[0])
-    paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+    paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
     return float(qd[body_a][2]), float(qd[body_b][2]), float(q[body_b][2] - q[body_a][2]), count, paths
 
 
@@ -675,7 +675,7 @@ def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
                 solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
                 count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+                paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
                 velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
                 expected_after = velocity_surface - restitution * closing_speed
                 test.assertEqual(count, 1, f"{label}: expected one sphere contact")
@@ -772,7 +772,7 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
     count = int(contacts.rigid_contact_count.numpy()[0])
     after = state_out.body_qd.numpy()[:, 2]
     end_gap = state_out.body_q.numpy()[:, 2] - RADIUS
-    paths = solver.contact_path.numpy()[:count]
+    paths = solver._contact_path.numpy()[:count]
     test.assertEqual(count, len(cases), "expected exactly one contact in every world")
     test.assertTrue(np.all(paths == PATH_MATRIX_FREE), f"multiworld contacts used paths {paths.tolist()}")
     for world, (restitution, speed, _mass, impact_fraction) in enumerate(cases):
@@ -804,10 +804,10 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.6,
     )
     solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(solver.velocity_iterations, 0)
+    test.assertEqual(solver._velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
-    test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.articulation_constraint_max))
-    test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.free_body_constraint_max))
+    test.assertEqual(solver._row_restitution.shape, (solver._world_count, solver._articulation_constraint_max))
+    test.assertEqual(solver._mf_row_restitution.shape, (solver._world_count, solver._free_body_constraint_max))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -819,13 +819,13 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.0,
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
-    test.assertEqual(zero_solver.velocity_iterations, 0)
+    test.assertEqual(zero_solver._velocity_iterations, 0)
 
     zero_model.shape_material_restitution.fill_(0.6)
     zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
     default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
-    test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
+    test.assertAlmostEqual(default_solver._restitution_velocity_threshold, 0.5)
 
 
 def test_restitution_can_be_disabled_without_changing_materials(test, device):
@@ -837,9 +837,9 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
         restitution_velocity_threshold=0.75,
     )
     np.testing.assert_array_equal(
-        solver.shape_material_restitution.numpy()[: model.shape_count], model.shape_material_restitution.numpy()
+        solver._shape_restitution.numpy()[: model.shape_count], model.shape_material_restitution.numpy()
     )
-    test.assertAlmostEqual(solver.restitution_velocity_threshold, 0.75)
+    test.assertAlmostEqual(solver._restitution_velocity_threshold, 0.75)
     test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
 
     speed = 2.0
@@ -921,7 +921,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 test.assertEqual(count, 1, f"{label}: reset impact generated {count} contacts")
                 test.assertEqual(
-                    {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0},
+                    {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0},
                     {expected_path},
                     f"{label}: reset impact used the wrong route",
                 )
@@ -1050,7 +1050,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
                 solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
                 count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+                paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
                 qd = state_out.body_qd.numpy()[root].astype(np.float64)
                 expected_path = PATH_DENSE if response == "immediate" else PATH_PROPAGATION
                 label = f"{joint_kind}/{response}"
@@ -1159,7 +1159,7 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device, solve_mode
             reference = model.state()
             _make_solver(model, solve_mode=solve_mode).step(state_in, reference, control, contacts, DEFAULT_DT)
             count = int(contacts.rigid_contact_count.numpy()[0])
-            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
             test.assertEqual(count, 1, f"{label}: expected one contact")
             test.assertEqual(paths, EXPECTED_PATHS[(scene, "immediate")], f"{label}: wrong route")
             expected = float(reference.body_qd.numpy()[body][2])

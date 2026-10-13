@@ -47,18 +47,18 @@ class TestSleepingDynamicsSkip(unittest.TestCase):
                 # The reference computes dynamics even while both runs omit sleeping constraint rows.
                 self.assertTrue(runs[0].solver._dynamics_art_active.numpy().all())
                 np.testing.assert_array_equal(
-                    runs[1].solver.sleeping.art_awake.numpy(), runs[0].solver.sleeping.art_awake.numpy()
+                    runs[1].solver._sleeping.art_awake.numpy(), runs[0].solver._sleeping.art_awake.numpy()
                 )
                 for field in _FIELDS:
                     np.testing.assert_array_equal(
                         runs[1].field(field), runs[0].field(field), err_msg=f"{phase} step {step} {field}"
                     )
-                awake = runs[1].solver.sleeping.art_awake.numpy()
+                awake = runs[1].solver._sleeping.art_awake.numpy()
                 slept |= phase == "settle" and not awake[:2].any()
                 woke |= phase == "push" and bool(awake[0])
         self.assertTrue(slept and woke)
         # The driven mimic articulation never sleeps, and everything else settles again.
-        np.testing.assert_array_equal(runs[1].solver.sleeping.art_awake.numpy(), [0, 0, 0, 1])
+        np.testing.assert_array_equal(runs[1].solver._sleeping.art_awake.numpy(), [0, 0, 0, 1])
         self.assertFalse(runs[1].solver._dynamics_art_active.numpy()[:3].any())
 
 
@@ -77,7 +77,7 @@ class _Run:
                 **options,
             )
         if not skip:
-            self.solver.sleeping = _SleepReference(self.solver.sleeping, compute_dynamics=True)
+            self.solver._sleeping = _SleepReference(self.solver._sleeping, compute_dynamics=True)
         self.states = [self.model.state(), self.model.state()]
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()

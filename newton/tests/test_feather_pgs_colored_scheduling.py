@@ -45,7 +45,7 @@ def _heap(nx=6, ny=6, nz=3, pitch=0.042, half=0.02, kinematic_tray=False):
 def _color_counts(solver):
     """Units per color for world 0; the last live entry is the serial overflow tail."""
     entries = PROPAGATION_COLOR_TAIL + 2
-    offsets = solver.color_world_offsets.numpy()[:entries].astype(np.int64)
+    offsets = solver._color_world_offsets.numpy()[:entries].astype(np.int64)
     counts = np.diff(offsets)
     return counts[:PROPAGATION_COLOR_TAIL], int(counts[PROPAGATION_COLOR_TAIL])
 
@@ -76,13 +76,13 @@ def _settle(model, steps=12, **solver_kwargs):
 def _first_fit_reference(solver, world=0):
     """Reference coloring of world 0's units: sort by contact, first-fit, stable counting sort."""
     entries = PROPAGATION_COLOR_TAIL + 2
-    stride = solver.propagation_max_constraints
-    n = min(int(solver.color_world_unit_cursor.numpy()[world]), stride)
+    stride = solver._propagation_max_constraints
+    n = min(int(solver._color_world_unit_cursor.numpy()[world]), stride)
     base = world * stride
-    contact = solver.color_unit_contact.numpy()[base : base + n]
-    body_a = solver.color_unit_body_a.numpy()[base : base + n]
-    body_b = solver.color_unit_body_b.numpy()[base : base + n]
-    length = solver.color_unit_len.numpy()[base : base + n]
+    contact = solver._color_unit_contact.numpy()[base : base + n]
+    body_a = solver._color_unit_body_a.numpy()[base : base + n]
+    body_b = solver._color_unit_body_b.numpy()[base : base + n]
+    length = solver._color_unit_len.numpy()[base : base + n]
     order = np.argsort(contact, kind="stable")
     used = {}
     color = np.zeros(n, dtype=np.int64)
@@ -219,8 +219,8 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
             )
             trial.step(state_in, state_out, control, contacts, 1.0 / 240.0)
             entries = PROPAGATION_COLOR_TAIL + 2
-            offsets = trial.color_world_offsets.numpy()[:entries].copy()
-            order = trial.color_unit_sorted.numpy()[: offsets[-1]].copy()
+            offsets = trial._color_world_offsets.numpy()[:entries].copy()
+            order = trial._color_unit_sorted.numpy()[: offsets[-1]].copy()
             results.append((offsets, order, state_out.body_qd.numpy().copy()))
         offsets, order, body_qd = results[0]
         self.assertGreater(int(offsets[-1]), 400)
@@ -286,10 +286,10 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
             n, color, offsets, row_start, sorted_contact = _first_fit_reference(solver)
             self.assertGreater(n, 400)
             entries = PROPAGATION_COLOR_TAIL + 2
-            np.testing.assert_array_equal(solver.color_unit_color.numpy()[:n], color, err_msg=f"{shape} colors")
-            np.testing.assert_array_equal(solver.color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver.color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver.color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape}")
+            np.testing.assert_array_equal(solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} colors")
+            np.testing.assert_array_equal(solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape}")
+            np.testing.assert_array_equal(solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape}")
+            np.testing.assert_array_equal(solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape}")
 
     def test_colored_accepts_a_large_row_budget(self):
         """The coloring keeps per-unit state in global scratch, so no staging cap applies."""
@@ -302,7 +302,7 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
             free_body_constraint_max=32768,
             articulation_constraint_max=2048,
         )
-        self.assertEqual(int(solver.propagation_max_constraints), 32768 + 2048)
+        self.assertEqual(int(solver._propagation_max_constraints), 32768 + 2048)
 
 
 if __name__ == "__main__":

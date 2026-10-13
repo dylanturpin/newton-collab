@@ -75,7 +75,7 @@ class TestTorsionRegularization(unittest.TestCase):
                         self.check_budget(result, solver)
                         count = int(result["count"][0])
                         types = result["row_type"][0, :count]
-                        weights = solver.row_w.numpy()[0, :count]
+                        weights = solver._row_w.numpy()[0, :count]
                         normal_rows = types == 0
                         self.assertTrue(np.any(normal_rows))
                         np.testing.assert_allclose(weights[normal_rows], 1 / (1 + regularization), atol=1e-7)
@@ -108,7 +108,7 @@ class TestTorsionRegularization(unittest.TestCase):
             count = int(contacts.rigid_contact_count.numpy()[0])
             forces = result["contact_f"][:count, :3]
             normals = contacts.rigid_contact_normal.numpy()[:count]
-            slots = solver.contact_slot.numpy()[:count]
+            slots = solver._contact_slot.numpy()[:count]
             for contact, slot in enumerate(slots):
                 if slot >= 0:
                     self.assertAlmostEqual(

@@ -385,9 +385,9 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         solve_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
         solver = newton.solvers.SolverFeatherPGS(model, solve_mode=solve_mode)
         test.assertFalse(solver._regularization_enabled)
-        test.assertIs(solver.row_w, solver._contact_row_w_dummy)
-        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
-        test.assertEqual(solver.row_w.shape, (1, 1))
+        test.assertIs(solver._row_w, solver._contact_row_w_dummy)
+        test.assertIs(solver._mf_row_w, solver._contact_row_w_dummy)
+        test.assertEqual(solver._row_w.shape, (1, 1))
 
 
 def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
@@ -397,10 +397,10 @@ def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCa
             device, g=0.0, solve_mode="split", response="immediate", velocity_iterations=0
         )
         body_q, _zs = _run(model, pipeline, solver, 1)
-        test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
+        test.assertGreater(int(solver._mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
-        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
-        test.assertEqual(float(solver.mf_row_w.numpy()[0, 0]), 1.0)
+        test.assertIs(solver._mf_row_w, solver._contact_row_w_dummy)
+        test.assertEqual(float(solver._mf_row_w.numpy()[0, 0]), 1.0)
 
 
 def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
@@ -446,7 +446,7 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
         apply_regularization = solver._stage6_apply_contact_regularization
 
         def recording_apply_regularization():
-            unregularized_diag["value"] = solver.diag.numpy()[0].copy()
+            unregularized_diag["value"] = solver._diag.numpy()[0].copy()
             apply_regularization()
 
         solver._stage6_apply_contact_regularization = recording_apply_regularization
@@ -462,8 +462,8 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
         rows = _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0]))
         test.assertGreater(len(rows), 0)
         base_diag = unregularized_diag["value"]
-        regularized_diag = solver.diag.numpy()[0]
-        weights = solver.row_w.numpy()[0]
+        regularized_diag = solver._diag.numpy()[0]
+        weights = solver._row_w.numpy()[0]
         for slot in rows.values():
             test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
             test.assertAlmostEqual(
@@ -500,7 +500,7 @@ def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
             wp.synchronize()
             rows = _contact_rows(solver, 2, int(contacts.rigid_contact_count.numpy()[0]))
             test.assertGreater(len(rows), 0, f"{response}: no propagation rows")
-            weights = solver.propagation_row_w.numpy()[0]
+            weights = solver._propagation_row_w.numpy()[0]
             for slot in rows.values():
                 test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
             test.assertTrue(np.isfinite(state_out.joint_qd.numpy()).all())

@@ -85,10 +85,10 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
     solver.step(state_in, state_out, control, contacts, 1.0 / 120.0)
     wp.synchronize()
 
-    propagation_count = getattr(solver, "propagation_constraint_count", None)
+    propagation_count = getattr(solver, "_propagation_constraint_count", None)
     rows = (
-        int(np.sum(solver.constraint_count.numpy())),
-        int(np.sum(solver.mf_constraint_count.numpy())),
+        int(np.sum(solver._constraint_count.numpy())),
+        int(np.sum(solver._mf_constraint_count.numpy())),
         int(np.sum(propagation_count.numpy())) if propagation_count is not None else 0,
     )
     return state_out.joint_qd.numpy().copy(), rows, getattr(solver, "_propagation_full_fused_size", None)
@@ -163,17 +163,17 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
         wp.synchronize()
 
-        row_count = int(solver.propagation_constraint_count.numpy()[0])
+        row_count = int(solver._propagation_constraint_count.numpy()[0])
         self.assertGreater(row_count, 0)
 
-        body_to_art = solver.body_to_articulation.numpy()
-        is_free = solver.is_free_rigid.numpy()
-        body_b = solver.propagation_body_b.numpy()[0, :row_count]
+        body_to_art = solver._body_to_articulation.numpy()
+        is_free = solver._is_free_rigid.numpy()
+        body_b = solver._propagation_body_b.numpy()[0, :row_count]
         free_bodies = [int(body) for body in body_b if body >= 0 and is_free[body_to_art[int(body)]] != 0]
         self.assertTrue(free_bodies)
 
-        response = solver.propagation_body_response.numpy()
-        mijt_b = solver.propagation_MiJt_b.numpy()[0, :row_count]
+        response = solver._propagation_body_response.numpy()
+        mijt_b = solver._propagation_MiJt_b.numpy()[0, :row_count]
         self.assertGreater(max(float(np.linalg.norm(response[body])) for body in free_bodies), 0.0)
         self.assertGreater(float(np.linalg.norm(mijt_b)), 0.0)
 

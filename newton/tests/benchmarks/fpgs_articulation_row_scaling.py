@@ -337,57 +337,57 @@ def _row_solver_bytes(solver: SolverFeatherPGS) -> int:
         "Y_world",
         "diag",
         "rhs",
-        "rhs_unbiased",
-        "impulses",
-        "row_type",
-        "row_parent",
-        "row_mu",
-        "row_cfm",
-        "phi",
-        "mf_rhs",
-        "mf_rhs_unbiased",
-        "mf_impulses",
-        "mf_eff_mass_inv",
-        "mf_row_type",
-        "mf_row_parent",
-        "mf_row_mu",
-        "mf_J_a",
-        "mf_J_b",
-        "mf_MiJt_a",
-        "mf_MiJt_b",
-        "mf_dof_a",
-        "mf_dof_b",
-        "propagation_rhs",
-        "propagation_rhs_unbiased",
-        "propagation_impulses",
-        "propagation_eff_mass_inv",
-        "propagation_row_type",
-        "propagation_row_parent",
-        "propagation_row_mu",
-        "propagation_phi",
-        "propagation_J_a",
-        "propagation_J_b",
-        "propagation_MiJt_a",
-        "propagation_MiJt_b",
-        "propagation_body_a",
-        "propagation_body_b",
+        "_rhs_unbiased",
+        "_impulses",
+        "_row_type",
+        "_row_parent",
+        "_row_mu",
+        "_row_cfm",
+        "_phi",
+        "_mf_rhs",
+        "_mf_rhs_unbiased",
+        "_mf_impulses",
+        "_mf_eff_mass_inv",
+        "_mf_row_type",
+        "_mf_row_parent",
+        "_mf_row_mu",
+        "_mf_J_a",
+        "_mf_J_b",
+        "_mf_MiJt_a",
+        "_mf_MiJt_b",
+        "_mf_dof_a",
+        "_mf_dof_b",
+        "_propagation_rhs",
+        "_propagation_rhs_unbiased",
+        "_propagation_impulses",
+        "_propagation_eff_mass_inv",
+        "_propagation_row_type",
+        "_propagation_row_parent",
+        "_propagation_row_mu",
+        "_propagation_phi",
+        "_propagation_J_a",
+        "_propagation_J_b",
+        "_propagation_MiJt_a",
+        "_propagation_MiJt_b",
+        "_propagation_body_a",
+        "_propagation_body_b",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
 
 def _propagation_extra_bytes(solver: SolverFeatherPGS) -> int:
     names = (
-        "propagation_body_response",
-        "propagation_body_qd",
-        "propagation_body_impulses",
-        "propagation_tree_Ia",
-        "propagation_tree_U",
-        "propagation_tree_D_chol",
-        "propagation_tree_D_inv",
-        "propagation_tree_pA",
-        "propagation_tree_u",
-        "propagation_tree_qdd",
-        "propagation_tree_body_delta",
+        "_propagation_body_response",
+        "_propagation_body_qd",
+        "_propagation_body_impulses",
+        "_propagation_tree_Ia",
+        "_propagation_tree_U",
+        "_propagation_tree_D_chol",
+        "_propagation_tree_D_inv",
+        "_propagation_tree_pA",
+        "_propagation_tree_u",
+        "_propagation_tree_qdd",
+        "_propagation_tree_body_delta",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
@@ -592,16 +592,16 @@ def _run_case_path(
     process_peak_gpu_mem_bytes = max(process_peak_gpu_mem_bytes, current_process_bytes)
     process_gpu_mem_delta_bytes = max(0, process_peak_gpu_mem_bytes - process_gpu_mem_baseline_bytes)
 
-    dense_counts = solver.constraint_count.numpy().astype(np.int64, copy=False)
-    mf_counts = solver.mf_constraint_count.numpy().astype(np.int64, copy=False)
-    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    dense_counts = solver._constraint_count.numpy().astype(np.int64, copy=False)
+    mf_counts = solver._mf_constraint_count.numpy().astype(np.int64, copy=False)
+    propagation_count_array = getattr(solver, "_propagation_constraint_count", None)
     if propagation_count_array is None:
         propagation_counts = np.zeros_like(dense_counts)
     else:
         propagation_counts = propagation_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
     propagation_active = bool(
-        solver.articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
+        solver._articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
     )
 
     result = RunResult(
@@ -618,9 +618,9 @@ def _run_case_path(
         world_count=model.world_count,
         body_count=model.body_count,
         joint_dof_count=model.joint_dof_count,
-        dense_row_capacity=int(solver.articulation_constraint_max),
-        mf_row_capacity=int(solver.free_body_constraint_max),
-        propagation_row_capacity=int(getattr(solver, "propagation_max_constraints", propagation_capacity)),
+        dense_row_capacity=int(solver._articulation_constraint_max),
+        mf_row_capacity=int(solver._free_body_constraint_max),
+        propagation_row_capacity=int(getattr(solver, "_propagation_max_constraints", propagation_capacity)),
         dense_rows_total=int(np.sum(dense_counts)),
         dense_rows_max_world=int(np.max(dense_counts)) if dense_counts.size else 0,
         mf_rows_total=int(np.sum(mf_counts)),

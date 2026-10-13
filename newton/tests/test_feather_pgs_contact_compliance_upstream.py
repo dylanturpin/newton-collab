@@ -100,7 +100,7 @@ def run_fixture(
                 control.joint_f.assign(np.array([lateral_force, 0.0], dtype=np.float32))
             solver.step(state, next_state, control, contacts, dt)
             state, next_state = next_state, state
-            seen_paths.update(solver.contact_path.numpy()[:count].tolist())
+            seen_paths.update(solver._contact_path.numpy()[:count].tolist())
             trace.append(state.body_q.numpy()[body].copy())
         return np.asarray(trace), seen_paths, solver, float(model.body_mass.numpy()[body])
 
@@ -175,11 +175,11 @@ def run_native_hydro_fixture(*, device, articulated=True):
                 np.testing.assert_array_equal(getattr(step_input, name).numpy(), value)
             step_input.clear_forces()
             solver.step(step_input, output, model.control(), contacts, 0.0025)
-            paths = solver.contact_path.numpy()[:count]
+            paths = solver._contact_path.numpy()[:count]
             if not np.all(paths == (0 if articulated else 1)):
                 raise AssertionError("Hydroelastic fixture did not use the requested contact route")
-            impulses = solver.impulses if articulated else solver.mf_impulses
-            row_types = solver.row_type if articulated else solver.mf_row_type
+            impulses = solver._impulses if articulated else solver._mf_impulses
+            row_types = solver._row_type if articulated else solver._mf_row_type
             results["compliant" if enabled else "stock_law"] = {
                 "body_z_m": float(output.body_q.numpy()[body, 2]),
                 "joint_velocity_m_s": float(output.joint_qd.numpy()[0]),
@@ -213,7 +213,7 @@ def test_omitted_friction_anchor_beta_keeps_patches_without_compliance(test, dev
     for kwargs in ({}, {"friction_anchor_beta": None}, {"contact_compliance": False}):
         with test.subTest(**kwargs):
             solver = SolverFeatherPGS(model, solve_mode="matrix_free", **kwargs)
-            test.assertEqual(solver.friction_anchor_beta, 0.2)
+            test.assertEqual(solver._friction_anchor_beta, 0.2)
             test.assertTrue(solver._friction_anchors_enabled)
 
 

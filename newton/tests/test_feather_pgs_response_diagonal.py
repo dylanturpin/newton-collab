@@ -189,25 +189,25 @@ def _run_mixed_response(
         state_in.clear_forces()
         pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-        constraint_count = int(solver.constraint_count.numpy()[0])
-        mf_count = int(solver.mf_constraint_count.numpy()[0])
+        constraint_count = int(solver._constraint_count.numpy()[0])
+        mf_count = int(solver._mf_constraint_count.numpy()[0])
         samples.append(
             (
                 constraint_count,
-                solver.diag.numpy()[0, :constraint_count].copy(),
-                solver.impulses.numpy()[0, :constraint_count].copy(),
+                solver._diag.numpy()[0, :constraint_count].copy(),
+                solver._impulses.numpy()[0, :constraint_count].copy(),
                 state_out.joint_q.numpy().copy(),
                 state_out.joint_qd.numpy().copy(),
                 int(solver._local_solve_owner.numpy()[0]),
-                solver.row_type.numpy()[0, :constraint_count].copy(),
+                solver._row_type.numpy()[0, :constraint_count].copy(),
                 mf_count,
-                solver.mf_impulses.numpy()[0, :mf_count].copy(),
-                solver.mf_row_type.numpy()[0, :mf_count].copy(),
-                solver.mf_row_parent.numpy()[0, :mf_count].copy(),
-                solver.mf_J_a.numpy()[0, :mf_count].copy(),
-                solver.mf_J_b.numpy()[0, :mf_count].copy(),
-                solver.mf_MiJt_a.numpy()[0, :mf_count].copy(),
-                solver.mf_MiJt_b.numpy()[0, :mf_count].copy(),
+                solver._mf_impulses.numpy()[0, :mf_count].copy(),
+                solver._mf_row_type.numpy()[0, :mf_count].copy(),
+                solver._mf_row_parent.numpy()[0, :mf_count].copy(),
+                solver._mf_J_a.numpy()[0, :mf_count].copy(),
+                solver._mf_J_b.numpy()[0, :mf_count].copy(),
+                solver._mf_MiJt_a.numpy()[0, :mf_count].copy(),
+                solver._mf_MiJt_b.numpy()[0, :mf_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
@@ -314,11 +314,11 @@ def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
             states.reverse()
 
     def sample():
-        count = solver.constraint_count.numpy()
+        count = solver._constraint_count.numpy()
         return (
             count.copy(),
-            [solver.diag.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
-            [solver.row_type.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
+            [solver._diag.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
+            [solver._row_type.numpy()[world, : count[world]].copy() for world in range(model.world_count)],
             solver._local_solve_owner.numpy().copy(),
             states[0].joint_q.numpy().copy(),
         )
@@ -852,38 +852,38 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), articulation_constraint_max=32)
-        self.assertEqual(set(solver.size_groups), {6, 13})
+        self.assertEqual(set(solver._size_groups), {6, 13})
 
         response_dof_count = solver._model_plan.response_dof_count
         articulation_world = solver._model_plan.articulation_world
         free_mask = solver._model_plan.is_free_rigid != 0
-        for size in solver.size_groups:
+        for size in solver._size_groups:
             size_arts = np.flatnonzero(response_dof_count == size)
             response_order = np.asarray(
                 sorted(size_arts, key=lambda art: (int(articulation_world[art]), int(art))), dtype=np.int32
             )
             propagation_order = response_order[~free_mask[response_order]]
-            response_counts = np.bincount(articulation_world[response_order], minlength=solver.world_count)
-            propagation_counts = np.bincount(articulation_world[propagation_order], minlength=solver.world_count)
+            response_counts = np.bincount(articulation_world[response_order], minlength=solver._world_count)
+            propagation_counts = np.bincount(articulation_world[propagation_order], minlength=solver._world_count)
             response_starts = np.pad(np.cumsum(response_counts), (1, 0)).astype(np.int32)
             propagation_starts = np.pad(np.cumsum(propagation_counts), (1, 0)).astype(np.int32)
 
-            np.testing.assert_array_equal(solver.world_response_group_art_start[size].numpy(), response_starts)
-            np.testing.assert_array_equal(solver.world_response_group_to_art[size].numpy(), response_order)
-            np.testing.assert_array_equal(solver.world_group_art_start[size].numpy(), propagation_starts)
-            np.testing.assert_array_equal(solver.world_group_to_art[size].numpy(), propagation_order)
+            np.testing.assert_array_equal(solver._world_response_group_art_start[size].numpy(), response_starts)
+            np.testing.assert_array_equal(solver._world_response_group_to_art[size].numpy(), response_order)
+            np.testing.assert_array_equal(solver._world_group_art_start[size].numpy(), propagation_starts)
+            np.testing.assert_array_equal(solver._world_group_to_art[size].numpy(), propagation_order)
 
         free_articulations = np.flatnonzero(free_mask).astype(np.int32)
-        np.testing.assert_array_equal(solver.world_group_art_start[6].numpy(), np.array((0, 0, 0), dtype=np.int32))
-        np.testing.assert_array_equal(solver.world_group_to_art[6].numpy(), np.empty(0, dtype=np.int32))
+        np.testing.assert_array_equal(solver._world_group_art_start[6].numpy(), np.array((0, 0, 0), dtype=np.int32))
+        np.testing.assert_array_equal(solver._world_group_to_art[6].numpy(), np.empty(0, dtype=np.int32))
         np.testing.assert_array_equal(
-            solver.world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
+            solver._world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
         )
-        np.testing.assert_array_equal(solver.world_response_group_to_art[6].numpy(), free_articulations)
+        np.testing.assert_array_equal(solver._world_response_group_to_art[6].numpy(), free_articulations)
 
         forced_tiled = _FeatherPGSExecutionPlan.build(
-            solver.size_groups,
-            max_constraints=solver.articulation_constraint_max,
+            solver._size_groups,
+            max_constraints=solver._articulation_constraint_max,
             max_shared_memory=101376,
             cholesky_kernel="auto",
             hinv_jt_kernel="tiled",

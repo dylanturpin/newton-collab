@@ -76,7 +76,7 @@ def test_sleeping_diagonal_dynamics_skip_is_exact(test, device):
             model, solve_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, articulation_constraint_max=64
         )
         test.assertTrue(solver._execution_plan.use_diagonal_mass(3))
-        solver.sleeping.skip_dynamics = skip
+        solver._sleeping.skip_dynamics = skip
         pipeline = newton.CollisionPipeline(model)
         runs.append([solver, pipeline, pipeline.contacts(), model.state(), model.state(), model.control()])
     slept = woke = False

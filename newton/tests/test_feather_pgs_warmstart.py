@@ -85,13 +85,13 @@ def _run_press(
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
         if articulated_contact_response.startswith("propagation"):
-            counts = solver.propagation_constraint_count.numpy()
-            rows = solver.propagation_row_type.numpy()[0, : counts[0]]
-            lam = solver.propagation_impulses.numpy()[0, : counts[0]]
+            counts = solver._propagation_constraint_count.numpy()
+            rows = solver._propagation_row_type.numpy()[0, : counts[0]]
+            lam = solver._propagation_impulses.numpy()[0, : counts[0]]
         else:
-            counts = solver.constraint_count.numpy()
-            rows = solver.row_type.numpy()[0, : counts[0]]
-            lam = solver.impulses.numpy()[0, : counts[0]]
+            counts = solver._constraint_count.numpy()
+            rows = solver._row_type.numpy()[0, : counts[0]]
+            lam = solver._impulses.numpy()[0, : counts[0]]
         impulse_sums[i] = np.abs(lam[rows == PGS_CONSTRAINT_TYPE_CONTACT]).sum()
         speeds[i] = np.abs(state_0.joint_qd.numpy()[0])
     return impulse_sums, speeds, state_0
@@ -395,13 +395,13 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(match[b_contact]), 0)
         self.assertLess(int(match[a_contact]), 0)
 
-        solver.iterations = 0
+        solver._iterations = 0
         solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
-        slots = solver.contact_slot.numpy()[:count]
+        slots = solver._contact_slot.numpy()[:count]
         b_slot = int(slots[b_contact])
         a_slot = int(slots[a_contact])
         self.assertNotEqual(b_slot, old_slot, "test did not produce actual solver-slot churn")
-        impulses = solver.mf_impulses.numpy()[0]
+        impulses = solver._mf_impulses.numpy()[0]
         self.assertAlmostEqual(float(impulses[b_slot]), old_impulse, delta=1.0e-6)
         self.assertEqual(float(impulses[a_slot]), 0.0)
 
@@ -470,7 +470,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         """contact_warmstart=True is the single all-contact warm-start mode."""
         model = _build_press()
         solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True, iterations=4)
-        self.assertTrue(solver.contact_warmstart)
+        self.assertTrue(solver._contact_warmstart)
         self.assertTrue(solver._mf_warmstart_enabled)
 
     def test_propagation_routes_hold_static_press(self):
@@ -561,13 +561,13 @@ def _seeded_sphere_impulses(solver, contacts, shapes, model, articulated, state_
     otherwise the caller has already stepped (for example by a graph replay).
     """
     if state_in is not None:
-        solver.iterations = 0
+        solver._iterations = 0
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
     count = int(contacts.rigid_contact_count.numpy()[0])
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
     shape1 = contacts.rigid_contact_shape1.numpy()[:count]
-    slots = solver.contact_slot.numpy()[:count]
-    impulses = (solver.impulses if articulated else solver.mf_impulses).numpy()[0]
+    slots = solver._contact_slot.numpy()[:count]
+    impulses = (solver._impulses if articulated else solver._mf_impulses).numpy()[0]
     seeds = []
     for shape in shapes:
         index = np.flatnonzero((shape0 == shape) | (shape1 == shape))
@@ -624,7 +624,7 @@ class TestFeatherPGSWarmstartProvenance(unittest.TestCase):
                     _insertion_after_solved_single_contact(articulated)
                 )
                 other = pipeline.contacts()
-                solver.iterations = 0
+                solver._iterations = 0
                 graphs = {}
                 with wp.ScopedCapture(device) as capture:
                     pipeline.collide(state_in, contacts)
@@ -743,7 +743,7 @@ def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device
         for captured in (False, True):
             _model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(device, articulated)
             impulses, row_type = (
-                (solver.impulses, solver.row_type) if articulated else (solver.mf_impulses, solver.mf_row_type)
+                (solver._impulses, solver._row_type) if articulated else (solver._mf_impulses, solver._mf_row_type)
             )
 
             def normal_load(impulses=impulses, row_type=row_type):
@@ -752,7 +752,7 @@ def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device
             settled = normal_load()
             test.assertGreater(settled, 0.0)
             # Without a sweep the solved impulses are the seeds.
-            solver.iterations = 0
+            solver._iterations = 0
             pipeline.collide(state_0, contacts)
             if captured:
                 with wp.ScopedCapture(device) as capture:

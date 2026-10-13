@@ -143,10 +143,10 @@ def _step_n(model, solver, n_steps, *, state_in=None):
 
 def _tree_inputs(model, solver, art):
     return {
-        "S": solver.propagation_joint_S_flat.numpy().astype(np.float64),
-        "U": solver.propagation_tree_U.numpy().astype(np.float64),
-        "Dinv": solver.propagation_tree_D_inv.numpy().astype(np.float64),
-        "com": solver.propagation_body_com_rel.numpy().astype(np.float64),
+        "S": solver._propagation_joint_S_flat.numpy().astype(np.float64),
+        "U": solver._propagation_tree_U.numpy().astype(np.float64),
+        "Dinv": solver._propagation_tree_D_inv.numpy().astype(np.float64),
+        "com": solver._propagation_body_com_rel.numpy().astype(np.float64),
         "jp": model.joint_parent.numpy(),
         "jc": model.joint_child.numpy(),
         "qd_start": model.joint_qd_start.numpy(),
@@ -239,7 +239,7 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
 
     def test_free_root_shape_detected(self):
         solver = _make_solver(self.model_free, "propagation_colored")
-        sizes = [int(s) for s in solver.size_groups if solver.n_arts_by_size[s] > 0]
+        sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 1)
         size = sizes[0]
         self.assertFalse(solver._propagation_tree_single_dof_by_size[size])
@@ -272,12 +272,12 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         for n_steps in (1, 12, 25):
             with self.subTest(n_steps=n_steps):
                 solver_w, solver_s = self._paired_solvers(n_steps)
-                U_w = solver_w.propagation_tree_U.numpy()
-                U_s = solver_s.propagation_tree_U.numpy()
-                Dc_w = solver_w.propagation_tree_D_chol.numpy()
-                Dc_s = solver_s.propagation_tree_D_chol.numpy()
-                Di_w = solver_w.propagation_tree_D_inv.numpy()
-                Di_s = solver_s.propagation_tree_D_inv.numpy()
+                U_w = solver_w._propagation_tree_U.numpy()
+                U_s = solver_s._propagation_tree_U.numpy()
+                Dc_w = solver_w._propagation_tree_D_chol.numpy()
+                Dc_s = solver_s._propagation_tree_D_chol.numpy()
+                Di_w = solver_w._propagation_tree_D_inv.numpy()
+                Di_s = solver_s._propagation_tree_D_inv.numpy()
                 for j in range(n_joints):
                     dc = int(qd_start[j + 1] - qd_start[j])
                     if dc == 0:
@@ -302,21 +302,21 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
             patterns.append(p)
         for pi, imps in enumerate(patterns):
             with self.subTest(pattern=pi):
-                v0 = rng.normal(scale=0.1, size=solver_w.v_out.shape).astype(np.float32)
+                v0 = rng.normal(scale=0.1, size=solver_w._v_out.shape).astype(np.float32)
                 for s in (solver_w, solver_s):
-                    s.propagation_body_impulses.assign(imps)
-                    s.v_out.assign(v0)
-                    s.propagation_body_qd.zero_()
+                    s._propagation_body_impulses.assign(imps)
+                    s._v_out.assign(v0)
+                    s._propagation_body_qd.zero_()
                 solver_w._propagate_response()
                 solver_s._propagate_response()
                 wp.synchronize()
-                dv = solver_w.v_out.numpy() - solver_s.v_out.numpy()
-                dqd = solver_w.propagation_body_qd.numpy() - solver_s.propagation_body_qd.numpy()
-                scale = max(1.0, float(np.max(np.abs(solver_s.v_out.numpy()))))
+                dv = solver_w._v_out.numpy() - solver_s._v_out.numpy()
+                dqd = solver_w._propagation_body_qd.numpy() - solver_s._propagation_body_qd.numpy()
+                scale = max(1.0, float(np.max(np.abs(solver_s._v_out.numpy()))))
                 self.assertLess(float(np.max(np.abs(dv))), 1e-5 * scale)
                 self.assertLess(float(np.max(np.abs(dqd))), 1e-5 * scale)
                 # deferred impulses must be consumed
-                self.assertEqual(float(np.max(np.abs(solver_w.propagation_body_impulses.numpy()))), 0.0)
+                self.assertEqual(float(np.max(np.abs(solver_w._propagation_body_impulses.numpy()))), 0.0)
 
     def test_propagate_matches_numpy_reference(self):
         model = self.model_free
@@ -326,9 +326,9 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         bodies_per_world = model.body_count // N_WORLDS
         imps = np.zeros((model.body_count, 6), dtype=np.float32)
         imps[:bodies_per_world] = rng.normal(scale=0.5, size=(bodies_per_world, 6))
-        solver_w.propagation_body_impulses.assign(imps)
-        solver_w.v_out.zero_()
-        solver_w.propagation_body_qd.zero_()
+        solver_w._propagation_body_impulses.assign(imps)
+        solver_w._v_out.zero_()
+        solver_w._propagation_body_qd.zero_()
         solver_w._propagate_response()
         wp.synchronize()
         n_dofs_w0 = int(model.joint_dof_count) // N_WORLDS
@@ -337,24 +337,24 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
             {b: imps[b].astype(np.float64) for b in range(bodies_per_world)},
             np.zeros(ti["S"].shape[0]),
         )
-        got_v = solver_w.v_out.numpy()[:n_dofs_w0]
+        got_v = solver_w._v_out.numpy()[:n_dofs_w0]
         self.assertLess(float(np.max(np.abs(got_v - ref_v[:n_dofs_w0]))), 1e-4)
-        got_qd = solver_w.propagation_body_qd.numpy()
+        got_qd = solver_w._propagation_body_qd.numpy()
         for b in range(bodies_per_world):
             self.assertLess(float(np.max(np.abs(got_qd[b] - ref_body_qd[b]))), 1e-4)
 
     def test_refresh_matches_serial(self):
         rng = np.random.default_rng(4321)
         solver_w, solver_s = self._paired_solvers(20)
-        v0 = rng.normal(scale=0.5, size=solver_w.v_out.shape).astype(np.float32)
+        v0 = rng.normal(scale=0.5, size=solver_w._v_out.shape).astype(np.float32)
         for s in (solver_w, solver_s):
-            s.v_out.assign(v0)
-            s.propagation_body_qd.zero_()
+            s._v_out.assign(v0)
+            s._propagation_body_qd.zero_()
         solver_w._refresh_propagation_body_qd_from_vout(force=True)
         solver_s._refresh_propagation_body_qd_from_vout(force=True)
         wp.synchronize()
-        qd_w = solver_w.propagation_body_qd.numpy()
-        qd_s = solver_s.propagation_body_qd.numpy()
+        qd_w = solver_w._propagation_body_qd.numpy()
+        qd_s = solver_s._propagation_body_qd.numpy()
         scale = max(1.0, float(np.max(np.abs(qd_s))))
         self.assertLess(float(np.max(np.abs(qd_w - qd_s))), 1e-5 * scale)
 
@@ -369,10 +369,10 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         """
         model = self.model_free
         solver_w, _ = self._paired_solvers(20)
-        size = next(int(s) for s in solver_w.size_groups if solver_w.n_arts_by_size[s] > 0)
+        size = next(int(s) for s in solver_w._size_groups if solver_w._n_arts_by_size[s] > 0)
         self.assertIsNotNone(solver_w._response_tree_warp_kernels_by_size.get(size))
         ti = _tree_inputs(model, solver_w, art=0)
-        resp = solver_w.propagation_body_response.numpy()
+        resp = solver_w._propagation_body_response.numpy()
         bodies_per_world = model.body_count // N_WORLDS
         for body in range(bodies_per_world):
             ref = _ref_body_response(ti, body)
@@ -403,8 +403,8 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
                         results[mode] = {
                             "joint_q": state.joint_q.numpy().copy(),
                             "joint_qd": state.joint_qd.numpy().copy(),
-                            "propagation_body_qd": solver.propagation_body_qd.numpy().copy(),
-                            "rows": int(solver.propagation_constraint_count.numpy().sum()),
+                            "propagation_body_qd": solver._propagation_body_qd.numpy().copy(),
+                            "rows": int(solver._propagation_constraint_count.numpy().sum()),
                         }
                     self.assertGreater(results["warp"]["rows"], 0, "no propagation contact rows produced")
                     # precondition: the scene is pipeline-deterministic

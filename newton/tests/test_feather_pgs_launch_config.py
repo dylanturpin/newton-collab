@@ -235,9 +235,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
-        self.assertEqual(solver.serial_kernel_block_dim, 256)
-        self.assertEqual(solver.tile_threads, 64)
-        self.assertEqual(solver.articulated_contact_response, "immediate")
+        self.assertEqual(solver._serial_kernel_block_dim, 256)
+        self.assertEqual(solver._tile_threads, 64)
+        self.assertEqual(solver._articulated_contact_response, "immediate")
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free contact responses require CUDA")
     def test_articulated_contact_response_validation(self):
@@ -247,13 +247,13 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
-        self.assertEqual(solver.articulated_contact_response, "propagation")
+        self.assertEqual(solver._articulated_contact_response, "propagation")
         fused = SolverFeatherPGS(
             model,
             solve_mode="matrix_free",
             articulated_contact_response="propagation_fused",
         )
-        self.assertEqual(fused.articulated_contact_response, "propagation_fused")
+        self.assertEqual(fused._articulated_contact_response, "propagation_fused")
 
         with self.assertRaisesRegex(ValueError, "articulated_contact_response"):
             SolverFeatherPGS(model, articulated_contact_response="bad")
@@ -275,7 +275,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
-        self.assertEqual(propagation_debug.articulated_contact_response, "propagation")
+        self.assertEqual(propagation_debug._articulated_contact_response, "propagation")
 
     def test_joint_limit_solver_compatibility_validation(self):
         model = _build_chain_model(num_links=2, num_worlds=1)
@@ -332,9 +332,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "compact response mapping requires CUDA matrix-free mode")
     def test_compact_world_dof_mapping_pads_heterogeneous_worlds(self):
         solver = SolverFeatherPGS(_build_heterogeneous_world_model(), solve_mode="matrix_free")
-        self.assertEqual(solver.max_world_dofs, 6)
-        np.testing.assert_array_equal(solver.world_dof_count.numpy(), np.array((6, 1), dtype=np.int32))
-        indices = solver.world_dof_indices.numpy()
+        self.assertEqual(solver._max_world_dofs, 6)
+        np.testing.assert_array_equal(solver._world_dof_count.numpy(), np.array((6, 1), dtype=np.int32))
+        indices = solver._world_dof_indices.numpy()
         np.testing.assert_array_equal(indices[0], np.arange(6, dtype=np.int32))
         self.assertGreaterEqual(int(indices[1, 0]), 0)
         np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
@@ -531,9 +531,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(optimized._selected_tau_articulation_count, 2)
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
-        self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
-        self.assertEqual(optimized.J_by_size[16].shape, (1, 1, 1))
-        self.assertEqual(optimized.J_world.shape, (1, 1, 1))
+        self.assertEqual(optimized._H_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized._J_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized._J_world.shape, (1, 1, 1))
         self.assertFalse(reference._sparse_diagonal_contact_solve)
         self.assertFalse(reference._sparse_diagonal_contact_triples)
 
@@ -610,7 +610,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
                 sparse = run(optimized)
                 general = run(reference)
-                self.assertGreater(int(optimized.constraint_count.numpy().max()), 0, "no contact rows were generated")
+                self.assertGreater(int(optimized._constraint_count.numpy().max()), 0, "no contact rows were generated")
                 self.assertGreater(
                     float(np.abs(sparse[-1][1] - slick[-1][1]).max()),
                     1.0e-3,
@@ -696,7 +696,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model.body_inertia.assign(body_inertia)
         model.body_com.assign(body_com)
         solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-        self.assertFalse(solver._step % solver.update_mass_matrix_interval == 0)
+        self.assertFalse(solver._step % solver._update_mass_matrix_interval == 0)
         masked = step()
 
         # Parallel-axis inertia about the hinge: 2 + m * 0.1^2 (+ armature).
@@ -705,7 +705,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         # The next global refresh must agree with the masked refresh.
         for _ in range(2):
             step()
-        self.assertTrue(solver._step % solver.update_mass_matrix_interval == 0)
+        self.assertTrue(solver._step % solver._update_mass_matrix_interval == 0)
         np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
@@ -757,13 +757,12 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             q_ref, qd_ref = _chain_trajectory(model, reference)
             for tile_threads in (32, 64):
                 with self.subTest(links=links, tile_threads=tile_threads):
-                    with kernel_overrides(dense):
-                        with kernel_overrides({"tile_threads": tile_threads}):
-                            fused = SolverFeatherPGS(model, enable_joint_limits=False)
+                    with kernel_overrides({**dense, "tile_threads": tile_threads}):
+                        fused = SolverFeatherPGS(model, enable_joint_limits=False)
                     self.assertIsNotNone(fused._crba_cholesky_kernels_by_size[links])
                     q, qd = _chain_trajectory(model, fused)
                     np.testing.assert_allclose(
-                        fused.L_by_size[links].numpy(), reference.L_by_size[links].numpy(), atol=2.0e-5
+                        fused._L_by_size[links].numpy(), reference._L_by_size[links].numpy(), atol=2.0e-5
                     )
                     np.testing.assert_allclose(q, q_ref, rtol=1.0e-5, atol=2.0e-5)
                     np.testing.assert_allclose(qd, qd_ref, rtol=1.0e-5, atol=2.0e-4)
@@ -810,7 +809,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with self.subTest(value=good):
                 with kernel_overrides({"serial_kernel_block_dim": good}):
                     solver = SolverFeatherPGS(model)
-                self.assertEqual(solver.serial_kernel_block_dim, good)
+                self.assertEqual(solver._serial_kernel_block_dim, good)
 
     def test_tile_threads_validation(self):
         model = newton.ModelBuilder().finalize()
@@ -823,21 +822,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with self.subTest(value=good):
                 with kernel_overrides({"tile_threads": good}):
                     solver = SolverFeatherPGS(model)
-                self.assertEqual(solver.tile_threads, good)
+                self.assertEqual(solver._tile_threads, good)
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled launch-config step test requires CUDA")
     def test_non_default_tile_threads_compiles_and_steps(self):
         model = _build_chain_model()
         forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
-        with kernel_overrides(forced):
-            with kernel_overrides({"serial_kernel_block_dim": 64, "tile_threads": 128, "pgs_kernel": "loop"}):
-                solver = SolverFeatherPGS(
-                    model,
-                    solve_mode="split",
-                    articulation_constraint_max=384,
-                )
-        self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver.size_groups))
-        self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
+        with kernel_overrides({**forced, "serial_kernel_block_dim": 64, "tile_threads": 128, "pgs_kernel": "loop"}):
+            solver = SolverFeatherPGS(model, solve_mode="split", articulation_constraint_max=384)
+        self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver._size_groups))
+        self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver._size_groups))
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(5):
@@ -870,7 +864,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 600.0)
         wp.synchronize()
 
-        self.assertGreater(int(solver.constraint_count.numpy()[0]), 0)
+        self.assertGreater(int(solver._constraint_count.numpy()[0]), 0)
         self.assertTrue(np.isfinite(state_1.joint_q.numpy()).all())
         self.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
 
@@ -890,7 +884,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                         SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
                     continue
                 solver = SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
-                self.assertFalse(solver.fuse_joint_velocity_limits)
+                self.assertFalse(solver._velocity_limits_fused)
         if wp.is_cuda_available():
             # drive_mode='augmented' with velocity limits enabled is inert too
             # (matrix_free construction requires CUDA).
@@ -901,7 +895,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 drive_mode="augmented",
                 fuse_joint_velocity_limits=True,
             )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
+            self.assertFalse(solver._velocity_limits_fused)
             # The applicable combination engages by default (no kwarg passed),
             # and an explicit False opts out.
             solver = SolverFeatherPGS(
@@ -910,7 +904,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 enable_joint_velocity_limits=True,
                 drive_mode="rows",
             )
-            self.assertTrue(solver.fuse_joint_velocity_limits)
+            self.assertTrue(solver._velocity_limits_fused)
             solver = SolverFeatherPGS(
                 model,
                 solve_mode="matrix_free",
@@ -918,7 +912,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 drive_mode="rows",
                 fuse_joint_velocity_limits=False,
             )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
+            self.assertFalse(solver._velocity_limits_fused)
             # velocity_limit_activation_fraction=inf is the explicit
             # never-activate kill-switch for velocity limits; the fused clamp
             # rides the drive-row visit (which the inf gate does not cover),
@@ -932,7 +926,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 fuse_joint_velocity_limits=True,
                 velocity_limit_activation_fraction=float("inf"),
             )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
+            self.assertFalse(solver._velocity_limits_fused)
             # The clamp pass runs at the end of each iteration, independent of
             # the drive-row visit, so frozen drive rows during velocity
             # iterations no longer disable fusion: the clamp keeps enforcing
@@ -947,7 +941,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     velocity_iterations=2,
                     velocity_drive_mode=velocity_drive_mode,
                 )
-                self.assertTrue(solver.fuse_joint_velocity_limits)
+                self.assertTrue(solver._velocity_limits_fused)
 
     @unittest.skipUnless(wp.is_cuda_available(), "fused velocity-limit clamp requires CUDA")
     def test_fuse_joint_velocity_limits_clamps_driven_dofs_without_rows(self):
@@ -987,7 +981,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 state_0, state_1 = state_1, state_0
                 max_speed = max(max_speed, float(np.max(np.abs(state_0.joint_qd.numpy()))))
             wp.synchronize()
-            return max_speed, int(solver.constraint_count.numpy()[0])
+            return max_speed, int(solver._constraint_count.numpy()[0])
 
         fused_speed, fused_rows = run(True)
         dedicated_speed, dedicated_rows = run(False)
@@ -1029,7 +1023,7 @@ def test_disabled_tree_joints_raise(test, device):
     loop = released.add_joint_ball(-1, tip, enabled=False)
     model = released.finalize(device=device)
     solver = SolverFeatherPGS(model)
-    test.assertIn(loop, solver._connect_joint_to_index)
+    test.assertIn(loop, solver._connect_joint.numpy().tolist())
 
 
 def _build_prismatic_links(device, enabled: tuple[bool, ...]):

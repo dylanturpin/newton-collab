@@ -98,9 +98,9 @@ def _make_solver(model: newton.Model, mode: str, **kwargs) -> SolverFeatherPGS:
 
 def _contact_rows(solver: SolverFeatherPGS, path_id: int, contact_count: int | None = None) -> dict[int, int]:
     """contact index -> row slot for contacts routed to the given path."""
-    contact_path = solver.contact_path.numpy().astype(np.int32)
-    contact_slot = solver.contact_slot.numpy().astype(np.int32)
-    contact_world = solver.contact_world.numpy().astype(np.int32)
+    contact_path = solver._contact_path.numpy().astype(np.int32)
+    contact_slot = solver._contact_slot.numpy().astype(np.int32)
+    contact_world = solver._contact_world.numpy().astype(np.int32)
     out = {}
     if contact_count is None:
         contact_count = solver._test_live_contact_count
@@ -186,13 +186,13 @@ def _analytic_H_and_X(model: newton.Model, state) -> tuple[np.ndarray, np.ndarra
 
 
 def _propagation_operator_diag(solver: SolverFeatherPGS) -> np.ndarray:
-    count = int(solver.propagation_constraint_count.numpy()[0])
-    J_a = solver.propagation_J_a.numpy()[0, :count].astype(np.float64)
-    J_b = solver.propagation_J_b.numpy()[0, :count].astype(np.float64)
-    MiJt_a = solver.propagation_MiJt_a.numpy()[0, :count].astype(np.float64)
-    MiJt_b = solver.propagation_MiJt_b.numpy()[0, :count].astype(np.float64)
-    body_a = solver.propagation_body_a.numpy()[0, :count].astype(np.int32)
-    body_b = solver.propagation_body_b.numpy()[0, :count].astype(np.int32)
+    count = int(solver._propagation_constraint_count.numpy()[0])
+    J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
+    J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
+    MiJt_a = solver._propagation_MiJt_a.numpy()[0, :count].astype(np.float64)
+    MiJt_b = solver._propagation_MiJt_b.numpy()[0, :count].astype(np.float64)
+    body_a = solver._propagation_body_a.numpy()[0, :count].astype(np.int32)
+    body_b = solver._propagation_body_b.numpy()[0, :count].astype(np.int32)
     diag = np.zeros(count, dtype=np.float64)
     for row in range(count):
         if body_a[row] >= 0:
@@ -215,7 +215,7 @@ class TestPropagationSameArticulation(unittest.TestCase):
         model = _build_scissor_model("cuda:0")
         solver = _make_solver(model, "propagation")
         _zero_iteration_step(model, solver)
-        self.assertEqual(int(solver.propagation_constraint_count.numpy()[0]), 0)
+        self.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), 0)
         self.assertGreater(len(_contact_rows(solver, DENSE_PATH)), 0)
 
     def test_flag_requires_propagation_mode(self):
@@ -247,17 +247,17 @@ class TestPropagationSameArticulation(unittest.TestCase):
         # Analytic reference: generalized row Jacobian g = X_a^T j_a + X_b^T j_b
         # from the solver's own row geometry, W_kk = g^T H^-1 g.
         H, X = _analytic_H_and_X(model, state)
-        count = int(solver.propagation_constraint_count.numpy()[0])
-        J_a = solver.propagation_J_a.numpy()[0, :count].astype(np.float64)
-        J_b = solver.propagation_J_b.numpy()[0, :count].astype(np.float64)
-        body_a = solver.propagation_body_a.numpy()[0, :count].astype(np.int32)
-        body_b = solver.propagation_body_b.numpy()[0, :count].astype(np.int32)
+        count = int(solver._propagation_constraint_count.numpy()[0])
+        J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
+        J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
+        body_a = solver._propagation_body_a.numpy()[0, :count].astype(np.int32)
+        body_b = solver._propagation_body_b.numpy()[0, :count].astype(np.int32)
 
         # Convention check: the reference solver's Y rows must equal H^-1 g
         # (up to overall row sign) — this pins frames/ordering before we
         # trust the reference for the real assertion.
-        width = int(reference.world_dof_count.numpy()[0])
-        Y = reference.Y_world.numpy()[0].astype(np.float64)
+        width = int(reference._world_dof_count.numpy()[0])
+        Y = reference._Y_world.numpy()[0].astype(np.float64)
         for contact, dense_slot in sorted(dense_rows.items()):
             row = prop_rows[contact]
             g = X[body_a[row]].T @ J_a[row] + X[body_b[row]].T @ J_b[row]

@@ -27,20 +27,20 @@ def main():
                     worlds=1, witnesses=count, patches=patches, device="cuda:0"
                 )
                 names = (
-                    "constraint_count",
-                    "slot_counter",
-                    "row_type",
-                    "row_parent",
-                    "row_mu",
-                    "row_beta",
-                    "row_cfm",
-                    "phi",
-                    "target_velocity",
-                    "row_restitution",
+                    "_constraint_count",
+                    "_slot_counter",
+                    "_row_type",
+                    "_row_parent",
+                    "_row_mu",
+                    "_row_beta",
+                    "_row_cfm",
+                    "_phi",
+                    "_target_velocity",
+                    "_row_restitution",
                     "_contact_torsion_group",
                 )
                 saved = [(getattr(solver, name), wp.clone(getattr(solver, name))) for name in names]
-                saved += [(array, wp.clone(array)) for array in solver.J_by_size.values()]
+                saved += [(array, wp.clone(array)) for array in solver._J_by_size.values()]
 
                 def restore(saved=saved):
                     for target, source in saved:
@@ -79,13 +79,13 @@ def main():
                     wp.synchronize_device("cuda:0")
                     elapsed.append((time.perf_counter() - start) * 1000.0)
                 actual = {name: getattr(solver, name).numpy() for name in names}
-                actual.update({f"J{key}": value.numpy() for key, value in solver.J_by_size.items()})
+                actual.update({f"J{key}": value.numpy() for key, value in solver._J_by_size.items()})
                 if reference is None:
                     reference = actual
                 else:
                     for key in reference:
                         np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)
-                rows = int(np.count_nonzero(actual["row_type"] == 7))
+                rows = int(np.count_nonzero(actual["_row_type"] == 7))
                 assert rows == 2, rows
                 print(
                     json.dumps(

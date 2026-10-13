@@ -91,11 +91,11 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
 
     def test_hetero_matrix_free_constructs(self):
         solver = SolverFeatherPGS(self.hetero_model, solve_mode="matrix_free")
-        self.assertEqual(solver.solve_mode, "matrix_free")
+        self.assertEqual(solver._solve_mode, "matrix_free")
 
     def test_hetero_split_constructs(self):
         solver = SolverFeatherPGS(self.hetero_model, solve_mode="split")
-        self.assertEqual(solver.solve_mode, "split")
+        self.assertEqual(solver._solve_mode, "split")
 
     def test_homogeneous_all_modes_construct(self):
         for solve_mode, response in (
@@ -111,8 +111,8 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
                     solve_mode=solve_mode,
                     articulated_contact_response=response,
                 )
-                self.assertEqual(solver.solve_mode, solve_mode)
-                self.assertEqual(solver.articulated_contact_response, response)
+                self.assertEqual(solver._solve_mode, solve_mode)
+                self.assertEqual(solver._articulated_contact_response, response)
 
 
 if __name__ == "__main__":

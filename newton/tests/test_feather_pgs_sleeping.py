@@ -15,14 +15,14 @@ class TestSleeping(unittest.TestCase):
     def test_disabled_allocates_no_state(self):
         """Keep sleep state absent on the default solver path."""
         _model, _pipeline, solver, _states, _control = _scene(enabled=False)
-        self.assertIsNone(solver.sleeping)
+        self.assertIsNone(solver._sleeping)
 
     def test_separated_boxes_sleep_and_force_wakes_one(self):
         """Sleep independent boxes and wake only the forced island."""
         model, pipeline, solver, states, control = _scene()
         _advance(model, pipeline, solver, states, control, 120)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
-        self.assertNotEqual(*solver.sleeping.body_island.numpy())
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+        self.assertNotEqual(*solver._sleeping.body_island.numpy())
         before = states[0].body_q.numpy().copy()
         _advance(model, pipeline, solver, states, control, 10)
         np.testing.assert_array_equal(states[0].body_q.numpy(), before)
@@ -30,19 +30,19 @@ class TestSleeping(unittest.TestCase):
         force[0, 0] = 100
         states[0].body_f.assign(force)
         _advance(model, pipeline, solver, states, control, 1, clear=False)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 0])
         self.assertGreater(states[0].body_qd.numpy()[0, 0], 0)
 
     def test_nonfinite_force_wakes_and_propagates(self):
         """A NaN external force on a sleeping body wakes its island instead of publishing a frozen state."""
         model, pipeline, solver, states, control = _scene()
         _advance(model, pipeline, solver, states, control, 120)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
         force = np.zeros((2, 6), dtype=np.float32)
         force[0, 0] = np.nan
         states[0].body_f.assign(force)
         _advance(model, pipeline, solver, states, control, 1, clear=False)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 0])
         self.assertFalse(np.all(np.isfinite(states[0].body_qd.numpy()[0])))
 
     def test_reset_and_gravity_change_wake(self):
@@ -50,12 +50,12 @@ class TestSleeping(unittest.TestCase):
         model, pipeline, solver, states, control = _scene()
         _advance(model, pipeline, solver, states, control, 120)
         solver.reset(states[0])
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
         _advance(model, pipeline, solver, states, control, 120)
         model.set_gravity((0, 0, 9.81))
         solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
         _advance(model, pipeline, solver, states, control, 1)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
         self.assertGreater(states[0].body_qd.numpy()[0, 2], 0)
 
     def test_free_flight_cannot_sleep(self):
@@ -63,7 +63,7 @@ class TestSleeping(unittest.TestCase):
         model, pipeline, solver, states, control = _scene(ground=False)
         model.set_gravity((0, 0, 0))
         _advance(model, pipeline, solver, states, control, 120)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
 
     def test_invalid_options(self):
         """Reject unsupported sleep settings explicitly."""
@@ -91,14 +91,14 @@ class TestSleeping(unittest.TestCase):
         """Wake the whole contacting stack when its top box is forced."""
         model, pipeline, solver, states, control = _scene(stack=True)
         _advance(model, pipeline, solver, states, control, 200)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
-        islands = solver.sleeping.body_island.numpy()
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+        islands = solver._sleeping.body_island.numpy()
         self.assertEqual(islands[0], islands[1])
         force = np.zeros((2, 6), dtype=np.float32)
         force[1, 0] = 100
         states[0].body_f.assign(force)
         _advance(model, pipeline, solver, states, control, 1, clear=False)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
 
     def test_cuda_graph_sleep_and_wake(self):
         """Advance sleep timers and force waking on captured graph replay."""
@@ -117,13 +117,13 @@ class TestSleeping(unittest.TestCase):
                 states.reverse()
         for _ in range(100):
             wp.capture_launch(capture.graph)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
         forces = np.zeros((2, 6), dtype=np.float32)
         forces[0, 0] = 100
         states[0].body_f.assign(forces)
         states[1].body_f.assign(forces)
         wp.capture_launch(capture.graph)
-        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 0])
 
 
 def _scene(*, enabled=True, ground=True, device="cpu", stack=False):

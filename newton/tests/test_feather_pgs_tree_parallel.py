@@ -144,7 +144,7 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
         """Schedule every finger segment and retain serial trees as one-lane groups."""
         model = _build_fingers(include_chain=True)
         solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
-        plan = _FeatherPGSTreePlan.build(model, solver.articulation_joint_end)
+        plan = _FeatherPGSTreePlan.build(model, solver._articulation_joint_end)
         self.assertIsNotNone(plan)
         self.assertTrue(any(group.lanes > 1 for group in plan.groups))
         self.assertTrue(any(group.lanes == 1 for group in plan.groups))
@@ -225,12 +225,12 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
         """Retain wholly serial, aliased, cross-articulation and loop topologies."""
         model, _, _ = _build_model(chain=True)
         solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
-        self.assertIsNone(_FeatherPGSTreePlan.build(model, solver.articulation_joint_end))
+        self.assertIsNone(_FeatherPGSTreePlan.build(model, solver._articulation_joint_end))
         for unsafe in ("alias", "foreign_parent", "loop"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
                 solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
-                ends = solver.articulation_joint_end.numpy().copy()
+                ends = solver._articulation_joint_end.numpy().copy()
                 if unsafe == "alias":
                     children = model.joint_child.numpy().copy()
                     children[2] = children[1]
@@ -305,8 +305,8 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                                 wrench = (wrench % 11 - 5) * (0.03 + force_phase * 0.04)
                                 state.body_f.assign(wrench)
                                 controls[index].joint_f.assign(seed * (1.0 + force_phase))
-                                solver.joint_tau.assign(seed)
-                                solver.body_ft_s.fill_(-123.25)
+                                solver._joint_tau.assign(seed)
+                                solver._body_ft_s.fill_(-123.25)
                                 for scratch in solver._tree_net_wrenches:
                                     scratch.fill_(-123.25)
                                 solver._launch_rigid_tau(state, solver, controls[index], add_to_existing=additive)
@@ -318,7 +318,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                                     atol=3e-6,
                                     err_msg=f"forces {force_phase}, additive {additive}: {name}",
                                 )
-                            tau = solvers[1].joint_tau.numpy().copy()
+                            tau = solvers[1]._joint_tau.numpy().copy()
                             if additive:
                                 np.testing.assert_allclose(tau - overwritten, seed, rtol=3e-6, atol=3e-6)
                             else:
@@ -331,7 +331,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                         solver._refresh_passive_joint_damping()
                         solver._launch_rigid_tau(states[index], solver, controls[index])
                         np.testing.assert_allclose(
-                            previous_tau - solver.joint_tau.numpy(),
+                            previous_tau - solver._joint_tau.numpy(),
                             -damping * states[index].joint_qd.numpy(),
                             rtol=3e-5,
                             atol=3e-6,
@@ -403,7 +403,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                                 err_msg=f"{phase}: {name}",
                             )
                         if velocity_limits:
-                            np.testing.assert_array_equal(solvers[1].qd_work.numpy(), solvers[0].qd_work.numpy())
+                            np.testing.assert_array_equal(solvers[1]._qd_work.numpy(), solvers[0]._qd_work.numpy())
 
     def test_cuda_uncached_publication_matches_public_fk(self):
         """Publish uncached FREE and mixed D6 states using the public FK convention."""

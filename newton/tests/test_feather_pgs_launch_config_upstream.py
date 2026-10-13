@@ -139,10 +139,10 @@ def test_tiled_and_loop_kernels_step_identically(test, device):
 def test_split_defaults(test, device):
     """Keep the documented defaults in split mode and allocate its Delassus storage."""
     solver = SolverFeatherPGS(_build_chain_model(device, num_links=2, num_worlds=2), solve_mode="split")
-    test.assertEqual(solver.solve_mode, "split")
-    test.assertEqual(solver.iterations, 12)
-    test.assertEqual(solver.articulation_constraint_max, 32)
-    test.assertEqual(solver.C.shape, (2, 32, 32))
+    test.assertEqual(solver._solve_mode, "split")
+    test.assertEqual(solver._iterations, 12)
+    test.assertEqual(solver._articulation_constraint_max, 32)
+    test.assertEqual(solver._C.shape, (2, 32, 32))
     test.assertFalse(solver._jy_world_aliased)
     test.assertFalse(solver._hinv_jt_writes_world)
 
@@ -187,7 +187,7 @@ def test_split_native_and_scalar_kernels_step_identically(test, device):
                 solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
                 state_0, state_1 = state_1, state_0
             solver.check_constraint_capacity()
-            test.assertGreater(int(solver.constraint_count.numpy().max()), 0)
+            test.assertGreater(int(solver._constraint_count.numpy().max()), 0)
             trajectories.append(state_0.joint_q.numpy().copy())
         with test.subTest(with_free_body=with_free_body):
             np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=1.0e-4)
@@ -197,8 +197,8 @@ def test_drive_mode_validation(test, device):
     """Default to the implicit drive and reject unknown drive formulations."""
     model = _build_chain_model(device, num_links=2, num_worlds=1)
     solver = SolverFeatherPGS(model)
-    test.assertEqual(solver.drive_mode, "augmented")
-    test.assertFalse(solver.fuse_joint_velocity_limits)
+    test.assertEqual(solver._drive_mode, "augmented")
+    test.assertFalse(solver._velocity_limits_fused)
     test.assertEqual(SolverFeatherPGS(model, solve_mode="matrix_free", drive_mode="rows").drive_mode, "rows")
     with test.assertRaisesRegex(NotImplementedError, "requires solve_mode='matrix_free'"):
         SolverFeatherPGS(model, solve_mode="split", drive_mode="rows")

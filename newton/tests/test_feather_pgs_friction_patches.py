@@ -827,7 +827,7 @@ class TestFrictionPatchDeviceFlood(unittest.TestCase):
                 solver.step(a, b, control, contacts, 1.0 / 240.0)
                 a, b = b, a
             frame, view = patches.current, patches.view
-            outputs = {"body_q": a.body_q, "body_qd": a.body_qd, "impulses": solver.propagation_impulses}
+            outputs = {"body_q": a.body_q, "body_qd": a.body_qd, "impulses": solver._propagation_impulses}
             for name in ("owner", "members", "valid", "source", "anchor_a", "anchor_b", "displacement"):
                 outputs["frame." + name] = getattr(frame, name)
             for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
@@ -1003,7 +1003,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     step()
                 self.assertEqual(solver._friction_anchors_enabled, enabled)
                 if enabled:
-                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+                    self.assertAlmostEqual(solver._friction_anchor_beta, 0.2)
                     self.assertEqual(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 2)
                 else:
                     self.assertFalse(hasattr(solver._friction_patches, "current"))
@@ -1065,9 +1065,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
         solver.step(s1, s0, model.control(), contacts, dt, observables=observables)
         self.assertGreater(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 0)
-        count = int(solver.mf_constraint_count.numpy()[0])
-        self.assertTrue(np.all(solver.contact_path.numpy()[:4] == 1))
-        solved = np.einsum("ij,i->j", solver.mf_J_a.numpy()[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
+        count = int(solver._mf_constraint_count.numpy()[0])
+        self.assertTrue(np.all(solver._contact_path.numpy()[:4] == 1))
+        solved = np.einsum("ij,i->j", solver._mf_J_a.numpy()[0, :count], solver._mf_impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
         reported = observables.contact_f.numpy().sum(axis=0)
         np.testing.assert_allclose(reported[:3], solved[:3], atol=1.0e-4)
@@ -1134,7 +1134,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_shape1.assign(grounds[::-1].copy())
         contacts.rigid_contact_point0.assign([[0, 0, 0.002]] * 2)
         solver.step(s1, s0, model.control(), contacts, 0.005)
-        self.assertTrue((solver.contact_slot.numpy()[:2] == -1).all())
+        self.assertTrue((solver._contact_slot.numpy()[:2] == -1).all())
         bodies = patches.current.body_a.numpy()[:2]
         worlds = model.body_world.numpy()[bodies]
         np.testing.assert_array_equal(patches.previous_world.numpy()[:2], worlds)
@@ -1153,7 +1153,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
                 self.assertFalse(solver._friction_anchors_enabled)
-                self.assertEqual(solver.friction_anchor_beta, 0.0)
+                self.assertEqual(solver._friction_anchor_beta, 0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
     def test_matrix_free_ignores_dense_pgs_kernel_for_friction(self):
@@ -1169,12 +1169,12 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     with kernel_overrides({"pgs_kernel": kernel}):
                         solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
                     self.assertTrue(solver._friction_anchors_enabled)
-                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+                    self.assertAlmostEqual(solver._friction_anchor_beta, 0.2)
                     with kernel_overrides({"pgs_kernel": kernel}):
                         solver = newton.solvers.SolverFeatherPGS(
                             model, solve_mode="matrix_free", friction_anchor_beta=0.3
                         )
-                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
+                    self.assertAlmostEqual(solver._friction_anchor_beta, 0.3)
                 self.assertIsNone(solver._pgs_solve_streaming_kernel)
                 self.assertIsNone(solver._pgs_solve_tiled_contact_kernel)
 
@@ -1196,7 +1196,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         # CPU resolves every native kernel selector to the scalar loop, so only CUDA rejects them.
         with kernel_overrides({"pgs_kernel": "tiled_contact"}):
             solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2)
-        self.assertEqual(solver.pgs_kernel, "loop")
+        self.assertEqual(solver._pgs_kernel, "loop")
         if wp.is_cuda_available():
             cuda_model = builder.finalize(device="cuda:0")
             for kernel in ("tiled_contact", "streaming"):
@@ -1222,7 +1222,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
                 contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
                 solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
-                rows = solver.mf_row_type.numpy()[0, : solver.mf_constraint_count.numpy()[0]]
+                rows = solver._mf_row_type.numpy()[0, : solver._mf_constraint_count.numpy()[0]]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver._friction_patches.view.weight.numpy()[:3], [0, 1, 0])
 
@@ -1349,8 +1349,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             solver.step(state, model.state(), model.control(), contacts, 0.005)
             rows = np.concatenate(
                 [
-                    solver.row_type.numpy()[0, : solver.constraint_count.numpy()[0]],
-                    solver.mf_row_type.numpy()[0, : solver.mf_constraint_count.numpy()[0]],
+                    solver._row_type.numpy()[0, : solver._constraint_count.numpy()[0]],
+                    solver._mf_row_type.numpy()[0, : solver._mf_constraint_count.numpy()[0]],
                 ]
             )
             normals = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_CONTACT))
@@ -1382,11 +1382,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             for _ in range(40):
                 step()
             self.assertGreater(int((patches.current.source.numpy() >= 0).sum()), 0)
-            solver.contact_friction_gap_threshold = -1.0
+            solver._contact_friction_gap_threshold = -1.0
             step()
             self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
             self.assertGreater(int(patches.previous.valid.numpy().sum()), 0)
-            solver.contact_friction_gap_threshold = 0.001
+            solver._contact_friction_gap_threshold = 0.001
             step()
             weights = patches.view.weight.numpy()
             sources = patches.current.source.numpy()

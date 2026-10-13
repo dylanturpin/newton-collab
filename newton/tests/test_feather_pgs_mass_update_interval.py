@@ -182,14 +182,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         cache = solver._fk_id_cache
 
         active_cache_pairs = (
-            (state_aug.body_q_com, cache.body_q_com),
-            (state_aug.joint_S_s, cache.joint_S_s),
-            (state_aug.body_I_s, cache.body_I_s),
+            (state_aug._body_q_com, cache.body_q_com),
+            (state_aug._joint_S_s, cache.joint_S_s),
+            (state_aug._body_I_s, cache.body_I_s),
             (solver._body_inertia_terms, cache.body_inertia_terms),
-            (state_aug.body_v_s, cache.body_v_s),
-            (state_aug.body_f_s, cache.body_f_s),
-            (state_aug.body_a_s, cache.body_a_s),
-            (solver.articulation_origin, cache.articulation_origin),
+            (state_aug._body_v_s, cache.body_v_s),
+            (state_aug._body_f_s, cache.body_f_s),
+            (state_aug._body_a_s, cache.body_a_s),
+            (solver._articulation_origin, cache.articulation_origin),
         )
         for active, cached in active_cache_pairs:
             self.assertNotEqual(active.ptr, cached.ptr)
@@ -431,7 +431,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
             self.assertEqual(
-                solver.mass_update_mask.numpy().tolist(),
+                solver._mass_update_mask.numpy().tolist(),
                 expected,
                 f"unexpected mass_update_mask after step {step_index}",
             )
@@ -453,7 +453,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
 
-        self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
+        self.assertEqual(solver._mass_update_mask.numpy().tolist(), [1, 1])
         self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0] * model.articulation_count)
 
     def test_teardown_waits_once_for_each_owned_stream(self):

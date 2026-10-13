@@ -24,7 +24,7 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         builder.add_shape_sphere(body, radius=0.05)
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion_radius=0.0)
-        self.assertEqual(solver.friction_anchor_beta, 0.2)
+        self.assertEqual(solver._friction_anchor_beta, 0.2)
         self.assertTrue(solver._friction_anchors_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
@@ -38,7 +38,7 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         reference, explicit, *_ = fixture(0.01, friction_anchor_beta=0.2, **options)
         self.assertTrue(solver._friction_anchors_enabled)
         self.assertTrue(explicit._friction_anchors_enabled)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+        self.assertAlmostEqual(solver._friction_anchor_beta, 0.2)
         self.assertGreater(solver._torsion_stats["rows"], 0)
         for name in reference:
             np.testing.assert_array_equal(actual[name], reference[name], err_msg=name)

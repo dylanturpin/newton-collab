@@ -54,7 +54,7 @@ def configure_contact_torsion(solver, radius, indices, patterns):
     radius = float(radius)
     if not np.isfinite(radius) or radius < 0:
         raise ValueError("contact_torsion_radius must be finite and non-negative [m]")
-    if radius > 0 and solver.contact_compliance:
+    if radius > 0 and solver._contact_compliance:
         raise ValueError("contact_torsion_radius > 0 is not validated with contact_compliance")
     if indices is not None and patterns is not None:
         raise ValueError("Use either contact_torsion_shape_indices or contact_torsion_shape_patterns")
@@ -105,18 +105,18 @@ def _validate_torsion_mode(solver):
     if (
         not solver.model.device.is_cuda
         or solver.model.requires_grad
-        or solver.solve_mode != "matrix_free"
-        or solver.articulated_contact_response != "immediate"
-        or solver.friction_mode != "fixed_normal"
-        or solver.row_schedule != "interleaved"
-        or solver.contact_warmstart
-        or solver.contact_compliance
+        or solver._solve_mode != "matrix_free"
+        or solver._articulated_contact_response != "immediate"
+        or solver._friction_mode != "fixed_normal"
+        or solver._row_schedule != "interleaved"
+        or solver._contact_warmstart
+        or solver._contact_compliance
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
             "interleaved, without warmstart or compliance"
         )
-    if solver.velocity_iterations > 0 and solver.enable_bilateral_preelimination:
+    if solver._velocity_iterations > 0 and solver._enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
@@ -172,10 +172,10 @@ def _contact_groups(solver, state, contacts):
     stiffness = contacts.rigid_contact_stiffness
     if stiffness is not None and np.any(stiffness.numpy()[:count] > 0):
         raise ValueError("Contact torsion does not support hydroelastic contacts")
-    paths = solver.contact_path.numpy()[:count]
-    slots = solver.contact_slot.numpy()[:count]
-    worlds = solver.contact_world.numpy()[:count]
-    slots_needed = solver.contact_slots_needed.numpy()[:count]
+    paths = solver._contact_path.numpy()[:count]
+    slots = solver._contact_slot.numpy()[:count]
+    worlds = solver._contact_world.numpy()[:count]
+    slots_needed = solver._contact_slots_needed.numpy()[:count]
     shape_a = contacts.rigid_contact_shape0.numpy()[:count]
     shape_b = contacts.rigid_contact_shape1.numpy()[:count]
     normals = -contacts.rigid_contact_normal.numpy()[:count]
@@ -186,9 +186,9 @@ def _contact_groups(solver, state, contacts):
     shape_body = solver.model.shape_body.numpy()
     shape_types = solver.model.shape_type.numpy()
     poses = state.body_q.numpy()
-    row_types = solver.row_type.numpy()
-    parents = solver.row_parent.numpy()
-    row_counts = solver.constraint_count.numpy()
+    row_types = solver._row_type.numpy()
+    parents = solver._row_parent.numpy()
+    row_counts = solver._constraint_count.numpy()
     patches = bool(solver._friction_anchors_enabled)
     owners = solver._friction_patches.current.owner.numpy()[:count] if patches else None
     groups = {}
@@ -358,21 +358,21 @@ def prepare_torsion_velocity_pass(solver, dt):
     """
     wp.launch(
         _prepare_velocity_torsion_rows,
-        dim=solver.world_count * solver.articulation_constraint_max,
+        dim=solver._world_count * solver._articulation_constraint_max,
         inputs=[
-            solver.constraint_count,
-            solver.articulation_constraint_max,
-            solver.row_type,
+            solver._constraint_count,
+            solver._articulation_constraint_max,
+            solver._row_type,
             solver._contact_torsion_group,
-            solver.phi,
-            solver.target_velocity,
-            solver.v_out_snap,
-            solver.world_dof_count,
-            solver.world_dof_indices,
-            solver.J_world,
+            solver._phi,
+            solver._target_velocity,
+            solver._v_out_snap,
+            solver._world_dof_count,
+            solver._world_dof_indices,
+            solver._J_world,
             dt,
         ],
-        outputs=[solver.rhs_unbiased],
+        outputs=[solver._rhs_unbiased],
         device=solver.model.device,
     )
 
@@ -393,10 +393,10 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     groups = _contact_groups(solver, state, contacts)
     if not groups:
         return
-    count = solver.constraint_count.numpy()
+    count = solver._constraint_count.numpy()
     membership = np.full(solver._contact_torsion_group.shape, -1, dtype=np.int32)
     fields = {
-        key: getattr(solver, key).numpy()
+        key: getattr(solver, f"_{key}").numpy()
         for key in (
             "row_type",
             "row_parent",
@@ -408,17 +408,17 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             "row_restitution",
         )
     }
-    jacobians = {size: array.numpy() for size, array in solver.J_by_size.items()}
-    body_joint = solver.body_to_joint.numpy()
-    body_art = solver.body_to_articulation.numpy()
+    jacobians = {size: array.numpy() for size, array in solver._J_by_size.items()}
+    body_joint = solver._body_to_joint.numpy()
+    body_art = solver._body_to_articulation.numpy()
     ancestor = solver.model.joint_ancestor.numpy()
     qd_start = solver.model.joint_qd_start.numpy()
-    art_start = solver.articulation_dof_start.numpy()
-    art_size = solver.articulation_response_dof_count.numpy()
-    art_group = solver.art_group_idx.numpy()
-    motions = augmented_state.joint_S_s.numpy()
+    art_start = solver._articulation_dof_start.numpy()
+    art_size = solver._articulation_response_dof_count.numpy()
+    art_group = solver._art_group_idx.numpy()
+    motions = augmented_state._joint_S_s.numpy()
     prescribed = solver._prescribed_articulation.numpy()
-    body_velocities = augmented_state.body_v_s.numpy()
+    body_velocities = augmented_state._body_v_s.numpy()
     for group in groups:
         world = group[0].world
         budget = _group_budget(solver, group, fields["row_mu"])
@@ -427,7 +427,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         coefficient, anchors, touching = budget
         lead = touching[0]
         row = int(count[world])
-        if row >= solver.articulation_constraint_max:
+        if row >= solver._articulation_constraint_max:
             raise RuntimeError("Experimental torsion row capacity exceeded; refusing dropped work")
         count[world] += 1
         for field in fields.values():
@@ -437,7 +437,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         # The sweep reads the group's coefficient from its own row; anchor tangent
         # rows carry it divided by the anchor count under persistent patches.
         fields["row_mu"][world, row] = coefficient
-        fields["row_cfm"][world, row] = solver.cfm
+        fields["row_cfm"][world, row] = solver._cfm
         for witness in group:
             membership[world, witness.slot] = row
         normal = lead.normal
@@ -474,11 +474,11 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     if not solver._torsion_stats["rows"]:
         return
     for name, values in fields.items():
-        getattr(solver, name).assign(values)
+        getattr(solver, f"_{name}").assign(values)
     for size, values in jacobians.items():
-        solver.J_by_size[size].assign(values)
-    solver.constraint_count.assign(count)
-    solver.slot_counter.assign(count)
+        solver._J_by_size[size].assign(values)
+    solver._constraint_count.assign(count)
+    solver._slot_counter.assign(count)
     solver._contact_torsion_group.assign(membership)
 
 

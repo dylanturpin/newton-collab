@@ -198,8 +198,8 @@ class TestFeatherPGSMimic(unittest.TestCase):
     def test_mimic_row_is_assembled(self):
         """Verify the solver assembles a MIMIC constraint row that carries the coupling."""
         solver, _ = _run_chain(coef0=0.0, coef1=1.0, leader_target=0.5, steps=10)
-        row_types = solver.row_type.numpy()
-        counts = solver.constraint_count.numpy()
+        row_types = solver._row_type.numpy()
+        counts = solver._constraint_count.numpy()
         rows = [int(t) for w in range(row_types.shape[0]) for t in row_types[w, : counts[w]]]
         self.assertIn(PGS_CONSTRAINT_TYPE_MIMIC, rows)
 
@@ -271,7 +271,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         )
         self.assertEqual(solver._mimic_count, 2 * mimic_count)
         self.assertGreaterEqual(solver._dense_internal_max_rows, mimic_count)
-        self.assertGreaterEqual(solver.articulation_constraint_max, mimic_count)
+        self.assertGreaterEqual(solver._articulation_constraint_max, mimic_count)
 
 
 if __name__ == "__main__":

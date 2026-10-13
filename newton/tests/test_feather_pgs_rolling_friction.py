@@ -127,12 +127,12 @@ def responsive_ball(*, radius, mu, mu_torsional, mu_rolling, velocity, cone, dt,
 def solved_block(scene):
     """Return the normal impulse, friction impulses, coefficients, and the friction block's Delassus and free velocity."""
     solver = scene.solver
-    rows = int(solver.constraint_count.numpy()[0])
-    impulse = solver.impulses.numpy()[0, :rows].astype(float)
-    jacobian = solver.J_world.numpy()[0, :rows].astype(float)
-    response = solver.Y_world.numpy()[0, :rows].astype(float)
-    mu = solver.row_mu.numpy()[0, :rows].astype(float)
-    free_velocity = solver.v_out.numpy().astype(float) - response.T @ impulse
+    rows = int(solver._constraint_count.numpy()[0])
+    impulse = solver._impulses.numpy()[0, :rows].astype(float)
+    jacobian = solver._J_world.numpy()[0, :rows].astype(float)
+    response = solver._Y_world.numpy()[0, :rows].astype(float)
+    mu = solver._row_mu.numpy()[0, :rows].astype(float)
+    free_velocity = solver._v_out.numpy().astype(float) - response.T @ impulse
     delassus = jacobian @ response.T
     # Velocity of the friction rows with the normal impulse applied and friction removed.
     velocity = delassus[1:, :1] @ impulse[:1] + (jacobian @ free_velocity)[1:]
@@ -644,17 +644,17 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 newton.eval_fk(scene.model, scene.state.joint_q, scene.state.joint_qd, scene.state)
                 scene.step()
                 solver = scene.solver
-                rows = int(solver.constraint_count.numpy()[0])
-                impulse = solver.impulses.numpy()[0, :rows].astype(float)
-                jacobian = solver.J_world.numpy()[0, :rows].astype(float)
-                response = solver.Y_world.numpy()[0, :rows].astype(float)
-                free_velocity = solver.v_out.numpy().astype(float) - response.T @ impulse
+                rows = int(solver._constraint_count.numpy()[0])
+                impulse = solver._impulses.numpy()[0, :rows].astype(float)
+                jacobian = solver._J_world.numpy()[0, :rows].astype(float)
+                response = solver._Y_world.numpy()[0, :rows].astype(float)
+                free_velocity = solver._v_out.numpy().astype(float) - response.T @ impulse
                 delassus = jacobian @ response.T
 
                 def objective(candidate, delassus=delassus, velocity=jacobian @ free_velocity):
                     return 0.5 * candidate @ delassus @ candidate + velocity @ candidate
 
-                mu = solver.row_mu.numpy()[0, :rows].astype(float)
+                mu = solver._row_mu.numpy()[0, :rows].astype(float)
                 velocity = delassus[1:, :1] @ impulse[:1] + (jacobian @ free_velocity)[1:]
                 friction = cone_minimum(delassus[1:, 1:], velocity, mu[1:], impulse[0], cone, [[0, 1], [2], [3, 4]])
                 best = np.concatenate([impulse[:1], friction])
@@ -675,7 +675,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                     scene.state.joint_qd.assign(np.array([1.0, vertical, 0.0, 0.0], np.float32))
                     newton.eval_fk(scene.model, scene.state.joint_q, scene.state.joint_qd, scene.state)
                     scene.step()
-                    self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 6)
+                    self.assertEqual(int(scene.solver._constraint_count.numpy()[0]), 6)
                     load, impulse, mu, _, _ = solved_block(scene)
                     if vertical > 0.0:
                         self.assertEqual(load, 0.0)
@@ -833,7 +833,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         observables = scene.solver.observables({SolverObservableFlags.CONTACT_F})
         scene.step(observables)
         # The sliding pair carries the angular row type, so the readers must accept it.
-        row_type = scene.solver.row_type.numpy()[0, 1:6]
+        row_type = scene.solver._row_type.numpy()[0, 1:6]
         np.testing.assert_array_equal(row_type, PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
         count = int(scene.contacts.rigid_contact_count.numpy()[0])
         self.assertEqual(count, 1)
@@ -902,10 +902,10 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
     def test_zero_coefficients_allocate_no_rows(self):
         scene = ball(mu_torsional=0.0, mu_rolling=0.0)
         scene.step()
-        self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 3)
+        self.assertEqual(int(scene.solver._constraint_count.numpy()[0]), 3)
         scene = ball()
         scene.step()
-        self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 6)
+        self.assertEqual(int(scene.solver._constraint_count.numpy()[0]), 6)
 
     def test_runtime_coefficient_edits_and_array_replacement(self):
         scene = ball(mu_rolling=0.0)
@@ -953,7 +953,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
     def test_row_capacity_overflow_is_reported(self):
         scene = ball(articulation_constraint_max=5, warn_constraint_overflow=False)
         scene.step()
-        self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 0)
+        self.assertEqual(int(scene.solver._constraint_count.numpy()[0]), 0)
         self.assertTrue(bool(scene.solver.constraint_overflow.numpy()[0]))
 
     def test_unsupported_routes_are_rejected(self):

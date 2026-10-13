@@ -95,8 +95,8 @@ def _make_layout_run(device, *, enable_joint_velocity_limits=True, solve_mode="m
 def test_combined_row_families_follow_the_documented_layout(test, device):
     """Lay out dense rows as limits, velocity limits, contacts; free-body rows as contacts, velocity limits."""
     solver = _make_layout_run(device)
-    dense_count = int(solver.constraint_count.numpy()[0])
-    dense_types = solver.row_type.numpy()[0, :dense_count]
+    dense_count = int(solver._constraint_count.numpy()[0])
+    dense_types = solver._row_type.numpy()[0, :dense_count]
     limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     contact_rows = np.flatnonzero(
@@ -108,9 +108,9 @@ def test_combined_row_families_follow_the_documented_layout(test, device):
     test.assertLess(limit_rows.max(), velocity_limit_rows.min())
     test.assertLess(velocity_limit_rows.max(), contact_rows.min())
 
-    mf_count = int(solver.mf_constraint_count.numpy()[0])
-    mf_types = solver.mf_row_type.numpy()[0, :mf_count]
-    mf_contact_end = int(solver.mf_contact_rows_end.numpy()[0])
+    mf_count = int(solver._mf_constraint_count.numpy()[0])
+    mf_types = solver._mf_row_type.numpy()[0, :mf_count]
+    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
     mf_contacts = np.flatnonzero((mf_types == PGS_CONSTRAINT_TYPE_CONTACT) | (mf_types == PGS_CONSTRAINT_TYPE_FRICTION))
     mf_velocity_limits = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     test.assertGreater(mf_contacts.size, 0)
@@ -122,8 +122,8 @@ def test_combined_row_families_follow_the_documented_layout(test, device):
 def test_velocity_limit_rows_require_the_option(test, device):
     """Build no joint velocity-limit rows unless velocity limits are enabled."""
     solver = _make_layout_run(device, enable_joint_velocity_limits=False)
-    dense_count = int(solver.constraint_count.numpy()[0])
-    dense_types = solver.row_type.numpy()[0, :dense_count]
+    dense_count = int(solver._constraint_count.numpy()[0])
+    dense_types = solver._row_type.numpy()[0, :dense_count]
     test.assertEqual(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 0)
     test.assertGreater(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 0)
 
@@ -184,9 +184,9 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     # The 34 rows of the +/-1e10 defaults would exceed the default capacity of 32 if limits were enabled.
     test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
     for solver in solvers:
-        test.assertFalse(solver.enable_joint_limits)
+        test.assertFalse(solver._enable_joint_limits)
         solver.step(model.state(), model.state(), model.control(), None, 0.01)
-        test.assertEqual(int(solver.constraint_count.numpy()[0]), 0)
+        test.assertEqual(int(solver._constraint_count.numpy()[0]), 0)
         test.assertFalse(bool(solver.constraint_overflow.numpy()[0]))
 
     # A joint outside its limit gets no row either, whatever the activation gap.
@@ -199,7 +199,7 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     solver = SolverFeatherPGS(model, joint_limit_activation_gap=0.5, **mode_kwargs)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, 0.01)
-    test.assertEqual(int(solver.constraint_count.numpy()[0]), 0)
+    test.assertEqual(int(solver._constraint_count.numpy()[0]), 0)
     test.assertAlmostEqual(float(state_1.joint_q.numpy()[0]), 0.2, places=6)
 
 
@@ -212,15 +212,15 @@ def _run_layout_trajectory(device, response, iterations):
     for _ in range(4):
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-        dense_count = int(solver.constraint_count.numpy()[0])
-        mf_count = int(solver.mf_constraint_count.numpy()[0])
+        dense_count = int(solver._constraint_count.numpy()[0])
+        mf_count = int(solver._mf_constraint_count.numpy()[0])
         samples.append(
             {
                 "dense_count": dense_count,
-                "row_type": solver.row_type.numpy()[0, :dense_count].copy(),
-                "impulses": solver.impulses.numpy()[0, :dense_count].copy(),
-                "mf_row_type": solver.mf_row_type.numpy()[0, :mf_count].copy(),
-                "propagation_count": int(solver.propagation_constraint_count.numpy()[0]),
+                "row_type": solver._row_type.numpy()[0, :dense_count].copy(),
+                "impulses": solver._impulses.numpy()[0, :dense_count].copy(),
+                "mf_row_type": solver._mf_row_type.numpy()[0, :mf_count].copy(),
+                "propagation_count": int(solver._propagation_constraint_count.numpy()[0]),
                 "joint_q": state_1.joint_q.numpy().copy(),
                 "joint_qd": state_1.joint_qd.numpy().copy(),
             }

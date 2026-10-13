@@ -124,7 +124,7 @@ def _drop(
         n = int(contacts.rigid_contact_count.numpy()[0])
         counts.append(n)
         if n:
-            routes.update(int(v) for v in solver.contact_path.numpy()[:n] if v >= 0)
+            routes.update(int(v) for v in solver._contact_path.numpy()[:n] if v >= 0)
     return np.asarray(heights), np.asarray(velocities), np.asarray(counts), routes
 
 
@@ -187,19 +187,19 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     _, _, state_1 = step(velocity_iterations)
     before = float(state_0.body_qd.numpy()[body][2])
     n = int(contacts.rigid_contact_count.numpy()[0])
-    rows = int(position.mf_constraint_count.numpy()[0])
-    phi = position.mf_phi.numpy()[0][:rows]
-    lam = position.mf_impulses.numpy()[0][:rows]
-    row_type = position.mf_row_type.numpy()[0][:rows]
+    rows = int(position._mf_constraint_count.numpy()[0])
+    phi = position._mf_phi.numpy()[0][:rows]
+    lam = position._mf_impulses.numpy()[0][:rows]
+    row_type = position._mf_row_type.numpy()[0][:rows]
     contact_rows = np.flatnonzero((row_type == 0) & (phi > 0.0))
     position_impulse = float(lam[contact_rows].max()) if contact_rows.size else 0.0
     max_phi = float(phi[contact_rows].max()) if contact_rows.size else 0.0
-    v_position = position.v_out.numpy()
-    J_a = position.mf_J_a.numpy()[0]
-    J_b = position.mf_J_b.numpy()[0]
-    dof_a = position.mf_dof_a.numpy()[0]
-    dof_b = position.mf_dof_b.numpy()[0]
-    world_dofs = position.world_dof_indices.numpy()[0]
+    v_position = position._v_out.numpy()
+    J_a = position._mf_J_a.numpy()[0]
+    J_b = position._mf_J_b.numpy()[0]
+    dof_a = position._mf_dof_a.numpy()[0]
+    dof_b = position._mf_dof_b.numpy()[0]
+    world_dofs = position._world_dof_indices.numpy()[0]
     end_gaps = []
     for row in contact_rows:
         jv = 0.0

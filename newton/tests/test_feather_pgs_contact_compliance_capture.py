@@ -60,7 +60,7 @@ def _run_free_spheres(*, dense_rows, graph, steps=20):
         trace = []
         two_steps()
         trace.append(states[0].body_q.numpy().copy())
-        slots = solver.contact_slot.numpy()[: int(contacts.rigid_contact_count.numpy()[0])].copy()
+        slots = solver._contact_slot.numpy()[: int(contacts.rigid_contact_count.numpy()[0])].copy()
         captured = None
         if graph:
             with wp.ScopedCapture() as capture:

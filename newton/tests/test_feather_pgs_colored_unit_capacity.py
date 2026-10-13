@@ -81,10 +81,10 @@ def _unit_impulses(model: newton.Model, solver: SolverFeatherPGS, contacts: newt
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
     shape1 = contacts.rigid_contact_shape1.numpy()[:count]
     shape_body = model.shape_body.numpy()
-    slots = solver.contact_slot.numpy()[:count]
-    lengths = solver.contact_slots_needed.numpy()[:count]
-    paths = solver.contact_path.numpy()[:count]
-    rows = solver.propagation_impulses.numpy()[0]
+    slots = solver._contact_slot.numpy()[:count]
+    lengths = solver._contact_slots_needed.numpy()[:count]
+    paths = solver._contact_path.numpy()[:count]
+    rows = solver._propagation_impulses.numpy()[0]
     result = {}
     for contact in range(count):
         if int(paths[contact]) != 2:
@@ -102,14 +102,14 @@ def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, co
     """Keep all four mixed-length units in the first color and preserve their rows."""
     count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertEqual(count, CONTACT_COUNT)
-    paths = solver.contact_path.numpy()[:count]
+    paths = solver._contact_path.numpy()[:count]
     np.testing.assert_array_equal(paths, np.full(CONTACT_COUNT, 2, dtype=np.int32))
-    lengths = solver.contact_slots_needed.numpy()[:count]
+    lengths = solver._contact_slots_needed.numpy()[:count]
     test.assertEqual(sorted(lengths.tolist()), [1, 1, 1, 3])
-    test.assertEqual(int(solver.propagation_constraint_count.numpy()[0]), ROW_CAPACITY)
-    test.assertEqual(int(solver.color_world_unit_cursor.numpy()[0]), CONTACT_COUNT)
+    test.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), ROW_CAPACITY)
+    test.assertEqual(int(solver._color_world_unit_cursor.numpy()[0]), CONTACT_COUNT)
 
-    offsets = solver.color_world_offsets.numpy().reshape(solver.world_count, -1)[0]
+    offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, -1)[0]
     bucket_counts = np.diff(offsets)
     test.assertEqual(int(offsets[-1]), CONTACT_COUNT)
     # Coloring now stages up to the row capacity, rather than row_capacity // 3.
@@ -119,7 +119,7 @@ def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, co
     np.testing.assert_array_equal(bucket_counts[1:-1], np.zeros_like(bucket_counts[1:-1]))
     test.assertEqual(int(bucket_counts[-1]), 0)
 
-    ordered = solver.color_unit_sorted.numpy()[:CONTACT_COUNT]
+    ordered = solver._color_unit_sorted.numpy()[:CONTACT_COUNT]
     test.assertEqual(sorted(ordered.tolist()), list(range(CONTACT_COUNT)))
 
 
@@ -157,8 +157,8 @@ class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
             for body, expected in serial_impulses.items():
                 np.testing.assert_allclose(colored_impulses[body], expected, rtol=2.0e-5, atol=2.0e-6)
             np.testing.assert_allclose(
-                colored.propagation_body_qd.numpy(),
-                serial.propagation_body_qd.numpy(),
+                colored._propagation_body_qd.numpy(),
+                serial._propagation_body_qd.numpy(),
                 rtol=2.0e-5,
                 atol=2.0e-6,
             )
@@ -213,8 +213,8 @@ class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
         np.testing.assert_allclose(graph_state.joint_q.numpy(), eager_state.joint_q.numpy(), rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(graph_state.joint_qd.numpy(), eager_state.joint_qd.numpy(), rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(
-            graph_solver.propagation_body_qd.numpy(),
-            eager_solver.propagation_body_qd.numpy(),
+            graph_solver._propagation_body_qd.numpy(),
+            eager_solver._propagation_body_qd.numpy(),
             rtol=0.0,
             atol=1.0e-6,
         )

@@ -76,7 +76,7 @@ def test_fused_assembly_follows_the_mass_update_interval(test, device):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
         model.body_mass.assign(body_mass)
         model.body_inv_mass.assign(1.0 / body_mass)
-        results.append((q, solver.L_by_size[solver.size_groups[0]].numpy()))
+        results.append((q, solver._L_by_size[solver._size_groups[0]].numpy()))
     np.testing.assert_allclose(results[0][0], results[1][0], rtol=0.0, atol=2.0e-5)
     np.testing.assert_allclose(results[0][1], results[1][1], rtol=0.0, atol=2.0e-5)
 

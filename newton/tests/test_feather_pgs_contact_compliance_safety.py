@@ -64,16 +64,16 @@ class TestContactComplianceSafety(unittest.TestCase):
         """Reject positive persistent-anchor bias but permit a disabled dummy patch buffer."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=self.device),
-            friction_anchor_beta=0.0,
+            _friction_anchor_beta=0.0,
             _friction_patches=object(),
             _contact_torsion_enabled=False,
             _sparse_mass_matrix_size=None,
         )
         start_step(solver, self.contacts(), 0.005)
-        solver.friction_anchor_beta = 0.2
+        solver._friction_anchor_beta = 0.2
         with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
             start_step(solver, self.contacts(), 0.005)
-        solver.contact_compliance = True
+        solver._contact_compliance = True
         with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
             SolverFeatherPGS.step(solver, None, None, None, None, 0.005)
 
@@ -122,11 +122,11 @@ class TestContactComplianceSafety(unittest.TestCase):
         fixture.pipeline.collide(state, contacts)
         contacts.rigid_contact_stiffness.fill_(3000.0)
         solver.step(state, output, model.control(), contacts, 0.005)
-        solver.constraint_count.fill_(solver.articulation_constraint_max + 1)
+        solver._constraint_count.fill_(solver._articulation_constraint_max + 1)
         with self.assertRaisesRegex(RuntimeError, "overflowing solver rows"):
             prepare_rows(solver, contacts, 0.005)
-        solver.constraint_count.fill_(1)
-        solver.contact_slot.fill_(-1)
+        solver._constraint_count.fill_(1)
+        solver._contact_slot.fill_(-1)
         with self.assertRaisesRegex(RuntimeError, "dropped"):
             prepare_rows(solver, contacts, 0.005)
 
@@ -152,14 +152,14 @@ class TestContactComplianceSafety(unittest.TestCase):
                     count = solver.compliance_contact_count
                     self.assertEqual(count, 1)
                     path, slot, world = (
-                        int(a.numpy()[0]) for a in (solver.contact_path, solver.contact_slot, solver.contact_world)
+                        int(a.numpy()[0]) for a in (solver._contact_path, solver._contact_slot, solver._contact_world)
                     )
-                    phi = (solver.phi if path == 0 else solver.mf_phi).numpy()[world, slot]
+                    phi = (solver._phi if path == 0 else solver._mf_phi).numpy()[world, slot]
                     self.assertEqual(phi > 0.0, height > 0.05)
                     gamma, bias = normal_coefficients(3000.0, 200.0, float(phi), dt=0.005)
                     buffers = solver._compliance
                     stored_gamma = (buffers.dense_gamma if path == 0 else buffers.mf_gamma).numpy()[world, slot]
-                    stored_bias = (solver.rhs if path == 0 else solver.mf_rhs).numpy()[world, slot]
+                    stored_bias = (solver._rhs if path == 0 else solver._mf_rhs).numpy()[world, slot]
                     self.assertEqual(stored_gamma, np.float32(gamma))
                     self.assertEqual(stored_bias, np.float32(bias))
 
@@ -170,7 +170,7 @@ class TestContactComplianceSafety(unittest.TestCase):
                 fixture = self.stepped_fixture(articulated=articulated, height=0.05, world_count=2)
                 solver, contacts = fixture.solver, fixture.contacts
                 self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 2)
-                for name in ("contact_path", "contact_slot", "contact_world"):
+                for name in ("_contact_path", "_contact_slot", "_contact_world"):
                     values = getattr(solver, name).numpy()
                     values[1] = values[0]
                     getattr(solver, name).assign(values)
