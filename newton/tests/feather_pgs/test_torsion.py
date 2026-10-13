@@ -489,9 +489,9 @@ class TestContactTorsionRegressions(unittest.TestCase):
 
     def test_previous_friction_rows_are_not_current_rows(self):
         """Reject stale tangent metadata when a later step admits only a normal."""
-        _, solver, model, initial, contacts = fixture(0.01, center_only=True)
+        _, solver, model, initial, contacts = fixture(0.01, center_only=True, contact_friction_gap_max=1.0)
         self.assertEqual(solver._torsion_stats["rows"], 1)
-        solver._contact_friction_gap_max = -1.0
+        solver.contact_friction_gap_max = -1.0
         solver.step(initial, model.state(), model.control(), contacts, 0.0025)
         self.assertEqual(solver._torsion_stats["rows"], 0)
 
