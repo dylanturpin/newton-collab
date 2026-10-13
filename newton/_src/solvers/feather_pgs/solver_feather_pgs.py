@@ -1851,9 +1851,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 witness points. With patch friction, only normal rows use this midpoint; a warning
                 explains how to select point friction for the original all-row behavior. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
-                constraints. Each active limit side adds one constraint row. Supported with
-                ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
-                and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
+                constraints. Each active limit side adds one constraint row. Defaults to False.
             enable_bilateral_preelimination (bool, optional): Pre-eliminate the mimic and
                 connect rows of each articulation through a small Schur complement so every
                 other row (contacts especially) sees the closed-loop effective mass exactly:
@@ -2223,7 +2221,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
         if self._friction_anchors_enabled and effective_pgs_kernel in ("tiled_contact", "streaming"):
             raise ValueError(
-                "Patch friction requires pgs_kernel='tiled_row' or 'loop'; set friction_anchor_beta=0 for a point-contact kernel."
+                "Patch friction requires the 'tiled_row' or 'loop' PGS kernel; set friction_anchor_beta=0 for a point-contact kernel."
             )
         if self._friction_anchors_enabled and (contact_shared_anchor or contact_friction_shared_anchor):
             warnings.warn(
@@ -12616,7 +12614,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     match_index = getattr(contacts, "rigid_contact_match_index", None)
                     if match_index is None:
                         raise NotImplementedError(
-                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                            "FeatherPGS contact_warmstart=True requires the Contacts buffer to be "
                             "created with contact_matching enabled (rigid_contact_match_index "
                             "is None). Build the CollisionPipeline / Contacts with "
                             'contact_matching="latest" (or "sticky").'
