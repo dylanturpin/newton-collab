@@ -3924,17 +3924,8 @@ def populate_connect_J_for_size(
         body_c = connect_body_c[k]
         prescribed = connect_parent_prescribed[k] != 0
         p_a = connect_anchor_p[k]
-        v_a = wp.vec3(0.0, 0.0, 0.0)
         if body_p >= 0:
             p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
-            if prescribed:
-                # Prescribed parent: the anchor velocity comes from the body twist
-                # (v_com_world, omega_world) rather than from tree DOFs.
-                twist = body_qd[body_p]
-                v_com = wp.spatial_top(twist)
-                omega = wp.spatial_bottom(twist)
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = v_com + wp.cross(omega, p_a - x_com)
         p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
         origin = articulation_origin[art]
         delta = p_a - p_b
@@ -3946,6 +3937,16 @@ def populate_connect_J_for_size(
         p_m = p_a - 0.5 * delta
         rel_a = p_m - origin
         rel_b = rel_a
+        v_a = wp.vec3(0.0, 0.0, 0.0)
+        if prescribed and body_p >= 0:
+            # Prescribed parent: the row target is the parent's velocity at the shared
+            # anchor, from the body twist (v_com_world, omega_world) rather than tree DOFs,
+            # so target and child Jacobian refer to the same point.
+            twist = body_qd[body_p]
+            v_com = wp.spatial_top(twist)
+            omega = wp.spatial_bottom(twist)
+            x_com = wp.transform_point(body_q[body_p], body_com[body_p])
+            v_a = v_com + wp.cross(omega, p_m - x_com)
 
         for axis in range(3):
             slot = base_slot + axis
