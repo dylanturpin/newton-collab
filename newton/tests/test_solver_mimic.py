@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
 def _build_mimic_model(device, vectorized, *, kinematic_reference=False, small_mismatch=False):
@@ -98,6 +98,9 @@ def _test_solver_mimic(test, device, solver_name):
                         joint_mimic_kd=3.0,
                     )
                 generalized = False
+            elif solver_name == "feather_pgs":
+                solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
+                generalized = True
             elif solver_name == "vbd":
                 solver = newton.solvers.SolverVBD(
                     model,
@@ -108,8 +111,9 @@ def _test_solver_mimic(test, device, solver_name):
             else:
                 raise ValueError(f"Unknown solver {solver_name}")
 
-            step_count = 240 if solver_name == "semi_implicit" else 1
-            dt = 1.0 / 240.0 if solver_name == "semi_implicit" else 1.0 / 60.0
+            # Penalty and Baumgarte-stabilized mimics converge over many steps.
+            step_count = 240 if solver_name in ("semi_implicit", "feather_pgs") else 1
+            dt = 1.0 / 240.0 if solver_name in ("semi_implicit", "feather_pgs") else 1.0 / 60.0
             for _ in range(step_count):
                 solver.step(state_in, state_out, None, None, dt)
                 state_in, state_out = state_out, state_in
@@ -182,9 +186,68 @@ def test_semi_implicit_mimic_validates_gains(test, device):
                     newton.solvers.SolverSemiImplicit(model, **{name: value})
 
 
+def test_feather_pgs_mimic(test, device):
+    """Enforce scalar and vectorized mimic relationships in FeatherPGS."""
+    _test_solver_mimic(test, device, "feather_pgs")
+
+
 def test_vbd_mimic(test, device):
     """Enforce scalar and vectorized mimic relationships in VBD."""
     _test_solver_mimic(test, device, "vbd")
+
+
+def test_eval_mimic_selection(test, device):
+    """Select articulations without overwriting unselected output coordinates."""
+    builder = newton.ModelBuilder()
+    for _ in range(2):
+        reference_body, follower_body = builder.add_link(), builder.add_link()
+        reference = builder.add_joint_revolute(-1, reference_body)
+        follower = builder.add_joint_revolute(reference_body, follower_body)
+        builder.add_articulation([reference, follower])
+        builder.set_joint_mimic(follower, reference, coeffs=(0.5, -2.0))
+    model = builder.finalize(device=device)
+    state_in, state_out = model.state(), model.state()
+    q, qd = [1.0, 9.0, 2.0, 9.0], [3.0, 9.0, 4.0, 9.0]
+    mask = wp.array([False, True], dtype=bool, device=device)
+    indices = wp.array([-1, 1, 2], dtype=int, device=device)
+    cases = (
+        ({"mask": mask}, True),
+        ({"indices": indices}, True),
+        ({"mask": wp.zeros(2, dtype=bool, device=device)}, False),
+        ({"indices": wp.empty(0, dtype=int, device=device)}, False),
+    )
+    for selection, selected in cases:
+        for in_place in (False, True):
+            with test.subTest(selection=selection, in_place=in_place):
+                state_in.joint_q.assign(q)
+                state_in.joint_qd.assign(qd)
+                state_out.joint_q.fill_(-17.0)
+                state_out.joint_qd.fill_(-19.0)
+                result = state_in if in_place else state_out
+                expected_q, expected_qd = result.joint_q.numpy(), result.joint_qd.numpy()
+                if selected:
+                    expected_q[2:] = [2.0, -3.5]
+                    expected_qd[2:] = [4.0, -8.0]
+                newton.eval_mimic(model, state_in, None if in_place else state_out, **selection)
+                np.testing.assert_array_equal(result.joint_q.numpy(), expected_q)
+                np.testing.assert_array_equal(result.joint_qd.numpy(), expected_qd)
+                if not in_place:
+                    np.testing.assert_array_equal(state_in.joint_q.numpy(), q)
+                    np.testing.assert_array_equal(state_in.joint_qd.numpy(), qd)
+
+    with test.assertRaisesRegex(ValueError, "both mask and indices"):
+        newton.eval_mimic(model, state_in, mask=mask, indices=indices)
+
+    if device.is_cuda:
+        state_in.joint_q.assign(q)
+        state_in.joint_qd.assign(qd)
+        mask.zero_()
+        with wp.ScopedCapture(device=device) as capture:
+            newton.eval_mimic(model, state_in, mask=mask)
+        mask.assign([False, True])
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(state_in.joint_q.numpy(), [1.0, 9.0, 2.0, -3.5])
+        np.testing.assert_array_equal(state_in.joint_qd.numpy(), [3.0, 9.0, 4.0, -8.0])
 
 
 class TestSolverMimic(unittest.TestCase):
@@ -192,6 +255,7 @@ class TestSolverMimic(unittest.TestCase):
 
 
 devices = get_test_devices()
+add_function_test(TestSolverMimic, "test_eval_mimic_selection", test_eval_mimic_selection, devices=devices)
 add_function_test(TestSolverMimic, "test_featherstone_mimic", test_featherstone_mimic, devices=devices)
 add_function_test(TestSolverMimic, "test_semi_implicit_mimic", test_semi_implicit_mimic, devices=devices)
 add_function_test(
@@ -207,6 +271,9 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestSolverMimic, "test_vbd_mimic", test_vbd_mimic, devices=devices)
+# FeatherPGS mimic rows need the CUDA-only matrix-free solve; its split solve rejects them.
+for device in get_cuda_test_devices():
+    add_function_test(TestSolverMimic, "test_feather_pgs_mimic", test_feather_pgs_mimic, devices=[device])
 
 
 if __name__ == "__main__":
