@@ -683,6 +683,32 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             np.testing.assert_array_equal(output.joint_qd.numpy(), state.joint_qd.numpy())
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+    def test_cuda_cold_capture_reports_errors_until_reset(self):
+        """Capture the first step of a solver that never stepped, and report a replay's error until reset."""
+        _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, iterations=16, step=False)
+        self.assertEqual(solver._step, 0)
+        output = model.state()
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.step(state, output, model.control(), contacts, 0.0025)
+        wp.capture_launch(capture.graph)
+        solver.check_constraint_capacity()
+        count = int(solver._constraint_count.numpy()[0])
+        self.assertGreater(np.count_nonzero(solver._row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_TORSION), 0)
+        self.assertFalse(np.array_equal(output.joint_q.numpy(), state.joint_q.numpy()))
+
+        solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(output.joint_q.numpy(), state.joint_q.numpy())
+            np.testing.assert_array_equal(output.joint_qd.numpy(), state.joint_qd.numpy())
+            with self.assertRaisesRegex(RuntimeError, "load ring"):
+                solver.check_constraint_capacity()
+        solver.reset(state)
+        wp.capture_launch(capture.graph)
+        solver.check_constraint_capacity()
+        self.assertFalse(np.array_equal(output.joint_q.numpy(), state.joint_q.numpy()))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_full_solver_graph(self):
         """Match captured and eager solves through the default-off public device API."""
 
