@@ -422,12 +422,13 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
 def _solver(model, **overrides):
     options = {
         "solve_mode": "matrix_free",
-        "angular_damping": 0.0,
         "enable_joint_friction": True,
         "iterations": 16,
     }
     options.update(overrides)
-    return SolverFeatherPGS(model, **options)
+    solver = SolverFeatherPGS(model, **options)
+    solver._rigid_body_angular_damping.zero_()
+    return solver
 
 
 def _advance(solver, states, control, steps, dt=DT):

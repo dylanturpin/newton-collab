@@ -104,7 +104,6 @@ def fixture(
         "contact_friction_shared_anchor": True,
         "enable_joint_velocity_limits": True,
         "contact_warmstart": False,
-        "angular_damping": 0,
         "articulation_constraint_max": 64,
         "free_body_constraint_max": 16,
         "row_watermark": True,
@@ -115,6 +114,7 @@ def fixture(
     tuning = {key: kwargs.pop(key) for key in ("pgs_kernel",) if key in kwargs}
     with kernel_overrides(tuning):
         solver = SolverFeatherPGS(model, **kwargs)
+    solver._rigid_body_angular_damping.zero_()
     if row_limit is not None:
         solver._articulation_constraint_max = row_limit
     if not step:
@@ -161,11 +161,11 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         cfm=0,
         contact_regularization=0,
         contact_warmstart=False,
-        angular_damping=0,
         articulation_constraint_max=64,
         free_body_constraint_max=16,
         **PATCH_OPTIONS,
     )
+    solver._rigid_body_angular_damping.zero_()
     pipeline = newton.CollisionPipeline(
         model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
     )

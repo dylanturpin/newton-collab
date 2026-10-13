@@ -2782,7 +2782,7 @@ def integrate_generalized_joints(
     joint_qd: wp.array[float],
     joint_qdd: wp.array[float],
     dt: float,
-    angular_damping: float,
+    body_angular_damping: wp.array[float],
     joint_active: wp.array[int],
     # outputs
     joint_q_new: wp.array[float],
@@ -2821,7 +2821,7 @@ def integrate_generalized_joints(
         lin_axis_count,
         ang_axis_count,
         dt,
-        angular_damping,
+        body_angular_damping[child],
         parent,
         joint_q_new,
         joint_qd_new,

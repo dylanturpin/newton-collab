@@ -44,9 +44,8 @@ def _build_mixed_gap_model(device: str) -> newton.Model:
 
 def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
     """Build a serial or colored propagation solver with six contact rows."""
-    return SolverFeatherPGS(
+    solver = SolverFeatherPGS(
         model,
-        angular_damping=0.0,
         solve_mode="matrix_free",
         articulated_contact_response=response,
         iterations=8,
@@ -58,6 +57,8 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
         contact_speculative_scale=0.0,
         use_parallel_streams=False,
     )
+    solver._rigid_body_angular_damping.zero_()
+    return solver
 
 
 def _seed_state(model: newton.Model, state: newton.State) -> tuple[np.ndarray, np.ndarray]:

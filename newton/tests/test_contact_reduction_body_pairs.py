@@ -343,6 +343,12 @@ def _world_points0(model, state, contacts):
     return out
 
 
+def _undamped(solver):
+    """Turn off the default angular damping of the free roots."""
+    solver._rigid_body_angular_damping.zero_()
+    return solver
+
+
 class TestBodyPairReductionCounts(unittest.TestCase):
     """Registered contacts drop to patch-descriptive sets on multi-shape pairs."""
 
@@ -831,7 +837,8 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
         control = model.control()
         pipeline = _make_pipeline(model, reduce_on)
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        solver._rigid_body_angular_damping.zero_()
         for _ in range(240):
             pipeline.collide(state_0, contacts)
             state_0.clear_forces()
@@ -963,12 +970,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            angular_damping=0.0,
             articulation_constraint_max=4,
             enable_joint_limits=True,
             joint_limit_activation_gap=float("inf"),
             row_watermark=True,
         )
+        solver._rigid_body_angular_damping.zero_()
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
@@ -994,10 +1001,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            angular_damping=0.0,
             articulation_constraint_max=4,
             row_watermark=True,
         )
+        solver._rigid_body_angular_damping.zero_()
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
@@ -1024,9 +1031,9 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            angular_damping=0.0,
             articulation_constraint_max=4,
         )
+        solver._rigid_body_angular_damping.zero_()
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
         self.assertFalse(solver._row_watermark)
@@ -1057,12 +1064,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
-                    angular_damping=0.0,
                     solve_mode="matrix_free",
                     articulated_contact_response=response,
                     articulation_constraint_max=4,
                     free_body_constraint_max=4,
                 )
+                solver._rigid_body_angular_damping.zero_()
                 solver.step(state_0, state_1, model.control(), contacts, DT)
 
                 dropped_rows = getattr(solver, dropped_attribute)
@@ -1081,7 +1088,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         """
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
-            lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0),
+            lambda m: _undamped(newton.solvers.SolverFeatherPGS(m)),
         )
 
     def test_feather_pgs_nondeterministic_conformance(self):
@@ -1093,7 +1100,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         """
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
-            lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0),
+            lambda m: _undamped(newton.solvers.SolverFeatherPGS(m)),
             deterministic=False,
         )
 
@@ -1109,7 +1116,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             _free_jointed_foot(b, (0.0, 0.0, 0.0175))
             return _free_jointed_foot(b, (0.0, 0.005, 0.09))
 
-        self._compare(build, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=2e-3, w_tol=0.15)
+        self._compare(build, lambda m: _undamped(newton.solvers.SolverFeatherPGS(m)), tol=2e-3, w_tol=0.15)
 
     def test_feather_pgs_contact_mode_conformance(self):
         """Settle identically on/off in every FeatherPGS contact mode.
@@ -1155,12 +1162,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                         kwargs["iterations"] = iters
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
-                        angular_damping=0.0,
                         solve_mode=mode,
                         articulated_contact_response=response,
                         row_watermark=True,
                         **kwargs,
                     )
+                    solver._rigid_body_angular_damping.zero_()
                     if iters is None:
                         self.assertEqual(solver._iterations, 12)
                     if row_path == "propagation":
@@ -1210,12 +1217,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            angular_damping=0.0,
             solve_mode="matrix_free",
             articulated_contact_response="propagation",
             propagation_same_articulation_rows=True,
             row_watermark=True,
         )
+        solver._rigid_body_angular_damping.zero_()
         self.assertEqual(solver._iterations, 12)
         self.assertTrue(solver._propagation_contacts_enabled())
         solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
@@ -1349,9 +1356,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             "candidate and a shallow scan-direction slot winner",
         )
 
-        self._compare(
-            build_jointed, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=1e-3, w_tol=0.15
-        )
+        self._compare(build_jointed, lambda m: _undamped(newton.solvers.SolverFeatherPGS(m)), tol=1e-3, w_tol=0.15)
 
 
 class TestBodyPairReductionTableSizing(unittest.TestCase):
@@ -2520,7 +2525,8 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
             control = model.control()
             pipeline = _make_pipeline(model, reduce_on)
             contacts = pipeline.contacts()
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            solver = newton.solvers.SolverFeatherPGS(model)
+            solver._rigid_body_angular_damping.zero_()
             zs = []
             for _ in range(240):
                 pipeline.collide(state_0, contacts)
@@ -2986,7 +2992,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
         control = model.control()
         pipeline = _make_pipeline(model, True, body_pair_verify=True)
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        solver._rigid_body_angular_damping.zero_()
         for _ in range(240):
             pipeline.collide(state_0, contacts)
             state_0.clear_forces()
@@ -3091,7 +3098,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             # Seven colliders per body generate thousands of speculative rows.
             # Both consumers must retain them for this to test reduction stability.
             mf_capacity = 3 * max(c_red.rigid_contact_max, c_raw.rigid_contact_max)
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, free_body_constraint_max=mf_capacity)
+            solver = newton.solvers.SolverFeatherPGS(model, free_body_constraint_max=mf_capacity)
+            solver._rigid_body_angular_damping.zero_()
             raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
@@ -3113,9 +3121,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             raw_control = model.control()
             raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
             raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
-            raw_solver = newton.solvers.SolverFeatherPGS(
-                model, angular_damping=0.0, free_body_constraint_max=mf_capacity
-            )
+            raw_solver = newton.solvers.SolverFeatherPGS(model, free_body_constraint_max=mf_capacity)
+            raw_solver._rigid_body_angular_damping.zero_()
             peak_raw = 0.0
             for _ in range(150):
                 raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)

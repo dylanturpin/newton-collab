@@ -23,7 +23,6 @@ SOLVER_OPTIONS = {
     "articulated_contact_response": "immediate",
     "iterations": 16,
     "friction_anchor_beta": 0.0,
-    "angular_damping": 0.0,
     "articulation_constraint_max": 32,
     "free_body_constraint_max": 16,
     "double_buffer": False,
@@ -84,6 +83,7 @@ def ball(
     solver = SolverFeatherPGS(
         model, enable_torsional_rolling_friction=enable, torsional_rolling_friction_cone=cone, **options
     )
+    solver._rigid_body_angular_damping.zero_()
     return Scene(model, state, solver)
 
 
@@ -121,6 +121,7 @@ def responsive_ball(*, radius, mu, mu_torsional, mu_rolling, velocity, cone, dt,
     solver = SolverFeatherPGS(
         model, enable_torsional_rolling_friction=True, torsional_rolling_friction_cone=cone, **options
     )
+    solver._rigid_body_angular_damping.zero_()
     return Scene(model, state, solver, dt)
 
 

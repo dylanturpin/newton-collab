@@ -83,7 +83,8 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
                 for parallel in (False, True):
                     options = {"solve_mode": mode, "parallel_tree": parallel}
                     _advance(model, SolverFeatherPGS, options, steps=2)
-                    solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
+                    solver = SolverFeatherPGS(model, **options)
+                    solver._rigid_body_angular_damping.zero_()
                     self.assertEqual(solver._tree_plan is not None, parallel)
                     self.assertTrue(solver._fk_id_cache_enabled)
                     state, output = model.state(), model.state()
@@ -157,7 +158,8 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
         builder.add_usd(stage, schema_resolvers=[SchemaResolverNewton(), SchemaResolverPhysx()])
         self.assertEqual(builder.body_disable_gravity, [True, False, False])
         model = builder.finalize(device=wp.get_device())
-        solver = SolverFeatherPGS(model, angular_damping=0.0)
+        solver = SolverFeatherPGS(model)
+        solver._rigid_body_angular_damping.zero_()
         state, output = model.state(), model.state()
         control = model.control()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -261,7 +263,8 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
                     builder.replicate(_free_pair(), 4)
                     model = builder.finalize(device=device)
                     _advance(model, SolverFeatherPGS, {"solve_mode": mode}, steps=2)
-                    solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode=mode)
+                    solver = SolverFeatherPGS(model, solve_mode=mode)
+                    solver._rigid_body_angular_damping.zero_()
                     state, output = model.state(), model.state()
                     control = model.control()
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -343,7 +346,11 @@ def _solver_options():
 
 def _advance(model, solver_type, options, *, steps, forces=None):
     """Step an isolated model with an optional fixed COM wrench."""
-    solver = solver_type(model, angular_damping=0.0, **options)
+    if solver_type is SolverFeatherPGS:
+        solver = solver_type(model, **options)
+        solver._rigid_body_angular_damping.zero_()
+    else:
+        solver = solver_type(model, angular_damping=0.0, **options)
     if options.get("parallel_tree"):
         assert solver._tree_plan is not None
         assert any(group.lanes > 1 for group in solver._tree_plan.groups)

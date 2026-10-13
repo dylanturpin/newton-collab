@@ -879,18 +879,26 @@ def test_kinematic_prescribed_response_lifetime(
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 
+def _undamped(solver):
+    """Turn off the default angular damping of the free roots."""
+    solver._rigid_body_angular_damping.zero_()
+    return solver
+
+
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, solve_mode="split"),
-    "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, solve_mode="matrix_free"
+    "feather_pgs_split": lambda model: _undamped(newton.solvers.SolverFeatherPGS(model, solve_mode="split")),
+    "feather_pgs_matrix_free": lambda model: _undamped(
+        newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
     ),
-    "feather_pgs_propagation": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, solve_mode="matrix_free", articulated_contact_response="propagation"
+    "feather_pgs_propagation": lambda model: _undamped(
+        newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", articulated_contact_response="propagation")
     ),
-    "feather_pgs_propagation_fused": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
+    "feather_pgs_propagation_fused": lambda model: _undamped(
+        newton.solvers.SolverFeatherPGS(
+            model, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
+        )
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),

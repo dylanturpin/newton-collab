@@ -180,7 +180,8 @@ def _spin_free_articulation(model, omega=OMEGA):
     state_0.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
-    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    solver = SolverFeatherPGS(model)
+    solver._rigid_body_angular_damping.zero_()
     control = model.control()
     reference = _com_velocity(model, state_0)
     worst = 0.0
@@ -270,7 +271,11 @@ class TestFeatherPgsFreeBaseMomentum(unittest.TestCase):
             joint_qd[3:6] = OMEGA
             state_0.joint_qd.assign(joint_qd)
             newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-            solver = solver_cls(model, angular_damping=0.0)
+            if solver_cls is SolverFeatherPGS:
+                solver = solver_cls(model)
+                solver._rigid_body_angular_damping.zero_()
+            else:
+                solver = solver_cls(model, angular_damping=0.0)
             control = model.control()
             for _ in range(20):
                 solver.step(state_0, state_1, control, None, DT)

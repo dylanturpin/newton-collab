@@ -118,11 +118,11 @@ def _slide_heights(model, omega_y, solve_mode, response="immediate", velocity_it
 
     solver = SolverFeatherPGS(
         model,
-        angular_damping=0.0,
         solve_mode=solve_mode,
         articulated_contact_response=response,
         velocity_iterations=velocity_iterations,
     )
+    solver._rigid_body_angular_damping.zero_()
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     control = model.control()
@@ -159,7 +159,8 @@ def _world_com(model, state):
 
 def _com_positions(model, state_0, state_1, steps):
     """Step the model contact-free; return per-step world COM positions [m]."""
-    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    solver = SolverFeatherPGS(model)
+    solver._rigid_body_angular_damping.zero_()
     control = model.control()
     positions = []
     for _ in range(steps):
@@ -315,7 +316,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
                 state.joint_qd,
                 wp.zeros_like(state.joint_qd),  # joint_qdd = 0
                 DT,
-                0.0,
+                wp.zeros(model.body_count, dtype=wp.float32, device=device),
                 wp.ones(model.joint_count, dtype=wp.int32, device=device),
             ],
             outputs=[q_new, qd_new],
@@ -332,7 +333,8 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         """Make prediction and solved-velocity conversion match root integration."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0)
+        solver = SolverFeatherPGS(model)
+        solver._rigid_body_angular_damping.zero_()
         self.assertEqual(solver._free_root_joint_count, 1)
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
@@ -430,7 +432,8 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         """Keep the final velocity-postpass conversion observable and wired."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode="split")
+        solver = SolverFeatherPGS(model, solve_mode="split")
+        solver._rigid_body_angular_damping.zero_()
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
 
@@ -465,7 +468,8 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         joint_qd[3:6] = (0.0, OMEGA_Y, 0.0)
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode="matrix_free")
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free")
+        solver._rigid_body_angular_damping.zero_()
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
         control = model.control()

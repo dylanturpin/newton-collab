@@ -225,7 +225,8 @@ def test_parent_wrench_matches_featherstone_on_every_inverse_dynamics_path(test,
         ]
     for options in configurations:
         with test.subTest(**options):
-            solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
+            solver = SolverFeatherPGS(model, **options)
+            solver._rigid_body_angular_damping.zero_()
             wrench = _first_step_wrench(model, state, control, solver)
             np.testing.assert_allclose(wrench, reference, rtol=1.0e-4, atol=1.0e-4)
 

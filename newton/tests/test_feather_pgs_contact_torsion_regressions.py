@@ -189,12 +189,12 @@ class TestContactTorsionRegressions(unittest.TestCase):
                     cfm=0,
                     contact_regularization=0,
                     contact_warmstart=False,
-                    angular_damping=0,
                     articulation_constraint_max=64,
                     free_body_constraint_max=16,
                     contact_torsion_radius=radius,
                     contact_torsion_device=preparation != "host",
                 )
+                solver._rigid_body_angular_damping.zero_()
                 qd = _step(solver, model, initial, contacts, preparation)
                 self.assertEqual(_row_count(solver, PGS_CONSTRAINT_TYPE_TORSION), int(radius > 0.0))
                 self.assertGreater(int(solver._mf_constraint_count.numpy()[0]), 0)

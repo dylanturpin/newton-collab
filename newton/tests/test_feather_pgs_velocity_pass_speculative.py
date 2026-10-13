@@ -97,12 +97,12 @@ def _drop(
     model, body = _build(device, scene)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        angular_damping=0.0,
         solve_mode="matrix_free",
         velocity_iterations=velocity_iterations,
         articulated_contact_response=response,
         contact_warmstart=contact_warmstart or mf_warmstart,
     )
+    solver._rigid_body_angular_damping.zero_()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
@@ -169,9 +169,8 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     contacts = pipeline.contacts()
 
     def step(iterations):
-        solver = newton.solvers.SolverFeatherPGS(
-            model, angular_damping=0.0, solve_mode="matrix_free", velocity_iterations=iterations
-        )
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", velocity_iterations=iterations)
+        solver._rigid_body_angular_damping.zero_()
         state_0, state_1 = model.state(), model.state()
         # A free body is driven through joint_qd; writing body_qd alone is discarded
         # by the forward kinematics the solver runs from joint state.
@@ -408,10 +407,10 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        angular_damping=0.0,
         solve_mode="matrix_free",
         velocity_iterations=4,
     )
+    solver._rigid_body_angular_damping.zero_()
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy().reshape(2, 6)
     joint_qd[0, 2] = -0.5 * gap / SIM_DT

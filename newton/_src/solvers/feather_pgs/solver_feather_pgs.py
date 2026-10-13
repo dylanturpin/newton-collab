@@ -277,6 +277,8 @@ _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
 _ATTRIBUTE_NAMESPACE = "physx"
+# PhysX's default rigid-body angular damping [1/s].
+_DEFAULT_ANGULAR_DAMPING = 0.05
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
@@ -1352,7 +1354,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     """
 
-    angular_damping = _ConstructionOption()
     update_mass_matrix_interval = _ConstructionOption()
     contact_friction_gap_threshold = _StepOption()
     contact_friction_position_iterations = _ConstructionOption()
@@ -1439,6 +1440,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         Each attribute maps to the matching PhysX rigid-body USD attribute:
 
+        - ``physx:angular_damping`` [1/s] damps the angular velocity of free bodies and
+          floating bases as ``w *= 1 - d dt`` each step (``physxRigidBody:angularDamping``,
+          default 0.05, as :class:`~newton.solvers.SolverFeatherstone`); joints with a parent
+          body are not damped. Fill the attribute for one value on every body.
         - ``physx:max_linear_velocity`` [m/s] and ``physx:max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
@@ -1460,6 +1465,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 return float("inf")
             return value * np.pi / 180.0
 
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="angular_damping",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=_DEFAULT_ANGULAR_DAMPING,
+                usd_attribute_name="physxRigidBody:angularDamping",
+            )
+        )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="max_linear_velocity",
@@ -1501,6 +1517,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         return getattr(namespace, name, None)
 
     @property
+    def _rigid_body_angular_damping(self) -> wp.array:
+        attribute = self._physx_attribute("angular_damping")
+        return self._default_angular_damping if attribute is None else attribute
+
+    @property
     def _rigid_body_max_linear_velocity(self) -> wp.array | None:
         return self._physx_attribute("max_linear_velocity")
 
@@ -1536,7 +1557,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def __init__(
         self,
         model: Model,
-        angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
@@ -1746,7 +1766,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
                     The ``contact_compliance=True`` material response and its supported combinations
                     may change without prior notice.
-            angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
                 CUDA graph capture the 0/1 pattern is baked at capture time: with K steps captured per graph,
@@ -2166,7 +2185,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         _validate_equality_constraints(model)
         _validate_tree_joints_enabled(model)
 
-        self._angular_damping = angular_damping
+        # Stand-in for models without the physx angular damping attribute.
+        self._default_angular_damping = wp.full(
+            max(model.body_count, 1), _DEFAULT_ANGULAR_DAMPING, dtype=wp.float32, device=model.device
+        )
         self._update_mass_matrix_interval = update_mass_matrix_interval
         self._contact_friction_gap_threshold = contact_friction_gap_threshold
         self._contact_friction_position_iterations = int(contact_friction_position_iterations)
@@ -13949,7 +13971,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     state_in.joint_qd,
                     state_aug._joint_qdd,
                     dt,
-                    self._angular_damping,
+                    self._rigid_body_angular_damping,
                     self._dynamics_joint_active,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
@@ -13999,7 +14021,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     state_in.joint_qd,
                     state_aug._joint_qdd,
                     dt,
-                    self._angular_damping,
+                    self._rigid_body_angular_damping,
                     self._dynamics_joint_active,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],

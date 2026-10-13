@@ -364,13 +364,18 @@ def _build_rolling_sphere(device):
     return model
 
 
+def _undamped(solver):
+    """Turn off the default angular damping of the free roots."""
+    solver._rigid_body_angular_damping.zero_()
+    return solver
+
+
 def test_articulated_graph_capture_matches_eager(test, device):
     """Graph replay of an articulated source matches eager stepping across proxy iterations and friction models."""
     options = {
         "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "iterations": 16,
-        "angular_damping": 0.0,
         "articulation_constraint_max": 32,
         "free_body_constraint_max": 16,
         "double_buffer": False,
@@ -393,7 +398,7 @@ def test_articulated_graph_capture_matches_eager(test, device):
                         _coupled(
                             model,
                             None,
-                            lambda view, kw=friction_options: SolverFeatherPGS(view, **options, **kw),
+                            lambda view, kw=friction_options: _undamped(SolverFeatherPGS(view, **options, **kw)),
                             iterations=iterations,
                         ),
                     )

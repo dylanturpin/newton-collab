@@ -128,7 +128,6 @@ def _make_solver(
 ):
     """Construct a deterministic frictionless FeatherPGS test solver."""
     kwargs = {
-        "angular_damping": 0.0,
         "contact_friction_scale": 0.0,
         "solve_mode": solve_mode,
         "articulated_contact_response": response,
@@ -142,9 +141,9 @@ def _make_solver(
         kwargs["enable_restitution"] = enable_restitution
     if restitution_velocity_threshold is not None:
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
-    # Keep a developer's environment from silently turning warm starting on in
-    # tests that are intended to be cold.
-    return newton.solvers.SolverFeatherPGS(model, **kwargs)
+    solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
+    solver._rigid_body_angular_damping.zero_()
+    return solver
 
 
 def _reset_state(model, state, vertical_velocity):
