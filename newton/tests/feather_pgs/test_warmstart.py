@@ -4,6 +4,7 @@
 """Contact warm start of SolverFeatherPGS."""
 
 import inspect
+import itertools
 import unittest
 
 import numpy as np
@@ -18,7 +19,12 @@ from newton._src.solvers.feather_pgs.kernels import (
     gather_propagation_warmstart,
     prepare_world_impulses,
 )
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_selected_cuda_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_selected_cuda_test_devices,
+    get_test_devices,
+)
 
 
 def _build_press():
@@ -698,7 +704,7 @@ class TestFeatherPGSWarmstartProvenance(unittest.TestCase):
                     self.assertAlmostEqual(got, want, delta=1.0e-6 * max(1.0, abs(want)))
 
 
-def _resting_box_rows(device, articulated: bool):
+def _resting_box_rows(device, articulated: bool, solve_mode: str = "matrix_free", **solver_kwargs):
     """Settle a box on the ground with warm start; return the model, pipeline, contacts, solver and states.
 
     ``articulated`` mounts the box on a vertical prismatic joint, so its contacts are dense
@@ -718,7 +724,9 @@ def _resting_box_rows(device, articulated: bool):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True, iterations=12)
+    solver = newton.solvers.SolverFeatherPGS(
+        model, solve_mode=solve_mode, contact_warmstart=True, iterations=12, **solver_kwargs
+    )
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     control = model.control()
@@ -768,10 +776,84 @@ def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device
             np.testing.assert_allclose(ratios[True], ratios[False], rtol=1.0e-5)
 
 
+def test_edited_warmstart_decay_reaches_every_row_family(test, device):
+    """Seed dense and free-body rows with the edited decay, as a solver constructed with it reports."""
+    # Matrix-free mode runs on CUDA only.
+    solve_modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
+    for solve_mode, articulated, decay in itertools.product(solve_modes, (True, False), (0.0, 0.25)):
+        label = f"{solve_mode} {'articulated' if articulated else 'free'} decay={decay}"
+        with test.subTest(label):
+            model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(
+                device, articulated, solve_mode
+            )
+            fresh = newton.solvers.SolverFeatherPGS(
+                model, solve_mode=solve_mode, contact_warmstart=True, contact_warmstart_decay=decay
+            )
+            impulses, row_type = (
+                (solver._impulses, solver._row_type) if articulated else (solver._mf_impulses, solver._mf_row_type)
+            )
+
+            def normal_load(impulses=impulses, row_type=row_type):
+                return float(impulses.numpy()[row_type.numpy() == PGS_CONSTRAINT_TYPE_CONTACT].sum())
+
+            settled = normal_load()
+            test.assertGreater(settled, 0.0)
+            solver.contact_warmstart_decay = decay
+            test.assertEqual(
+                [(route, d) for route, *_rows, d in solver._patch_row_arrays()],
+                [(route, d) for route, *_rows, d in fresh._patch_row_arrays()],
+            )
+            # Without a sweep the solved impulses are the seeds.
+            solver._iterations = 0
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+            test.assertAlmostEqual(normal_load() / settled, decay, delta=1.0e-5, msg=label)
+
+
+def test_captured_graph_keeps_its_warmstart_decay_until_recaptured(test, device):
+    """Replay a graph with its capture-time decay; a recapture after the edit seeds with the new one."""
+    for articulated in (True, False):
+        with test.subTest(articulated=articulated):
+            _model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(device, articulated)
+            impulses, row_type = (
+                (solver._impulses, solver._row_type) if articulated else (solver._mf_impulses, solver._mf_row_type)
+            )
+
+            def normal_load(impulses=impulses, row_type=row_type):
+                return float(impulses.numpy()[row_type.numpy() == PGS_CONSTRAINT_TYPE_CONTACT].sum())
+
+            settled = normal_load()
+            test.assertGreater(settled, 0.0)
+            # Without a sweep the solved impulses are the seeds.
+            solver._iterations = 0
+            pipeline.collide(state_0, contacts)
+            with wp.ScopedCapture(device) as before_edit:
+                solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+            solver.contact_warmstart_decay = 0.25
+            with wp.ScopedCapture(device) as after_edit:
+                solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+            wp.capture_launch(before_edit.graph)
+            test.assertAlmostEqual(normal_load() / settled, 1.0, delta=1.0e-5)
+            wp.capture_launch(after_edit.graph)
+            test.assertAlmostEqual(normal_load() / settled, 0.25, delta=1.0e-5)
+
+
 class TestFeatherPGSWarmstartReplay(unittest.TestCase):
     pass
 
 
+add_function_test(
+    TestFeatherPGSWarmstartReplay,
+    "test_edited_warmstart_decay_reaches_every_row_family",
+    test_edited_warmstart_decay_reaches_every_row_family,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSWarmstartReplay,
+    "test_captured_graph_keeps_its_warmstart_decay_until_recaptured",
+    test_captured_graph_keeps_its_warmstart_decay_until_recaptured,
+    devices=get_cuda_test_devices(),
+)
 add_function_test(
     TestFeatherPGSWarmstartReplay,
     "test_graph_replay_rescales_history_once_after_a_timestep_change",

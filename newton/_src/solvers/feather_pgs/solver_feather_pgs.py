@@ -1546,6 +1546,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
 
     @property
+    def _rebound_velocity_threshold(self) -> float:
+        """Restitution threshold the kernels read; the largest finite float32 speed turns rebounds off."""
+        return self._restitution_velocity_threshold if self._enable_restitution else float(np.finfo(np.float32).max)
+
+    @property
     def _friction_gap(self) -> float:
         """Largest gap [m] of a contact with friction rows, as the kernels read it."""
         return float("inf") if self._contact_friction_gap_max is None else self._contact_friction_gap_max
@@ -2304,9 +2309,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             raise ValueError(threshold_error) from exc
         if not np.isfinite(self._restitution_velocity_threshold) or self._restitution_velocity_threshold < 0.0:
             raise ValueError(threshold_error)
-        self._effective_restitution_velocity_threshold = (
-            self._restitution_velocity_threshold if self._enable_restitution else np.finfo(np.float32).max
-        )
         if velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"velocity_drive_mode must be 'active' or 'freeze', got {velocity_drive_mode!r}")
         self._velocity_drive_mode = velocity_drive_mode
@@ -2373,7 +2375,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # MF contacts are one route owned by the unified mode. The internal
         # names remain because the MF buffers and kernels predate that API.
         self._mf_warmstart_enabled = self._contact_warmstart
-        self._mf_warmstart_decay = self._contact_warmstart_decay
         # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
         self._ws_prev_mf_impulses = None
         # Device-resident so a captured step rescales the history by the step ratio at replay.
@@ -8406,7 +8407,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._contact_w,
                     dt,
                     self._contact_speculative_scale,
-                    self._effective_restitution_velocity_threshold,
+                    self._rebound_velocity_threshold,
                     self._propagation_max_constraints,
                 ],
                 outputs=[
@@ -11326,7 +11327,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._mf_row_parent,
                 self._mf_row_mu,
                 self._mf_impulses,
-                self._mf_warmstart_decay if self._mf_warmstart_enabled else 0.0,
+                self._contact_warmstart_decay if self._mf_warmstart_enabled else 0.0,
             )
         if self._propagation_row_parent is not None:
             yield (
@@ -12624,7 +12625,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             contacts.rigid_contact_normal,
                             self._ws_prev_contact_normal,
                             self._mf_row_mu,
-                            self._mf_warmstart_decay,
+                            self._contact_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
                             self._warmstart_dt_scale(dt),
@@ -13275,7 +13276,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._effective_restitution_velocity_threshold,
+                    self._rebound_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -13356,7 +13357,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._row_restitution,
                         self._sparse_row_incident,
                         dt,
-                        self._effective_restitution_velocity_threshold,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -13382,7 +13383,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._sparse_diagonal_row_dof,
                         self._sparse_diagonal_row_jy,
                         dt,
-                        self._effective_restitution_velocity_threshold,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -13403,7 +13404,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._effective_restitution_velocity_threshold,
+                    self._rebound_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
                 outputs=[self._rhs, self._row_w],
@@ -13423,7 +13424,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._row_restitution,
                 dt,
                 self._contact_speculative_scale,
-                self._effective_restitution_velocity_threshold,
+                self._rebound_velocity_threshold,
                 int(self._regularization_enabled),
             ],
             outputs=[self._rhs, self._row_w],
@@ -13763,7 +13764,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._contact_w,
                 dt,
                 self._contact_speculative_scale,
-                self._effective_restitution_velocity_threshold,
+                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[
@@ -13801,7 +13802,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 dt,
                 self._v_out_snap,
                 self._v_hat,
-                self._effective_restitution_velocity_threshold,
+                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[output],

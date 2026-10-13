@@ -2398,7 +2398,7 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
         solver._shape_restitution.numpy()[: model.shape_count], model.shape_material_restitution.numpy()
     )
     test.assertAlmostEqual(solver._restitution_velocity_threshold, 0.75)
-    test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
+    test.assertGreater(solver._rebound_velocity_threshold, 1.0e30)
 
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
@@ -2725,6 +2725,106 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device, solve_mode
             test.assertAlmostEqual(float(state_out.body_qd.numpy()[body][2]), expected, delta=2.0e-5, msg=label)
 
 
+# (label, solve_mode, scene, response, velocity_iterations)
+THRESHOLD_EDIT_ROUTES = (
+    ("split/free", "split", "free", "immediate", 0),
+    ("split/articulated", "split", "articulated", "immediate", 0),
+    ("matrix_free/free", "matrix_free", "free", "immediate", 0),
+    ("matrix_free/articulated", "matrix_free", "articulated", "immediate", 0),
+    ("matrix_free/free/velocity_pass", "matrix_free", "free", "immediate", 2),
+    ("matrix_free/free/propagation", "matrix_free", "free", "propagation", 0),
+    ("matrix_free/articulated/propagation", "matrix_free", "articulated", "propagation", 0),
+)
+
+
+def _threshold_bounce(device, route, threshold, edited=None, enable_restitution=True):
+    """Return the rebound speed of a resting-gap 1 m/s sphere impact and the solver that produced it."""
+    _label, solve_mode, scene, response, velocity_iterations = route
+    model, body = _build_plane_model(device, separation=0.0, restitution=1.0, scene=scene)
+    solver = _make_solver(
+        model,
+        solve_mode=solve_mode,
+        response=response,
+        velocity_iterations=velocity_iterations,
+        enable_restitution=enable_restitution,
+        restitution_velocity_threshold=threshold,
+    )
+    if edited is not None:
+        solver.restitution_velocity_threshold = edited
+    state_in, state_out = model.state(), model.state()
+    _reset_state(model, state_in, -1.0)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, model.control(), contacts, 0.01)
+    return float(state_out.body_qd.numpy()[body][2]), solver
+
+
+def test_edited_restitution_threshold_matches_a_fresh_solver(test, device):
+    """Launch an edited threshold on every contact route exactly as a solver constructed with it."""
+    # Matrix-free mode runs on CUDA only.
+    routes = [r for r in THRESHOLD_EDIT_ROUTES if wp.get_device(device).is_cuda or r[1] != "matrix_free"]
+    for route in routes:
+        for old, new in ((0.5, 2.0), (2.0, 0.5)):
+            label = f"{route[0]} {old}->{new}"
+            with test.subTest(label):
+                edited, solver = _threshold_bounce(device, route, old, edited=new)
+                fresh_old, _ = _threshold_bounce(device, route, old)
+                fresh_new, _ = _threshold_bounce(device, route, new)
+                test.assertGreater(abs(fresh_new - fresh_old), 0.5, f"{label}: thresholds do not discriminate")
+                test.assertAlmostEqual(edited, fresh_new, delta=2.0e-5, msg=label)
+                test.assertEqual(solver.restitution_velocity_threshold, new)
+                test.assertAlmostEqual(solver._rebound_velocity_threshold, new)
+
+    # The enable switch is construction-only: an edited threshold leaves rebounds off.
+    disabled, solver = _threshold_bounce(device, THRESHOLD_EDIT_ROUTES[0], 0.5, edited=0.0, enable_restitution=False)
+    test.assertGreater(solver._rebound_velocity_threshold, 1.0e30)
+    test.assertLess(disabled, 0.5)
+
+
+def test_captured_graph_keeps_its_restitution_threshold_until_recaptured(test, device):
+    """Replay a graph with its capture-time threshold; a recapture after the edit launches the new one."""
+    for route in THRESHOLD_EDIT_ROUTES:
+        label = route[0]
+        with test.subTest(label):
+            _label, solve_mode, scene, response, velocity_iterations = route
+            model, body = _build_plane_model(device, separation=0.0, restitution=1.0, scene=scene)
+            solver = _make_solver(
+                model,
+                solve_mode=solve_mode,
+                response=response,
+                velocity_iterations=velocity_iterations,
+                enable_restitution=True,
+                restitution_velocity_threshold=0.5,
+            )
+            state_in, state_out = model.state(), model.state()
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            contacts = pipeline.contacts()
+            control = model.control()
+
+            _reset_state(model, state_in, -1.0)
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, 0.01)
+            with wp.ScopedCapture(device) as before_edit:
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 0.01)
+            solver.restitution_velocity_threshold = 2.0
+            with wp.ScopedCapture(device) as after_edit:
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 0.01)
+
+            replays = {}
+            for name, graph in (("before", before_edit.graph), ("after", after_edit.graph)):
+                _reset_state(model, state_in, -1.0)
+                wp.capture_launch(graph)
+                replays[name] = float(state_out.body_qd.numpy()[body][2])
+            fresh_old, _ = _threshold_bounce(device, route, 0.5)
+            fresh_new, _ = _threshold_bounce(device, route, 2.0)
+            test.assertGreater(abs(fresh_new - fresh_old), 0.5, f"{label}: thresholds do not discriminate")
+            test.assertAlmostEqual(replays["before"], fresh_old, delta=2.0e-5, msg=f"{label}: capture-time graph")
+            test.assertAlmostEqual(replays["after"], fresh_new, delta=2.0e-5, msg=f"{label}: recaptured graph")
+
+
 devices_restitution = get_selected_cuda_test_devices()
 
 
@@ -2758,6 +2858,18 @@ for _fn in (
     add_function_test(TestFeatherPGSRestitution, _fn.__name__, _fn, devices=devices_restitution)
 
 
+add_function_test(
+    TestFeatherPGSRestitution,
+    "test_edited_restitution_threshold_matches_a_fresh_solver",
+    test_edited_restitution_threshold_matches_a_fresh_solver,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRestitution,
+    "test_captured_graph_keeps_its_restitution_threshold_until_recaptured",
+    test_captured_graph_keeps_its_restitution_threshold_until_recaptured,
+    devices=get_selected_cuda_test_devices(),
+)
 add_function_test(
     TestFeatherPGSRestitution,
     "test_notify_reads_replaced_and_in_place_restitution_split",
