@@ -93,11 +93,15 @@ from .kernels import (
     ROW_SLOTS_ATOMIC,
     ROW_SLOTS_COUNT,
     ROW_SLOTS_WRITE,
+    ROW_WATERMARK_CONTACT_SLOT,
+    ROW_WATERMARK_FAMILY_STRIDE,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_articulation_tau,
+    accumulate_contact_watermark,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
+    accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
@@ -337,40 +341,6 @@ def _prepare_augmented_joint_drives_by_dof(
         u0 = wp.clamp(u0, -effort_limit, effort_limit)
     row_K[row] = K
     drive_tau[dof] = u0
-
-
-@wp.kernel
-def _accumulate_row_watermark(
-    counts: wp.array[wp.int32],
-    watermark: wp.array[wp.int32],
-):
-    # Per-world reduce-max into a single scalar slot. Read-only on ``counts``;
-    # writes only the separate ``watermark`` buffer, so this is numerics-neutral.
-    # Matches the perf-harness pattern in newton_solver_core_perf.py.
-    tid = wp.tid()
-    wp.atomic_max(watermark, 0, counts[tid])
-
-
-@wp.kernel
-def _accumulate_row_capacity_telemetry(
-    raw_counts: wp.array[wp.int32],
-    dropped_contact_rows: wp.array[wp.int32],
-    capacity: int,
-    raw_watermark: wp.array[wp.int32],
-    dropped_contact_rows_watermark: wp.array[wp.int32],
-    overflow_excess_watermark: wp.array[wp.int32],
-    overflow_world_steps: wp.array[wp.int32],
-):
-    """Accumulate raw row demand and capacity overflow without changing solver state."""
-    tid = wp.tid()
-    dropped = dropped_contact_rows[tid]
-    count = raw_counts[tid]  # monotone counter: accepted rows plus rejected reservations
-    wp.atomic_max(raw_watermark, 0, count)
-    wp.atomic_max(dropped_contact_rows_watermark, 0, dropped)
-    excess = count - capacity
-    if excess > 0:
-        wp.atomic_max(overflow_excess_watermark, 0, excess)
-        wp.atomic_add(overflow_world_steps, 0, 1)
 
 
 @wp.kernel
@@ -3105,40 +3075,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._row_overflow_warning_emitted = (
             wp.zeros(3, dtype=wp.int32, device=wm_device) if self.warn_constraint_overflow else None
         )
-        if self._row_watermark:
-            self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_propagation = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_contact = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_dense_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_mf_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_propagation_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_dense_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_mf_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_overflow_propagation_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
-        else:
-            self._row_watermark_dense = None
-            self._row_watermark_mf = None
-            self._row_watermark_propagation = None
-            self._row_watermark_contact = None
-            self._row_watermark_dense_raw = None
-            self._row_watermark_mf_raw = None
-            self._row_watermark_propagation_raw = None
-            self._row_dropped_dense_high_water = None
-            self._row_dropped_mf_high_water = None
-            self._row_dropped_propagation_high_water = None
-            self._row_overflow_dense_excess = None
-            self._row_overflow_mf_excess = None
-            self._row_overflow_propagation_excess = None
-            self._row_overflow_dense_world_steps = None
-            self._row_overflow_mf_world_steps = None
-            self._row_overflow_propagation_world_steps = None
+        self._row_watermarks = (
+            wp.zeros(ROW_WATERMARK_CONTACT_SLOT + 1, dtype=wp.int32, device=wm_device) if self._row_watermark else None
+        )
 
         self.constraint_overflow = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
         # Tree joints disabled after construction, which the solver does not simulate.
@@ -9898,85 +9837,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         )
                 self._buf_idx = 1 - self._buf_idx
 
-        # Opt-in row high-water telemetry (behavior-neutral). Launched here, at
-        # the end of step() after _stage4_build_rows has finalized the per-world
-        # counts, so the atomic-max runs inside the captured graph every step and
-        # catches mid-run peaks. Read-only on the counts; writes only the
-        # separate watermark buffers. No-op when the flag is off (nothing
-        # allocated, nothing launched), keeping the captured graph identical.
         if self._row_watermark:
-            wp.launch(
-                _accumulate_row_watermark,
-                dim=self.constraint_count.shape[0],
-                inputs=[self.constraint_count, self._row_watermark_dense],
-                device=self.constraint_count.device,
-            )
-            wp.launch(
-                _accumulate_row_capacity_telemetry,
-                dim=self.slot_counter.shape[0],
-                inputs=[
-                    self.slot_counter,
-                    self._row_dropped_dense,
-                    self.dense_max_constraints,
-                    self._row_watermark_dense_raw,
-                    self._row_dropped_dense_high_water,
-                    self._row_overflow_dense_excess,
-                    self._row_overflow_dense_world_steps,
-                ],
-                device=self.slot_counter.device,
-            )
-            mf_counts = getattr(self, "mf_constraint_count", None)
-            if mf_counts is not None and mf_counts.shape[0] > 0:
-                wp.launch(
-                    _accumulate_row_watermark,
-                    dim=mf_counts.shape[0],
-                    inputs=[mf_counts, self._row_watermark_mf],
-                    device=mf_counts.device,
-                )
-                wp.launch(
-                    _accumulate_row_capacity_telemetry,
-                    dim=self.mf_slot_counter.shape[0],
-                    inputs=[
-                        self.mf_slot_counter,
-                        self._row_dropped_mf,
-                        self.mf_max_constraints,
-                        self._row_watermark_mf_raw,
-                        self._row_dropped_mf_high_water,
-                        self._row_overflow_mf_excess,
-                        self._row_overflow_mf_world_steps,
-                    ],
-                    device=self.mf_slot_counter.device,
-                )
-            prop_counts = getattr(self, "propagation_constraint_count", None)
-            if prop_counts is not None and prop_counts.shape[0] > 0:
-                wp.launch(
-                    _accumulate_row_watermark,
-                    dim=prop_counts.shape[0],
-                    inputs=[prop_counts, self._row_watermark_propagation],
-                    device=prop_counts.device,
-                )
-                wp.launch(
-                    _accumulate_row_capacity_telemetry,
-                    dim=self.propagation_slot_counter.shape[0],
-                    inputs=[
-                        self.propagation_slot_counter,
-                        self._row_dropped_propagation,
-                        self.propagation_max_constraints,
-                        self._row_watermark_propagation_raw,
-                        self._row_dropped_propagation_high_water,
-                        self._row_overflow_propagation_excess,
-                        self._row_overflow_propagation_world_steps,
-                    ],
-                    device=self.propagation_slot_counter.device,
-                )
-            if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                contact_counts = contacts.rigid_contact_count
-                wp.launch(
-                    _accumulate_row_watermark,
-                    dim=contact_counts.shape[0],
-                    inputs=[contact_counts, self._row_watermark_contact],
-                    device=contact_counts.device,
-                )
+            self._accumulate_row_watermarks(contacts)
 
         if self._device_torsion is not None:
             self._device_torsion.end_step(state_out)
@@ -10099,68 +9961,66 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 " the scene (see the class documentation), and reset before accepting transitions."
             )
 
-    def constraint_row_watermarks(self) -> dict:
-        """Return the opt-in constraint/contact row high-water marks.
-
-        These are whole-run running maxima (warmup included) of retained and
-        raw per-world dense / matrix-free / rigid-contact row counts, rejected
-        contact rows that allocators rolled back, peak over-capacity demand,
-        and the number of overflowing world-steps. They are accumulated inside
-        the captured :meth:`step` when
-        ``row_watermark`` is enabled. Reads ``.numpy()[0]`` from the device
-        buffers and so must be called OUTSIDE any captured/timed region (it
-        forces a device sync).
-
-        Returns ``0`` for every field when the telemetry was not enabled, so the
-        caller never has to special-case the off path.
-        """
-        if not self._row_watermark:
-            return {
-                "dense_high_water": 0,
-                "dense_raw_high_water": 0,
-                "dense_dropped_contact_rows_high_water": 0,
-                "dense_overflow_excess_high_water": 0,
-                "dense_overflow_world_steps": 0,
-                "mf_high_water": 0,
-                "mf_raw_high_water": 0,
-                "mf_dropped_contact_rows_high_water": 0,
-                "mf_overflow_excess_high_water": 0,
-                "mf_overflow_world_steps": 0,
-                "propagation_high_water": 0,
-                "propagation_raw_high_water": 0,
-                "propagation_dropped_contact_rows_high_water": 0,
-                "propagation_overflow_excess_high_water": 0,
-                "propagation_overflow_world_steps": 0,
-                "contact_high_water": 0,
-            }
-        return {
-            "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
-            "dense_raw_high_water": int(self._row_watermark_dense_raw.numpy()[0]),
-            "dense_dropped_contact_rows_high_water": int(self._row_dropped_dense_high_water.numpy()[0]),
-            "dense_overflow_excess_high_water": int(self._row_overflow_dense_excess.numpy()[0]),
-            "dense_overflow_world_steps": int(self._row_overflow_dense_world_steps.numpy()[0]),
-            "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
-            "mf_raw_high_water": int(self._row_watermark_mf_raw.numpy()[0]),
-            "mf_dropped_contact_rows_high_water": int(self._row_dropped_mf_high_water.numpy()[0]),
-            "mf_overflow_excess_high_water": int(self._row_overflow_mf_excess.numpy()[0]),
-            "mf_overflow_world_steps": int(self._row_overflow_mf_world_steps.numpy()[0]),
-            "propagation_high_water": int(self._row_watermark_propagation.numpy()[0])
-            if self._row_watermark_propagation is not None
-            else 0,
-            "propagation_raw_high_water": int(self._row_watermark_propagation_raw.numpy()[0])
-            if self._row_watermark_propagation_raw is not None
-            else 0,
-            "propagation_dropped_contact_rows_high_water": int(self._row_dropped_propagation_high_water.numpy()[0])
-            if self._row_dropped_propagation_high_water is not None
-            else 0,
-            "propagation_overflow_excess_high_water": int(self._row_overflow_propagation_excess.numpy()[0])
-            if self._row_overflow_propagation_excess is not None
-            else 0,
-            "propagation_overflow_world_steps": int(self._row_overflow_propagation_world_steps.numpy()[0])
-            if self._row_overflow_propagation_world_steps is not None
-            else 0,
-            "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
+    def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
+        """Fold this step's row counts into the high-water marks."""
+        families = {
+            0: (self.constraint_count, self.slot_counter, self._row_dropped_dense, self.dense_max_constraints),
         }
+        if self._has_free_rigid_bodies:
+            families[1] = (
+                self.mf_constraint_count,
+                self.mf_slot_counter,
+                self._row_dropped_mf,
+                self.mf_max_constraints,
+            )
+        if self.propagation_constraint_count is not None:
+            families[2] = (
+                self.propagation_constraint_count,
+                self.propagation_slot_counter,
+                self._row_dropped_propagation,
+                self.propagation_max_constraints,
+            )
+        for family, (count, requested, dropped, capacity) in families.items():
+            wp.launch(
+                accumulate_row_watermarks,
+                dim=self.world_count,
+                inputs=[count, requested, dropped, capacity, family * ROW_WATERMARK_FAMILY_STRIDE],
+                outputs=[self._row_watermarks],
+                device=self.model.device,
+            )
+        if contacts is not None:
+            wp.launch(
+                accumulate_contact_watermark,
+                dim=1,
+                inputs=[contacts.rigid_contact_count],
+                outputs=[self._row_watermarks],
+                device=self.model.device,
+            )
+
+    def constraint_row_watermarks(self) -> dict[str, int]:
+        """Return the row high-water marks accumulated since construction (``row_watermark`` only).
+
+        Per family (``dense``, ``mf`` for free-body rows, ``propagation``): the largest retained
+        and requested row count of any world and step, the largest number of dropped contact
+        rows, the largest excess over the capacity, and the number of overflowing world-steps;
+        and ``contact_high_water``, the largest contact count. Reads the device on the host, so
+        call it outside CUDA graph capture. Every value is ``0`` when ``row_watermark`` is off.
+        """
+        values = (
+            self._row_watermarks.numpy().tolist()
+            if self._row_watermarks is not None
+            else [0] * (ROW_WATERMARK_CONTACT_SLOT + 1)
+        )
+        result = {}
+        for family, name in enumerate(("dense", "mf", "propagation")):
+            base = family * ROW_WATERMARK_FAMILY_STRIDE
+            result[f"{name}_high_water"] = int(values[base])
+            result[f"{name}_raw_high_water"] = int(values[base + 1])
+            result[f"{name}_dropped_contact_rows_high_water"] = int(values[base + 2])
+            result[f"{name}_overflow_excess_high_water"] = int(values[base + 3])
+            result[f"{name}_overflow_world_steps"] = int(values[base + 4])
+        result["contact_high_water"] = int(values[ROW_WATERMARK_CONTACT_SLOT])
+        return result
 
     def _contact_force_inputs(self, contacts: Contacts, inv_dt: float) -> list:
         """Return the inputs shared by the contact-force kernels."""

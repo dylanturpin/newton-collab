@@ -419,7 +419,7 @@ class TestContactTorsion(unittest.TestCase):
         for dt in (0.00125, 0.0025, 0.005):
             result, solver, *_ = fixture(0.01, spin=100.0, center_only=True, dt=dt)
             velocities.append(result["v_out"])
-            self.assertEqual(int(solver._row_dropped_dense_high_water.numpy()[0]), 0)
+            self.assertEqual(solver.constraint_row_watermarks()["dense_dropped_contact_rows_high_water"], 0)
             self.assertLessEqual(int(solver.constraint_count.numpy().max()), solver.dense_max_constraints)
         for velocity in velocities[1:]:
             np.testing.assert_allclose(velocity, velocities[0], atol=2e-5)

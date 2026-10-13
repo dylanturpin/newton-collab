@@ -32,7 +32,7 @@ class TestTorsionRegularization(unittest.TestCase):
             sliding = sum(float(np.linalg.norm(impulses[n + 1 : n + 3])) for n in group["anchor_rows"])
             spin = abs(float(impulses[group["row"]])) / group["effective_radius_m"]
             self.assertLessEqual(sliding + spin, group["mu"] * load + 2e-6)
-        self.assertEqual(int(solver._row_dropped_dense_high_water.numpy()[0]), 0)
+        self.assertEqual(solver.constraint_row_watermarks()["dense_dropped_contact_rows_high_water"], 0)
 
     def test_analytic_regularized_load_and_saturated_spin(self):
         """Use the solved normal impulse once, without double-regularizing spin capacity."""
