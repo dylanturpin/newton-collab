@@ -1593,9 +1593,14 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         np.testing.assert_array_equal(solver._passive_joint_damping.numpy()[: model.joint_dof_count], damping)
         for name, buffer in materials.items():
             np.testing.assert_array_equal(buffer.numpy()[: model.shape_count], edited[name], err_msg=name)
-        np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), np.arange(WORLD_COUNT) == 2)
+        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(WORLD_COUNT) == 2)
+        flags = solver.joint_friction_invalid
+        with self.assertRaises(AttributeError):
+            solver.joint_friction_invalid = flags
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             solver.check_joint_friction()
+        self.assertIs(solver.joint_friction_invalid, flags)
+        self.assertFalse(flags.numpy().any())
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
     def test_captured_notify_flags_invalid_joint_friction(self):
@@ -1619,10 +1624,10 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
                 model.joint_friction.assign(friction)
                 wp.capture_launch(capture.graph)
                 expected = _dof_world(model)[dof] == np.arange(WORLD_COUNT)
-                np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), expected)
+                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), expected)
                 with self.assertRaisesRegex(ValueError, message):
                     solver.check_joint_friction()
-                self.assertFalse(solver._joint_friction_invalid.numpy().any())
+                self.assertFalse(solver.joint_friction_invalid.numpy().any())
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires a CUDA device")
     def test_invalid_joint_friction_stays_latched_until_reported(self):
@@ -1640,7 +1645,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.joint_friction.zero_()
         wp.capture_launch(capture.graph)
         solver.reset(model.state())
-        np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), [False, True, False])
+        np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), [False, True, False])
         with self.assertRaisesRegex(ValueError, r"captured notify in worlds \[1\]"):
             solver.check_joint_friction()
         solver.check_joint_friction()
@@ -1663,7 +1668,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
             friction[revolute[0]] = 0.0
             model.joint_friction.assign(friction)
             wp.capture_launch(capture.graph)
-            self.assertFalse(solver._joint_friction_invalid.numpy().any())
+            self.assertFalse(solver.joint_friction_invalid.numpy().any())
         solver.check_joint_friction()
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free joint friction requires CUDA")
@@ -1678,7 +1683,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.joint_friction.assign(friction)
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
-        self.assertFalse(solver._joint_friction_invalid.numpy().any())
+        self.assertFalse(solver.joint_friction_invalid.numpy().any())
         self.assertTrue(np.all(solver._joint_armature_device.numpy() == np.float32(0.3)))
         model.joint_friction.zero_()
         solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
@@ -1703,7 +1708,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
                 friction[dof] = value
                 model.joint_friction.assign(friction)
                 wp.capture_launch(capture.graph)
-                np.testing.assert_array_equal(solver._joint_friction_invalid.numpy(), np.arange(3) == world)
+                np.testing.assert_array_equal(solver.joint_friction_invalid.numpy(), np.arange(3) == world)
                 with self.assertRaisesRegex(ValueError, message):
                     solver.check_joint_friction()
                 model.joint_friction.zero_()

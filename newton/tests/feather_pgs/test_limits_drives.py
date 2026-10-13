@@ -2309,7 +2309,7 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
                 else:
                     episode()
                 qd.append(states[0].joint_qd.numpy().copy())
-            self.assertFalse(solver._joint_friction_invalid.numpy().any())
+            self.assertFalse(solver.joint_friction_invalid.numpy().any())
             runs.append(np.array(qd))
         np.testing.assert_array_equal(runs[1], runs[0])
 

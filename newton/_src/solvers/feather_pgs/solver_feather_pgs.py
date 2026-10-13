@@ -3501,6 +3501,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if check_friction and not wp.get_stream(self.model.device).is_capturing:
             self.check_joint_friction()
 
+    @property
+    def joint_friction_invalid(self) -> wp.array:
+        """Per-world device flags for invalid ``joint_friction``, cleared by :meth:`check_joint_friction`."""
+        return self._joint_friction_invalid
+
     def check_joint_friction(self) -> None:
         """Raise :class:`ValueError` if a notify flagged :attr:`joint_friction_invalid`, then clear the flag.
 
