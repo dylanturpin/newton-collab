@@ -87,7 +87,7 @@ def _prismatic_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.
 
     Unlike a single-link free articulation, this is a non-free articulation.
     Contacts on it must therefore take the articulated propagation-row path in
-    every propagation response mode, including ``propagation-fused``.
+    every propagation response mode, including ``propagation_fused``.
     """
     link = builder.add_link()
     for i in range(num_cyl):
@@ -738,7 +738,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
-        cases = (("pgs_warmstart=True", {"pgs_mode": "split", "pgs_warmstart": True}),)
+        cases = (("contact_warmstart=True", {"solve_mode": "split", "contact_warmstart": True}),)
         for label, kwargs in cases:
             with self.subTest(configuration=label):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
@@ -964,7 +964,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            dense_max_constraints=4,
+            articulation_constraint_max=4,
             enable_joint_limits=True,
             joint_limit_activation_gap=float("inf"),
             row_watermark=True,
@@ -972,11 +972,11 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
-        self.assertGreater(rows["dense_high_water"], 0)
-        self.assertLessEqual(rows["dense_high_water"], 4)
-        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
-        self.assertEqual(rows["dense_overflow_world_steps"], 1)
-        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+        self.assertGreater(rows["articulation_high_water"], 0)
+        self.assertLessEqual(rows["articulation_high_water"], 4)
+        self.assertGreater(rows["articulation_raw_high_water"], rows["articulation_high_water"])
+        self.assertEqual(rows["articulation_overflow_world_steps"], 1)
+        self.assertGreater(rows["articulation_overflow_excess_high_water"], 0)
         self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_row_watermark_includes_rolled_back_contact_rows(self):
@@ -995,20 +995,20 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            dense_max_constraints=4,
+            articulation_constraint_max=4,
             row_watermark=True,
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
-        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
-        self.assertGreater(rows["dense_dropped_contact_rows_high_water"], 0)
+        self.assertGreater(rows["articulation_raw_high_water"], rows["articulation_high_water"])
+        self.assertGreater(rows["articulation_dropped_contact_rows_high_water"], 0)
         self.assertEqual(
-            rows["dense_raw_high_water"],
-            rows["dense_high_water"] + rows["dense_dropped_contact_rows_high_water"],
+            rows["articulation_raw_high_water"],
+            rows["articulation_high_water"] + rows["articulation_dropped_contact_rows_high_water"],
         )
-        self.assertEqual(rows["dense_overflow_world_steps"], 1)
-        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+        self.assertEqual(rows["articulation_overflow_world_steps"], 1)
+        self.assertGreater(rows["articulation_overflow_excess_high_water"], 0)
 
     def test_constraint_overflow_warning_does_not_require_row_watermark(self):
         """Keep the default warning active without full high-water telemetry."""
@@ -1025,7 +1025,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            dense_max_constraints=4,
+            articulation_constraint_max=4,
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
@@ -1058,10 +1058,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
                     angular_damping=0.0,
-                    pgs_mode="matrix_free",
+                    solve_mode="matrix_free",
                     articulated_contact_response=response,
-                    dense_max_constraints=4,
-                    mf_max_constraints=4,
+                    articulation_constraint_max=4,
+                    free_body_constraint_max=4,
                 )
                 solver.step(state_0, state_1, model.control(), contacts, DT)
 
@@ -1123,21 +1123,21 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
         configs = [
-            ("split", "immediate", 16, _prismatic_jointed_foot, "dense"),
-            ("split", "immediate", 16, _free_jointed_foot, "mf"),
+            ("split", "immediate", 16, _prismatic_jointed_foot, "articulation"),
+            ("split", "immediate", 16, _free_jointed_foot, "free_body"),
         ]
         # Matrix-free (and its propagation response family) is CUDA-only. Use
         # a non-free prismatic articulation for every propagation variant. A
-        # free-only scene disables propagation-fused and would let that
+        # free-only scene disables propagation_fused and would let that
         # subtest pass through the ordinary matrix-free solver.
         configs += [
-            ("matrix_free", "immediate", None, _free_jointed_foot, "mf"),
+            ("matrix_free", "immediate", None, _free_jointed_foot, "free_body"),
             ("matrix_free", "propagation", 16, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation-fused", None, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation-colored", 16, _prismatic_jointed_foot, "propagation"),
+            ("matrix_free", "propagation_fused", None, _prismatic_jointed_foot, "propagation"),
+            ("matrix_free", "propagation_colored", 16, _prismatic_jointed_foot, "propagation"),
         ]
-        # Dense, propagation, and propagation-colored run 16 iterations. The
-        # two ``None`` entries deliberately omit pgs_iterations and assert the
+        # Dense, propagation, and propagation_colored run 16 iterations. The
+        # two ``None`` entries deliberately omit iterations and assert the
         # production default (12), rather than testing a stale assumed default.
         # At 8 iterations the UNREDUCED redundant set does not converge (dense
         # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
@@ -1147,28 +1147,28 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # reduction itself is what removes it.  The comparison must be against
         # a converged baseline.
         for mode, response, iters, build_foot, row_path in configs:
-            with self.subTest(pgs_mode=mode, response=response):
+            with self.subTest(solve_mode=mode, response=response):
 
                 def make_solver(model, mode=mode, response=response, iters=iters, row_path=row_path):
                     kwargs = {}
                     if iters is not None:
-                        kwargs["pgs_iterations"] = iters
+                        kwargs["iterations"] = iters
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
                         angular_damping=0.0,
-                        pgs_mode=mode,
+                        solve_mode=mode,
                         articulated_contact_response=response,
                         row_watermark=True,
                         **kwargs,
                     )
                     if iters is None:
-                        self.assertEqual(solver.pgs_iterations, 12)
+                        self.assertEqual(solver.iterations, 12)
                     if row_path == "propagation":
                         self.assertTrue(
                             solver._propagation_contacts_enabled(),
                             f"{response} test scene did not enable propagation contacts",
                         )
-                    if response == "propagation-fused":
+                    if response == "propagation_fused":
                         self.assertTrue(solver.propagation_full_fused_iterations)
                     return solver
 
@@ -1211,12 +1211,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             propagation_same_articulation_rows=True,
             row_watermark=True,
         )
-        self.assertEqual(solver.pgs_iterations, 12)
+        self.assertEqual(solver.iterations, 12)
         self.assertTrue(solver._propagation_contacts_enabled())
         solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
@@ -2412,7 +2412,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="split", contact_warmstart=True)
         control = model.control()
         solver.step(state_0, state_1, control, contacts, DT)
         with wp.ScopedCapture(device) as solver_capture:
@@ -3091,7 +3091,7 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             # Seven colliders per body generate thousands of speculative rows.
             # Both consumers must retain them for this to test reduction stability.
             mf_capacity = 3 * max(c_red.rigid_contact_max, c_raw.rigid_contact_max)
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, free_body_constraint_max=mf_capacity)
             raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
@@ -3113,7 +3113,9 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             raw_control = model.control()
             raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
             raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
-            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
+            raw_solver = newton.solvers.SolverFeatherPGS(
+                model, angular_damping=0.0, free_body_constraint_max=mf_capacity
+            )
             peak_raw = 0.0
             for _ in range(150):
                 raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)
@@ -3213,11 +3215,11 @@ class TestBodyPairReductionTouchingFootprint(unittest.TestCase):
             contacts = pipeline.contacts()
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
-                pgs_iterations=16,
-                pgs_beta=0.2,
-                pgs_contact_regularization=0.01,
-                pgs_warmstart=True,
+                solve_mode="matrix_free",
+                iterations=16,
+                baumgarte=0.2,
+                contact_regularization=0.01,
+                contact_warmstart=True,
                 friction_anchor_beta=0.2,
                 contact_friction_gap_threshold=0.001,
             )

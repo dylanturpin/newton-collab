@@ -112,8 +112,8 @@ def test_four_bar_capture_matches_eager(test, device):
     targets = model.joint_target_q.numpy().copy()
     targets[0] = 0.6
     control.joint_target_q.assign(targets)
-    eager = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1)
-    captured = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1)
+    eager = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
+    captured = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
     e0, e1 = model.state(), model.state()
     c0, c1 = model.state(), model.state()
 
@@ -139,7 +139,7 @@ def check_standalone_world_root_is_not_loop_joint(test, device, **solver_kwargs)
     model = b.finalize(device=device)
     test.assertEqual(model.joint_articulation.numpy().tolist(), [0, -1])
     test.assertEqual(standalone_joint, 1)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", **solver_kwargs)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", **solver_kwargs)
     test.assertEqual(solver._connect_count, 0)
     np.testing.assert_array_equal(solver._model_plan.loop_joint_articulation, np.array([-1, -1], dtype=np.int32))
 
@@ -196,7 +196,7 @@ def test_disabled_loop_joint_starts_released(test, device):
     """Start a loop joint disabled in Model.joint_enabled released, and engage it later."""
     b, _, load, joints = _build_carried_load(enabled=False, world_parent=True)
     model = b.finalize(device=device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.2)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16, baumgarte=0.2)
     state_0, state_1 = model.state(), model.state()
     z0 = float(state_0.body_q.numpy()[load, 2])
     for _ in range(48):
@@ -241,9 +241,9 @@ def test_imported_connect_equality_is_enforced(test, device):
         test.assertEqual(model.mujoco.equality_constraint_count, 1)
         if not convert:
             with test.assertRaisesRegex(NotImplementedError, "equality"):
-                SolverFeatherPGS(model, pgs_mode="matrix_free")
+                SolverFeatherPGS(model, solve_mode="matrix_free")
             continue
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16)
         test.assertEqual(solver._connect_count, 1)
         state_0, state_1 = model.state(), model.state()
         for _ in range(120):

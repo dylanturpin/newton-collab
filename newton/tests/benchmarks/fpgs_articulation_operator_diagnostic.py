@@ -153,14 +153,14 @@ def _make_solver(
     with kernel_overrides(overrides):
         return SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=0,
-            pgs_velocity_iterations=0,
+            iterations=0,
+            velocity_iterations=0,
             contact_friction_scale=1.0 if enable_contact_friction else 0.0,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
 
 

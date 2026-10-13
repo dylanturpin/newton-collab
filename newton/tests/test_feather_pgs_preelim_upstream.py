@@ -100,7 +100,7 @@ class TestPreeliminationKernels(unittest.TestCase):
         self.assertGreater(residual, 0.0)
 
 
-def _run_four_bar(device, steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
+def _run_four_bar(device, steps: int = 720, crank_target: float = 0.6, iterations: int = 2, **solver_kwargs):
     """Drive the four-bar and track the worst loop-anchor gap.
 
     Runs at a low iteration count on purpose: with iterative connect rows the anchor gap
@@ -108,9 +108,7 @@ def _run_four_bar(device, steps: int = 720, crank_target: float = 0.6, pgs_itera
     keeps it small at the same budget.
     """
     model = _build_four_bar().finalize(device=device)
-    solver = SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=pgs_iterations, pgs_beta=0.1, **solver_kwargs
-    )
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=iterations, baumgarte=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -156,7 +154,7 @@ def test_mimic_held_at_low_iterations(test, device):
         builder.set_joint_mimic(1, 0, coeffs=(0.0, -1.0))
         model = builder.finalize(device=device)
         solver = SolverFeatherPGS(
-            model, pgs_mode="matrix_free", pgs_iterations=1, pgs_beta=0.1, enable_bilateral_preelimination=enabled
+            model, solve_mode="matrix_free", iterations=1, baumgarte=0.1, enable_bilateral_preelimination=enabled
         )
         test.assertEqual(solver._preelim_active, enabled)
         state_0, state_1 = model.state(), model.state()
@@ -195,10 +193,10 @@ def test_preelimination_with_free_body_in_world(test, device):
         model = builder.finalize(device=device)
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=2,
-            pgs_beta=0.1,
-            dense_max_constraints=64,
+            solve_mode="matrix_free",
+            iterations=2,
+            baumgarte=0.1,
+            articulation_constraint_max=64,
             enable_bilateral_preelimination=True,
         )
         test.assertTrue(solver._preelim_active)
@@ -229,10 +227,10 @@ def test_preelimination_capture_matches_eager(test, device):
     targets = model.joint_target_q.numpy().copy()
     targets[0] = 0.6
     control.joint_target_q.assign(targets)
-    options = {"pgs_iterations": 2, "pgs_beta": 0.1, "enable_bilateral_preelimination": True}
+    options = {"iterations": 2, "baumgarte": 0.1, "enable_bilateral_preelimination": True}
     eager, captured = (
-        SolverFeatherPGS(model, pgs_mode="matrix_free", **options),
-        SolverFeatherPGS(model, pgs_mode="matrix_free", **options),
+        SolverFeatherPGS(model, solve_mode="matrix_free", **options),
+        SolverFeatherPGS(model, solve_mode="matrix_free", **options),
     )
     e0, e1 = model.state(), model.state()
     c0, c1 = model.state(), model.state()

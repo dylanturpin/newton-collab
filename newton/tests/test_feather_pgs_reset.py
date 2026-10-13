@@ -21,19 +21,19 @@ def _build_two_world_free_model(device):
     return builder.finalize(device=device)
 
 
-def _make_solver(model, *, pgs_mode: str, dense_warmstart: bool, mf_warmstart: bool):
+def _make_solver(model, *, solve_mode: str, dense_warmstart: bool, mf_warmstart: bool):
     return SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
-        pgs_warmstart=dense_warmstart or mf_warmstart,
-        dense_max_constraints=4,
-        mf_max_constraints=4,
+        solve_mode=solve_mode,
+        contact_warmstart=dense_warmstart or mf_warmstart,
+        articulation_constraint_max=4,
+        free_body_constraint_max=4,
     )
 
 
 def _history_specs(solver):
     specs = []
-    if solver.pgs_warmstart:
+    if solver.contact_warmstart:
         specs.append(("dense impulses", solver.impulses, 7.0, 0.0))
     if solver._ws_prev_mf_impulses is not None:
         specs.extend(
@@ -63,7 +63,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_model_changes_invalidate_impulses_without_clearing_overflow(self):
         """Invalidate changed-model impulses while retaining invalid-transition status."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
         for flags in (
             newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
             newton.ModelFlags.JOINT_DOF_PROPERTIES,
@@ -80,7 +80,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_model_change_world_mask_limits_impulse_invalidation(self):
         """Invalidate impulses only in the masked worlds, in either mask layout."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
         for mask in ((False, True), (False, True, False)):
             with self.subTest(mask=mask):
                 specs = _history_specs(solver)
@@ -96,12 +96,12 @@ class TestFeatherPGSReset(unittest.TestCase):
             ("combined selected", "split", True, True, (True, False)),
             ("combined all", "split", True, True, (True, True)),
         )
-        for name, pgs_mode, dense_warmstart, mf_warmstart, reset_worlds in cases:
+        for name, solve_mode, dense_warmstart, mf_warmstart, reset_worlds in cases:
             with self.subTest(name=name):
                 model = _build_two_world_free_model("cpu")
                 solver = _make_solver(
                     model,
-                    pgs_mode=pgs_mode,
+                    solve_mode=solve_mode,
                     dense_warmstart=dense_warmstart,
                     mf_warmstart=mf_warmstart,
                 )
@@ -115,7 +115,7 @@ class TestFeatherPGSReset(unittest.TestCase):
 
     def test_reset_validates_mask_before_disabled_noop(self):
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", dense_warmstart=False, mf_warmstart=False)
+        solver = _make_solver(model, solve_mode="split", dense_warmstart=False, mf_warmstart=False)
         solver.impulses.fill_(17.0)
         before = solver.impulses.numpy().copy()
 
@@ -132,7 +132,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_reset_is_cuda_graph_capturable(self):
         device = wp.get_device("cuda:0")
         model = _build_two_world_free_model(device)
-        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
         state = model.state()
         mask = wp.array((True, False), dtype=wp.bool, device=device)
         specs = _history_specs(solver)

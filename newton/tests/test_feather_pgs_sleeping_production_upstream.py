@@ -13,12 +13,12 @@ from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
 # A manipulation profile without contact torsion; the torsion variant is in test_feather_pgs_sleeping_torsion.
 PROFILE = {
-    "pgs_iterations": 32,
-    "pgs_contact_regularization": 0.01,
+    "iterations": 32,
+    "contact_regularization": 0.01,
     "friction_anchor_beta": 0.2,
     "contact_friction_gap_threshold": 0.001,
-    "dense_max_constraints": 512,
-    "mf_max_constraints": 512,
+    "articulation_constraint_max": 512,
+    "free_body_constraint_max": 512,
     "enable_sleeping": True,
     "sleep_quiet_time": 0.1,
 }
@@ -122,7 +122,7 @@ def _articulations(device, tiles=False, profile=None):
     model = builder.finalize(device=device)
     # Deterministic contact order, as in production, so A/B trajectories compare bitwise.
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", **(profile or PROFILE))
+    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", **(profile or PROFILE))
     return model, pipeline, solver, [model.state(), model.state()], model.control()
 
 

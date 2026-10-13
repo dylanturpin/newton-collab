@@ -14,14 +14,14 @@ import newton
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 240.0
-PROPAGATION_RESPONSES = ("propagation", "propagation-fused")
-REGULARIZED = {"pgs_beta": 0.0, "pgs_cfm": 0.0, "pgs_contact_regularization": 3.0}
+PROPAGATION_RESPONSES = ("propagation", "propagation_fused")
+REGULARIZED = {"baumgarte": 0.0, "cfm": 0.0, "contact_regularization": 3.0}
 # (articulated_contact_response, propagation_cached_response)
 PROPAGATION_ROUTES = (
     ("propagation", False),
-    ("propagation-fused", False),
+    ("propagation_fused", False),
     ("propagation", True),
-    ("propagation-colored", False),
+    ("propagation_colored", False),
 )
 
 
@@ -77,13 +77,13 @@ def _three_foot_slider_model(device):
 def _solver(model, response, iterations, cached=False, **kwargs):
     return SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=response,
         propagation_cached_response=cached,
         friction_anchor_beta=0.0,
-        dense_max_constraints=96,
-        mf_max_constraints=96,
-        pgs_iterations=iterations,
+        articulation_constraint_max=96,
+        free_body_constraint_max=96,
+        iterations=iterations,
         **kwargs,
     )
 
@@ -110,7 +110,7 @@ class TestPropagationCoupledContacts(unittest.TestCase):
         for response in PROPAGATION_RESPONSES:
             for iterations in (1, 2, 12, 13):
                 with self.subTest(response=response, iterations=iterations):
-                    solver = _solver(model, response, iterations, pgs_beta=0.0, pgs_cfm=0.0)
+                    solver = _solver(model, response, iterations, baumgarte=0.0, cfm=0.0)
                     (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
                     self.assertLess(abs(float(qd[0])), 1.0e-3)
 

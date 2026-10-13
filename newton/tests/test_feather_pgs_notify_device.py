@@ -27,7 +27,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Refresh the effective armature and its size groups exactly as a host rebuild would."""
         device = wp.get_device()
         model = _build_model(device)
-        options = {"pgs_mode": "matrix_free", "enable_joint_friction": True} if device.is_cuda else {}
+        options = {"solve_mode": "matrix_free", "enable_joint_friction": True} if device.is_cuda else {}
         solver = SolverFeatherPGS(model, **options)
         rng = np.random.default_rng(0)
         model.joint_armature.assign(rng.uniform(0.0, 0.5, model.joint_dof_count).astype(np.float32))
@@ -77,7 +77,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Replay a captured notify and pick up armature and geometry written after the capture."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True, friction_anchor_beta=0.2)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True, friction_anchor_beta=0.2)
         patches = solver._friction_patches
         flags = (
             ModelFlags.JOINT_PROPERTIES
@@ -98,7 +98,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         model.shape_scale.assign(scale)
         wp.capture_launch(capture.graph)
         _assert_armature_matches(
-            self, solver, SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+            self, solver, SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         )
         expected_radius, expected_valid, _ = _host_update_geometry(model, patches, seen, valid_before)
         np.testing.assert_array_equal(patches.body_radius.numpy(), expected_radius)
@@ -110,7 +110,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Replay a captured narrow-flag notify and pick up armature, damping, friction and materials edited in place."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         flags = (
             ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
             | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
@@ -132,7 +132,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         for name in materials:
             edited[name] = rng.uniform(0.01, 0.9, model.shape_count).astype(np.float32)
             getattr(model, name).assign(edited[name])
-        fresh = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        fresh = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         revolute, _ = _friction_dofs(model)
         friction = np.zeros(model.joint_dof_count, dtype=np.float32)
         friction[revolute[2]] = -1.0
@@ -151,7 +151,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Latch the world of each invalid coefficient on replay and report it outside capture."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, free = _friction_dofs(model)
@@ -178,7 +178,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Keep the flag through later valid replays and resets until the host reports it once."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, _ = _friction_dofs(model)
@@ -200,7 +200,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Leave the flag clear for valid coefficients, including zero and supported nonzero values."""
         device = wp.get_device("cuda:0")
         model = _build_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, _ = _friction_dofs(model)
@@ -219,7 +219,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
     def test_eager_notify_raises_for_invalid_joint_friction(self):
         """Raise from an eager notify after applying it, and accept the next valid notify."""
         model = _build_model(wp.get_device("cuda:0"))
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         revolute, _ = _friction_dofs(model)
         model.joint_armature.fill_(0.3)
         friction = np.zeros(model.joint_dof_count, dtype=np.float32)
@@ -237,7 +237,7 @@ class TestFeatherPGSNotifyDevice(unittest.TestCase):
         """Attribute loop-closing and global DOFs to their solver world in a sparse layout."""
         device = wp.get_device("cuda:0")
         model, dofs = _build_loop_model(device)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_friction=True)
         self.assertEqual(solver.world_count, 3)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)

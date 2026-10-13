@@ -32,7 +32,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
                 body_pair_hysteresis=0.001,
             ),
         )
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True)
         state, output = model.state(), model.state()
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
@@ -72,7 +72,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device=device)
         model.shape_material_mu.fill_(1.0)
-        solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=0)
+        solver = SolverFeatherPGS(model, contact_warmstart=True, iterations=0)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()
@@ -188,7 +188,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         builder.add_ground_plane()
         _cylinder_foot(builder, wp.vec3(0.0, 0.0, 0.015))
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=8)
+        solver = SolverFeatherPGS(model, contact_warmstart=True, iterations=8)
         pipeline = newton.CollisionPipeline(
             model,
             contact_matching="latest",

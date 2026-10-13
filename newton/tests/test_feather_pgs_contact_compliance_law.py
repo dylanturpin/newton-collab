@@ -40,15 +40,15 @@ class TestContactComplianceLaw(unittest.TestCase):
         """Reject settings whose update law has not been wired or validated."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for key, value in (
-            ("articulated_contact_response", "propagation-colored"),
-            ("pgs_velocity_iterations", 1),
-            ("pgs_contact_regularization", 0.01),
-            ("pgs_warmstart", True),
+            ("articulated_contact_response", "propagation_colored"),
+            ("velocity_iterations", 1),
+            ("contact_regularization", 0.01),
+            ("contact_warmstart", True),
             ("enable_restitution", True),
             ("friction_mode", "coulomb_newton"),
             ("contact_friction_shared_anchor", True),
         ):
-            kwargs = {"pgs_mode": "matrix_free", "enable_restitution": False, key: value}
+            kwargs = {"solve_mode": "matrix_free", "enable_restitution": False, key: value}
             with self.assertRaisesRegex(ValueError, key):
                 SolverFeatherPGS(model, contact_compliance=True, **kwargs)
 

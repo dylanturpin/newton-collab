@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the FeatherPGS contact regularizer (``pgs_contact_regularization``)."""
+"""Tests for the FeatherPGS contact regularizer (``contact_regularization``)."""
 
 import unittest
 
@@ -67,14 +67,14 @@ def _resting_box(device, g, rate, frames, articulated=False, **solver_kwargs):
         contact_matching="latest",
     )
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=12, pgs_contact_regularization=g, **solver_kwargs
+        model, solve_mode="matrix_free", iterations=12, contact_regularization=g, **solver_kwargs
     )
     _, zs = _run(model, pipeline, solver, frames, dt=1.0 / rate)
     return 0.05 - zs[-1]
 
 
 def _sag_formula(g, rate):
-    """Resting sag of a body under gravity: ``g * a * dt^2 / pgs_beta`` with the default beta."""
+    """Resting sag of a body under gravity: ``g * a * dt^2 / baumgarte`` with the default beta."""
     return g * 9.81 / (rate * rate) / 0.2
 
 
@@ -83,12 +83,12 @@ def _scissor_step(device, g, velocity_iterations):
     model = _build_scissor_model(device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        pgs_iterations=8,
-        pgs_velocity_iterations=velocity_iterations,
-        pgs_contact_regularization=g,
-        dense_max_constraints=64,
-        mf_max_constraints=16,
+        solve_mode="matrix_free",
+        iterations=8,
+        velocity_iterations=velocity_iterations,
+        contact_regularization=g,
+        articulation_constraint_max=64,
+        free_body_constraint_max=16,
     )
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -108,10 +108,10 @@ def test_regularization_documented_sag_on_dense_rows(test: unittest.TestCase, de
     ``lambda = m * a * dt / 4``, so it sags by ``g * a * dt^2 / (4 * beta)``.
     """
     for rate in (60, 240):
-        sag = _resting_box(device, 0.5, rate, 3 * rate, articulated=True, pgs_warmstart=True)
+        sag = _resting_box(device, 0.5, rate, 3 * rate, articulated=True, contact_warmstart=True)
         expected = 0.25 * _sag_formula(0.5, rate)
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
-        rigid = _resting_box(device, 0.0, rate, 3 * rate, articulated=True, pgs_warmstart=True)
+        rigid = _resting_box(device, 0.0, rate, 3 * rate, articulated=True, contact_warmstart=True)
         test.assertLess(abs(rigid), 0.1 * expected, msg=f"{rate} Hz: rigid sag {rigid * 1000:.3f} mm")
 
 

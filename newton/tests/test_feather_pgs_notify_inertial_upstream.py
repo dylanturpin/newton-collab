@@ -44,10 +44,10 @@ def _build_model(device, com=None):
     return model
 
 
-def test_step_refreshes_reused_state_after_joint_q_write(test, device, pgs_mode="matrix_free"):
+def test_step_refreshes_reused_state_after_joint_q_write(test, device, solve_mode="matrix_free"):
     """Pick up a joint_q write into a state the solver produced on the previous step."""
     model = _build_model(device)
-    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     solver.step(state_0, state_1, control, None, DT)
@@ -61,17 +61,17 @@ def test_step_refreshes_reused_state_after_joint_q_write(test, device, pgs_mode=
     reference_state.joint_q.assign(state_1.joint_q)
     reference_state.joint_qd.assign(state_1.joint_qd)
     reference_out = reference_model.state()
-    SolverFeatherPGS(reference_model, pgs_mode=pgs_mode).step(
+    SolverFeatherPGS(reference_model, solve_mode=solve_mode).step(
         reference_state, reference_out, reference_model.control(), None, DT
     )
     np.testing.assert_allclose(state_0.joint_q.numpy(), reference_out.joint_q.numpy(), rtol=0.0, atol=1.0e-6)
     np.testing.assert_allclose(state_0.body_q.numpy(), reference_out.body_q.numpy(), rtol=0.0, atol=1.0e-6)
 
 
-def test_kinematic_flag_change_is_picked_up(test, device, pgs_mode="matrix_free"):
+def test_kinematic_flag_change_is_picked_up(test, device, solve_mode="matrix_free"):
     """Hold a body still once it is flagged kinematic and the solver is notified."""
     model = _build_model(device, com=NEW_COM)
-    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode)
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     control = model.control()
@@ -96,7 +96,7 @@ for _name in (
 ):
     add_function_test(TestFeatherPGSNotifyInertial, _name, globals()[_name], devices=devices)
     add_function_test(
-        TestFeatherPGSNotifyInertial, f"{_name}_split", globals()[_name], devices=get_test_devices(), pgs_mode="split"
+        TestFeatherPGSNotifyInertial, f"{_name}_split", globals()[_name], devices=get_test_devices(), solve_mode="split"
     )
 
 

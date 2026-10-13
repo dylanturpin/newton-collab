@@ -174,21 +174,21 @@ class TestFeatherPGSRowAllocation(unittest.TestCase):
         model.rigid_contact_max = 256
         dense_routed = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            dense_max_constraints=320,
-            mf_max_constraints=256,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            articulation_constraint_max=320,
+            free_body_constraint_max=256,
         )
-        self.assertEqual(int(dense_routed.dense_max_constraints), 320)
+        self.assertEqual(int(dense_routed.articulation_constraint_max), 320)
         propagation_routed = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            dense_max_constraints=320,
-            mf_max_constraints=256,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            articulation_constraint_max=320,
+            free_body_constraint_max=256,
             propagation_same_articulation_rows=True,
         )
-        self.assertLess(int(propagation_routed.dense_max_constraints), 320)
+        self.assertLess(int(propagation_routed.articulation_constraint_max), 320)
 
 
 if __name__ == "__main__":

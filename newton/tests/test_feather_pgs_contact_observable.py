@@ -60,8 +60,8 @@ def _check_rows(test, contacts, contact_f):
 def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **options):
     """Report linear-only per-contact forces that sum to each box's weight at rest."""
     model, pipeline = _stacked_boxes(device)
-    options.setdefault("pgs_mode", "matrix_free")
-    solver = SolverFeatherPGS(model, pgs_iterations=32, **options)
+    options.setdefault("solve_mode", "matrix_free")
+    solver = SolverFeatherPGS(model, iterations=32, **options)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     test.assertEqual(observables.contact_f.shape[0], model.rigid_contact_max + model.soft_contact_max)
     observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
@@ -75,7 +75,7 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **op
     contact_f = observables.contact_f.numpy()
     # The SolverBase signature, which also passes the state.
     _check_rows(test, contacts, contact_f)
-    if options.get("mf_max_constraints") is not None:
+    if options.get("free_body_constraint_max") is not None:
         # Rows beyond the capacity were dropped; those contacts report zero.
         count = int(contacts.rigid_contact_count.numpy()[0])
         dropped = solver.contact_slot.numpy()[:count] < 0
@@ -91,7 +91,7 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, **op
 def test_unrequested_contact_f_is_left_untouched(test, device):
     """Write nothing when the observable is allocated but not selected for the step."""
     model, pipeline = _stacked_boxes(device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split")
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free" if wp.get_device(device).is_cuda else "split")
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     contacts = pipeline.contacts()
@@ -106,7 +106,7 @@ def test_unrequested_contact_f_is_left_untouched(test, device):
 def test_contact_f_in_a_captured_graph(test, device):
     """Write the observable from the replayed step's impulses in a captured graph."""
     model, pipeline = _stacked_boxes(device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=32)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=32)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
     states = [model.state(), model.state()]
@@ -135,8 +135,8 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        pgs_iterations=32,
+        solve_mode="matrix_free",
+        iterations=32,
         enable_sleeping=True,
         sleep_quiet_time=0.05,
         sleep_skip_constraints=skip_constraints,
@@ -196,12 +196,12 @@ def test_contact_f_of_compliant_hydroelastic_rows(test, device):
         )
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             contact_compliance=True,
             enable_restitution=False,
             friction_anchor_beta=0.0,
-            pgs_iterations=64,
-            mf_max_constraints=2048,
+            iterations=64,
+            free_body_constraint_max=2048,
         )
         observables = solver.observables({SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
@@ -225,8 +225,8 @@ def test_overflowing_contact_count_stays_in_the_rigid_rows(test, device, capture
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
     model = builder.finalize(device=device)
     # Built before the pipeline, the solver's contact scratch is larger than the contact buffer.
-    pgs_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
-    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, warn_constraint_overflow=False)
+    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode, warn_constraint_overflow=False)
     rigid_capacity, soft_capacity = 4, 2
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_capacity, soft_contact_max=soft_capacity)
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
@@ -326,17 +326,17 @@ add_function_test(
     "test_contact_f_matches_legacy_force_and_weight_split",
     test_contact_f_matches_legacy_force_and_weight,
     devices=all_devices,
-    pgs_mode="split",
+    solve_mode="split",
 )
 for _suffix, _options in (
     ("propagation", {"articulated_contact_response": "propagation"}),
-    ("propagation_fused", {"articulated_contact_response": "propagation-fused"}),
-    ("propagation_colored", {"articulated_contact_response": "propagation-colored"}),
+    ("propagation_fused", {"articulated_contact_response": "propagation_fused"}),
+    ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
     ("point_friction", {"friction_anchor_beta": 0.0}),
     ("torsion", {"contact_torsion_radius": 0.01}),
     ("device_torsion", {"contact_torsion_radius": 0.01, "contact_torsion_device": True}),
     ("double_buffer", {"double_buffer": True}),
-    ("row_overflow", {"mf_max_constraints": 6, "warn_constraint_overflow": False}),
+    ("row_overflow", {"free_body_constraint_max": 6, "warn_constraint_overflow": False}),
 ):
     add_function_test(
         TestFeatherPGSContactObservable,

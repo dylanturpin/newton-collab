@@ -93,15 +93,15 @@ def _build_model(*, free_count=0, free_first=False, robot_count=1, prescribed=Fa
 def _make_solver(model, sparse, **overrides):
     """Change only the representation selection between comparison solvers."""
     options = {
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
         "friction_mode": "current",
-        "pgs_iterations": 32,
+        "iterations": 32,
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,
-        "pgs_warmstart": False,
-        "dense_max_constraints": 32,
+        "contact_warmstart": False,
+        "articulation_constraint_max": 32,
         "use_parallel_streams": True,
         "double_buffer": False,
         "update_mass_matrix_interval": 4,
@@ -124,7 +124,7 @@ def _case(sparse, *, free_count=0, free_first=False, robot_count=1, prescribed=F
         model,
         sparse,
         **(
-            {"dense_max_constraints": 96 if robot_count > 1 else 64, "mf_max_constraints": 64}
+            {"articulation_constraint_max": 96 if robot_count > 1 else 64, "free_body_constraint_max": 64}
             if free_count or robot_count > 1
             else {}
         ),
@@ -239,7 +239,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
         for world in range(solver.world_count):
             count = int(counts[world])
-            self.assertLessEqual(count, solver.dense_max_constraints)
+            self.assertLessEqual(count, solver.articulation_constraint_max)
             self.assertTrue(np.isfinite(impulses[world, :count]).all())
             kinds = solver.row_type.numpy()[world, :count]
             unilateral = (kinds == PGS_CONSTRAINT_TYPE_CONTACT) | (kinds == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
@@ -512,8 +512,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for options in (
             {"contact_torsion_radius": 0.01},
             {"enable_joint_velocity_limits": True},
-            {"pgs_warmstart": True},
-            {"dense_max_constraints": 2048},
+            {"contact_warmstart": True},
+            {"articulation_constraint_max": 2048},
         ):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)

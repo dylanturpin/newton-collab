@@ -2152,7 +2152,7 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
    two shape coefficients, freezes incident relative normal velocity, and uses
    the rebound target only when a sufficiently fast contact is predicted to
    reach the surface during the timestep. Other rows retain their speculative
-   or Baumgarte law. ``pgs_velocity_iterations`` remains optional and exactly
+   or Baumgarte law. ``velocity_iterations`` remains optional and exactly
    user-controlled; positive values refine the velocity result but restitution
    never enables them implicitly. Coefficients are read while rebuilding rows,
    so in-place zero-to-positive material updates work under an already-captured

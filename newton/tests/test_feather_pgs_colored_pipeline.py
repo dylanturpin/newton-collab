@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the pipelined colored solve behind ``articulated_contact_response='propagation-colored'``.
+"""Tests for the pipelined colored solve behind ``articulated_contact_response='propagation_colored'``.
 
 The lane-per-unit colored kernel prefetches each unit's rows, keeps the unit's body
 twists in registers, solves standard units on a straight-line path, and, for a few
@@ -38,12 +38,12 @@ def _solver(model, env, regularization=0.0):
                 os.environ.pop(key, None)
         return newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            pgs_iterations=8,
-            mf_max_constraints=8192,
-            dense_max_constraints=64,
-            pgs_contact_regularization=regularization,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            iterations=8,
+            free_body_constraint_max=8192,
+            articulation_constraint_max=64,
+            contact_regularization=regularization,
         )
 
 
@@ -58,7 +58,7 @@ class TestFeatherPGSColoredStagingSelection(unittest.TestCase):
         self.assertFalse(_colored_staging_supported(120, 1, 1, 400), "staging must fit static shared memory")
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "propagation-colored requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "propagation_colored requires CUDA")
 class TestFeatherPGSColoredPipeline(unittest.TestCase):
     def test_pipelined_variants_match_the_reference_bitwise(self):
         """Prefetched and (where supported) staged sweeps match the reference unit body."""

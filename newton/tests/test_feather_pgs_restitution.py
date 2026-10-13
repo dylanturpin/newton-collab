@@ -32,16 +32,16 @@ PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
-RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
+RESPONSE_MODES = ("immediate", "propagation", "propagation_fused", "propagation_colored")
 EXPECTED_PATHS = {
     ("free", "immediate"): {PATH_MATRIX_FREE},
     ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation-fused"): {PATH_MATRIX_FREE},
-    ("free", "propagation-colored"): {PATH_PROPAGATION},
+    ("free", "propagation_fused"): {PATH_MATRIX_FREE},
+    ("free", "propagation_colored"): {PATH_PROPAGATION},
     ("articulated", "immediate"): {PATH_DENSE},
     ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation-fused"): {PATH_PROPAGATION},
-    ("articulated", "propagation-colored"): {PATH_PROPAGATION},
+    ("articulated", "propagation_fused"): {PATH_PROPAGATION},
+    ("articulated", "propagation_colored"): {PATH_PROPAGATION},
 }
 
 
@@ -121,22 +121,22 @@ def _make_solver(
     velocity_iterations=0,
     response="immediate",
     restitution_velocity_threshold=0.0,
-    pgs_iterations=16,
-    pgs_warmstart=False,
+    iterations=16,
+    contact_warmstart=False,
     mf_warmstart=False,
-    pgs_mode="matrix_free",
+    solve_mode="matrix_free",
 ):
     """Construct a deterministic frictionless FeatherPGS test solver."""
     kwargs = {
         "angular_damping": 0.0,
         "contact_friction_scale": 0.0,
-        "pgs_mode": pgs_mode,
+        "solve_mode": solve_mode,
         "articulated_contact_response": response,
-        "pgs_iterations": pgs_iterations,
-        "pgs_velocity_iterations": velocity_iterations,
-        "pgs_cfm": 0.0,
-        "pgs_omega": 1.0,
-        "pgs_warmstart": pgs_warmstart or mf_warmstart,
+        "iterations": iterations,
+        "velocity_iterations": velocity_iterations,
+        "cfm": 0.0,
+        "relaxation": 1.0,
+        "contact_warmstart": contact_warmstart or mf_warmstart,
     }
     if enable_restitution is not None:
         kwargs["enable_restitution"] = enable_restitution
@@ -173,8 +173,8 @@ def _step_plane(
     enable_restitution=None,
     velocity_iterations=0,
     restitution_velocity_threshold=0.0,
-    pgs_iterations=16,
-    pgs_mode="matrix_free",
+    iterations=16,
+    solve_mode="matrix_free",
 ):
     """Run one sphere-plane step and return observable contact and state data."""
     model, body = _build_plane_model(
@@ -192,8 +192,8 @@ def _step_plane(
         response=response,
         enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
-        pgs_iterations=pgs_iterations,
-        pgs_mode=pgs_mode,
+        iterations=iterations,
+        solve_mode=solve_mode,
     )
     state_in, state_out = model.state(), model.state()
     vz = -speed if initial_vertical_velocity is None else initial_vertical_velocity
@@ -302,10 +302,10 @@ def test_crossing_result_is_invariant_to_dt_and_time_of_impact(test, device):
         (1.0e-2, 0.1),
         (1.0e-2, 0.9),
     )
-    for pgs_iterations in (1, 2, 8):
+    for iterations in (1, 2, 8):
         for dt, impact_fraction in cases:
-            label = f"iters={pgs_iterations}, dt={dt:g}, impact/dt={impact_fraction:g}"
-            with test.subTest(pgs_iterations=pgs_iterations, dt=dt, impact_fraction=impact_fraction):
+            label = f"iters={iterations}, dt={dt:g}, impact/dt={impact_fraction:g}"
+            with test.subTest(iterations=iterations, dt=dt, impact_fraction=impact_fraction):
                 separation = speed * dt * impact_fraction
                 result = _step_plane(
                     device,
@@ -313,7 +313,7 @@ def test_crossing_result_is_invariant_to_dt_and_time_of_impact(test, device):
                     speed=speed,
                     restitution=restitution,
                     dt=dt,
-                    pgs_iterations=pgs_iterations,
+                    iterations=iterations,
                 )
                 _assert_crossing_setup(test, result, separation, speed, dt, label)
                 _assert_velocity(test, result["after"], restitution * speed, speed, label)
@@ -333,8 +333,8 @@ def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
                 speed=speed,
                 restitution=restitution,
                 velocity_iterations=0,
-                pgs_iterations=8,
-                pgs_mode="split",
+                iterations=8,
+                solve_mode="split",
             )
             test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
             test.assertEqual(result["paths"], {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
@@ -706,7 +706,7 @@ def test_every_contact_response_route_enforces_restitution(test, device):
                     scene=scene,
                     response=response,
                     velocity_iterations=0,
-                    pgs_iterations=16,
+                    iterations=16,
                 )
                 _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
                 test.assertEqual(result["paths"], EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
@@ -722,7 +722,7 @@ def test_dense_and_production_split_modes_enforce_restitution_without_velocity_i
         ("split/free", "split", "free", PATH_MATRIX_FREE),
         ("split/articulated", "split", "articulated", PATH_DENSE),
     )
-    for label, pgs_mode, scene, expected_path in cases:
+    for label, solve_mode, scene, expected_path in cases:
         with test.subTest(case=label):
             result = _step_plane(
                 device,
@@ -731,8 +731,8 @@ def test_dense_and_production_split_modes_enforce_restitution_without_velocity_i
                 restitution=restitution,
                 scene=scene,
                 velocity_iterations=0,
-                pgs_iterations=16,
-                pgs_mode=pgs_mode,
+                iterations=16,
+                solve_mode=solve_mode,
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
             test.assertEqual(result["paths"], {expected_path}, f"{label}: wrong route")
@@ -804,10 +804,10 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.6,
     )
     solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(solver.pgs_velocity_iterations, 0)
+    test.assertEqual(solver.velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
-    test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.dense_max_constraints))
-    test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.mf_max_constraints))
+    test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.articulation_constraint_max))
+    test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.free_body_constraint_max))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -819,7 +819,7 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.0,
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
-    test.assertEqual(zero_solver.pgs_velocity_iterations, 0)
+    test.assertEqual(zero_solver.velocity_iterations, 0)
 
     zero_model.shape_material_restitution.fill_(0.6)
     zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
@@ -894,7 +894,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
         ("split MF", "split", "free", True, False, PATH_MATRIX_FREE),
         ("split dense", "split", "articulated", False, True, PATH_DENSE),
     )
-    for label, pgs_mode, scene, mf_warmstart, pgs_warmstart, expected_path in cases:
+    for label, solve_mode, scene, mf_warmstart, contact_warmstart, expected_path in cases:
         with test.subTest(warmstart=label):
             model, body = _build_plane_model(
                 device,
@@ -906,8 +906,8 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
                 model,
                 velocity_iterations=0,
                 mf_warmstart=mf_warmstart,
-                pgs_warmstart=pgs_warmstart,
-                pgs_mode=pgs_mode,
+                contact_warmstart=contact_warmstart,
+                solve_mode=solve_mode,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
             contacts = pipeline.contacts()
@@ -962,7 +962,7 @@ def test_redundant_box_contacts_do_not_multiply_restitution_energy(test, device)
     builder.add_shape_box(body, hx=hx, hy=hy, hz=hz, cfg=cfg)
     builder.add_ground_plane(cfg=cfg)
     model = builder.finalize(device=device)
-    solver = _make_solver(model, velocity_iterations=32, pgs_iterations=32)
+    solver = _make_solver(model, velocity_iterations=32, iterations=32)
     state_in, state_out = model.state(), model.state()
     _reset_state(model, state_in, -speed)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
@@ -1005,7 +1005,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
     inertia = _diagonal_inertia(0.02)
 
     for joint_kind in ("fixed", "revolute"):
-        for response in ("immediate", "propagation-fused", "propagation-colored"):
+        for response in ("immediate", "propagation_fused", "propagation_colored"):
             with test.subTest(joint=joint_kind, response=response):
                 builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
                 xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
@@ -1040,7 +1040,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
                     model,
                     response=response,
                     velocity_iterations=0,
-                    pgs_iterations=16,
+                    iterations=16,
                 )
                 state_in, state_out = model.state(), model.state()
                 _reset_state(model, state_in, -speed)
@@ -1122,7 +1122,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     test.assertAlmostEqual(graph_velocity, eager_velocity, delta=1.0e-6, msg="captured and eager steps diverged")
 
 
-def test_notify_reads_replaced_and_in_place_restitution(test, device, pgs_mode="matrix_free"):
+def test_notify_reads_replaced_and_in_place_restitution(test, device, solve_mode="matrix_free"):
     """Match a fresh solver after a SHAPE_PROPERTIES notify, eagerly and in a captured graph."""
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
@@ -1133,7 +1133,7 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device, pgs_mode="
         label = f"{scene} e={old}->{new} {'replaced' if replace else 'in place'} {'captured' if capture else 'eager'}"
         with test.subTest(label):
             model, body = _build_plane_model(device, separation=separation, restitution=old, scene=scene)
-            solver = _make_solver(model, pgs_mode=pgs_mode)
+            solver = _make_solver(model, solve_mode=solve_mode)
             state_in, state_out = model.state(), model.state()
             _reset_state(model, state_in, -speed)
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
@@ -1157,7 +1157,7 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device, pgs_mode="
                 solver.step(state_in, state_out, control, contacts, DEFAULT_DT)
 
             reference = model.state()
-            _make_solver(model, pgs_mode=pgs_mode).step(state_in, reference, control, contacts, DEFAULT_DT)
+            _make_solver(model, solve_mode=solve_mode).step(state_in, reference, control, contacts, DEFAULT_DT)
             count = int(contacts.rigid_contact_count.numpy()[0])
             paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
             test.assertEqual(count, 1, f"{label}: expected one contact")
@@ -1203,7 +1203,7 @@ add_function_test(
     "test_notify_reads_replaced_and_in_place_restitution_split",
     test_notify_reads_replaced_and_in_place_restitution,
     devices=get_test_devices(),
-    pgs_mode="split",
+    solve_mode="split",
 )
 
 

@@ -103,13 +103,13 @@ def run(
     model.rigid_contact_max = worlds * tiles * tiles * 4
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        pgs_iterations=32,
-        pgs_beta=0.05,
-        pgs_warmstart=warmstart,
+        solve_mode="matrix_free",
+        iterations=32,
+        baumgarte=0.05,
+        contact_warmstart=warmstart,
         **({"friction_anchor_beta": beta} if beta is not None else {}),
-        dense_max_constraints=32,
-        mf_max_constraints=max(256, 12 * tiles * tiles),
+        articulation_constraint_max=32,
+        free_body_constraint_max=max(256, 12 * tiles * tiles),
         warn_constraint_overflow=True,
     )
     pipeline = newton.CollisionPipeline(

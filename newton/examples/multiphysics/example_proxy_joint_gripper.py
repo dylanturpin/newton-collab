@@ -112,8 +112,8 @@ class Example:
             def rigid_factory(v):
                 return SolverFeatherPGS(
                     v,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=int(args.fpgs_iterations),
+                    solve_mode="matrix_free",
+                    iterations=int(args.fpgs_iterations),
                     enable_joint_limits=True,
                 )
 

@@ -22,10 +22,10 @@ def _box_on_ground(device, worlds=1):
     return builder.finalize(device=device)
 
 
-def test_capacity_failure_is_observable(test, device, pgs_mode="matrix_free"):
+def test_capacity_failure_is_observable(test, device, solve_mode="matrix_free"):
     """Flag dropped free-body contact rows until reset, without optional telemetry."""
     model = _box_on_ground(device)
-    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, mf_max_constraints=1, warn_constraint_overflow=False)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode, free_body_constraint_max=1, warn_constraint_overflow=False)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_in, state_out = model.state(), model.state()
@@ -57,7 +57,7 @@ for _name in ("test_capacity_failure_is_observable",):
         globals()[_name],
         devices=get_test_devices(),
         check_output=_name != "test_overflow_warning_is_printed_once",
-        pgs_mode="split",
+        solve_mode="split",
     )
 
 

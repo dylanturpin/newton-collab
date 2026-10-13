@@ -149,7 +149,7 @@ def test_runtime_coefficient_change(test, device):
     """Read joint-owned coefficients every step, also from a captured graph."""
     builder, _, follower = _build_two_revolute_chain(0.0, 1.0)
     model = builder.finalize(device=device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -180,12 +180,12 @@ def test_runtime_coefficient_change(test, device):
 
 
 def test_mimic_row_overflow_is_reported(test, device):
-    """Drop and flag a mimic row beyond dense_max_constraints rather than keep part of it."""
+    """Drop and flag a mimic row beyond articulation_constraint_max rather than keep part of it."""
     builder, _, _ = _build_two_revolute_chain(0.0, 1.0)
     model = builder.finalize(device=device)
     # A zero activation gap keeps the (far) joint-limit rows out of the single row slot.
-    options = {"dense_max_constraints": 1, "joint_limit_activation_gap": 0.0, "warn_constraint_overflow": False}
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", **options)
+    options = {"articulation_constraint_max": 1, "joint_limit_activation_gap": 0.0, "warn_constraint_overflow": False}
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
     test.assertEqual(int(solver.mimic_slot.numpy()[0]), 0)
@@ -196,7 +196,7 @@ def test_mimic_row_overflow_is_reported(test, device):
         # A second, consistent row on the other joint (identity coupling in both directions).
         builder.add_constraint_mimic(joint0=0, joint1=1, coef0=0.0, coef1=1.0)
     model = builder.finalize(device=device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", **options)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
     test.assertEqual(int(solver.constraint_count.numpy()[0]), 1)

@@ -50,7 +50,7 @@ def _run_press(
     steps: int,
     warm_kwargs: dict,
     contact_matching: str | None = "sticky",
-    pgs_mode: str = "matrix_free",
+    solve_mode: str = "matrix_free",
     articulated_contact_response: str = "immediate",
     propagation_cached_response: bool = True,
 ):
@@ -61,11 +61,11 @@ def _run_press(
     model = _build_press()
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
+        solve_mode=solve_mode,
         articulated_contact_response=articulated_contact_response,
         propagation_cached_response=propagation_cached_response,
-        pgs_iterations=8,
-        pgs_beta=0.1,
+        iterations=8,
+        baumgarte=0.1,
         **warm_kwargs,
     )
     pipeline_kwargs = {} if contact_matching is None else {"contact_matching": contact_matching}
@@ -318,28 +318,28 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
 
     def test_constructor_layout_and_decay_validation(self):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
-        start = parameters.index("pgs_warmstart")
+        start = parameters.index("contact_warmstart")
         self.assertEqual(
             parameters[start : start + 2],
-            ("pgs_warmstart", "pgs_mode"),
+            ("contact_warmstart", "solve_mode"),
         )
         self.assertGreater(
-            parameters.index("pgs_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
+            parameters.index("contact_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
         )
 
         model = newton.ModelBuilder().finalize(device="cpu")
         for value in (-1.0, float("inf"), float("nan")):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                newton.solvers.SolverFeatherPGS(model, pgs_warmstart_decay=value)
+                newton.solvers.SolverFeatherPGS(model, contact_warmstart_decay=value)
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="split", contact_warmstart=True)
         solver.step(model.state(), model.state(), model.control(), None, 1.0 / 60.0)
 
     def test_split_mode_holds_the_press(self):
         """The identity carry works on the CPU-supported dense-row route."""
-        impulses, speeds, _ = _run_press(120, {"pgs_warmstart": True}, pgs_mode="split")
+        impulses, speeds, _ = _run_press(120, {"contact_warmstart": True}, solve_mode="split")
         self.assertGreater(float(impulses[-1]), 0.0)
         self.assertLess(float(np.ptp(impulses[-10:])), 1.0e-5)
         self.assertLess(float(speeds[-10:].max()), 1.0e-4)
@@ -360,9 +360,9 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=8,
-            pgs_warmstart=True,
+            solve_mode="matrix_free",
+            iterations=8,
+            contact_warmstart=True,
         )
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -395,7 +395,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(match[b_contact]), 0)
         self.assertLess(int(match[a_contact]), 0)
 
-        solver.pgs_iterations = 0
+        solver.iterations = 0
         solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
         slots = solver.contact_slot.numpy()[:count]
         b_slot = int(slots[b_contact])
@@ -421,7 +421,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         stall = slice(120, None)  # well past touchdown + transient
 
         lam_cold, _speed_cold, _ = _run_press(steps, {})
-        lam_warm, speed_warm, state = _run_press(steps, {"pgs_warmstart": True})
+        lam_warm, speed_warm, state = _run_press(steps, {"contact_warmstart": True})
 
         self.assertTrue(np.isfinite(state.body_q.numpy()).all())
 
@@ -429,7 +429,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         warm_end = lam_warm[-10:].mean()
 
         # The solver installs carried impulses into the starting velocity
-        # (_stage6_apply_impulses_world under pgs_warmstart), so warm and cold
+        # (_stage6_apply_impulses_world under contact_warmstart), so warm and cold
         # must share an equilibrium. A duplicated velocity install shows
         # up here as a halved impulse ledger (measured 0.5x when the matched
         # path folded the seed a second time); a missing install shows up as an
@@ -451,7 +451,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         the stall both runs must agree on the joint position to sub-millimetre.
         """
         _, _, state_cold = _run_press(240, {})
-        _, _, state_warm = _run_press(240, {"pgs_warmstart": True})
+        _, _, state_warm = _run_press(240, {"contact_warmstart": True})
         q_cold = float(state_cold.joint_q.numpy()[0])
         q_warm = float(state_warm.joint_q.numpy()[0])
         self.assertAlmostEqual(q_warm, q_cold, delta=1.0e-3)
@@ -464,22 +464,22 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         silently reusing impulses by raw slot index.
         """
         with self.assertRaises(NotImplementedError):
-            _run_press(3, {"pgs_warmstart": True}, contact_matching=None)
+            _run_press(3, {"contact_warmstart": True}, contact_matching=None)
 
     def test_single_flag_enables_dense_and_mf_carry(self):
-        """pgs_warmstart=True is the single all-contact warm-start mode."""
+        """contact_warmstart=True is the single all-contact warm-start mode."""
         model = _build_press()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=4)
-        self.assertTrue(solver.pgs_warmstart)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True, iterations=4)
+        self.assertTrue(solver.contact_warmstart)
         self.assertTrue(solver._mf_warmstart_enabled)
 
     def test_propagation_routes_hold_static_press(self):
         """Serial, colored, and cached propagation install carried impulses once."""
         cases = (
             ("propagation", False),
-            ("propagation-colored", False),
-            ("propagation-colored", True),
-            ("propagation-fused", False),
+            ("propagation_colored", False),
+            ("propagation_colored", True),
+            ("propagation_fused", False),
         )
         for response, cached in cases:
             with self.subTest(response=response, cached=cached):
@@ -491,7 +491,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
                 )
                 warm, speed, state_warm = _run_press(
                     160,
-                    {"pgs_warmstart": True},
+                    {"contact_warmstart": True},
                     articulated_contact_response=response,
                     propagation_cached_response=cached,
                 )
@@ -527,7 +527,7 @@ def _insertion_after_solved_single_contact(articulated: bool):
     model = builder.finalize()
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
+    solver = newton.solvers.SolverFeatherPGS(model, iterations=8, contact_warmstart=True)
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     pipeline.collide(state_0, contacts)
@@ -561,7 +561,7 @@ def _seeded_sphere_impulses(solver, contacts, shapes, model, articulated, state_
     otherwise the caller has already stepped (for example by a graph replay).
     """
     if state_in is not None:
-        solver.pgs_iterations = 0
+        solver.iterations = 0
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
     count = int(contacts.rigid_contact_count.numpy()[0])
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
@@ -624,7 +624,7 @@ class TestFeatherPGSWarmstartProvenance(unittest.TestCase):
                     _insertion_after_solved_single_contact(articulated)
                 )
                 other = pipeline.contacts()
-                solver.pgs_iterations = 0
+                solver.iterations = 0
                 graphs = {}
                 with wp.ScopedCapture(device) as capture:
                     pipeline.collide(state_in, contacts)
@@ -720,7 +720,7 @@ def _resting_box_rows(device, articulated: bool):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=12)
+    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True, iterations=12)
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     control = model.control()
@@ -752,7 +752,7 @@ def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device
             settled = normal_load()
             test.assertGreater(settled, 0.0)
             # Without a sweep the solved impulses are the seeds.
-            solver.pgs_iterations = 0
+            solver.iterations = 0
             pipeline.collide(state_0, contacts)
             if captured:
                 with wp.ScopedCapture(device) as capture:

@@ -53,7 +53,7 @@ def scalar_hinv_jt():
         yield
 
 
-PROPAGATION_PATHS = ("propagation", "propagation-fused", "propagation-colored")
+PROPAGATION_PATHS = ("propagation", "propagation_fused", "propagation_colored")
 
 
 @dataclass(frozen=True)
@@ -532,8 +532,8 @@ def _run_case_path(
     repeats: int,
     warmups: int,
     dt: float,
-    pgs_iterations: int,
-    pgs_velocity_iterations: int,
+    iterations: int,
+    velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
     model: newton.Model | None = None,
@@ -560,15 +560,15 @@ def _run_case_path(
     with scalar_hinv_jt():
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=pgs_iterations,
-            pgs_velocity_iterations=pgs_velocity_iterations,
+            iterations=iterations,
+            velocity_iterations=velocity_iterations,
             contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             contact_friction_position_iterations=contact_friction_position_iterations,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
     wp.synchronize()
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
@@ -618,8 +618,8 @@ def _run_case_path(
         world_count=model.world_count,
         body_count=model.body_count,
         joint_dof_count=model.joint_dof_count,
-        dense_row_capacity=int(solver.dense_max_constraints),
-        mf_row_capacity=int(solver.mf_max_constraints),
+        dense_row_capacity=int(solver.articulation_constraint_max),
+        mf_row_capacity=int(solver.free_body_constraint_max),
         propagation_row_capacity=int(getattr(solver, "propagation_max_constraints", propagation_capacity)),
         dense_rows_total=int(np.sum(dense_counts)),
         dense_rows_max_world=int(np.max(dense_counts)) if dense_counts.size else 0,
@@ -994,11 +994,11 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("This report uses real `SolverFeatherPGS.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
     lines.append("- `propagation`: fixed-size articulated contact rows plus tree response/propagation.")
-    lines.append("- `propagation-fused`: same response model with the fused propagation kernel where supported.")
+    lines.append("- `propagation_fused`: same response model with the fused propagation kernel where supported.")
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
-        f"dt {args.dt}, PGS iterations {args.pgs_iterations}, velocity iterations {args.pgs_velocity_iterations}, "
+        f"dt {args.dt}, PGS iterations {args.iterations}, velocity iterations {args.velocity_iterations}, "
         f"contact friction {'off' if args.no_friction else 'on'}, "
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
         f"scalar `H^-1 J^T` kernel pinned, "
@@ -1125,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("mf_immediate", *PROPAGATION_PATHS),
         default=None,
-        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation-fused.",
+        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation_fused.",
     )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument(
@@ -1174,7 +1174,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation-fused")
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation_fused")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:
@@ -1185,8 +1185,8 @@ def main() -> None:
                 repeats=args.repeats,
                 warmups=args.warmups,
                 dt=args.dt,
-                pgs_iterations=args.pgs_iterations,
-                pgs_velocity_iterations=args.pgs_velocity_iterations,
+                iterations=args.pgs_iterations,
+                velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
                 model=model,

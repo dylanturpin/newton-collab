@@ -535,7 +535,7 @@ class DeviceTorsionPreparation:
             setattr(w, name, wp.empty(self.capacity, dtype=float, device=device))
         for name in ("normal", "point"):
             setattr(w, name, wp.empty(self.capacity, dtype=wp.vec3, device=device))
-        shape = (solver.world_count, solver.dense_max_constraints)
+        shape = (solver.world_count, solver.articulation_constraint_max)
         w.row_contact = wp.full(shape, -1, dtype=int, device=device)
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver.world_count, dtype=int, device=device)
@@ -684,13 +684,13 @@ class DeviceTorsionPreparation:
             wp.launch(
                 _check_patch_membership,
                 dim=self.capacity,
-                inputs=[s.dense_max_constraints, s.row_parent, w],
+                inputs=[s.articulation_constraint_max, s.row_parent, w],
                 device=device,
             )
             wp.launch(
                 _emit_patches,
                 dim=s.world_count,
-                inputs=[self.capacity, s.dense_max_constraints, s.constraint_count, s._row_dropped_dense, w],
+                inputs=[self.capacity, s.articulation_constraint_max, s.constraint_count, s._row_dropped_dense, w],
                 device=device,
             )
         else:
@@ -700,7 +700,7 @@ class DeviceTorsionPreparation:
                 dim=s.world_count,
                 inputs=[
                     self.capacity,
-                    s.dense_max_constraints,
+                    s.articulation_constraint_max,
                     s.constraint_count,
                     s._row_dropped_dense,
                     s.row_mu,
@@ -715,7 +715,7 @@ class DeviceTorsionPreparation:
             dim=self.capacity,
             inputs=[
                 w,
-                s.pgs_cfm,
+                s.cfm,
                 s.body_to_articulation,
                 s._prescribed_articulation,
                 augmented_state.body_v_s,

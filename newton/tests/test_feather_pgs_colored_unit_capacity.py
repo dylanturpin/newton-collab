@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end coverage for mixed propagation-colored contact units."""
+"""End-to-end coverage for mixed propagation_colored contact units."""
 
 import unittest
 
@@ -47,13 +47,13 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=response,
-        pgs_iterations=8,
-        pgs_warmstart=False,
+        iterations=8,
+        contact_warmstart=False,
         propagation_cached_response=False,
-        dense_max_constraints=3,
-        mf_max_constraints=3,
+        articulation_constraint_max=3,
+        free_body_constraint_max=3,
         contact_friction_gap_threshold=FRICTION_GAP_THRESHOLD,
         contact_speculative_scale=0.0,
         use_parallel_streams=False,
@@ -123,13 +123,13 @@ def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, co
     test.assertEqual(sorted(ordered.tolist()), list(range(CONTACT_COUNT)))
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "propagation-colored requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "propagation_colored requires CUDA")
 class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
     def test_mixed_gap_matches_serial_propagation(self):
         """Match impulses, body velocity, and a short trajectory with mixed-length units."""
         device = "cuda:0"
         model = _build_mixed_gap_model(device)
-        colored = _make_solver(model, "propagation-colored")
+        colored = _make_solver(model, "propagation_colored")
         serial = _make_solver(model, "propagation")
         colored_in, colored_out = model.state(), model.state()
         serial_in, serial_out = model.state(), model.state()
@@ -175,8 +175,8 @@ class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
         """Replay a captured mixed-unit colored step with the same result as eager execution."""
         device = wp.get_device("cuda:0")
         model = _build_mixed_gap_model(str(device))
-        graph_solver = _make_solver(model, "propagation-colored")
-        eager_solver = _make_solver(model, "propagation-colored")
+        graph_solver = _make_solver(model, "propagation_colored")
+        eager_solver = _make_solver(model, "propagation_colored")
         graph_state, graph_out = model.state(), model.state()
         eager_state, eager_out = model.state(), model.state()
         initial_q, initial_qd = _seed_state(model, graph_state)

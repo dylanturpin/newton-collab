@@ -73,7 +73,7 @@ def test_sleeping_diagonal_dynamics_skip_is_exact(test, device):
     for skip in (False, True):
         model = _build_fixed_base_star_model(device, num_branches=3, ground=True)
         solver = SolverFeatherPGS(
-            model, pgs_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, dense_max_constraints=64
+            model, solve_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, articulation_constraint_max=64
         )
         test.assertTrue(solver._execution_plan.use_diagonal_mass(3))
         solver.sleeping.skip_dynamics = skip

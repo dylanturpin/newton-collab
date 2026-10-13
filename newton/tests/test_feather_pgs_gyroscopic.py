@@ -35,7 +35,7 @@ def test_free_spin_energy(test, device):
         if mode == "matrix_free" and not wp.get_device(device).is_cuda:
             continue
         model, state, output = _model(device, inertia, (100.0, 20.0, 50.0))
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=mode, angular_damping=0.0)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode=mode, angular_damping=0.0)
         control = model.control()
         omega = _body_omega(state)
         energy = 0.5 * omega @ inertia @ omega
@@ -176,7 +176,7 @@ def _mixed_scene(device, *, arm, totes):
     control = model.control()
     control.joint_target_q.fill_(0.1)
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split", angular_damping=0.0
+        model, solve_mode="matrix_free" if wp.get_device(device).is_cuda else "split", angular_damping=0.0
     )
     return model, solver, control, [state, output]
 

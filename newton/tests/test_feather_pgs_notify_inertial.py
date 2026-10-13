@@ -100,7 +100,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
             if caller_refreshes_fk:
                 newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
-            SolverFeatherPGS(model, pgs_mode="split").step(
+            SolverFeatherPGS(model, solve_mode="split").step(
                 state_0,
                 state_1,
                 model.control(),
@@ -195,12 +195,12 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         for mode in modes:
             reference_model = _build_model(device)
             shift_child_frame(reference_model)
-            reference_solver = SolverFeatherPGS(reference_model, pgs_mode=mode, update_mass_matrix_interval=interval)
+            reference_solver = SolverFeatherPGS(reference_model, solve_mode=mode, update_mass_matrix_interval=interval)
             reference = _run_trajectory(reference_model, reference_solver, 5)
             for capture in [False, True] if device.is_cuda else [False]:
                 with self.subTest(mode=mode, capture=capture):
                     model = _build_model(device)
-                    solver = SolverFeatherPGS(model, pgs_mode=mode, update_mass_matrix_interval=interval)
+                    solver = SolverFeatherPGS(model, solve_mode=mode, update_mass_matrix_interval=interval)
                     state_0, state_1 = model.state(), model.state()
                     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
                     control = model.control()
@@ -232,7 +232,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
 
 def _check_joint_dof_edit_matches_fresh_solver(test, device, name: str, value: float, flag):
     """Assign one joint DOF property after a step, notify ``flag``, and compare the next step to a fresh solver."""
-    pgs_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
     # Graph capture needs a CUDA device.
     for capture in (False, True) if wp.get_device(device).is_cuda else (False,):
         with test.subTest(capture=capture):
@@ -241,7 +241,7 @@ def _check_joint_dof_edit_matches_fresh_solver(test, device, name: str, value: f
             joint = builder.add_joint_prismatic(-1, link, axis=newton.Axis.X, target_kd=10.0, armature=0.0)
             builder.add_articulation([joint])
             model = builder.finalize(device=device)
-            solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, update_mass_matrix_interval=100)
+            solver = SolverFeatherPGS(model, solve_mode=solve_mode, update_mass_matrix_interval=100)
             state_0, state_1 = model.state(), model.state()
             state_0.joint_qd.fill_(1.0)
             control = model.control()
@@ -257,7 +257,7 @@ def _check_joint_dof_edit_matches_fresh_solver(test, device, name: str, value: f
             else:
                 solver.step(state_0, state_1, control, None, 0.01)
 
-            fresh = SolverFeatherPGS(model, pgs_mode=pgs_mode, update_mass_matrix_interval=100)
+            fresh = SolverFeatherPGS(model, solve_mode=solve_mode, update_mass_matrix_interval=100)
             fresh_out = model.state()
             fresh.step(state_0, fresh_out, control, None, 0.01)
             test.assertFalse(np.allclose(fresh_out.joint_qd.numpy(), stale_qd, atol=1.0e-4))
@@ -285,7 +285,7 @@ def test_dof_inertial_flag_refreshes_armature(test, device):
     )
 
 
-def _check_damping_edit_matches_fresh_solver(test, device, replace: bool, flag, pgs_mode: str):
+def _check_damping_edit_matches_fresh_solver(test, device, replace: bool, flag, solve_mode: str):
     """Edit joint damping after a step, notify, and compare the next eager or captured step to a fresh solver."""
     # Graph capture needs a CUDA device.
     for capture in (False, True) if wp.get_device(device).is_cuda else (False,):
@@ -295,7 +295,7 @@ def _check_damping_edit_matches_fresh_solver(test, device, replace: bool, flag, 
             joint = builder.add_joint_prismatic(-1, link, axis=newton.Axis.X, damping=1.0, armature=0.0)
             builder.add_articulation([joint])
             model = builder.finalize(device=device)
-            solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, update_mass_matrix_interval=100)
+            solver = SolverFeatherPGS(model, solve_mode=solve_mode, update_mass_matrix_interval=100)
             state_0, state_1 = model.state(), model.state()
             state_0.joint_qd.fill_(1.0)
             control = model.control()
@@ -314,14 +314,14 @@ def _check_damping_edit_matches_fresh_solver(test, device, replace: bool, flag, 
             else:
                 solver.step(state_0, state_1, control, None, 0.01)
 
-            fresh = SolverFeatherPGS(model, pgs_mode=pgs_mode, update_mass_matrix_interval=100)
+            fresh = SolverFeatherPGS(model, solve_mode=solve_mode, update_mass_matrix_interval=100)
             fresh_out = model.state()
             fresh.step(state_0, fresh_out, control, None, 0.01)
             test.assertFalse(np.allclose(fresh_out.joint_qd.numpy(), stale_qd, atol=1.0e-4))
             np.testing.assert_allclose(state_1.joint_qd.numpy(), fresh_out.joint_qd.numpy(), atol=1.0e-6)
 
 
-def _check_friction_edit_matches_fresh_solver(test, device, replace: bool, pgs_mode: str):
+def _check_friction_edit_matches_fresh_solver(test, device, replace: bool, solve_mode: str):
     """Edit shape friction after a step, notify, and compare the next eager or captured step to a fresh solver."""
     # Graph capture needs a CUDA device.
     for capture in (False, True) if wp.get_device(device).is_cuda else (False,):
@@ -332,7 +332,7 @@ def _check_friction_edit_matches_fresh_solver(test, device, replace: bool, pgs_m
             body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
             builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
             model = builder.finalize(device=device)
-            solver = SolverFeatherPGS(model, pgs_mode=pgs_mode)
+            solver = SolverFeatherPGS(model, solve_mode=solve_mode)
             state_0, state_1 = model.state(), model.state()
             state_0.joint_qd.assign([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
@@ -355,36 +355,36 @@ def _check_friction_edit_matches_fresh_solver(test, device, replace: bool, pgs_m
             else:
                 solver.step(state_0, state_1, control, contacts, DT)
 
-            fresh = SolverFeatherPGS(model, pgs_mode=pgs_mode)
+            fresh = SolverFeatherPGS(model, solve_mode=solve_mode)
             fresh_out = model.state()
             fresh.step(state_0, fresh_out, control, contacts, DT)
             test.assertLess(float(fresh_out.joint_qd.numpy()[0]), 0.95)
             np.testing.assert_allclose(state_1.joint_qd.numpy(), fresh_out.joint_qd.numpy(), atol=1.0e-5)
 
 
-def test_replaced_joint_damping_matches_fresh_solver(test, device, pgs_mode="matrix_free"):
+def test_replaced_joint_damping_matches_fresh_solver(test, device, solve_mode="matrix_free"):
     """Read a joint damping array replaced on the model at the next JOINT_DOF_PROPERTIES notify."""
-    _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_PROPERTIES, pgs_mode)
+    _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_PROPERTIES, solve_mode)
 
 
-def test_assigned_joint_damping_matches_fresh_solver(test, device, pgs_mode="matrix_free"):
+def test_assigned_joint_damping_matches_fresh_solver(test, device, solve_mode="matrix_free"):
     """Read joint damping modified in place at the next JOINT_DOF_PROPERTIES notify."""
-    _check_damping_edit_matches_fresh_solver(test, device, False, ModelFlags.JOINT_DOF_PROPERTIES, pgs_mode)
+    _check_damping_edit_matches_fresh_solver(test, device, False, ModelFlags.JOINT_DOF_PROPERTIES, solve_mode)
 
 
-def test_dof_force_flag_reads_replaced_joint_damping(test, device, pgs_mode="matrix_free"):
+def test_dof_force_flag_reads_replaced_joint_damping(test, device, solve_mode="matrix_free"):
     """Read a joint damping array replaced on the model at the next JOINT_DOF_FORCE_PROPERTIES notify."""
-    _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_FORCE_PROPERTIES, pgs_mode)
+    _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_FORCE_PROPERTIES, solve_mode)
 
 
-def test_replaced_shape_friction_matches_fresh_solver(test, device, pgs_mode="matrix_free"):
+def test_replaced_shape_friction_matches_fresh_solver(test, device, solve_mode="matrix_free"):
     """Read a friction array replaced on the model at the next SHAPE_PROPERTIES notify."""
-    _check_friction_edit_matches_fresh_solver(test, device, replace=True, pgs_mode=pgs_mode)
+    _check_friction_edit_matches_fresh_solver(test, device, replace=True, solve_mode=solve_mode)
 
 
-def test_assigned_shape_friction_matches_fresh_solver(test, device, pgs_mode="matrix_free"):
+def test_assigned_shape_friction_matches_fresh_solver(test, device, solve_mode="matrix_free"):
     """Read friction modified in place at the next SHAPE_PROPERTIES notify."""
-    _check_friction_edit_matches_fresh_solver(test, device, replace=False, pgs_mode=pgs_mode)
+    _check_friction_edit_matches_fresh_solver(test, device, replace=False, solve_mode=solve_mode)
 
 
 class TestFeatherPGSNarrowJointDofFlags(unittest.TestCase):
@@ -416,7 +416,7 @@ for _name in (
         f"{_name}_split",
         globals()[_name],
         devices=get_test_devices(),
-        pgs_mode="split",
+        solve_mode="split",
     )
 
 

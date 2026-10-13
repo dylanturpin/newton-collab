@@ -34,7 +34,7 @@ def _build_model(device):
 def _run(device, double_buffer, pause_between_steps, replays):
     """Capture two FPGS steps, optionally with a capture-pausing conditional node between them."""
     model = _build_model(device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", double_buffer=double_buffer)
+    solver = SolverFeatherPGS(model, solve_mode="matrix_free", double_buffer=double_buffer)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()

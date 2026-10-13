@@ -16,13 +16,13 @@ class TestTorsionCombined(unittest.TestCase):
     def check_pair(self, regularization, velocity, **options):
         """Check split position integration and the accumulated velocity correction."""
         common = dict(
-            pgs_iterations=64,
-            pgs_contact_regularization=regularization,
+            iterations=64,
+            contact_regularization=regularization,
             enable_bilateral_preelimination=False,
             **options,
         )
-        baseline, *_ = fixture(0.01, pgs_velocity_iterations=0, **common)
-        result, solver, model, state, contacts = fixture(0.01, pgs_velocity_iterations=velocity, **common)
+        baseline, *_ = fixture(0.01, velocity_iterations=0, **common)
+        result, solver, model, state, contacts = fixture(0.01, velocity_iterations=velocity, **common)
         np.testing.assert_array_equal(result["body_q"], baseline["body_q"])
         count = int(result["count"][0])
         delta = result["impulses"][0, :count] - baseline["impulses"][0, :count]

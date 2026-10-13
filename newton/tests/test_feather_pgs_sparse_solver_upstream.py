@@ -61,7 +61,7 @@ class TestFeatherPGSSparseSelectionGuard(unittest.TestCase):
         """Select sparse factors for the uncoupled Y tree used by the bilateral guard."""
         self.assertEqual(
             SolverFeatherPGS(
-                _build_y_tree("cuda:0"), pgs_mode="matrix_free", friction_anchor_beta=0.0
+                _build_y_tree("cuda:0"), solve_mode="matrix_free", friction_anchor_beta=0.0
             )._sparse_mass_matrix_size,
             3,
         )
@@ -75,7 +75,7 @@ class TestFeatherPGSSparseSelectionGuard(unittest.TestCase):
             ("disabled closure", {"closure": True, "closure_enabled": False}),
         ):
             with self.subTest(label):
-                solver = SolverFeatherPGS(_build_y_tree("cuda:0", **kwargs), pgs_mode="matrix_free")
+                solver = SolverFeatherPGS(_build_y_tree("cuda:0", **kwargs), solve_mode="matrix_free")
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertGreater(solver.J_by_size[3].size, 1)
 

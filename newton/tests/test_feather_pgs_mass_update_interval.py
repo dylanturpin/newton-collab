@@ -176,7 +176,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_split_fk_id_cache_does_not_alias_active_step_state(self):
         """Keep split-mode cached dynamics isolated from active solve scratch."""
         model = _build_floating_model("cuda:0")
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, solve_mode="split")
         state_in = _make_floating_state(model)
         state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
         cache = solver._fk_id_cache
@@ -198,7 +198,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
         """Keep matrix-free dynamics publication on its validated zero-copy path."""
         model = _build_floating_model("cuda:0")
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, solve_mode="matrix_free")
 
         self.assertTrue(solver._fk_id_cache_enabled)
         self.assertFalse(solver._fk_id_cache_uses_snapshot)
@@ -208,7 +208,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", enable_joint_velocity_limits=True)
         self.assertFalse(solver._fk_id_cache_enabled)
         self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
 
@@ -326,15 +326,15 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         FK/ID reuse path then consumes cleared body forces while its cache still reads valid.
         """
         warm_model = _build_model("cuda:0", ground=False)
-        warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
         warm_solver.step(_make_initial_state(warm_model), warm_model.state(), warm_model.control(), None, DT)
         wp.synchronize_device("cuda:0")
 
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
         # matrix_free keeps the zero-copy FK/ID reuse path; split restores its snapshot and would mask the defect.
-        graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
-        eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
+        eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
         self.assertTrue(graph_solver._fk_id_cache_enabled)
         self.assertFalse(graph_solver._fk_id_cache_uses_snapshot)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
@@ -370,8 +370,8 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         """
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        graph_solver = SolverFeatherPGS(graph_model, pgs_mode="matrix_free")
-        eager_solver = SolverFeatherPGS(eager_model, pgs_mode="matrix_free")
+        graph_solver = SolverFeatherPGS(graph_model, solve_mode="matrix_free")
+        eager_solver = SolverFeatherPGS(eager_model, solve_mode="matrix_free")
         self.assertTrue(graph_solver._fk_id_cache_enabled)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()

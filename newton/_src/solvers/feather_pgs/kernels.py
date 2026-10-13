@@ -42,7 +42,7 @@ PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
 # ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
 # same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
 # entries (+1 on the follower DOF, -coef1 on the leader DOF); lambda is
-# unbounded; drift is removed with the standard Baumgarte ``pgs_beta`` bias.
+# unbounded; drift is removed with the standard Baumgarte ``baumgarte`` bias.
 PGS_CONSTRAINT_TYPE_MIMIC = 5
 # Connect (loop-closure) row: one axis of the bilateral 3-DoF point-coincidence equality
 # ``p_anchor(parent) - p_anchor(child) = 0`` closing a kinematic loop between two links of
@@ -81,7 +81,7 @@ def local_solve_launch_gate():
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
-# :class:`~newton.solvers.SolverFeatherPGS` (``"current"`` /
+# :class:`~newton.solvers.SolverFeatherPGS` (``"fixed_normal"`` /
 # ``"bisection"`` / ``"bisection_desaxce"`` / ``"coulomb_newton"``).
 # The matrix-free kernel branches on the numeric id at each PGS row to
 # avoid duplicating the kernel body per friction strategy (see the
@@ -10083,7 +10083,7 @@ def friction_step_bisection(
     Drop-in replacement for :func:`friction_step_current` selected by
     ``friction_mode="bisection"`` (``use_de_saxce == 0``) or
     ``friction_mode="bisection_desaxce"`` (``use_de_saxce == 1``) on
-    ``pgs_mode="matrix_free"``.  Ported from the ``USE_BISECTION`` branch
+    ``solve_mode="matrix_free"``.  Ported from the ``USE_BISECTION`` branch
     of ``artifacts/2026-04-16-slack-raisim/repos/mmacklin-newton-solver-raisim
     /newton/_src/solvers/raisim/kernels.py`` (``gs_contact_sweep``, lines
     ~687-803).  The de Saxce branch augments the normal target velocity
@@ -10113,23 +10113,23 @@ def friction_step_bisection(
         world: World index for the current row.
         i: Constraint row index within the world.
         mf_body_a: Matrix-free body-a indices [shape: world_count,
-            mf_max_constraints].
+            free_body_constraint_max].
         mf_body_b: Matrix-free body-b indices [shape: world_count,
-            mf_max_constraints].
+            free_body_constraint_max].
         mf_J_a: Per-row Jacobian ``J`` for body a [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_J_b: Per-row Jacobian ``J`` for body b [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_MiJt_a: ``H^{-1} J^T`` for body a per row [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_MiJt_b: ``H^{-1} J^T`` for body b per row [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_row_parent: Parent normal-row index for each friction row
-            [shape: world_count, mf_max_constraints].
+            [shape: world_count, free_body_constraint_max].
         mf_row_mu: Coulomb friction coefficient per row [shape:
-            world_count, mf_max_constraints].
+            world_count, free_body_constraint_max].
         mf_rhs: Baumgarte normal-row bias ``b_n`` (and 0 on friction
-            rows) [shape: world_count, mf_max_constraints].
+            rows) [shape: world_count, free_body_constraint_max].
         body_to_articulation: Body-to-articulation index map.
         art_dof_start: First DOF index per articulation.
         use_de_saxce: When non-zero, augment the normal target velocity
@@ -10139,7 +10139,7 @@ def friction_step_bisection(
             ``USE_BISECTION + USE_DE_SAXCE`` branch.
         mf_impulses: Current matrix-free impulses; updated in place for
             the normal and second-friction siblings with the bisection
-            solution [shape: world_count, mf_max_constraints].
+            solution [shape: world_count, free_body_constraint_max].
         v_out: Generalized velocity buffer; updated in place with the
             normal and second-friction row velocity corrections [N].
 
@@ -10371,7 +10371,7 @@ def friction_step_coulomb_newton(
     """Gilles Daviet's 1D Coulomb Newton per-row friction step.
 
     Drop-in replacement for :func:`friction_step_current` selected by
-    ``friction_mode="coulomb_newton"`` on ``pgs_mode="matrix_free"``.
+    ``friction_mode="coulomb_newton"`` on ``solve_mode="matrix_free"``.
     FPGS Friction Modes 7/13.  Invokes :func:`solve_coulomb_row`
     (ported from ``coulomb_root_finding_warp.py``) on the per-contact
     3x3 effective-mass (Delassus) block and rewrites the contact
@@ -10421,28 +10421,28 @@ def friction_step_coulomb_newton(
         world: World index for the current row.
         i: Constraint row index within the world.
         mf_body_a: Matrix-free body-a indices [shape: world_count,
-            mf_max_constraints].
+            free_body_constraint_max].
         mf_body_b: Matrix-free body-b indices [shape: world_count,
-            mf_max_constraints].
+            free_body_constraint_max].
         mf_J_a: Per-row Jacobian ``J`` for body a [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_J_b: Per-row Jacobian ``J`` for body b [shape: world_count,
-            mf_max_constraints, 6].
+            free_body_constraint_max, 6].
         mf_MiJt_a: ``H^{-1} J^T`` for body a per row [shape:
-            world_count, mf_max_constraints, 6].
+            world_count, free_body_constraint_max, 6].
         mf_MiJt_b: ``H^{-1} J^T`` for body b per row [shape:
-            world_count, mf_max_constraints, 6].
+            world_count, free_body_constraint_max, 6].
         mf_row_parent: Parent normal-row index for each friction row
-            [shape: world_count, mf_max_constraints].
+            [shape: world_count, free_body_constraint_max].
         mf_row_mu: Coulomb friction coefficient per row [shape:
-            world_count, mf_max_constraints].
+            world_count, free_body_constraint_max].
         mf_rhs: Baumgarte normal-row bias ``beta * phi / dt`` (and 0
-            on friction rows) [shape: world_count, mf_max_constraints].
+            on friction rows) [shape: world_count, free_body_constraint_max].
         body_to_articulation: Body-to-articulation index map.
         art_dof_start: First DOF index per articulation.
         mf_impulses: Current matrix-free impulses; updated in place
             for the normal and second-friction siblings with the
-            Newton solution [shape: world_count, mf_max_constraints].
+            Newton solution [shape: world_count, free_body_constraint_max].
         v_out: Generalized velocity buffer; updated in place with the
             normal and second-friction row velocity corrections [N].
 
@@ -10738,7 +10738,7 @@ def finalize_mf_constraint_counts(
 ):
     """Turn the monotone MF slot counter into the row count.
 
-    Truncates at the first rejected reservation and at ``mf_max_constraints``
+    Truncates at the first rejected reservation and at ``free_body_constraint_max``
     (see :func:`finalize_world_constraint_counts`). ``slots_per_contact`` is
     kept for call-site compatibility.  The MF buffer may contain a mix of 3-row
     normal+friction contacts and 1-row speculative normal contacts, so rounding
@@ -11722,7 +11722,7 @@ def compute_delta_and_accumulate(
 
 # ---------------------------------------------------------------------------
 # Graph coloring for propagation rows (articulated_contact_response=
-# "propagation-colored").
+# "propagation_colored").
 #
 # Two propagation rows conflict iff they share a dynamic body (their velocity
 # writes and deferred-impulse accumulations overlap). Rows of one color are

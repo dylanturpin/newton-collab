@@ -291,7 +291,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contact capacity"):
             solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "propagation-colored prebuild requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "propagation_colored prebuild requires CUDA")
     def test_colored_prebuild_preserves_mixed_contact_units(self):
         """Schedule friction-gap and patch-selected one-row units alongside three-row units."""
         scenarios = {

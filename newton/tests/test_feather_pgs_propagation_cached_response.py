@@ -201,12 +201,12 @@ def _make_solver(
 ) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=response,
-        pgs_iterations=8,
-        pgs_warmstart=False,
+        iterations=8,
+        contact_warmstart=False,
         propagation_cached_response=cached,
-        propagation_cached_response_max_bodies=cache_max_bodies,
+        propagation_cached_response_body_max=cache_max_bodies,
         **solver_kwargs,
     )
 
@@ -323,7 +323,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         cls.model_fixed = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=True)
 
     def test_cached_path_detected(self):
-        solver = _make_solver(self.model_multi, "propagation-colored", cached=True)
+        solver = _make_solver(self.model_multi, "propagation_colored", cached=True)
         self.assertTrue(solver._propagation_cached_response_active)
         self.assertIsNotNone(solver._propagation_cached_gemv_kernel)
         self.assertIsNotNone(solver.propagation_cache_R)
@@ -332,7 +332,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         self.assertIsNotNone(solver.propagation_cache_world_flag)
         self.assertEqual(
             solver.propagation_cache_max_bodies,
-            min(solver.max_propagation_bodies, solver.propagation_cached_response_max_bodies),
+            min(solver.max_propagation_bodies, solver.propagation_cached_response_body_max),
         )
         sizes = [int(s) for s in solver.size_groups if solver.n_arts_by_size[s] > 0]
         for size in sizes:
@@ -343,7 +343,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         # eligibility must exclude nothing here: all arts are free-root trees
         self.assertTrue(np.all(solver.propagation_cache_art_eligible.numpy() == 1))
 
-        off = _make_solver(self.model_multi, "propagation-colored", cached=False)
+        off = _make_solver(self.model_multi, "propagation_colored", cached=False)
         self.assertFalse(off._propagation_cached_response_active)
         self.assertIsNone(off.propagation_cache_R)
 
@@ -359,13 +359,13 @@ class TestPropagationCachedResponse(unittest.TestCase):
 
     def test_lockstep_multi_contact_bodies(self):
         """Three contact spheres per articulation: cross blocks B_ab are live."""
-        stats, _, test = _run_lockstep(self, self.model_multi, "propagation-colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40)
         self.assertTrue(np.all(test.propagation_cache_world_flag.numpy() == 1))
         self._assert_stats(stats, expect_min_bodies=2)
 
     def test_lockstep_second_size_group(self):
         """Two articulations per world -> two DOF-size groups, both cached."""
-        stats, _, test = _run_lockstep(self, self.model_two_groups, "propagation-colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_two_groups, "propagation_colored", 40)
         sizes = [int(s) for s in test.size_groups if test.n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 2, f"expected two size groups, got {sizes}")
         for size in sizes:
@@ -387,7 +387,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         every table-mounted robot — takes the other one, so gate it
         explicitly against the tree walk on the same contact-rich scene.
         """
-        stats, _, test = _run_lockstep(self, self.model_fixed, "propagation-colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_fixed, "propagation_colored", 40)
         sizes = [int(s) for s in test.size_groups if test.n_arts_by_size[s] > 0]
         for size in sizes:
             # A fully single-DOF group takes the plain fixed-base extraction
@@ -405,7 +405,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
     def test_overflow_falls_back_to_tree_walk(self):
         """Cache capacity below the active-body count: every world must take
         the device-side tree-walk fallback and match the cached=False run."""
-        stats, ref, test = _run_lockstep(self, self.model_multi, "propagation-colored", 40, cache_max_bodies=2)
+        stats, ref, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40, cache_max_bodies=2)
         self.assertTrue(test._propagation_cached_response_active)
         self.assertEqual(test.propagation_cache_max_bodies, 2)
         flags = test.propagation_cache_world_flag.numpy()
@@ -430,7 +430,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         """
         model = _build_clutter_model(self.device, n_boxes=2)
         stats, ref, test = _run_lockstep(
-            self, model, "propagation-colored", 40, cache_max_bodies=4, dense_max_constraints=128
+            self, model, "propagation_colored", 40, cache_max_bodies=4, articulation_constraint_max=128
         )
         self.assertTrue(test._propagation_cached_response_active)
         counts = ref.propagation_body_count.numpy()
@@ -473,7 +473,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         wrench j at body b; B_ab column j is the resulting COM twist delta at
         body a. Both fall out of _ref_propagate run at zero initial velocity.
         """
-        solver = _make_solver(model, "propagation-colored", cached=True)
+        solver = _make_solver(model, "propagation_colored", cached=True)
         state_in, state_out = model.state(), model.state()
         control = model.control()
         state_in.joint_qd.assign(_seed_joint_qd(model))
@@ -539,7 +539,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
     def test_impulses_consumed(self):
         """Deferred body impulses must be cleared by the GEMV each iteration."""
         model = self.model_multi
-        solver = _make_solver(model, "propagation-colored", cached=True)
+        solver = _make_solver(model, "propagation_colored", cached=True)
         state_in, state_out = model.state(), model.state()
         control = model.control()
         state_in.joint_qd.assign(_seed_joint_qd(model))

@@ -52,7 +52,7 @@ PATHS = ("mf_immediate", "propagation")
 class AccuracyResult:
     label: str
     path: str
-    pgs_iterations: int
+    iterations: int
     reference_iterations: int
     friction: bool
     articulations: int
@@ -108,8 +108,8 @@ def _make_solver(
     case: BenchCase,
     path: str,
     *,
-    pgs_iterations: int,
-    pgs_velocity_iterations: int,
+    iterations: int,
+    velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
 ) -> SolverFeatherPGS:
@@ -118,15 +118,15 @@ def _make_solver(
     with scalar_hinv_jt():
         return SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=pgs_iterations,
-            pgs_velocity_iterations=pgs_velocity_iterations,
+            iterations=iterations,
+            velocity_iterations=velocity_iterations,
             contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             contact_friction_position_iterations=contact_friction_position_iterations,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
 
 
@@ -197,8 +197,8 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
             model,
             case,
             path,
-            pgs_iterations=args.reference_iterations,
-            pgs_velocity_iterations=args.pgs_velocity_iterations,
+            iterations=args.reference_iterations,
+            velocity_iterations=args.pgs_velocity_iterations,
             enable_contact_friction=not args.no_friction,
             contact_friction_position_iterations=args.contact_friction_position_iterations,
         )
@@ -212,8 +212,8 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 model,
                 case,
                 path,
-                pgs_iterations=iterations,
-                pgs_velocity_iterations=args.pgs_velocity_iterations,
+                iterations=iterations,
+                velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
             )
@@ -223,7 +223,7 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
             partial[(path, iterations)] = {
                 "label": case.label,
                 "path": path,
-                "pgs_iterations": iterations,
+                "iterations": iterations,
                 "reference_iterations": args.reference_iterations,
                 "friction": not args.no_friction,
                 "articulations": case.articulations,
@@ -282,7 +282,7 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
                 [
                     row.label,
                     row.path,
-                    str(row.pgs_iterations),
+                    str(row.iterations),
                     f"{row.dense_rows_total}/{row.mf_rows_total}/{row.propagation_rows_total}",
                     f"{row.self_ref_joint_qd_abs_linf:.6g}",
                     f"{row.mf_ref_joint_qd_abs_linf:.6g}",

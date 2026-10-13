@@ -113,7 +113,7 @@ def _run_mixed_response(
     warmstart,
     preelimination,
     dof_count=13,
-    dense_max_constraints=32,
+    articulation_constraint_max=32,
     inactive_joint_limit_capacity=False,
     friction=0.0,
     restitution=0.0,
@@ -135,16 +135,16 @@ def _run_mixed_response(
     with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_warmstart=warmstart,
+            solve_mode="matrix_free",
+            contact_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
             enable_joint_limits=inactive_joint_limit_capacity,
             joint_limit_activation_gap=0.0,
-            pgs_iterations=8,
-            pgs_contact_regularization=contact_regularization,
+            iterations=8,
+            contact_regularization=contact_regularization,
             friction_anchor_beta=friction_anchor_beta,
-            dense_max_constraints=dense_max_constraints,
-            mf_max_constraints=32,
+            articulation_constraint_max=articulation_constraint_max,
+            free_body_constraint_max=32,
         )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
@@ -201,7 +201,7 @@ class TestFeatherPGSPairedResponse(unittest.TestCase):
             "warmstart": False,
             "preelimination": False,
             "dof_count": 23,
-            "dense_max_constraints": 96,
+            "articulation_constraint_max": 96,
             "inactive_joint_limit_capacity": True,
             "friction": 0.7,
             "restitution": 0.3,

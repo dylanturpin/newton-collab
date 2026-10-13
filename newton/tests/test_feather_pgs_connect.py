@@ -91,7 +91,7 @@ def _run(steps: int = 720, crank_target: float = 0.6, **solver_kwargs):
     builder = _build_four_bar()
     model = builder.finalize()
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
+        model, solve_mode="matrix_free", iterations=16, baumgarte=0.1, **solver_kwargs
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -148,7 +148,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         loop_joint = b.add_joint_ball(parent=left, child=right)
         model = b.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
 
         self.assertEqual(int(model.joint_articulation.numpy()[loop_joint]), -1)
         np.testing.assert_array_equal(
@@ -176,7 +176,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
         self.assertFalse(solver._has_loop_joints)
@@ -249,7 +249,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
         b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
         model = b.finalize()
 
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
         self.assertEqual(
             getattr(solver, "_connect_count", 0),
             1,
@@ -372,7 +372,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
         model = b.finalize()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+            solver = newton.solvers.SolverFeatherPGS(model, solve_mode=_pgs_mode(), iterations=16, baumgarte=0.2)
         self.assertFalse([w for w in caught if "loop joint" in str(w.message)], [str(w.message) for w in caught])
         articulation = wp.array([int(solver.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
         state_0, state_1 = model.state(), model.state()
@@ -401,7 +401,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
     def test_world_parent_closure_holds_hanging_load(self):
         b, _, load, joints = _build_carried_load(world_parent=True)
         model = b.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode=_pgs_mode(), iterations=16, baumgarte=0.2)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(240):
@@ -418,7 +418,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
         """Release closures through Model.joint_enabled, re-anchor them through joint_X_p and engage them again."""
         b, carrier, load, joints = _build_carried_load()
         model = b.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode=_pgs_mode(), iterations=16, baumgarte=0.2)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         dt = 1.0 / 240.0

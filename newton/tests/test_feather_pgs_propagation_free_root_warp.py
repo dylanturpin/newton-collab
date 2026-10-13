@@ -101,10 +101,10 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
     # test_feather_pgs_propagation_cached_response.py.
     return SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=response,
-        pgs_iterations=8,
-        pgs_warmstart=False,
+        iterations=8,
+        contact_warmstart=False,
         propagation_cached_response=False,
     )
 
@@ -238,7 +238,7 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         cls.model_free = _build_model(cls.device, base_z=2.0, contact_sphere=None, ground=False)
 
     def test_free_root_shape_detected(self):
-        solver = _make_solver(self.model_free, "propagation-colored")
+        solver = _make_solver(self.model_free, "propagation_colored")
         sizes = [int(s) for s in solver.size_groups if solver.n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 1)
         size = sizes[0]
@@ -257,8 +257,8 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         both solvers reach bitwise-identical states and tree factorizations
         are computed from identical inputs.
         """
-        solver_w = _make_solver(self.model_free, "propagation-colored")
-        solver_s = _make_solver(self.model_free, "propagation-colored")
+        solver_w = _make_solver(self.model_free, "propagation_colored")
+        solver_s = _make_solver(self.model_free, "propagation_colored")
         _force_serial_fallback(solver_s)
         state_w = _step_n(self.model_free, solver_w, n_steps)
         state_s = _step_n(self.model_free, solver_s, n_steps)
@@ -392,7 +392,7 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         """
         for contact_sphere, base_z in (("base", 0.115), ("deep", 0.12)):
             model = _build_model(self.device, base_z=base_z, contact_sphere=contact_sphere, ground=True)
-            for response in ("propagation-colored", "propagation"):
+            for response in ("propagation_colored", "propagation"):
                 with self.subTest(contact=contact_sphere, articulated_contact_response=response):
                     results = {}
                     for mode in ("warp", "serial", "serial2"):

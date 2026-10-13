@@ -84,14 +84,14 @@ def _zero_iteration_step(model: newton.Model, solver: SolverFeatherPGS):
 def _make_solver(model: newton.Model, mode: str, **kwargs) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=mode,
-        pgs_iterations=0,
-        pgs_velocity_iterations=0,
+        iterations=0,
+        velocity_iterations=0,
         contact_friction_scale=0.0,
-        dense_max_constraints=64,
-        mf_max_constraints=16,
-        pgs_warmstart=False,
+        articulation_constraint_max=64,
+        free_body_constraint_max=16,
+        contact_warmstart=False,
         **kwargs,
     )
 

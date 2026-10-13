@@ -102,7 +102,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
     @staticmethod
     def _references_dense_max_constraints(node):
         return any(
-            isinstance(child, ast.Attribute) and child.attr == "dense_max_constraints" for child in ast.walk(node)
+            isinstance(child, ast.Attribute) and child.attr == "articulation_constraint_max" for child in ast.walk(node)
         )
 
     @classmethod

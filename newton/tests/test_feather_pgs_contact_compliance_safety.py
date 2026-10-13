@@ -107,8 +107,8 @@ class TestContactComplianceSafety(unittest.TestCase):
                     enabled=True,
                     steps=1,
                     solver_options={
-                        "dense_max_constraints": 1,
-                        "mf_max_constraints": 1,
+                        "articulation_constraint_max": 1,
+                        "free_body_constraint_max": 1,
                         "warn_constraint_overflow": False,
                     },
                 )
@@ -122,7 +122,7 @@ class TestContactComplianceSafety(unittest.TestCase):
         fixture.pipeline.collide(state, contacts)
         contacts.rigid_contact_stiffness.fill_(3000.0)
         solver.step(state, output, model.control(), contacts, 0.005)
-        solver.constraint_count.fill_(solver.dense_max_constraints + 1)
+        solver.constraint_count.fill_(solver.articulation_constraint_max + 1)
         with self.assertRaisesRegex(RuntimeError, "overflowing solver rows"):
             prepare_rows(solver, contacts, 0.005)
         solver.constraint_count.fill_(1)

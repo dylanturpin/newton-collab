@@ -105,18 +105,18 @@ def _validate_torsion_mode(solver):
     if (
         not solver.model.device.is_cuda
         or solver.model.requires_grad
-        or solver.pgs_mode != "matrix_free"
+        or solver.solve_mode != "matrix_free"
         or solver.articulated_contact_response != "immediate"
-        or solver.friction_mode != "current"
-        or solver.pgs_schedule != "interleaved"
-        or solver.pgs_warmstart
+        or solver.friction_mode != "fixed_normal"
+        or solver.row_schedule != "interleaved"
+        or solver.contact_warmstart
         or solver.contact_compliance
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
             "interleaved, without warmstart or compliance"
         )
-    if solver.pgs_velocity_iterations > 0 and solver.enable_bilateral_preelimination:
+    if solver.velocity_iterations > 0 and solver.enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
@@ -358,10 +358,10 @@ def prepare_torsion_velocity_pass(solver, dt):
     """
     wp.launch(
         _prepare_velocity_torsion_rows,
-        dim=solver.world_count * solver.dense_max_constraints,
+        dim=solver.world_count * solver.articulation_constraint_max,
         inputs=[
             solver.constraint_count,
-            solver.dense_max_constraints,
+            solver.articulation_constraint_max,
             solver.row_type,
             solver._contact_torsion_group,
             solver.phi,
@@ -427,7 +427,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         coefficient, anchors, touching = budget
         lead = touching[0]
         row = int(count[world])
-        if row >= solver.dense_max_constraints:
+        if row >= solver.articulation_constraint_max:
             raise RuntimeError("Experimental torsion row capacity exceeded; refusing dropped work")
         count[world] += 1
         for field in fields.values():
@@ -437,7 +437,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         # The sweep reads the group's coefficient from its own row; anchor tangent
         # rows carry it divided by the anchor count under persistent patches.
         fields["row_mu"][world, row] = coefficient
-        fields["row_cfm"][world, row] = solver.pgs_cfm
+        fields["row_cfm"][world, row] = solver.cfm
         for witness in group:
             membership[world, witness.slot] = row
         normal = lead.normal

@@ -92,12 +92,12 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
 
 
 _SQUEEZE_SOLVER = {
-    "pgs_mode": "matrix_free",
+    "solve_mode": "matrix_free",
     "articulated_contact_response": "immediate",
-    "pgs_iterations": 64,
-    "pgs_velocity_iterations": 0,
-    "pgs_beta": 0.05,
-    "pgs_contact_regularization": 0.01,
+    "iterations": 64,
+    "velocity_iterations": 0,
+    "baumgarte": 0.05,
+    "contact_regularization": 0.01,
     "contact_friction_gap_threshold": 0.001,
     "contact_friction_position_iterations": 4,
     "contact_shared_anchor": True,
@@ -157,7 +157,7 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
     theta, mu = 30.0, 0.3
     model, box, _rot = _build_incline(theta, mu)
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=32, pgs_beta=0.05, **solver_kwargs
+        model, solve_mode="matrix_free", iterations=32, baumgarte=0.05, **solver_kwargs
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
     contacts = pipeline.contacts()
@@ -325,12 +325,12 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertGreater(c_dense[0], 0)
         # propagation route: same scene, contacts routed to propagation rows
         model, _, _ = _build_v_jaws(5.0)
-        prop_kwargs = dict(_SQUEEZE_SOLVER, articulated_contact_response="propagation", pgs_contact_regularization=0.0)
+        prop_kwargs = dict(_SQUEEZE_SOLVER, articulated_contact_response="propagation", contact_regularization=0.0)
         c_prop = check(model, prop_kwargs)
         self.assertGreater(c_prop[2], 0)
         # matrix-free route: free box resting on a static slab
         model, _, _ = _build_incline(0.0, 0.5)
-        c_mf = check(model, {"pgs_mode": "matrix_free", "pgs_iterations": 16, "pgs_beta": 0.05})
+        c_mf = check(model, {"solve_mode": "matrix_free", "iterations": 16, "baumgarte": 0.05})
         self.assertGreater(c_mf[1], 0)
 
     def test_graph_capture_replays(self):
@@ -362,7 +362,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
 
-def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, device="cpu"):
+def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, device="cpu"):
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
 
     ``phi`` holds what the row builders store: raw separation for dense rows (paired with
@@ -417,7 +417,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 inf,
                 1.0e-6,
-                pgs_beta,
+                baumgarte,
                 1.0,
                 dt,
                 1.0,
@@ -471,7 +471,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
                 inf,
                 1.0e-6,
-                pgs_beta,
+                baumgarte,
                 1.0,
                 dt,
                 1.0,
@@ -521,20 +521,25 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
 
     def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
         """Apply equal positional bias on all row families and drop it in velocity-only passes."""
-        pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
+        baumgarte, fa_beta, dt = 0.05, 0.3, 0.005
         phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
-        expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
+        expect_pos = np.array([baumgarte * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
         dense = lambda s: _rhs_for_family(  # noqa: E731
-            "dense", phi=[phi_n, e0, e1], row_beta=[pgs_beta, fa_beta, fa_beta], pgs_beta=pgs_beta, dt=dt, bias_scale=s
+            "dense",
+            phi=[phi_n, e0, e1],
+            row_beta=[baumgarte, fa_beta, fa_beta],
+            baumgarte=baumgarte,
+            dt=dt,
+            bias_scale=s,
         )
         pre = [phi_n, fa_beta * e0, fa_beta * e1]
         np.testing.assert_allclose(dense(1.0), expect_pos, rtol=1.0e-5)
         np.testing.assert_allclose(dense(0.0), 0.0, atol=1.0e-9)
         for family in ("mf_setup", "propagation_setup"):
-            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+            got = _rhs_for_family(family, phi=pre, row_beta=None, baumgarte=baumgarte, dt=dt, bias_scale=1.0)
             np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
         for family in ("mf_velocity", "propagation_velocity"):
-            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=None)
+            got = _rhs_for_family(family, phi=pre, row_beta=None, baumgarte=baumgarte, dt=dt, bias_scale=None)
             np.testing.assert_allclose(got, 0.0, atol=1.0e-9, err_msg=family)
 
     def test_reset_clears_anchor_history_full_and_masked(self):
@@ -542,9 +547,13 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         device = "cpu"
         model = _build_two_world_free_model(device)
         solver = newton.solvers.SolverFeatherPGS(
-            model, pgs_mode="split", friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
+            model,
+            solve_mode="split",
+            friction_anchor_beta=0.2,
+            articulation_constraint_max=4,
+            free_body_constraint_max=4,
         )
-        self.assertFalse(solver.pgs_warmstart)
+        self.assertFalse(solver.contact_warmstart)
         n = solver._friction_patches.previous.valid.shape[0]
         worlds = np.arange(n, dtype=np.int32) % 2
         for mask, expect_cleared in (

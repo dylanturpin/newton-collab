@@ -39,13 +39,13 @@ def _slide(device, mode, beta, mesh, angle, response=None, *, locked_tangent=Fal
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=mode,
+        solve_mode=mode,
         friction_anchor_beta=beta,
-        pgs_iterations=64,
-        pgs_cfm=0.0 if locked_tangent else 1.0e-6,
+        iterations=64,
+        cfm=0.0 if locked_tangent else 1.0e-6,
         angular_damping=0.0,
-        mf_max_constraints=128,
-        dense_max_constraints=32,
+        free_body_constraint_max=128,
+        articulation_constraint_max=32,
         row_watermark=True,
         articulated_contact_response=response or "immediate",
     )
@@ -72,7 +72,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_articulated_sliding_direction(self):
         """Preserve sliding direction through dense and every articulated propagation route."""
-        for response in ("immediate", "propagation", "propagation-fused", "propagation-colored"):
+        for response in ("immediate", "propagation", "propagation_fused", "propagation_colored"):
             with self.subTest(response=response):
                 velocity, direction, _ = _slide("cuda:0", "matrix_free", 0.2, False, np.pi / 4, response)
                 np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
@@ -80,7 +80,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_locked_tangent_preserves_other_friction_direction(self):
         """Retain friction along a slider when its first tangent has zero response."""
-        for response in ("immediate", "propagation", "propagation-fused", "propagation-colored"):
+        for response in ("immediate", "propagation", "propagation_fused", "propagation_colored"):
             for beta in (0.0, 0.2):
                 with self.subTest(response=response, beta=beta):
                     velocity, direction, watermarks = _slide(

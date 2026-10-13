@@ -44,7 +44,7 @@ RADIUS = 0.1
 # the contact normal; spin parallel to the slide cannot excite the term.
 OMEGA_Y = 20.0
 SLIDE_VX = 2.0
-# (pgs_mode, articulated_contact_response, pgs_velocity_iterations): the split
+# (solve_mode, articulated_contact_response, velocity_iterations): the split
 # velocity post-pass converts velocity to acceleration at two more patched
 # sites, and each propagation response variant is a separately generated
 # contact path
@@ -55,8 +55,8 @@ SLIDER_CONFIGS_CUDA = [
     ("matrix_free", "immediate", 0),
     ("matrix_free", "immediate", 2),
     ("matrix_free", "propagation", 0),
-    ("matrix_free", "propagation-fused", 0),
-    ("matrix_free", "propagation-colored", 0),
+    ("matrix_free", "propagation_fused", 0),
+    ("matrix_free", "propagation_colored", 0),
 ]
 
 
@@ -102,7 +102,7 @@ def _build_slider(device, articulated=False):
     return builder.finalize(device=device)
 
 
-def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iterations=0):
+def _slide_heights(model, omega_y, solve_mode, response="immediate", velocity_iterations=0):
     """Slide the sphere at ``SLIDE_VX`` while spinning at ``omega_y``.
 
     Returns per-step COM heights [m] and the peak live contact count, so the
@@ -119,20 +119,20 @@ def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iter
     solver = SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode=pgs_mode,
+        solve_mode=solve_mode,
         articulated_contact_response=response,
-        pgs_velocity_iterations=velocity_iterations,
+        velocity_iterations=velocity_iterations,
     )
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     control = model.control()
     heights = wp.empty(STEPS, dtype=wp.float32, device=model.device)
     peak_contacts = wp.zeros(1, dtype=wp.int32, device=model.device)
-    if response == "propagation-fused":
+    if response == "propagation_fused":
         if not solver._propagation_contacts_enabled():
-            raise AssertionError("propagation-fused test model did not activate propagation contacts")
+            raise AssertionError("propagation_fused test model did not activate propagation contacts")
         if solver._pgs_solve_propagation_full_iteration_kernel is None:
-            raise AssertionError("propagation-fused test model did not construct the fused iteration kernel")
+            raise AssertionError("propagation_fused test model did not construct the fused iteration kernel")
     for step in range(STEPS):
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
@@ -144,8 +144,8 @@ def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iter
             outputs=[heights, peak_contacts],
             device=model.device,
         )
-    if response == "propagation-fused" and int(solver.propagation_constraint_count.numpy().sum()) <= 0:
-        raise AssertionError("propagation-fused test did not build any propagation contact rows")
+    if response == "propagation_fused" and int(solver.propagation_constraint_count.numpy().sum()) <= 0:
+        raise AssertionError("propagation_fused test did not build any propagation contact rows")
     return heights.numpy(), int(peak_contacts.numpy()[0])
 
 
@@ -179,18 +179,18 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         exactly that of the unspun sphere.  A predictor missing the
         ``omega x v`` term feeds the normal rows a phantom vertical velocity of
         ``dt * omega_y * vx`` (0.2 m/s here): the sphere's height diverges by
-        millimetres within the run, in every ``pgs_mode``.  With the conventions
+        millimetres within the run, in every ``solve_mode``.  With the conventions
         agreeing the trajectories match to solver precision.
         """
         device = wp.get_device()
         configs = list(SLIDER_CONFIGS)
         if device.is_cuda:
             configs += SLIDER_CONFIGS_CUDA
-        for pgs_mode, response, vel_iters in configs:
-            with self.subTest(pgs_mode=pgs_mode, response=response, velocity_iterations=vel_iters):
-                model = _build_slider(device, articulated=response == "propagation-fused")
-                still, contacts_still = _slide_heights(model, 0.0, pgs_mode, response, vel_iters)
-                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, pgs_mode, response, vel_iters)
+        for solve_mode, response, vel_iters in configs:
+            with self.subTest(solve_mode=solve_mode, response=response, velocity_iterations=vel_iters):
+                model = _build_slider(device, articulated=response == "propagation_fused")
+                still, contacts_still = _slide_heights(model, 0.0, solve_mode, response, vel_iters)
+                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, solve_mode, response, vel_iters)
                 # the comparison is vacuous unless both runs really ride on
                 # active contact rows at the rest height
                 self.assertGreater(min(contacts_still, contacts_spin), 0, "no contacts were generated")
@@ -430,7 +430,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         """Keep the final velocity-postpass conversion observable and wired."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split")
+        solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode="split")
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
 
@@ -465,7 +465,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         joint_qd[3:6] = (0.0, OMEGA_Y, 0.0)
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="matrix_free")
+        solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode="matrix_free")
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
         control = model.control()

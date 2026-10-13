@@ -86,8 +86,8 @@ def _build_limited_chain_on_ground(device, num_links, num_worlds=2, *, with_free
 def test_default_kernel_selection_is_cached(test, device):
     """Resolve identical solver shapes to the same cached kernel objects."""
     model = _build_chain_model(device)
-    first = SolverFeatherPGS(model, pgs_mode="matrix_free")
-    second = SolverFeatherPGS(model, pgs_mode="matrix_free")
+    first = SolverFeatherPGS(model, solve_mode="matrix_free")
+    second = SolverFeatherPGS(model, solve_mode="matrix_free")
     for attr in ("_cholesky_kernels_by_size", "_triangular_solve_kernels_by_size", "_hinv_jt_kernels_by_size"):
         first_kernels = getattr(first, attr)
         second_kernels = getattr(second, attr)
@@ -100,12 +100,14 @@ def test_default_kernel_selection_is_cached(test, device):
 def test_diagonal_fusion_requires_nonaliased_world_response(test, device):
     """Compute the row diagonal in H^-1 J^T only when it writes separate world storage."""
     aliased = SolverFeatherPGS(
-        _build_chain_model(device, num_links=23, num_worlds=1), pgs_mode="matrix_free", dense_max_constraints=192
+        _build_chain_model(device, num_links=23, num_worlds=1),
+        solve_mode="matrix_free",
+        articulation_constraint_max=192,
     )
     direct = SolverFeatherPGS(
         _build_chain_model(device, num_links=23, num_worlds=1, with_free_body=True),
-        pgs_mode="matrix_free",
-        dense_max_constraints=192,
+        solve_mode="matrix_free",
+        articulation_constraint_max=192,
     )
     test.assertTrue(aliased._jy_world_aliased)
     test.assertFalse(aliased._hinv_jt_writes_world)
@@ -121,7 +123,7 @@ def test_tiled_and_loop_kernels_step_identically(test, device):
     for overrides in ({}, {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}):
         model = _build_chain_model(device, num_links=14, num_worlds=2)
         with kernel_overrides(overrides):
-            solver = SolverFeatherPGS(model, pgs_mode="matrix_free", dense_max_constraints=64)
+            solver = SolverFeatherPGS(model, solve_mode="matrix_free", articulation_constraint_max=64)
         if not overrides:
             test.assertTrue(solver._execution_plan.use_tiled_cholesky(14))
             test.assertTrue(solver._execution_plan.use_tiled_hinv_jt(14))
@@ -136,10 +138,10 @@ def test_tiled_and_loop_kernels_step_identically(test, device):
 
 def test_split_defaults(test, device):
     """Keep the documented defaults in split mode and allocate its Delassus storage."""
-    solver = SolverFeatherPGS(_build_chain_model(device, num_links=2, num_worlds=2), pgs_mode="split")
-    test.assertEqual(solver.pgs_mode, "split")
-    test.assertEqual(solver.pgs_iterations, 12)
-    test.assertEqual(solver.dense_max_constraints, 32)
+    solver = SolverFeatherPGS(_build_chain_model(device, num_links=2, num_worlds=2), solve_mode="split")
+    test.assertEqual(solver.solve_mode, "split")
+    test.assertEqual(solver.iterations, 12)
+    test.assertEqual(solver.articulation_constraint_max, 32)
     test.assertEqual(solver.C.shape, (2, 32, 32))
     test.assertFalse(solver._jy_world_aliased)
     test.assertFalse(solver._hinv_jt_writes_world)
@@ -148,8 +150,8 @@ def test_split_defaults(test, device):
 def test_split_kernel_selection_is_cached(test, device):
     """Resolve identical split-mode solver shapes to the same cached kernel objects."""
     model = _build_chain_model(device, num_links=14, num_worlds=2, with_free_body=True)
-    first = SolverFeatherPGS(model, pgs_mode="split")
-    second = SolverFeatherPGS(model, pgs_mode="split")
+    first = SolverFeatherPGS(model, solve_mode="split")
+    second = SolverFeatherPGS(model, solve_mode="split")
     test.assertEqual(first._delassus_kernels_by_size.keys(), second._delassus_kernels_by_size.keys())
     for size, kernel in first._delassus_kernels_by_size.items():
         test.assertIs(kernel, second._delassus_kernels_by_size[size])
@@ -171,7 +173,9 @@ def test_split_native_and_scalar_kernels_step_identically(test, device):
         for overrides in ({}, scalar):
             model = _build_limited_chain_on_ground(device, 14, with_free_body=with_free_body)
             with kernel_overrides(overrides):
-                solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True, dense_max_constraints=64)
+                solver = SolverFeatherPGS(
+                    model, solve_mode="split", enable_joint_limits=True, articulation_constraint_max=64
+                )
             if not overrides:
                 test.assertIsNotNone(solver._pgs_solve_tiled_row_kernel)
             pipeline = newton.CollisionPipeline(model)
@@ -195,9 +199,9 @@ def test_drive_mode_validation(test, device):
     solver = SolverFeatherPGS(model)
     test.assertEqual(solver.drive_mode, "augmented")
     test.assertFalse(solver.fuse_joint_velocity_limits)
-    test.assertEqual(SolverFeatherPGS(model, pgs_mode="matrix_free", drive_mode="physx_pgs").drive_mode, "physx_pgs")
-    with test.assertRaisesRegex(NotImplementedError, "requires pgs_mode='matrix_free'"):
-        SolverFeatherPGS(model, pgs_mode="split", drive_mode="physx_pgs")
+    test.assertEqual(SolverFeatherPGS(model, solve_mode="matrix_free", drive_mode="rows").drive_mode, "rows")
+    with test.assertRaisesRegex(NotImplementedError, "requires solve_mode='matrix_free'"):
+        SolverFeatherPGS(model, solve_mode="split", drive_mode="rows")
     with test.assertRaisesRegex(ValueError, "drive_mode"):
         SolverFeatherPGS(model, drive_mode="implicit")
 

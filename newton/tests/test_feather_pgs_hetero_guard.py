@@ -22,7 +22,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 
-PROPAGATION_RESPONSES = ("propagation", "propagation-fused", "propagation-colored")
+PROPAGATION_RESPONSES = ("propagation", "propagation_fused", "propagation_colored")
 
 
 def _make_chain_world(n_links: int) -> newton.ModelBuilder:
@@ -81,7 +81,7 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     SolverFeatherPGS(
                         self.hetero_model,
-                        pgs_mode="matrix_free",
+                        solve_mode="matrix_free",
                         articulated_contact_response=response,
                     )
                 message = str(ctx.exception)
@@ -90,28 +90,28 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
                 self.assertIn("1, 3", message)
 
     def test_hetero_matrix_free_constructs(self):
-        solver = SolverFeatherPGS(self.hetero_model, pgs_mode="matrix_free")
-        self.assertEqual(solver.pgs_mode, "matrix_free")
+        solver = SolverFeatherPGS(self.hetero_model, solve_mode="matrix_free")
+        self.assertEqual(solver.solve_mode, "matrix_free")
 
     def test_hetero_split_constructs(self):
-        solver = SolverFeatherPGS(self.hetero_model, pgs_mode="split")
-        self.assertEqual(solver.pgs_mode, "split")
+        solver = SolverFeatherPGS(self.hetero_model, solve_mode="split")
+        self.assertEqual(solver.solve_mode, "split")
 
     def test_homogeneous_all_modes_construct(self):
-        for pgs_mode, response in (
+        for solve_mode, response in (
             ("split", "immediate"),
             ("matrix_free", "immediate"),
             ("matrix_free", "propagation"),
-            ("matrix_free", "propagation-fused"),
-            ("matrix_free", "propagation-colored"),
+            ("matrix_free", "propagation_fused"),
+            ("matrix_free", "propagation_colored"),
         ):
-            with self.subTest(pgs_mode=pgs_mode, articulated_contact_response=response):
+            with self.subTest(solve_mode=solve_mode, articulated_contact_response=response):
                 solver = SolverFeatherPGS(
                     self.homogeneous_model,
-                    pgs_mode=pgs_mode,
+                    solve_mode=solve_mode,
                     articulated_contact_response=response,
                 )
-                self.assertEqual(solver.pgs_mode, pgs_mode)
+                self.assertEqual(solver.solve_mode, solve_mode)
                 self.assertEqual(solver.articulated_contact_response, response)
 
 

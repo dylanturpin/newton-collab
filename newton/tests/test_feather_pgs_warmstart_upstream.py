@@ -32,13 +32,13 @@ def test_substeps_reuse_contacts_with_their_own_history(test, device):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=8, pgs_warmstart=True)
+    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", iterations=8, contact_warmstart=True)
     states = [model.state(), model.state()]
     control = model.control()
     dt = 1.0 / 240.0
 
     def step(iterations):
-        solver.pgs_iterations = iterations
+        solver.iterations = iterations
         solver.step(states[0], states[1], control, contacts, dt)
         states.reverse()
 
@@ -114,7 +114,7 @@ def _resting_box_rows(device, articulated: bool):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=12)
+    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", contact_warmstart=True, iterations=12)
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     control = model.control()
@@ -128,7 +128,7 @@ def _resting_box_rows(device, articulated: bool):
 def test_both_row_families_seed_impulses_scaled_by_the_step_ratio(test, device):
     """Seed the carried normal impulses of dense and free-body rows, scaled by ``dt / dt_previous``.
 
-    With no sweep (``pgs_iterations = 0``) the solved impulses are exactly the seeds.
+    With no sweep (``iterations = 0``) the solved impulses are exactly the seeds.
     """
     for articulated in (True, False):
         with test.subTest(articulated=articulated):
@@ -142,7 +142,7 @@ def test_both_row_families_seed_impulses_scaled_by_the_step_ratio(test, device):
             previous = impulses.numpy()[0, :n][normal]
             test.assertGreater(float(previous.sum()), 0.0)
 
-            solver.pgs_iterations = 0
+            solver.iterations = 0
             pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, 0.5 / 120.0)
             test.assertEqual(int(count.numpy()[0]), n)

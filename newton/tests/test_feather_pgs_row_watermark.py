@@ -70,7 +70,7 @@ def test_watermarks_accumulate_in_captured_steps(test, device):
                 substep()
         results.append(solver.constraint_row_watermarks())
     test.assertEqual(results[0], results[1])
-    test.assertGreater(results[1]["dense_high_water"], 0)
+    test.assertGreater(results[1]["articulation_high_water"], 0)
 
 
 class TestFeatherPGSRowWatermark(unittest.TestCase):

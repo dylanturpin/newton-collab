@@ -37,9 +37,9 @@ def _drive_scene(device, sleeping):
     model = builder.finalize(device=device)
     solver = SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        drive_mode="physx_pgs",
-        pgs_iterations=16,
+        solve_mode="matrix_free",
+        drive_mode="rows",
+        iterations=16,
         friction_anchor_beta=0.0,
         **(SLEEP if sleeping else {}),
     )

@@ -152,8 +152,8 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
     with kernel_overrides({"pgs_kernel": "loop"}):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode=mode,
-            pgs_iterations=8,
+            solve_mode=mode,
+            iterations=8,
             update_mass_matrix_interval=2,
             use_parallel_streams=False,
             enable_joint_velocity_limits=velocity_limits,

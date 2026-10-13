@@ -32,7 +32,7 @@ class TestTorsionRegularization(unittest.TestCase):
             sliding = sum(float(np.linalg.norm(impulses[n + 1 : n + 3])) for n in group["anchor_rows"])
             spin = abs(float(impulses[group["row"]])) / group["effective_radius_m"]
             self.assertLessEqual(sliding + spin, group["mu"] * load + 2e-6)
-        self.assertEqual(solver.constraint_row_watermarks()["dense_dropped_contact_rows_high_water"], 0)
+        self.assertEqual(solver.constraint_row_watermarks()["articulation_dropped_contact_rows_high_water"], 0)
 
     def test_analytic_regularized_load_and_saturated_spin(self):
         """Use the solved normal impulse once, without double-regularizing spin capacity."""
@@ -42,8 +42,8 @@ class TestTorsionRegularization(unittest.TestCase):
                     0.01,
                     center_only=True,
                     spin=100.0,
-                    pgs_iterations=16,
-                    pgs_contact_regularization=regularization,
+                    iterations=16,
+                    contact_regularization=regularization,
                 )
                 group = solver._torsion_stats["groups"][0]
                 impulse = result["impulses"][0]
@@ -66,8 +66,8 @@ class TestTorsionRegularization(unittest.TestCase):
                     with self.subTest(reg=regularization, iterations=iterations, spin=spin):
                         result, solver, *_ = fixture(
                             0.0075,
-                            pgs_iterations=iterations,
-                            pgs_contact_regularization=regularization,
+                            iterations=iterations,
+                            contact_regularization=regularization,
                             spin=spin,
                             sliding=sliding,
                             **PATCH_OPTIONS,
@@ -85,12 +85,12 @@ class TestTorsionRegularization(unittest.TestCase):
     def test_zero_controls_and_no_load(self):
         """Preserve excluded/radius-zero controls and forbid spin without compressive load."""
         for regularization in (0.0, 0.01, 0.02):
-            base, *_ = fixture(0.0, pgs_contact_regularization=regularization)
-            excluded, *_ = fixture(0.01, pgs_contact_regularization=regularization, contact_torsion_shape_indices=())
+            base, *_ = fixture(0.0, contact_regularization=regularization)
+            excluded, *_ = fixture(0.01, contact_regularization=regularization, contact_torsion_shape_indices=())
             for name in base:
                 np.testing.assert_array_equal(base[name], excluded[name], err_msg=name)
             for options in ({"closing": 0.0}, {"mu": 0.0}):
-                result, *_ = fixture(0.01, pgs_contact_regularization=regularization, center_only=True, **options)
+                result, *_ = fixture(0.01, contact_regularization=regularization, center_only=True, **options)
                 self.assertLess(np.abs(result["impulses"][result["row_type"] == 7]).max(initial=0), 1e-9)
 
     def test_substep_force_export_and_release(self):
@@ -102,7 +102,7 @@ class TestTorsionRegularization(unittest.TestCase):
                 center_only=True,
                 spin=100.0,
                 dt=dt,
-                pgs_contact_regularization=0.02,
+                contact_regularization=0.02,
                 **PATCH_OPTIONS,
             )
             count = int(contacts.rigid_contact_count.numpy()[0])

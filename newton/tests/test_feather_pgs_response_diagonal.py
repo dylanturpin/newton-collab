@@ -133,7 +133,7 @@ def _run_mixed_response(
     warmstart,
     preelimination,
     dof_count=13,
-    dense_max_constraints=32,
+    articulation_constraint_max=32,
     inactive_joint_limit_capacity=False,
     friction=0.0,
     restitution=0.0,
@@ -155,17 +155,17 @@ def _run_mixed_response(
     with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_warmstart=warmstart,
+            solve_mode="matrix_free",
+            contact_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
             contact_friction_scale=1.0 if friction > 0.0 else 0.0,
             enable_joint_limits=inactive_joint_limit_capacity,
             joint_limit_activation_gap=0.0,
-            pgs_iterations=8,
-            pgs_contact_regularization=contact_regularization,
+            iterations=8,
+            contact_regularization=contact_regularization,
             friction_anchor_beta=friction_anchor_beta,
-            dense_max_constraints=dense_max_constraints,
-            mf_max_constraints=32,
+            articulation_constraint_max=articulation_constraint_max,
+            free_body_constraint_max=32,
         )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
@@ -291,13 +291,13 @@ def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
     with kernel_overrides(overrides):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=iterations,
+            solve_mode="matrix_free",
+            iterations=iterations,
             enable_joint_limits=True,
             joint_limit_activation_gap=0.0,
             friction_anchor_beta=0.0,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
+            articulation_constraint_max=32,
+            free_body_constraint_max=32,
         )
     model.rigid_contact_max = 32
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
@@ -392,7 +392,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         stop = (0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
         oblique = (0.3, -0.2, -1.0, 0.4, 0.5, -0.3)
         for mode in _armature_modes(device):
-            kwargs = {"pgs_mode": mode, "pgs_cfm": 0.0, "friction_anchor_beta": 0.0}
+            kwargs = {"solve_mode": mode, "cfm": 0.0, "friction_anchor_beta": 0.0}
             for armature, expected in ((0.0, 100.0), (9.0, 1000.0)):
                 with self.subTest(mode=mode, armature=armature):
                     model = _armature_sphere_on_ground(device, armature, dense=False)
@@ -414,7 +414,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 results = {}
                 for dense in (False, True):
                     model = _armature_sphere_on_ground(device, _ARMATURE, dense=dense, com=(0.03, -0.02, 0.01), mu=0.5)
-                    solver = SolverFeatherPGS(model, pgs_iterations=64, **kwargs)
+                    solver = SolverFeatherPGS(model, iterations=64, **kwargs)
                     results[dense] = _armature_impact(model, solver, oblique)
                 np.testing.assert_allclose(results[False][0], results[True][0], rtol=0.0, atol=1.0e-4)
                 np.testing.assert_allclose(results[False][1], results[True][1], rtol=1.0e-3, atol=1.0e-2)
@@ -851,7 +851,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
-        solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
+        solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), articulation_constraint_max=32)
         self.assertEqual(set(solver.size_groups), {6, 13})
 
         response_dof_count = solver._model_plan.response_dof_count
@@ -883,7 +883,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         forced_tiled = _FeatherPGSExecutionPlan.build(
             solver.size_groups,
-            max_constraints=solver.dense_max_constraints,
+            max_constraints=solver.articulation_constraint_max,
             max_shared_memory=101376,
             cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
@@ -935,7 +935,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "warmstart": False,
             "preelimination": False,
             "dof_count": 23,
-            "dense_max_constraints": 96,
+            "articulation_constraint_max": 96,
             "inactive_joint_limit_capacity": True,
             "friction": 0.7,
             "restitution": 0.3,
@@ -986,7 +986,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "warmstart": False,
             "preelimination": False,
             "dof_count": 23,
-            "dense_max_constraints": 96,
+            "articulation_constraint_max": 96,
             "friction": 0.7,
             "restitution": 0.3,
             "tangential_velocity": 2.0,
@@ -1021,22 +1021,22 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
+                    solve_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
-                    pgs_iterations=8,
-                    dense_max_constraints=96,
-                    mf_max_constraints=32,
+                    iterations=8,
+                    articulation_constraint_max=96,
+                    free_body_constraint_max=32,
                     contact_torsion_radius=radius,
                 )
             point = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 enable_joint_limits=True,
                 joint_limit_activation_gap=0.0,
-                pgs_iterations=8,
-                dense_max_constraints=96,
-                mf_max_constraints=32,
+                iterations=8,
+                articulation_constraint_max=96,
+                free_body_constraint_max=32,
                 friction_anchor_beta=0.0,
             )
         self.assertTrue(solvers[0.0]._friction_anchors_enabled)
@@ -1264,12 +1264,12 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
+                    solve_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
-                    pgs_iterations=8,
-                    dense_max_constraints=32,
-                    mf_max_constraints=32,
+                    iterations=8,
+                    articulation_constraint_max=32,
+                    free_body_constraint_max=32,
                     contact_torsion_radius=radius,
                 )
         self.assertTrue(solvers[0.0]._local_internal_fast_path)
@@ -1280,7 +1280,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     def test_local_owners_are_limited_to_small_world_counts(self):
         """Select local owners only up to one world per SM; larger models solve exactly as the general owner."""
         limit = wp.get_device("cuda:0").sm_count
-        kwargs = {"pgs_mode": "matrix_free", "dense_max_constraints": 32, "mf_max_constraints": 32}
+        kwargs = {"solve_mode": "matrix_free", "articulation_constraint_max": 32, "free_body_constraint_max": 32}
         with kernel_overrides({"hinv_jt_kernel": "par_row"}):
             for world_count, expected in ((limit, True), (limit + 1, False)):
                 model = _build_mixed_response_model("cuda:0", world_count=world_count)

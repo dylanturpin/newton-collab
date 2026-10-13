@@ -73,11 +73,11 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
         for mode in ["matrix_free"] if device.is_cuda else []:
             with self.subTest(mode=mode):
                 static_model = _floor_model(device, "static")
-                static_v = _step_once(static_model, SolverFeatherPGS(static_model, pgs_mode=mode))[0][:2]
+                static_v = _step_once(static_model, SolverFeatherPGS(static_model, solve_mode=mode))[0][:2]
                 self.assertLess(np.max(np.abs(static_v)), 0.05)
 
                 model = _floor_model(device, "kinematic")
-                solver = SolverFeatherPGS(model, pgs_mode=mode, warn_constraint_overflow=False)
+                solver = SolverFeatherPGS(model, solve_mode=mode, warn_constraint_overflow=False)
                 v, contacts = _step_once(model, solver)
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 self.assertGreater(count, 0)
@@ -85,12 +85,12 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
                 np.testing.assert_allclose(v[:2], static_v, atol=1.0e-5)
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False])
 
-                moving_v = _step_once(model, SolverFeatherPGS(model, pgs_mode=mode), floor_velocity=0.5)[0][:2]
+                moving_v = _step_once(model, SolverFeatherPGS(model, solve_mode=mode), floor_velocity=0.5)[0][:2]
                 np.testing.assert_allclose(moving_v, static_v + 0.5, atol=1.0e-4)
 
                 # The floor is elided even when world 0, where it is stored, has no dynamic body.
                 model = _floor_model(device, "kinematic", kinematic_world0=True)
-                solver = SolverFeatherPGS(model, pgs_mode=mode, warn_constraint_overflow=False)
+                solver = SolverFeatherPGS(model, solve_mode=mode, warn_constraint_overflow=False)
                 v, _ = _step_once(model, solver, box_velocity=(0.0, -1.0))
                 np.testing.assert_allclose(v[1], static_v[1], atol=1.0e-5)
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False])
@@ -99,7 +99,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
         """Without prescribed-response elision, other worlds' contacts with a global kinematic body are flagged."""
         device = wp.get_device()
         model = _floor_model(device, "kinematic")
-        solver = _construct(self, model, True, pgs_mode="split", warn_constraint_overflow=False)
+        solver = _construct(self, model, True, solve_mode="split", warn_constraint_overflow=False)
         _, contacts = _step_once(model, solver)
         count = int(contacts.rigid_contact_count.numpy()[0])
         paths = solver.contact_path.numpy()[:count]
@@ -120,7 +120,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
                 joint_q = model.joint_q.numpy()
                 joint_q[2] += 3.0  # lift world 0's box out of contact
                 model.joint_q.assign(joint_q)
-                solver = _construct(self, model, True, pgs_mode=mode, warn_constraint_overflow=False)
+                solver = _construct(self, model, True, solve_mode=mode, warn_constraint_overflow=False)
                 _, contacts = _step_once(model, solver)
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 self.assertGreater(count, 0)
@@ -134,23 +134,23 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
         for mode in _modes(device):
             with self.subTest(mode=mode):
                 # A dynamic global body always keeps response DOFs in world 0.
-                _construct(self, _floor_model(device, "dynamic"), True, pgs_mode=mode)
+                _construct(self, _floor_model(device, "dynamic"), True, solve_mode=mode)
                 # A global kinematic free body is prescribed only on the matrix_free/immediate path.
-                _construct(self, _floor_model(device, "kinematic"), mode != "matrix_free", pgs_mode=mode)
+                _construct(self, _floor_model(device, "kinematic"), mode != "matrix_free", solve_mode=mode)
                 # World geometry is solvable in every world.
-                _construct(self, _floor_model(device, "static"), False, pgs_mode=mode)
+                _construct(self, _floor_model(device, "static"), False, solve_mode=mode)
 
                 # One world, or global shapes that cannot collide with the worlds' bodies, never warn.
                 builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
                 body = builder.add_body(mass=1.0)
                 builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
                 builder.add_ground_plane()
-                _construct(self, builder.finalize(device=device), False, pgs_mode=mode)
+                _construct(self, builder.finalize(device=device), False, solve_mode=mode)
                 model = _floor_model(device, "dynamic")
                 groups = model.shape_collision_group.numpy()
                 groups[model.shape_body.numpy() == 2] = 7
                 model.shape_collision_group.assign(groups)
-                _construct(self, model, False, pgs_mode=mode)
+                _construct(self, model, False, solve_mode=mode)
 
         if device.is_cuda:
             # A kinematic global articulation with joints keeps response DOFs on every path.
@@ -163,7 +163,7 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
             floor = builder.add_link(mass=1.0, is_kinematic=True)
             builder.add_articulation([builder.add_joint_prismatic(-1, floor, axis=newton.Axis.Z)])
             builder.add_shape_box(floor, hx=5.0, hy=5.0, hz=0.5)
-            _construct(self, builder.finalize(device=device), True, pgs_mode="matrix_free")
+            _construct(self, builder.finalize(device=device), True, solve_mode="matrix_free")
 
 
 if __name__ == "__main__":

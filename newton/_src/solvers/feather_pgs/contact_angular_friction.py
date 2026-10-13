@@ -68,20 +68,20 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
     if (
         not model.device.is_cuda
         or model.requires_grad
-        or solver.pgs_mode != "matrix_free"
+        or solver.solve_mode != "matrix_free"
         or solver.articulated_contact_response != "immediate"
-        or solver.pgs_schedule != "interleaved"
-        or solver.friction_mode != "current"
+        or solver.row_schedule != "interleaved"
+        or solver.friction_mode != "fixed_normal"
         or solver._friction_anchors_enabled
-        or solver.pgs_warmstart
-        or solver.pgs_velocity_iterations != 0
+        or solver.contact_warmstart
+        or solver.velocity_iterations != 0
         or solver.contact_compliance
         or solver._contact_torsion_enabled
         or solver.sleeping is not None
     ):
         raise ValueError(
             "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "
-            "solving with friction_mode='current', point friction (friction_anchor_beta=0), and no warm start, "
+            "solving with friction_mode='fixed_normal', point friction (friction_anchor_beta=0), and no warm start, "
             "velocity iterations, contact compliance, contact torsion radius, or sleeping"
         )
 
@@ -144,7 +144,7 @@ def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads:
                 solver._prescribed_articulation,
                 solver._shape_mu_torsional,
                 solver._shape_mu_rolling,
-                solver.pgs_cfm,
+                solver.cfm,
                 int(index == 0),
             ],
             outputs=[

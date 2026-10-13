@@ -313,13 +313,13 @@ class Example:
             # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
             self.solver = newton.solvers.SolverFeatherPGS(
                 self.model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 enable_restitution=False,
-                pgs_iterations=args.pgs_iterations,
-                dense_max_constraints=1536,
-                mf_max_constraints=1024,
+                iterations=args.pgs_iterations,
+                articulation_constraint_max=1536,
+                free_body_constraint_max=1024,
             )
         else:
             # Create MuJoCo solver with Newton contacts

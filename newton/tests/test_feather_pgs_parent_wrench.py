@@ -38,9 +38,9 @@ def _advance(pipeline, solver, states, control, steps, *, observables=None):
 
 def _sleeping_wrench_solvers(model):
     solver = SolverFeatherPGS(
-        model, pgs_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, friction_anchor_beta=0.0
+        model, solve_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, friction_anchor_beta=0.0
     )
-    reference = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_anchor_beta=0.0)
+    reference = SolverFeatherPGS(model, solve_mode="matrix_free", friction_anchor_beta=0.0)
     return solver, reference
 
 
@@ -215,13 +215,13 @@ def test_parent_wrench_matches_featherstone_on_every_inverse_dynamics_path(test,
     model, state, control = _branched_chains(device)
     reference = _first_step_wrench(model, state, control, SolverFeatherstone(model, angular_damping=0.0))
     test.assertGreater(np.abs(reference).max(), 1.0)
-    configurations = [{"pgs_mode": "split"}]
+    configurations = [{"solve_mode": "split"}]
     if wp.get_device(device).is_cuda:
         configurations += [
-            {"pgs_mode": "matrix_free"},
-            {"pgs_mode": "matrix_free", "parallel_tree": True},
-            {"pgs_mode": "matrix_free", "use_parallel_streams": False},
-            {"pgs_mode": "matrix_free", "double_buffer": False},
+            {"solve_mode": "matrix_free"},
+            {"solve_mode": "matrix_free", "parallel_tree": True},
+            {"solve_mode": "matrix_free", "use_parallel_streams": False},
+            {"solve_mode": "matrix_free", "double_buffer": False},
         ]
     for options in configurations:
         with test.subTest(**options):

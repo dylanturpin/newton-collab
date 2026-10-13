@@ -36,8 +36,8 @@ def test_floating_base_drive_reads_its_own_target(test, device, drive_mode):
     """A revolute drive after a free joint must read its target at joint_target_q_start, not its DOF index."""
     with wp.ScopedDevice(device):
         model, hinge = _floating_base_arm()
-        pgs_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=pgs_mode, pgs_iterations=16, drive_mode=drive_mode)
+        solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode=solve_mode, iterations=16, drive_mode=drive_mode)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         targets = control.joint_target_q.numpy()
@@ -54,8 +54,8 @@ class TestFeatherPGSTargetLayout(unittest.TestCase):
     pass
 
 
-# physx_pgs drives require the CUDA-only matrix-free mode.
-for _mode, _devices in (("augmented", get_test_devices()), ("physx_pgs", get_selected_cuda_test_devices())):
+# rows drives require the CUDA-only matrix-free mode.
+for _mode, _devices in (("augmented", get_test_devices()), ("rows", get_selected_cuda_test_devices())):
     add_function_test(
         TestFeatherPGSTargetLayout,
         f"test_floating_base_drive_reads_its_own_target_{_mode}",

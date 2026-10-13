@@ -38,13 +38,13 @@ def _run_free_spheres(*, dense_rows, graph, steps=20):
             setattr(contacts, name, wp.zeros(32, dtype=float))
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             contact_compliance=True,
             friction_anchor_beta=0.0,
             enable_restitution=False,
-            dense_max_constraints=dense_rows,
-            mf_max_constraints=32,
-            pgs_iterations=8,
+            articulation_constraint_max=dense_rows,
+            free_body_constraint_max=32,
+            iterations=8,
         )
         states = (model.state(), model.state())
         newton.eval_fk(model, model.joint_q, model.joint_qd, states[0])
@@ -202,8 +202,8 @@ class TestContactComplianceCapture(unittest.TestCase):
                     enabled=True,
                     height=0.08,
                     solver_options={
-                        "dense_max_constraints": 1,
-                        "mf_max_constraints": 1,
+                        "articulation_constraint_max": 1,
+                        "free_body_constraint_max": 1,
                         "warn_constraint_overflow": False,
                     },
                 )

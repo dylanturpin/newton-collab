@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the FeatherPGS contact regularizer (``pgs_contact_regularization``)."""
+"""Tests for the FeatherPGS contact regularizer (``contact_regularization``)."""
 
 import inspect
 import unittest
@@ -92,7 +92,7 @@ def test_regularization_fixed_points(test: unittest.TestCase, device):
         test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
-def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", velocity_iterations=2):
+def _stack_scene(device, g, solve_mode="matrix_free", response="immediate", velocity_iterations=2):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.003
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -113,12 +113,12 @@ def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", veloci
     )
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
-        pgs_iterations=8,
-        pgs_velocity_iterations=velocity_iterations,
+        solve_mode=solve_mode,
+        iterations=8,
+        velocity_iterations=velocity_iterations,
         articulated_contact_response=response,
-        pgs_contact_regularization=g,
-        pgs_warmstart=True,
+        contact_regularization=g,
+        contact_warmstart=True,
     )
     return model, pipeline, solver, bodies
 
@@ -141,7 +141,7 @@ def _run(model, pipeline, solver, frames, dt=DT):
 def test_regularization_route_agreement(test: unittest.TestCase, device):
     """The regularized update must agree across the matrix-free execution
     routes: the fused MF-GS kernel (matrix_free/immediate), the standalone
-    MF kernel (split/immediate), and the propagation-fused full-iteration
+    MF kernel (split/immediate), and the propagation_fused full-iteration
     kernel: same scene, same g, matching resting poses."""
     with wp.ScopedDevice(device):
         results = {}
@@ -149,10 +149,10 @@ def test_regularization_route_agreement(test: unittest.TestCase, device):
             ("fused", "matrix_free", "immediate", 2),
             # velocity iterations are matrix_free-only; split runs without
             ("standalone", "split", "immediate", 0),
-            ("propagation-fused", "matrix_free", "propagation-fused", 2),
+            ("propagation_fused", "matrix_free", "propagation_fused", 2),
         ):
             model, pipeline, solver, _bodies = _stack_scene(
-                device, g=0.05, pgs_mode=mode, response=response, velocity_iterations=velit
+                device, g=0.05, solve_mode=mode, response=response, velocity_iterations=velit
             )
             body_q, _ = _run(model, pipeline, solver, 120)
             results[label] = body_q
@@ -163,7 +163,7 @@ def test_regularization_route_agreement(test: unittest.TestCase, device):
             )
 
 
-def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
+def _resting_box(device, g, solve_mode, rate, frames, **solver_kwargs):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.01
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -181,9 +181,9 @@ def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
     )
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
-        pgs_iterations=12,
-        pgs_contact_regularization=g,
+        solve_mode=solve_mode,
+        iterations=12,
+        contact_regularization=g,
         **solver_kwargs,
     )
     _, zs = _run(model, pipeline, solver, frames, dt=1.0 / rate)
@@ -191,7 +191,7 @@ def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
 
 
 def _sag_formula(g, rate):
-    """Resting sag of a body under gravity: ``g * a * dt^2 / pgs_beta`` with the default beta."""
+    """Resting sag of a body under gravity: ``g * a * dt^2 / baumgarte`` with the default beta."""
     return g * 9.81 / (rate * rate) / 0.2
 
 
@@ -201,7 +201,7 @@ def test_regularization_documented_sag(test: unittest.TestCase, device):
     matrix-free route."""
     with wp.ScopedDevice(device):
         for rate in (60, 240):
-            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, pgs_warmstart=True)
+            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, contact_warmstart=True)
             expected = _sag_formula(0.5, rate)
             test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
 
@@ -210,7 +210,7 @@ def test_regularization_split_route_documented_sag(test: unittest.TestCase, devi
     """The split route's standalone matrix-free kernel carries the same law as the
     fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
     with wp.ScopedDevice(device):
-        sag = _resting_box(device, 0.5, "split", 60, 180, pgs_warmstart=True)
+        sag = _resting_box(device, 0.5, "split", 60, 180, contact_warmstart=True)
         expected = _sag_formula(0.5, 60)
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
@@ -219,7 +219,7 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
     """The velocity-only pass solves the exact rigid law: a settled stack holds
     its height to well under a millimetre over the last second."""
     with wp.ScopedDevice(device):
-        for response in ("immediate", "propagation-fused"):
+        for response in ("immediate", "propagation_fused"):
             model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
             _, zs = _run(model, pipeline, solver, 240)
             drift = abs(zs[-1] - zs[179])
@@ -230,7 +230,7 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
 
 def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, device):
     """Same-articulation link-link contacts stay dense under the ``propagation`` and
-    ``propagation-colored`` schedules, and their velocity-only pass runs through
+    ``propagation_colored`` schedules, and their velocity-only pass runs through
     nested fused-GS launches inside the propagation-tree launcher. Every one of
     those launches must be rigid (``soft_relax=True``), and the converged velocity
     after the pass must be the ``g = 0`` solution, since the rigid law does not
@@ -240,14 +240,14 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         model = _build_scissor_model(device)
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response,
-            pgs_iterations=8,
-            pgs_velocity_iterations=8,
-            pgs_contact_regularization=g,
+            iterations=8,
+            velocity_iterations=8,
+            contact_regularization=g,
             contact_friction_scale=0.0,
-            dense_max_constraints=64,
-            mf_max_constraints=16,
+            articulation_constraint_max=64,
+            free_body_constraint_max=16,
         )
         calls = []
         in_velocity_pass = {"on": False}
@@ -282,7 +282,7 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         return calls, state_out.joint_qd.numpy().copy()
 
     with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation-colored"):
+        for response in ("propagation", "propagation_colored"):
             calls, qd_soft = stepped(response, 0.5)
             velocity_calls = [soft for on, soft in calls if on]
             position_calls = [soft for on, soft in calls if not on]
@@ -321,11 +321,11 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         )
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=8,
-            pgs_velocity_iterations=2,
-            pgs_contact_regularization=0.02,
-            pgs_warmstart=True,
+            solve_mode="matrix_free",
+            iterations=8,
+            velocity_iterations=2,
+            contact_regularization=0.02,
+            contact_warmstart=True,
         )
         observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
@@ -369,9 +369,9 @@ def test_regularization_validation(test: unittest.TestCase, device):
         model = builder.finalize()
         for bad in (-0.1, float("nan"), float("inf"), 1.0e7):
             with test.assertRaises(ValueError):
-                newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=bad)
-        newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=0.0)
-        newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=1.0e6)
+                newton.solvers.SolverFeatherPGS(model, contact_regularization=bad)
+        newton.solvers.SolverFeatherPGS(model, contact_regularization=0.0)
+        newton.solvers.SolverFeatherPGS(model, contact_regularization=1.0e6)
 
 
 def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, device):
@@ -382,8 +382,8 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        pgs_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=pgs_mode)
+        solve_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode=solve_mode)
         test.assertFalse(solver._regularization_enabled)
         test.assertIs(solver.row_w, solver._contact_row_w_dummy)
         test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
@@ -394,7 +394,7 @@ def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCa
     """The standalone MF route must not read its one-element inactive weight argument."""
     with wp.ScopedDevice(device):
         model, pipeline, solver, _bodies = _stack_scene(
-            device, g=0.0, pgs_mode="split", response="immediate", velocity_iterations=0
+            device, g=0.0, solve_mode="split", response="immediate", velocity_iterations=0
         )
         body_q, _zs = _run(model, pipeline, solver, 1)
         test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
@@ -434,13 +434,13 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
         model = _build_scissor_model(device)
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="split",
-            pgs_iterations=0,
-            pgs_velocity_iterations=0,
-            pgs_contact_regularization=0.5,
+            solve_mode="split",
+            iterations=0,
+            velocity_iterations=0,
+            contact_regularization=0.5,
             contact_friction_scale=0.0,
-            dense_max_constraints=64,
-            mf_max_constraints=16,
+            articulation_constraint_max=64,
+            free_body_constraint_max=16,
         )
         unregularized_diag = {}
         apply_regularization = solver._stage6_apply_contact_regularization
@@ -476,19 +476,19 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
 def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
     """Serial and colored propagation solve real articulated rows with per-row weights."""
     with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation-colored"):
+        for response in ("propagation", "propagation_colored"):
             model = _build_scissor_model(device)
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 articulated_contact_response=response,
                 propagation_same_articulation_rows=True,
-                pgs_iterations=1,
-                pgs_velocity_iterations=0,
-                pgs_contact_regularization=0.5,
+                iterations=1,
+                velocity_iterations=0,
+                contact_regularization=0.5,
                 contact_friction_scale=0.0,
-                dense_max_constraints=64,
-                mf_max_constraints=16,
+                articulation_constraint_max=64,
+                free_body_constraint_max=16,
             )
             state_in, state_out = model.state(), model.state()
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -511,8 +511,8 @@ def test_compliance_parameters_removed(test: unittest.TestCase, device):
     names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
     test.assertNotIn("dense_contact_compliance", names)
     test.assertNotIn("speculative_dense_contact_compliance", names)
-    start = names.index("pgs_beta")
-    test.assertEqual(names[start : start + 4], ("pgs_beta", "pgs_cfm", "pgs_omega", "pgs_contact_regularization"))
+    start = names.index("baumgarte")
+    test.assertEqual(names[start : start + 4], ("baumgarte", "cfm", "relaxation", "contact_regularization"))
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
@@ -547,11 +547,11 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=16,
-            pgs_velocity_iterations=0,
-            pgs_contact_regularization=g,
-            pgs_warmstart=True,
+            solve_mode="matrix_free",
+            iterations=16,
+            velocity_iterations=0,
+            contact_regularization=g,
+            contact_warmstart=True,
         )
         s0, s1 = model.state(), model.state()
         control = model.control()

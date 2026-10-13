@@ -124,14 +124,14 @@ def test_full_reset_matches_fresh_solver(test, device):
 # Two floating ants dropped onto each other plus a stack of boxes in every world: articulation-articulation,
 # articulation-box and box-box contacts, joint limits, PhysX drives, joint velocity limits and joint friction.
 ROBOT_SOLVER_OPTIONS = {
-    "pgs_mode": "matrix_free",
-    "drive_mode": "physx_pgs",
+    "solve_mode": "matrix_free",
+    "drive_mode": "rows",
     "enable_joint_limits": True,
     "enable_joint_velocity_limits": True,
     "enable_joint_friction": True,
-    "pgs_iterations": 8,
-    "dense_max_constraints": 256,
-    "mf_max_constraints": 256,
+    "iterations": 8,
+    "articulation_constraint_max": 256,
+    "free_body_constraint_max": 256,
     # Rows that do not fit are dropped deterministically too, so overflow stays in scope.
     "warn_constraint_overflow": False,
 }
@@ -141,14 +141,14 @@ ANGULAR_FRICTION_SOLVER_OPTIONS = {
     **ROBOT_SOLVER_OPTIONS,
     "enable_torsional_rolling_friction": True,
     "friction_anchor_beta": 0.0,
-    "dense_max_constraints": 512,
+    "articulation_constraint_max": 512,
 }
 
 SPLIT_SOLVER_OPTIONS = {
-    "pgs_mode": "split",
+    "solve_mode": "split",
     "enable_joint_limits": True,
-    "dense_max_constraints": 128,
-    "mf_max_constraints": 256,
+    "articulation_constraint_max": 128,
+    "free_body_constraint_max": 256,
     # Rows that do not fit are dropped deterministically too, so overflow stays in scope.
     "warn_constraint_overflow": False,
 }
@@ -264,7 +264,7 @@ def test_warm_started_full_reset_matches_fresh_solver(test, device):
 
     for name, base_options in configurations.items():
         with test.subTest(name):
-            options = {**base_options, "pgs_warmstart": True}
+            options = {**base_options, "contact_warmstart": True}
             reused = SolverFeatherPGS(model, deterministic=True, **options)
             simulate(reused, 5)
             reused.reset(model.state())
@@ -389,7 +389,7 @@ def test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical(test,
     for name in ("shape_scale", "shape_collision_radius", "shape_collision_aabb_lower", "shape_collision_aabb_upper"):
         getattr(model, name).assign(getattr(rescaled, name))
     collision_options = {"dynamic_shape_scale": True}
-    options = {**SPLIT_SOLVER_OPTIONS, "mf_max_constraints": 2048}
+    options = {**SPLIT_SOLVER_OPTIONS, "free_body_constraint_max": 2048}
     pipeline = newton.CollisionPipeline(model, deterministic=True, **collision_options)
     test.assertFalse(pipeline.narrow_phase.mesh_sdf_identity_scale_only)
     for graph in (False, True):
@@ -414,8 +414,8 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
         solver = SolverFeatherPGS(
             model,
             deterministic=True,
-            pgs_mode="split",
-            mf_max_constraints=capacity,
+            solve_mode="split",
+            free_body_constraint_max=capacity,
             warn_constraint_overflow=False,
         )
         solver.step(state, model.state(), model.control(), contacts, 0.005)
@@ -449,7 +449,7 @@ def test_overflow_warning_names_deterministic_mode(test, device):
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     pipeline.collide(state, contacts)
     warning = r"Warning: FeatherPGS matrix-free constraint-row overflow in world \d+: requested \d+ rows, limit 24; "
-    warning += r"dropped \d+ contact/friction rows\. Increase mf_max_constraints\.\n"
+    warning += r"dropped \d+ contact/friction rows\. Increase free_body_constraint_max\.\n"
     note = (
         "FeatherPGS deterministic mode: each world keeps the rows of its earliest contacts in contact-buffer order. "
         "While its contacts and joint rows are unchanged it drops the same contacts every step; otherwise it drops "
@@ -457,7 +457,9 @@ def test_overflow_warning_names_deterministic_mode(test, device):
     )
     for deterministic in (False, True):
         with test.subTest(deterministic=deterministic):
-            solver = SolverFeatherPGS(model, deterministic=deterministic, pgs_mode="split", mf_max_constraints=24)
+            solver = SolverFeatherPGS(
+                model, deterministic=deterministic, solve_mode="split", free_body_constraint_max=24
+            )
             wp.synchronize_device(device)
             capture = StdOutCapture()
             capture.begin()
@@ -479,7 +481,9 @@ def test_overflow_warning_names_deterministic_mode(test, device):
 def test_deterministic_requires_immediate_contact_response(test, device):
     model = _build_contact_scene(device, worlds=1, boxes=1, ants=1)
     with test.assertRaisesRegex(ValueError, "deterministic=True requires"):
-        SolverFeatherPGS(model, deterministic=True, pgs_mode="matrix_free", articulated_contact_response="propagation")
+        SolverFeatherPGS(
+            model, deterministic=True, solve_mode="matrix_free", articulated_contact_response="propagation"
+        )
 
 
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
@@ -509,13 +513,13 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
     solver = SolverFeatherPGS(
         model,
         deterministic=True,
-        pgs_mode="matrix_free",
-        drive_mode="physx_pgs",
+        solve_mode="matrix_free",
+        drive_mode="rows",
         enable_joint_limits=True,
         joint_limit_activation_gap=0.0,
         enable_joint_velocity_limits=True,
         fuse_joint_velocity_limits=False,
-        dense_max_constraints=4 * arts_per_world,
+        articulation_constraint_max=4 * arts_per_world,
     )
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -553,7 +557,7 @@ def test_deterministic_angular_friction_rows_follow_their_contact(test, device):
     count = int(contacts.rigid_contact_count.numpy()[0])
 
     def route(capacity):
-        options = {**ANGULAR_FRICTION_SOLVER_OPTIONS, "dense_max_constraints": capacity}
+        options = {**ANGULAR_FRICTION_SOLVER_OPTIONS, "articulation_constraint_max": capacity}
         solver = SolverFeatherPGS(model, deterministic=True, **options)
         solver.step(state, model.state(), model.control(), contacts, 0.005)
         return (

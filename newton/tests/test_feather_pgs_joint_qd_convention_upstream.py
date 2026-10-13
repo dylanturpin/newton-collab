@@ -49,13 +49,13 @@ def _step_once(model, solver):
     return state_out
 
 
-def test_joint_qd_matches_featherstone_far_from_origin(test, device, pgs_mode="matrix_free"):
+def test_joint_qd_matches_featherstone_far_from_origin(test, device, solve_mode="matrix_free"):
     """Match SolverFeatherstone's joint_qd and body_qd from the same public twist, far from the origin."""
     for origin in ORIGINS:
         with test.subTest(origin=origin):
             model = _build_free_body(origin, device)
             reference = _step_once(model, SolverFeatherstone(model))
-            state_out = _step_once(model, SolverFeatherPGS(model, pgs_mode=pgs_mode))
+            state_out = _step_once(model, SolverFeatherPGS(model, solve_mode=solve_mode))
             # A convention mismatch would differ by omega x x_com_world, about 60 m/s at 20 m.
             np.testing.assert_allclose(state_out.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1e-3)
             np.testing.assert_allclose(state_out.body_qd.numpy(), reference.body_qd.numpy(), rtol=0.0, atol=1e-3)
@@ -70,7 +70,7 @@ for _name, _func in (
 ):
     add_function_test(TestFeatherPGSJointQdConvention, _name, _func, devices=get_cuda_test_devices())
     add_function_test(
-        TestFeatherPGSJointQdConvention, f"{_name}_split", _func, devices=get_test_devices(), pgs_mode="split"
+        TestFeatherPGSJointQdConvention, f"{_name}_split", _func, devices=get_test_devices(), solve_mode="split"
     )
 
 

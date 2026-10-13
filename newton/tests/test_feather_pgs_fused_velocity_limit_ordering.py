@@ -87,8 +87,8 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
 
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            drive_mode="physx_pgs",
+            solve_mode="matrix_free",
+            drive_mode="rows",
             articulated_contact_response=articulated_contact_response,
             enable_joint_velocity_limits=True,
             fuse_joint_velocity_limits=fuse,
@@ -100,9 +100,9 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
             # reach 1.53x the limit at 8 iterations (7.1x at 1); dedicated
             # rows and the end-of-iteration clamp hold the limit exactly at
             # every iteration count.
-            pgs_iterations=8,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
+            iterations=8,
+            articulation_constraint_max=32,
+            free_body_constraint_max=32,
         )
 
         state_0, state_1 = model.state(), model.state()
@@ -140,12 +140,12 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="immediate")
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "propagation-fused FPGS requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "propagation_fused FPGS requires CUDA")
     def test_fused_clamp_holds_limit_through_impact_propagation_fused(self):
         # Same invariant on the propagation full-iteration kernel, where the
         # box-arm contact is solved in the propagation family with the tree
         # response inside the same kernel.
-        speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="propagation-fused")
+        speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="propagation_fused")
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
 

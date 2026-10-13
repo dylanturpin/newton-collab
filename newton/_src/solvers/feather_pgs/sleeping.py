@@ -21,10 +21,10 @@ class _SleepState:
         if (
             model.requires_grad
             or model.particle_count
-            or solver.pgs_warmstart
+            or solver.contact_warmstart
             or solver._mf_warmstart_enabled
             or solver.contact_compliance
-            or solver.pgs_velocity_iterations
+            or solver.velocity_iterations
             or solver.articulated_contact_response != "immediate"
         ):
             raise ValueError(

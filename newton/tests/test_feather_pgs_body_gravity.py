@@ -36,7 +36,7 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
         for mode in ("split", "matrix_free"):
             for parallel in (False, True):
                 with self.subTest(mode=mode, parallel_tree=parallel):
-                    state = _advance(model, SolverFeatherPGS, {"pgs_mode": mode, "parallel_tree": parallel}, steps=8)
+                    state = _advance(model, SolverFeatherPGS, {"solve_mode": mode, "parallel_tree": parallel}, steps=8)
                     np.testing.assert_allclose(state.body_qd.numpy()[:, :3], expected, atol=2.0e-6)
                     np.testing.assert_allclose(state.body_qd.numpy()[:, 3:], 0.0, atol=1.0e-7)
 
@@ -54,7 +54,7 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
             serial = None
             for parallel in (False, True):
                 with self.subTest(mode=mode, parallel_tree=parallel):
-                    options = {"pgs_mode": mode, "parallel_tree": parallel}
+                    options = {"solve_mode": mode, "parallel_tree": parallel}
                     state = _advance(model, SolverFeatherPGS, options, steps=8)
                     control = _advance(reference, SolverFeatherPGS, options, steps=8, forces=forces)
                     for name in ("body_q", "body_qd"):
@@ -81,7 +81,7 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
                 model = builder.finalize(device=device)
                 solvers, states, graphs, outputs, controls = [], [], [], [], []
                 for parallel in (False, True):
-                    options = {"pgs_mode": mode, "parallel_tree": parallel}
+                    options = {"solve_mode": mode, "parallel_tree": parallel}
                     _advance(model, SolverFeatherPGS, options, steps=2)
                     solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
                     self.assertEqual(solver._tree_plan is not None, parallel)
@@ -260,8 +260,8 @@ class TestFeatherPGSBodyGravity(unittest.TestCase):
                     builder = newton.ModelBuilder()
                     builder.replicate(_free_pair(), 4)
                     model = builder.finalize(device=device)
-                    _advance(model, SolverFeatherPGS, {"pgs_mode": mode}, steps=2)
-                    solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_mode=mode)
+                    _advance(model, SolverFeatherPGS, {"solve_mode": mode}, steps=2)
+                    solver = SolverFeatherPGS(model, angular_damping=0.0, solve_mode=mode)
                     state, output = model.state(), model.state()
                     control = model.control()
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -335,9 +335,9 @@ def _mixed_articulation(gravity):
 
 def _solver_options():
     """Exercise serial and cached dynamics in both Feather solvers."""
-    choices = [(SolverFeatherstone, {}), (SolverFeatherPGS, {"pgs_mode": "split"})]
+    choices = [(SolverFeatherstone, {}), (SolverFeatherPGS, {"solve_mode": "split"})]
     if wp.get_device().is_cuda:
-        choices.append((SolverFeatherPGS, {"pgs_mode": "matrix_free"}))
+        choices.append((SolverFeatherPGS, {"solve_mode": "matrix_free"}))
     return choices
 
 

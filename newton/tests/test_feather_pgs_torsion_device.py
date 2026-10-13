@@ -134,7 +134,7 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
     solver = SimpleNamespace(
         model=model,
         world_count=worlds,
-        dense_max_constraints=dense,
+        articulation_constraint_max=dense,
         _max_contacts_alloc=capacity,
         _contact_torsion_shape_set=None,
         _friction_anchors_enabled=patches,
@@ -150,7 +150,7 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         row_mu=arr(mu, float),
         _row_dropped_dense=zero(worlds, int),
         _contact_torsion_group=full((worlds, dense), -1),
-        pgs_cfm=0.003,
+        cfm=0.003,
         contact_torsion_radius=0.01,
         body_to_joint=arr(np.arange(worlds * 2, dtype=np.int32), int),
         body_to_articulation=arr(np.arange(worlds * 2, dtype=np.int32), int),
@@ -285,14 +285,14 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             before = solver.row_type.numpy().copy()
             if failure == "ring":
                 parents = solver.row_parent.numpy()
-                parents[0, 0] = solver.dense_max_constraints - 1
+                parents[0, 0] = solver.articulation_constraint_max - 1
                 solver.row_parent.assign(parents)
             elif failure == "dense":
                 solver._row_dropped_dense.fill_(1)
             elif failure == "input":
                 contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
             else:
-                solver.constraint_count.fill_(solver.dense_max_constraints)
+                solver.constraint_count.fill_(solver.articulation_constraint_max)
             device = DeviceTorsionPreparation(solver)
             with self.subTest(failure=failure), self.assertRaises(RuntimeError):
                 device.prepare(state, augmented, contacts)
@@ -510,14 +510,14 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 model = builder.finalize(device="cuda:0")
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=64,
-                    pgs_velocity_iterations=velocity,
-                    pgs_contact_regularization=regularization,
+                    solve_mode="matrix_free",
+                    iterations=64,
+                    velocity_iterations=velocity,
+                    contact_regularization=regularization,
                     contact_torsion_radius=0.01,
                     enable_bilateral_preelimination=False,
-                    dense_max_constraints=128,
-                    mf_max_constraints=64,
+                    articulation_constraint_max=128,
+                    free_body_constraint_max=64,
                     row_watermark=True,
                     **PATCH_OPTIONS,
                 )
@@ -563,9 +563,9 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
         for patches in (False, True):
             for velocity, regularization in ((16, 0.0), (0, 0.01)):
                 options = {
-                    "pgs_iterations": 16,
-                    "pgs_velocity_iterations": velocity,
-                    "pgs_contact_regularization": regularization,
+                    "iterations": 16,
+                    "velocity_iterations": velocity,
+                    "contact_regularization": regularization,
                     "enable_bilateral_preelimination": False,
                     "sliding": 0.03,
                     "spin": 0.4,
@@ -609,7 +609,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             device.validate()
             self.assertEqual(np.count_nonzero(device.work.spin_row.numpy() >= 0), 0 if count == 0 else 6)
         bad = initial_parent.numpy()
-        bad[0, 0] = solver.dense_max_constraints - 1
+        bad[0, 0] = solver.articulation_constraint_max - 1
         initial_parent.assign(bad)
         wp.capture_launch(capture.graph)
         with self.assertRaisesRegex(RuntimeError, "load ring"):
@@ -650,7 +650,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             elif failure == "dense":
                 solver._row_dropped_dense.fill_(1)
             else:
-                initial_count.fill_(solver.dense_max_constraints)
+                initial_count.fill_(solver.articulation_constraint_max)
             for _ in range(2):
                 wp.capture_launch(capture.graph)
                 with self.subTest(failure=failure), self.assertRaises(RuntimeError):
@@ -662,16 +662,16 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_public_api_noop_and_fail_stop(self):
         """No radius means no new state; active host torsion cannot be captured."""
-        _, plain, model, state, _ = fixture(0.0, contact_torsion_device=True, pgs_iterations=16)
+        _, plain, model, state, _ = fixture(0.0, contact_torsion_device=True, iterations=16)
         plain.check_constraint_capacity()
         self.assertIsNone(getattr(plain, "_device_torsion", None))
 
-        _, reference, model, state, contacts = fixture(0.01, pgs_iterations=16)
+        _, reference, model, state, contacts = fixture(0.01, iterations=16)
         with self.assertRaisesRegex(RuntimeError, "requires contact_torsion_device"):
             with wp.ScopedCapture(device=model.device):
                 reference.step(state, model.state(), model.control(), contacts, 0.0025)
 
-        _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, pgs_iterations=16)
+        _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, iterations=16)
         output = model.state()
         solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
         for _ in range(2):
@@ -692,9 +692,9 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 _, solver, model, a, contacts = fixture(
                     0.01,
                     contact_torsion_device=True,
-                    pgs_iterations=16,
-                    pgs_velocity_iterations=velocity,
-                    pgs_contact_regularization=regularization,
+                    iterations=16,
+                    velocity_iterations=velocity,
+                    contact_regularization=regularization,
                     enable_bilateral_preelimination=False,
                     sliding=0.01,
                     spin=0.4,

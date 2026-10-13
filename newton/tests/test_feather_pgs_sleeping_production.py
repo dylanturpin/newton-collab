@@ -14,19 +14,19 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_TORSION
 
 _PROFILE = {
-    "pgs_mode": "matrix_free",
-    "pgs_schedule": "interleaved",
+    "solve_mode": "matrix_free",
+    "row_schedule": "interleaved",
     "articulated_contact_response": "immediate",
-    "pgs_iterations": 32,
-    "pgs_contact_regularization": 0.01,
+    "iterations": 32,
+    "contact_regularization": 0.01,
     "contact_shared_anchor": True,
     "contact_friction_shared_anchor": True,
     "friction_anchor_beta": 0.2,
     "contact_friction_gap_threshold": 0.001,
     "contact_torsion_radius": 0.01,
     "contact_torsion_device": True,
-    "dense_max_constraints": 512,
-    "mf_max_constraints": 512,
+    "articulation_constraint_max": 512,
+    "free_body_constraint_max": 512,
     "enable_sleeping": True,
     "sleep_quiet_time": 0.1,
 }

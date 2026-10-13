@@ -48,11 +48,11 @@ def _hinge_model(device, *, damping: float, spring_k: float | None = None, sprin
     return builder.finalize(device=device)
 
 
-def _construct(test, model, *, pgs_mode, expect_warning):
+def _construct(test, model, *, solve_mode, expect_warning):
     """Construct the solver, requiring exactly the spring warning or no warning."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, pgs_iterations=8)
+        solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=8)
     messages = [f"{w.category.__name__}: {w.message}" for w in caught]
     test.assertEqual(len(caught), int(expect_warning), messages)
     if expect_warning:
@@ -61,16 +61,16 @@ def _construct(test, model, *, pgs_mode, expect_warning):
     return solver
 
 
-def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, pgs_mode="matrix_free"):
+def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, solve_mode="matrix_free"):
     """Construct silently without the spring attributes, and with zero registered stiffness."""
-    _construct(test, _hinge_model(device, damping=0.1), pgs_mode=pgs_mode, expect_warning=False)
-    _construct(test, _hinge_model(device, damping=0.1, spring_k=0.0), pgs_mode=pgs_mode, expect_warning=False)
+    _construct(test, _hinge_model(device, damping=0.1), solve_mode=solve_mode, expect_warning=False)
+    _construct(test, _hinge_model(device, damping=0.1, spring_k=0.0), solve_mode=solve_mode, expect_warning=False)
 
 
-def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, pgs_mode="matrix_free"):
+def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve_mode="matrix_free"):
     """Refresh damping on a JOINT_DOF_PROPERTIES notify while still applying no spring torque."""
     model = _hinge_model(device, damping=0.0, spring_k=0.0, spring_ref=0.5)
-    solver = _construct(test, model, pgs_mode=pgs_mode, expect_warning=False)
+    solver = _construct(test, model, solve_mode=solve_mode, expect_warning=False)
     model.mujoco.dof_passive_stiffness.assign([4.0])
     model.joint_damping.assign([3.0])
     solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
@@ -99,7 +99,7 @@ for _name, _func in (
     ),
 ):
     add_function_test(TestFeatherPGSSprings, _name, _func, devices=get_cuda_test_devices())
-    add_function_test(TestFeatherPGSSprings, f"{_name}_split", _func, devices=get_test_devices(), pgs_mode="split")
+    add_function_test(TestFeatherPGSSprings, f"{_name}_split", _func, devices=get_test_devices(), solve_mode="split")
 add_function_test(
     TestFeatherPGSSprings,
     "test_registration_adds_no_spring_attributes",

@@ -18,7 +18,7 @@ DT = 1.0 / 480.0
 
 
 def _fpgs(view, **kwargs):
-    return SolverFeatherPGS(view, pgs_mode="matrix_free", **kwargs)
+    return SolverFeatherPGS(view, solve_mode="matrix_free", **kwargs)
 
 
 def _build_box_cloth(
@@ -367,12 +367,12 @@ def _build_rolling_sphere(device):
 def test_articulated_graph_capture_matches_eager(test, device):
     """Graph replay of an articulated source matches eager stepping across proxy iterations and friction models."""
     options = {
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
-        "pgs_iterations": 16,
+        "iterations": 16,
         "angular_damping": 0.0,
-        "dense_max_constraints": 32,
-        "mf_max_constraints": 16,
+        "articulation_constraint_max": 32,
+        "free_body_constraint_max": 16,
         "double_buffer": False,
     }
     cases = [
@@ -429,7 +429,7 @@ def test_articulated_graph_capture_matches_eager(test, device):
 def test_unsupported_options_raise(test, device):
     """Options that are not validated in coupled use fail explicitly."""
     for kwargs in (
-        {"pgs_warmstart": True},
+        {"contact_warmstart": True},
         {"enable_sleeping": True},
     ):
         model, boxes = _build_box_cloth(device)

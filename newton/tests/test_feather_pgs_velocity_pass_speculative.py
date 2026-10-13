@@ -12,7 +12,7 @@ a falling body at the edge of the margin. The velocity pass distinguishes the
 two using the position solution's linearized end gap, not impulse magnitude.
 
 No restitution is involved anywhere here: this is ordinary free fall with
-``pgs_velocity_iterations`` enabled.
+``velocity_iterations`` enabled.
 """
 
 import unittest
@@ -29,7 +29,7 @@ SIM_DT = 1.0 / 2000.0
 RADIUS = 0.05
 DROP = 0.12
 
-RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
+RESPONSE_MODES = ("immediate", "propagation", "propagation_fused", "propagation_colored")
 
 # Values written into ``SolverFeatherPGS.contact_path``.
 PATH_DENSE = 0
@@ -37,7 +37,7 @@ PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
 # The route each scene and response mode takes, measured rather than assumed.
-# A lone free body never reaches dense rows, and "propagation-fused" only uses
+# A lone free body never reaches dense rows, and "propagation_fused" only uses
 # propagation rows once a real articulation exists -- with a free body it
 # degrades to the matrix-free path -- so a single-sphere scene cannot claim to
 # cover either. Asserting the exact set keeps the suite from silently claiming
@@ -45,12 +45,12 @@ PATH_PROPAGATION = 2
 EXPECTED_PATHS = {
     ("free", "immediate"): {PATH_MATRIX_FREE},
     ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation-fused"): {PATH_MATRIX_FREE},
-    ("free", "propagation-colored"): {PATH_PROPAGATION},
+    ("free", "propagation_fused"): {PATH_MATRIX_FREE},
+    ("free", "propagation_colored"): {PATH_PROPAGATION},
     ("articulated", "immediate"): {PATH_DENSE},
     ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation-fused"): {PATH_PROPAGATION},
-    ("articulated", "propagation-colored"): {PATH_PROPAGATION},
+    ("articulated", "propagation_fused"): {PATH_PROPAGATION},
+    ("articulated", "propagation_colored"): {PATH_PROPAGATION},
 }
 
 
@@ -90,7 +90,7 @@ def _drop(
     steps=620,
     scene="free",
     *,
-    pgs_warmstart=False,
+    contact_warmstart=False,
     mf_warmstart=False,
 ):
     """Drop a body onto a plane; return heights, velocities, contact counts, routes."""
@@ -98,10 +98,10 @@ def _drop(
     solver = newton.solvers.SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode="matrix_free",
-        pgs_velocity_iterations=velocity_iterations,
+        solve_mode="matrix_free",
+        velocity_iterations=velocity_iterations,
         articulated_contact_response=response,
-        pgs_warmstart=pgs_warmstart or mf_warmstart,
+        contact_warmstart=contact_warmstart or mf_warmstart,
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -109,7 +109,7 @@ def _drop(
     heights, velocities, counts, routes = [], [], [], set()
     pipeline = (
         newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
-        if pgs_warmstart or mf_warmstart
+        if contact_warmstart or mf_warmstart
         else newton.CollisionPipeline(model)
     )
     contacts = pipeline.contacts()
@@ -170,7 +170,7 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
 
     def step(iterations):
         solver = newton.solvers.SolverFeatherPGS(
-            model, angular_damping=0.0, pgs_mode="matrix_free", pgs_velocity_iterations=iterations
+            model, angular_damping=0.0, solve_mode="matrix_free", velocity_iterations=iterations
         )
         state_0, state_1 = model.state(), model.state()
         # A free body is driven through joint_qd; writing body_qd alone is discarded
@@ -290,7 +290,7 @@ def test_velocity_iterations_do_not_halt_a_falling_body(test, device):
     """Land a falling body on the plane with the velocity pass enabled."""
     for iterations in (2, 8):
         h, v, n, _r = _drop(device, iterations)
-        _assert_landed(test, h, v, n, f"pgs_velocity_iterations={iterations}")
+        _assert_landed(test, h, v, n, f"velocity_iterations={iterations}")
 
 
 def test_velocity_iterations_match_the_position_only_landing(test, device):
@@ -409,8 +409,8 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
     solver = newton.solvers.SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode="matrix_free",
-        pgs_velocity_iterations=4,
+        solve_mode="matrix_free",
+        velocity_iterations=4,
     )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy().reshape(2, 6)
@@ -442,9 +442,9 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
     model, _body = _build(device, "free")
 
     def make(**kwargs):
-        return newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=4, **kwargs)
+        return newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", velocity_iterations=4, **kwargs)
 
-    make(pgs_warmstart=True)
+    make(contact_warmstart=True)
 
     # Exercise dense slot warm starting and MF identity warm starting through
     # the same velocity pass, not just their constructor paths.
@@ -453,7 +453,7 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
         4,
         response="immediate",
         scene="articulated",
-        pgs_warmstart=True,
+        contact_warmstart=True,
     )
     _assert_landed(test, h, v, n, "dense warm start")
     test.assertEqual(routes, {PATH_DENSE})

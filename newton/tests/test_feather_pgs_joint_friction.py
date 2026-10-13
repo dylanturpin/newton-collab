@@ -90,17 +90,17 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
     def test_drive_settles_inside_friction_deadband(self):
         """Stop a PD-driven hinge where the drive effort falls inside the friction box."""
         ke, kd, target = 10.0, 2.0, 1.0
-        for drive_mode in ("augmented", "physx_pgs"):
+        for drive_mode in ("augmented", "rows"):
             with self.subTest(drive_mode=drive_mode):
                 model = _single_dof_model("revolute", ke=ke, kd=kd, gravity=0.0)
-                solver = _solver(model, drive_mode=drive_mode, pgs_iterations=32)
+                solver = _solver(model, drive_mode=drive_mode, iterations=32)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_target_q.assign([target])
                 q, qd = _advance(solver, states, control, 400)
                 self.assertLess(abs(float(qd[-1])), 1.0e-5)
                 self.assertLessEqual(abs(float(q[-1]) - target), FRICTION / ke + 1.0e-3)
                 self.assertGreater(abs(float(q[-1]) - target), 1.0e-2)
-                reference = _solver(model, drive_mode=drive_mode, pgs_iterations=32, enable_joint_friction=False)
+                reference = _solver(model, drive_mode=drive_mode, iterations=32, enable_joint_friction=False)
                 states = [model.state(), model.state()]
                 q_free, _ = _advance(reference, states, control, 400)
                 self.assertAlmostEqual(float(q_free[-1]), target, delta=1.0e-3)
@@ -118,9 +118,9 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
     def test_velocity_limit_keeps_last_word(self):
         """Saturate breakaway acceleration at the joint velocity limit."""
         model = _single_dof_model("revolute", velocity_limit=1.0)
-        for schedule in ("interleaved", "physx_grasp"):
+        for schedule in ("interleaved", "phased"):
             with self.subTest(schedule=schedule):
-                solver = _solver(model, enable_joint_velocity_limits=True, pgs_schedule=schedule)
+                solver = _solver(model, enable_joint_velocity_limits=True, row_schedule=schedule)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_f.assign([10.0])
                 _, qd = _advance(solver, states, control, 20)
@@ -135,7 +135,7 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
                 model = _vertical_slider_model(mass=mass, half=half, friction=friction)
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
                 contacts = pipeline.contacts()
-                solver = _solver(model, friction_anchor_beta=0.0, pgs_iterations=24)
+                solver = _solver(model, friction_anchor_beta=0.0, iterations=24)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
                 for _ in range(150):
@@ -330,7 +330,7 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
     def test_dense_row_overflow_is_reported(self):
         """Flag worlds whose friction rows exceed the dense row capacity."""
         model = _two_link_model(length=0.4, mass=2.0, friction=(FRICTION, FRICTION))
-        solver = _solver(model, dense_max_constraints=1, warn_constraint_overflow=False)
+        solver = _solver(model, articulation_constraint_max=1, warn_constraint_overflow=False)
         states, control = [model.state(), model.state()], model.control()
         _advance(solver, states, control, 1)
         self.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
@@ -356,21 +356,21 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
         model = _single_dof_model("revolute")
         expected = (2.5 - FRICTION) / INERTIA * DT * 10
         options = (
-            {"pgs_schedule": "contact_then_internal"},
-            {"pgs_schedule": "physx_grasp"},
-            {"pgs_velocity_iterations": 2},
-            {"pgs_warmstart": True},
-            {"drive_mode": "physx_pgs"},
+            {"row_schedule": "contact_then_internal"},
+            {"row_schedule": "phased"},
+            {"velocity_iterations": 2},
+            {"contact_warmstart": True},
+            {"drive_mode": "rows"},
             {"articulated_contact_response": "propagation"},
-            {"articulated_contact_response": "propagation-colored"},
-            {"articulated_contact_response": "propagation-fused"},
+            {"articulated_contact_response": "propagation_colored"},
+            {"articulated_contact_response": "propagation_fused"},
         )
         for kwargs in options:
             with self.subTest(**kwargs):
                 route = _solver(model, **kwargs)
-                if kwargs.get("articulated_contact_response") == "propagation-fused":
+                if kwargs.get("articulated_contact_response") == "propagation_fused":
                     self.assertIsNotNone(route._propagation_full_fused_size)
-                if kwargs.get("articulated_contact_response") == "propagation-colored":
+                if kwargs.get("articulated_contact_response") == "propagation_colored":
                     self.assertTrue(route._propagation_colored)
                 stick = _run(model, effort=0.5, steps=10, **kwargs)
                 np.testing.assert_allclose(stick, 0.0, atol=1.0e-6)
@@ -421,10 +421,10 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
 
 def _solver(model, **overrides):
     options = {
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "angular_damping": 0.0,
         "enable_joint_friction": True,
-        "pgs_iterations": 16,
+        "iterations": 16,
     }
     options.update(overrides)
     return SolverFeatherPGS(model, **options)

@@ -38,7 +38,7 @@ class TestFeatherPGSSafety(unittest.TestCase):
             with self.subTest(capacity=capacity):
                 model = _driven_model(worlds=3, device=device)
                 with kernel_overrides({"pgs_kernel": "tiled_row"}):
-                    solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=capacity)
+                    solver = SolverFeatherPGS(model, solve_mode="split", articulation_constraint_max=capacity)
                 initial = np.zeros((3, capacity), dtype=np.float32)
                 initial[2] = 1234.0  # Inactive world must remain untouched.
                 solver.constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))

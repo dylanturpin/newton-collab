@@ -40,7 +40,7 @@ class TestPreeliminationSignature(unittest.TestCase):
         self.assertIs(bound.arguments["bilateral_preelimination_include_mimics"], False)
 
 
-def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
+def _run_four_bar(steps: int = 720, crank_target: float = 0.6, iterations: int = 2, **solver_kwargs):
     """Drive the connect-test four-bar and track the worst loop-anchor gap.
 
     Deliberately runs at a LOW iteration count: with iterative closure rows the
@@ -49,7 +49,7 @@ def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: i
     """
     model = _build_four_bar().finalize()
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=pgs_iterations, pgs_beta=0.1, **solver_kwargs
+        model, solve_mode="matrix_free", iterations=iterations, baumgarte=0.1, **solver_kwargs
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -85,7 +85,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         model = builder.finalize()
         solvers = [
             newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="matrix_free", pgs_iterations=8, enable_bilateral_preelimination=True, **options
+                model, solve_mode="matrix_free", iterations=8, enable_bilateral_preelimination=True, **options
             )
             for options in ({}, {"bilateral_preelimination_include_mimics": True})
         ]
@@ -120,7 +120,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver_all = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 enable_bilateral_preelimination=True,
             )
         self.assertFalse(solver_all._preelim_active)
@@ -128,8 +128,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=8,
+            solve_mode="matrix_free",
+            iterations=8,
             enable_bilateral_preelimination=True,
             bilateral_preelimination_include_mimics=False,
         )
@@ -196,12 +196,12 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            pgs_iterations=2,
-            pgs_beta=0.1,
-            dense_max_constraints=128,
+            solve_mode="matrix_free",
+            iterations=2,
+            baumgarte=0.1,
+            articulation_constraint_max=128,
             enable_bilateral_preelimination=True,
-            pgs_warmstart=True,
+            contact_warmstart=True,
         )
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
@@ -224,7 +224,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
-        solver.pgs_iterations = 0
+        solver.iterations = 0
         pipeline.collide(state_0, contacts)
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
@@ -242,7 +242,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "propagation"):
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 articulated_contact_response="propagation",
                 enable_bilateral_preelimination=True,
             )
@@ -251,7 +251,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
 
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""
-        _, _, state, _ = _run_four_bar(enable_bilateral_preelimination=True, pgs_iterations=16)
+        _, _, state, _ = _run_four_bar(enable_bilateral_preelimination=True, iterations=16)
         q = state.joint_q.numpy()
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
@@ -272,7 +272,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="split", pgs_iterations=16, enable_bilateral_preelimination=True
+                model, solve_mode="split", iterations=16, enable_bilateral_preelimination=True
             )
         self.assertFalse(solver._preelim_active)
         self.assertTrue(any("matrix_free" in str(w.message) for w in caught))
@@ -284,9 +284,9 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
-                pgs_iterations=16,
-                pgs_velocity_iterations=4,
+                solve_mode="matrix_free",
+                iterations=16,
+                velocity_iterations=4,
                 enable_bilateral_preelimination=True,
             )
         self.assertFalse(solver._preelim_active)

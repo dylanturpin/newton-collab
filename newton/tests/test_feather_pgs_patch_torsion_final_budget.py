@@ -22,7 +22,7 @@ class TestFinalPatchBudget(unittest.TestCase):
                             0.0075,
                             friction_anchor_beta=0.2,
                             pgs_kernel=kernel,
-                            pgs_iterations=iterations,
+                            iterations=iterations,
                             closing=0.1,
                             spin=spin,
                             sliding=sliding,

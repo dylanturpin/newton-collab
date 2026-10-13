@@ -74,13 +74,13 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
 
     solver = SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response=mode,
-        pgs_iterations=2,
-        pgs_velocity_iterations=0,
-        dense_max_constraints=32,
-        mf_max_constraints=32,
-        pgs_warmstart=False,
+        iterations=2,
+        velocity_iterations=0,
+        articulation_constraint_max=32,
+        free_body_constraint_max=32,
+        contact_warmstart=False,
     )
     solver.step(state_in, state_out, control, contacts, 1.0 / 120.0)
     wp.synchronize()
@@ -96,7 +96,7 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
 
 class TestFpgsArticulationRowScalingBench(unittest.TestCase):
     def test_fpgs_propagation_fused_supports_multi_dof_contact_rows(self):
-        _require_cuda("CUDA is required for propagation-fused multi-DOF contact rows")
+        _require_cuda("CUDA is required for propagation_fused multi-DOF contact rows")
 
         model = _build_d6_articulated_free_contact_model("cuda:0")
         self.assertEqual(model.joint_dof_dim.numpy().tolist(), [[3, 3], [3, 3]])
@@ -111,7 +111,7 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
 
         qd_immediate, rows_immediate, fused_immediate = _step_d6_contact_case(model, contacts, "immediate")
         qd_propagation, rows_propagation, fused_propagation = _step_d6_contact_case(model, contacts, "propagation")
-        qd_fused, rows_fused, fused_size = _step_d6_contact_case(model, contacts, "propagation-fused")
+        qd_fused, rows_fused, fused_size = _step_d6_contact_case(model, contacts, "propagation_fused")
 
         self.assertGreater(rows_immediate[0], 0)
         self.assertEqual(rows_immediate[2], 0)
@@ -152,13 +152,13 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
 
         solver = module.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="propagation",
-            pgs_iterations=2,
-            pgs_velocity_iterations=0,
-            dense_max_constraints=32,
-            mf_max_constraints=16,
-            pgs_warmstart=False,
+            iterations=2,
+            velocity_iterations=0,
+            articulation_constraint_max=32,
+            free_body_constraint_max=16,
+            contact_warmstart=False,
         )
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
         wp.synchronize()
@@ -200,7 +200,7 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
             self.assertTrue((out_dir / "results.csv").is_file())
             results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
         paths = {row["path"] for row in results}
-        self.assertEqual(paths, {"mf_immediate", "propagation", "propagation-fused"})
+        self.assertEqual(paths, {"mf_immediate", "propagation", "propagation_fused"})
         self.assertFalse(
             paths
             & {
@@ -221,7 +221,7 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
 
         # Contact-row placement is intrinsic to the response mode (3f282c21):
         # "propagation" routes free/free rows onto the propagation family (the
-        # family allocates for all-free-body scenes), while "propagation-fused"
+        # family allocates for all-free-body scenes), while "propagation_fused"
         # keeps free/free rows on the matrix-free family (its measured-best
         # configuration).
         free_propagation = next(row for row in free_rows if row["path"] == "propagation")
@@ -231,7 +231,7 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
         self.assertEqual(free_propagation["mf_rows_total"], 0)
         self.assertGreater(free_propagation["propagation_rows_total"], 0)
 
-        free_fused = next(row for row in free_rows if row["path"] == "propagation-fused")
+        free_fused = next(row for row in free_rows if row["path"] == "propagation_fused")
         self.assertEqual(free_fused["dense_rows_total"], 0)
         self.assertGreater(free_fused["mf_rows_total"], 0)
         self.assertEqual(free_fused["propagation_rows_total"], 0)
@@ -360,7 +360,7 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
             results = json.loads((out_dir / "accuracy_probe.json").read_text(encoding="utf-8"))
         self.assertIn("Contacts are generated once", summary)
         self.assertEqual({row["path"] for row in results}, {"mf_immediate", "propagation"})
-        self.assertEqual({row["pgs_iterations"] for row in results}, {1, 2})
+        self.assertEqual({row["iterations"] for row in results}, {1, 2})
 
         propagation_rows = [row for row in results if row["path"] == "propagation"]
         self.assertTrue(propagation_rows)

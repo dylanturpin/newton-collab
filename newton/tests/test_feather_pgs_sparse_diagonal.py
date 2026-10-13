@@ -13,10 +13,10 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 _PAIR_SOLVER = {
-    "pgs_mode": "matrix_free",
-    "dense_max_constraints": 64,
-    "mf_max_constraints": 32,
-    "pgs_iterations": 8,
+    "solve_mode": "matrix_free",
+    "articulation_constraint_max": 64,
+    "free_body_constraint_max": 32,
+    "iterations": 8,
     "enable_joint_limits": True,
 }
 
@@ -77,7 +77,11 @@ def test_sparse_diagonal_is_selected_only_where_supported(test, device):
     model = _build_sparse_diagonal_pair_model(device=device)
     if not wp.get_device(device).is_cuda:
         solver = SolverFeatherPGS(
-            model, pgs_mode="split", enable_joint_limits=True, dense_max_constraints=64, use_parallel_streams=True
+            model,
+            solve_mode="split",
+            enable_joint_limits=True,
+            articulation_constraint_max=64,
+            use_parallel_streams=True,
         )
         test.assertFalse(solver._sparse_diagonal_contact_solve)
         return
@@ -87,11 +91,11 @@ def test_sparse_diagonal_is_selected_only_where_supported(test, device):
         ("no streams", {"use_parallel_streams": False}),
         ("joint limits off", {"enable_joint_limits": False}),
         ("torsion", {"contact_torsion_radius": 0.01}),
-        ("regularization", {"pgs_contact_regularization": 0.02}),
-        ("velocity iterations", {"pgs_velocity_iterations": 1}),
-        ("warm start", {"pgs_warmstart": True}),
-        ("schedule", {"pgs_schedule": "physx_grasp"}),
-        ("drive rows", {"drive_mode": "physx_pgs"}),
+        ("regularization", {"contact_regularization": 0.02}),
+        ("velocity iterations", {"velocity_iterations": 1}),
+        ("warm start", {"contact_warmstart": True}),
+        ("schedule", {"row_schedule": "phased"}),
+        ("drive rows", {"drive_mode": "rows"}),
         ("friction mode", {"friction_mode": "bisection", "friction_anchor_beta": 0.0}),
     ):
         with test.subTest(label):

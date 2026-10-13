@@ -28,7 +28,7 @@ class TestFeatherPGSMimicLayout(unittest.TestCase):
                         q_start[follower + 1] - q_start[follower], qd_start[follower + 1] - qd_start[follower]
                     )
                     with self.assertRaisesRegex(ValueError, "joint-owned mimic.*position and velocity"):
-                        newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+                        newton.solvers.SolverFeatherPGS(model, solve_mode="split")
 
     def test_scalar_and_d6_mimic_coordinate_maps(self):
         """Preserve componentwise mimic maps after a quaternion-layout free base."""
@@ -41,7 +41,7 @@ class TestFeatherPGSMimicLayout(unittest.TestCase):
                 with self.subTest(device=device, joint_type=joint_type):
                     builder, leader, follower = _build_mimic_layout(joint_type)
                     model = builder.finalize(device=device)
-                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+                    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="split")
                     self.assertEqual(solver._mimic_count, dimensions)
                     for suffix, start, joint in (
                         ("q0", model.joint_q_start, follower),
@@ -62,7 +62,7 @@ class TestFeatherPGSMimicLayout(unittest.TestCase):
                     builder.add_constraint_mimic(joint0=follower, joint1=leader)
                 model = builder.finalize(device=device)
                 with self.assertWarnsRegex(UserWarning, "references a non-1-DoF"):
-                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+                    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="split")
                 self.assertEqual(solver._mimic_count, 1)
                 self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
                 self.assertEqual(solver._mimic_valid_np.tolist(), [0])
@@ -152,7 +152,7 @@ def _run_chain(
     builder, _, _ = _build_two_revolute_chain(coef0, coef1, legacy=legacy)
     model = builder.finalize()
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
+        model, solve_mode="matrix_free", iterations=16, baumgarte=0.1, **solver_kwargs
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -186,7 +186,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             builder.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=0.1, coef1=-0.5)
-        solver = newton.solvers.SolverFeatherPGS(builder.finalize(), pgs_mode="matrix_free")
+        solver = newton.solvers.SolverFeatherPGS(builder.finalize(), solve_mode="matrix_free")
         self.assertEqual(solver._mimic_count, 1)
         self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
 
@@ -209,7 +209,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.replicate(template, world_count=4)
         model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
 
         self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
@@ -219,7 +219,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         builder, _, _ = _build_two_revolute_chain(0.0, 1.0, legacy=True)
         builder.constraint_mimic_enabled[0] = False
         model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16)
+        solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", iterations=16)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         targets = model.joint_target_q.numpy().copy()
@@ -263,15 +263,15 @@ class TestFeatherPGSMimic(unittest.TestCase):
         scene.replicate(builder, world_count=2)  # per-world row counts exclude the global world
         solver = newton.solvers.SolverFeatherPGS(
             scene.finalize(),
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             propagation_same_articulation_rows=True,
-            dense_max_constraints=64,
+            articulation_constraint_max=64,
             enable_joint_limits=False,
         )
         self.assertEqual(solver._mimic_count, 2 * mimic_count)
         self.assertGreaterEqual(solver._dense_internal_max_rows, mimic_count)
-        self.assertGreaterEqual(solver.dense_max_constraints, mimic_count)
+        self.assertGreaterEqual(solver.articulation_constraint_max, mimic_count)
 
 
 if __name__ == "__main__":

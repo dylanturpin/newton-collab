@@ -92,23 +92,23 @@ def normal_coefficients(stiffness, damping, separation, *, dt):
 def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
     required = {
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
-        "pgs_schedule": "interleaved",
-        "pgs_velocity_iterations": 0,
-        "pgs_warmstart": False,
+        "row_schedule": "interleaved",
+        "velocity_iterations": 0,
+        "contact_warmstart": False,
         "enable_restitution": False,
-        "pgs_contact_regularization": 0.0,
+        "contact_regularization": 0.0,
         "contact_friction_position_iterations": -1,
-        "friction_mode": "current",
+        "friction_mode": "fixed_normal",
         "contact_friction_shared_anchor": False,
         "contact_shared_anchor": False,
     }
     for key, expected in required.items():
         if settings[key] != expected:
             raise ValueError(f"contact_compliance requires {key}={expected!r}; got {settings[key]!r}")
-    if settings["pgs_iterations"] <= 0:
-        raise ValueError("contact_compliance requires positive pgs_iterations")
+    if settings["iterations"] <= 0:
+        raise ValueError("contact_compliance requires positive iterations")
     if not model.device.is_cuda:
         raise ValueError("contact_compliance currently requires CUDA")
 
@@ -175,9 +175,9 @@ def prepare_rows(solver, contacts, dt):
             contacts.rigid_contact_count,
             contacts.rigid_contact_max,
             solver.constraint_count,
-            solver.dense_max_constraints,
+            solver.articulation_constraint_max,
             solver.mf_constraint_count,
-            solver.mf_max_constraints,
+            solver.free_body_constraint_max,
             solver._row_dropped_all,
             buffers.status,
         ],
@@ -207,7 +207,7 @@ def prepare_rows(solver, contacts, dt):
             solver.mf_phi,
             solver.mf_target_velocity if has_target else buffers.dummy_target,
             int(has_target),
-            float(solver.pgs_cfm),
+            float(solver.cfm),
         ],
         outputs=[
             solver.diag,

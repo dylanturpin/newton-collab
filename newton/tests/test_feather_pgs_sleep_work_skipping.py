@@ -39,12 +39,12 @@ class TestSleepWorkSkipping(unittest.TestCase):
                     sleep_angular_threshold=0.15,
                     sleep_quiet_time=0.5,
                     enable_joint_limits=True,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=8,
+                    solve_mode="matrix_free",
+                    iterations=8,
                     friction_anchor_beta=0.0,
                     contact_torsion_radius=0.0,
-                    dense_max_constraints=256,
-                    mf_max_constraints=256,
+                    articulation_constraint_max=256,
+                    free_body_constraint_max=256,
                 )
                 original_indices = solver._joint_limit_q_index.numpy().copy()
                 self.assertEqual(int(np.count_nonzero(original_indices >= 0)), 8)
@@ -265,8 +265,8 @@ class _Scene:
             enable_sleeping=True,
             sleep_quiet_time=0.05,
             friction_anchor_beta=0.0,
-            pgs_iterations=16,
-            pgs_mode="matrix_free" if self.model.device.is_cuda else "split",
+            iterations=16,
+            solve_mode="matrix_free" if self.model.device.is_cuda else "split",
             **options,
         )
         self.states = [self.model.state(), self.model.state()]

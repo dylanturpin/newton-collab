@@ -117,7 +117,7 @@ def test_fraction_zero_allocates_every_rigid_row(test, device):
     test.assertEqual(count, 12)
 
 
-def test_free_body_velocity_limits_hold(test, device, pgs_mode="matrix_free"):
+def test_free_body_velocity_limits_hold(test, device, solve_mode="matrix_free"):
     """Hold a free body's authored linear and angular speed limits."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     SolverFeatherPGS.register_custom_attributes(builder)
@@ -126,7 +126,7 @@ def test_free_body_velocity_limits_hold(test, device, pgs_mode="matrix_free"):
     )
     builder.add_shape_box(body, hx=0.1, hy=0.2, hz=0.3)
     model = builder.finalize(device=device)
-    solver = SolverFeatherPGS(model, pgs_mode=pgs_mode)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode)
     state_0, state_1 = model.state(), model.state()
     qd = state_0.joint_qd.numpy()
     qd[3:6] = (5.0, 0.0, 0.0)
@@ -163,7 +163,7 @@ add_function_test(
     "test_free_body_velocity_limits_hold_split",
     test_free_body_velocity_limits_hold,
     devices=get_test_devices(),
-    pgs_mode="split",
+    solve_mode="split",
 )
 
 

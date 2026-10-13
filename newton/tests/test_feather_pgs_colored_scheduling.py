@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the contact-unit coloring behind ``articulated_contact_response='propagation-colored'``.
+"""Tests for the contact-unit coloring behind ``articulated_contact_response='propagation_colored'``.
 
 The colored sweep solves one color at a time, in parallel within a color; units that do
 not fit the color budget run in an ordered serial tail. A coloring that produces few units
@@ -54,11 +54,11 @@ def _settle(model, steps=12, **solver_kwargs):
     model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        articulated_contact_response="propagation-colored",
-        pgs_iterations=6,
-        mf_max_constraints=8192,
-        dense_max_constraints=64,
+        solve_mode="matrix_free",
+        articulated_contact_response="propagation_colored",
+        iterations=6,
+        free_body_constraint_max=8192,
+        articulation_constraint_max=64,
         **solver_kwargs,
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
@@ -105,7 +105,7 @@ def _first_fit_reference(solver, world=0):
     return n, color, offsets, row_start, contact[position_unit]
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "propagation-colored requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "propagation_colored requires CUDA")
 class TestFeatherPGSColoredScheduling(unittest.TestCase):
     def test_dense_heap_colors_without_a_serial_tail(self):
         """A dense heap must color into few colors with nothing left for the serial tail.
@@ -164,11 +164,11 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         model_ref.rigid_contact_max = 8192
         solver = newton.solvers.SolverFeatherPGS(
             model_ref,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="immediate",
-            pgs_iterations=6,
-            mf_max_constraints=8192,
-            dense_max_constraints=64,
+            iterations=6,
+            free_body_constraint_max=8192,
+            articulation_constraint_max=64,
             row_watermark=True,
         )
         pipeline = newton.CollisionPipeline(model_ref, rigid_contact_max=8192)
@@ -182,7 +182,7 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
             s0, s1 = s1, s0
 
         # An undersized reference drops rows in atomic order, which makes it nondeterministic.
-        self.assertEqual(solver.constraint_row_watermarks()["mf_dropped_contact_rows_high_water"], 0)
+        self.assertEqual(solver.constraint_row_watermarks()["free_body_dropped_contact_rows_high_water"], 0)
         a = colored.body_q.numpy()[:, :3]
         b = s0.body_q.numpy()[:, :3]
         self.assertTrue(np.isfinite(b).all())
@@ -210,12 +210,12 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
                 getattr(state_in, name).assign(getattr(state, name))
             trial = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
-                articulated_contact_response="propagation-colored",
-                pgs_iterations=6,
-                pgs_warmstart=False,
-                mf_max_constraints=8192,
-                dense_max_constraints=64,
+                solve_mode="matrix_free",
+                articulated_contact_response="propagation_colored",
+                iterations=6,
+                contact_warmstart=False,
+                free_body_constraint_max=8192,
+                articulation_constraint_max=64,
             )
             trial.step(state_in, state_out, control, contacts, 1.0 / 240.0)
             entries = PROPAGATION_COLOR_TAIL + 2
@@ -260,7 +260,10 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         model = builder.finalize()
         model.rigid_contact_max = 256
         solver = newton.solvers.SolverFeatherPGS(
-            model, pgs_mode="matrix_free", articulated_contact_response="propagation-colored", mf_max_constraints=256
+            model,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            free_body_constraint_max=256,
         )
         prescribed = solver._body_prescribed.numpy()
         self.assertEqual(int(prescribed[free_kinematic]), 1)
@@ -294,10 +297,10 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         model.rigid_contact_max = 65536
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            mf_max_constraints=32768,
-            dense_max_constraints=2048,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            free_body_constraint_max=32768,
+            articulation_constraint_max=2048,
         )
         self.assertEqual(int(solver.propagation_max_constraints), 32768 + 2048)
 

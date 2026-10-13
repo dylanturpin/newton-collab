@@ -73,7 +73,7 @@ class Example:
         if args.tray_solver == "featherpgs":
 
             def tray_factory(v):
-                return SolverFeatherPGS(v, pgs_mode="matrix_free")
+                return SolverFeatherPGS(v, solve_mode="matrix_free")
 
         elif args.tray_solver == "mujoco":
 

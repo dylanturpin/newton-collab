@@ -480,7 +480,7 @@ def test_kinematic_free_base_prescribed_motion(
         solver = solver_fn(model)
         if (
             isinstance(solver, newton.solvers.SolverFeatherPGS)
-            and solver.pgs_mode == "matrix_free"
+            and solver.solve_mode == "matrix_free"
             and solver.articulated_contact_response == "immediate"
         ):
             body_to_articulation = solver.body_to_articulation.numpy()
@@ -882,15 +882,15 @@ def test_kinematic_prescribed_response_lifetime(
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split"),
+    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, solve_mode="split"),
     "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, pgs_mode="matrix_free"
+        model, angular_damping=0.0, solve_mode="matrix_free"
     ),
     "feather_pgs_propagation": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, pgs_mode="matrix_free", articulated_contact_response="propagation"
+        model, angular_damping=0.0, solve_mode="matrix_free", articulated_contact_response="propagation"
     ),
     "feather_pgs_propagation_fused": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, pgs_mode="matrix_free", articulated_contact_response="propagation-fused"
+        model, angular_damping=0.0, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),

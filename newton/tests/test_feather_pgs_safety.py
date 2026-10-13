@@ -19,7 +19,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, mf_max_constraints=1)
+        solver = SolverFeatherPGS(model, free_body_constraint_max=1)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()

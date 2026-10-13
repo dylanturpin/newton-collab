@@ -90,21 +90,21 @@ def fixture(
         # Keep this material-law control on the same point-friction baseline
         # whether the optional spin radius is zero or positive.
         "friction_anchor_beta": 0.0,
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
-        "pgs_iterations": 128,
-        "pgs_velocity_iterations": 0,
-        "pgs_beta": 0.05,
-        "pgs_cfm": 0,
-        "pgs_contact_regularization": 0,
+        "iterations": 128,
+        "velocity_iterations": 0,
+        "baumgarte": 0.05,
+        "cfm": 0,
+        "contact_regularization": 0,
         "contact_friction_position_iterations": -1,
         "contact_shared_anchor": True,
         "contact_friction_shared_anchor": True,
         "enable_joint_velocity_limits": True,
-        "pgs_warmstart": False,
+        "contact_warmstart": False,
         "angular_damping": 0,
-        "dense_max_constraints": 64,
-        "mf_max_constraints": 16,
+        "articulation_constraint_max": 64,
+        "free_body_constraint_max": 16,
         "row_watermark": True,
     }
     if radius is not None:
@@ -114,7 +114,7 @@ def fixture(
     with kernel_overrides(tuning):
         solver = SolverFeatherPGS(model, **kwargs)
     if row_limit is not None:
-        solver.dense_max_constraints = row_limit
+        solver.articulation_constraint_max = row_limit
     observables = solver.observables({SolverObservableFlags.CONTACT_F})
     solver.step(a, z, model.control(), contacts, dt, observables=observables)
     result = {name: getattr(z, name).numpy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
@@ -149,17 +149,17 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
     solver = SolverFeatherPGS(
         model,
         contact_torsion_radius=radius,
-        pgs_mode="matrix_free",
+        solve_mode="matrix_free",
         articulated_contact_response="immediate",
-        pgs_iterations=64,
-        pgs_velocity_iterations=0,
-        pgs_beta=0.05,
-        pgs_cfm=0,
-        pgs_contact_regularization=0,
-        pgs_warmstart=False,
+        iterations=64,
+        velocity_iterations=0,
+        baumgarte=0.05,
+        cfm=0,
+        contact_regularization=0,
+        contact_warmstart=False,
         angular_damping=0,
-        dense_max_constraints=64,
-        mf_max_constraints=16,
+        articulation_constraint_max=64,
+        free_body_constraint_max=16,
         **PATCH_OPTIONS,
     )
     pipeline = newton.CollisionPipeline(
@@ -423,8 +423,8 @@ class TestContactTorsion(unittest.TestCase):
         for dt in (0.00125, 0.0025, 0.005):
             result, solver, *_ = fixture(0.01, spin=100.0, center_only=True, dt=dt)
             velocities.append(result["v_out"])
-            self.assertEqual(solver.constraint_row_watermarks()["dense_dropped_contact_rows_high_water"], 0)
-            self.assertLessEqual(int(solver.constraint_count.numpy().max()), solver.dense_max_constraints)
+            self.assertEqual(solver.constraint_row_watermarks()["articulation_dropped_contact_rows_high_water"], 0)
+            self.assertLessEqual(int(solver.constraint_count.numpy().max()), solver.articulation_constraint_max)
         for velocity in velocities[1:]:
             np.testing.assert_allclose(velocity, velocities[0], atol=2e-5)
         baseline, *_ = fixture(0.0, center_only=True)
@@ -452,8 +452,8 @@ class TestContactTorsion(unittest.TestCase):
             {"contact_torsion_shape_patterns": ("[",)},
             {"contact_torsion_shape_patterns": ("missing-label",)},
             {"contact_torsion_shape_indices": (), "contact_torsion_shape_patterns": ()},
-            {"pgs_warmstart": True},
-            {"pgs_velocity_iterations": 1, "enable_bilateral_preelimination": True},
+            {"contact_warmstart": True},
+            {"velocity_iterations": 1, "enable_bilateral_preelimination": True},
             {"articulated_contact_response": "propagation"},
             {"friction_mode": "bisection"},
         ):

@@ -75,10 +75,10 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
 
 def _make_phase_layout_run(
     device,
-    pgs_mode,
+    solve_mode,
     *,
-    pgs_iterations=0,
-    pgs_schedule="interleaved",
+    iterations=0,
+    row_schedule="interleaved",
     response="immediate",
     enable_joint_velocity_limits=True,
 ):
@@ -119,16 +119,16 @@ def _make_phase_layout_run(
     model.joint_velocity_limit.assign(velocity_limits)
     solver = SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
-        pgs_schedule=pgs_schedule,
+        solve_mode=solve_mode,
+        row_schedule=row_schedule,
         articulated_contact_response=response,
         enable_joint_limits=True,
         enable_joint_velocity_limits=enable_joint_velocity_limits,
         velocity_limit_activation_fraction=0.5,
-        dense_max_constraints=64,
-        mf_max_constraints=64,
-        pgs_iterations=pgs_iterations,
-        pgs_warmstart=False,
+        articulation_constraint_max=64,
+        free_body_constraint_max=64,
+        iterations=iterations,
+        contact_warmstart=False,
     )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy()
@@ -204,8 +204,8 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
     _model, solver, state_in, state_out, control, pipeline, contacts = _make_phase_layout_run(
         "cuda:0",
         "matrix_free",
-        pgs_iterations=8,
-        pgs_schedule="physx_grasp",
+        iterations=8,
+        row_schedule="phased",
         response="propagation",
     )
     if not use_warp_builder:
@@ -258,7 +258,7 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
 
         self.assertFalse(reference_solver._joint_limit_warp_kernels)
         self.assertTrue(any(kernel is not None for kernel in warp_solver._joint_limit_warp_kernels.values()))
-        self.assertEqual(reference_solver.pgs_schedule, "physx_grasp")
+        self.assertEqual(reference_solver.row_schedule, "phased")
         self.assertEqual(reference_solver.articulated_contact_response, "propagation")
         self.assertEqual(len(reference), len(actual))
         for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):

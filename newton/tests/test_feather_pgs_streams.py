@@ -52,7 +52,7 @@ def _scene(device, worlds=2):
 
 def _run(model, steps=60, capture=False, **solver_kwargs):
     solver = SolverFeatherPGS(
-        model, enable_joint_limits=True, friction_anchor_beta=0.0, dense_max_constraints=96, **solver_kwargs
+        model, enable_joint_limits=True, friction_anchor_beta=0.0, articulation_constraint_max=96, **solver_kwargs
     )
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
@@ -80,11 +80,11 @@ def _run(model, steps=60, capture=False, **solver_kwargs):
     return solver, state_0.joint_q.numpy().copy()
 
 
-def test_captured_double_buffer_matches_eager(test, device, pgs_mode="matrix_free"):
+def test_captured_double_buffer_matches_eager(test, device, solve_mode="matrix_free"):
     """Replay a two-step graph of the double-buffered solve with the eager result."""
     model = _scene(device)
-    _, eager = _run(model, pgs_mode=pgs_mode, use_parallel_streams=True, double_buffer=True)
-    _, captured = _run(model, pgs_mode=pgs_mode, use_parallel_streams=True, double_buffer=True, capture=True)
+    _, eager = _run(model, solve_mode=solve_mode, use_parallel_streams=True, double_buffer=True)
+    _, captured = _run(model, solve_mode=solve_mode, use_parallel_streams=True, double_buffer=True, capture=True)
     np.testing.assert_array_equal(captured, eager)
 
 
@@ -95,7 +95,7 @@ class TestFeatherPGSStreams(unittest.TestCase):
 cuda_devices = get_cuda_test_devices()
 for _fn in (test_captured_double_buffer_matches_eager,):
     add_function_test(TestFeatherPGSStreams, _fn.__name__, _fn, devices=cuda_devices)
-    add_function_test(TestFeatherPGSStreams, f"{_fn.__name__}_split", _fn, devices=cuda_devices, pgs_mode="split")
+    add_function_test(TestFeatherPGSStreams, f"{_fn.__name__}_split", _fn, devices=cuda_devices, solve_mode="split")
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
     def test_complete_finger_levels_and_serial_group(self):
         """Schedule every finger segment and retain serial trees as one-lane groups."""
         model = _build_fingers(include_chain=True)
-        solver = SolverFeatherPGS(model, pgs_mode="split", use_parallel_streams=False)
+        solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
         plan = _FeatherPGSTreePlan.build(model, solver.articulation_joint_end)
         self.assertIsNotNone(plan)
         self.assertTrue(any(group.lanes > 1 for group in plan.groups))
@@ -224,12 +224,12 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
     def test_serial_and_unsafe_topologies_fall_back(self):
         """Retain wholly serial, aliased, cross-articulation and loop topologies."""
         model, _, _ = _build_model(chain=True)
-        solver = SolverFeatherPGS(model, pgs_mode="split", use_parallel_streams=False)
+        solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
         self.assertIsNone(_FeatherPGSTreePlan.build(model, solver.articulation_joint_end))
         for unsafe in ("alias", "foreign_parent", "loop"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
-                solver = SolverFeatherPGS(model, pgs_mode="split", use_parallel_streams=False)
+                solver = SolverFeatherPGS(model, solve_mode="split", use_parallel_streams=False)
                 ends = solver.articulation_joint_end.numpy().copy()
                 if unsafe == "alias":
                     children = model.joint_child.numpy().copy()
@@ -256,7 +256,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                 model = _build_contact_model(device)
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
+                    solve_mode="matrix_free",
                     parallel_tree=True,
                     contact_torsion_device=True,
                     contact_torsion_radius=0.01,
@@ -353,8 +353,8 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                     for parallel in (False, True):
                         solver = SolverFeatherPGS(
                             model,
-                            pgs_mode="matrix_free",
-                            pgs_iterations=8,
+                            solve_mode="matrix_free",
+                            iterations=8,
                             use_parallel_streams=False,
                             enable_joint_velocity_limits=velocity_limits,
                             parallel_tree=parallel,

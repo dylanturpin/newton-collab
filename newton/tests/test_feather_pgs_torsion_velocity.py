@@ -65,8 +65,8 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                         spin=0.0,
                         sat=True,
                         center_only=True,
-                        pgs_iterations=64,
-                        pgs_velocity_iterations=16,
+                        iterations=64,
+                        velocity_iterations=16,
                         enable_bilateral_preelimination=False,
                         **PATCH_OPTIONS,
                     )
@@ -96,8 +96,8 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                 with self.subTest(velocity=velocity, spin=spin, sliding=sliding):
                     result, solver, *_ = fixture(
                         0.01,
-                        pgs_iterations=16,
-                        pgs_velocity_iterations=velocity,
+                        iterations=16,
+                        velocity_iterations=velocity,
                         spin=spin,
                         sliding=sliding,
                         center_only=sliding == 0,
@@ -116,7 +116,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
             spin=100.0,
             closing=0.1,
             center_only=True,
-            pgs_iterations=16,
+            iterations=16,
             enable_bilateral_preelimination=False,
             **PATCH_OPTIONS,
         )
@@ -125,8 +125,8 @@ class TestTorsionVelocitySolve(unittest.TestCase):
             spin=100.0,
             closing=0.1,
             center_only=True,
-            pgs_iterations=16,
-            pgs_velocity_iterations=4,
+            iterations=16,
+            velocity_iterations=4,
             enable_bilateral_preelimination=False,
             **PATCH_OPTIONS,
         )
@@ -144,7 +144,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         for options in ({"closing": 0.0}, {"closing": -0.1}, {"separation": 0.004}, {"mu": 0.0}):
             with self.subTest(options=options):
                 result, solver, *_ = fixture(
-                    0.01, pgs_velocity_iterations=4, enable_bilateral_preelimination=False, **PATCH_OPTIONS, **options
+                    0.01, velocity_iterations=4, enable_bilateral_preelimination=False, **PATCH_OPTIONS, **options
                 )
                 active = result["row_type"] == 7
                 self.assertLess(np.abs(result["impulses"][active]).max(initial=0), 2e-7)
@@ -153,7 +153,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_carried_spin_is_refunded_when_postpass_retires_group(self):
         """Undo carried spin through its response column when final support is separated."""
         original, solver, model, state, contacts = fixture(
-            0.01, spin=100.0, center_only=True, pgs_velocity_iterations=4, **PATCH_OPTIONS
+            0.01, spin=100.0, center_only=True, velocity_iterations=4, **PATCH_OPTIONS
         )
         group = solver._torsion_stats["groups"][0]
         count = int(solver.constraint_count.numpy()[0])
@@ -193,7 +193,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         for dt in (0.00125, 0.0025, 0.005):
             with self.subTest(dt=dt):
                 result, solver, model, initial, contacts = fixture(
-                    0.01, spin=100.0, center_only=True, dt=dt, pgs_velocity_iterations=4, **PATCH_OPTIONS
+                    0.01, spin=100.0, center_only=True, dt=dt, velocity_iterations=4, **PATCH_OPTIONS
                 )
                 observables = solver.observables({SolverObservableFlags.CONTACT_F})
                 for _ in range(4):
@@ -211,17 +211,15 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_selected_out_torsion_matches_zero_radius(self):
         """Keep the torsion-zero velocity path identical when no shapes are selected."""
         for velocity in (0, 4):
-            expected, *_ = fixture(0.0, pgs_velocity_iterations=velocity, **PATCH_OPTIONS)
-            actual, *_ = fixture(
-                0.01, pgs_velocity_iterations=velocity, contact_torsion_shape_indices=(), **PATCH_OPTIONS
-            )
+            expected, *_ = fixture(0.0, velocity_iterations=velocity, **PATCH_OPTIONS)
+            actual, *_ = fixture(0.01, velocity_iterations=velocity, contact_torsion_shape_indices=(), **PATCH_OPTIONS)
             for key in expected:
                 np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
 
     def test_runtime_incompatible_mutation_rejected(self):
         """Reject unsupported mutation before stepping an allocated torsion solver."""
-        _, solver, model, state, contacts = fixture(0.01, pgs_velocity_iterations=4)
-        solver.pgs_warmstart = True
+        _, solver, model, state, contacts = fixture(0.01, velocity_iterations=4)
+        solver.contact_warmstart = True
         with self.assertRaisesRegex(ValueError, "warmstart"):
             solver.step(state, model.state(), model.control(), contacts, 0.0025)
 

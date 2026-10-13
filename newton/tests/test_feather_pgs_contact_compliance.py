@@ -79,15 +79,15 @@ def make_fixture(
         options = dict(
             # Isolate the normal material law from positional patch friction.
             friction_anchor_beta=0.0,
-            pgs_mode="matrix_free",
-            pgs_schedule="interleaved",
+            solve_mode="matrix_free",
+            row_schedule="interleaved",
             articulated_contact_response="immediate",
             enable_restitution=False,
-            pgs_iterations=iterations,
-            pgs_velocity_iterations=0,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
-            pgs_beta=0.05,
+            iterations=iterations,
+            velocity_iterations=0,
+            articulation_constraint_max=32,
+            free_body_constraint_max=32,
+            baumgarte=0.05,
             **extra,
         )
         options.update(solver_options or {})
@@ -210,15 +210,15 @@ def run_native_hydro_fixture(*, articulated=True):
                 model,
                 contact_compliance=enabled,
                 friction_anchor_beta=0.0,
-                pgs_mode="matrix_free",
-                pgs_schedule="interleaved",
+                solve_mode="matrix_free",
+                row_schedule="interleaved",
                 articulated_contact_response="immediate",
                 enable_restitution=False,
-                pgs_iterations=128,
-                pgs_contact_regularization=0.0,
-                dense_max_constraints=2048,
-                mf_max_constraints=32 if articulated else 2048,
-                pgs_beta=0.05,
+                iterations=128,
+                contact_regularization=0.0,
+                articulation_constraint_max=2048,
+                free_body_constraint_max=32 if articulated else 2048,
+                baumgarte=0.05,
             )
             output = model.state()
             step_input = model.state()
@@ -271,13 +271,13 @@ def run_paired_fixture(*, hinv_jt_kernel, friction, steps=40):
                 model,
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 enable_restitution=False,
                 contact_friction_scale=1.0 if friction > 0.0 else 0.0,
                 joint_limit_activation_gap=0.0,
-                pgs_iterations=8,
-                dense_max_constraints=96,
-                mf_max_constraints=32,
+                iterations=8,
+                articulation_constraint_max=96,
+                free_body_constraint_max=32,
             )
         state, output = model.state(), model.state()
         free = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])

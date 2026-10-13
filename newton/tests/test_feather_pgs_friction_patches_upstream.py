@@ -32,7 +32,7 @@ def _check_notified_friction_edit(test, device, replace, capture):
     body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=32)
+    solver = newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", iterations=32)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()

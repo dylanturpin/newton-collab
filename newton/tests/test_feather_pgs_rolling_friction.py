@@ -19,13 +19,13 @@ MU = 0.8
 RADIUS = 0.02
 MU_ROLLING = 0.01
 SOLVER_OPTIONS = {
-    "pgs_mode": "matrix_free",
+    "solve_mode": "matrix_free",
     "articulated_contact_response": "immediate",
-    "pgs_iterations": 16,
+    "iterations": 16,
     "friction_anchor_beta": 0.0,
     "angular_damping": 0.0,
-    "dense_max_constraints": 32,
-    "mf_max_constraints": 16,
+    "articulation_constraint_max": 32,
+    "free_body_constraint_max": 16,
     "double_buffer": False,
 }
 
@@ -638,9 +638,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         objectives = {}
         for cone in ("pyramidal", "elliptic"):
             for iterations in (16, 128):
-                scene = ball(
-                    radius=0.1, speed=0.0, mu_torsional=0.02, mu_rolling=0.0, cone=cone, pgs_iterations=iterations
-                )
+                scene = ball(radius=0.1, speed=0.0, mu_torsional=0.02, mu_rolling=0.0, cone=cone, iterations=iterations)
                 scene.run(40)
                 scene.state.joint_qd.assign(np.array([0.05, 0.0, 0.0, 5.0], np.float32))
                 newton.eval_fk(scene.model, scene.state.joint_q, scene.state.joint_qd, scene.state)
@@ -698,7 +696,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 mu_torsional=0.005,
                 mu_rolling=0.0001,
                 cone=cone,
-                pgs_iterations=iterations,
+                iterations=iterations,
             ),
             "responsive": lambda cone, iterations: responsive_ball(
                 radius=0.1,
@@ -708,7 +706,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                 velocity=(0.001, 0.0, 0.0, 0.0, 0.01, 0.0),
                 cone=cone,
                 dt=1.0 / 240.0,
-                pgs_iterations=iterations,
+                iterations=iterations,
             ),
         }
         for name, build in builders.items():
@@ -758,7 +756,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
                     state = model.state()
                     state.joint_qd.assign(np.array([0.0, 0.0, 1.0e-5], np.float32))
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                    options = dict(SOLVER_OPTIONS, pgs_iterations=iterations)
+                    options = dict(SOLVER_OPTIONS, iterations=iterations)
                     solver = SolverFeatherPGS(
                         model, enable_torsional_rolling_friction=True, torsional_rolling_friction_cone=cone, **options
                     )
@@ -953,20 +951,20 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(scene.run(30), fresh)
 
     def test_row_capacity_overflow_is_reported(self):
-        scene = ball(dense_max_constraints=5, warn_constraint_overflow=False)
+        scene = ball(articulation_constraint_max=5, warn_constraint_overflow=False)
         scene.step()
         self.assertEqual(int(scene.solver.constraint_count.numpy()[0]), 0)
         self.assertTrue(bool(scene.solver.constraint_overflow.numpy()[0]))
 
     def test_unsupported_routes_are_rejected(self):
         rejected = (
-            {"pgs_mode": "split"},
+            {"solve_mode": "split"},
             {"articulated_contact_response": "propagation"},
             {"friction_anchor_beta": 0.2},
-            {"pgs_warmstart": True},
-            {"pgs_velocity_iterations": 2},
+            {"contact_warmstart": True},
+            {"velocity_iterations": 2},
             {"friction_mode": "bisection"},
-            {"pgs_schedule": "contact_then_internal"},
+            {"row_schedule": "contact_then_internal"},
             {"contact_torsion_radius": 0.01},
             {"enable_sleeping": True},
             {"contact_compliance": True},

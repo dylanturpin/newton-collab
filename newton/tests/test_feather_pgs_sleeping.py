@@ -71,8 +71,8 @@ class TestSleeping(unittest.TestCase):
         for kwargs in (
             {"sleep_quiet_time": 0},
             {"sleep_linear_threshold": float("nan")},
-            {"pgs_velocity_iterations": 1},
-            {"pgs_warmstart": True},
+            {"velocity_iterations": 1},
+            {"contact_warmstart": True},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, enable_sleeping=True, friction_anchor_beta=0, **kwargs)
@@ -80,7 +80,7 @@ class TestSleeping(unittest.TestCase):
     def test_default_and_explicit_disabled_match(self):
         """Preserve the existing trajectory with sleeping explicitly disabled."""
         model, pipeline, explicit, states, control = _scene(enabled=False)
-        default = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_mode="split", friction_anchor_beta=0)
+        default = newton.solvers.SolverFeatherPGS(model, iterations=16, solve_mode="split", friction_anchor_beta=0)
         reference = [model.state(), model.state()]
         _advance(model, pipeline, explicit, states, control, 30)
         _advance(model, pipeline, default, reference, control, 30)
@@ -140,9 +140,9 @@ def _scene(*, enabled=True, ground=True, device="cpu", stack=False):
         model,
         enable_sleeping=enabled,
         sleep_quiet_time=0.05,
-        pgs_iterations=16,
+        iterations=16,
         friction_anchor_beta=0,
-        pgs_mode="matrix_free" if model.device.is_cuda else "split",
+        solve_mode="matrix_free" if model.device.is_cuda else "split",
     )
     return model, pipeline, solver, [model.state(), model.state()], model.control()
 
