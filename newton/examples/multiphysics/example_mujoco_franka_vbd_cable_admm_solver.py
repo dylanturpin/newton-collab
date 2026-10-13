@@ -213,10 +213,10 @@ class Example:
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
             return "fpgs", lambda v: SolverFeatherPGS(
                 v,
-                pgs_mode="matrix_free",
-                pgs_iterations=int(args.fpgs_iterations),
+                solve_mode="matrix_free",
+                iterations=int(args.fpgs_iterations),
                 enable_joint_limits=True,
-                dense_max_constraints=64,
+                articulation_constraint_max=64,
             )
         mujoco_contact_budget = max(64, 16 * self.world_count)
         return "mjc", lambda v: SolverMuJoCo(

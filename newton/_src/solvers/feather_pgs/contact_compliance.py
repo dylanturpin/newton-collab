@@ -23,6 +23,9 @@ import warp as wp
 
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
+# SolverFeatherPGS rejects models with ``requires_grad``, so no kernel needs an adjoint.
+wp.set_module_options({"enable_backward": False})
+
 # Match the float64 host arithmetic of the coefficient law.
 wp.set_module_options({"fuse_fp": False})
 
@@ -92,25 +95,23 @@ def normal_coefficients(stiffness, damping, separation, *, dt):
 def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
     required = {
-        "pgs_mode": "matrix_free",
+        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
-        "pgs_schedule": "interleaved",
-        "pgs_velocity_iterations": 0,
-        "pgs_warmstart": False,
-        "mf_warmstart": False,
+        "row_schedule": "interleaved",
+        "velocity_iterations": 0,
+        "contact_warmstart": False,
         "enable_restitution": False,
-        "pgs_contact_regularization": 0.0,
-        "pgs_debug": False,
+        "contact_regularization": 0.0,
         "contact_friction_position_iterations": -1,
-        "friction_mode": "current",
+        "friction_mode": "fixed_normal",
         "contact_friction_shared_anchor": False,
         "contact_shared_anchor": False,
     }
     for key, expected in required.items():
         if settings[key] != expected:
             raise ValueError(f"contact_compliance requires {key}={expected!r}; got {settings[key]!r}")
-    if settings["pgs_iterations"] <= 0:
-        raise ValueError("contact_compliance requires positive pgs_iterations")
+    if settings["iterations"] <= 0:
+        raise ValueError("contact_compliance requires positive iterations")
     if not model.device.is_cuda:
         raise ValueError("contact_compliance currently requires CUDA")
 
@@ -118,7 +119,7 @@ def validate_configuration(model, settings):
 def validate_step(solver):
     """Reject unqualified combinations before any contact preprocessing."""
     # The persistent-patch implementation allocates a dummy buffer even when OFF.
-    if getattr(solver, "friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
+    if getattr(solver, "_friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
         raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
 
 
@@ -140,10 +141,10 @@ class ComplianceBuffers:
     def __init__(self, solver):
         device = solver.model.device
         # Same shapes as the row storage they shadow, so routing bounds match the row arrays.
-        self.dense_gamma = wp.zeros(solver.diag.shape, dtype=float, device=device)
-        self.mf_gamma = wp.zeros(solver.mf_eff_mass_inv.shape, dtype=float, device=device)
-        self.dense_weight = wp.zeros(solver.diag.shape, dtype=float, device=device)
-        self.mf_weight = wp.zeros(solver.mf_eff_mass_inv.shape, dtype=float, device=device)
+        self.dense_gamma = wp.zeros(solver._diag.shape, dtype=float, device=device)
+        self.mf_gamma = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
+        self.dense_weight = wp.zeros(solver._diag.shape, dtype=float, device=device)
+        self.mf_weight = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
         # [active, skipped] for the latest prepared step.
         self.counts = wp.zeros(2, dtype=wp.int32, device=device)
         self.status = wp.empty(_STATUS_CODES + 1, dtype=wp.int32, device=device)
@@ -163,7 +164,7 @@ def begin_rows(solver):
     buffers.counts.zero_()
     # The allocator writes slots_needed only after intentional skip gates.
     # Clear prior-step requests so an excluded contact cannot look overflowed.
-    solver.contact_slots_needed.zero_()
+    solver._contact_slots_needed.zero_()
 
 
 def prepare_rows(solver, contacts, dt):
@@ -172,14 +173,14 @@ def prepare_rows(solver, contacts, dt):
     device = solver.model.device
     wp.launch(
         _check_capacity,
-        dim=max(solver.world_count, 1),
+        dim=max(solver._world_count, 1),
         inputs=[
             contacts.rigid_contact_count,
             contacts.rigid_contact_max,
-            solver.constraint_count,
-            solver.dense_max_constraints,
-            solver.mf_constraint_count,
-            solver.mf_max_constraints,
+            solver._constraint_count,
+            solver._articulation_constraint_max,
+            solver._mf_constraint_count,
+            solver._free_body_constraint_max,
             solver._row_dropped_all,
             buffers.status,
         ],
@@ -194,28 +195,28 @@ def prepare_rows(solver, contacts, dt):
             contacts.rigid_contact_stiffness,
             contacts.rigid_contact_damping,
             contacts.rigid_contact_friction,
-            solver.contact_path,
-            solver.contact_slot,
-            solver.contact_world,
-            solver.contact_slots_needed,
+            solver._contact_path,
+            solver._contact_slot,
+            solver._contact_world,
+            solver._contact_slots_needed,
             wp.float64(dt),
-            solver.constraint_count,
-            solver.row_type,
-            solver.phi,
-            solver.row_cfm,
-            solver.target_velocity,
-            solver.mf_constraint_count,
-            solver.mf_row_type,
-            solver.mf_phi,
-            solver.mf_target_velocity if has_target else buffers.dummy_target,
+            solver._constraint_count,
+            solver._row_type,
+            solver._phi,
+            solver._row_cfm,
+            solver._target_velocity,
+            solver._mf_constraint_count,
+            solver._mf_row_type,
+            solver._mf_phi,
+            solver._mf_target_velocity if has_target else buffers.dummy_target,
             int(has_target),
-            float(solver.pgs_cfm),
+            float(solver._cfm),
         ],
         outputs=[
-            solver.diag,
-            solver.rhs,
-            solver.mf_eff_mass_inv,
-            solver.mf_rhs,
+            solver._diag,
+            solver._rhs,
+            solver._mf_eff_mass_inv,
+            solver._mf_rhs,
             buffers.dense_gamma,
             buffers.mf_gamma,
             buffers.dense_weight,
@@ -227,23 +228,29 @@ def prepare_rows(solver, contacts, dt):
     )
     wp.launch(
         _weight_friction_rows,
-        dim=solver.row_mu.shape,
-        inputs=[solver.constraint_count, solver.row_type, solver.row_parent, buffers.dense_gamma, buffers.dense_weight],
-        outputs=[solver.row_mu],
+        dim=solver._row_mu.shape,
+        inputs=[
+            solver._constraint_count,
+            solver._row_type,
+            solver._row_parent,
+            buffers.dense_gamma,
+            buffers.dense_weight,
+        ],
+        outputs=[solver._row_mu],
         device=device,
     )
     if solver._has_free_rigid_bodies:
         wp.launch(
             _weight_friction_rows,
-            dim=solver.mf_row_mu.shape,
+            dim=solver._mf_row_mu.shape,
             inputs=[
-                solver.mf_constraint_count,
-                solver.mf_row_type,
-                solver.mf_row_parent,
+                solver._mf_constraint_count,
+                solver._mf_row_type,
+                solver._mf_row_parent,
                 buffers.mf_gamma,
                 buffers.mf_weight,
             ],
-            outputs=[solver.mf_row_mu],
+            outputs=[solver._mf_row_mu],
             device=device,
         )
     if not wp.get_stream(device).is_capturing:

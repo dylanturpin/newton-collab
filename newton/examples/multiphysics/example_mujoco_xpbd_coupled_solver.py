@@ -71,7 +71,7 @@ def _rigid_solver_entry_args(
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
     if rigid_solver == "featherpgs":
         # The chain and boxes pile up on the ground, past the default 32 dense contact rows.
-        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free", "dense_max_constraints": 256}
+        return "fpgs", SolverFeatherPGS, {"solve_mode": "matrix_free", "articulation_constraint_max": 256}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 

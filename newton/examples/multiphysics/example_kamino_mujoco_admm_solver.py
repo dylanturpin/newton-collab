@@ -144,7 +144,7 @@ class Example:
             rigid_name = "fpgs"
 
             def rigid_factory(v):
-                return SolverFeatherPGS(v, pgs_mode="matrix_free")
+                return SolverFeatherPGS(v, solve_mode="matrix_free")
 
         else:
             rigid_name = "mjc"

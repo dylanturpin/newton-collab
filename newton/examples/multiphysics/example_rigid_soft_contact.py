@@ -75,7 +75,7 @@ def _rigid_solver_entry_args(rigid_solver: str):
     if rigid_solver == "mjc":
         return "mjc", SolverMuJoCo, {"use_mujoco_contacts": False, "njmax": 64}
     if rigid_solver == "featherpgs":
-        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
+        return "fpgs", SolverFeatherPGS, {"solve_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver {rigid_solver!r}")
 
 

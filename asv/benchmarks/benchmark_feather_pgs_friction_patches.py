@@ -103,14 +103,13 @@ def run(
     model.rigid_contact_max = worlds * tiles * tiles * 4
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        pgs_iterations=32,
-        pgs_beta=0.05,
-        pgs_warmstart=warmstart,
-        mf_warmstart=warmstart,
+        solve_mode="matrix_free",
+        iterations=32,
+        baumgarte=0.05,
+        contact_warmstart=warmstart,
         **({"friction_anchor_beta": beta} if beta is not None else {}),
-        dense_max_constraints=32,
-        mf_max_constraints=max(256, 12 * tiles * tiles),
+        articulation_constraint_max=32,
+        free_body_constraint_max=max(256, 12 * tiles * tiles),
         warn_constraint_overflow=True,
     )
     pipeline = newton.CollisionPipeline(
@@ -150,7 +149,6 @@ def run(
         step(s0, s1)
         step(s1, s0)
     with wp.ScopedCapture(device=model.device) as capture:
-        solver.seed_double_buffer_events()
         step(s0, s1)
         step(s1, s0)
     before = s0.body_q.numpy().copy()
@@ -160,8 +158,8 @@ def run(
     wp.synchronize()
     elapsed = time.perf_counter() - start
     after = s0.body_q.numpy()
-    types = solver.mf_row_type.numpy()
-    counts = solver.mf_constraint_count.numpy()
+    types = solver._mf_row_type.numpy()
+    counts = solver._mf_constraint_count.numpy()
     normal_rows = sum(int(np.count_nonzero(types[w, : counts[w]] == 0)) for w in range(worlds))
     friction_rows = sum(int(np.count_nonzero(types[w, : counts[w]] == 2)) for w in range(worlds))
     result = {
@@ -169,7 +167,7 @@ def run(
         "warp": wp.__version__,
         "worlds": worlds,
         "tiles": tiles,
-        "beta": solver.friction_anchor_beta,
+        "beta": solver._friction_anchor_beta,
         "steps": steps,
         "warmstart": warmstart,
         "frozen_contacts": frozen_contacts,
