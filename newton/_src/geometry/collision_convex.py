@@ -212,9 +212,8 @@ def create_solve_convex_multi_contact(
             point_b = point_b + normal * half_enlarge
         else:
             # GJK fallback for separated shapes -- no Minkowski inflate; accurate normals/distances.
-            # The separation cutoff stops iterating once the support-plane bound
-            # clears contact_threshold plus the rounding margin (the write below
-            # is rejected then).
+            # Pairs whose support-plane bound clears contact_threshold plus the rounding margin stop early;
+            # no contact is kept for them.
             _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                 geom_a,
                 geom_b,
@@ -350,9 +349,8 @@ def create_solve_convex_single_contact(
             point_b = point_b + normal * half_enlarge
         else:
             # GJK fallback for separated shapes -- no Minkowski inflate; accurate normals/distances.
-            # The separation cutoff stops iterating once the support-plane bound
-            # clears contact_threshold plus the rounding margin (the writer's gap
-            # check rejects then).
+            # Pairs whose support-plane bound clears contact_threshold plus the rounding margin stop early;
+            # no contact is kept for them.
             _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                 geom_a,
                 geom_b,

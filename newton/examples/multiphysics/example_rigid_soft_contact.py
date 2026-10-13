@@ -7,6 +7,7 @@
 # Shows how to set up a rigid sphere colliding with a soft FEM beam.
 #
 # Command: uv run -m newton.examples rigid_soft_contact
+#          uv run -m newton.examples rigid_soft_contact --solver coupled --rigid-solver featherpgs
 #
 ###########################################################################
 
@@ -16,7 +17,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverKamino, SolverMuJoCo, SolverSemiImplicit, SolverVBD, SolverXPBD
+from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo, SolverSemiImplicit, SolverVBD, SolverXPBD
 from newton.viewer import ViewerBase
 
 GRID_DIM_X = 20
@@ -68,11 +69,13 @@ def _make_kamino_config() -> SolverKamino.Config:
 def _rigid_solver_entry_args(rigid_solver: str):
     rigid_solver = _normalized_rigid_solver_name(rigid_solver)
     if rigid_solver == "vbd":
-        return "rigid_vbd", SolverVBD, {"iterations": 10, "rigid_compliant_alm": True}
+        return "rigid_vbd", SolverVBD, {"iterations": 10}
     if rigid_solver == "kamino":
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mjc":
         return "mjc", SolverMuJoCo, {"use_mujoco_contacts": False, "njmax": 64}
+    if rigid_solver == "featherpgs":
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver {rigid_solver!r}")
 
 
@@ -89,7 +92,6 @@ def _soft_solver_entry_args(soft_solver: str, args):
                 "iterations": args.vbd_iterations,
                 "particle_enable_self_contact": False,
                 "particle_enable_tile_solve": False,
-                "rigid_compliant_alm": True,
                 "rigid_body_particle_contact_buffer_size": 512,
             },
         )
@@ -208,7 +210,6 @@ class Example:
                 iterations=10,
                 particle_enable_self_contact=False,
                 particle_enable_tile_solve=False,
-                rigid_compliant_alm=True,
                 rigid_body_particle_contact_buffer_size=512,
             )
         elif self.solver_type == "coupled":
@@ -362,7 +363,7 @@ class Example:
             "--rigid-solver",
             help="Rigid solver used by --solver coupled",
             type=str,
-            choices=["mjc", "mujoco", "kamino", "vbd"],
+            choices=["mjc", "mujoco", "kamino", "vbd", "featherpgs"],
             default="mjc",
         )
         parser.add_argument(

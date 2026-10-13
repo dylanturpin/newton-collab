@@ -152,7 +152,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             0,
                         ]
                         if device == "cpu":
-                            wp.launch(pgs_solve_loop, dim=1, inputs=[args[0], capacity, *args[1:]], device=device)
+                            wp.launch(pgs_solve_loop, dim=1, inputs=[args[0], *args[1:]], device=device)
                         else:
                             kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
                             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)

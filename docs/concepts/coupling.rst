@@ -3,6 +3,8 @@
 
 .. currentmodule:: newton
 
+.. _Coupled Solvers:
+
 Coupled Solvers
 ===============
 
@@ -61,7 +63,7 @@ one sub-solver:
 
    entry = SolverCoupled.Entry(
        name="soft",
-       solver=lambda view: SolverVBD(model=view, iterations=20, rigid_compliant_alm=True),
+       solver=lambda view: SolverVBD(model=view, iterations=20),
        bodies=soft_body_ids,
        particles=cloth_particle_ids,
        shapes=cloth_shape_ids,
@@ -220,6 +222,8 @@ destination)``. One source step and one destination step are performed for each
 solver pair and proxy iteration, so a single proxy declaration can carry both
 body and particle mappings around the same destination solve.
 
+.. _ADMM coupling:
+
 ADMM Coupling
 -------------
 
@@ -245,7 +249,7 @@ objects. It does not currently accept arbitrary user-authored endpoint records
 as public API. Supported row sources are:
 
 - cross-solver model joints;
-- custom body-particle attachment attributes;
+- model body-particle attachments;
 - internally detected rigid-rigid, rigid-particle, and particle-particle
   contacts.
 
@@ -259,12 +263,18 @@ model joint friction. Prismatic, distance, and D6 joint rows are not yet part of
 the experimental API.
 
 Body-particle attachments cover interfaces that cannot be represented by a
-model joint because one endpoint is a particle. The helper
-``SolverCoupledADMM.add_body_particle_attachment()`` registers and fills custom
-attributes under ``coupling:body_particle_attachment`` with body id, particle id,
-body-local point, stiffness, damping, and enabled state. Importers can author the
-same custom attributes directly. Rows whose endpoints are unowned or owned by
-the same entry are ignored; only cross-solver attachments are coupled by ADMM.
+model joint because one endpoint is a particle. The coupler reads the model
+attachment rows described under :ref:`Body-particle attachments` and owns those
+whose body and particle endpoints belong to different entries; rows owned
+entirely by one entry are left to that entry's solver. The coupler logs a warning
+if that solver does not support attachments or if an endpoint is owned by no
+entry. Rows authored under the legacy ``coupling:body_particle_attachment``
+custom frequency are also consumed by ADMM, so importers that write those
+attributes keep working; these legacy rows remain invisible to
+:class:`~newton.solvers.SolverVBD`.
+``SolverCoupledADMM.add_body_particle_attachment()`` is deprecated in favor of
+:meth:`newton.ModelBuilder.add_attachment_body_particle`, but keeps writing the
+legacy custom-row layout until it is removed.
 
 Contact coupling is enabled by adding one or more ``ContactPair`` values to
 ``SolverCoupledADMM.Config.contact_pairs``. A contact pair names two entries.
@@ -370,6 +380,28 @@ MuJoCo provides GPU effective-mass hooks from MuJoCo Warp data so proxy virtual
 inertia and ADMM endpoint weights can use articulated mass estimates rather than
 raw body mass.
 
+:class:`~newton.solvers.SolverFeatherPGS` can own rigid bodies and articulations
+as a proxy source or an ADMM entry; it must not own particles. It consumes
+coupling forces through ``state.body_f`` and reports articulated effective mass
+as the inverse of the axis mean of the endpoint mobility ``J H^-1 J^T``, with
+the tree-only joint-space mass matrix ``H`` (including armature, excluding
+loop-closing joints) evaluated on the host at ``model.joint_q``; joint drives,
+limits, and contacts are not included. Its input-state hook invalidates cached
+kinematics after coupler writes and restores persistent friction-patch history
+before the next solve after an iteration restart, so repeated solves of one step
+start from the same history; a reset cancels that restore, so worlds a masked
+reset does not select keep their history. A reset that selects global entities
+also clears world 0, where FeatherPGS solves global articulations. Sleeping,
+warm starting, contact compliance, contact torsion, owning particles, and
+acting as a proxy destination raise :class:`NotImplementedError` in coupled
+use. Proxy-contact friction between FeatherPGS bodies and deformables is solved
+by the destination solver, not by FeatherPGS patch or torsional friction. Size
+``model.rigid_contact_max`` to the contact buffer passed to the coupled step
+before constructing the solver, because FeatherPGS allocates its contact scratch
+from the model. FeatherPGS does not integrate the cross-solver joints that ADMM
+joint proxies keep in its view, so route those proxies to the other entry with
+``joint_proximal_destination_entries``.
+
 Current Limitations
 -------------------
 
@@ -386,6 +418,9 @@ The coupled-solver framework is useful today, but it is still experimental:
 - Particle-particle ADMM contacts use a private stream, not a public contact API.
 - Effective-mass weighting falls back to simple model mass/inertia where no
   custom hook is available.
+- FeatherPGS effective masses are fixed at the configuration in
+  ``model.joint_q`` and are refreshed only on ``BODY_INERTIAL_PROPERTIES``
+  notifications, outside graph capture.
 - USD ownership, automatic coupled-solver construction, and high-level tuning
   guidance are not part of the experimental public API yet.
 - Full-surface (edge/face) rigid-soft contacts are consumed by

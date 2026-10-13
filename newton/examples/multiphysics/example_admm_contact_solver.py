@@ -13,6 +13,8 @@
 #
 # Command: python -m newton.examples admm_contact_solver
 #          python -m newton.examples admm_contact_solver --solver free
+#          python -m newton.examples admm_contact_solver --tray-solver mujoco
+#          python -m newton.examples admm_contact_solver --tray-solver featherpgs
 #
 ###########################################################################
 
@@ -24,7 +26,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
-from newton.solvers import SolverSemiImplicit, SolverXPBD
+from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverSemiImplicit, SolverXPBD
 
 
 @wp.kernel(enable_backward=False)
@@ -68,6 +70,23 @@ class Example:
         self.model.soft_contact_kf = 0.0
         self.model.soft_contact_mu = 0.0
 
+        if args.tray_solver == "featherpgs":
+
+            def tray_factory(v):
+                return SolverFeatherPGS(v, pgs_mode="matrix_free")
+
+        elif args.tray_solver == "mujoco":
+
+            def tray_factory(v):
+                return SolverMuJoCo(model=v, use_mujoco_contacts=False, disable_contacts=True)
+
+        else:
+
+            def tray_factory(v):
+                return SolverSemiImplicit(
+                    model=v, enable_tri_contact=False, joint_attach_ke=2.5e4, joint_attach_kd=4.0e2
+                )
+
         self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
@@ -83,10 +102,7 @@ class Example:
                 ),
                 SolverCoupled.Entry(
                     name="tray",
-                    solver=lambda v: SolverSemiImplicit(
-                        model=v,
-                        **{"enable_tri_contact": False, "joint_attach_ke": 2.5e4, "joint_attach_kd": 4.0e2},
-                    ),
+                    solver=tray_factory,
                     bodies=[self.tray_body],
                     joints=[self.tray_joint],
                 ),
@@ -354,6 +370,13 @@ class Example:
             type=str,
             choices=["admm", "free"],
             default="admm",
+        )
+        parser.add_argument(
+            "--tray-solver",
+            help="Rigid solver that owns the ball-jointed tray",
+            type=str,
+            choices=["semi_implicit", "mujoco", "featherpgs"],
+            default="semi_implicit",
         )
         parser.add_argument(
             "--admm-iterations",

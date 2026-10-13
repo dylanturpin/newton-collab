@@ -121,6 +121,8 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         indices[0] = 0
         contacts.rigid_contact_match_index.assign(indices)
         model.shape_material_mu.fill_(friction)
+        # Refresh the solver's friction copy without the history reset a SHAPE_PROPERTIES notify performs.
+        solver._refresh_shape_materials()
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.contact_slot.numpy()[0])
         impulses = solver.mf_impulses.numpy()[0, slot : slot + 3]

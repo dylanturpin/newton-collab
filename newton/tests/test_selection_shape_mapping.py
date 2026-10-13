@@ -14,7 +14,7 @@ from newton.selection import ArticulationView
 
 class TestShapeMapping(unittest.TestCase):
     def test_gathered_shape_lifetime(self):
-        """Keep gathered values alive while releasing their view and model independently."""
+        """Keep gathered values valid while releasing their view, model and source independently."""
         for device in wp.get_devices():
             with self.subTest(device=device):
                 model = make_world().finalize(device=device)
@@ -31,7 +31,6 @@ class TestShapeMapping(unittest.TestCase):
                 gc.collect()
                 self.assertIsNone(model_ref())
                 self.assertIsNone(view_ref())
-                self.assertIsNotNone(source_ref())
                 np.testing.assert_array_equal(values.numpy(), expected)
                 np.testing.assert_array_equal(
                     live_view.get_attribute("shape_material_mu", live_model).numpy(), live_expected
@@ -81,7 +80,8 @@ class TestShapeMapping(unittest.TestCase):
                 model = make_world().finalize(device=device)
                 for name in ("robot_left", "robot_right"):
                     view = ArticulationView(model, name)
-                    self.assertTrue(view.uses_explicit_model_indices)
+                    # Global articulations take the indexed shape layout.
+                    self.assertFalse(view.frequency_layouts[newton.Model.AttributeFrequency.SHAPE].is_contiguous)
                     self.assertFalse(view.shapes_contiguous)
                     indices = selected_shapes(model, view)
                     initial = model.shape_material_mu.numpy().copy()
@@ -224,9 +224,8 @@ class TestShapeMapping(unittest.TestCase):
 
                 model, indices = make_appended_worlds(device)
                 view = ArticulationView(model, "*")
-                self.assertTrue(
-                    view.frequency_layouts[newton.Model.AttributeFrequency.SHAPE].uses_explicit_model_indices
-                )
+                # Uniform worlds take the per-world indexed layout.
+                self.assertFalse(view.frequency_layouts[newton.Model.AttributeFrequency.SHAPE].is_contiguous)
                 original = model.shape_scale.numpy().copy()
                 backing = np.arange(3 * indices[0].size * 3, dtype=np.float32).reshape(3, *indices.shape[1:], 3) + 1
                 values = wp.indexedarray(

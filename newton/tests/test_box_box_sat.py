@@ -419,6 +419,159 @@ def test_box_box_sat_speculative_admission_uses_authored_gap(test: unittest.Test
         test.assertEqual(spec, 4, "approaching box should receive a speculative four-contact manifold")
 
 
+def test_box_box_sat_drift_manifold(test: unittest.TestCase, device):
+    """Keep four upward face contacts for stacked equal boxes under sub-microradian drift.
+
+    The poses hit three failures: more than eight face-clip candidates, an edge axis tied with the
+    face axis in float32, and an incident corner within rounding of the reference face boundary."""
+    poses = (
+        (
+            (
+                115.99996185302734,
+                0.9994751214981079,
+                2.125256299972534,
+                2.316320291e-08,
+                1.542881200e-08,
+                3.762892930e-08,
+                1.0,
+            ),
+            (
+                115.99996185302734,
+                0.9994751214981079,
+                2.625131368637085,
+                2.393707099e-08,
+                1.426083340e-08,
+                -2.363266204e-08,
+                1.0,
+            ),
+        ),
+        (
+            (
+                291.0011901855469,
+                -0.000828361778985709,
+                0.35296380519866943,
+                5.242253298e-09,
+                -5.918314727e-08,
+                4.356563820e-08,
+                1.0,
+            ),
+            (
+                291.0011901855469,
+                -0.0008283545030280948,
+                0.8527665734291077,
+                -1.110785796e-09,
+                -4.627866978e-10,
+                6.346922276e-08,
+                1.0,
+            ),
+        ),
+        (
+            (
+                219.99838256835938,
+                34.99989318847656,
+                1.6229681968688965,
+                -2.320742169e-06,
+                7.075635494e-06,
+                -7.455936668e-08,
+                1.0,
+            ),
+            (
+                219.99838256835938,
+                34.99989318847656,
+                2.122823715209961,
+                1.087677810e-05,
+                -3.897166322e-07,
+                6.604682766e-06,
+                1.0,
+            ),
+        ),
+    )
+    for k, (lower, upper) in enumerate(poses):
+        with wp.ScopedDevice(device):
+            builder = newton.ModelBuilder()
+            for pose in (lower, upper):
+                body = builder.add_body(xform=wp.transform(wp.vec3(*pose[:3]), wp.quat(*pose[3:])))
+                builder.add_shape_box(body, hx=0.25, hy=0.25, hz=0.25)
+            model = builder.finalize()
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", box_box_sat=True)
+            contacts = pipeline.contacts()
+            pipeline.collide(model.state(), contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertEqual(count, 4, f"pose {k}: expected a 4-contact manifold, got {count}")
+            normals = contacts.rigid_contact_normal.numpy()[:count]
+            test.assertTrue(np.all(np.abs(normals[:, 2]) > 0.999), f"pose {k}: tilted normals {normals}")
+            p0 = contacts.rigid_contact_point0.numpy()[:count]
+            quads = {(p[0] > 0.0, p[1] > 0.0) for p in p0}
+            test.assertEqual(len(quads), 4, f"pose {k}: manifold does not span four corners: {p0}")
+
+
+def test_box_box_sat_thin_face_keeps_corners(test: unittest.TestCase, device):
+    """Keep both signs on both in-plane axes for an aligned, stacked thin face.
+
+    Long boxes with sub-millimeter half-widths emit more than eight candidates; candidate
+    reduction must not merge corners across the thin face."""
+    for half_width in (1.0e-4, 1.0e-5):
+        size = wp.vec3(1.0, half_width, 0.25)
+        dist, pos, _feat = _features_raw(device, size, wp.vec3(0.0, 0.0, 0.5 - 1.0e-6), size)
+        corners = pos[dist < 1.0e5]
+        signs = {(bool(p[0] > 0.0), bool(p[1] > 0.0)) for p in corners}
+        test.assertEqual(len(signs), 4, f"half-width {half_width}: corners {corners.tolist()}")
+
+
+def _features_raw(device, box1_size, box2_pos, box2_size):
+    ident = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    out_dist = wp.zeros(8, dtype=wp.float32, device=device)
+    out_pos = wp.zeros(8, dtype=wp.vec3, device=device)
+    out_feat = wp.zeros(8, dtype=wp.int32, device=device)
+    wp.launch(
+        _eval_box_box_features,
+        dim=1,
+        inputs=[wp.vec3(0.0), ident, box1_size, box2_pos, ident, box2_size, 0.0],
+        outputs=[out_dist, out_pos, out_feat],
+        device=device,
+    )
+    return out_dist.numpy(), out_pos.numpy(), out_feat.numpy()
+
+
+def test_box_box_sat_patch_corners_order_independent(test: unittest.TestCase, device):
+    """Keep all four corners of thin, offset and crossed face patches in either argument order.
+
+    The last tuple element of each case is the patch center in x and y."""
+    cases = (
+        ((1.0, 1.0, 0.25), (0.0, 1.0 - 2.0**-14, 0.499999), (1.0, 2.0**-14, 0.25), (0.0, 1.0 - 2.0**-14)),
+        ((1.0, 1.0, 0.25), (0.0, 1.0 - 1.0e-5, 0.499999), (1.0, 1.0e-5, 0.25), (0.0, 1.0 - 1.0e-5)),
+        ((1.0, 1.0, 0.25), (0.0, 2.0 - 1.0e-5, 0.499999), (1.0, 1.0, 0.25), (0.0, 1.0 - 0.5e-5)),
+        ((1.0, 1.0e-5, 0.25), (0.0, 0.0, 0.499999), (1.0e-5, 1.0, 0.25), (0.0, 0.0)),
+    )
+    for size_a, pos_b, size_b, (cx, cy) in cases:
+        for angle in (0.0, 1.0e-6):
+            rot_b = wp.quat_to_matrix(wp.quat(0.0, 0.0, float(np.sin(0.5 * angle)), float(np.cos(0.5 * angle))))
+            for swap in (False, True):
+                a = (wp.vec3(0.0), wp.mat33(np.eye(3)), wp.vec3(*size_a))
+                b = (wp.vec3(*pos_b), rot_b, wp.vec3(*size_b))
+                first, second = (b, a) if swap else (a, b)
+                dist, pos = _features_posed(device, *first, *second)
+                corners = pos[dist < 1.0e5]
+                signs = {(bool(p[0] > cx), bool(p[1] > cy)) for p in corners}
+                test.assertEqual(
+                    len(signs), 4, f"sizes {size_a}/{size_b}, angle {angle}, swap {swap}: corners {corners.tolist()}"
+                )
+
+
+def _features_posed(device, pos1, rot1, size1, pos2, rot2, size2):
+    out_dist = wp.zeros(8, dtype=wp.float32, device=device)
+    out_pos = wp.zeros(8, dtype=wp.vec3, device=device)
+    out_feat = wp.zeros(8, dtype=wp.int32, device=device)
+    wp.launch(
+        _eval_box_box_features,
+        dim=1,
+        inputs=[pos1, rot1, size1, pos2, rot2, size2, 0.0],
+        outputs=[out_dist, out_pos, out_feat],
+        device=device,
+    )
+    return out_dist.numpy(), out_pos.numpy()
+
+
 class TestBoxBoxSAT(unittest.TestCase):
     pass
 
@@ -469,6 +622,24 @@ add_function_test(
     TestBoxBoxSAT,
     "test_box_box_sat_speculative_admission_uses_authored_gap",
     test_box_box_sat_speculative_admission_uses_authored_gap,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_sat_drift_manifold",
+    test_box_box_sat_drift_manifold,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_sat_thin_face_keeps_corners",
+    test_box_box_sat_thin_face_keeps_corners,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_sat_patch_corners_order_independent",
+    test_box_box_sat_patch_corners_order_independent,
     devices=get_test_devices(),
 )
 

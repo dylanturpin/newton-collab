@@ -218,8 +218,6 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
 def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     """Treat exactly and numerically reached surfaces as active without consulting impulse."""
     count = wp.array([1], dtype=wp.int32, device=device)
-    body_a = wp.array([[0]], dtype=wp.int32, device=device)
-    body_b = wp.array([[-1]], dtype=wp.int32, device=device)
     dof_a = wp.array([[0]], dtype=wp.int32, device=device)
     dof_b = wp.array([[-1]], dtype=wp.int32, device=device)
     J_a = wp.array([[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]], dtype=wp.float32, device=device)
@@ -229,7 +227,6 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     row_type = wp.array([[0]], dtype=wp.int32, device=device)
     target_velocity = wp.zeros((1, 1), dtype=wp.float32, device=device)
     row_restitution = wp.zeros((1, 1), dtype=wp.float32, device=device)
-    max_depenetration_velocity = wp.array([float("inf")], dtype=wp.float32, device=device)
     position_velocity = wp.zeros((6,), dtype=wp.float32, device=device)
     rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
 
@@ -241,8 +238,6 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
             dim=1,
             inputs=[
                 count,
-                body_a,
-                body_b,
                 dof_a,
                 dof_b,
                 J_a,
@@ -253,15 +248,9 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 target_velocity,
                 row_restitution,
                 has_target,
-                max_depenetration_velocity,
-                0.2,
                 0.5,
-                0.0,
-                0.0,
                 position_velocity,
                 position_velocity,
-                1,
-                0,
                 0.5,
                 1,
             ],

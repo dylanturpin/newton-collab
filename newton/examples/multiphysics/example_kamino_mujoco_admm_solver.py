@@ -5,11 +5,12 @@
 # Example Kamino-MuJoCo ADMM Coupled Solver
 #
 # A closed four-bar linkage is split across two rigid solvers: two links are
-# owned by Kamino and two links are owned by MuJoCo. SolverCoupledADMM detects
-# the model revolute joints that connect bodies owned by different solvers and
-# turns them into ADMM attachments.
+# owned by Kamino and two links are owned by MuJoCo (or FeatherPGS).
+# SolverCoupledADMM detects the model revolute joints that connect bodies owned
+# by different solvers and turns them into ADMM attachments.
 #
 # Command: python -m newton.examples kamino_mujoco_admm_solver
+#          python -m newton.examples kamino_mujoco_admm_solver --rigid-solver featherpgs
 #
 ###########################################################################
 
@@ -23,7 +24,7 @@ from newton.solvers.experimental.coupled import ModelView, SolverCoupled, Solver
 
 import newton
 import newton.examples
-from newton.solvers import SolverKamino, SolverMuJoCo
+from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo
 
 
 def _configure_kamino_rigid_view(view: ModelView) -> None:
@@ -139,6 +140,18 @@ class Example:
         kamino_config = _make_kamino_config()
         kamino_config.padmm.max_iterations = args.kamino_iterations
 
+        if args.rigid_solver == "featherpgs":
+            rigid_name = "fpgs"
+
+            def rigid_factory(v):
+                return SolverFeatherPGS(v, pgs_mode="matrix_free")
+
+        else:
+            rigid_name = "mjc"
+
+            def rigid_factory(v):
+                return SolverMuJoCo(model=v, use_mujoco_contacts=False, njmax=64, nconmax=64)
+
         self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
@@ -150,11 +163,8 @@ class Example:
                     configure_view=_configure_kamino_rigid_view,
                 ),
                 SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        **{"use_mujoco_contacts": False, "njmax": 64, "nconmax": 64},
-                    ),
+                    name=rigid_name,
+                    solver=rigid_factory,
                     bodies=self.mujoco_bodies,
                     joints=self.mujoco_joints,
                 ),
@@ -168,6 +178,8 @@ class Example:
                 joint_angular_stiffness=args.joint_stiffness,
                 joint_damping=args.joint_damping,
                 joint_angular_damping=args.joint_damping,
+                # FeatherPGS warns on and ignores the revolute joint proxies, so only Kamino carries them.
+                joint_proximal_destination_entries=("kamino",) if args.rigid_solver == "featherpgs" else None,
             ),
         )
 
@@ -369,6 +381,13 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=4)
+        parser.add_argument(
+            "--rigid-solver",
+            type=str,
+            choices=["mujoco", "featherpgs"],
+            default="mujoco",
+            help="Rigid solver that owns the ground link and the coupler.",
+        )
         parser.add_argument("--substeps", type=int, default=3, help="Coupled substeps per rendered frame.")
         parser.add_argument("--admm-iterations", type=int, default=2, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=50.0, help="ADMM penalty parameter.")

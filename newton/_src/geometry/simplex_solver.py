@@ -113,12 +113,12 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         edge = b - a
         vsq = wp.length_sq(edge)
 
-        degenerate = vsq < EPSILON
+        degenerate = vsq < EPSILON * EPSILON
 
         # Guard division by zero in degenerate cases
         denom = vsq
         if degenerate:
-            denom = EPSILON
+            denom = EPSILON * EPSILON
         t = -wp.dot(a, edge) / denom
         lambda0 = 1.0 - t
         lambda1 = t
@@ -139,7 +139,11 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         bc[i0] = lambda0
         bc[i1] = lambda1
 
-        return lambda0 * a + lambda1 * b, bc, mask
+        closest = lambda0 * a + lambda1 * b
+        if lambda0 > 0.0 and lambda1 > 0.0 and wp.length_sq(closest) <= EPSILON * EPSILON:
+            # Project directly to avoid cancellation along a nearly touching edge.
+            closest = wp.cross(edge, wp.cross(a, edge)) * (1.0 / vsq)
+        return closest, bc, mask
 
     @wp.func
     def closest_triangle(
@@ -161,9 +165,8 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         normal = wp.cross(u, w)
 
         t = wp.length_sq(normal)
-        # Squared area has units of length^4. An absolute cutoff rejects
-        # ordinary small triangles and can stall GJK on an unchanged edge.
-        # Compare sin(angle)^2 instead, including zero-length edges.
+        # Squared area has units of length^4; use a scale-relative squared-sine
+        # test to retain small, well-shaped faces and reject zero-length edges.
         degenerate = t <= EPSILON * wp.length_sq(u) * wp.length_sq(w)
         # Guard division by zero in degenerate cases
         denom = t
@@ -353,20 +356,20 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             extend: Contact offset extension (sum of contact offsets)
             data_provider: Support mapping data provider
             MAX_ITER: Maximum number of GJK iterations (default: 30)
-            COLLIDE_EPSILON: Relative duality-gap tolerance and near-contact distance [m] (default: 1e-4)
-            max_dist: Separation cutoff [m]. When positive, iteration stops as
-                soon as a support-plane lower bound exceeds ``max_dist`` plus a
-                float32 rounding margin (``GJK_CUTOFF_TOLERANCE`` times the
-                support-point coordinate scale). The bound is exact in real
-                arithmetic; the margin is an empirical allowance chosen so the
-                exact query (``max_dist=0.0``) also returns a distance above
-                ``max_dist`` in tested cases, not a proven float32 error bound.
-                The returned distance is then an upper bound on the true
-                distance that still exceeds ``max_dist``, and the witness points
-                are the current (unrefined) simplex estimate. Queries the cutoff
-                does not stop return the exact query's results. ``0.0``
-                (default) disables the cutoff and computes the exact closest
-                distance.
+            COLLIDE_EPSILON: Relative duality-gap tolerance, also used as an absolute distance
+                threshold [m] for overlap and duplicate vertices (default: 1e-4).
+            max_dist: Separation cutoff [m]. When positive, iteration stops once a
+                support-plane lower bound exceeds ``max_dist`` plus a float32 rounding
+                margin (``GJK_CUTOFF_TOLERANCE`` times the support-point coordinate scale).
+                The bound is exact in real arithmetic; the margin is an empirical allowance
+                chosen so the exact query (``max_dist=0.0``) also returns a distance above
+                ``max_dist`` in tested cases, not a proven float32 error bound. The
+                returned distance is then an upper bound on the true distance that
+                still exceeds ``max_dist``, and the witness points are the
+                current simplex estimate rather than the closest points. Queries the
+                cutoff does not stop follow the exact query's iteration path.
+                Independently compiled call sites can differ in floating-point rounding.
+                ``0.0`` (default) disables the cutoff.
 
         Returns:
             Tuple of:
@@ -411,9 +414,9 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
                 # separation, even below the distance convergence tolerance.
                 if simplex_usage_mask != wp.uint32(0):
                     near_direction = last_search_dir
-                    if dist_sq > EPSILON * EPSILON:
+                    if dist_sq > 0.0:
                         near_direction = -v
-                    if wp.length_sq(near_direction) > EPSILON * EPSILON:
+                    if wp.length_sq(near_direction) > 0.0:
                         near_normal = wp.normalize(near_direction)
                         support = minkowski_support(
                             geom_a, geom_b, near_normal, orientation_b, position_b, extend, data_provider
@@ -421,16 +424,18 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
                         support_plane = wp.dot(near_normal, support.BtoA)
                         if support_plane < 0.0 and dist_sq > EPSILON * EPSILON:
                             certified_near = True
-                            break
                         if support_plane <= 0.0 and dist_sq <= EPSILON * EPSILON:
                             point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
+                            if support_plane < 0.0:
+                                # At the origin tolerance, preserve the certified plane gap.
+                                return True, point_a, point_b, near_normal, -support_plane
                             return False, point_a, point_b, near_normal, 0.0
-                if dist_sq <= EPSILON * EPSILON:
+                if simplex_usage_mask != wp.uint32(0) and dist_sq <= EPSILON * EPSILON:
                     # Origin reached without a separating/supporting plane.
                     point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
                     return False, point_a, point_b, wp.vec3(0.0), 0.0
-                # The simplex is close but its direction has not certified
-                # separation. Refine rather than declaring an overlap.
+                # Separation alone does not certify distance convergence.
+                # Refine rather than accepting the current witnesses.
                 duplicate_epsilon = EPSILON
 
             search_dir = -v
@@ -443,22 +448,20 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             # Check for convergence using Frank-Wolfe duality gap
             # Use BtoA directly (Minkowski difference)
             w_v = w.BtoA
-            # Separation cutoff: the support plane orthogonal to the search
-            # direction lower-bounds the true distance by dot(v, w_v)/|v|.
-            # The exact query's float32 distance can fall a few rounding errors
-            # below that bound, so stop refining only once the bound clears
-            # max_dist by a margin relative to the coordinates involved. The
-            # post-loop exit then returns |v| >= bound > max_dist; the margin is
-            # empirical, chosen so the exact query also returns a distance above
-            # max_dist in tested cases.
+            # The support plane orthogonal to v lower-bounds the distance by
+            # dot(v, w_v) / |v|. The exact query's float32 distance can fall a few
+            # rounding errors below that bound, so exit only once the bound clears
+            # max_dist by a margin relative to the coordinates involved. The exit below
+            # then returns |v| >= bound > max_dist; the margin is empirical, chosen so the
+            # exact query also returns a distance above max_dist in tested cases.
             if max_dist > 0.0:
                 cutoff_scale = wp.max(cutoff_scale, coordinate_scale(w.B) + coordinate_scale(w_v))
                 cutoff = max_dist + GJK_CUTOFF_TOLERANCE * (cutoff_scale + max_dist)
                 if simplex_usage_mask != wp.uint32(0) and wp.dot(v, w_v) > cutoff * wp.sqrt(dist_sq):
                     break
-            # Relative duality gap; an absolute cutoff is too loose at millimeter gaps.
-            # A populated simplex supplies surface witnesses for either early exit.
             delta_dist = wp.dot(v, v - w_v)
+            # Compare the gap relative to squared distance; an absolute cutoff is too loose at small gaps.
+            # An empty simplex cannot supply surface witnesses, even when the center offset passes this test.
             if simplex_usage_mask != wp.uint32(0) and (delta_dist <= 0.0 or delta_dist < COLLIDE_EPSILON * dist_sq):
                 break
 

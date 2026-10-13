@@ -31,7 +31,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
-from newton.solvers import SolverKamino, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo, SolverVBD
 
 
 def _add_rigid_solver_arg(parser) -> None:
@@ -39,7 +39,7 @@ def _add_rigid_solver_arg(parser) -> None:
         "--rigid-solver",
         help="Rigid-body solver used by the coupled path.",
         type=str,
-        choices=["mujoco", "kamino"],
+        choices=["mujoco", "kamino", "featherpgs"],
         default="mujoco",
     )
 
@@ -73,6 +73,8 @@ def _rigid_solver_entry_args(
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
+    if rigid_solver == "featherpgs":
+        return "fpgs", SolverFeatherPGS, {"pgs_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 
@@ -147,8 +149,7 @@ class Example:
         )
         self.ball_joint = builder.joint_count - 1
         builder.add_shape_sphere(self.ball_body, radius=ball_radius)
-        SolverCoupledADMM.add_body_particle_attachment(
-            builder,
+        builder.add_attachment_body_particle(
             self.ball_body,
             self.center_particle,
             body_point=wp.vec3(0.0, 0.0, ball_radius),
@@ -213,7 +214,7 @@ class Example:
                 ),
                 SolverCoupled.Entry(
                     name="vbd",
-                    solver=lambda v: SolverVBD(model=v, iterations=8, rigid_compliant_alm=True),
+                    solver=lambda v: SolverVBD(model=v, iterations=8),
                     bodies=[self.payload_body],
                     joints=[self.payload_free_joint],
                     particles=list(range(self.model.particle_count)),
@@ -224,7 +225,8 @@ class Example:
                 rho=50,
                 gamma=0.1,
                 baumgarte=0.01,
-                joint_proximal_bodies=args.joint_proximal_bodies,
+                # FeatherPGS does not carry ADMM joint proxies; with them on, its result is unchanged.
+                joint_proximal_bodies=args.joint_proximal_bodies and self.rigid_solver != "featherpgs",
                 joint_proximal_destination_entries=(rigid_name,),
             ),
         )

@@ -487,7 +487,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
 def torque_sweep_source(dofs):
     """Return the coupled residual-budget angular solve inside each PGS sweep."""
     return f"""
-        if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
+        if (row_phase == 0) {{
             for (int spin = 0; spin < m_dense; ++spin) {{
                 if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
                 float radius = contact_torsion_radius;
@@ -533,6 +533,8 @@ def torque_sweep_source(dofs):
                         float t2 = s_lam_dense[n + 2] * scale;
                         float delta1 = t1 - s_lam_dense[n + 1];
                         float delta2 = t2 - s_lam_dense[n + 2];
+                        // Every lane has read the tangent pair before lane 0 rescales it.
+                        __syncwarp();
                         if (delta1 != 0.0f || delta2 != 0.0f) {{
                             iteration_changed = 1;
                             if (lane == 0) {{
@@ -565,6 +567,8 @@ def torque_sweep_source(dofs):
                 float trial = diagonal > 0.0f ? old - omega * residual / diagonal : 0.0f;
                 float next = fminf(fmaxf(trial, -bound), bound);
                 float delta = next - old;
+                // Every lane has read the torsion impulse before lane 0 overwrites it.
+                __syncwarp();
                 if (delta != 0.0f) {{
                     iteration_changed = 1;
                     if (lane == 0) s_lam_dense[spin] = next;

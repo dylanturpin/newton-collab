@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import unittest
 import warnings
 from collections import Counter
@@ -13,15 +14,14 @@ import warp.examples
 
 import newton
 from newton import GeoType
+from newton._src.core import capture_release
 from newton._src.geometry import create_mesh_terrain
-from newton._src.geometry.broad_phase_nxn import BroadPhaseAllPairs
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
     create_soft_contacts,
     mesh_sdf,
     resolve_mesh_sign_method,
 )
-from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.geometry.sdf_texture import TextureSDFData
 from newton._src.geometry.soft_contacts_sdf import (
     SDF_EDGE_ITERS,
@@ -259,6 +259,114 @@ class CollisionSetup:
 devices = get_cuda_test_devices(mode="basic")
 
 
+def _expert_mesh_box_model(device):
+    """Build an overlapping static mesh and dynamic box for expert collision tests."""
+    builder = newton.ModelBuilder()
+    mesh = newton.Mesh.create_box(
+        0.25, 0.25, 0.25, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+    )
+    builder.add_shape_mesh(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, 0.24), wp.quat_identity()), mesh=mesh)
+    body = builder.add_body()
+    builder.add_shape_box(body, xform=wp.transform(wp.vec3(0.0, 0.0, -0.25)), hx=2.0, hy=2.0, hz=0.25)
+    return builder.finalize(device=device)
+
+
+def _expert_collision_components(model, **kwargs):
+    """Build custom collision components with externally allocated AABB buffers."""
+    broad_phase = BroadPhaseAllPairs(model.shape_world, model.shape_flags, device=model.device)
+    narrow_phase = NarrowPhase(
+        max_candidate_pairs=64,
+        max_triangle_pairs=100000,
+        device=model.device,
+        shape_aabb_lower=wp.zeros(model.shape_count, dtype=wp.vec3, device=model.device),
+        shape_aabb_upper=wp.zeros(model.shape_count, dtype=wp.vec3, device=model.device),
+        contact_writer_warp_func=write_contact,
+        **kwargs,
+    )
+    return broad_phase, narrow_phase
+
+
+def test_expert_narrow_phase_default_voxel_resolution(test, device):
+    """Bind omitted voxel tables and generate mesh contacts eagerly and under CUDA graph capture."""
+    model = _expert_mesh_box_model(device)
+    state = model.state()
+    broad_phase, narrow_phase = _expert_collision_components(model)
+    test.assertIsNone(narrow_phase.shape_voxel_resolution)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024
+    )
+    # Fail before launching a kernel that would dereference the missing table.
+    test.assertIs(narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+
+    reference = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=1024)
+    reference_contacts = reference.contacts()
+    reference.collide(state, reference_contacts)
+    test.assertEqual(count, int(reference_contacts.rigid_contact_count.numpy()[0]))
+
+    if device.is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            pipeline.collide(state, contacts)
+        wp.capture_launch(capture.graph)
+        test.assertEqual(count, int(contacts.rigid_contact_count.numpy()[0]))
+
+
+def test_expert_narrow_phase_preserves_voxel_resolution(test, device):
+    """Preserve a valid caller-supplied voxel table while generating mesh contacts."""
+    model = _expert_mesh_box_model(device)
+    supplied = wp.clone(model._shape_voxel_resolution)
+    broad_phase, narrow_phase = _expert_collision_components(model, shape_voxel_resolution=supplied)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024
+    )
+    test.assertIs(narrow_phase.shape_voxel_resolution, supplied)
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+
+def test_expert_narrow_phase_rejects_voxel_resolution_length(test, device):
+    """Reject missing or excess entries in a caller-supplied voxel table."""
+    model = _expert_mesh_box_model(device)
+    for length in (0, model.shape_count - 1, model.shape_count + 1):
+        with test.subTest(length=length):
+            broad_phase, narrow_phase = _expert_collision_components(
+                model, shape_voxel_resolution=wp.zeros(length, dtype=wp.vec3i, device=device)
+            )
+            with test.assertRaisesRegex(ValueError, "shape_voxel_resolution.*one entry per model shape"):
+                newton.CollisionPipeline(
+                    model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024
+                )
+
+
+def test_expert_narrow_phase_rejects_voxel_resolution_device(test, device):
+    """Reject a voxel table allocated on a different device from the model."""
+    if not wp.is_cuda_available():
+        test.skipTest("Requires CPU and CUDA devices to test a device mismatch")
+    other_device = "cpu" if device.is_cuda else "cuda:0"
+    model = _expert_mesh_box_model(device)
+    broad_phase, narrow_phase = _expert_collision_components(
+        model, shape_voxel_resolution=wp.zeros(model.shape_count, dtype=wp.vec3i, device=other_device)
+    )
+    with test.assertRaisesRegex(ValueError, "shape_voxel_resolution.*model device"):
+        newton.CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024)
+
+
+def test_expert_narrow_phase_empty_voxel_resolution(test, device):
+    """Accept an empty voxel table for an empty model."""
+    model = newton.ModelBuilder().finalize(device=device)
+    broad_phase, narrow_phase = _expert_collision_components(model)
+    pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1)
+    test.assertIs(narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
+    test.assertEqual(narrow_phase.shape_voxel_resolution.shape[0], 0)
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+
 class TestCollisionPipeline(unittest.TestCase):
     def test_legacy_expert_components_ignore_unconfigured_extension_inputs(self):
         """Preserve the Newton 1.5 expert-component call contract by default."""
@@ -382,6 +490,80 @@ add_function_test(
     TestCollisionPipeline,
     "test_collision_pipeline_first_call_capture",
     test_collision_pipeline_first_call_capture,
+    devices=get_cuda_test_devices(mode="basic"),
+)
+
+
+def test_sdf_pipeline_garbage_collected_during_capture(test, device):
+    """A dropped SDF model and pipeline finalized inside another graph capture leave the capture valid."""
+    mesh = newton.Mesh.create_box(
+        0.5, 0.5, 0.5, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+    )
+    mesh.build_sdf(max_resolution=32, device=device)
+    builder = newton.ModelBuilder()
+    for x in (-1.0, 1.0):
+        builder.add_shape_mesh(builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.0))), mesh=mesh)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    pipeline.collide(model.state(), pipeline.contacts())
+    test.assertIsNotNone(pipeline._unit_scale_sdf_rescaled_host)
+    textures = [
+        texture
+        for texture in model._texture_sdf_coarse_textures + model._texture_sdf_subgrid_textures
+        if texture is not None
+    ]
+    texture_handles = {texture._tex_handle for texture in textures}
+    test.assertEqual(len(texture_handles), len(textures))
+    pinned_ptr = pipeline._unit_scale_sdf_rescaled_host.ptr
+    del textures
+
+    # Record the native releases of exactly these resources, and whether a capture was active at each.
+    native = wp._src.context.runtime.core
+    released = []
+
+    def recording(name):
+        original = getattr(native, name)
+
+        def release(*args):
+            handle = args[1] if name == "wp_texture_object_destroy_device" else args[0]
+            if handle in texture_handles or handle == pinned_ptr:
+                released.append((handle, wp.get_device(device).is_capturing))
+            return original(*args)
+
+        return mock.patch.object(native, name, release)
+
+    values = wp.zeros(1, dtype=wp.int32, device=device)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with recording("wp_texture_object_destroy_device"), recording("wp_free_pinned"):
+            # Only the cyclic collector can free the textures and pinned flag, and it runs inside the capture.
+            garbage = [mesh, model, pipeline]
+            garbage.append(garbage)
+            del mesh, builder, model, pipeline, garbage
+            with wp.ScopedCapture(device=device) as capture:
+                gc.collect()
+                test.assertGreater(len(capture_release._pending_releases), 0)
+                values.fill_(1)
+            test.assertEqual(released, [])
+
+            wp.capture_launch(capture.graph)
+            test.assertEqual(int(values.numpy()[0]), 1)
+            # The next collection outside a capture runs the deferred native releases, each once.
+            gc.collect()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    test.assertEqual(len(capture_release._pending_releases), 0)
+    test.assertEqual(sorted(handle for handle, _ in released), sorted([*texture_handles, pinned_ptr]))
+    test.assertFalse(any(capturing for _, capturing in released))
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_sdf_pipeline_garbage_collected_during_capture",
+    test_sdf_pipeline_garbage_collected_during_capture,
     devices=get_cuda_test_devices(mode="basic"),
 )
 
@@ -1378,6 +1560,70 @@ add_function_test(
 )
 
 
+def test_explicit_pairs_reach_shapes_without_shape_collision(test, device):
+    """Route explicit pairs whose shapes have shape collision disabled like enabled ones.
+
+    The explicit pair list is authoritative, so the narrow phase must build the stage each
+    listed pair needs. Flags are compared before ``collide()`` because launching a pair whose
+    stage was not built reads absent storage.
+    """
+    heightfield = newton.Heightfield(
+        data=np.zeros((3, 3), dtype=np.float32), nrow=3, ncol=3, hx=1.0, hy=1.0, min_z=0.0, max_z=0.0
+    )
+    capsule_xform = wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * wp.pi))
+
+    def build(scene, has_shape_collision):
+        cfg = newton.ModelBuilder.ShapeConfig(has_shape_collision=has_shape_collision)
+        builder = newton.ModelBuilder()
+        if scene == "heightfield_box":
+            first = builder.add_shape_heightfield(heightfield=heightfield, cfg=cfg)
+        elif scene == "mesh_box":
+            mesh = newton.Mesh.create_box(1.0, 1.0, 0.1)
+            first = builder.add_shape_mesh(-1, mesh=mesh, xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)), cfg=cfg)
+        elif scene == "plane_mesh":
+            first = builder.add_ground_plane()
+        else:
+            first = builder.add_shape_capsule(-1, radius=0.1, half_height=0.5, xform=capsule_xform, cfg=cfg)
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.09)))
+        if scene == "plane_mesh":
+            second = builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.1, 0.1, 0.1), cfg=cfg)
+        else:
+            second = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device=device)
+        pairs = wp.array([[first, second]], dtype=wp.vec2i, device=device)
+        return model, newton.CollisionPipeline(model, broad_phase="explicit", shape_pairs_filtered=pairs)
+
+    for scene in ("heightfield_box", "mesh_box", "plane_mesh", "capsule_box"):
+        with test.subTest(scene=scene):
+            control_stages = None
+            contact_counts = []
+            for has_shape_collision in (True, False):
+                model, pipeline = build(scene, has_shape_collision)
+                narrow_phase = pipeline.narrow_phase
+                stages = (
+                    narrow_phase.has_meshes,
+                    narrow_phase.has_heightfields,
+                    narrow_phase.max_mesh_mesh_pairs,
+                    narrow_phase.max_mesh_plane_pairs,
+                )
+                if control_stages is None:
+                    control_stages = stages
+                test.assertEqual(stages, control_stages, "stage setup differs from the colliding control")
+                contacts = pipeline.contacts()
+                pipeline.collide(model.state(), contacts)
+                contact_counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+            test.assertGreater(contact_counts[0], 0)
+            test.assertEqual(contact_counts[1], contact_counts[0])
+
+
+add_function_test(
+    TestCollisionPipelineFilterPairs,
+    "test_explicit_pairs_reach_shapes_without_shape_collision",
+    test_explicit_pairs_reach_shapes_without_shape_collision,
+    devices=get_test_devices(),
+)
+
+
 def test_collision_filter_consistent_across_broadphases(test, device):
     """Verify that all broad phase modes produce the same contact pairs when collision filtering is applied.
 
@@ -2317,6 +2563,49 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         self.assertEqual(_compute_per_world_mask_pair_max(model, same_mask), 7)
         self.assertEqual(_compute_per_world_mask_pair_max(model, first_mask, second_mask), 9)
 
+    def test_pair_bounds_match_segment_enumeration(self):
+        """Preserve sparse worlds, disabled shapes, globals and overlapping masks."""
+        worlds = np.array([-1, 7, 0, 7, 1000000, 0, -1, 9], dtype=np.int32)
+        colliding = np.array([True, True, True, False, True, False, True, False])
+        model = newton.Model()
+        model.shape_count = len(worlds)
+        model.shape_world = wp.array(worlds, dtype=wp.int32, device="cpu")
+        model.shape_flags = wp.array(
+            colliding.astype(np.int32) * int(ShapeFlags.COLLIDE_SHAPES), dtype=wp.int32, device="cpu"
+        )
+        segments = [np.flatnonzero(worlds == -1)]
+        for world in sorted(set(worlds[colliding]) - {-1}):
+            segments.append(np.flatnonzero((worlds == -1) | (worlds == world)))
+        expected = sum(
+            sum(colliding[i] and colliding[j] for k, i in enumerate(segment) for j in segment[k + 1 :])
+            for segment in segments
+        )
+        self.assertEqual(_compute_per_world_shape_pairs_max(model), expected)
+        masks = (colliding, np.arange(len(worlds)) % 2 == 0, np.ones(len(worlds), dtype=bool))
+        for first in masks:
+            for second in masks:
+                # Count directed category matches, removing self pairs and
+                # counting overlapping-category pairs only once.
+                pairs = set()
+                for segment_id, segment in enumerate(segments):
+                    for i in segment:
+                        for j in segment:
+                            if i != j and first[i] and second[j]:
+                                pairs.add((segment_id, min(i, j), max(i, j)))
+                self.assertEqual(_compute_per_world_mask_pair_max(model, first, second), len(pairs))
+
+    def test_pair_bounds_empty_global_and_large_segments(self):
+        """Handle empty and global-only scenes and counts larger than int32."""
+        for worlds in ([], [-1], [-1, -1, -1], [0] * 70000):
+            with self.subTest(shape_count=len(worlds)):
+                model = newton.Model()
+                model.shape_count = len(worlds)
+                model.shape_world = wp.array(worlds, dtype=wp.int32, device="cpu")
+                mask = np.ones(len(worlds), dtype=bool)
+                expected = len(worlds) * (len(worlds) - 1) // 2
+                self.assertEqual(_compute_per_world_shape_pairs_max(model), expected)
+                self.assertEqual(_compute_per_world_mask_pair_max(model, mask), expected)
+
     def test_generic_convex_work_estimate_counts_only_routed_pairs(self):
         """Count only world-compatible pairs routed to generic convex collision."""
         model = self._make_model(num_worlds=2, shapes_per_world=4)
@@ -2350,7 +2639,8 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         )
 
         self.assertTrue(has_generic_convex_pairs)
-        self.assertEqual(estimate, _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD)
+        self.assertEqual(estimate, 27_776)
+        self.assertGreaterEqual(estimate, _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD)
 
     def test_explicit_generic_convex_work_estimate_uses_routed_pairs(self):
         """Count exact generic convex routes for explicit broad phase pairs."""
@@ -2527,6 +2817,48 @@ class TestShapePairsMaxScaling(unittest.TestCase):
                 self.assertEqual(pipeline.narrow_phase.max_mesh_mesh_pairs, 0)
                 self.assertEqual(pipeline.narrow_phase.max_mesh_plane_pairs, 0)
                 self.assertEqual(pipeline.narrow_phase.has_generic_convex_pairs, geometry != "heightfield")
+
+    def test_stages_skip_shapes_outside_every_contact_pair(self):
+        """Skip mesh and heightfield stages for shapes that can never reach the narrow phase."""
+        heightfield = newton.Heightfield(
+            data=np.zeros((3, 3), dtype=np.float32), nrow=3, ncol=3, hx=1.0, hy=1.0, min_z=0.0, max_z=0.0
+        )
+        cases = (
+            # A colliding mesh filtered against the only shape it could touch is in no contact pair.
+            ("filtered_mesh", "explicit"),
+            # A heightfield without shape collision is in no contact pair in any broad phase.
+            ("visual_heightfield", "explicit"),
+            ("visual_heightfield", "nxn"),
+            ("visual_heightfield", "sap"),
+        )
+        for scene, broad_phase in cases:
+            with self.subTest(scene=scene, broad_phase=broad_phase):
+                builder = newton.ModelBuilder()
+                builder.add_ground_plane()
+                box_body = builder.add_body(xform=wp.transform(wp.vec3(3.0, 0.0, 0.09)))
+                builder.add_shape_box(box_body, hx=0.1, hy=0.1, hz=0.1)
+                if scene == "filtered_mesh":
+                    mesh_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0)))
+                    mesh = builder.add_shape_mesh(mesh_body, mesh=newton.Mesh.create_box(0.5, 0.5, 0.5))
+                    builder.add_shape_collision_filter_pair(mesh, 0)
+                    builder.add_shape_collision_filter_pair(mesh, 1)
+                else:
+                    builder.add_shape_heightfield(
+                        heightfield=heightfield, cfg=newton.ModelBuilder.ShapeConfig(has_shape_collision=False)
+                    )
+                model = builder.finalize(device="cpu")
+                self.assertEqual(model.shape_contact_pair_count, 1)
+
+                pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
+                narrow_phase = pipeline.narrow_phase
+                self.assertFalse(narrow_phase.has_meshes)
+                self.assertFalse(narrow_phase.has_heightfields)
+                self.assertIsNone(narrow_phase.mesh_triangle_contacts_kernel)
+                self.assertIsNone(narrow_phase.triangle_pairs)
+
+                contacts = pipeline.contacts()
+                pipeline.collide(model.state(), contacts)
+                self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
     def test_absent_texture_sdfs_skip_shape_iteration(self):
         """Skip per-shape texture classification when no texture SDF storage exists."""
@@ -3883,6 +4215,219 @@ def test_cylinder_scale_update_keeps_generic_stage(test, device):
     test.assertEqual(reused_count, int(rebuilt_contacts.rigid_contact_count.numpy()[0]))
 
 
+def _build_meshes_on_terrain(device, terrain, mesh, scales):
+    """Build a heightfield or mesh slab with one rotated mesh body per scale."""
+    n = 17
+    xs = np.linspace(-1.0, 1.0, n)
+    elevation = (0.5 + 0.5 * np.sin(3.0 * xs)[None, :] * np.cos(2.0 * xs)[:, None]).astype(np.float32)
+    rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.2, 1.0)), 0.4)
+    builder = newton.ModelBuilder()
+    if terrain == "heightfield":
+        builder.add_shape_heightfield(
+            heightfield=newton.Heightfield(data=elevation, nrow=n, ncol=n, hx=1.0, hy=1.0, min_z=0.0, max_z=0.04)
+        )
+    else:
+        slab = newton.Mesh.create_box(1.0, 1.0, 0.05, compute_inertia=False)
+        builder.add_shape_mesh(body=-1, mesh=slab, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
+    for i, scale in enumerate(scales):
+        body = builder.add_body(xform=wp.transform((-0.4 + 0.5 * i, 0.1 * i, 0.07), rotation))
+        builder.add_shape_mesh(body=body, mesh=mesh, scale=scale)
+    return builder.finalize(device=device)
+
+
+def _assign_rebuilt_shape_scale(model, rebuilt):
+    for name in ("shape_scale", "shape_collision_radius", "shape_collision_aabb_lower", "shape_collision_aabb_upper"):
+        getattr(model, name).assign(getattr(rebuilt, name))
+
+
+def _sorted_contact_points(contacts):
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    points = np.concatenate(
+        (contacts.rigid_contact_point0.numpy()[:count], contacts.rigid_contact_point1.numpy()[:count]), axis=1
+    )
+    return points[np.lexsort(points.T[::-1])]
+
+
+_INITIAL_MESH_SCALES = ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0))
+_UPDATED_MESH_SCALES = ((2.0, 1.6, 1.8), (1.8, 2.0, 2.0))
+
+
+def test_mesh_scale_update_matches_rebuild(test, device):
+    """Match a rebuilt model's contacts after changing a mesh's shape_scale on non-planar terrain."""
+    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    cube_with_sdf = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    if device.is_cuda:
+        cube_with_sdf.build_sdf(max_resolution=32, device=device)
+
+    def collide(model, pipeline):
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        return _sorted_contact_points(contacts)
+
+    meshes = {"no_sdf": cube, "texture_sdf": cube_with_sdf} if device.is_cuda else {"no_sdf": cube}
+    for terrain in ("heightfield", "mesh"):
+        for mesh_name, mesh in meshes.items():
+            with test.subTest(terrain=terrain, mesh=mesh_name):
+                model = _build_meshes_on_terrain(device, terrain, mesh, _INITIAL_MESH_SCALES)
+                pipeline = newton.CollisionPipeline(model, deterministic=True, dynamic_shape_scale=True)
+                rebuilt = _build_meshes_on_terrain(device, terrain, mesh, _UPDATED_MESH_SCALES)
+                _assign_rebuilt_shape_scale(model, rebuilt)
+
+                points = collide(model, pipeline)
+                expected = collide(rebuilt, newton.CollisionPipeline(rebuilt, deterministic=True))
+                test.assertGreater(len(expected), 0)
+                test.assertEqual(len(points), len(expected))
+                np.testing.assert_allclose(points, expected, atol=1.0e-5)
+
+
+def test_dynamic_shape_scale_selects_sdf_scale_path(test, device):
+    """Specialize unit-scale texture SDFs unless dynamic_shape_scale is set; baked SDFs always qualify."""
+    runtime_cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    runtime_cube.build_sdf(max_resolution=32, device=device)
+    baked_cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    baked_cube.build_sdf(max_resolution=32, device=device, scale=(1.0, 1.0, 1.0))
+    for mesh_name, mesh, dynamic, expected_identity, expected_checked in (
+        ("runtime", runtime_cube, False, True, True),
+        ("runtime", runtime_cube, True, False, False),
+        ("baked", baked_cube, False, True, False),
+        ("baked", baked_cube, True, True, False),
+    ):
+        with test.subTest(mesh=mesh_name, dynamic_shape_scale=dynamic):
+            model = _build_meshes_on_terrain(device, "heightfield", mesh, _INITIAL_MESH_SCALES)
+            pipeline = newton.CollisionPipeline(model, dynamic_shape_scale=dynamic)
+            test.assertTrue(pipeline.narrow_phase.mesh_sdf_texture_only)
+            test.assertEqual(pipeline.narrow_phase.mesh_sdf_identity_scale_only, expected_identity)
+            test.assertEqual(pipeline._shape_unit_scale_sdf.shape[0] > 0, expected_checked)
+
+
+def test_unit_scale_sdf_rescale_raises(test, device):
+    """Raise on a later eager collide() after rescaling a unit-scale texture SDF, in eager and replayed graphs."""
+    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    cube.build_sdf(max_resolution=32, device=device)
+    rebuilt = _build_meshes_on_terrain(device, "heightfield", cube, _UPDATED_MESH_SCALES)
+    for use_graph in (False, True):
+        with test.subTest(use_graph=use_graph):
+            model = _build_meshes_on_terrain(device, "heightfield", cube, _INITIAL_MESH_SCALES)
+            pipeline = newton.CollisionPipeline(model)
+            test.assertTrue(pipeline.narrow_phase.mesh_sdf_identity_scale_only)
+            contacts = pipeline.contacts()
+            state = model.state()
+            pipeline.collide(state, contacts)
+            if use_graph:
+                with wp.ScopedCapture(device=device) as capture:
+                    pipeline.collide(state, contacts)
+                wp.capture_launch(capture.graph)
+            pipeline.collide(state, contacts)
+            wp.synchronize_device(device)
+            pipeline.collide(state, contacts)
+            test.assertEqual(int(pipeline._unit_scale_sdf_rescaled.numpy()[0]), 0)
+
+            _assign_rebuilt_shape_scale(model, rebuilt)
+            if use_graph:
+                wp.capture_launch(capture.graph)
+                wp.capture_launch(capture.graph)
+            else:
+                pipeline.collide(state, contacts)
+            wp.synchronize()
+            test.assertEqual(int(pipeline._unit_scale_sdf_rescaled.numpy()[0]), 1)
+            # The host reads a copy queued by an earlier eager call, so the raise may need one more call.
+            try:
+                pipeline.collide(state, contacts)
+            except RuntimeError as error:
+                test.assertIn("dynamic_shape_scale=True", str(error))
+            else:
+                wp.synchronize()
+                with test.assertRaisesRegex(RuntimeError, "dynamic_shape_scale=True"):
+                    pipeline.collide(state, contacts)
+            with test.assertRaisesRegex(RuntimeError, "dynamic_shape_scale=True"):
+                pipeline.collide(state, contacts)
+
+
+def test_dynamic_shape_scale_graph_replay_matches_rebuild(test, device):
+    """Replay a graph captured before a texture-SDF rescale and match a rebuilt model's contacts."""
+    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    cube.build_sdf(max_resolution=32, device=device)
+    model = _build_meshes_on_terrain(device, "heightfield", cube, _INITIAL_MESH_SCALES)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, dynamic_shape_scale=True)
+    contacts = pipeline.contacts()
+    state = model.state()
+    pipeline.collide(state, contacts)
+    with wp.ScopedCapture(device=device) as capture:
+        pipeline.collide(state, contacts)
+    wp.capture_launch(capture.graph)
+    initial_points = _sorted_contact_points(contacts)
+
+    rebuilt = _build_meshes_on_terrain(device, "heightfield", cube, _UPDATED_MESH_SCALES)
+    _assign_rebuilt_shape_scale(model, rebuilt)
+    wp.capture_launch(capture.graph)
+    rebuilt_pipeline = newton.CollisionPipeline(rebuilt, deterministic=True)
+    expected = rebuilt_pipeline.contacts()
+    rebuilt_pipeline.collide(rebuilt.state(), expected)
+    points = _sorted_contact_points(contacts)
+    expected_points = _sorted_contact_points(expected)
+    test.assertGreater(len(expected_points), 0)
+    test.assertEqual(len(points), len(expected_points))
+    np.testing.assert_allclose(points, expected_points, atol=1.0e-5)
+    test.assertFalse(np.array_equal(points, initial_points))
+
+
+def test_packed_mesh_edges_use_mesh_coordinates(test, device):
+    """Read caller-packed edges in unscaled mesh coordinates, matching edges read from the mesh."""
+    scale = np.array((2.0, 1.6, 1.8), dtype=np.float32)
+    n = 17
+    xs = np.linspace(-1.0, 1.0, n)
+    elevation = (0.5 + 0.5 * np.sin(3.0 * xs)[None, :] * np.cos(2.0 * xs)[:, None]).astype(np.float32)
+    rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.2, 1.0)), 0.4)
+    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
+    builder = newton.ModelBuilder()
+    builder.add_shape_heightfield(
+        heightfield=newton.Heightfield(data=elevation, nrow=n, ncol=n, hx=1.0, hy=1.0, min_z=0.0, max_z=0.04)
+    )
+    for i in range(2):
+        body = builder.add_body(xform=wp.transform((-0.4 + 0.5 * i, 0.1 * i, 0.07), rotation))
+        builder.add_shape_mesh(body=body, mesh=cube, scale=tuple(float(value) for value in scale))
+    model = builder.finalize(device=device)
+
+    # Ownership code zero allows both endpoints, as edges read from the mesh do.
+    edges = model.mesh_edge_indices.numpy()
+    vertices = np.asarray(cube.vertices, dtype=np.float32)
+    edge_v0, edge_v1 = vertices[edges[:, 0]], vertices[edges[:, 1]]
+    halves = (edge_v1 - edge_v0) * 0.5
+    radii = np.linalg.norm(halves, axis=1, keepdims=True)
+    centers = np.concatenate(((edge_v0 + edge_v1) * 0.5, radii), axis=1)
+    halves = np.concatenate((halves, np.zeros_like(radii)), axis=1)
+    np.testing.assert_allclose(model.mesh_edge_centers.numpy(), centers, rtol=1e-6)
+    np.testing.assert_allclose(model.mesh_edge_halves.numpy()[:, :3], halves[:, :3], rtol=1e-6)
+
+    class PackedEdgeNarrowPhase(NarrowPhase):
+        def __init__(self, wrapped, edge_centers, edge_halves):
+            self.__dict__ = wrapped.__dict__
+            self.edge_centers = edge_centers
+            self.edge_halves = edge_halves
+
+        def launch_custom_write(self, **kwargs):
+            kwargs["mesh_edge_centers"] = self.edge_centers
+            kwargs["mesh_edge_halves"] = self.edge_halves
+            return super().launch_custom_write(**kwargs)
+
+    def collide(edge_centers, edge_halves):
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        pipeline.narrow_phase = PackedEdgeNarrowPhase(pipeline.narrow_phase, edge_centers, edge_halves)
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        points = np.concatenate(
+            (contacts.rigid_contact_point0.numpy()[:count], contacts.rigid_contact_point1.numpy()[:count]), axis=1
+        )
+        return points[np.lexsort(points.T[::-1])]
+
+    expected = collide(None, None)
+    points = collide(wp.array(centers, dtype=wp.vec4, device=device), wp.array(halves, dtype=wp.vec4, device=device))
+    test.assertGreater(len(expected), 0)
+    test.assertEqual(len(points), len(expected))
+    np.testing.assert_allclose(points, expected, atol=1.0e-5)
+
+
 add_function_test(
     TestDeterministicPipeline,
     "test_separated_analytic_pair_skips_gjk_queue",
@@ -3893,6 +4438,37 @@ add_function_test(
     TestDeterministicPipeline,
     "test_cylinder_scale_update_keeps_generic_stage",
     test_cylinder_scale_update_keeps_generic_stage,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestDeterministicPipeline,
+    "test_mesh_scale_update_matches_rebuild",
+    test_mesh_scale_update_matches_rebuild,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestDeterministicPipeline,
+    "test_dynamic_shape_scale_selects_sdf_scale_path",
+    test_dynamic_shape_scale_selects_sdf_scale_path,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestDeterministicPipeline,
+    "test_unit_scale_sdf_rescale_raises",
+    test_unit_scale_sdf_rescale_raises,
+    devices=get_cuda_test_devices(),
+    check_output=False,
+)
+add_function_test(
+    TestDeterministicPipeline,
+    "test_dynamic_shape_scale_graph_replay_matches_rebuild",
+    test_dynamic_shape_scale_graph_replay_matches_rebuild,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestDeterministicPipeline,
+    "test_packed_mesh_edges_use_mesh_coordinates",
+    test_packed_mesh_edges_use_mesh_coordinates,
     devices=get_test_devices(),
 )
 add_function_test(
@@ -5778,62 +6354,14 @@ add_function_test(
 )
 
 
-def _expert_mesh_box_model(device):
-    """Static mesh cube overlapping a box on a body, for expert-component construction."""
-    builder = newton.ModelBuilder()
-    mesh = newton.Mesh.create_box(
-        0.25, 0.25, 0.25, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
-    )
-    builder.add_shape_mesh(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, 0.24), wp.quat_identity()), mesh=mesh)
-    body = builder.add_body(xform=wp.transform_identity())
-    builder.add_shape_box(
-        body, xform=wp.transform(wp.vec3(0.0, 0.0, -0.25), wp.quat_identity()), hx=2.0, hy=2.0, hz=0.25
-    )
-    return builder.finalize(device=device)
-
-
-def test_expert_narrow_phase_voxel_resolution(test, device):
-    """The pipeline binds the model's voxel-resolution table to a hand-built narrow phase.
-
-    The mesh contact kernels index that table per shape, so an expert narrow phase built
-    without one previously faulted inside them. A supplied table must match the model.
-    """
-    model = _expert_mesh_box_model(device)
-    state = model.state()
-    broad_phase = BroadPhaseAllPairs(model.shape_world, model.shape_flags, device=device)
-
-    def make_narrow_phase(**kwargs):
-        return NarrowPhase(
-            max_candidate_pairs=64,
-            max_triangle_pairs=100000,
-            device=device,
-            shape_aabb_lower=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
-            shape_aabb_upper=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
-            contact_writer_warp_func=write_contact,
-            **kwargs,
-        )
-
-    narrow_phase = make_narrow_phase()
-    test.assertIsNone(narrow_phase.shape_voxel_resolution)
-    pipeline = CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024)
-    test.assertIs(pipeline.narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
-    contacts = pipeline.contacts()
-    pipeline.collide(state, contacts)
-    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-
-    wrong_length = make_narrow_phase(
-        shape_voxel_resolution=wp.zeros(model.shape_count + 1, dtype=wp.vec3i, device=device)
-    )
-    with test.assertRaisesRegex(ValueError, "shape_voxel_resolution"):
-        CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=wrong_length, rigid_contact_max=1024)
-
-
-add_function_test(
-    TestCollisionPipeline,
-    "test_expert_narrow_phase_voxel_resolution",
-    test_expert_narrow_phase_voxel_resolution,
-    devices=get_test_devices(),
-)
+for _expert_test in (
+    test_expert_narrow_phase_default_voxel_resolution,
+    test_expert_narrow_phase_preserves_voxel_resolution,
+    test_expert_narrow_phase_rejects_voxel_resolution_length,
+    test_expert_narrow_phase_rejects_voxel_resolution_device,
+    test_expert_narrow_phase_empty_voxel_resolution,
+):
+    add_function_test(TestCollisionPipeline, _expert_test.__name__, _expert_test, devices=get_test_devices())
 
 
 if __name__ == "__main__":

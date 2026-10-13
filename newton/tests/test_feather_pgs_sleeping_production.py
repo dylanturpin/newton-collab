@@ -125,7 +125,9 @@ class TestSleepingProductionProfile(unittest.TestCase):
         trajectories, flood_pairs = [], []
         for carry in (False, True):
             model, pipeline, solver, states, control = _articulations(self, tiles=tiles)
-            solver.sleeping.carry_frozen_patches = carry
+            if not carry:
+                solver.sleeping = _SleepReference(solver.sleeping, rebuild_patches=True)
+            self.assertEqual(solver.sleeping.patch_frozen_bodies is not None, carry)
             contacts = pipeline.contacts()
             frozen = 0
             trajectory = []
@@ -141,7 +143,14 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 frozen += int(solver.sleeping.frozen_bodies.numpy().sum())
                 if step == 399:
                     flood_pairs.append(int(solver._friction_patches._flood_pair_count.numpy()[0]))
-                trajectory.append(np.concatenate((states[0].body_q.numpy().ravel(), states[0].body_qd.numpy().ravel())))
+                trajectory.append(
+                    np.concatenate(
+                        [
+                            getattr(states[0], field).numpy().ravel()
+                            for field in ("body_q", "body_qd", "joint_q", "joint_qd")
+                        ]
+                    )
+                )
             self.assertGreater(frozen, 0)
             np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [0, 0])
             trajectories.append(np.array(trajectory))
@@ -285,6 +294,37 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 awake = solver.sleeping.art_awake.numpy()
                 self.assertEqual(int(awake[solver.body_to_articulation.numpy()[base]]), 1)
                 self.assertEqual(int(awake[solver.body_to_articulation.numpy()[box]]), 0)
+
+
+class _SleepReference:
+    """Compute discarded sleeping dynamics or rebuild frozen patches entirely within tests."""
+
+    def __init__(self, sleeping, *, compute_dynamics=False, rebuild_patches=False):
+        self._sleeping = sleeping
+        self._compute_dynamics = compute_dynamics
+        self._rebuild_patches = rebuild_patches
+
+    def __getattr__(self, name):
+        return getattr(self._sleeping, name)
+
+    @property
+    def patch_frozen_bodies(self):
+        return None if self._rebuild_patches else self._sleeping.patch_frozen_bodies
+
+    def begin(self, state, control, contacts):
+        self._sleeping.begin(state, control, contacts)
+        if self._compute_dynamics:
+            solver = self._sleeping.solver
+            # These device operations are captured too, so every graph replay recomputes the reference.
+            for name in (
+                "_dynamics_art_active",
+                "_dynamics_art_mask",
+                "_dynamics_dof_active",
+                "_dynamics_joint_active",
+                "_dynamics_body_active",
+            ):
+                getattr(solver, name).fill_(1)
+            solver._fk_id_cache_valid.zero_()
 
 
 def _articulations(test, tiles=False):

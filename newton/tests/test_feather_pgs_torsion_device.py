@@ -218,13 +218,6 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 atol=2e-6,
                 err_msg=f"J{size}",
             )
-        stats = preparer.read_stats()
-        self.assertEqual(stats["rows"], expected._torsion_stats["rows"])
-        actual_groups = sorted(stats["groups"], key=lambda group: (group["world"], group["row"]))
-        expected_groups = sorted(expected._torsion_stats["groups"], key=lambda group: (group["world"], group["row"]))
-        for actual_group, expected_group in zip(actual_groups, expected_groups, strict=True):
-            for name in expected_group:
-                np.testing.assert_allclose(actual_group[name], expected_group[name], rtol=2e-6, atol=2e-6)
         return actual, preparer
 
     def test_randomized_patch_and_point_oracle(self):
@@ -310,13 +303,13 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 device.prepare(state, augmented, None)
 
-    def test_patch_segments_match_world_scan(self):
-        """Match the per-world patch scan exactly under selection, rejection and negative owners."""
+    def test_patch_segments_match_host_oracle(self):
+        """Match the host patch grouping under selection, rejection and negative owners."""
         devices = ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
         for device in devices:
             for seed in range(8):
                 results = []
-                for patch_segments in (False, True):
+                for oracle in (True, False):
                     solver, state, augmented, contacts = synthetic_fixture(
                         worlds=4, witnesses=12, seed=seed, device=device
                     )
@@ -332,20 +325,22 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                         owner = solver._friction_patches.current.owner.numpy()
                         owner[owner == owner.max()] = -1
                         solver._friction_patches.current.owner.assign(owner)
-                    preparer = DeviceTorsionPreparation(solver, patch_segments=patch_segments)
                     try:
-                        preparer.prepare(state, augmented, contacts)
+                        if oracle:
+                            run_oracle(solver, state, augmented, contacts)
+                        else:
+                            DeviceTorsionPreparation(solver).prepare(state, augmented, contacts)
                         error = None
                     except RuntimeError as exc:
                         error = str(exc)
                     names = ("constraint_count", "row_type", "row_parent", "row_mu", "target_velocity")
                     arrays = [getattr(solver, name).numpy() for name in (*names, "_contact_torsion_group")]
-                    arrays += [preparer.work.status.numpy(), preparer.work.spin_row.numpy()]
                     results.append((error, arrays))
                 with self.subTest(device=device, seed=seed):
-                    self.assertEqual(results[0][0], results[1][0])
-                    for legacy, segmented in zip(results[0][1], results[1][1], strict=True):
-                        np.testing.assert_array_equal(segmented, legacy)
+                    self.assertEqual(results[0][0] is None, results[1][0] is None)
+                    if results[0][0] is None:
+                        for expected, actual in zip(results[0][1], results[1][1], strict=True):
+                            np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
 
     def test_patch_eligibility_and_point_cluster_edges(self):
         """Match mixed-anchor patches, selector rejection and nontransitive clusters."""

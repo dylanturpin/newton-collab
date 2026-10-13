@@ -12,6 +12,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ..core.capture_release import make_pinned_release_capture_safe
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from ..geometry.broad_phase_sap import BroadPhaseSAP
@@ -339,9 +340,12 @@ def eval_rigid_contact_surface_velocities(
 
 @wp.kernel(enable_backward=False)
 def _record_reduction_overflow(
-    insert_failures: wp.array[int], buffer_overflows: wp.array[int], overflow: wp.array[int]
+    insert_failures: wp.array[wp.int32],
+    buffer_overflows: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
 ):
-    overflow[0] = int(insert_failures[0] > 0 or buffer_overflows[0] > 0)
+    """Copy the reducer's loss counters into the contact stream's overflow flag."""
+    overflow[0] = wp.where(insert_failures[0] > 0 or buffer_overflows[0] > 0, 1, 0)
 
 
 @wp.kernel(enable_backward=False)
@@ -362,11 +366,14 @@ def compute_shape_aabbs(
     contact_generation: wp.array[wp.int32],
     broad_phase_pair_count: wp.array[wp.int32],
     num_contact_counters: int,
+    # Per-shape nonzero when its texture SDF is queried at unit scale; empty when no shape is.
+    shape_unit_scale_sdf: wp.array[wp.int32],
     # outputs
     aabb_lower: wp.array[wp.vec3],
     aabb_upper: wp.array[wp.vec3],
     geom_data: wp.array[wp.vec4],
     geom_xform: wp.array[wp.transform],
+    unit_scale_sdf_rescaled: wp.array[wp.int32],
 ):
     """Compute AABBs, narrow-phase geometry data, and zero collision counters.
 
@@ -408,6 +415,14 @@ def compute_shape_aabbs(
 
     # Check if this is an infinite plane or a shape with a pre-computed local AABB
     scale = shape_scale[shape_id]
+    if shape_unit_scale_sdf.shape[0] > 0:
+        if shape_unit_scale_sdf[shape_id] != 0 and (scale[0] != 1.0 or scale[1] != 1.0 or scale[2] != 1.0):
+            if wp.atomic_max(unit_scale_sdf_rescaled, 0, 1) == 0:
+                wp.printf(
+                    "Warning: shape_scale of shape %d changed, but its texture SDF is queried at unit scale. "
+                    "Construct CollisionPipeline with dynamic_shape_scale=True, which is slower.\n",
+                    shape_id,
+                )
     is_infinite_plane = (geo_type == GeoType.PLANE) and (scale[0] == 0.0 and scale[1] == 0.0)
     has_local_aabb = geo_type == GeoType.MESH or geo_type == GeoType.HFIELD or geo_type == GeoType.CONVEX_MESH
 
@@ -979,11 +994,11 @@ def _compute_per_world_shape_pairs_max(model: Model) -> int:
         colliding = np.ones(len(sw), dtype=bool)
 
     global_count = int(np.count_nonzero((sw == -1) & colliding))
-    world_ids = np.unique(sw[(sw >= 0) & colliding])
+    _, world_counts = np.unique(sw[(sw >= 0) & colliding], return_counts=True)
 
     total = 0
-    for wid in world_ids:
-        n = int(np.count_nonzero((sw == wid) & colliding)) + global_count
+    for count in world_counts:
+        n = int(count) + global_count
         total += (n * (n - 1)) // 2
 
     # Dedicated global-vs-global segment (appended by precompute_world_map).
@@ -1008,20 +1023,21 @@ def _compute_per_world_mask_pair_max(
 
     sw = shape_world.numpy()
     colliding = _shape_collide_mask(model, len(sw))
-    global_shapes = sw == -1
-    world_ids = np.unique(sw[(sw >= 0) & colliding])
+    # Group once instead of scanning all shapes for every world's segment.
+    # Compact indices also avoid allocating by the largest (possibly sparse) world ID.
+    world_ids, inverse = np.unique(sw, return_inverse=True)
+    active = (world_ids >= 0) & (np.bincount(inverse[colliding], minlength=len(world_ids)) > 0)
 
-    def count_pairs(segment: np.ndarray) -> int:
-        first_count = int(np.count_nonzero(segment & first_mask))
-        second_count = int(np.count_nonzero(segment & second_mask))
-        overlap = int(np.count_nonzero(segment & first_mask & second_mask))
-        return first_count * second_count - overlap * (overlap + 1) // 2
+    def segment_counts(mask: np.ndarray) -> np.ndarray:
+        counts = np.bincount(inverse[mask], minlength=len(world_ids)).astype(np.int64, copy=False)
+        global_count = counts[world_ids == -1].sum()
+        return np.append(counts[active] + global_count, global_count)
 
-    total = 0
-    for world_id in world_ids:
-        total += count_pairs(global_shapes | (sw == world_id))
-    total += count_pairs(global_shapes)
-    return max(0, total)
+    first_counts = segment_counts(first_mask)
+    second_counts = segment_counts(second_mask)
+    overlaps = segment_counts(first_mask & second_mask)
+    pairs = first_counts * second_counts - overlaps * (overlaps + 1) // 2
+    return max(0, int(pairs.sum()))
 
 
 def _resolve_shape_pairs_max(model: Model, override: int | None) -> int:
@@ -1046,8 +1062,11 @@ def _resolve_shape_pairs_max(model: Model, override: int | None) -> int:
 
 
 BROAD_PHASE_MODES = ("nxn", "sap", "explicit")
-_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD = 27_776
-_SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD = 65_536
+# The fused kernel inlines overlap refinement for every pair, while split
+# kernels refine on a concurrent stream. Splitting pays off once the extra
+# launches amortize: from about 4k lean or 8k full-support pairs.
+_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD = 4_096
+_SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD = 8_192
 
 
 def _compute_generic_convex_pair_stats(
@@ -1061,8 +1080,7 @@ def _compute_generic_convex_pair_stats(
     """Determine whether generic convex pairs exist and estimate their work.
 
     ``shape_pairs_host`` is an optional ``(N, 2)`` host copy of
-    ``shape_pairs_filtered`` that callers already read, avoiding another
-    device-to-host transfer.
+    ``shape_pairs_filtered`` that spares another device-to-host read.
     """
     shape_types_array = getattr(model, "shape_type", None)
     if shape_types_array is None:
@@ -1541,6 +1559,7 @@ class CollisionPipeline:
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_contact_gap_max: float | None = None,
+        dynamic_shape_scale: bool = False,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1565,7 +1584,7 @@ class CollisionPipeline:
             rigid_contact_max: Maximum number of rigid contacts to allocate.
                 Resolution order:
                 - If provided, use this value.
-                - Else if ``model.rigid_contact_max > 0``, use the model value.
+                - Else if ``model.rigid_contact_max is not None``, use the model value (including zero).
                 - Else estimate automatically from model shape and pair metadata.
                 The automatic estimate is a conservative heuristic that generally
                 grows linearly with replicated worlds, but it is not a guaranteed
@@ -1626,6 +1645,8 @@ class CollisionPipeline:
                 ``pipeline.reduce_contacts`` and
                 ``pipeline.contact_reduction_config.mesh`` retain the requested
                 policy for backwards-compatible inspection.
+                If its voxel-resolution table is omitted, use the model's table.
+                A supplied table must match the model's shape count and device.
             shape_pairs_filtered: Precomputed shape pairs for EXPLICIT mode.
                 When broad_phase is "explicit", uses model.shape_contact_pairs if not provided. For
                 "nxn"/"sap" modes, ignored. The pair count and shape-type routing are used to size
@@ -1666,9 +1687,11 @@ class CollisionPipeline:
                     The ``"sticky"`` mode may change without prior notice.
             contact_matching_pos_threshold: World-space distance threshold [m]
                 between the previous and current contact midpoints
-                ``0.5 * (world(point0) + world(point1))``. Contacts whose
-                midpoint moves more than this are considered broken. Defaults
-                to ``0.0005``.
+                ``0.5 * (world(point0) + world(point1))``.  Contacts whose
+                midpoint moves more than this are considered broken. In sticky mode,
+                keep fresh geometry when either saved witness moves farther than this
+                from its fresh contact point under the current body transforms.
+                Defaults to ``0.0005``.
             contact_matching_normal_dot_threshold: Minimum dot product between
                 old and new contact normals for a match.
             contact_report: Allocate ``rigid_contact_new_indices`` /
@@ -1690,6 +1713,13 @@ class CollisionPipeline:
                 ``0.0`` enables them without enlarging authored gaps. Defaults to
                 ``None``. See
                 :ref:`Speculative contacts <speculative-contacts>`.
+            dynamic_shape_scale: Query texture SDFs built without a baked scale with the current
+                :attr:`Model.shape_scale <newton.Model.shape_scale>` on every call, which is slower.
+                Enable this when such a shape's scale changes after construction. When ``False`` and
+                every such shape has unit scale at construction, these queries are compiled for unit
+                scale; rescaling one of these shapes afterwards makes the device print a warning once
+                and a later :meth:`collide` call outside graph capture raise :class:`RuntimeError`.
+                Ignored when ``narrow_phase`` is provided. Defaults to ``False``.
 
         .. experimental::
 
@@ -1759,9 +1789,9 @@ class CollisionPipeline:
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
-        model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
         if rigid_contact_max is None:
-            if model_rigid_contact_max > 0:
+            model_rigid_contact_max = model.rigid_contact_max
+            if model_rigid_contact_max is not None:
                 rigid_contact_max = model_rigid_contact_max
             else:
                 rigid_contact_estimate = _estimate_rigid_contact_details(model)
@@ -1785,9 +1815,6 @@ class CollisionPipeline:
 
         if max_triangle_pairs <= 0:
             raise ValueError("max_triangle_pairs must be > 0")
-        # Keep model-level default in sync with the resolved pipeline capacity.
-        # This avoids divergence between model- and contacts-based users (e.g. VBD init).
-        model.rigid_contact_max = rigid_contact_max
         if requires_grad is None:
             requires_grad = model.requires_grad
 
@@ -1811,6 +1838,7 @@ class CollisionPipeline:
         self._speculative_enabled = speculative_contact_gap_max is not None
         contact_writer = write_contact_speculative if self._speculative_enabled else write_contact
 
+        unit_scale_sdf_shapes = None
         if using_expert_components:
             if broad_phase_instance is None or narrow_phase is None:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
@@ -1929,7 +1957,7 @@ class CollisionPipeline:
             # Keep mesh and heightfield flags independent: heightfield-only scenes
             # should not trigger mesh-only kernel setup/launches.
             has_meshes = False
-            has_heightfields = False
+            has_heightfields = model.heightfield_count > 0
             use_lean_gjk_mpr = False
             mesh_sdf_texture_only = False
             mesh_sdf_identity_scale_only = False
@@ -1939,35 +1967,24 @@ class CollisionPipeline:
             explicit_pairs_host = None
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
-                # Gate the mesh/heightfield narrow-phase stages pair-aware:
-                # only shapes that can appear in a contact pair count. With
-                # the explicit broad phase that is the filtered pair list;
-                # with NXN/SAP the broad phase only emits pairs for shapes
-                # with COLLIDE_SHAPES set. Visual-only meshes therefore no
-                # longer construct or launch the mesh-SDF subpipeline.
-                colliding_mask = _shape_collide_mask(model, len(shape_types))
-                pair_mask = colliding_mask
-                if self.shape_pairs_filtered is not None:
-                    pairs = self.shape_pairs_filtered
-                    pairs_np = pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)
-                    explicit_pairs_host = pairs_np.reshape(-1, 2)
-                    pair_idx = np.unique(pairs_np.reshape(-1).astype(np.int64))
-                    pair_idx = pair_idx[(pair_idx >= 0) & (pair_idx < len(shape_types))]
-                    pair_mask = np.zeros(len(shape_types), dtype=bool)
-                    pair_mask[pair_idx] = True
-                pair_shape_types = shape_types[pair_mask]
-                colliding_shape_types = shape_types[colliding_mask]
-                # Pair-aware pipeline gating (fork): visual-only shapes that
-                # appear in no contact pair must not construct mesh subpipelines.
-                has_heightfields = bool((pair_shape_types == int(GeoType.HFIELD)).any())
-                has_meshes = bool((pair_shape_types == int(GeoType.MESH)).any())
-                # Mask-based sizing inputs (upstream #3961): conservative,
-                # colliding_mask-based (a superset of the pair-aware masks).
-                mesh_mask = colliding_mask & (shape_types == int(GeoType.MESH))
-                heightfield_mask = colliding_mask & (shape_types == int(GeoType.HFIELD))
-                plane_mask = colliding_mask & (shape_types == int(GeoType.PLANE))
+                route_mask = _shape_collide_mask(model, len(shape_types))
+                # Shapes that can reach the narrow phase decide which stages it builds.
+                # NXN/SAP pair only shapes that collide with shapes. The explicit list is
+                # authoritative: every listed shape reaches the narrow phase, including
+                # one with shape collision disabled, and an unlisted shape never does.
+                if self.broad_phase_mode == "explicit" and self.shape_pairs_filtered is not None:
+                    explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
+                    route_mask = np.zeros(len(shape_types), dtype=bool)
+                    pair_shapes = explicit_pairs_host.ravel()
+                    route_mask[pair_shapes[(pair_shapes >= 0) & (pair_shapes < len(shape_types))]] = True
+                route_shape_types = shape_types[route_mask]
+                mesh_mask = route_mask & (shape_types == int(GeoType.MESH))
+                heightfield_mask = route_mask & (shape_types == int(GeoType.HFIELD))
+                plane_mask = route_mask & (shape_types == int(GeoType.PLANE))
                 mesh_sdf_pair_mask = mesh_mask | heightfield_mask
                 planar_sdf_mask = np.zeros(len(shape_types), dtype=bool)
+                has_meshes = bool(np.any(mesh_mask))
+                has_heightfields = bool(np.any(heightfield_mask))
                 if (
                     hasattr(model, "_shape_sdf_index")
                     and model._shape_sdf_index is not None
@@ -1976,14 +1993,11 @@ class CollisionPipeline:
                 ):
                     shape_sdf_index = model._shape_sdf_index.numpy()
                     shape_edge_range = model.shape_edge_range.numpy()
-                    planar_sdf_mask = colliding_mask & (shape_sdf_index >= 0) & (shape_edge_range[:, 1] > 0)
-                    # Pair-aware gate (fork) alongside the upstream sizing mask.
-                    has_planar_sdf_shapes = bool(
-                        np.any(pair_mask & (shape_sdf_index >= 0) & (shape_edge_range[:, 1] > 0))
-                    )
+                    planar_sdf_mask = route_mask & (shape_sdf_index >= 0) & (shape_edge_range[:, 1] > 0)
+                    has_planar_sdf_shapes = bool(np.any(planar_sdf_mask))
                     has_meshes = has_meshes or has_planar_sdf_shapes
                     mesh_sdf_pair_mask |= planar_sdf_mask
-                    mesh_sdf_shapes = colliding_mask & (
+                    mesh_sdf_shapes = route_mask & (
                         (shape_types != int(GeoType.HFIELD))
                         & ((shape_types == int(GeoType.MESH)) | (shape_edge_range[:, 1] > 0))
                     )
@@ -2002,12 +2016,19 @@ class CollisionPipeline:
                     if mesh_sdf_texture_only:
                         texture_sdf_data = model._texture_sdf_data.numpy()
                         scale_baked = texture_sdf_data["scale_baked"]
-                        shape_scale = model.shape_scale.numpy()
-                        identity_shape_scale = np.all(shape_scale == np.float32(1.0), axis=1)
-                        mesh_sdf_identity_scale_only = all(
-                            bool(scale_baked[shape_sdf_index[shape_idx]]) or identity_shape_scale[shape_idx]
-                            for shape_idx in np.flatnonzero(mesh_sdf_shapes)
-                        )
+                        mesh_sdf_shape_indices = np.flatnonzero(mesh_sdf_shapes)
+                        runtime_scale_sdf_shapes = mesh_sdf_shape_indices[
+                            ~scale_baked[shape_sdf_index[mesh_sdf_shape_indices]].astype(bool)
+                        ]
+                        if dynamic_shape_scale:
+                            mesh_sdf_identity_scale_only = runtime_scale_sdf_shapes.size == 0
+                        else:
+                            shape_scale = model.shape_scale.numpy()
+                            mesh_sdf_identity_scale_only = bool(
+                                np.all(shape_scale[runtime_scale_sdf_shapes] == np.float32(1.0))
+                            )
+                            if mesh_sdf_identity_scale_only and runtime_scale_sdf_shapes.size > 0:
+                                unit_scale_sdf_shapes = runtime_scale_sdf_shapes
                 if self.broad_phase_mode == "explicit" and self.shape_pairs_filtered is not None:
                     # Explicit pair types are fixed at pipeline construction, including
                     # intentional cross-world pairs, so size only the stages they can reach.
@@ -2016,13 +2037,10 @@ class CollisionPipeline:
                         max_mesh_mesh_pairs = 0
                         max_mesh_plane_pairs = 0
                     else:
-                        if explicit_pairs_host is not None:
-                            explicit_pairs = explicit_pairs_host
-                        else:
-                            explicit_pairs = self.shape_pairs_filtered.numpy().reshape(-1, 2)
+                        explicit_pairs = explicit_pairs_host
                         shape_a = explicit_pairs[:, 0]
                         shape_b = explicit_pairs[:, 1]
-                        box_mask = colliding_mask & (shape_types == int(GeoType.BOX))
+                        box_mask = route_mask & (shape_types == int(GeoType.BOX))
                         mesh_mesh_routes = (
                             (mesh_mask[shape_a] & mesh_mask[shape_b])
                             | (heightfield_mask[shape_a] & mesh_mask[shape_b])
@@ -2058,7 +2076,7 @@ class CollisionPipeline:
                     int(GeoType.CYLINDER),
                     int(GeoType.CONE),
                 }
-                use_lean_gjk_mpr = not bool(lean_unsupported & set(colliding_shape_types.tolist()))
+                use_lean_gjk_mpr = not bool(lean_unsupported & set(route_shape_types.tolist()))
 
             if self.broad_phase_mode == "explicit":
                 candidate_pair_work_estimate = self.shape_pairs_max
@@ -2147,6 +2165,18 @@ class CollisionPipeline:
             # ordinary body-pair compaction does not preserve.
             raise ValueError("body-pair contact reduction does not support hydroelastic contacts")
 
+        # Marks shapes whose texture SDF queries assume the unit scale they had at construction.
+        shape_unit_scale_sdf = np.zeros(shape_count if unit_scale_sdf_shapes is not None else 0, dtype=np.int32)
+        if unit_scale_sdf_shapes is not None:
+            shape_unit_scale_sdf[unit_scale_sdf_shapes] = 1
+        self._shape_unit_scale_sdf = wp.array(shape_unit_scale_sdf, dtype=wp.int32, device=device)
+        self._unit_scale_sdf_rescaled = wp.zeros(min(len(shape_unit_scale_sdf), 1), dtype=wp.int32, device=device)
+        self._unit_scale_sdf_rescaled_host = None
+        if unit_scale_sdf_shapes is not None:
+            self._unit_scale_sdf_rescaled_host = make_pinned_release_capture_safe(
+                wp.zeros(1, dtype=wp.int32, device="cpu", pinned=wp.get_device(device).is_cuda)
+            )
+
         # Analytic and convex manifolds use compact unique sub-keys even when
         # matching; complex contact families retain the full fingerprint width.
         self._contact_sort_sub_key_bits = getattr(
@@ -2191,10 +2221,7 @@ class CollisionPipeline:
                 f"(expected {shape_count}, got {self.narrow_phase.shape_aabb_upper.shape[0]})"
             )
 
-        # The mesh contact kernels index the voxel-resolution table per shape. Expert
-        # construction rarely supplies it, and the pipeline holds the authoritative model
-        # data, so bind it here; leaving the narrow phase without one faults inside those
-        # kernels. A supplied table must match the model it is used with.
+        # Mesh/SDF contact reduction indexes this table even for custom components.
         voxel_resolution = getattr(self.narrow_phase, "shape_voxel_resolution", None)
         if voxel_resolution is None:
             self.narrow_phase.shape_voxel_resolution = model._shape_voxel_resolution
@@ -2245,6 +2272,7 @@ class CollisionPipeline:
         self.soft_self_contact_gap = 0.0
         self.soft_self_contact_rest_shape_exclusion_radius = 0.0
         self._soft_contact_max = soft_contact_max
+        model._validate_contact_capacity(rigid_contact_max, soft_contact_max)
 
         self.requires_grad = requires_grad
         self.deterministic = deterministic
@@ -2266,6 +2294,7 @@ class CollisionPipeline:
                 rigid_contact_max,
                 key_bit_count=self._contact_sort_sub_key_bits + 2 * self._contact_sort_shape_index_bits,
                 per_contact_shape_properties=per_contact_props,
+                allocate_simple_scratch=False,
                 device=device,
             )
         else:
@@ -2343,6 +2372,12 @@ class CollisionPipeline:
         # the shared detector (re-pointed per Contacts buffer; see
         # _get_soft_self_contact_detector).
         self._soft_self_contact_detector: TriMeshCollisionDetector | None = None
+
+        # Publish only after all construction succeeds. Observables can now allocate
+        # from these capacities without needing a Contacts instance or a collide.
+        model.rigid_contact_max = rigid_contact_max
+        model.soft_contact_max = soft_contact_max
+        model._contact_capacity_initialized = True
 
     def _acquire_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):
         """Register a graph-owned reducer writer lease (Contacts callback)."""
@@ -3011,6 +3046,11 @@ class CollisionPipeline:
         # augmentation and soft-contact kernels that follow are tape-safe
         # and recorded normally.
 
+        # Eager calls copy the sticky rescale flag to the host and raise on a copy from an earlier call; never syncs.
+        check_unit_scale_sdf = self._shape_unit_scale_sdf.shape[0] > 0 and not wp.get_device(self.device).is_capturing
+        if check_unit_scale_sdf and self._unit_scale_sdf_rescaled_host.numpy()[0]:
+            raise RuntimeError("Rescaled a unit-scale texture SDF shape; set dynamic_shape_scale=True (slower).")
+
         # Compute AABBs for all shapes, zero counters, bump generation.
         # Fuses contacts.clear() + broad_phase_pair_count.zero_() + AABB update.
         wp.launch(
@@ -3032,16 +3072,20 @@ class CollisionPipeline:
                 contacts.contact_generation,
                 self.broad_phase_pair_count,
                 contacts.contact_counters.shape[0],
+                self._shape_unit_scale_sdf,
             ],
             outputs=[
                 self.narrow_phase.shape_aabb_lower,
                 self.narrow_phase.shape_aabb_upper,
                 self.geom_data,
                 self.geom_transform,
+                self._unit_scale_sdf_rescaled,
             ],
             device=self.device,
             record_tape=False,
         )
+        if check_unit_scale_sdf:
+            wp.copy(self._unit_scale_sdf_rescaled_host, self._unit_scale_sdf_rescaled)
 
         if speculative_active:
             wp.launch(
@@ -3214,6 +3258,7 @@ class CollisionPipeline:
             **narrow_phase_extension_kwargs,
         )
 
+        # The reducer's counters are reused by the next pass, so latch losses on this contact stream.
         reducer = self.narrow_phase.global_contact_reducer
         if reducer is not None:
             wp.launch(
@@ -3222,6 +3267,13 @@ class CollisionPipeline:
                 inputs=[reducer.ht_insert_failures, reducer.buffer_overflows, contacts._reduction_overflow],
                 device=self.device,
                 record_tape=False,
+            )
+
+        if self._contact_matcher is not None and contacts.rigid_contact_match_index is None:
+            raise ValueError(
+                "CollisionPipeline has contact_matching enabled but the "
+                "Contacts buffer was created without contact_matching. "
+                "Use pipeline.contacts() to create a compatible buffer."
             )
 
         if self.deterministic and self._contact_sorter is not None:
@@ -3241,7 +3293,6 @@ class CollisionPipeline:
                 stiffness=contacts.rigid_contact_stiffness,
                 damping=contacts.rigid_contact_damping,
                 friction=contacts.rigid_contact_friction,
-                match_index=contacts.rigid_contact_match_index,
                 device=self.device,
             )
 
@@ -3276,12 +3327,6 @@ class CollisionPipeline:
         # Match and save the retained stream so all indices name solver contacts.
         # Matching now sees the final retained and sorted stream.
         if self._contact_matcher is not None:
-            if contacts.rigid_contact_match_index is None:
-                raise ValueError(
-                    "CollisionPipeline has contact_matching enabled but the "
-                    "Contacts buffer was created without contact_matching. "
-                    "Use pipeline.contacts() to create a compatible buffer."
-                )
             self._contact_matcher.match(
                 sort_keys=self._contact_sorter.sorted_keys_view,
                 contact_count=contacts.rigid_contact_count,
@@ -3304,7 +3349,7 @@ class CollisionPipeline:
             contacts.rigid_contact_match_generation.fill_(GENERATION_SENTINEL)
 
         # Sticky mode: overwrite matched rows with the saved previous-frame
-        # contact geometry.  Must run after sort_full (so match_index points at
+        # contact geometry.  Must run after matching (so match_index points at
         # the sorted prev-frame layout *and* we target the final sorted rows)
         # and before save_sorted_state (we save the record we actually used
         # this frame, carrying the sticky history forward).

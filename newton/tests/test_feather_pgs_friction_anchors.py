@@ -384,7 +384,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             dim=1,
             inputs=[
                 count,
-                3,
                 phi_arr,
                 wp.array([list(row_beta)], dtype=wp.float32, device=device),
                 row_type,
@@ -437,8 +436,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 count,
                 neg1,
                 neg1,
-                neg1,
-                neg1,
                 zJ(),
                 zJ(),
                 wp.zeros((1, 1), dtype=wp.int32, device=device),
@@ -447,15 +444,9 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 zeros3(),
                 zeros3(),
                 0,
-                inf,
-                pgs_beta,
                 dt,
-                bias_scale,
-                1.0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 wp.zeros((1,), dtype=wp.float32, device=device),
-                0,
-                0,
                 0.5,
                 3,
             ],
@@ -473,6 +464,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 zJ(),
                 zJ(),
                 wp.zeros((1, 6, 6), dtype=wp.float32, device=device),
+                wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.ones((1,), dtype=wp.int32, device=device),
                 phi_arr,
                 row_type,
                 zeros3(),
@@ -502,14 +495,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 phi_arr,
                 row_type,
                 zeros3(),
-                inf,
-                pgs_beta,
                 dt,
-                bias_scale,
-                1.0,
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
-                0,
-                0,
                 3,
             ],
             outputs=[rhs],
@@ -548,10 +535,8 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
             got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
             np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
         for family in ("mf_velocity", "propagation_velocity"):
-            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
-            np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
-            got0 = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=0.0)
-            np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg=family)
+            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=None)
+            np.testing.assert_allclose(got, 0.0, atol=1.0e-9, err_msg=family)
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""

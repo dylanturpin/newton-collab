@@ -62,7 +62,6 @@ def _solve_rows(device, n_rows, g, iterations=300):
             iterations,
             1.0,  # omega
             1,  # regularize
-            0,  # friction_mode
             iterations,  # friction_start_iteration (no friction rows)
             0,  # iteration_offset
             mf_impulses,
@@ -413,7 +412,6 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             dim=1,
             inputs=[
                 wp.array([1], dtype=wp.int32, device=device),
-                1,
                 wp.zeros((1, 1), dtype=wp.float32, device=device),
                 wp.full((1, 1), 0.2, dtype=wp.float32, device=device),
                 wp.full((1, 1), PGS_CONSTRAINT_TYPE_CONTACT, dtype=wp.int32, device=device),

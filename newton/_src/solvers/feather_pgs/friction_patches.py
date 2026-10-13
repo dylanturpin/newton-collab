@@ -31,7 +31,6 @@ capture: all buffers and the radix-sort workspace have fixed capacity.
 
 import inspect
 
-import numpy as np
 import warp as wp
 
 from ...math.spatial import velocity_at_point
@@ -1087,6 +1086,144 @@ def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shape
         prev.valid[c] = 0
 
 
+@wp.kernel(enable_backward=False)
+def _accumulate_body_radius(
+    shape_body: wp.array[int],
+    shape_collision_radius: wp.array[float],
+    shape_transform: wp.array[wp.transform],
+    body_radius: wp.array[float],
+):
+    """Grow each body's radius to cover its shapes' bounding spheres."""
+    s = wp.tid()
+    body = shape_body[s]
+    if body >= 0:
+        offset = wp.length(wp.transform_get_translation(shape_transform[s]))
+        wp.atomic_max(body_radius, body, shape_collision_radius[s] + offset)
+
+
+@wp.kernel(enable_backward=False)
+def _mark_changed_geometry(
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_scale: wp.array[wp.vec3],
+    shape_type: wp.array[int],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_margin: wp.array[float],
+    shape_is_solid: wp.array[wp.bool],
+    seen_body: wp.array[int],
+    seen_transform: wp.array[wp.transform],
+    seen_scale: wp.array[wp.vec3],
+    seen_type: wp.array[int],
+    seen_source_ptr: wp.array[wp.uint64],
+    seen_margin: wp.array[float],
+    seen_is_solid: wp.array[wp.bool],
+    changed_shapes: wp.array[int],
+    changed_bodies: wp.array[int],
+):
+    """Flag shapes whose geometry differs from the last snapshot, flag their bodies, and update the snapshot."""
+    s = wp.tid()
+    body = shape_body[s]
+    previous_body = seen_body[s]
+    transform = shape_transform[s]
+    scale = shape_scale[s]
+    changed = (
+        body != previous_body
+        or shape_type[s] != seen_type[s]
+        or shape_source_ptr[s] != seen_source_ptr[s]
+        or shape_margin[s] != seen_margin[s]
+        or shape_is_solid[s] != seen_is_solid[s]
+    )
+    for i in range(7):
+        changed = changed or transform[i] != seen_transform[s][i]
+    for i in range(3):
+        changed = changed or scale[i] != seen_scale[s][i]
+    changed_shapes[s] = int(changed)
+    if not changed:
+        return
+    # An anchor may have crossed a convex seam since it was created: retire the
+    # history of every body that carried or carries this shape.
+    if previous_body >= 0:
+        changed_bodies[previous_body] = 1
+    if body >= 0:
+        changed_bodies[body] = 1
+    seen_body[s] = body
+    seen_transform[s] = transform
+    seen_scale[s] = scale
+    seen_type[s] = shape_type[s]
+    seen_source_ptr[s] = shape_source_ptr[s]
+    seen_margin[s] = shape_margin[s]
+    seen_is_solid[s] = shape_is_solid[s]
+
+
+# Fields of the previous frame that _store_history writes and later steps read.
+_CARRIED_HISTORY_FIELDS = frozenset(
+    (
+        "keys",
+        "indices",
+        "normal",
+        "displacement",
+        "mu",
+        "body_a",
+        "body_b",
+        "owner",
+        "shape_a",
+        "shape_b",
+        "anchor_a",
+        "anchor_b",
+        "surface_a",
+        "surface_b",
+        "valid",
+        "tangent_impulse",
+    )
+)
+
+
+@wp.kernel(enable_backward=False)
+def _copy_carried_history(
+    src: _PatchFrame,
+    src_world: wp.array[int],
+    src_q: wp.array[wp.transform],
+    dst: _PatchFrame,
+    dst_world: wp.array[int],
+    dst_q: wp.array[wp.transform],
+):
+    """Copy the carried patch history written by _store_history."""
+    c = wp.tid()
+    if c < src_q.shape[0]:
+        dst_q[c] = src_q[c]
+    if c >= src_world.shape[0]:
+        return
+    dst.keys[c] = src.keys[c]
+    dst.indices[c] = src.indices[c]
+    dst.normal[c] = src.normal[c]
+    dst.displacement[c] = src.displacement[c]
+    dst.mu[c] = src.mu[c]
+    dst.body_a[c] = src.body_a[c]
+    dst.body_b[c] = src.body_b[c]
+    dst.owner[c] = src.owner[c]
+    dst.shape_a[c] = src.shape_a[c]
+    dst.shape_b[c] = src.shape_b[c]
+    dst.anchor_a[c] = src.anchor_a[c]
+    dst.anchor_b[c] = src.anchor_b[c]
+    dst.surface_a[c] = src.surface_a[c]
+    dst.surface_b[c] = src.surface_b[c]
+    dst.valid[c] = src.valid[c]
+    dst.tangent_impulse[c] = src.tangent_impulse[c]
+    dst_world[c] = src_world[c]
+
+
+# Shape fields whose change retires friction-anchor history, in _mark_changed_geometry order.
+_GEOMETRY_FIELDS = (
+    "shape_body",
+    "shape_transform",
+    "shape_scale",
+    "shape_type",
+    "shape_source_ptr",
+    "shape_margin",
+    "shape_is_solid",
+)
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
@@ -1101,11 +1238,15 @@ class _FrictionPatchState:
         self.view.next_contact = wp.full(n, -1, dtype=int, device=device)
         self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
+        self._history_snapshot = None
         if not enabled:
             return
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
-        self.update_geometry(model)
+        self._refresh_body_radius(model)
+        self._seen_geometry = [wp.clone(getattr(model, name)) for name in _GEOMETRY_FIELDS]
+        self._changed_shapes = wp.zeros(model.shape_body.shape[0], dtype=int, device=device)
+        self._changed_bodies = wp.zeros(model.body_count, dtype=int, device=device)
         self.current = self._frame(capacity, device)
         self.previous = self._frame(capacity, device)
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
@@ -1119,52 +1260,36 @@ class _FrictionPatchState:
         self._no_frozen_bodies = wp.zeros(0, dtype=int, device=device)
 
     def update_geometry(self, model):
-        """Refresh scales and retire affected history after explicit geometry edits."""
-        geometry = {
-            name: getattr(model, name).numpy().copy()
-            for name in (
-                "shape_body",
-                "shape_transform",
-                "shape_scale",
-                "shape_type",
-                "shape_source_ptr",
-                "shape_margin",
-                "shape_is_solid",
+        """Refresh body radii and retire history whose geometry changed, on the device."""
+        self._refresh_body_radius(model)
+        if model.shape_body.shape[0] == 0:
+            return
+        self._changed_bodies.zero_()
+        wp.launch(
+            _mark_changed_geometry,
+            dim=model.shape_body.shape[0],
+            inputs=[*(getattr(model, name) for name in _GEOMETRY_FIELDS), *self._seen_geometry],
+            outputs=[self._changed_shapes, self._changed_bodies],
+            device=model.device,
+        )
+        # Unrelated bodies and static shapes keep their history.
+        wp.launch(
+            _invalidate_geometry_history,
+            dim=self.capacity,
+            inputs=[self.previous, self._changed_bodies, self._changed_shapes],
+            device=model.device,
+        )
+
+    def _refresh_body_radius(self, model):
+        self.body_radius.zero_()
+        if model.shape_body.shape[0]:
+            wp.launch(
+                _accumulate_body_radius,
+                dim=model.shape_body.shape[0],
+                inputs=[model.shape_body, model.shape_collision_radius, model.shape_transform],
+                outputs=[self.body_radius],
+                device=model.device,
             )
-        }
-        radii = np.zeros(model.body_count, dtype=np.float32)
-        for body, radius, transform in zip(
-            geometry["shape_body"], model.shape_collision_radius.numpy(), geometry["shape_transform"], strict=True
-        ):
-            if body >= 0:
-                radii[body] = max(radii[body], radius + np.linalg.norm(transform[:3]))
-        self.body_radius.assign(radii)
-        if hasattr(self, "_geometry"):
-            changed = np.zeros(len(geometry["shape_body"]), dtype=bool)
-            for name, values in geometry.items():
-                difference = values != self._geometry[name]
-                if difference.ndim > 1:
-                    difference = np.any(difference, axis=tuple(range(1, difference.ndim)))
-                changed |= difference
-            if np.any(changed):
-                # An anchor may have crossed a convex seam since it was created.
-                # Invalidate the affected body's history, including other carrier
-                # shapes, while keeping unrelated bodies and static shapes intact.
-                bodies = np.zeros(model.body_count, dtype=np.int32)
-                for shape_body in (self._geometry["shape_body"], geometry["shape_body"]):
-                    affected = shape_body[changed]
-                    bodies[affected[affected >= 0]] = 1
-                wp.launch(
-                    _invalidate_geometry_history,
-                    dim=self.capacity,
-                    inputs=[
-                        self.previous,
-                        wp.array(bodies, dtype=int, device=model.device),
-                        wp.array(changed, dtype=int, device=model.device),
-                    ],
-                    device=model.device,
-                )
-        self._geometry = geometry
 
     @staticmethod
     def _frame(n, device):
@@ -1219,6 +1344,7 @@ class _FrictionPatchState:
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
         frozen_bodies=None,
+        shape_material_mu=None,
     ):
         wp.launch(
             _prepare,
@@ -1233,7 +1359,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
                 model.shape_body,
-                model.shape_material_mu,
+                model.shape_material_mu if shape_material_mu is None else shape_material_mu,
                 model.shape_gap,
                 self.body_radius,
                 state.body_q,
@@ -1303,6 +1429,40 @@ class _FrictionPatchState:
                 int(flooded),
             ],
             device=model.device,
+        )
+
+    def reserve_history_snapshot(self):
+        """Allocate the buffers :meth:`snapshot_history` writes; call outside graph capture."""
+        if self.view.enabled and self._history_snapshot is None:
+            device = self.previous_q.device
+            frame = _PatchFrame()
+            for name in _PatchFrame.vars:
+                count = self.capacity if name in _CARRIED_HISTORY_FIELDS else 0
+                setattr(frame, name, wp.empty(count, dtype=getattr(self.previous, name).dtype, device=device))
+            self._history_snapshot = (frame, wp.empty_like(self.previous_world), wp.empty_like(self.previous_q))
+
+    def snapshot_history(self):
+        """Save the carried history so a repeated solve of the same step can restore it."""
+        if not self.view.enabled:
+            return
+        self.reserve_history_snapshot()
+        frame, world, q = self._history_snapshot
+        self._copy_history(self.previous, self.previous_world, self.previous_q, frame, world, q)
+
+    def restore_history(self):
+        """Restore the history saved by :meth:`snapshot_history`."""
+        if not self.view.enabled or self._history_snapshot is None:
+            return
+        frame, world, q = self._history_snapshot
+        self._copy_history(frame, world, q, self.previous, self.previous_world, self.previous_q)
+
+    def _copy_history(self, src, src_world, src_q, dst, dst_world, dst_q):
+        wp.launch(
+            _copy_carried_history,
+            dim=max(self.capacity, src_q.shape[0]),
+            inputs=[src, src_world, src_q],
+            outputs=[dst, dst_world, dst_q],
+            device=src_q.device,
         )
 
     def store(self, state):
@@ -1404,29 +1564,29 @@ def seed_patch_impulses(
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
     scale: float,
+    dt_scale: wp.array[float],
 ):
-    """Transport cached patch impulses after all contact normals have been seeded.
+    """Transport cached patch impulses and project every anchor's seed onto its patch cone.
 
-    Anchors without patch history keep whatever the contact-matched warm start
-    seeded; only carried anchors overwrite their friction rows.
+    Anchors without patch history keep the contact-matched warm start, bounded by the region's load.
     """
     c = wp.tid()
     if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
         return
-    source = frame.source[c]
-    if source < 0:
-        return
-    tangent = prev.tangent_impulse[source] * scale
-    if frame.body_a[c] >= 0:
-        tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
-    n = frame.normal[c]
-    if frame.flipped[c] != 0:
-        n = -n
-        tangent = -tangent
-    t0, t1 = contact_tangent_basis(n)
-    value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
     w = world[c]
     s = slot[c]
+    value = wp.vec2(impulses[w, s + 1], impulses[w, s + 2])
+    source = frame.source[c]
+    if source >= 0:
+        tangent = prev.tangent_impulse[source] * (scale * dt_scale[0])
+        if frame.body_a[c] >= 0:
+            tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
+        n = frame.normal[c]
+        if frame.flipped[c] != 0:
+            n = -n
+            tangent = -tangent
+        t0, t1 = contact_tangent_basis(n)
+        value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
     radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
     magnitude = wp.length(value)
     if magnitude > radius and magnitude > 0.0:

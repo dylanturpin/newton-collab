@@ -5,6 +5,8 @@
 
 import os
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -12,6 +14,87 @@ import warp as wp
 import newton
 from newton.geometry import HydroelasticSDF
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
+
+
+def make_fixture(
+    *,
+    articulated,
+    enabled,
+    iterations=8,
+    stock=False,
+    height=0.05,
+    kinematic=False,
+    world_count=1,
+    solver_options=None,
+):
+    """Build actual Newton sphere/plane contacts, one sphere per world."""
+    device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.rigid_gap = 0.005
+        if world_count == 1:
+            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+        xform = wp.transform(wp.vec3(0, 0, height), wp.quat_identity())
+        if articulated:
+            body = builder.add_link(xform=xform)
+            if solver_options and solver_options.pop("_d6", False):
+                joint = builder.add_joint_d6(
+                    parent=-1,
+                    child=body,
+                    parent_xform=xform,
+                    linear_axes=[
+                        newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X),
+                        newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z),
+                    ],
+                )
+            else:
+                joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z, parent_xform=xform)
+            builder.add_articulation([joint])
+        else:
+            body = builder.add_body(xform=xform)
+        builder.add_shape_sphere(
+            body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5)
+        )
+        if world_count == 1:
+            model = builder.finalize()
+        else:
+            scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            scene.rigid_gap = 0.005
+            scene.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+            scene.replicate(builder, world_count)
+            model = scene.finalize()
+        bodies = [body + world * builder.body_count for world in range(world_count)]
+        if kinematic:
+            flags = model.body_flags.numpy()
+            flags[bodies] |= int(newton.BodyFlags.KINEMATIC)
+            model.body_flags.assign(flags)
+        capacity = 32 * world_count
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=capacity)
+        model.rigid_contact_max = capacity
+        contacts = pipeline.contacts()
+        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+            setattr(contacts, name, wp.zeros(capacity, dtype=float))
+        extra = {} if stock else {"contact_compliance": enabled}
+        options = dict(
+            # Isolate the normal material law from positional patch friction.
+            friction_anchor_beta=0.0,
+            pgs_mode="matrix_free",
+            pgs_schedule="interleaved",
+            articulated_contact_response="immediate",
+            enable_restitution=False,
+            pgs_iterations=iterations,
+            pgs_velocity_iterations=0,
+            dense_max_constraints=32,
+            mf_max_constraints=32,
+            pgs_beta=0.05,
+            **extra,
+        )
+        options.update(solver_options or {})
+        solver = SolverFeatherPGS(model, **options)
+        return SimpleNamespace(
+            model=model, pipeline=pipeline, contacts=contacts, solver=solver, body=body, bodies=bodies, device=device
+        )
 
 
 def run_fixture(
@@ -30,59 +113,26 @@ def run_fixture(
     solver_options=None,
 ):
     """Run actual Newton sphere/plane contacts through one physical step per tick."""
-    device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
-    with wp.ScopedDevice(device):
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.rigid_gap = 0.005
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
-        xform = wp.transform(wp.vec3(0, 0, height), wp.quat_identity())
-        if articulated:
-            body = builder.add_link(xform=xform)
-            if lateral_force:
-                joint = builder.add_joint_d6(
-                    parent=-1,
-                    child=body,
-                    parent_xform=xform,
-                    linear_axes=[
-                        newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X),
-                        newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z),
-                    ],
-                )
-            else:
-                joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z, parent_xform=xform)
-            builder.add_articulation([joint])
-        else:
-            body = builder.add_body(xform=xform)
-        builder.add_shape_sphere(
-            body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5)
-        )
-        model = builder.finalize()
-        if kinematic:
-            flags = model.body_flags.numpy()
-            flags[body] |= int(newton.BodyFlags.KINEMATIC)
-            model.body_flags.assign(flags)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
-        model.rigid_contact_max = 32
-        contacts = pipeline.contacts()
-        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
-            setattr(contacts, name, wp.zeros(32, dtype=float))
-        extra = {} if stock else {"contact_compliance": enabled}
-        options = dict(
-            # Isolate the normal material law from positional patch friction.
-            friction_anchor_beta=0.0,
-            pgs_mode="matrix_free",
-            pgs_schedule="interleaved",
-            articulated_contact_response="immediate",
-            enable_restitution=False,
-            pgs_iterations=iterations,
-            pgs_velocity_iterations=0,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
-            pgs_beta=0.05,
-            **extra,
-        )
-        options.update(solver_options or {})
-        solver = SolverFeatherPGS(model, **options)
+    options = dict(solver_options or {})
+    if lateral_force:
+        options["_d6"] = True
+    fixture = make_fixture(
+        articulated=articulated,
+        enabled=enabled,
+        iterations=iterations,
+        stock=stock,
+        height=height,
+        kinematic=kinematic,
+        solver_options=options,
+    )
+    model, pipeline, contacts, solver, body = (
+        fixture.model,
+        fixture.pipeline,
+        fixture.contacts,
+        fixture.solver,
+        fixture.body,
+    )
+    with wp.ScopedDevice(fixture.device):
         state, next_state = model.state(), model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         trace = []
@@ -206,6 +256,53 @@ def run_native_hydro_fixture(*, articulated=True):
         return results
 
 
+def run_paired_fixture(*, hinv_jt_kernel, friction, steps=40):
+    """Drop a free box onto a 23-DOF arm (one robot/free-body pair per world) with compliant contacts."""
+    device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
+    with wp.ScopedDevice(device):
+        model = _build_mixed_response_model(device, dof_count=23, friction=friction)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", reduce_contacts=False)
+        model.rigid_contact_max = 64
+        contacts = pipeline.contacts()
+        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+            setattr(contacts, name, wp.zeros(64, dtype=float))
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": hinv_jt_kernel}):
+            solver = SolverFeatherPGS(
+                model,
+                contact_compliance=True,
+                friction_anchor_beta=0.0,
+                pgs_mode="matrix_free",
+                enable_restitution=False,
+                enable_contact_friction=friction > 0.0,
+                joint_limit_activation_gap=0.0,
+                pgs_iterations=8,
+                dense_max_constraints=96,
+                mf_max_constraints=32,
+            )
+        state, output = model.state(), model.state()
+        free = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
+        start = int(solver._model_plan.articulation_dof_start[free])
+        qd = state.joint_qd.numpy()
+        qd[start] = 0.5
+        qd[start + 2] = -3.0
+        state.joint_qd.assign(qd)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        control = model.control()
+        trace = []
+        compliant = 0
+        for _ in range(steps):
+            state.clear_forces()
+            pipeline.collide(state, contacts)
+            contacts.rigid_contact_stiffness.fill_(2.0e4)
+            contacts.rigid_contact_damping.fill_(10.0)
+            contacts.rigid_contact_friction.fill_(1.0)
+            solver.step(state, output, control, contacts, 1.0 / 240.0)
+            state, output = output, state
+            trace.append(state.joint_q.numpy().copy())
+            compliant = max(compliant, solver.compliance_contact_count)
+        return solver, np.asarray(trace), compliant
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestContactComplianceIntegration(unittest.TestCase):
     """Gate the experimental adapter against actual dense and MF contact paths."""
@@ -251,6 +348,18 @@ class TestContactComplianceIntegration(unittest.TestCase):
         tangent = np.linalg.norm(solver.impulses.numpy()[0, types == 2]) / 0.005
         self.assertAlmostEqual(float(normal), mass * 9.81, delta=1e-4)
         self.assertAlmostEqual(float(tangent), 0.5, delta=1e-4)
+
+    def test_paired_factor_owner_matches_general_owner(self):
+        """Apply the compliant residual in the paired factor-coordinate owner as in the general owner."""
+        # Frictional contacts use the contact-triple branch; frictionless normal-only rows use the general branch.
+        for friction in (0.7, 0.0):
+            with self.subTest(friction=friction):
+                general_solver, general, _ = run_paired_fixture(hinv_jt_kernel="par_row", friction=friction)
+                paired_solver, paired, compliant = run_paired_fixture(hinv_jt_kernel="auto", friction=friction)
+                self.assertFalse(general_solver._paired_factor_coordinates)
+                self.assertTrue(paired_solver._paired_factor_coordinates)
+                self.assertGreater(compliant, 0)
+                np.testing.assert_allclose(paired, general, rtol=5.0e-4, atol=1.0e-5)
 
     def test_native_hydro_material_pipeline(self):
         """Apply native pressure-weighted hydro coefficients without overwriting fields."""

@@ -62,6 +62,7 @@ class Example:
         self.test_mode = args.test
         self.deterministic = args.deterministic
         self.deterministic_solver = args.deterministic_solver
+        self.solver_type = args.solver
         self.show_isosurface = False  # Disabled by default for performance
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -71,6 +72,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.world_count = args.world_count
         self.viewer = viewer
+        self.viewer.picking_enabled = False
 
         sdf_max_resolution = 64
         sdf_narrow_band_range = (-0.01, 0.01)
@@ -307,30 +309,43 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
 
-        # Create MuJoCo solver with Newton contacts
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_contacts=False,
-            disable_sensors=True,
-            solver="newton",
-            integrator="implicitfast",
-            cone="elliptic",
-            njmax=500,
-            nconmax=500,
-            iterations=15,
-            ls_iterations=100,
-            impratio=1000.0,
-            deterministic=wp.DeterministicMode.RUN_TO_RUN
-            if self.deterministic_solver
-            else wp.DeterministicMode.NOT_GUARANTEED,
-        )
+        if self.solver_type == "featherpgs":
+            # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
+            self.solver = newton.solvers.SolverFeatherPGS(
+                self.model,
+                pgs_mode="matrix_free",
+                contact_compliance=True,
+                friction_anchor_beta=0.0,
+                enable_restitution=False,
+                pgs_iterations=args.pgs_iterations,
+                dense_max_constraints=1536,
+                mf_max_constraints=1024,
+            )
+        else:
+            # Create MuJoCo solver with Newton contacts
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                use_mujoco_contacts=False,
+                disable_sensors=True,
+                solver="newton",
+                integrator="implicitfast",
+                cone="elliptic",
+                njmax=500,
+                nconmax=500,
+                iterations=15,
+                ls_iterations=100,
+                impratio=1000.0,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN
+                if self.deterministic_solver
+                else wp.DeterministicMode.NOT_GUARANTEED,
+            )
 
         self.viewer.set_model(self.model)
-        self.viewer.picking_enabled = False  # Disable interactive picking for this example
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_camera(wp.vec3(0.5, 0.0, 0.5), -15, -140)
             self.viewer.set_world_offsets(wp.vec3(1.0, 1.0, 0.0))
             self.viewer.show_hydro_contact_surface = self.show_isosurface
+        if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self.render_ui, position="side")
 
         # Initialize state for IK setup
@@ -391,7 +406,17 @@ class Example:
 
     def capture(self):
         self.graph = None
+        if self.solver_type == "featherpgs":
+            # A captured first FeatherPGS step diverges on this scene; warm up eagerly, then restore the state.
+            initial = self.model.state()
+            initial.assign(self.state_0)
+            self.simulate()
+            self.state_0.assign(initial)
+            self.state_1.assign(initial)
+            self.solver.reset(self.state_0)
         with wp.ScopedCapture() as capture:
+            if self.solver_type == "featherpgs":
+                self.solver.seed_double_buffer_events()
             self.simulate()
         self.graph = capture.graph
 
@@ -411,6 +436,8 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
+        if self.solver_type == "featherpgs":
+            self.solver.validate_contact_compliance()
 
         self.sim_time += self.frame_dt
 
@@ -584,6 +611,19 @@ class Example:
             choices=[scene.value for scene in SceneType],
             default=SceneType.PEN.value,
             help="Scene type to load (pen, cube)",
+        )
+        parser.add_argument(
+            "--solver",
+            type=str,
+            choices=["mujoco", "featherpgs"],
+            default="mujoco",
+            help="Solver to use: 'mujoco' or the experimental compliant 'featherpgs'.",
+        )
+        parser.add_argument(
+            "--pgs-iterations",
+            type=int,
+            default=16,
+            help="FeatherPGS position iterations (only with --solver featherpgs).",
         )
         return parser
 

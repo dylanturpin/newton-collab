@@ -80,8 +80,11 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             1,
             0.0,
             0,
-            1,
             FrictionPatches(),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
         ],
         outputs=[
             contact_world,
@@ -106,7 +109,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     wp.launch(
         finalize_mf_constraint_counts,
         dim=1,
-        inputs=[counter, row_capacity, 3, first_rejected],
+        inputs=[counter, row_capacity, first_rejected],
         outputs=[count],
         device=device,
     )
