@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
+
+from newton.tests.unittest_utils import patch_sys_module
 
 try:
     from docs import generate_api
@@ -77,6 +78,27 @@ class TestGenerateApiPublicSymbols(unittest.TestCase):
             r"newton\.invalid_all_entry\.__all__ must contain only strings; got 1",
         ):
             generate_api.public_symbols(module)
+
+
+@unittest.skipUnless(generate_api is not None, "requires the docs/ package (source checkout only)")
+class TestGenerateApiSolverSubmodules(unittest.TestCase):
+    def test_style3d_helpers_use_public_documentation_paths(self):
+        """Register Style3D helpers under their canonical public paths."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "api"
+            with (
+                mock.patch.object(generate_api, "OUTPUT_DIR", output_dir),
+                mock.patch.object(generate_api, "REPO_ROOT", output_dir.parent),
+            ):
+                generate_api.write_module_page("newton.solvers.style3d", api_toctree_modules=set())
+
+            page = (output_dir / "newton_solvers_style3d.rst").read_text(encoding="utf-8")
+
+        self.assertIn(".. py:module:: newton.solvers.style3d", page)
+        self.assertIn(".. currentmodule:: newton.solvers.style3d", page)
+        self.assertIn(".. autofunction:: add_cloth_grid", page)
+        self.assertIn(".. autofunction:: add_cloth_mesh", page)
+        self.assertNotIn("newton._src", page)
 
 
 @unittest.skipUnless(generate_api is not None, "requires the docs/ package (source checkout only)")
@@ -158,7 +180,7 @@ class TestGenerateApiDeprecatedSymbols(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             with (
-                mock.patch.dict(sys.modules, {mod_name: fake_module}),
+                patch_sys_module(mod_name, fake_module),
                 mock.patch.object(generate_api, "OUTPUT_DIR", output_dir),
                 mock.patch.object(generate_api, "REPO_ROOT", output_dir.parent),
                 warnings.catch_warnings(),

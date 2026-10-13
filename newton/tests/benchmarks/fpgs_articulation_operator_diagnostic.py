@@ -43,6 +43,7 @@ from fpgs_articulation_row_scaling import (  # noqa: E402
     _restore_state,
 )
 
+from newton._src.solvers.feather_pgs._testing import kernel_overrides  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
@@ -148,24 +149,19 @@ def _make_solver(
     mf_capacity = 16
     response_mode = "propagation" if path == "propagation" else "immediate"
 
-    previous_overrides = SolverFeatherPGS._kernel_overrides
-    if path == "mf_immediate":
-        SolverFeatherPGS._kernel_overrides = {**previous_overrides, "hinv_jt_kernel": "tiled"}
-    try:
+    overrides = {"hinv_jt_kernel": "tiled"} if path == "mf_immediate" else {}
+    with kernel_overrides(overrides):
         return SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=0,
-            pgs_velocity_iterations=0,
-            enable_contact_friction=enable_contact_friction,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
-            mf_warmstart=False,
+            iterations=0,
+            velocity_iterations=0,
+            contact_friction_scale=1.0 if enable_contact_friction else 0.0,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
-    finally:
-        SolverFeatherPGS._kernel_overrides = previous_overrides
 
 
 def _run_zero_iteration_setup(
@@ -189,7 +185,7 @@ def _run_zero_iteration_setup(
 
 def _body_link_maps(solver: SolverFeatherPGS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model = solver.model
-    body_to_art = solver.body_to_articulation.numpy().astype(np.int32, copy=False)
+    body_to_art = solver._body_to_articulation.numpy().astype(np.int32, copy=False)
     body_to_link = np.full(model.body_count, -1, dtype=np.int32)
     articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
     joint_child = model.joint_child.numpy().astype(np.int32, copy=False)
@@ -199,10 +195,10 @@ def _body_link_maps(solver: SolverFeatherPGS) -> tuple[np.ndarray, np.ndarray, n
             if child >= 0:
                 body_to_link[child] = local_link
 
-    if solver.is_free_rigid is None:
+    if solver._is_free_rigid is None:
         art_is_free = np.zeros(model.articulation_count, dtype=bool)
     else:
-        art_is_free = solver.is_free_rigid.numpy().astype(np.int32, copy=False) != 0
+        art_is_free = solver._is_free_rigid.numpy().astype(np.int32, copy=False) != 0
     body_is_free = np.zeros(model.body_count, dtype=bool)
     for body, art in enumerate(body_to_art):
         if art >= 0 and art_is_free[int(art)]:
@@ -234,11 +230,11 @@ def _select_sources(row_count: int, max_sources: int) -> np.ndarray:
 
 
 def _world_operator_from_jy(solver: SolverFeatherPGS, world: int) -> np.ndarray:
-    counts = solver.constraint_count.numpy().astype(np.int32, copy=False)
+    counts = solver._constraint_count.numpy().astype(np.int32, copy=False)
     row_count = int(counts[world])
-    width = int(solver.world_dof_count.numpy()[world])
-    J = solver.J_world.numpy()[world, :row_count, :width].astype(np.float64, copy=True)
-    Y = solver.Y_world.numpy()[world, :row_count, :width].astype(np.float64, copy=True)
+    width = int(solver._world_dof_count.numpy()[world])
+    J = solver._J_world.numpy()[world, :row_count, :width].astype(np.float64, copy=True)
+    Y = solver._Y_world.numpy()[world, :row_count, :width].astype(np.float64, copy=True)
     return J @ Y.T
 
 
@@ -249,9 +245,9 @@ def _contact_row_map(
     row_count: int,
     row_parent: np.ndarray,
 ) -> dict[tuple[int, int], int]:
-    contact_world = solver.contact_world.numpy().astype(np.int32, copy=False)
-    contact_slot = solver.contact_slot.numpy().astype(np.int32, copy=False)
-    contact_path = solver.contact_path.numpy().astype(np.int32, copy=False)
+    contact_world = solver._contact_world.numpy().astype(np.int32, copy=False)
+    contact_slot = solver._contact_slot.numpy().astype(np.int32, copy=False)
+    contact_path = solver._contact_path.numpy().astype(np.int32, copy=False)
     out: dict[tuple[int, int], int] = {}
     for contact_index in range(contact_slot.shape[0]):
         if int(contact_path[contact_index]) != path_id:
@@ -275,8 +271,8 @@ def _dense_rows_in_propagation_order(
     world: int,
     row_count: int,
 ) -> tuple[np.ndarray, bool]:
-    old_parent = old_solver.row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
-    propagation_parent = propagation_solver.propagation_row_parent.numpy()[world, :row_count].astype(
+    old_parent = old_solver._row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
+    propagation_parent = propagation_solver._propagation_row_parent.numpy()[world, :row_count].astype(
         np.int32, copy=True
     )
     dense_by_key = _contact_row_map(old_solver, world, 0, row_count, old_parent)
@@ -317,10 +313,15 @@ def _propagation_target_velocities(
 
 
 def _zero_propagation_state(solver: SolverFeatherPGS) -> None:
-    solver.v_out.zero_()
-    solver.propagation_body_qd.zero_()
-    solver.propagation_body_impulses.zero_()
-    for name in ("propagation_tree_pA", "propagation_tree_u", "propagation_tree_qdd", "propagation_tree_body_delta"):
+    solver._v_out.zero_()
+    solver._propagation_body_qd.zero_()
+    solver._propagation_body_impulses.zero_()
+    for name in (
+        "_propagation_tree_pA",
+        "_propagation_tree_u",
+        "_propagation_tree_qdd",
+        "_propagation_tree_body_delta",
+    ):
         array = getattr(solver, name, None)
         if array is not None:
             array.zero_()
@@ -331,18 +332,18 @@ def _propagation_operator_columns(
     world: int,
     source_rows: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    propagation_counts = solver.propagation_constraint_count.numpy().astype(np.int32, copy=False)
+    propagation_counts = solver._propagation_constraint_count.numpy().astype(np.int32, copy=False)
     row_count = int(propagation_counts[world])
-    body_a = solver.propagation_body_a.numpy()[world, :row_count].astype(np.int32, copy=True)
-    body_b = solver.propagation_body_b.numpy()[world, :row_count].astype(np.int32, copy=True)
-    J_a = solver.propagation_J_a.numpy()[world, :row_count].astype(np.float64, copy=True)
-    J_b = solver.propagation_J_b.numpy()[world, :row_count].astype(np.float64, copy=True)
-    MiJt_a = solver.propagation_MiJt_a.numpy()[world, :row_count].astype(np.float64, copy=True)
-    MiJt_b = solver.propagation_MiJt_b.numpy()[world, :row_count].astype(np.float64, copy=True)
+    body_a = solver._propagation_body_a.numpy()[world, :row_count].astype(np.int32, copy=True)
+    body_b = solver._propagation_body_b.numpy()[world, :row_count].astype(np.int32, copy=True)
+    J_a = solver._propagation_J_a.numpy()[world, :row_count].astype(np.float64, copy=True)
+    J_b = solver._propagation_J_b.numpy()[world, :row_count].astype(np.float64, copy=True)
+    MiJt_a = solver._propagation_MiJt_a.numpy()[world, :row_count].astype(np.float64, copy=True)
+    MiJt_b = solver._propagation_MiJt_b.numpy()[world, :row_count].astype(np.float64, copy=True)
 
     body_count = solver.model.body_count
-    world_start = int(solver.world_dof_start.numpy()[world])
-    world_width = int(solver.world_dof_count.numpy()[world])
+    world_start = int(solver._world_dof_start.numpy()[world])
+    world_width = int(solver._world_dof_count.numpy()[world])
     propagated = np.zeros((row_count, len(source_rows)), dtype=np.float64)
     local_only = np.zeros_like(propagated)
     qd_propagated = np.zeros((world_width, len(source_rows)), dtype=np.float64)
@@ -361,14 +362,14 @@ def _propagation_operator_columns(
         local_only[:, out_col] = _propagation_target_velocities(body_qd.astype(np.float64), body_a, body_b, J_a, J_b)
 
         _zero_propagation_state(solver)
-        solver.propagation_body_qd.assign(body_qd)
-        solver.propagation_body_impulses.assign(body_impulses)
+        solver._propagation_body_qd.assign(body_qd)
+        solver._propagation_body_impulses.assign(body_impulses)
         solver._propagate_response()
         wp.synchronize()
 
-        qd_after = solver.propagation_body_qd.numpy().astype(np.float64, copy=True)
+        qd_after = solver._propagation_body_qd.numpy().astype(np.float64, copy=True)
         propagated[:, out_col] = _propagation_target_velocities(qd_after, body_a, body_b, J_a, J_b)
-        qd_propagated[:, out_col] = solver.v_out.numpy()[world_start : world_start + world_width].astype(
+        qd_propagated[:, out_col] = solver._v_out.numpy()[world_start : world_start + world_width].astype(
             np.float64, copy=True
         )
 
@@ -376,17 +377,17 @@ def _propagation_operator_columns(
 
 
 def _nonfree_world_dof_mask_and_condition(solver: SolverFeatherPGS, world: int) -> tuple[np.ndarray, float | None]:
-    width = int(solver.world_dof_count.numpy()[world])
-    world_start = int(solver.world_dof_start.numpy()[world])
+    width = int(solver._world_dof_count.numpy()[world])
+    world_start = int(solver._world_dof_start.numpy()[world])
     mask = np.zeros(width, dtype=bool)
 
-    if solver.is_free_rigid is None:
+    if solver._is_free_rigid is None:
         art_is_free = np.zeros(solver.model.articulation_count, dtype=bool)
     else:
-        art_is_free = solver.is_free_rigid.numpy().astype(np.int32, copy=False) != 0
+        art_is_free = solver._is_free_rigid.numpy().astype(np.int32, copy=False) != 0
 
-    art_to_world = solver.art_to_world.numpy().astype(np.int32, copy=False)
-    art_dof_start = solver.articulation_dof_start.numpy().astype(np.int32, copy=False)
+    art_to_world = solver._art_to_world.numpy().astype(np.int32, copy=False)
+    art_dof_start = solver._articulation_dof_start.numpy().astype(np.int32, copy=False)
     # PR #13 renamed the per-articulation solve-size array (art_size ->
     # articulation_response_dof_count, sourced from the model plan); read the
     # plan's response_dof_count like the surviving solver-side consumers
@@ -406,14 +407,14 @@ def _nonfree_world_dof_mask_and_condition(solver: SolverFeatherPGS, world: int) 
         mask[max(local_start, 0) : min(local_end, width)] = True
 
         size = int(art_size[art])
-        if size <= 0 or size not in solver.L_by_size:
+        if size <= 0 or size not in solver._L_by_size:
             continue
-        group_to_art = solver.group_to_art[size].numpy().astype(np.int32, copy=False)
+        group_to_art = solver._group_to_art[size].numpy().astype(np.int32, copy=False)
         matches = np.where(group_to_art == art)[0]
         if matches.size == 0:
             continue
         group_idx = int(matches[0])
-        L = solver.L_by_size[size].numpy()[group_idx, :size, :size].astype(np.float64, copy=True)
+        L = solver._L_by_size[size].numpy()[group_idx, :size, :size].astype(np.float64, copy=True)
         H = L @ L.T
         try:
             eig = np.linalg.eigvalsh(H)
@@ -582,13 +583,13 @@ def _diagnose_case(
     _run_zero_iteration_setup(model, old_solver, contacts, initial, dt=dt)
     _run_zero_iteration_setup(model, propagation_solver, contacts, initial, dt=dt)
 
-    dense_counts = old_solver.constraint_count.numpy().astype(np.int32, copy=False)
-    propagation_counts = propagation_solver.propagation_constraint_count.numpy().astype(np.int32, copy=False)
+    dense_counts = old_solver._constraint_count.numpy().astype(np.int32, copy=False)
+    propagation_counts = propagation_solver._propagation_constraint_count.numpy().astype(np.int32, copy=False)
     body_to_art, body_to_link, body_is_free = _body_link_maps(propagation_solver)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
 
     results: list[OperatorDiagnosticResult] = []
-    for world in range(old_solver.world_count):
+    for world in range(old_solver._world_count):
         dense_rows = int(dense_counts[world])
         propagation_rows = int(propagation_counts[world])
         if dense_rows == 0 and propagation_rows == 0:
@@ -608,14 +609,14 @@ def _diagnose_case(
         propagation, local_only, propagation_qd = _propagation_operator_columns(propagation_solver, world, source_rows)
         diff = propagation - old
         local_diff = local_only - old
-        width = int(old_solver.world_dof_count.numpy()[world])
-        old_Y = old_solver.Y_world.numpy()[world, :dense_rows, :width].astype(np.float64, copy=True)
+        width = int(old_solver._world_dof_count.numpy()[world])
+        old_Y = old_solver._Y_world.numpy()[world, :dense_rows, :width].astype(np.float64, copy=True)
         old_qd = old_Y[dense_rows_for_propagation[source_rows]].T
         nonfree_qd_mask, mass_condition = _nonfree_world_dof_mask_and_condition(old_solver, world)
         qd_diff = propagation_qd[nonfree_qd_mask] - old_qd[nonfree_qd_mask]
 
-        row_type_old_raw = old_solver.row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        row_parent_old_raw = old_solver.row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_type_old_raw = old_solver._row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_parent_old_raw = old_solver._row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
         old_to_propagation = np.full(dense_rows, -1, dtype=np.int32)
         for propagation_row, dense_row in enumerate(dense_rows_for_propagation):
             old_to_propagation[int(dense_row)] = propagation_row
@@ -624,17 +625,17 @@ def _diagnose_case(
         row_parent_old = np.full_like(row_parent_old_selected, -1)
         parent_mask = row_parent_old_selected >= 0
         row_parent_old[parent_mask] = old_to_propagation[row_parent_old_selected[parent_mask]]
-        row_type_propagation = propagation_solver.propagation_row_type.numpy()[world, :dense_rows].astype(
+        row_type_propagation = propagation_solver._propagation_row_type.numpy()[world, :dense_rows].astype(
             np.int32, copy=True
         )
-        row_parent_propagation = propagation_solver.propagation_row_parent.numpy()[world, :dense_rows].astype(
+        row_parent_propagation = propagation_solver._propagation_row_parent.numpy()[world, :dense_rows].astype(
             np.int32, copy=True
         )
         row_type_mismatch = int(np.count_nonzero(row_type_old != row_type_propagation))
         row_parent_mismatch = int(np.count_nonzero(row_parent_old != row_parent_propagation))
 
-        body_a = propagation_solver.propagation_body_a.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        body_b = propagation_solver.propagation_body_b.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        body_a = propagation_solver._propagation_body_a.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        body_b = propagation_solver._propagation_body_b.numpy()[world, :dense_rows].astype(np.int32, copy=True)
         row_type = row_type_propagation
         worst = _worst_columns(
             diff,
@@ -677,7 +678,7 @@ def _diagnose_case(
                 world=world,
                 rows=dense_rows,
                 rigid_contacts=rigid_contacts,
-                D=int(old_solver.world_dof_count.numpy()[world]),
+                D=int(old_solver._world_dof_count.numpy()[world]),
                 sampled_sources=len(source_rows),
                 all_sources=len(source_rows) == dense_rows,
                 row_alignment_complete=True,

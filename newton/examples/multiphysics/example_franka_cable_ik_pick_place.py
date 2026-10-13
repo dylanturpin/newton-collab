@@ -303,10 +303,10 @@ class Example:
             def rigid_solver(v):
                 return SolverFeatherPGS(
                     v,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=int(args.fpgs_iterations),
+                    solve_mode="matrix_free",
+                    iterations=int(args.fpgs_iterations),
                     enable_joint_limits=True,
-                    dense_max_constraints=64,
+                    articulation_constraint_max=64,
                 )
 
         else:

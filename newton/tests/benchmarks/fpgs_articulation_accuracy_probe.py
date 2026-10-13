@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -47,27 +46,13 @@ import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 PATHS = ("mf_immediate", "propagation")
-CONVERGENCE_KEYS = (
-    "max_delta_lambda",
-    "complementarity_gap",
-    "tangent_residual",
-    "fb_merit",
-)
-NCP_KEYS = (
-    "r_compl",
-    "r_cone",
-    "r_gap",
-    "r_ds_compl",
-    "r_ds_dual",
-    "r_mdp_dir",
-)
 
 
 @dataclass
 class AccuracyResult:
     label: str
     path: str
-    pgs_iterations: int
+    iterations: int
     reference_iterations: int
     friction: bool
     articulations: int
@@ -78,16 +63,6 @@ class AccuracyResult:
     dense_rows_total: int
     mf_rows_total: int
     propagation_rows_total: int
-    final_max_delta_lambda: float
-    final_complementarity_gap: float
-    final_tangent_residual: float
-    final_fb_merit: float
-    final_r_compl: float
-    final_r_cone: float
-    final_r_gap: float
-    final_r_ds_compl: float
-    final_r_ds_dual: float
-    final_r_mdp_dir: float
     self_ref_joint_qd_abs_l2: float
     self_ref_joint_qd_abs_linf: float
     self_ref_body_qd_abs_l2: float
@@ -133,28 +108,25 @@ def _make_solver(
     case: BenchCase,
     path: str,
     *,
-    pgs_iterations: int,
-    pgs_velocity_iterations: int,
+    iterations: int,
+    velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
-    pgs_debug: bool,
 ) -> SolverFeatherPGS:
     dense_capacity, mf_capacity = _solver_capacities(case)
     response_mode = "propagation" if path == "propagation" else "immediate"
     with scalar_hinv_jt():
         return SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=pgs_iterations,
-            pgs_velocity_iterations=pgs_velocity_iterations,
-            enable_contact_friction=enable_contact_friction,
+            iterations=iterations,
+            velocity_iterations=velocity_iterations,
+            contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             contact_friction_position_iterations=contact_friction_position_iterations,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
-            mf_warmstart=False,
-            pgs_debug=pgs_debug,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
 
 
@@ -177,33 +149,11 @@ def _run_one_step(
 
 
 def _count_rows(solver: SolverFeatherPGS) -> tuple[int, int, int]:
-    dense = int(np.sum(solver.constraint_count.numpy()))
-    mf = int(np.sum(solver.mf_constraint_count.numpy()))
-    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    dense = int(np.sum(solver._constraint_count.numpy()))
+    mf = int(np.sum(solver._mf_constraint_count.numpy()))
+    propagation_count_array = getattr(solver, "_propagation_constraint_count", None)
     propagation = 0 if propagation_count_array is None else int(np.sum(propagation_count_array.numpy()))
     return dense, mf, propagation
-
-
-def _last_debug_metrics(solver: SolverFeatherPGS) -> tuple[dict[str, float], dict[str, float]]:
-    if not solver._pgs_convergence_log:
-        return (dict.fromkeys(CONVERGENCE_KEYS, math.nan), dict.fromkeys(NCP_KEYS, math.nan))
-
-    convergence = np.asarray(solver._pgs_convergence_log[-1], dtype=np.float64)
-    if convergence.size == 0:
-        conv = dict.fromkeys(CONVERGENCE_KEYS, math.nan)
-    else:
-        conv = {key: float(convergence[-1, idx]) for idx, key in enumerate(CONVERGENCE_KEYS)}
-
-    if not solver._pgs_ncp_residual_log:
-        ncp = dict.fromkeys(NCP_KEYS, math.nan)
-    else:
-        ncp_log = np.asarray(solver._pgs_ncp_residual_log[-1], dtype=np.float64)
-        if ncp_log.size == 0:
-            ncp = dict.fromkeys(NCP_KEYS, math.nan)
-        else:
-            final = np.max(ncp_log[-1], axis=0)
-            ncp = {key: float(final[idx]) for idx, key in enumerate(NCP_KEYS)}
-    return conv, ncp
 
 
 def _state_delta(prefix: str, value: dict[str, np.ndarray], reference: dict[str, np.ndarray]) -> dict[str, float]:
@@ -247,11 +197,10 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
             model,
             case,
             path,
-            pgs_iterations=args.reference_iterations,
-            pgs_velocity_iterations=args.pgs_velocity_iterations,
+            iterations=args.reference_iterations,
+            velocity_iterations=args.pgs_velocity_iterations,
             enable_contact_friction=not args.no_friction,
             contact_friction_position_iterations=args.contact_friction_position_iterations,
-            pgs_debug=False,
         )
         reference_states[path] = _run_one_step(model, solver, contacts, initial, args.dt)
 
@@ -263,20 +212,18 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 model,
                 case,
                 path,
-                pgs_iterations=iterations,
-                pgs_velocity_iterations=args.pgs_velocity_iterations,
+                iterations=iterations,
+                velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
-                pgs_debug=True,
             )
             final_state = _run_one_step(model, solver, contacts, initial, args.dt)
             dense_rows, mf_rows, propagation_rows = _count_rows(solver)
-            convergence, ncp = _last_debug_metrics(solver)
             states[(path, iterations)] = final_state
             partial[(path, iterations)] = {
                 "label": case.label,
                 "path": path,
-                "pgs_iterations": iterations,
+                "iterations": iterations,
                 "reference_iterations": args.reference_iterations,
                 "friction": not args.no_friction,
                 "articulations": case.articulations,
@@ -287,16 +234,6 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 "dense_rows_total": dense_rows,
                 "mf_rows_total": mf_rows,
                 "propagation_rows_total": propagation_rows,
-                "final_max_delta_lambda": convergence["max_delta_lambda"],
-                "final_complementarity_gap": convergence["complementarity_gap"],
-                "final_tangent_residual": convergence["tangent_residual"],
-                "final_fb_merit": convergence["fb_merit"],
-                "final_r_compl": ncp["r_compl"],
-                "final_r_cone": ncp["r_cone"],
-                "final_r_gap": ncp["r_gap"],
-                "final_r_ds_compl": ncp["r_ds_compl"],
-                "final_r_ds_dual": ncp["r_ds_dual"],
-                "final_r_mdp_dir": ncp["r_mdp_dir"],
                 **_state_delta("self_ref", final_state, reference_states[path]),
                 **_state_delta("mf_ref", final_state, reference_states["mf_immediate"]),
             }
@@ -335,8 +272,8 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
         "",
         "Contacts are generated once and reused for every path. Metrics therefore measure the fixed PGS problem, not long-horizon trajectory divergence.",
         "",
-        "| case | path | iters | rows dense/mf/propagation | final r_compl | final r_cone | final tangent | self-ref qd Linf | MF-ref qd Linf | same-iter MF qd Linf |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| case | path | iters | rows dense/mf/propagation | self-ref qd Linf | MF-ref qd Linf | same-iter MF qd Linf |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
@@ -345,11 +282,8 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
                 [
                     row.label,
                     row.path,
-                    str(row.pgs_iterations),
+                    str(row.iterations),
                     f"{row.dense_rows_total}/{row.mf_rows_total}/{row.propagation_rows_total}",
-                    f"{row.final_r_compl:.6g}",
-                    f"{row.final_r_cone:.6g}",
-                    f"{row.final_tangent_residual:.6g}",
                     f"{row.self_ref_joint_qd_abs_linf:.6g}",
                     f"{row.mf_ref_joint_qd_abs_linf:.6g}",
                     ""

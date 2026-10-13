@@ -1481,9 +1481,13 @@ class ArticulationView:
     # ========================================================================================
     # Generic attribute API
 
-    @staticmethod
-    def _resolve_attribute(name: str, source: Model | State | Control | SolverObservables) -> tuple[wp.array, str]:
+    def _resolve_attribute(
+        self, name: str, source: Model | State | Control | SolverObservables
+    ) -> tuple[wp.array, str]:
         """Return the array currently stored on ``source`` under ``name`` and its frequency name."""
+        is_observable = isinstance(source, SolverObservables)
+        if is_observable and source.model is not self.model:
+            raise ValueError("Solver observables and ArticulationView must use the same model.")
         # handle namespaced attributes like "mujoco.tendon_stiffness"
         # Note: the user-facing API uses dots (e.g., "mujoco.tendon_stiffness")
         # but internally attributes are stored with colons (e.g., "mujoco:tendon_stiffness")
@@ -1509,7 +1513,7 @@ class ArticulationView:
         _slice: Slice | int | None = None,
         layout=None,
     ):
-        """Return the cached reshaped array of ``source.<name>``, rebuilding it if the source array changed.
+        """Return the cached reshaped array of ``source.<name>``, rebuilding it if the source array was replaced.
 
         Entries are keyed weakly on ``source``, so they are dropped with the source and with the view.
         An entry is reused only while ``source.<name>`` and its gradient are the arrays it was built from.
@@ -1540,13 +1544,10 @@ class ArticulationView:
         _slice: Slice | int | None = None,
         layout=None,
     ):
-        is_observable = isinstance(source, SolverObservables)
-        if is_observable and source.model is not self.model:
-            raise ValueError("Solver observables and ArticulationView must use the same model.")
         attrib, frequency_name = self._resolve_attribute(name, source)
 
         # get frequency info
-        frequency_source = source if is_observable else self.model
+        frequency_source = source if isinstance(source, SolverObservables) else self.model
         frequency = frequency_source.get_attribute_frequency(frequency_name)
         if frequency in (AttributeFrequency.CONTACT, AttributeFrequency.CONTACT_RIGID, AttributeFrequency.CONTACT_SOFT):
             raise AttributeError(

@@ -62,6 +62,7 @@ class _Workspace:
     first_pair: wp.array[int]
     lead: wp.array[int]
     coefficient: wp.array[float]
+    radius: wp.array[float]
     spin_row: wp.array[int]
     row_contact: wp.array2d[int]
     spin_source: wp.array2d[int]
@@ -93,7 +94,7 @@ def _gather(
     has_stiffness: int,
     shape_body: wp.array[int],
     supported: wp.array[int],
-    selected: wp.array[int],
+    shape_radius: wp.array[float],
     poses: wp.array[wp.transform],
     row_type: wp.array2d[int],
     parents: wp.array2d[int],
@@ -133,7 +134,7 @@ def _gather(
     b = shape_b[c]
     if a < 0 or b < 0 or a >= shape_body.shape[0] or b >= shape_body.shape[0]:
         return
-    if selected[a] == 0 and selected[b] == 0:
+    if wp.max(shape_radius[a], shape_radius[b]) <= 0.0:
         return
     if supported[a] == 0 or supported[b] == 0:
         return
@@ -196,7 +197,7 @@ def _patch_keys(work: _Workspace):
 
 
 @wp.kernel(enable_backward=False)
-def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
+def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[float], work: _Workspace):
     """Summarize one patch from its head; eligible members precede rejection witnesses."""
     i = wp.tid()
     key = work.patch_keys[i]
@@ -212,12 +213,14 @@ def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
     anchor_count = int(0)
     first_anchor = int(-1)
     touching = int(-1)
+    radius = float(0.0)
     j = i
     while j < capacity and (work.patch_keys[j] >> wp.int64(1)) == patch:
         c = work.patch_indices[j]
         if work.eligible[c] == 1:
             work.group[c] = rep
             work.first_pair[c] = rep
+            radius = wp.max(radius, wp.max(shape_radius[work.shape_a[c]], shape_radius[work.shape_b[c]]))
             if work.anchor[c] != 0:
                 anchor_count += 1
                 if first_anchor < 0:
@@ -234,6 +237,7 @@ def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
     if coefficient <= 0.0:
         return
     work.coefficient[rep] = coefficient
+    work.radius[rep] = radius
     work.lead[rep] = touching
 
 
@@ -306,6 +310,7 @@ def _group_world(
     row_count: wp.array[int],
     row_dropped: wp.array[int],
     mu: wp.array2d[float],
+    shape_radius: wp.array[float],
     work: _Workspace,
 ):
     world = wp.tid()
@@ -356,10 +361,12 @@ def _group_world(
             continue
         first_anchor = int(-1)
         touching = int(-1)
+        radius = float(0.0)
         for j in range(start, end):
             c = work.indices[j]
             if work.group[c] != rep:
                 continue
+            radius = wp.max(radius, wp.max(shape_radius[work.shape_a[c]], shape_radius[work.shape_b[c]]))
             if work.anchor[c] != 0 and first_anchor < 0:
                 first_anchor = c
             if touching < 0 and work.gap[c] <= _TOUCH_TOLERANCE:
@@ -370,6 +377,7 @@ def _group_world(
         if coefficient <= 0.0:
             continue
         work.coefficient[rep] = coefficient
+        work.radius[rep] = radius
         work.lead[rep] = touching
 
     row = row_count[world]
@@ -401,6 +409,7 @@ def _apply_rows(
     target: wp.array2d[float],
     restitution: wp.array2d[float],
     membership: wp.array2d[int],
+    row_radius: wp.array2d[float],
 ):
     c = wp.tid()
     if work.status[0] != 0:
@@ -421,6 +430,7 @@ def _apply_rows(
     mu[world, row] = work.coefficient[rep]
     beta[world, row] = 0.0
     cfm[world, row] = pgs_cfm
+    row_radius[world, row] = work.radius[rep]
     phi[world, row] = 0.0
     restitution[world, row] = 0.0
     velocity = float(0.0)
@@ -531,57 +541,68 @@ class DeviceTorsionPreparation:
             "spin_row",
         ):
             setattr(w, name, wp.empty(self.capacity, dtype=int, device=device))
-        for name in ("gap", "coefficient"):
+        for name in ("gap", "coefficient", "radius"):
             setattr(w, name, wp.empty(self.capacity, dtype=float, device=device))
         for name in ("normal", "point"):
             setattr(w, name, wp.empty(self.capacity, dtype=wp.vec3, device=device))
-        shape = (solver.world_count, solver.dense_max_constraints)
+        shape = (solver._world_count, solver._articulation_constraint_max)
         w.row_contact = wp.full(shape, -1, dtype=int, device=device)
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
-        w.planned_count = wp.zeros(solver.world_count, dtype=int, device=device)
+        w.planned_count = wp.zeros(solver._world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
         w.patch_keys = wp.empty(2 * self.capacity, dtype=wp.int64, device=device)
         w.patch_indices = wp.empty(2 * self.capacity, dtype=int, device=device)
         w.rejected = wp.empty(self.capacity, dtype=int, device=device)
         w.spin_row.fill_(-1)
-        selected = solver._contact_torsion_shape_set
-        self.selected = wp.array(
-            np.array([selected is None or i in selected for i in range(solver.model.shape_count)], dtype=np.int32),
-            dtype=int,
-            device=device,
-        )
         self.supported = wp.array(
             np.isin(solver.model.shape_type.numpy(), _SUPPORTED_TYPES).astype(np.int32), dtype=int, device=device
         )
         self._dummy_stiffness = wp.zeros(1, dtype=float, device=device)
         self._dummy_owner = wp.full(1, -1, dtype=int, device=device)
-        self._dummy_mf_count = wp.zeros(solver.world_count, dtype=int, device=device)
+        self._dummy_mf_count = wp.zeros(solver._world_count, dtype=int, device=device)
         self._saved_state = None
+        self._saved_names = ()
+
+    def allocate_snapshots(self, model):
+        """Allocate the rollback snapshots from the model's counts, so capture needs no eager warm-up."""
+        device = model.device
+        self._saved_state = {
+            "body_q": wp.empty(model.body_count, dtype=wp.transform, device=device),
+            "body_qd": wp.empty(model.body_count, dtype=wp.spatial_vector, device=device),
+            "body_qdd": wp.empty(model.body_count, dtype=wp.spatial_vector, device=device),
+            "joint_q": wp.empty(model.joint_coord_count, dtype=float, device=device),
+            "joint_qd": wp.empty(model.joint_dof_count, dtype=float, device=device),
+        }
 
     def begin_step(self, state_in, state_out):
         """Snapshot dynamic state on-device for fail-stop deferred validation."""
         if not self.deferred_errors:
             return
-        names = ("body_q", "body_qd", "body_qdd", "joint_q", "joint_qd", "particle_q", "particle_qd")
         if self._saved_state is None:
-            if self.solver.model.device.is_cuda and wp.get_stream(self.solver.model.device).is_capturing:
-                raise RuntimeError("Warm up device torsion state buffers before graph capture")
+            if self.solver.model.device.is_capturing:
+                raise RuntimeError("Allocate the device torsion snapshots before graph capture")
             self._saved_state = {
                 name: wp.empty_like(getattr(state_in, name))
-                for name in names
-                if getattr(state_in, name, None) is not None and getattr(state_out, name, None) is not None
+                for name in ("body_q", "body_qd", "body_qdd", "joint_q", "joint_qd")
+                if getattr(state_in, name, None) is not None
             }
+        names = []
         for name, saved in self._saved_state.items():
             source = getattr(state_in, name, None)
             target = getattr(state_out, name, None)
-            if source is None or target is None or source.shape != saved.shape or target.shape != saved.shape:
-                raise ValueError("Device torsion state layout changed; recreate preparation and recapture")
+            if source is None or target is None:
+                continue
+            if source.shape != saved.shape or target.shape != saved.shape:
+                raise ValueError(f"State array {name!r} does not match the model's {name} layout")
             wp.copy(saved, source)
+            names.append(name)
+        self._saved_names = tuple(names)
 
     def end_step(self, state_out):
-        """Prevent invalid captured work from advancing published dynamic state."""
-        if self.deferred_errors and self._saved_state is not None:
-            for name, saved in self._saved_state.items():
+        """Prevent invalid work from advancing published dynamic state."""
+        if self.deferred_errors:
+            for name in self._saved_names:
+                saved = self._saved_state[name]
                 wp.launch(
                     _rollback_state,
                     dim=saved.shape,
@@ -590,11 +611,7 @@ class DeviceTorsionPreparation:
                 )
 
     def validate(self):
-        """Synchronously raise latched errors; mandatory after every deferred replay batch.
-
-        Errors remain latched: recreate the preparation after fixing invalid
-        input rather than clearing evidence and continuing an invalid graph.
-        """
+        """Synchronously raise latched errors; they stay latched until :meth:`clear_status`."""
         status = int(self.work.status.numpy()[0])
         if status & 1:
             raise RuntimeError("Contact input overflow before contact torsion")
@@ -606,6 +623,10 @@ class DeviceTorsionPreparation:
             raise RuntimeError("Experimental torsion row capacity exceeded; refusing dropped work")
         if status & 16:
             raise RuntimeError("Persistent friction patch load ring does not match its contact torsion group")
+
+    def clear_status(self):
+        """Clear the latched errors on the device; a recurring cause latches again on the next step."""
+        self.work.status.zero_()
 
     def prepare(self, state, augmented_state, contacts):
         """Build rows entirely on device, followed by optional scalar error readback."""
@@ -631,11 +652,11 @@ class DeviceTorsionPreparation:
                 contacts.rigid_contact_count,
                 self.capacity,
                 contacts.rigid_contact_max,
-                s.world_count,
-                s.contact_path,
-                s.contact_slot,
-                s.contact_world,
-                s.contact_slots_needed,
+                s._world_count,
+                s._contact_path,
+                s._contact_slot,
+                s._contact_world,
+                s._contact_slots_needed,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
                 contacts.rigid_contact_normal,
@@ -647,11 +668,11 @@ class DeviceTorsionPreparation:
                 int(stiffness is not None),
                 s.model.shape_body,
                 self.supported,
-                self.selected,
+                s._contact_torsion_shape_radius,
                 state.body_q,
-                s.row_type,
-                s.row_parent,
-                s.constraint_count,
+                s._row_type,
+                s._row_parent,
+                s._constraint_count,
                 int(patches),
                 s._friction_patches.current.owner if patches else self._dummy_owner,
                 w,
@@ -663,30 +684,36 @@ class DeviceTorsionPreparation:
             wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
             # Stable sort keeps contact order inside each patch segment.
             wp.utils.radix_sort_pairs(w.patch_keys, w.patch_indices, self.capacity)
-            wp.launch(_group_patches, dim=self.capacity, inputs=[self.capacity, s.row_mu, w], device=device)
+            wp.launch(
+                _group_patches,
+                dim=self.capacity,
+                inputs=[self.capacity, s._row_mu, s._contact_torsion_shape_radius, w],
+                device=device,
+            )
             wp.launch(
                 _check_patch_membership,
                 dim=self.capacity,
-                inputs=[s.dense_max_constraints, s.row_parent, w],
+                inputs=[s._articulation_constraint_max, s._row_parent, w],
                 device=device,
             )
             wp.launch(
                 _emit_patches,
-                dim=s.world_count,
-                inputs=[self.capacity, s.dense_max_constraints, s.constraint_count, s._row_dropped_dense, w],
+                dim=s._world_count,
+                inputs=[self.capacity, s._articulation_constraint_max, s._constraint_count, s._row_dropped_dense, w],
                 device=device,
             )
         else:
             wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
             wp.launch(
                 _group_world,
-                dim=s.world_count,
+                dim=s._world_count,
                 inputs=[
                     self.capacity,
-                    s.dense_max_constraints,
-                    s.constraint_count,
+                    s._articulation_constraint_max,
+                    s._constraint_count,
                     s._row_dropped_dense,
-                    s.row_mu,
+                    s._row_mu,
+                    s._contact_torsion_shape_radius,
                     w,
                 ],
                 device=device,
@@ -698,60 +725,62 @@ class DeviceTorsionPreparation:
             dim=self.capacity,
             inputs=[
                 w,
-                s.pgs_cfm,
-                s.body_to_articulation,
+                s._cfm,
+                s._body_to_articulation,
                 s._prescribed_articulation,
-                augmented_state.body_v_s,
-                s.row_type,
-                s.row_parent,
-                s.row_mu,
-                s.row_beta,
-                s.row_cfm,
-                s.phi,
-                s.target_velocity,
-                s.row_restitution,
+                augmented_state._body_v_s,
+                s._row_type,
+                s._row_parent,
+                s._row_mu,
+                s._row_beta,
+                s._row_cfm,
+                s._phi,
+                s._target_velocity,
+                s._row_restitution,
                 s._contact_torsion_group,
+                s._torsion_row_radius,
             ],
             device=device,
         )
-        for size, jacobian in s.J_by_size.items():
+        for size, jacobian in s._J_by_size.items():
             wp.launch(
                 _jacobians,
                 dim=jacobian.shape,
                 inputs=[
                     w,
-                    s.group_to_art[size],
-                    s.art_to_world,
-                    s.articulation_dof_start,
-                    s.body_to_articulation,
-                    s.body_to_joint,
+                    s._group_to_art[size],
+                    s._art_to_world,
+                    s._articulation_dof_start,
+                    s._body_to_articulation,
+                    s._body_to_joint,
                     s._prescribed_articulation,
                     s.model.joint_ancestor,
                     s.model.joint_qd_start,
-                    augmented_state.joint_S_s,
+                    augmented_state._joint_S_s,
                     jacobian,
                 ],
                 device=device,
             )
         wp.launch(
             _apply_counts,
-            dim=s.world_count,
-            inputs=[w, s.constraint_count, s.slot_counter, getattr(s, "mf_constraint_count", self._dummy_mf_count)],
+            dim=s._world_count,
+            inputs=[w, s._constraint_count, s._slot_counter, getattr(s, "_mf_constraint_count", self._dummy_mf_count)],
             device=device,
         )
 
 
-def enable_device_torsion(solver):
-    """Opt into the local experimental port without changing the host default.
+def enable_device_torsion(solver, *, deferred_errors=False):
+    """Prepare the solver's torsion rows on the device.
 
-    The caller must invoke ``solver._device_torsion.validate()`` after every
-    deferred replay batch before consuming results. Invalid input latches a
-    permanent error and rolls back the published dynamic state; recreate the
-    solver after fixing the input instead of reusing an invalid captured graph.
-    Warm up one eager step before capturing, to allocate rollback buffers.
+    With ``deferred_errors``, invalid input latches an error and rolls back the published dynamic
+    state of the failing step instead of raising during preparation.
     """
+    if not solver._contact_torsion_enabled:
+        raise ValueError("Give a shape a positive feather_pgs:min_torsional_patch_radius before device preparation")
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Configure device torsion before CUDA graph capture")
-    solver._device_torsion = DeviceTorsionPreparation(solver)
+    solver._device_torsion = DeviceTorsionPreparation(solver, deferred_errors=deferred_errors)
+    if deferred_errors:
+        solver._device_torsion.allocate_snapshots(solver.model)
     solver._torsion_stats = {"device_resident": True, "rows": None, "groups": None}
     return solver._device_torsion
