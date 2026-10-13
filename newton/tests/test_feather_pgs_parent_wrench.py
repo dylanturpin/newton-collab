@@ -495,7 +495,7 @@ def test_parent_wrench_excludes_velocity_limit_prescaling(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     hub = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
     hub_joint = builder.add_joint_revolute(-1, hub, axis=(0.0, 0.0, 1.0))
-    disk = builder.add_link(mass=1.0, inertia=wp.mat33(np.diag([0.01, 0.01, 0.02])), lock_inertia=True)
+    disk = builder.add_link(mass=1.0, inertia=wp.mat33(np.diag([0.015, 0.015, 0.02])), lock_inertia=True)
     disk_joint = builder.add_joint_revolute(
         hub,
         disk,
