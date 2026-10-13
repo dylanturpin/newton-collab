@@ -1950,34 +1950,354 @@ def _compute_body_net_wrench(
 
 
 @wp.kernel
-def compute_body_parent_f(
+def subtract_arrays(a: wp.array[float], b: wp.array[float], out: wp.array[float]):
+    i = wp.tid()
+    out[i] = a[i] - b[i]
+
+
+@wp.func
+def _add_point_force(
+    body: int,
+    force: wp.vec3,
+    point: wp.vec3,
     body_to_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
-    body_fb_s: wp.array[wp.spatial_vector],
-    body_ft_s: wp.array[wp.spatial_vector],
-    body_f_ext: wp.array[wp.spatial_vector],
-    body_flags: wp.array[wp.int32],
+    body_wrench: wp.array[wp.spatial_vector],
+):
+    if body >= 0:
+        origin = wp.vec3()
+        if body_to_articulation[body] >= 0:
+            origin = articulation_origin[body_to_articulation[body]]
+        wp.atomic_add(body_wrench, body, wp.spatial_vector(force, wp.cross(point - origin, force)))
+
+
+@wp.kernel
+def accumulate_contact_wrenches_from_impulses(
+    contact_count: wp.array[wp.int32],
+    rigid_contact_max: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    contact_shared_anchor: int,
+    contact_friction_shared_anchor: int,
+    friction_patches: FrictionPatches,
+    inv_dt: float,
+    # outputs
+    body_contact_wrench: wp.array[wp.spatial_vector],
+    dense_slot_contact: wp.array2d[int],
+):
+    """Add each contact's solved force on its two bodies at the points its rows act on.
+
+    Wrenches are world-frame force and torque about the body's articulation origin. Dense contacts
+    also record their contact index at their normal slot for the torsion rows that refer to it.
+    """
+    c = wp.tid()
+    if c >= wp.min(contact_count[0], rigid_contact_max):
+        return
+    lam = contact_row_impulses(
+        c,
+        contact_world,
+        contact_slot,
+        contact_path,
+        world_impulses,
+        mf_impulses,
+        propagation_impulses,
+        world_constraint_count,
+        mf_constraint_count,
+        propagation_constraint_count,
+        world_row_type,
+        world_row_parent,
+        mf_row_type,
+        mf_row_parent,
+        propagation_row_type,
+        propagation_row_parent,
+    )
+    slot = contact_slot[c]
+    angular = wp.vec3(0.0)
+    if contact_path[c] == 0 and slot >= 0:
+        world = contact_world[c]
+        dense_slot_contact[world, slot] = c
+        # Torsional/rolling rows about the normal and both tangents follow a dense contact's sliding pair.
+        if slot + 5 < world_constraint_count[world]:
+            angular_rows = int(1)
+            for k in range(3):
+                row = slot + 3 + k
+                if (
+                    world_row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+                    or world_row_parent[world, row] != slot
+                ):
+                    angular_rows = 0
+            if angular_rows != 0:
+                angular = wp.vec3(
+                    world_impulses[world, slot + 3], world_impulses[world, slot + 4], world_impulses[world, slot + 5]
+                )
+    if (
+        lam[0] == 0.0
+        and lam[1] == 0.0
+        and lam[2] == 0.0
+        and angular[0] == 0.0
+        and angular[1] == 0.0
+        and angular[2] == 0.0
+    ):
+        return
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+    # The rows act along the B-to-A normal at the same points the row builders use.
+    normal = -contact_normal[c]
+    point_a = contact_point0[c]
+    point_b = contact_point1[c]
+    if body_a >= 0:
+        point_a = wp.transform_point(body_q[body_a], point_a)
+    if body_b >= 0:
+        point_b = wp.transform_point(body_q[body_b], point_b)
+    point_a = point_a - contact_thickness0[c] * normal
+    point_b = point_b + contact_thickness1[c] * normal
+    anchor = 0.5 * (point_a + point_b)
+    normal_a = point_a
+    normal_b = point_b
+    if contact_shared_anchor != 0:
+        normal_a = anchor
+        normal_b = anchor
+    friction_a = point_a
+    friction_b = point_b
+    if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+        friction_a = anchor
+        friction_b = anchor
+    if friction_patches.enabled != 0:
+        friction_a = friction_patches.point_a[c]
+        friction_b = friction_patches.point_b[c]
+    normal_force = lam[0] * inv_dt * normal
+    tangent0, tangent1 = contact_tangent_basis(normal)
+    friction_force = (lam[1] * tangent0 + lam[2] * tangent1) * inv_dt
+    _add_point_force(body_a, normal_force, normal_a, body_to_articulation, articulation_origin, body_contact_wrench)
+    _add_point_force(body_b, -normal_force, normal_b, body_to_articulation, articulation_origin, body_contact_wrench)
+    _add_point_force(body_a, friction_force, friction_a, body_to_articulation, articulation_origin, body_contact_wrench)
+    _add_point_force(
+        body_b, -friction_force, friction_b, body_to_articulation, articulation_origin, body_contact_wrench
+    )
+    torque = (angular[0] * normal + angular[1] * tangent0 + angular[2] * tangent1) * inv_dt
+    if body_a >= 0:
+        wp.atomic_add(body_contact_wrench, body_a, wp.spatial_vector(wp.vec3(0.0), torque))
+    if body_b >= 0:
+        wp.atomic_add(body_contact_wrench, body_b, wp.spatial_vector(wp.vec3(0.0), -torque))
+
+
+@wp.kernel
+def accumulate_torsion_wrenches_from_impulses(
+    world_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    dense_slot_contact: wp.array2d[int],
+    contact_count: wp.array[wp.int32],
+    rigid_contact_max: int,
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_body: wp.array[int],
+    inv_dt: float,
+    # outputs
+    body_contact_wrench: wp.array[wp.spatial_vector],
+):
+    """Add each solved spin row's torque about its lead contact's normal to the contact's bodies."""
+    world, row = wp.tid()
+    if row >= world_constraint_count[world] or world_row_type[world, row] != PGS_CONSTRAINT_TYPE_TORSION:
+        return
+    lead = world_row_parent[world, row]
+    if lead < 0:
+        return
+    c = dense_slot_contact[world, lead]
+    # The map is never cleared, so confirm the entry belongs to this step's lead contact.
+    if c < 0 or c >= wp.min(contact_count[0], rigid_contact_max):
+        return
+    if contact_path[c] != 0 or contact_world[c] != world or contact_slot[c] != lead:
+        return
+    torque = world_impulses[world, row] * inv_dt * (-contact_normal[c])
+    if contact_shape0[c] >= 0 and shape_body[contact_shape0[c]] >= 0:
+        wp.atomic_add(body_contact_wrench, shape_body[contact_shape0[c]], wp.spatial_vector(wp.vec3(0.0), torque))
+    if contact_shape1[c] >= 0 and shape_body[contact_shape1[c]] >= 0:
+        wp.atomic_add(body_contact_wrench, shape_body[contact_shape1[c]], wp.spatial_vector(wp.vec3(0.0), -torque))
+
+
+@wp.kernel
+def accumulate_connect_wrenches_from_impulses(
+    connect_slot: wp.array[wp.int32],
+    connect_art: wp.array[wp.int32],
+    connect_body_p: wp.array[wp.int32],
+    connect_body_c: wp.array[wp.int32],
+    connect_joint: wp.array[wp.int32],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    connect_row_inv_norm: wp.array2d[float],
+    art_to_world: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_to_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    world_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    inv_dt: float,
+    # outputs
+    body_contact_wrench: wp.array[wp.spatial_vector],
+):
+    """Add each loop closure's solved point-coincidence force to its parent and child bodies.
+
+    The rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse maps
+    back to a force along ``e_k`` at each anchor.
+    """
+    k = wp.tid()
+    base_slot = connect_slot[k]
+    if base_slot < 0:
+        return
+    world = art_to_world[connect_art[k]]
+    body_p = connect_body_p[k]
+    body_c = connect_body_c[k]
+    joint = connect_joint[k]
+    anchor_p = wp.transform_get_translation(joint_X_p[joint])
+    p_a = anchor_p
+    if body_p >= 0:
+        p_a = wp.transform_point(body_q[body_p], anchor_p)
+    p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
+    for axis_index in range(3):
+        slot = base_slot + axis_index
+        if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
+            continue
+        inv_norm = connect_row_inv_norm[k, axis_index]
+        if inv_norm == 0.0:
+            continue
+        axis = wp.vec3(0.0)
+        axis[axis_index] = 1.0
+        force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
+        _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
+
+
+@wp.kernel
+def zero_unattached_parent_wrenches(
+    body_to_articulation: wp.array[int],
     # outputs
     body_parent_f: wp.array[wp.spatial_vector],
 ):
-    """Publish the inverse-dynamics wrench transmitted through each body's inbound joint.
-
-    The backward pass leaves the net wrench of a body's subtree, referenced to the
-    articulation origin, in ``body_fb_s + body_ft_s - f_ext``. Translate it to the body's
-    center of mass in world frame (linear force first, torque second).
-    """
+    """Bodies outside every articulation have no inbound joint and transmit nothing."""
     body = wp.tid()
-    articulation = body_to_articulation[body]
-    if articulation < 0:
+    if body_to_articulation[body] < 0:
         body_parent_f[body] = wp.spatial_vector()
+
+
+@wp.kernel
+def eval_post_solve_parent_wrenches(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    joint_qdd: wp.array[float],
+    prescale: wp.array[float],
+    inv_dt: float,
+    body_fb_s: wp.array[wp.spatial_vector],
+    body_f_ext: wp.array[wp.spatial_vector],
+    body_contact_wrench: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    articulation_origin: wp.array[wp.vec3],
+    articulation_active: wp.array[int],
+    # scratch
+    body_a_s: wp.array[wp.spatial_vector],
+    body_ft_s: wp.array[wp.spatial_vector],
+    # outputs
+    body_parent_f: wp.array[wp.spatial_vector],
+):
+    """Publish each body's incoming joint wrench consistent with the step's solved accelerations.
+
+    Inverse dynamics runs with the post-solve acceleration, measured from the velocities the
+    dynamics start from (``prescale`` holds what velocity-limit prescaling removed), on top of
+    the start-of-step bias wrench ``body_fb_s``, and subtracts the applied and solved contact
+    wrenches, so the result includes joint drives, limits and every contact impulse on the subtree.
+    """
+    articulation = wp.tid()
+    if articulation_active[articulation] == 0:
         return
+    start = articulation_start[articulation]
+    end = articulation_joint_end[articulation]
     origin = articulation_origin[articulation]
-    f_s = _compute_body_net_wrench(body, body_ft_s[body], origin, body_fb_s, body_f_ext, body_flags, body_q, body_com)
-    force = wp.spatial_top(f_s)
-    com_rel = wp.transform_point(body_q[body], body_com[body]) - origin
-    body_parent_f[body] = wp.spatial_vector(force, wp.spatial_bottom(f_s) - wp.cross(com_rel, force))
+    for i in range(start, end):
+        parent = joint_parent[i]
+        child = joint_child[i]
+        a_s = wp.spatial_vector()
+        if parent >= 0:
+            a_s = body_a_s[parent]
+        dof_start = joint_qd_start[i]
+        for dof in range(dof_start, dof_start + joint_dof_dim[i, 0] + joint_dof_dim[i, 1]):
+            qdd = joint_qdd[dof]
+            if prescale:
+                qdd += prescale[dof] * inv_dt
+            a_s += joint_S_s[dof] * qdd
+        body_a_s[child] = a_s
+        body_ft_s[child] = wp.spatial_vector()
+    for offset in range(end - start):
+        i = end - offset - 1
+        parent = joint_parent[i]
+        child = joint_child[i]
+        X_wb = body_q[child]
+        com_world = wp.transform_point(X_wb, body_com[child])
+        com_rel = com_world - origin
+        mass = body_mass[child]
+        com, inertia_origin = transform_com_inertia_terms(
+            wp.transform(com_rel, wp.transform_get_rotation(X_wb)), mass, body_inertia[child]
+        )
+        f_s = _compute_body_net_wrench(
+            child,
+            body_ft_s[child]
+            + mul_com_spatial_inertia(mass, com, inertia_origin, body_a_s[child])
+            - body_contact_wrench[child],
+            origin,
+            body_fb_s,
+            body_f_ext,
+            body_flags,
+            body_q,
+            body_com,
+        )
+        if parent >= 0:
+            body_ft_s[parent] = body_ft_s[parent] + f_s
+        force = wp.spatial_top(f_s)
+        body_parent_f[child] = wp.spatial_vector(force, wp.spatial_bottom(f_s) - wp.cross(com_rel, force))
 
 
 @wp.func
@@ -2880,9 +3200,8 @@ def _is_sliding_row_type(row_type: int):
 
 
 @wp.func
-def contact_linear_force_from_impulses(
+def contact_row_impulses(
     c: int,
-    contact_normal: wp.array[wp.vec3],
     contact_world: wp.array[wp.int32],
     contact_slot: wp.array[wp.int32],
     contact_path: wp.array[wp.int32],
@@ -2898,26 +3217,18 @@ def contact_linear_force_from_impulses(
     mf_row_parent: wp.array2d[wp.int32],
     propagation_row_type: wp.array2d[wp.int32],
     propagation_row_parent: wp.array2d[wp.int32],
-    inv_dt: float,
 ):
-    """Return the world-frame force on shape 0's body from contact ``c``'s solved impulses.
+    """Return contact ``c``'s solved normal and two friction impulses [N·s].
 
-    Contacts whose rows were dropped report zero; contacts without friction rows report their normal force only.
+    Contacts whose rows were dropped report zero; contacts without friction rows report their normal impulse only.
     """
-    force = wp.vec3(0.0)
+    lam_n = 0.0
+    lam_t0 = 0.0
+    lam_t1 = 0.0
     slot = contact_slot[c]
     path = contact_path[c]
-
-    if slot >= 0 and path >= 0 and inv_dt > 0.0:
+    if slot >= 0 and path >= 0:
         world = contact_world[c]
-        # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
-        # solves along the opposite direction internally, which corresponds to the
-        # force on shape/body 0 from shape/body 1.
-        normal = -contact_normal[c]
-
-        lam_n = 0.0
-        lam_t0 = 0.0
-        lam_t1 = 0.0
         if path == 0:
             lam_n = world_impulses[world, slot]
             count = world_constraint_count[world]
@@ -2954,10 +3265,61 @@ def contact_linear_force_from_impulses(
             ):
                 lam_t0 = propagation_impulses[world, slot + 1]
                 lam_t1 = propagation_impulses[world, slot + 2]
+    return wp.vec3(lam_n, lam_t0, lam_t1)
 
-        force = lam_n * normal
+
+@wp.func
+def contact_linear_force_from_impulses(
+    c: int,
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    inv_dt: float,
+):
+    """Return the world-frame force on shape 0's body from contact ``c``'s solved impulses.
+
+    Contacts whose rows were dropped report zero; contacts without friction rows report their normal force only.
+    """
+    force = wp.vec3(0.0)
+    if inv_dt > 0.0:
+        lam = contact_row_impulses(
+            c,
+            contact_world,
+            contact_slot,
+            contact_path,
+            world_impulses,
+            mf_impulses,
+            propagation_impulses,
+            world_constraint_count,
+            mf_constraint_count,
+            propagation_constraint_count,
+            world_row_type,
+            world_row_parent,
+            mf_row_type,
+            mf_row_parent,
+            propagation_row_type,
+            propagation_row_parent,
+        )
+        # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
+        # solves along the opposite direction internally, which corresponds to the
+        # force on shape/body 0 from shape/body 1.
+        normal = -contact_normal[c]
+        force = lam[0] * normal
         tangent0, tangent1 = contact_tangent_basis(normal)
-        force += lam_t0 * tangent0 + lam_t1 * tangent1
+        force += lam[1] * tangent0 + lam[2] * tangent1
         force *= inv_dt
     return force
 
@@ -3808,6 +4170,7 @@ def populate_connect_J_for_size(
     world_row_cfm: wp.array2d[float],
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
+    connect_row_inv_norm: wp.array2d[float],
 ):
     """Populate Jacobian and metadata for connect (loop-closure) rows.
 
@@ -3907,6 +4270,7 @@ def populate_connect_J_for_size(
             for d in range(n_dofs):
                 norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
             phi_axis = delta[axis]
+            inv_norm = float(0.0)
             if norm_sq > 1.0e-8:
                 inv_norm = 1.0 / wp.sqrt(norm_sq)
                 for d in range(n_dofs):
@@ -3918,6 +4282,8 @@ def populate_connect_J_for_size(
                     J_group[group_idx, slot, d] = 0.0
                 phi_axis = 0.0
                 target = 0.0
+            # The joint wrench maps solved impulses back to forces with this exact scale.
+            connect_row_inv_norm[k, axis] = inv_norm
 
             world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
             world_row_parent[world, slot] = -1

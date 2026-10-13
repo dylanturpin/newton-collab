@@ -28,7 +28,11 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
-from newton.tests.feather_pgs._fixtures import _build_sparse_contact_friction_model, set_torsion_radius
+from newton.tests.feather_pgs._fixtures import (
+    _build_sparse_contact_friction_model,
+    _sphere_on_ground,
+    set_torsion_radius,
+)
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 from newton.tests.unittest_utils import (
     StdOutCapture,
@@ -778,30 +782,6 @@ def test_friction_slides_at_the_coulomb_bound(test, device, solve_mode="matrix_f
 
 
 ARMATURE = (9.0, 4.0, 2.0, 0.5, 1.5, 3.0)
-
-
-def _sphere_on_ground(device, armature, dense, com=(0.0, 0.0, 0.0), mu=0.0):
-    """A 1 kg sphere on a free joint, optionally with a massless fixed child that routes it to dense rows."""
-    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    body = builder.add_link(
-        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity()),
-        mass=1.0,
-        com=wp.vec3(com),
-        inertia=wp.mat33(np.eye(3) * 0.01),
-    )
-    joints = [builder.add_joint_free(body)]
-    if dense:
-        child = builder.add_link(mass=0.0, inertia=wp.mat33(0.0))
-        joints.append(builder.add_joint_fixed(body, child))
-    builder.add_articulation(joints)
-    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=mu)
-    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
-    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
-    model = builder.finalize(device=device)
-    joint_armature = model.joint_armature.numpy()
-    joint_armature[:6] = armature
-    model.joint_armature.assign(joint_armature)
-    return model
 
 
 def _impact(model, solver, joint_qd):

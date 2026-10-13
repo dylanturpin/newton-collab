@@ -98,11 +98,14 @@ from .kernels import (
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_articulation_tau,
+    accumulate_connect_wrenches_from_impulses,
     accumulate_contact_watermark,
+    accumulate_contact_wrenches_from_impulses,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
+    accumulate_torsion_wrenches_from_impulses,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -134,7 +137,6 @@ from .kernels import (
     clear_sparse_diagonal_response_prefix,
     collect_propagation_units,
     compact_local_pair_candidates,
-    compute_body_parent_f,
     compute_com_transforms,
     compute_compact_diagonal_inverse_mass,
     compute_composite_inertia,
@@ -161,6 +163,7 @@ from .kernels import (
     delassus_par_row_col,
     diag_from_JY_par_art,
     diag_from_JY_world,
+    eval_post_solve_parent_wrenches,
     eval_rigid_fk_id,
     eval_rigid_fk_kinematics,
     eval_rigid_tau,
@@ -230,11 +233,13 @@ from .kernels import (
     snapshot_warmstart_history,
     solve_compact_diagonal_mass,
     solve_diagonal_mass,
+    subtract_arrays,
     trisolve_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
     warmstart_dt_scale,
+    zero_unattached_parent_wrenches,
 )
 from .sleeping import _SleepState
 from .sparse_contact import (
@@ -1351,14 +1356,48 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :attr:`~newton.solvers.SolverObservables.body_parent_f` is populated when
         :attr:`~newton.solvers.SolverObservableFlags.BODY_PARENT_F` is requested from
         :meth:`~newton.solvers.SolverBase.observables`, or when the deprecated
-        :attr:`~newton.State.body_parent_f` is allocated. As in
-        :class:`~newton.solvers.SolverFeatherstone`, it is the per-body net spatial wrench of
-        the inverse-dynamics backward pass at the start of the step, translated to the body's
-        center of mass (linear force [N] first, torque [N·m] second, world frame). It does not
-        include constraint or contact impulses of the step: joint limits, joint friction,
-        mimic and loop-closure rows, and PGS drive rows are not part of it. With sleeping
-        enabled the solver computes the wrench every step into its own history, so a sleeping
-        body reports its last awake wrench in whichever output the caller passes.
+        :attr:`~newton.State.body_parent_f` is allocated. It is the wrench the parent applies to
+        each body through its inbound joint, accounted from the step's solved motion: inverse
+        dynamics with the post-solve joint accelerations (taken from the velocities the dynamics
+        start from, after any velocity-limit prescaling), less gravity,
+        :attr:`~newton.State.body_f`, and the solved impulses divided by ``dt`` of the subtree's
+        contact normal, friction, spin, torsional and rolling rows and its loop-closure rows.
+        Linear force [N] first, torque [N·m] about the body's center of mass second, world frame.
+        Joint-space rows (drives, limits, joint friction, mimic) enter through the accelerations.
+        Bodies outside every articulation report zero.
+
+        The reconstruction is rigid-body inverse dynamics: it uses the bodies' mass and inertia,
+        not :attr:`~newton.Model.joint_armature`, which the solve adds to the joint-space inertia.
+        For a dynamic DOF, the wrench projected onto the joint's motion subspace (in matching
+        frames) is therefore the DOF's generalized load, :attr:`~newton.Control.joint_f` plus its
+        explicit passive spring and damping forces and its joint-space rows, less
+        ``armature * qdd``, where ``qdd`` is the solver's integration acceleration. For example,
+        a revolute joint driven by 10 N·m with armature 9 kg·m² on a body of axial inertia
+        1 kg·m² reports 1 N·m about the axis.
+        :class:`~newton.solvers.SolverMuJoCo` reconstructs MuJoCo's ``cfrc_int`` the same way.
+        Kinematic DOFs are held by a large internal armature that is not part of the wrench, and
+        their ``qdd`` is zero. They report the rigid-body load of carrying their subtree along the
+        prescribed motion, such as the weight moment of a held arm.
+
+        The accounting has these limits:
+
+        - With ``enable_bilateral_preelimination`` the loop-closure reactions are not stored and
+          are left out; requesting the wrench warns once.
+        - A body whose inbound joint is FREE reports the residual of its discrete momentum
+          balance: its FREE ``joint_f`` less ``armature * qdd``, in the solver's FREE coordinates.
+          Without ``joint_f`` it is ``-armature * qdd``, so a body pushed through
+          :attr:`~newton.State.body_f` or stopped by contact reports a nonzero wrench when its
+          FREE joint has armature; with neither, its force part is zero up to solver tolerance.
+          For a moving FREE body ``qdd`` differs from the change of ``joint_qd`` over ``dt`` by a
+          velocity-product transport term. The stabilized gyroscopic update of single-body FREE
+          articulations is not the inverse dynamics' ``v x* (I v)`` term, so a spinning body with
+          anisotropic inertia can also report a torque residual.
+        - Coupled-solver forces that do not arrive through :attr:`~newton.State.body_f` are not
+          included.
+        - Contact wrenches are summed with atomics, so the last bits can differ run to run.
+
+        With sleeping enabled the solver computes the wrench every step into its own history, so
+        a sleeping body reports its last awake wrench in whichever output the caller passes.
 
         :attr:`~newton.solvers.SolverObservables.contact_f` is populated when
         :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` is requested. Each live rigid
@@ -2593,7 +2632,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._fk_id_cache = None
         # Per-entity dynamics activity; sleeping clears the entries of islands that sleep through a step.
         self._dynamics_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
-        self._parent_wrench_scratch: tuple[wp.array, wp.array] | None = None
+        self._parent_wrench_scratch: tuple[wp.array, ...] | None = None
+        self._parent_wrench_request: tuple[wp.array, Contacts | None, wp.array | None] | None = None
+        self._parent_wrench_prescale: wp.array | None = None
+        self._parent_wrench_preelim_warned = False
         self._dynamics_art_mask = wp.ones(model.articulation_count, dtype=wp.bool, device=model.device)
         self._dynamics_joint_active = wp.ones(model.joint_count, dtype=wp.int32, device=model.device)
         self._dynamics_dof_active = wp.ones(model.joint_dof_count, dtype=wp.int32, device=model.device)
@@ -4552,6 +4594,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 3), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
@@ -9269,14 +9312,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
         return state_out
 
-    def _compute_parent_wrenches(
-        self, state_in: State, state_aug: State, control: Control, body_parent_f: wp.array
-    ) -> None:
-        """Write each body's inverse-dynamics joint wrench at the start of the step.
+    def _compute_parent_wrenches(self, state_in: State, state_aug: State, dt: float) -> None:
+        """Write each body's incoming joint wrench consistent with the step's solved velocities.
 
-        Runs its own backward pass into solver scratch, so every stage-1 inverse-dynamics path
-        (tree, direct-branch, asynchronous) reports the same wrench.
+        Must run once ``joint_qdd`` holds the post-solve acceleration and before stage 7 publishes
+        the next step's kinematics over the start-of-step motion subspaces.
         """
+        request = self._parent_wrench_request
+        if request is None:
+            return
+        self._parent_wrench_request = None
+        body_parent_f, contacts, prescale = request
         model = self.model
         if not model.articulation_count:
             body_parent_f.zero_()
@@ -9284,56 +9330,126 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._parent_wrench_scratch is None:
             self._parent_wrench_scratch = (
                 wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
-                wp.zeros(max(model.joint_dof_count, 1), dtype=float, device=model.device),
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.full(
+                    (self._world_count, max(self._articulation_constraint_max, 1)), -1, dtype=int, device=model.device
+                ),
             )
-        body_ft_s, joint_tau = self._parent_wrench_scratch
-        body_ft_s.zero_()
-        body_f = state_in.body_f if state_in.body_count else None
+        contact_wrench, body_a_s, body_ft_s, dense_slot_contact = self._parent_wrench_scratch
+        contact_wrench.zero_()
+        inv_dt = 1.0 / dt
+        if contacts is not None and contacts.rigid_contact_max:
+            wp.launch(
+                accumulate_contact_wrenches_from_impulses,
+                dim=min(contacts.rigid_contact_max, self._max_contacts_alloc),
+                inputs=[
+                    contacts.rigid_contact_count,
+                    min(contacts.rigid_contact_max, self._max_contacts_alloc),
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    model.shape_body,
+                    state_in.body_q,
+                    self._body_to_articulation,
+                    self._articulation_origin,
+                    *self._contact_force_inputs(contacts, inv_dt)[2:-1],
+                    1 if self._contact_shared_anchor else 0,
+                    1 if self._contact_friction_shared_anchor else 0,
+                    self._friction_patches.view,
+                    inv_dt,
+                ],
+                outputs=[contact_wrench, dense_slot_contact],
+                device=model.device,
+            )
+            if self._contact_torsion_enabled:
+                wp.launch(
+                    accumulate_torsion_wrenches_from_impulses,
+                    dim=dense_slot_contact.shape,
+                    inputs=[
+                        self._constraint_count,
+                        self._row_type,
+                        self._row_parent,
+                        self._impulses,
+                        dense_slot_contact,
+                        contacts.rigid_contact_count,
+                        min(contacts.rigid_contact_max, self._max_contacts_alloc),
+                        self._contact_world,
+                        self._contact_slot,
+                        self._contact_path,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        model.shape_body,
+                        inv_dt,
+                    ],
+                    outputs=[contact_wrench],
+                    device=model.device,
+                )
+        if self._connect_count and self._connect_slot is not None:
+            wp.launch(
+                accumulate_connect_wrenches_from_impulses,
+                dim=self._connect_count,
+                inputs=[
+                    self._connect_slot,
+                    self._connect_art,
+                    self._connect_body_p,
+                    self._connect_body_c,
+                    self._connect_joint,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    self._connect_row_inv_norm,
+                    self._art_to_world,
+                    state_in.body_q,
+                    self._body_to_articulation,
+                    self._articulation_origin,
+                    self._constraint_count,
+                    self._row_type,
+                    self._impulses,
+                    inv_dt,
+                ],
+                outputs=[contact_wrench],
+                device=model.device,
+            )
         wp.launch(
-            eval_rigid_tau,
+            eval_post_solve_parent_wrenches,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
                 self._articulation_joint_end,
-                model.joint_type,
                 model.joint_parent,
                 model.joint_child,
-                model.joint_articulation,
                 model.joint_qd_start,
-                model.joint_q_start,
                 model.joint_dof_dim,
-                control.joint_f,
-                state_in.joint_q,
-                state_in.joint_qd,
-                self._passive_spring_stiffness,
-                self._passive_spring_ref,
-                self._passive_joint_damping,
                 state_aug._joint_S_s,
+                state_aug._joint_qdd,
+                prescale,
+                inv_dt,
                 state_aug._body_f_s,
-                body_f,
+                state_in.body_f if state_in.body_count else None,
+                contact_wrench,
                 model.body_flags,
                 state_in.body_q,
                 model.body_com,
+                model.body_mass,
+                model.body_inertia,
                 self._articulation_origin,
                 self._dynamics_art_active,
+                body_a_s,
+                body_ft_s,
             ],
-            outputs=[body_ft_s, joint_tau],
+            outputs=[body_parent_f],
             block_dim=self._serial_kernel_block_dim,
             device=model.device,
         )
         wp.launch(
-            compute_body_parent_f,
+            zero_unattached_parent_wrenches,
             dim=model.body_count,
-            inputs=[
-                self._body_to_articulation,
-                self._articulation_origin,
-                state_aug._body_f_s,
-                body_ft_s,
-                body_f,
-                model.body_flags,
-                state_in.body_q,
-                model.body_com,
-            ],
+            inputs=[self._body_to_articulation],
             outputs=[body_parent_f],
             device=model.device,
         )
@@ -9450,9 +9566,31 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             else:
                 inverse_dynamics_ready = None
             # With sleeping, wrenches go to solver-owned history first, so frozen bodies never read a caller buffer.
+            self._parent_wrench_request = None
             computed_parent_f = self._sleeping.parent_wrenches if self._sleeping is not None else body_parent_f
             if computed_parent_f is not None:
-                self._compute_parent_wrenches(state_in, state_aug, control, computed_parent_f)
+                # Published after the solve, from the accelerations and impulses it commits to.
+                if self._preelim_active and self._connect_count and not self._parent_wrench_preelim_warned:
+                    self._parent_wrench_preelim_warned = True
+                    warnings.warn(
+                        "BODY_PARENT_F leaves out pre-eliminated loop-closure reactions; "
+                        "set enable_bilateral_preelimination=False to include them.",
+                        stacklevel=3,
+                    )
+                prescale = None
+                if stage3_qd is not state_in.joint_qd:
+                    # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.
+                    if self._parent_wrench_prescale is None:
+                        self._parent_wrench_prescale = wp.empty_like(stage3_qd)
+                    wp.launch(
+                        subtract_arrays,
+                        dim=model.joint_dof_count,
+                        inputs=[state_in.joint_qd, stage3_qd],
+                        outputs=[self._parent_wrench_prescale],
+                        device=model.device,
+                    )
+                    prescale = self._parent_wrench_prescale
+                self._parent_wrench_request = (computed_parent_f, contacts, prescale)
 
             self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
         # ══════════════════════════════════════════════════════════════
@@ -11615,6 +11753,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._row_cfm,
                         self._phi,
                         self._target_velocity,
+                        self._connect_row_inv_norm,
                     ],
                     device=model.device,
                 )
@@ -13947,6 +14086,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
+            self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
         self.integrate_particles(model, state_in, state_out, dt)
@@ -14015,6 +14155,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self._v_out)
+            self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
     def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:

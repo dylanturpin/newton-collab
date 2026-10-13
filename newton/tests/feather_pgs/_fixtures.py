@@ -538,6 +538,30 @@ def _build_free_root_chain_model(
     return scene.finalize(device=device)
 
 
+def _sphere_on_ground(device, armature, dense, com=(0.0, 0.0, 0.0), mu=0.0):
+    """A 1 kg sphere on a free joint, optionally with a massless fixed child that routes it to dense rows."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    body = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity()),
+        mass=1.0,
+        com=wp.vec3(com),
+        inertia=wp.mat33(np.eye(3) * 0.01),
+    )
+    joints = [builder.add_joint_free(body)]
+    if dense:
+        child = builder.add_link(mass=0.0, inertia=wp.mat33(0.0))
+        joints.append(builder.add_joint_fixed(body, child))
+    builder.add_articulation(joints)
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=mu)
+    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
+    model = builder.finalize(device=device)
+    joint_armature = model.joint_armature.numpy()
+    joint_armature[:6] = armature
+    model.joint_armature.assign(joint_armature)
+    return model
+
+
 def set_torsion_radius(model, radius, shapes=None):
     """Set ``feather_pgs:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
 
