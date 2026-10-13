@@ -92,7 +92,7 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
             articulated_contact_response=articulated_contact_response,
             enable_joint_velocity_limits=True,
             fuse_joint_velocity_limits=fuse,
-            enable_contact_friction=False,
+            contact_friction_scale=0.0,
             # Deliberately under-converged (franka-class training configs run
             # 8): ordering only matters when the sweep does NOT converge — at
             # convergence the last contact visits apply ~zero delta and any

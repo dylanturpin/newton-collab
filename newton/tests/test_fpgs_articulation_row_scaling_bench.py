@@ -78,11 +78,9 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
         articulated_contact_response=mode,
         pgs_iterations=2,
         pgs_velocity_iterations=0,
-        enable_contact_friction=True,
         dense_max_constraints=32,
         mf_max_constraints=32,
         pgs_warmstart=False,
-        mf_warmstart=False,
     )
     solver.step(state_in, state_out, control, contacts, 1.0 / 120.0)
     wp.synchronize()
@@ -158,11 +156,9 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
             articulated_contact_response="propagation",
             pgs_iterations=2,
             pgs_velocity_iterations=0,
-            enable_contact_friction=True,
             dense_max_constraints=32,
             mf_max_constraints=16,
             pgs_warmstart=False,
-            mf_warmstart=False,
         )
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
         wp.synchronize()
@@ -336,53 +332,6 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
             self.assertTrue(row["mass_condition_est"] is None or np.isfinite(row["mass_condition_est"]))
             self.assertTrue(row["worst_columns"])
 
-    def test_fpgs_propagation_debug_residuals_include_propagation_rows(self):
-        _require_cuda("CUDA is required for propagation PGS debug diagnostics")
-
-        module = _load_row_scaling_module()
-
-        case = module.BenchCase(
-            "debug_propagation",
-            "L=4,boxes=1",
-            "articulated_free",
-            articulations=1,
-            links=4,
-            contacts_per_articulation=1,
-        )
-        model, initial, contacts = module._prepare_case_run(case, "cuda:0")
-        solver = module.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-            pgs_iterations=2,
-            enable_contact_friction=True,
-            dense_max_constraints=16,
-            mf_max_constraints=16,
-            pgs_warmstart=False,
-            mf_warmstart=False,
-            pgs_debug=True,
-        )
-
-        state_in = model.state()
-        state_out = model.state()
-        module._restore_state(model, state_in, initial)
-        module._restore_state(model, state_out, initial)
-        state_in.clear_forces()
-        state_out.clear_forces()
-        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
-        wp.synchronize()
-
-        self.assertGreater(int(np.sum(solver.propagation_constraint_count.numpy())), 0)
-        self.assertTrue(solver._pgs_convergence_log)
-        self.assertTrue(solver._pgs_ncp_residual_log)
-        convergence = solver._pgs_convergence_log[-1]
-        ncp = solver._pgs_ncp_residual_log[-1]
-        self.assertEqual(convergence.shape, (2, 4))
-        self.assertEqual(ncp.shape, (2, model.world_count, 6))
-        self.assertTrue(np.all(np.isfinite(convergence)))
-        self.assertTrue(np.all(np.isfinite(ncp)))
-        self.assertGreater(np.max(convergence[:, 0]), 0.0)
-
     def test_fpgs_articulation_accuracy_probe_smoke(self):
         _require_cuda("CUDA is required for the FPGS accuracy probe")
 
@@ -416,7 +365,6 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
         propagation_rows = [row for row in results if row["path"] == "propagation"]
         self.assertTrue(propagation_rows)
         for row in results:
-            self.assertTrue(np.isfinite(row["final_r_compl"]))
             self.assertTrue(np.isfinite(row["self_ref_joint_qd_abs_linf"]))
             self.assertTrue(np.isfinite(row["mf_ref_joint_qd_abs_linf"]))
             self.assertGreaterEqual(row["self_ref_joint_qd_abs_linf"], 0.0)

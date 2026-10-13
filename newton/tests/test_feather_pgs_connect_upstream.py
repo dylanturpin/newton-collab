@@ -205,8 +205,9 @@ def test_disabled_loop_joint_starts_released(test, device):
     test.assertGreater(z0 - float(state_0.body_q.numpy()[load, 2]), 0.15)
     test.assertEqual(solver.connect_slot.numpy().tolist(), [-1, -1, -1])
 
-    for j in joints:
-        solver.set_loop_joint_enabled(j, True)
+    flags = model.joint_enabled.numpy()
+    flags[np.asarray(joints, dtype=np.int64)] = True
+    model.joint_enabled.assign(flags)
     solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
     test.assertTrue(np.all(solver.connect_slot.numpy() >= 0))
 

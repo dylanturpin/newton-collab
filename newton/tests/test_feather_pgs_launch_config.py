@@ -3,13 +3,13 @@
 
 import unittest
 import warnings
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -274,7 +274,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             model,
             pgs_mode="matrix_free",
             articulated_contact_response="propagation",
-            pgs_debug=True,
         )
         self.assertEqual(propagation_debug.articulated_contact_response, "propagation")
 
@@ -291,17 +290,18 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for pgs_kernel in ("tiled_contact", "streaming"):
             with self.subTest(pgs_kernel=pgs_kernel):
                 with self.assertRaisesRegex(ValueError, "contact-only"):
-                    SolverFeatherPGS(
-                        model,
-                        pgs_mode="split",
-                        pgs_kernel=pgs_kernel,
-                        enable_joint_limits=True,
-                    )
+                    with kernel_overrides({"pgs_kernel": pgs_kernel}):
+                        SolverFeatherPGS(
+                            model,
+                            pgs_mode="split",
+                            enable_joint_limits=True,
+                        )
 
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
         implicit = SolverFeatherPGS(model)
-        explicit = SolverFeatherPGS(model, serial_kernel_block_dim=256, tile_threads=64)
+        with kernel_overrides({"serial_kernel_block_dim": 256, "tile_threads": 64}):
+            explicit = SolverFeatherPGS(model)
         for attr in (
             "_cholesky_kernels_by_size",
             "_triangular_solve_kernels_by_size",
@@ -319,7 +319,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_non_default_tile_threads_selects_distinct_kernels(self):
         model = _build_chain_model()
         default = SolverFeatherPGS(model)
-        wide = SolverFeatherPGS(model, tile_threads=128)
+        with kernel_overrides({"tile_threads": 128}):
+            wide = SolverFeatherPGS(model)
         for size, kernel in default._cholesky_kernels_by_size.items():
             if kernel is None:
                 continue
@@ -468,7 +469,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
 
         forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+        with kernel_overrides(forced):
             reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
 
@@ -594,7 +595,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
             return history
 
-        slick = run(make_solver(enable_contact_friction=False))
+        slick = run(make_solver(contact_friction_scale=0.0))
         for label, friction_kwargs, triples in (("patch", {}, False), ("point", {"friction_anchor_beta": 0.0}, True)):
             with self.subTest(friction=label):
                 optimized = make_solver(**friction_kwargs)
@@ -748,14 +749,15 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         dense = {"sparse_mass_matrix": False}
         for links in (33, 64):
             model = _build_chain_model(num_links=links, num_worlds=1)
-            with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", dense):
+            with kernel_overrides(dense):
                 reference = SolverFeatherPGS(model, enable_joint_limits=False, use_parallel_streams=False)
             self.assertIsNone(reference._crba_cholesky_kernels_by_size[links])
             q_ref, qd_ref = _chain_trajectory(model, reference)
             for tile_threads in (32, 64):
                 with self.subTest(links=links, tile_threads=tile_threads):
-                    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", dense):
-                        fused = SolverFeatherPGS(model, enable_joint_limits=False, tile_threads=tile_threads)
+                    with kernel_overrides(dense):
+                        with kernel_overrides({"tile_threads": tile_threads}):
+                            fused = SolverFeatherPGS(model, enable_joint_limits=False)
                     self.assertIsNotNone(fused._crba_cholesky_kernels_by_size[links])
                     q, qd = _chain_trajectory(model, fused)
                     np.testing.assert_allclose(
@@ -800,10 +802,12 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for bad in (0, -32, 1, 33, 100):
             with self.subTest(value=bad):
                 with self.assertRaisesRegex(ValueError, "serial_kernel_block_dim"):
-                    SolverFeatherPGS(model, serial_kernel_block_dim=bad)
+                    with kernel_overrides({"serial_kernel_block_dim": bad}):
+                        SolverFeatherPGS(model)
         for good in (32, 64, 128, 256, 512):
             with self.subTest(value=good):
-                solver = SolverFeatherPGS(model, serial_kernel_block_dim=good)
+                with kernel_overrides({"serial_kernel_block_dim": good}):
+                    solver = SolverFeatherPGS(model)
                 self.assertEqual(solver.serial_kernel_block_dim, good)
 
     def test_tile_threads_validation(self):
@@ -811,25 +815,25 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for bad in (0, -64, 16, 48, 96, 512):
             with self.subTest(value=bad):
                 with self.assertRaisesRegex(ValueError, "tile_threads"):
-                    SolverFeatherPGS(model, tile_threads=bad)
+                    with kernel_overrides({"tile_threads": bad}):
+                        SolverFeatherPGS(model)
         for good in (32, 64, 128, 256):
             with self.subTest(value=good):
-                solver = SolverFeatherPGS(model, tile_threads=good)
+                with kernel_overrides({"tile_threads": good}):
+                    solver = SolverFeatherPGS(model)
                 self.assertEqual(solver.tile_threads, good)
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled launch-config step test requires CUDA")
     def test_non_default_tile_threads_compiles_and_steps(self):
         model = _build_chain_model()
         forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
-            solver = SolverFeatherPGS(
-                model,
-                serial_kernel_block_dim=64,
-                tile_threads=128,
-                pgs_mode="split",
-                pgs_kernel="loop",
-                dense_max_constraints=384,
-            )
+        with kernel_overrides(forced):
+            with kernel_overrides({"serial_kernel_block_dim": 64, "tile_threads": 128, "pgs_kernel": "loop"}):
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="split",
+                    dense_max_constraints=384,
+                )
         self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver.size_groups))
         self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
         state_0, state_1 = model.state(), model.state()

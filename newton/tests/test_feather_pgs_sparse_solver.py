@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_propagation_free_root_warp import _build_model as _build_chain
@@ -100,14 +101,13 @@ def _make_solver(model, sparse, **overrides):
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,
         "pgs_warmstart": False,
-        "mf_warmstart": False,
         "dense_max_constraints": 32,
         "use_parallel_streams": True,
         "double_buffer": False,
         "update_mass_matrix_interval": 4,
     }
     options.update(overrides)
-    with mock.patch.dict(SolverFeatherPGS._kernel_overrides, {"sparse_mass_matrix": sparse}):
+    with kernel_overrides({"sparse_mass_matrix": sparse}):
         return SolverFeatherPGS(model, **options)
 
 
@@ -513,7 +513,6 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             {"contact_torsion_radius": 0.01},
             {"enable_joint_velocity_limits": True},
             {"pgs_warmstart": True},
-            {"mf_warmstart": True},
             {"dense_max_constraints": 2048},
         ):
             with self.subTest(options=options):

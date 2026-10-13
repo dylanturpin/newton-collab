@@ -118,7 +118,7 @@ def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", veloci
         pgs_velocity_iterations=velocity_iterations,
         articulated_contact_response=response,
         pgs_contact_regularization=g,
-        mf_warmstart=True,
+        pgs_warmstart=True,
     )
     return model, pipeline, solver, bodies
 
@@ -201,7 +201,7 @@ def test_regularization_documented_sag(test: unittest.TestCase, device):
     matrix-free route."""
     with wp.ScopedDevice(device):
         for rate in (60, 240):
-            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, mf_warmstart=True)
+            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, pgs_warmstart=True)
             expected = _sag_formula(0.5, rate)
             test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
 
@@ -210,7 +210,7 @@ def test_regularization_split_route_documented_sag(test: unittest.TestCase, devi
     """The split route's standalone matrix-free kernel carries the same law as the
     fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
     with wp.ScopedDevice(device):
-        sag = _resting_box(device, 0.5, "split", 60, 180, mf_warmstart=True)
+        sag = _resting_box(device, 0.5, "split", 60, 180, pgs_warmstart=True)
         expected = _sag_formula(0.5, 60)
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
@@ -245,7 +245,7 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
             pgs_iterations=8,
             pgs_velocity_iterations=8,
             pgs_contact_regularization=g,
-            enable_contact_friction=False,
+            contact_friction_scale=0.0,
             dense_max_constraints=64,
             mf_max_constraints=16,
         )
@@ -325,8 +325,9 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
             pgs_iterations=8,
             pgs_velocity_iterations=2,
             pgs_contact_regularization=0.02,
-            mf_warmstart=True,
+            pgs_warmstart=True,
         )
+        observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
         control = model.control()
@@ -334,14 +335,13 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         for _k in range(120):
             pipeline.collide(s0, contacts)
             s0.clear_forces()
-            solver.step(s0, s1, control, contacts, DT)
+            solver.step(s0, s1, control, contacts, DT, observables=observables)
             s0, s1 = s1, s0
-        solver.update_contacts(contacts)
 
         count = int(contacts.rigid_contact_count.numpy()[0])
         shape0 = contacts.rigid_contact_shape0.numpy()[:count]
         shape1 = contacts.rigid_contact_shape1.numpy()[:count]
-        force = contacts.rigid_contact_force.numpy()[:count]
+        force = observables.contact_f.numpy()[:count, :3]
         loads = []
         for s in supports:
             fz = 0.0
@@ -438,7 +438,7 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
             pgs_iterations=0,
             pgs_velocity_iterations=0,
             pgs_contact_regularization=0.5,
-            enable_contact_friction=False,
+            contact_friction_scale=0.0,
             dense_max_constraints=64,
             mf_max_constraints=16,
         )
@@ -486,7 +486,7 @@ def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
                 pgs_iterations=1,
                 pgs_velocity_iterations=0,
                 pgs_contact_regularization=0.5,
-                enable_contact_friction=False,
+                contact_friction_scale=0.0,
                 dense_max_constraints=64,
                 mf_max_constraints=16,
             )
@@ -551,7 +551,7 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             pgs_iterations=16,
             pgs_velocity_iterations=0,
             pgs_contact_regularization=g,
-            mf_warmstart=True,
+            pgs_warmstart=True,
         )
         s0, s1 = model.state(), model.state()
         control = model.control()

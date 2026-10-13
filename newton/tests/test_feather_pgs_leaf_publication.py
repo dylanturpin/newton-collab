@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.solvers import SolverFeatherPGS
 
 
@@ -148,16 +149,16 @@ def _build_contact_model(device):
 
 
 def _solver(model, *, enabled, mode="split", velocity_limits=False):
-    solver = SolverFeatherPGS(
-        model,
-        pgs_mode=mode,
-        pgs_kernel="loop",
-        pgs_iterations=8,
-        update_mass_matrix_interval=2,
-        use_parallel_streams=False,
-        enable_joint_velocity_limits=velocity_limits,
-        parallel_tree=enabled,
-    )
+    with kernel_overrides({"pgs_kernel": "loop"}):
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode=mode,
+            pgs_iterations=8,
+            update_mass_matrix_interval=2,
+            use_parallel_streams=False,
+            enable_joint_velocity_limits=velocity_limits,
+            parallel_tree=enabled,
+        )
     if enabled and model.device.is_cuda:
         assert solver._tree_plan is not None
     if not enabled or model.device.is_cpu:
@@ -431,7 +432,6 @@ class TestLeafPublication(unittest.TestCase):
             for index, solver in enumerate(solvers):
                 pair = states[index]
                 with wp.ScopedCapture(device=model.device) as capture:
-                    solver.seed_double_buffer_events()
                     for phase in (0, 1):
                         pipeline.collide(pair[phase], contacts[index])
                         solver.step(pair[phase], pair[1 - phase], controls[index], contacts[index], 1.0 / 240.0)

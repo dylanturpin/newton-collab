@@ -353,7 +353,6 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         for _ in range(4):
             step()
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.seed_double_buffer_events()
             step()
             step()
         for _ in range(200):

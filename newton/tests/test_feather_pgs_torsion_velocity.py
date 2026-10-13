@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import contact_torsion
+from newton.solvers import SolverObservableFlags
 from newton.tests.test_feather_pgs_contact_torsion import PATCH_OPTIONS, fixture
 
 
@@ -194,15 +195,13 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                 result, solver, model, initial, contacts = fixture(
                     0.01, spin=100.0, center_only=True, dt=dt, pgs_velocity_iterations=4, **PATCH_OPTIONS
                 )
-                # The base fixture does not request the optional spatial export.
-                contacts.force = wp.zeros(contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device)
+                observables = solver.observables({SolverObservableFlags.CONTACT_F})
                 for _ in range(4):
                     output = model.state()
-                    solver.step(initial, output, model.control(), contacts, dt)
-                    solver.update_contacts(contacts)
+                    solver.step(initial, output, model.control(), contacts, dt, observables=observables)
                     row = int(solver.contact_slot.numpy()[0])
                     normal = contacts.rigid_contact_normal.numpy()[0]
-                    force = contacts.force.numpy()[0]
+                    force = observables.contact_f.numpy()[0]
                     expected = max(float(solver.impulses.numpy()[0, row]), 0.0) / dt
                     self.assertAlmostEqual(abs(float(np.dot(force[:3], normal))), expected, delta=1e-4)
                     # Torque slots are deliberately placeholders, not solved spin wrench.

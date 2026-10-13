@@ -111,7 +111,6 @@ class TestSleeping(unittest.TestCase):
             solver.step(states[0], states[1], control, contacts, 0.005)
             states.reverse()
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.seed_double_buffer_events()
             for _ in range(2):
                 pipeline.collide(states[0], contacts)
                 solver.step(states[0], states[1], control, contacts, 0.005)

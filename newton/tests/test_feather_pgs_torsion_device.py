@@ -177,12 +177,10 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
     """Exercise portable preparation kernels independently of a full CUDA solve."""
 
     def test_public_device_option_is_default_off(self):
-        """Keep public device preparation opt-in and expose explicit graph validation."""
+        """Keep public device preparation opt-in."""
         self.assertIs(
             signature(solver_feather_pgs.SolverFeatherPGS).parameters["contact_torsion_device"].default, False
         )
-        self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "prepare_contact_torsion_capture", None)))
-        self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "validate_contact_torsion", None)))
 
     def compare(self, *, device="cpu", modify=None, **options):
         """Compare every row field, group membership and size-specific Jacobian."""
@@ -665,23 +663,22 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
     def test_public_api_noop_and_fail_stop(self):
         """No radius means no new state; active host torsion cannot be captured."""
         _, plain, model, state, _ = fixture(0.0, contact_torsion_device=True, pgs_iterations=16)
-        plain.prepare_contact_torsion_capture(state, model.state())
-        plain.validate_contact_torsion()
+        plain.check_constraint_capacity()
         self.assertIsNone(getattr(plain, "_device_torsion", None))
 
-        _, reference, model, state, _ = fixture(0.01, pgs_iterations=16)
+        _, reference, model, state, contacts = fixture(0.01, pgs_iterations=16)
         with self.assertRaisesRegex(RuntimeError, "requires contact_torsion_device"):
-            reference.prepare_contact_torsion_capture(state, model.state())
+            with wp.ScopedCapture(device=model.device):
+                reference.step(state, model.state(), model.control(), contacts, 0.0025)
 
         _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, pgs_iterations=16)
         output = model.state()
-        solver.prepare_contact_torsion_capture(state, output)
         solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
         for _ in range(2):
             with self.assertRaisesRegex(RuntimeError, "load ring"):
                 solver.step(state, output, model.control(), contacts, 0.0025)
             with self.assertRaisesRegex(RuntimeError, "load ring"):
-                solver.validate_contact_torsion()
+                solver.check_constraint_capacity()
             np.testing.assert_array_equal(output.joint_q.numpy(), state.joint_q.numpy())
             np.testing.assert_array_equal(output.joint_qd.numpy(), state.joint_qd.numpy())
 
@@ -704,7 +701,6 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                     **PATCH_OPTIONS,
                 )
                 z = model.state()
-                solver.prepare_contact_torsion_capture(a, z)
                 control = model.control()
                 pipeline = newton.CollisionPipeline(
                     model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
@@ -721,15 +717,14 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 pair()
                 if captured:
                     with wp.ScopedCapture(device=model.device) as capture:
-                        solver.seed_double_buffer_events()
                         pair()
                     for _ in range(5):
                         wp.capture_launch(capture.graph)
-                        solver.validate_contact_torsion()
+                        solver.check_constraint_capacity()
                 else:
                     for _ in range(5):
                         pair()
-                        solver.validate_contact_torsion()
+                        solver.check_constraint_capacity()
                 results.append((a.joint_q.numpy(), a.joint_qd.numpy(), a.body_q.numpy()))
             for eager, graph in zip(*results, strict=True):
                 np.testing.assert_allclose(graph, eager, rtol=3e-5, atol=3e-6)

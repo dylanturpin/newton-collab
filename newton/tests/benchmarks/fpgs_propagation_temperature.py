@@ -128,12 +128,10 @@ def _make_solver(model: newton.Model, case: TempCase, mode: str, pgs_iterations:
             articulated_contact_response="immediate" if mode not in PROPAGATION_PATHS else mode,
             pgs_iterations=pgs_iterations,
             pgs_velocity_iterations=0,
-            enable_contact_friction=True,
             contact_friction_position_iterations=-1,
             dense_max_constraints=row_capacity,
             mf_max_constraints=16,
             pgs_warmstart=False,
-            mf_warmstart=False,
         )
 
 

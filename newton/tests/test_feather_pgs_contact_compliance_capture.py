@@ -64,7 +64,6 @@ def _run_free_spheres(*, dense_rows, graph, steps=20):
         captured = None
         if graph:
             with wp.ScopedCapture() as capture:
-                solver.seed_double_buffer_events()
                 two_steps()
             captured = capture.graph
         for _ in range(steps - 1):
@@ -111,7 +110,6 @@ class _Episode:
                 self.two_steps()
                 trace.append(self.snapshot())
                 with wp.ScopedCapture() as capture:
-                    self.fixture.solver.seed_double_buffer_events()
                     self.two_steps()
                 captured = capture.graph
             for pair in range(len(trace), pairs):
@@ -184,7 +182,6 @@ class TestContactComplianceCapture(unittest.TestCase):
             _materials(contacts, 3000.0)
             solver.step(state, output, episode.control, contacts, episode.dt)
             with wp.ScopedCapture() as capture:
-                solver.seed_double_buffer_events()
                 solver.step(state, output, episode.control, contacts, episode.dt)
             contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
             wp.capture_launch(capture.graph)
@@ -216,7 +213,6 @@ class TestContactComplianceCapture(unittest.TestCase):
                     episode.two_steps()
                     fixture.solver.validate_contact_compliance()
                     with wp.ScopedCapture() as capture:
-                        fixture.solver.seed_double_buffer_events()
                         episode.two_steps()
                     with self.assertRaisesRegex(RuntimeError, "overflowing solver rows"):
                         for _ in range(40):
@@ -322,7 +318,6 @@ class TestContactComplianceContactsLease(unittest.TestCase):
         with wp.ScopedDevice(fixture.device):
             episode.two_steps()
             with wp.ScopedCapture() as capture:
-                fixture.solver.seed_double_buffer_events()
                 episode.two_steps()
             graph = capture.graph
             graph_ref = weakref.ref(graph)
@@ -393,7 +388,6 @@ class TestContactComplianceContactsLease(unittest.TestCase):
             fixture.solver.step(state, output, episode.control, contacts, episode.dt)
             self.assertTrue(np.isfinite(output.body_q.numpy()).all())
             with wp.ScopedCapture() as capture:
-                fixture.solver.seed_double_buffer_events()
                 episode.two_steps()
             wp.capture_launch(capture.graph)
             reducer.collide(state, contacts)

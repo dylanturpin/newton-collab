@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.friction_patches import (
     _FrictionPatchState,
     _pose_motion,
@@ -21,18 +22,10 @@ from newton._src.solvers.feather_pgs.friction_patches import (
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    contact_friction_residuals,
     pgs_solve_loop,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws, _run_squeeze
-
-
-@wp.kernel(enable_backward=False)
-def _friction_residual_probe(result: wp.array[wp.vec4]):
-    result[0] = contact_friction_residuals(0.0, 4.0, 0.25, 0.0, wp.vec2(-1.0, 0.0), wp.vec2(1.0, 0.0))
-    result[1] = contact_friction_residuals(0.0, 4.0, 0.25, 0.0, wp.vec2(-1.0, 0.0), wp.vec2(2.5, 0.0))
-    result[2] = contact_friction_residuals(2.0, 2.0, 0.5, -0.1, wp.vec2(0.0), wp.vec2(0.0))
 
 
 @wp.kernel(enable_backward=False)
@@ -64,11 +57,11 @@ def _ground_box(device, **solver_kwargs):
     states = [model.state(), model.state()]
     control = model.control()
 
-    def step():
+    def step(observables=None):
         s0, s1 = states
         s0.clear_forces()
         pipeline.collide(s0, contacts)
-        solver.step(s0, s1, control, contacts, 0.005)
+        solver.step(s0, s1, control, contacts, 0.005, observables=observables)
         states.reverse()
 
     return model, solver, contacts, step
@@ -470,12 +463,6 @@ class TestFrictionPatchHistory(unittest.TestCase):
         patches.build(model, state, contacts)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 2)
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [1, 1])
-
-    def test_residuals_use_patch_support_and_keep_normal_terms_local(self):
-        """Distinguish supported friction, a cone violation, and normal error in the residual diagnostics."""
-        residuals = wp.zeros(3, dtype=wp.vec4, device="cpu")
-        wp.launch(_friction_residual_probe, dim=1, inputs=[residuals], device="cpu")
-        np.testing.assert_allclose(residuals.numpy(), [[0, 0, 0, 0], [1.5, 1.5, 0, 1.5], [0, 0.2, 0.1, 0]], atol=1e-7)
 
     def test_incomplete_frame_cannot_create_anchor_history(self):
         """Reject an overflowing contact frame before selecting or carrying anchors."""
@@ -1058,7 +1045,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         box = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device=device)
         solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=64)
-        contacts = newton.Contacts(4, 0, requested_attributes=["force"], device=device)
+        # A pipeline publishes the contact capacity; the contacts are written by hand and never collided.
+        contacts = newton.CollisionPipeline(model, rigid_contact_max=4, soft_contact_max=0).contacts()
         contacts.rigid_contact_count.assign([4])
         contacts.rigid_contact_shape0.assign([box] * 4)
         contacts.rigid_contact_shape1.assign([ground] * 4)
@@ -1074,14 +1062,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_point1.assign(points)
         # The x force and z torque correspond to an off-centre tangential load.
         s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
-        solver.step(s1, s0, model.control(), contacts, dt)
+        observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+        solver.step(s1, s0, model.control(), contacts, dt, observables=observables)
         self.assertGreater(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 0)
         count = int(solver.mf_constraint_count.numpy()[0])
         self.assertTrue(np.all(solver.contact_path.numpy()[:4] == 1))
         solved = np.einsum("ij,i->j", solver.mf_J_a.numpy()[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
-        solver.update_contacts(contacts)
-        reported = contacts.force.numpy().sum(axis=0)
+        reported = observables.contact_f.numpy().sum(axis=0)
         np.testing.assert_allclose(reported[:3], solved[:3], atol=1.0e-4)
         # Torque is explicitly unsupported by this export, including on the base
         # branch. Preserve that limitation visibly instead of asserting a wrench.
@@ -1178,12 +1166,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(pgs_kernel=kernel):
                 with warnings.catch_warnings():
                     warnings.simplefilter("error")
-                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel=kernel)
+                    with kernel_overrides({"pgs_kernel": kernel}):
+                        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
                     self.assertTrue(solver._friction_anchors_enabled)
                     self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model, pgs_mode="matrix_free", pgs_kernel=kernel, friction_anchor_beta=0.3
-                    )
+                    with kernel_overrides({"pgs_kernel": kernel}):
+                        solver = newton.solvers.SolverFeatherPGS(
+                            model, pgs_mode="matrix_free", friction_anchor_beta=0.3
+                        )
                     self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
                 self.assertIsNone(solver._pgs_solve_streaming_kernel)
                 self.assertIsNone(solver._pgs_solve_tiled_contact_kernel)
@@ -1204,13 +1194,15 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Patch friction requires"):
             newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, friction_mode="bisection")
         # CPU resolves every native kernel selector to the scalar loop, so only CUDA rejects them.
-        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="tiled_contact")
+        with kernel_overrides({"pgs_kernel": "tiled_contact"}):
+            solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2)
         self.assertEqual(solver.pgs_kernel, "loop")
         if wp.is_cuda_available():
             cuda_model = builder.finalize(device="cuda:0")
             for kernel in ("tiled_contact", "streaming"):
                 with self.subTest(pgs_kernel=kernel), self.assertRaisesRegex(ValueError, "Patch friction requires"):
-                    newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2, pgs_kernel=kernel)
+                    with kernel_overrides({"pgs_kernel": kernel}):
+                        newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
@@ -1371,11 +1363,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         with wp.ScopedDevice(device):
             model, solver, contacts, step = _ground_box(device)
+            observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
             for _ in range(100):
-                step()
-            solver.update_contacts(contacts)
+                step(observables)
             count = int(contacts.rigid_contact_count.numpy()[0])
-            forces = contacts.rigid_contact_force.numpy()[:count]
+            forces = observables.contact_f.numpy()[:count, :3]
         weight = float(model.body_mass.numpy()[0]) * 9.81
         self.assertGreaterEqual(count, 3)
         self.assertAlmostEqual(float(abs(forces[:, 2].sum())), weight, delta=0.05 * weight)

@@ -88,11 +88,10 @@ def _make_solver(model: newton.Model, mode: str, **kwargs) -> SolverFeatherPGS:
         articulated_contact_response=mode,
         pgs_iterations=0,
         pgs_velocity_iterations=0,
-        enable_contact_friction=False,
+        contact_friction_scale=0.0,
         dense_max_constraints=64,
         mf_max_constraints=16,
         pgs_warmstart=False,
-        mf_warmstart=False,
         **kwargs,
     )
 

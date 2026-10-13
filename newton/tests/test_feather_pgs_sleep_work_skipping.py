@@ -58,7 +58,6 @@ class TestSleepWorkSkipping(unittest.TestCase):
                     solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
                     states.reverse()
                 with wp.ScopedCapture(device=model.device) as capture:
-                    solver.seed_double_buffer_events()
                     for _ in range(2):
                         pipeline.collide(states[0], contacts)
                         solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
@@ -201,7 +200,6 @@ class TestSleepWorkSkipping(unittest.TestCase):
         self.assertGreater(int(scene.solver.mf_constraint_count.numpy().sum()), 0)
         scene.step()
         with wp.ScopedCapture(device=scene.model.device) as capture:
-            scene.solver.seed_double_buffer_events()
             for _ in range(2):
                 scene.step(clear=False)
         for _ in range(100):

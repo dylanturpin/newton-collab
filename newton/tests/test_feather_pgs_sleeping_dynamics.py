@@ -4,12 +4,12 @@
 """Skipping sleeping articulations' dynamics must not change any published state."""
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.tests.test_feather_pgs_sleeping_production import _SleepReference, _solver
 
 _FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
@@ -68,7 +68,7 @@ class _Run:
         self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=512)
         options = dict(options)
         overrides = options.pop("kernel_overrides", {})
-        with mock.patch.object(newton.solvers.SolverFeatherPGS, "_kernel_overrides", overrides):
+        with kernel_overrides(overrides):
             self.solver = _solver(
                 test,
                 self.model,
@@ -85,9 +85,7 @@ class _Run:
         if graph:
             self._step()
             self._step()
-            self.solver.prepare_contact_torsion_capture(self.states[0], self.states[1])
             with wp.ScopedCapture(device=self.model.device) as capture:
-                self.solver.seed_double_buffer_events()
                 self._step()
                 self._step()
             self.graph = capture.graph
@@ -101,7 +99,7 @@ class _Run:
             self._step()
         else:
             wp.capture_launch(self.graph)
-            self.solver.validate_contact_torsion()
+            self.solver.check_constraint_capacity()
 
     def _step(self):
         self.pipeline.collide(self.states[0], self.contacts)

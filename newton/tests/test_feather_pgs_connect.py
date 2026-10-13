@@ -318,11 +318,13 @@ def _build_carried_load(*, enabled: bool = True, world_parent: bool = False):
     return b, carrier, load, joints
 
 
-def _anchor_gaps(model, state, joints, solver):
-    """World-space parent/child anchor distances [m] using the solver's live anchors."""
+def _anchor_gaps(model, state, joints):
+    """World-space parent/child anchor distances [m] of the model's loop joint frames."""
     bq = state.body_q.numpy().astype(np.float64)
     jp = model.joint_parent.numpy()
     jc = model.joint_child.numpy()
+    xp = model.joint_X_p.numpy()
+    xc = model.joint_X_c.numpy()
 
     def anchor(body, local):
         if body < 0:
@@ -331,11 +333,14 @@ def _anchor_gaps(model, state, joints, solver):
         w = wp.transform_point(t, wp.vec3(*local))
         return np.array([w[0], w[1], w[2]])
 
-    gaps = []
-    for j in joints:
-        anchor_p, anchor_c = solver.loop_joint_anchors(j)
-        gaps.append(float(np.linalg.norm(anchor(int(jp[j]), anchor_p) - anchor(int(jc[j]), anchor_c))))
-    return gaps
+    return [float(np.linalg.norm(anchor(int(jp[j]), xp[j][:3]) - anchor(int(jc[j]), xc[j][:3]))) for j in joints]
+
+
+def _set_joint_enabled(model, joints, enabled):
+    """Write ``Model.joint_enabled`` in place, without a notification."""
+    flags = model.joint_enabled.numpy()
+    flags[np.asarray(joints, dtype=np.int64)] = enabled
+    model.joint_enabled.assign(flags)
 
 
 def _prescribe_carrier(model, solver, state, articulation, t, v, omega):
@@ -388,7 +393,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
         expected = wp.transform_point(carrier_t, wp.vec3(*_REL_P))
         error = np.linalg.norm(bq[load, :3] - np.array([expected[0], expected[1], expected[2]]))
         self.assertLess(error, 3.0e-3, f"load lagged the carrier by {error:.4f} m")
-        for gap in _anchor_gaps(model, state_0, joints, solver):
+        for gap in _anchor_gaps(model, state_0, joints):
             self.assertLess(gap, 3.0e-3)
         # The carrier actually moved, so the test exercised a non-trivial target velocity.
         self.assertGreater(np.linalg.norm(bq[carrier, :3] - np.array([0.0, 0.0, 1.0])), 0.25)
@@ -406,11 +411,11 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
         bq = state_0.body_q.numpy().astype(np.float64)
         self.assertTrue(np.isfinite(bq).all())
         self.assertLess(np.linalg.norm(bq[load, :3] - (np.array([0.0, 0.0, 1.0]) + _REL_P)), 3.0e-3)
-        for gap in _anchor_gaps(model, state_0, joints, solver):
+        for gap in _anchor_gaps(model, state_0, joints):
             self.assertLess(gap, 3.0e-3)
 
-    def test_runtime_enable_and_anchor_update(self):
-        """Closures can be released, re-targeted at the measured pose and re-engaged."""
+    def test_model_edits_release_and_reanchor_closures(self):
+        """Release closures through Model.joint_enabled, re-anchor them through joint_X_p and engage them again."""
         b, carrier, load, joints = _build_carried_load()
         model = b.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
@@ -425,8 +430,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
                 solver.step(state_0, state_1, control, None, dt)
                 state_0, state_1 = state_1, state_0
 
-        for j in joints:
-            solver.set_loop_joint_enabled(j, False)
+        _set_joint_enabled(model, joints, False)
         z0 = float(state_0.body_q.numpy()[load, 2])
         run(48)
         bq = state_0.body_q.numpy().astype(np.float64)
@@ -437,29 +441,24 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
         carrier_t = wp.transform(wp.vec3(*bq[carrier, :3]), wp.quat(*bq[carrier, 3:]))
         load_t = wp.transform(wp.vec3(*bq[load, :3]), wp.quat(*bq[load, 3:]))
         rel = wp.transform_multiply(wp.transform_inverse(carrier_t), load_t)
+        joint_X_p = model.joint_X_p.numpy()
         for j, c in zip(joints, _CHILD_ANCHORS, strict=True):
             p = wp.transform_point(rel, wp.vec3(*c))
-            solver.set_loop_joint_anchors(j, (p[0], p[1], p[2]), c)
-            solver.set_loop_joint_enabled(j, True)
+            joint_X_p[j][:3] = (p[0], p[1], p[2])
+        model.joint_X_p.assign(joint_X_p)
+        _set_joint_enabled(model, joints, True)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
         held_z = float(bq[load, 2])
         run(120)
         bq = state_0.body_q.numpy().astype(np.float64)
         self.assertTrue(np.isfinite(bq).all())
         self.assertLess(abs(float(bq[load, 2]) - held_z), 3.0e-3, "re-engaged closure should hold the load")
-        for gap in _anchor_gaps(model, state_0, joints, solver):
+        for gap in _anchor_gaps(model, state_0, joints):
             self.assertLess(gap, 3.0e-3)
 
-        for j in joints:
-            solver.set_loop_joint_enabled(j, False)
+        _set_joint_enabled(model, joints, False)
         run(48)
         self.assertGreater(held_z - float(state_0.body_q.numpy()[load, 2]), 0.1, "released again: must fall")
-
-    def test_unknown_joint_is_rejected(self):
-        b, _, _, joints = _build_carried_load()
-        model = b.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode())
-        with self.assertRaises(ValueError):
-            solver.set_loop_joint_enabled(joints[0] + 100, False)
 
 
 if __name__ == "__main__":

@@ -129,7 +129,6 @@ def _make_phase_layout_run(
         mf_max_constraints=64,
         pgs_iterations=pgs_iterations,
         pgs_warmstart=False,
-        mf_warmstart=False,
     )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy()

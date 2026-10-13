@@ -5,16 +5,16 @@
 import unittest
 import warnings
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton import GeoType
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.contact_torsion import _contact_groups, _group_budget
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_rows
-from newton.solvers import SolverFeatherPGS
+from newton.solvers import SolverFeatherPGS, SolverObservableFlags
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 
 # Persistent patches select their own friction locations; shared-anchor flags only warn.
@@ -110,11 +110,15 @@ def fixture(
     if radius is not None:
         kwargs["contact_torsion_radius"] = radius
     kwargs.update(solver_overrides)
-    solver = SolverFeatherPGS(model, **kwargs)
+    tuning = {key: kwargs.pop(key) for key in ("pgs_kernel",) if key in kwargs}
+    with kernel_overrides(tuning):
+        solver = SolverFeatherPGS(model, **kwargs)
     if row_limit is not None:
         solver.dense_max_constraints = row_limit
-    solver.step(a, z, model.control(), contacts, dt)
+    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    solver.step(a, z, model.control(), contacts, dt, observables=observables)
     result = {name: getattr(z, name).numpy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
+    result["contact_f"] = observables.contact_f.numpy()
     result.update(
         {
             name: getattr(solver, name).numpy()
@@ -452,13 +456,9 @@ class TestContactTorsion(unittest.TestCase):
             {"pgs_velocity_iterations": 1, "enable_bilateral_preelimination": True},
             {"articulated_contact_response": "propagation"},
             {"friction_mode": "bisection"},
-            {"pgs_debug": True},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 fixture(0.01, **options)
-        with patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
-            with self.assertRaises(ValueError):
-                fixture(0.01)
 
     def test_compliance_combination_rejected_at_construction(self):
         """Fail before stepping when both experimental responses are requested."""

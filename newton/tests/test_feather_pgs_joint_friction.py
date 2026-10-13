@@ -237,7 +237,6 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
         _advance(solver, states, control, 2)
         control.joint_f.assign([2.5])
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.seed_double_buffer_events()
             for _ in range(2):
                 solver.step(states[0], states[1], control, None, DT)
                 solver.step(states[1], states[0], control, None, DT)
@@ -294,7 +293,6 @@ class TestFeatherPGSJointFriction(unittest.TestCase):
 
             if captured:
                 with wp.ScopedCapture(device=model.device) as capture:
-                    solver.seed_double_buffer_events()
                     episode()
             qd = []
             for row in coefficients:

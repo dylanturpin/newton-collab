@@ -51,7 +51,6 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
         articulated_contact_response=response,
         pgs_iterations=8,
         pgs_warmstart=False,
-        mf_warmstart=False,
         propagation_cached_response=False,
         dense_max_constraints=3,
         mf_max_constraints=3,

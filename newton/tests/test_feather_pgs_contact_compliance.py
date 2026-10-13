@@ -6,12 +6,12 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.geometry import HydroelasticSDF
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
@@ -266,14 +266,14 @@ def run_paired_fixture(*, hinv_jt_kernel, friction, steps=40):
         contacts = pipeline.contacts()
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
             setattr(contacts, name, wp.zeros(64, dtype=float))
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": hinv_jt_kernel}):
+        with kernel_overrides({"hinv_jt_kernel": hinv_jt_kernel}):
             solver = SolverFeatherPGS(
                 model,
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 pgs_mode="matrix_free",
                 enable_restitution=False,
-                enable_contact_friction=friction > 0.0,
+                contact_friction_scale=1.0 if friction > 0.0 else 0.0,
                 joint_limit_activation_gap=0.0,
                 pgs_iterations=8,
                 dense_max_constraints=96,

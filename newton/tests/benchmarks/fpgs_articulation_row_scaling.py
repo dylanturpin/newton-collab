@@ -37,6 +37,7 @@ if str(_NEWTON_REPO) not in sys.path:
     sys.path.insert(0, str(_NEWTON_REPO))
 
 import newton  # noqa: E402
+from newton._src.solvers.feather_pgs._testing import kernel_overrides  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
@@ -48,12 +49,8 @@ def scalar_hinv_jt():
     cost curves isolate contact-row scaling from tiled-kernel occupancy effects;
     keep them comparable by pinning it through the solver's private test hook.
     """
-    previous = SolverFeatherPGS._kernel_overrides
-    SolverFeatherPGS._kernel_overrides = {**previous, "hinv_jt_kernel": "par_row"}
-    try:
+    with kernel_overrides({"hinv_jt_kernel": "par_row"}):
         yield
-    finally:
-        SolverFeatherPGS._kernel_overrides = previous
 
 
 PROPAGATION_PATHS = ("propagation", "propagation-fused", "propagation-colored")
@@ -567,12 +564,11 @@ def _run_case_path(
             articulated_contact_response=response_mode,
             pgs_iterations=pgs_iterations,
             pgs_velocity_iterations=pgs_velocity_iterations,
-            enable_contact_friction=enable_contact_friction,
+            contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             contact_friction_position_iterations=contact_friction_position_iterations,
             dense_max_constraints=dense_capacity,
             mf_max_constraints=mf_capacity,
             pgs_warmstart=False,
-            mf_warmstart=False,
         )
     wp.synchronize()
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())

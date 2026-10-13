@@ -320,8 +320,8 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
         start = parameters.index("pgs_warmstart")
         self.assertEqual(
-            parameters[start : start + 4],
-            ("pgs_warmstart", "mf_warmstart", "mf_warmstart_decay", "pgs_mode"),
+            parameters[start : start + 2],
+            ("pgs_warmstart", "pgs_mode"),
         )
         self.assertGreater(
             parameters.index("pgs_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
@@ -331,15 +331,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         for value in (-1.0, float("inf"), float("nan")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, pgs_warmstart_decay=value)
-
-        legacy = newton.solvers.SolverFeatherPGS(
-            model,
-            mf_warmstart=True,
-            mf_warmstart_decay=0.25,
-        )
-        self.assertTrue(legacy.pgs_warmstart)
-        self.assertEqual(legacy.pgs_warmstart_decay, 0.25)
-        self.assertEqual(legacy._mf_warmstart_decay, legacy.pgs_warmstart_decay)
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")

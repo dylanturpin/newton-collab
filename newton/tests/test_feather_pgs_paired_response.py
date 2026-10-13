@@ -4,12 +4,12 @@
 """Paired articulation/free-body response of SolverFeatherPGS."""
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.solvers import SolverFeatherPGS
 
 
@@ -132,7 +132,7 @@ def _run_mixed_response(
         static_plane=static_plane,
         **(model_kwargs or {}),
     )
-    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
+    with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

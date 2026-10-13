@@ -218,8 +218,6 @@ def test_mixed_arm_and_spinning_bodies(test, device):
             graph = None
             if execution == "graph":
                 with wp.ScopedCapture(device=device) as capture:
-                    for _, scene_solver, _, _ in scenes:
-                        scene_solver.seed_double_buffer_events()
                     step()
                     step()
                 graph = capture.graph

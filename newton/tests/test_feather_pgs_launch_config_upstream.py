@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
@@ -117,22 +118,19 @@ def test_diagonal_fusion_requires_nonaliased_world_response(test, device):
 def test_tiled_and_loop_kernels_step_identically(test, device):
     """Match the tiled and loop factorizations on a chain that selects tiled kernels by default."""
     trajectories = []
-    try:
-        for overrides in ({}, {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}):
-            SolverFeatherPGS._kernel_overrides = overrides
-            model = _build_chain_model(device, num_links=14, num_worlds=2)
+    for overrides in ({}, {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}):
+        model = _build_chain_model(device, num_links=14, num_worlds=2)
+        with kernel_overrides(overrides):
             solver = SolverFeatherPGS(model, pgs_mode="matrix_free", dense_max_constraints=64)
-            if not overrides:
-                test.assertTrue(solver._execution_plan.use_tiled_cholesky(14))
-                test.assertTrue(solver._execution_plan.use_tiled_hinv_jt(14))
-            state_0, state_1 = model.state(), model.state()
-            control = model.control()
-            for _ in range(10):
-                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
-                state_0, state_1 = state_1, state_0
-            trajectories.append(state_0.joint_q.numpy().copy())
-    finally:
-        SolverFeatherPGS._kernel_overrides = {}
+        if not overrides:
+            test.assertTrue(solver._execution_plan.use_tiled_cholesky(14))
+            test.assertTrue(solver._execution_plan.use_tiled_hinv_jt(14))
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        for _ in range(10):
+            solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+            state_0, state_1 = state_1, state_0
+        trajectories.append(state_0.joint_q.numpy().copy())
     np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=1.0e-4)
 
 
@@ -171,12 +169,9 @@ def test_split_native_and_scalar_kernels_step_identically(test, device):
     for with_free_body in (False, True):
         trajectories = []
         for overrides in ({}, scalar):
-            SolverFeatherPGS._kernel_overrides = overrides
-            try:
-                model = _build_limited_chain_on_ground(device, 14, with_free_body=with_free_body)
+            model = _build_limited_chain_on_ground(device, 14, with_free_body=with_free_body)
+            with kernel_overrides(overrides):
                 solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True, dense_max_constraints=64)
-            finally:
-                SolverFeatherPGS._kernel_overrides = {}
             if not overrides:
                 test.assertIsNotNone(solver._pgs_solve_tiled_row_kernel)
             pipeline = newton.CollisionPipeline(model)

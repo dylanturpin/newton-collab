@@ -830,25 +830,20 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(baseline, ball(enable=False, mu_rolling=0.5).run(60))
 
     def test_contact_force_reports_the_sliding_pair(self):
-        """CONTACT_F and the legacy force report the normal and sliding force; the angular couples stay out of both."""
+        """CONTACT_F reports the normal and sliding force; the angular couples stay out of it."""
         scene = ball(speed=1.0, rolling=False)
         observables = scene.solver.observables({SolverObservableFlags.CONTACT_F})
-        with self.assertWarns(DeprecationWarning):
-            scene.model.request_contact_attributes("force")
-        scene.contacts = scene.pipeline.contacts()
         scene.step(observables)
         # The sliding pair carries the angular row type, so the readers must accept it.
         row_type = scene.solver.row_type.numpy()[0, 1:6]
         np.testing.assert_array_equal(row_type, PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
-        scene.solver.update_contacts(scene.contacts)
         count = int(scene.contacts.rigid_contact_count.numpy()[0])
         self.assertEqual(count, 1)
         contact_f = observables.contact_f.numpy()
-        for wrench in (scene.contacts.force.numpy()[0], contact_f[0]):
-            self.assertAlmostEqual(abs(float(wrench[2])), GRAVITY * 1.0003, delta=0.01)
-            self.assertAlmostEqual(float(np.linalg.norm(wrench[:2])), MU * GRAVITY * 1.0003, delta=0.02)
-            np.testing.assert_array_equal(wrench[3:], 0.0)
-        np.testing.assert_array_equal(contact_f[0], scene.contacts.force.numpy()[0])
+        wrench = contact_f[0]
+        self.assertAlmostEqual(abs(float(wrench[2])), GRAVITY * 1.0003, delta=0.01)
+        self.assertAlmostEqual(float(np.linalg.norm(wrench[:2])), MU * GRAVITY * 1.0003, delta=0.02)
+        np.testing.assert_array_equal(wrench[3:], 0.0)
         np.testing.assert_array_equal(contact_f[count:], 0.0)
 
     def test_body_parent_f_is_unchanged_by_angular_rows(self):

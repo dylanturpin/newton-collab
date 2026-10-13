@@ -9,6 +9,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_feather_pgs_module
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -151,13 +152,13 @@ def _run_mixed_response(
         static_plane=static_plane,
         **(model_kwargs or {}),
     )
-    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
+    with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
             pgs_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
-            enable_contact_friction=friction > 0.0,
+            contact_friction_scale=1.0 if friction > 0.0 else 0.0,
             enable_joint_limits=inactive_joint_limit_capacity,
             joint_limit_activation_gap=0.0,
             pgs_iterations=8,
@@ -287,7 +288,7 @@ def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
     """Record dense rows and joint coordinates per step for one H-inverse implementation."""
     model = _build_diagonal_mass_local_model("cuda:0")
     overrides = {} if kernel is None else {"hinv_jt_kernel": kernel}
-    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", overrides):
+    with kernel_overrides(overrides):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
@@ -327,7 +328,6 @@ def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
     captured = None
     if graph:
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.seed_double_buffer_events()
             step()
         captured = capture.graph
     for _ in range(steps // 2 - 1):
@@ -375,10 +375,10 @@ def _armature_impact(model, solver, joint_qd):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
-    solver.step(state_in, state_out, model.control(), contacts, 0.01)
-    solver.update_contacts(contacts)
+    observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+    solver.step(state_in, state_out, model.control(), contacts, 0.01, observables=observables)
     count = int(contacts.rigid_contact_count.numpy()[0])
-    return state_out.joint_qd.numpy()[:6], contacts.rigid_contact_force.numpy()[:count].sum(axis=0)
+    return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)
 
 
 def _armature_modes(device):
@@ -1017,7 +1017,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Keep factor coordinates with default patch friction and yield them to the general owner for torsion."""
         model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "auto"}):
+        with kernel_overrides({"hinv_jt_kernel": "auto"}):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
@@ -1260,7 +1260,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Keep torsion-eligible worlds on the general owner, which solves the appended torsion row."""
         model = _build_mixed_response_model("cuda:0", friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+        with kernel_overrides({"hinv_jt_kernel": "par_row"}):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
@@ -1281,7 +1281,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Select local owners only up to one world per SM; larger models solve exactly as the general owner."""
         limit = wp.get_device("cuda:0").sm_count
         kwargs = {"pgs_mode": "matrix_free", "dense_max_constraints": 32, "mf_max_constraints": 32}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+        with kernel_overrides({"hinv_jt_kernel": "par_row"}):
             for world_count, expected in ((limit, True), (limit + 1, False)):
                 model = _build_mixed_response_model("cuda:0", world_count=world_count)
                 solver = SolverFeatherPGS(model, **kwargs)

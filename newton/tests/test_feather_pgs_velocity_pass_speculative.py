@@ -17,7 +17,6 @@ No restitution is involved anywhere here: this is ordinary free fall with
 
 import unittest
 import warnings
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -96,16 +95,14 @@ def _drop(
 ):
     """Drop a body onto a plane; return heights, velocities, contact counts, routes."""
     model, body = _build(device, scene)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            pgs_velocity_iterations=velocity_iterations,
-            articulated_contact_response=response,
-            pgs_warmstart=pgs_warmstart,
-            mf_warmstart=mf_warmstart,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        angular_damping=0.0,
+        pgs_mode="matrix_free",
+        pgs_velocity_iterations=velocity_iterations,
+        articulated_contact_response=response,
+        pgs_warmstart=pgs_warmstart or mf_warmstart,
+    )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
@@ -166,41 +163,43 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Inertia validation corrected", category=UserWarning)
         model = builder.finalize(device=device)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            pgs_velocity_iterations=velocity_iterations,
-            pgs_debug=True,
-        )
-    state_0, state_1 = model.state(), model.state()
-    # A free body is driven through joint_qd; writing body_qd alone is discarded
-    # by the forward kinematics the solver runs from joint state.
-    joint_qd = state_0.joint_qd.numpy()
+    joint_qd = model.joint_qd.numpy()
     joint_qd[2] = -abs(approach_speed)
-    state_0.joint_qd.assign(joint_qd)
-    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    before = float(state_0.body_qd.numpy()[body][2])
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-    pipeline.collide(state_0, contacts)
-    state_0.clear_forces()
-    solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
+
+    def step(iterations):
+        solver = newton.solvers.SolverFeatherPGS(
+            model, angular_damping=0.0, pgs_mode="matrix_free", pgs_velocity_iterations=iterations
+        )
+        state_0, state_1 = model.state(), model.state()
+        # A free body is driven through joint_qd; writing body_qd alone is discarded
+        # by the forward kinematics the solver runs from joint state.
+        state_0.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline.collide(state_0, contacts)
+        state_0.clear_forces()
+        solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
+        return solver, state_0, state_1
+
+    # A solve without velocity iterations leaves the position pass's rows, impulses and velocity in place.
+    position, state_0, _ = step(0)
+    _, _, state_1 = step(velocity_iterations)
+    before = float(state_0.body_qd.numpy()[body][2])
     n = int(contacts.rigid_contact_count.numpy()[0])
-    rows = int(solver.mf_constraint_count.numpy()[0])
-    phi = solver._debug_position_mf_phi.numpy()[0][:rows]
-    lam = solver._debug_position_mf_impulses.numpy()[0][:rows]
-    row_type = solver._debug_position_mf_row_type.numpy()[0][:rows]
+    rows = int(position.mf_constraint_count.numpy()[0])
+    phi = position.mf_phi.numpy()[0][:rows]
+    lam = position.mf_impulses.numpy()[0][:rows]
+    row_type = position.mf_row_type.numpy()[0][:rows]
     contact_rows = np.flatnonzero((row_type == 0) & (phi > 0.0))
     position_impulse = float(lam[contact_rows].max()) if contact_rows.size else 0.0
     max_phi = float(phi[contact_rows].max()) if contact_rows.size else 0.0
-    v_position = solver._debug_position_v_out.numpy()
-    J_a = solver._debug_position_mf_J_a.numpy()[0]
-    J_b = solver._debug_position_mf_J_b.numpy()[0]
-    dof_a = solver._debug_position_mf_dof_a.numpy()[0]
-    dof_b = solver._debug_position_mf_dof_b.numpy()[0]
-    world_dofs = solver.world_dof_indices.numpy()[0]
+    v_position = position.v_out.numpy()
+    J_a = position.mf_J_a.numpy()[0]
+    J_b = position.mf_J_b.numpy()[0]
+    dof_a = position.mf_dof_a.numpy()[0]
+    dof_b = position.mf_dof_b.numpy()[0]
+    world_dofs = position.world_dof_indices.numpy()[0]
     end_gaps = []
     for row in contact_rows:
         jv = 0.0
@@ -407,13 +406,12 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.replicate(template, 2)
     model = builder.finalize(device=device)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            pgs_velocity_iterations=4,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        angular_damping=0.0,
+        pgs_mode="matrix_free",
+        pgs_velocity_iterations=4,
+    )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy().reshape(2, 6)
     joint_qd[0, 2] = -0.5 * gap / SIM_DT
@@ -447,10 +445,6 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
         return newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=4, **kwargs)
 
     make(pgs_warmstart=True)
-    make(mf_warmstart=True)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
-        solver = make()
-        test.assertTrue(solver._mf_warmstart_enabled)
 
     # Exercise dense slot warm starting and MF identity warm starting through
     # the same velocity pass, not just their constructor paths.

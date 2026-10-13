@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 
@@ -36,9 +37,8 @@ class TestFeatherPGSSafety(unittest.TestCase):
         for capacity in (33, 35, 40):
             with self.subTest(capacity=capacity):
                 model = _driven_model(worlds=3, device=device)
-                solver = SolverFeatherPGS(
-                    model, pgs_mode="split", pgs_kernel="tiled_row", dense_max_constraints=capacity
-                )
+                with kernel_overrides({"pgs_kernel": "tiled_row"}):
+                    solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=capacity)
                 initial = np.zeros((3, capacity), dtype=np.float32)
                 initial[2] = 1234.0  # Inactive world must remain untouched.
                 solver.constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))
@@ -72,7 +72,6 @@ class TestFeatherPGSSafety(unittest.TestCase):
                 if wp.get_device(device).is_cuda:
                     first_mask = wp.empty_like(solver.mass_update_mask)
                     with wp.ScopedCapture(device=device) as capture:
-                        solver.seed_double_buffer_events()
                         solver.reset(state, mask)
                         solver.step(state, output, control, None, 0.01)
                         wp.copy(first_mask, solver.mass_update_mask)

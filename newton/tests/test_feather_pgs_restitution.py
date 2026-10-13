@@ -15,7 +15,6 @@ closed-form rather than inferred from a later bounce height.
 
 import itertools
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -130,15 +129,14 @@ def _make_solver(
     """Construct a deterministic frictionless FeatherPGS test solver."""
     kwargs = {
         "angular_damping": 0.0,
-        "enable_contact_friction": False,
+        "contact_friction_scale": 0.0,
         "pgs_mode": pgs_mode,
         "articulated_contact_response": response,
         "pgs_iterations": pgs_iterations,
         "pgs_velocity_iterations": velocity_iterations,
         "pgs_cfm": 0.0,
         "pgs_omega": 1.0,
-        "pgs_warmstart": pgs_warmstart,
-        "mf_warmstart": mf_warmstart,
+        "pgs_warmstart": pgs_warmstart or mf_warmstart,
     }
     if enable_restitution is not None:
         kwargs["enable_restitution"] = enable_restitution
@@ -146,8 +144,7 @@ def _make_solver(
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
     # Keep a developer's environment from silently turning warm starting on in
     # tests that are intended to be cold.
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        return newton.solvers.SolverFeatherPGS(model, **kwargs)
+    return newton.solvers.SolverFeatherPGS(model, **kwargs)
 
 
 def _reset_state(model, state, vertical_velocity):
@@ -809,8 +806,6 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
     solver = _make_solver(positive_model, velocity_iterations=0)
     test.assertEqual(solver.pgs_velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
-    test.assertFalse(solver._debug_buffers_enabled)
-    test.assertIsNone(solver._debug_position_v_out)
     test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.dense_max_constraints))
     test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.mf_max_constraints))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):

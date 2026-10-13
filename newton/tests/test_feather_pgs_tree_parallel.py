@@ -266,8 +266,7 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                 self.assertIsNotNone(solver._tree_plan)
                 self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
                 self.assertIsNotNone(getattr(solver, "_device_torsion", None))
-                solver.prepare_contact_torsion_capture(model.state(), model.state())
-                solver.validate_contact_torsion()
+                solver.check_constraint_capacity()
 
     def test_cuda_backward_torques_with_live_forces_and_passive_terms(self):
         """Preserve child reductions, additive torque and original-velocity damping."""

@@ -43,6 +43,7 @@ from fpgs_articulation_row_scaling import (  # noqa: E402
     _restore_state,
 )
 
+from newton._src.solvers.feather_pgs._testing import kernel_overrides  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
@@ -148,24 +149,19 @@ def _make_solver(
     mf_capacity = 16
     response_mode = "propagation" if path == "propagation" else "immediate"
 
-    previous_overrides = SolverFeatherPGS._kernel_overrides
-    if path == "mf_immediate":
-        SolverFeatherPGS._kernel_overrides = {**previous_overrides, "hinv_jt_kernel": "tiled"}
-    try:
+    overrides = {"hinv_jt_kernel": "tiled"} if path == "mf_immediate" else {}
+    with kernel_overrides(overrides):
         return SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
             articulated_contact_response=response_mode,
             pgs_iterations=0,
             pgs_velocity_iterations=0,
-            enable_contact_friction=enable_contact_friction,
+            contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             dense_max_constraints=dense_capacity,
             mf_max_constraints=mf_capacity,
             pgs_warmstart=False,
-            mf_warmstart=False,
         )
-    finally:
-        SolverFeatherPGS._kernel_overrides = previous_overrides
 
 
 def _run_zero_iteration_setup(

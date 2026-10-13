@@ -205,7 +205,6 @@ def _make_solver(
         articulated_contact_response=response,
         pgs_iterations=8,
         pgs_warmstart=False,
-        mf_warmstart=False,
         propagation_cached_response=cached,
         propagation_cached_response_max_bodies=cache_max_bodies,
         **solver_kwargs,

@@ -70,9 +70,7 @@ class TestSleepingProductionProfile(unittest.TestCase):
         model, pipeline, solver, states, control = _articulations(self)
         contacts = pipeline.contacts()
         _advance(pipeline, solver, states, control, 2, contacts=contacts)
-        solver.prepare_contact_torsion_capture(states[0], states[1])
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.seed_double_buffer_events()
             for _ in range(2):
                 states[0].clear_forces()
                 pipeline.collide(states[0], contacts)
@@ -80,11 +78,11 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 states.reverse()
         for _ in range(200):
             wp.capture_launch(capture.graph)
-        solver.validate_contact_torsion()
+        solver.check_constraint_capacity()
         np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
         solver.sleeping.wake()
         wp.capture_launch(capture.graph)
-        solver.validate_contact_torsion()
+        solver.check_constraint_capacity()
         self.assertGreater(_torsion_rows(solver), 0)
 
     def test_masked_reset_wakes_only_selected_worlds(self):

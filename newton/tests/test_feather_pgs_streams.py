@@ -69,7 +69,6 @@ def _run(model, steps=60, capture=False, **solver_kwargs):
     if capture:
         # A graph of two steps cycles both buffer sets.
         with wp.ScopedCapture(model.device) as scope:
-            solver.seed_double_buffer_events()
             substep()
             substep()
         for _ in range(steps // 2):
