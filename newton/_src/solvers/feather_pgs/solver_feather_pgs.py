@@ -2144,8 +2144,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 change floating-point reduction order with the block size, so non-default
                 values are not bit-identical (results stay within numerical tolerance).
                 Must be one of {32, 64, 128, 256}. Defaults to 64.
-            enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
-                ``True`` to preserve FeatherPGS behavior before this option was exposed.
+            enable_restitution: Apply contact restitution, the only restitution switch. The
+                default ``True`` leaves the shapes' coefficients in charge; they default to
+                zero, so a model that authors no restitution does not bounce.
+                ``False`` turns restitution off for every contact regardless of the
+                coefficients.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
                 relative normal velocity required to apply restitution. The contact must also be at the surface or
                 be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
