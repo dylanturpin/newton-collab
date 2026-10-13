@@ -22,13 +22,13 @@ PATCH_OPTIONS = {"friction_anchor_beta": 0.2, "contact_shared_anchor": False, "c
 
 
 def set_torsion_radius(model, radius, shapes=None):
-    """Set ``physx:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
+    """Set ``feather_pgs:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
 
     ``radius`` may also be one value per selected shape.
     """
     radii = np.zeros(model.shape_count, dtype=np.float32)
     radii[slice(None) if shapes is None else list(shapes)] = radius
-    namespace = getattr(model, "physx", None)
+    namespace = getattr(model, "feather_pgs", None)
     if namespace is not None and getattr(namespace, "min_torsional_patch_radius", None) is not None:
         namespace.min_torsional_patch_radius.assign(radii)
     else:
@@ -36,7 +36,7 @@ def set_torsion_radius(model, radius, shapes=None):
             "min_torsional_patch_radius",
             wp.array(radii, dtype=wp.float32, device=model.device),
             frequency=newton.Model.AttributeFrequency.SHAPE,
-            namespace="physx",
+            namespace="feather_pgs",
         )
 
 

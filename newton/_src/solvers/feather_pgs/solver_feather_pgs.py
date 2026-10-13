@@ -276,7 +276,7 @@ _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
-_ATTRIBUTE_NAMESPACE = "physx"
+_ATTRIBUTE_NAMESPACE = "feather_pgs"
 # PhysX's default rigid-body angular damping [1/s].
 _DEFAULT_ANGULAR_DAMPING = 0.05
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
@@ -1433,29 +1433,29 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register the body and shape attributes consumed by FeatherPGS in the ``physx`` namespace.
+        """Register the body and shape attributes consumed by FeatherPGS in the ``feather_pgs`` namespace.
 
         Each attribute maps to the matching PhysX rigid-body USD attribute:
 
-        - ``physx:angular_damping`` [1/s] damps the angular velocity of free bodies and
+        - ``feather_pgs:rigid_body_angular_damping`` [1/s] damps the angular velocity of free bodies and
           floating bases as ``w *= 1 - d dt`` each step (``physxRigidBody:angularDamping``,
           default 0.05, as :class:`~newton.solvers.SolverFeatherstone`); joints with a parent
           body are not damped. Fill the attribute for one value on every body.
-        - ``physx:max_linear_velocity`` [m/s] and ``physx:max_angular_velocity`` [rad/s]
+        - ``feather_pgs:rigid_body_max_linear_velocity`` [m/s] and ``feather_pgs:rigid_body_max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
-        - ``physx:max_depenetration_velocity`` [m/s] bounds the contact correction velocity
+        - ``feather_pgs:rigid_body_max_depenetration_velocity`` [m/s] bounds the contact correction velocity
           of free bodies (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
 
         One per-shape attribute enables contact torsion, see ``contact_torsion_device``:
 
-        - ``physx:min_torsional_patch_radius`` [m] is the effective spin radius of the
+        - ``feather_pgs:min_torsional_patch_radius`` [m] is the effective spin radius of the
           shape's contacts (``physxCollision:minTorsionalPatchRadius``, default 0, no
           torsion). PhysX also scales a radius with the penetration depth through
           ``physxCollision:torsionalPatchRadius``; this solver does not.
 
         The solver reads them from the model at every step, for example
-        ``model.physx.max_linear_velocity``. Models built without these attributes use the defaults.
+        ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
 
         Args:
             builder: Model builder to register the attributes with.
@@ -1471,7 +1471,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="angular_damping",
+                name="rigid_body_angular_damping",
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1482,7 +1482,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="max_linear_velocity",
+                name="rigid_body_max_linear_velocity",
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1493,7 +1493,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="max_angular_velocity",
+                name="rigid_body_max_angular_velocity",
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1516,7 +1516,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="max_depenetration_velocity",
+                name="rigid_body_max_depenetration_velocity",
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1541,27 +1541,27 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """Whether every contact gets friction rows (uniform normal/tangent/tangent triples)."""
         return self._contact_friction_gap_max is None or bool(np.isposinf(self._contact_friction_gap_max))
 
-    def _physx_attribute(self, name: str) -> wp.array | None:
-        """Return the model's ``physx:<name>`` custom attribute, or ``None`` when it is not registered."""
+    def _namespaced_attribute(self, name: str) -> wp.array | None:
+        """Return the model's ``feather_pgs:<name>`` custom attribute, or ``None`` when it is not registered."""
         namespace = getattr(self.model, _ATTRIBUTE_NAMESPACE, None)
         return getattr(namespace, name, None)
 
     @property
     def _rigid_body_angular_damping(self) -> wp.array:
-        attribute = self._physx_attribute("angular_damping")
+        attribute = self._namespaced_attribute("rigid_body_angular_damping")
         return self._default_angular_damping if attribute is None else attribute
 
     @property
     def _rigid_body_max_linear_velocity(self) -> wp.array | None:
-        return self._physx_attribute("max_linear_velocity")
+        return self._namespaced_attribute("rigid_body_max_linear_velocity")
 
     @property
     def _rigid_body_max_angular_velocity(self) -> wp.array | None:
-        return self._physx_attribute("max_angular_velocity")
+        return self._namespaced_attribute("rigid_body_max_angular_velocity")
 
     @property
     def _rigid_body_max_depenetration_velocity(self) -> wp.array:
-        attribute = self._physx_attribute("max_depenetration_velocity")
+        attribute = self._namespaced_attribute("rigid_body_max_depenetration_velocity")
         return self._unbounded_body_velocity if attribute is None else attribute
 
     @property
@@ -1572,7 +1572,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     @property
     def _contact_torsion_shape_radius(self) -> wp.array | None:
         """The model's per-shape torsion radius [m], or ``None`` when it is not registered."""
-        return self._physx_attribute("min_torsional_patch_radius")
+        return self._namespaced_attribute("min_torsional_patch_radius")
 
     def __init__(
         self,
@@ -1670,7 +1670,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 and skip their articulated dynamics for steps they sleep through. When False, sleeping
                 islands keep their rows and dynamics and only their published state is frozen.
             contact_torsion_device: Experimental contact torsion is enabled at construction
-                when any shape has a positive ``physx:min_torsional_patch_radius`` (see
+                when any shape has a positive ``feather_pgs:min_torsional_patch_radius`` (see
                 :meth:`register_custom_attributes`). It adds one angular row per contact group
                 of an articulated body, about the group's normal, bounded by
                 ``r * (mu * N - sliding)``: sliding and spin share one Coulomb budget, ``N`` is
@@ -2440,8 +2440,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             model.body_count, float("inf"), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
         )
         self._has_rigid_body_velocity_limits = (
-            self._physx_attribute("max_linear_velocity") is not None
-            and self._physx_attribute("max_angular_velocity") is not None
+            self._namespaced_attribute("rigid_body_max_linear_velocity") is not None
+            and self._namespaced_attribute("rigid_body_max_angular_velocity") is not None
         )
 
         # Select the contact update once, when specializing the matrix-free kernel.
