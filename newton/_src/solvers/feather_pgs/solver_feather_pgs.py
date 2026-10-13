@@ -1832,7 +1832,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 wrench with two locations; faceted wheels still experience facet-impact losses.
                 Patch locations define the friction row points, so ``contact_shared_anchor`` and
                 ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
-                Requires ``friction_mode="fixed_normal"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
+                Requires ``friction_mode="fixed_normal"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
@@ -2103,12 +2103,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 any value other than ``"fixed_normal"`` with ``solve_mode="split"`` raises ``ValueError``.
                 Defaults to ``"fixed_normal"``.
             free_body_constraint_max (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
-            pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for PGS solve. CPU models
-                use the scalar kernel suite regardless of these selectors. Defaults to "tiled_row".
-            pgs_chunk_size (int, optional): Chunk size (in contacts, i.e. groups of 3 constraint rows)
-                for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
-                preloaded into shared memory at once. 1 = current streaming behavior (one block-row
-                at a time). None defaults to 1. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
             parallel_tree: Opt in to parallel branches for forward dynamics, backward
@@ -2127,17 +2121,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 force-drive PGS formula each Gauss-Seidel iteration. The
                 PhysX row mode is currently supported only with
                 ``solve_mode="matrix_free"``. Defaults to ``"augmented"``.
-            serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``prepare_augmented_joint_drives``,
-                ``eval_rigid_tau``, and the selected-articulation fallbacks). These kernels have no
-                cross-thread reductions, so changing this value is bit-identical; it only
-                changes occupancy/grid shape. Must be a positive multiple of 32.
-                Defaults to 256 (the Warp default).
-            tile_threads (int, optional): Threads per block for the tiled
-                Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
-                change floating-point reduction order with the block size, so non-default
-                values are not bit-identical (results stay within numerical tolerance).
-                Must be one of {32, 64, 128, 256}. Defaults to 64.
+            row_watermark: Accumulate the high-water marks of the per-world row counts of
+                every row family and of the contact count on the device in every step,
+                including captured ones; read them with :meth:`constraint_row_watermarks`.
+            double_buffer: Keep two sets of the grouped mass-matrix and Jacobian buffers and
+                clear the set a step used on a separate CUDA stream. Results are unchanged; CPU
+                devices ignore it. Steps and graph launches of one solver must be ordered on one
+                stream (or through explicit stream dependencies).
             enable_restitution: Apply contact restitution, the only restitution switch. The
                 default ``True`` leaves the shapes' coefficients in charge; they default to
                 zero, so a model that authors no restitution does not bounce.
