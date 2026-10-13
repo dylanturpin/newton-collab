@@ -62,6 +62,7 @@ class _Workspace:
     first_pair: wp.array[int]
     lead: wp.array[int]
     coefficient: wp.array[float]
+    radius: wp.array[float]
     spin_row: wp.array[int]
     row_contact: wp.array2d[int]
     spin_source: wp.array2d[int]
@@ -196,7 +197,7 @@ def _patch_keys(work: _Workspace):
 
 
 @wp.kernel(enable_backward=False)
-def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
+def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[float], work: _Workspace):
     """Summarize one patch from its head; eligible members precede rejection witnesses."""
     i = wp.tid()
     key = work.patch_keys[i]
@@ -212,12 +213,14 @@ def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
     anchor_count = int(0)
     first_anchor = int(-1)
     touching = int(-1)
+    radius = float(0.0)
     j = i
     while j < capacity and (work.patch_keys[j] >> wp.int64(1)) == patch:
         c = work.patch_indices[j]
         if work.eligible[c] == 1:
             work.group[c] = rep
             work.first_pair[c] = rep
+            radius = wp.max(radius, wp.max(shape_radius[work.shape_a[c]], shape_radius[work.shape_b[c]]))
             if work.anchor[c] != 0:
                 anchor_count += 1
                 if first_anchor < 0:
@@ -234,6 +237,7 @@ def _group_patches(capacity: int, mu: wp.array2d[float], work: _Workspace):
     if coefficient <= 0.0:
         return
     work.coefficient[rep] = coefficient
+    work.radius[rep] = radius
     work.lead[rep] = touching
 
 
@@ -306,6 +310,7 @@ def _group_world(
     row_count: wp.array[int],
     row_dropped: wp.array[int],
     mu: wp.array2d[float],
+    shape_radius: wp.array[float],
     work: _Workspace,
 ):
     world = wp.tid()
@@ -356,10 +361,12 @@ def _group_world(
             continue
         first_anchor = int(-1)
         touching = int(-1)
+        radius = float(0.0)
         for j in range(start, end):
             c = work.indices[j]
             if work.group[c] != rep:
                 continue
+            radius = wp.max(radius, wp.max(shape_radius[work.shape_a[c]], shape_radius[work.shape_b[c]]))
             if work.anchor[c] != 0 and first_anchor < 0:
                 first_anchor = c
             if touching < 0 and work.gap[c] <= _TOUCH_TOLERANCE:
@@ -370,6 +377,7 @@ def _group_world(
         if coefficient <= 0.0:
             continue
         work.coefficient[rep] = coefficient
+        work.radius[rep] = radius
         work.lead[rep] = touching
 
     row = row_count[world]
@@ -401,7 +409,6 @@ def _apply_rows(
     target: wp.array2d[float],
     restitution: wp.array2d[float],
     membership: wp.array2d[int],
-    shape_radius: wp.array[float],
     row_radius: wp.array2d[float],
 ):
     c = wp.tid()
@@ -423,7 +430,7 @@ def _apply_rows(
     mu[world, row] = work.coefficient[rep]
     beta[world, row] = 0.0
     cfm[world, row] = pgs_cfm
-    row_radius[world, row] = wp.max(shape_radius[work.shape_a[lead]], shape_radius[work.shape_b[lead]])
+    row_radius[world, row] = work.radius[rep]
     phi[world, row] = 0.0
     restitution[world, row] = 0.0
     velocity = float(0.0)
@@ -534,7 +541,7 @@ class DeviceTorsionPreparation:
             "spin_row",
         ):
             setattr(w, name, wp.empty(self.capacity, dtype=int, device=device))
-        for name in ("gap", "coefficient"):
+        for name in ("gap", "coefficient", "radius"):
             setattr(w, name, wp.empty(self.capacity, dtype=float, device=device))
         for name in ("normal", "point"):
             setattr(w, name, wp.empty(self.capacity, dtype=wp.vec3, device=device))
@@ -677,7 +684,12 @@ class DeviceTorsionPreparation:
             wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
             # Stable sort keeps contact order inside each patch segment.
             wp.utils.radix_sort_pairs(w.patch_keys, w.patch_indices, self.capacity)
-            wp.launch(_group_patches, dim=self.capacity, inputs=[self.capacity, s._row_mu, w], device=device)
+            wp.launch(
+                _group_patches,
+                dim=self.capacity,
+                inputs=[self.capacity, s._row_mu, s._contact_torsion_shape_radius, w],
+                device=device,
+            )
             wp.launch(
                 _check_patch_membership,
                 dim=self.capacity,
@@ -701,6 +713,7 @@ class DeviceTorsionPreparation:
                     s._constraint_count,
                     s._row_dropped_dense,
                     s._row_mu,
+                    s._contact_torsion_shape_radius,
                     w,
                 ],
                 device=device,
@@ -725,7 +738,6 @@ class DeviceTorsionPreparation:
                 s._target_velocity,
                 s._row_restitution,
                 s._contact_torsion_group,
-                s._contact_torsion_shape_radius,
                 s._torsion_row_radius,
             ],
             device=device,

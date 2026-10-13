@@ -1690,9 +1690,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 :meth:`register_custom_attributes`). It adds one angular row per contact group
                 of an articulated body, about the group's normal, bounded by
                 ``r * (mu * N - sliding)``: sliding and spin share one Coulomb budget, ``N`` is
-                the final solved load of the group's normal rows, and ``r`` is the larger
-                radius of the group's shape pair (contacts whose pair has no positive radius
-                get no torsion). With point friction a group is a coplanar cluster of touching
+                the final solved load of the group's normal rows, and ``r`` is the largest
+                radius of the group's shapes (a patch region can span several shape pairs;
+                contacts whose pair has no positive radius get no torsion). With point friction a group is a coplanar cluster of touching
                 contacts of one shape pair; with friction patches it is one patch region,
                 budgeted by its pooled load and undivided friction coefficient. The radius is
                 an effective footprint, not derived from the geometry: for uniform pressure on
@@ -1781,10 +1781,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 step pattern to behave as requested. Per-articulation limit-count changes still trigger a
                 device-side mass refresh on skipped steps. Defaults to 1.
             contact_friction_gap_max (float | None, optional): Contacts with a gap [m] above this distance
-                get a normal row only. ``None`` (the default) gives every contact friction rows; a negative
-                value gives none of them friction rows, which saves the rows that zero friction
-                coefficients would keep. Switching between ``None`` (or ``inf``) and a finite or
-                ``-inf`` value requires a new solver.
+                get a normal row only. ``None`` (the default) gives every contact friction rows; ``-inf``
+                gives none of them friction rows, which saves the rows that zero friction coefficients
+                would keep. A finite negative value keeps friction rows for contacts that penetrate
+                deeper than it. Switching between ``None`` (or ``inf``) and a finite or ``-inf`` value
+                requires a new solver.
             contact_friction_position_iterations (int, optional): Number of biased PGS position
                 iterations that solve contact-friction rows. ``-1`` preserves legacy FeatherPGS
                 behavior by solving friction in every position iteration; ``0`` skips position-pass
@@ -3050,7 +3051,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             dtype=wp.int32,
             device=model.device,
         )
-        # Effective spin radius [m] of each torsion row, the larger of its shape pair's radii.
+        # Effective spin radius [m] of each torsion row, the largest radius of its group's shapes.
         self._torsion_row_radius = wp.zeros(
             self._row_parent.shape if self._contact_torsion_enabled else (1, 1), dtype=wp.float32, device=model.device
         )
