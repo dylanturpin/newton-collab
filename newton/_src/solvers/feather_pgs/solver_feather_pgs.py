@@ -9431,6 +9431,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Double-buffer: select the buffer set; its clear was joined when the previous step returned.
         if self._memset_stream is not None:
             self._double_buffer_selected = True
+            # Set by the mass-matrix stage; a step that raises before it wrote no mass matrices.
+            self._mass_update_global_flag = False
             self._H_by_size = self._H_bufs[self._buf_idx]
             self._J_by_size = self._J_bufs[self._buf_idx]
             if self._jy_world_aliased:
