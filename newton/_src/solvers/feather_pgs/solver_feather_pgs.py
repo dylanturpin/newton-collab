@@ -1325,9 +1325,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         not :attr:`~newton.Model.joint_armature`, which the solve adds to the joint-space inertia.
         For a dynamic DOF, the wrench projected onto the joint's motion subspace (in matching
         frames) is therefore the DOF's generalized load, :attr:`~newton.Control.joint_f` plus its
-        joint-space rows, less ``armature * qdd``, where ``qdd`` is the solver's integration
-        acceleration. For example, a revolute joint driven by 10 N·m with armature 9 kg·m² on a
-        body of axial inertia 1 kg·m² reports 1 N·m about the axis.
+        explicit passive spring and damping forces and its joint-space rows, less
+        ``armature * qdd``, where ``qdd`` is the solver's integration acceleration. For example,
+        a revolute joint driven by 10 N·m with armature 9 kg·m² on a body of axial inertia
+        1 kg·m² reports 1 N·m about the axis.
         :class:`~newton.solvers.SolverMuJoCo` reconstructs MuJoCo's ``cfrc_int`` the same way.
         Kinematic DOFs are held by a large internal armature that is not part of the wrench, and
         their ``qdd`` is zero. They report the rigid-body load of carrying their subtree along the
