@@ -96,7 +96,7 @@ def _make_solver(model, sparse, **overrides):
         "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
-        "friction_mode": "current",
+        "friction_mode": "fixed_normal",
         "iterations": 32,
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,
@@ -151,8 +151,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         """Admit a robot-only world and a separate free-only world without oversized row support."""
         dense, sparse = _case(False, heterogeneous=True), _case(True, heterogeneous=True)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
-        np.testing.assert_array_equal(sparse[1].world_dof_count.numpy(), [9, 6])
-        self.assertLessEqual(sparse[1]._sparse_row_dof.shape[2], sparse[1].max_world_dofs)
+        np.testing.assert_array_equal(sparse[1]._world_dof_count.numpy(), [9, 6])
+        self.assertLessEqual(sparse[1]._sparse_row_dof.shape[2], sparse[1]._max_world_dofs)
         for _ in range(4):
             for case in (dense, sparse):
                 _step(case)
@@ -179,8 +179,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             self.assert_states_close(dense[2], sparse[2])
             for family, (counter, target) in enumerate(
                 (
-                    ("constraint_count", "target_velocity"),
-                    ("mf_constraint_count", "mf_target_velocity"),
+                    ("_constraint_count", "_target_velocity"),
+                    ("_mf_constraint_count", "_mf_target_velocity"),
                 )
             ):
                 counts = getattr(sparse[1], counter).numpy()
@@ -340,7 +340,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         dense, sparse = _case(False, robot_count=2), _case(True, robot_count=2)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
         self.assertEqual(sparse[1]._sparse_Linv.shape[0], 4)
-        self.assertEqual(sparse[1].world_count, 2)
+        self.assertEqual(sparse[1]._world_count, 2)
         contact_seen = False
         for _ in range(16):
             row_orders = []
@@ -382,11 +382,11 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 for case in (dense, sparse):
                     _step(case)
                 self.assert_states_close(dense[2], sparse[2])
-                for name in ("constraint_count", "mf_constraint_count"):
+                for name in ("_constraint_count", "_mf_constraint_count"):
                     np.testing.assert_array_equal(getattr(dense[1], name).numpy(), getattr(sparse[1], name).numpy())
                 for count_name, impulse_name in (
-                    ("constraint_count", "impulses"),
-                    ("mf_constraint_count", "mf_impulses"),
+                    ("_constraint_count", "_impulses"),
+                    ("_mf_constraint_count", "_mf_impulses"),
                 ):
                     counts = getattr(sparse[1], count_name).numpy()
                     self.assertTrue(np.all(counts > 0), count_name)
@@ -400,8 +400,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 contacts = sparse[-1]
                 active = int(contacts.rigid_contact_count.numpy()[0])
                 shape_body = sparse[0].shape_body.numpy()
-                body_art = sparse[1].body_to_articulation.numpy()
-                free = sparse[1].is_free_rigid.numpy()
+                body_art = sparse[1]._body_to_articulation.numpy()
+                free = sparse[1]._is_free_rigid.numpy()
                 seen = set()
                 for shape_a, shape_b in zip(
                     contacts.rigid_contact_shape0.numpy()[:active],
@@ -459,7 +459,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             for case in (dense, sparse):
                 _step(case)
             contact_seen |= bool(sparse[-1].rigid_contact_count.numpy()[0])
-            limit_seen |= bool(np.any(sparse[1].row_type.numpy() == PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+            limit_seen |= bool(np.any(sparse[1]._row_type.numpy() == PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
             self.assert_states_close(dense[2], sparse[2])
         self.assertTrue(contact_seen and limit_seen, "Fixture must exercise contacts and joint limits")
         self.assert_sparse_state(sparse)
@@ -474,7 +474,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (dense, sparse):
             _step(case)
-        np.testing.assert_array_equal(sparse[1].mass_update_mask.numpy(), [1, 0])
+        np.testing.assert_array_equal(sparse[1]._mass_update_mask.numpy(), [1, 0])
         np.testing.assert_array_equal(sparse[1]._sparse_Linv.numpy()[1], held[1])
         self.assert_states_close(dense[2], sparse[2])
         for model, solver, *_ in (dense, sparse):
@@ -484,7 +484,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
         for case in (dense, sparse):
             _step(case)
-        np.testing.assert_array_equal(sparse[1].mass_update_mask.numpy(), [1, 1])
+        np.testing.assert_array_equal(sparse[1]._mass_update_mask.numpy(), [1, 1])
         self.assertFalse(np.array_equal(sparse[1]._sparse_Linv.numpy()[0], held[0]))
         self.assert_states_close(dense[2], sparse[2])
         self.assert_sparse_state(sparse)

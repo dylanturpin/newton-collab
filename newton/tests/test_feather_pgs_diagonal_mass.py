@@ -95,7 +95,7 @@ def test_sleeping_diagonal_dynamics_skip_is_exact(test, device):
             np.testing.assert_array_equal(
                 getattr(runs[0][3], field).numpy(), getattr(runs[1][3], field).numpy(), err_msg=f"{step}: {field}"
             )
-        awake = runs[1][0].sleeping.art_awake.numpy()
+        awake = runs[1][0]._sleeping.art_awake.numpy()
         slept |= step < 300 and not awake.any()
         woke |= 300 <= step < 306 and bool(awake[0])
     test.assertTrue(slept, "the diagonal-mass articulations never slept")

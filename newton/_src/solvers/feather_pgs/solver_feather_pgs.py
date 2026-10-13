@@ -1639,11 +1639,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 False retains the host reference implementation. True preserves the
                 grouping and friction law while using preallocated GPU buffers.
                 It supports CUDA graph capture of :meth:`step`. Invalid torsion input
-                (for example rows beyond the capacity or hydroelastic contacts) makes the
-                failing step restore its output motion arrays (``joint_q``, ``joint_qd``,
-                ``body_q``, ``body_qd``, ``body_qdd``) to the input values; other outputs,
-                observables and solver history still advance. An eager step raises when it
-                returns; after graph replays, :meth:`check_constraint_capacity` raises.
+                (for example rows beyond the capacity or hydroelastic contacts) makes
+                an eager step raise before it applies torsion rows. In a captured step the
+                error is deferred: the failing step restores its output motion arrays
+                (``joint_q``, ``joint_qd``, ``body_q``, ``body_qd``, ``body_qdd``) to the input
+                values, while other outputs, observables and solver history still advance,
+                and :meth:`check_constraint_capacity` raises after the replays.
                 Check before using replay results, discard failed output, fix the cause and
                 :meth:`reset`. The error is solver-wide: any reset clears it, and a cause
                 that persists latches it again on the next step. No effect when the torsion radius is
@@ -3228,7 +3229,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._contact_torsion_enabled and self._contact_torsion_device:
             from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
 
-            enable_device_torsion(self, deferred_errors=True)
+            enable_device_torsion(self)
+            # Rollback snapshots are sized from the model, so a first step can be captured.
+            self._device_torsion.allocate_snapshots(model)
 
         self._enable_sleeping = bool(enable_sleeping)
         self._sleep_linear_threshold = float(sleep_linear_threshold)
@@ -9171,6 +9174,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if self._device_torsion is not None:
+                # Captured steps defer errors to the device; eager steps raise during preparation.
+                self._device_torsion.deferred_errors = wp.get_stream(self.model.device).is_capturing
                 self._device_torsion.begin_step(state_in, state_out)
         validate_torsional_rolling_friction_mode(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
@@ -9964,8 +9969,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         if self._device_torsion is not None:
             self._device_torsion.end_step(state_out)
-            if not wp.get_stream(self.model.device).is_capturing:
-                self._device_torsion.validate()
         self._step += 1
         return state_out
 

@@ -204,7 +204,7 @@ def main():
         "results": [],
     }
     for repeat in range(args.repeats):
-        result = run(args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations, "current")
+        result = run(args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations, "fixed_normal")
         result["repeat"] = repeat
         report["results"].append(result)
         if args.output:

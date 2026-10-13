@@ -139,8 +139,8 @@ def _articulated_contact_penetration_m(solver: SolverFeatherPGS) -> float:
     """Max articulated-contact penetration over dense + propagation rows [m]."""
     peak = 0.0
     for count_name, phi_name, type_name in (
-        ("constraint_count", "phi", "row_type"),
-        ("propagation_constraint_count", "propagation_phi", "propagation_row_type"),
+        ("_constraint_count", "_phi", "_row_type"),
+        ("_propagation_constraint_count", "_propagation_phi", "_propagation_row_type"),
     ):
         counts = getattr(solver, count_name, None)
         phi = getattr(solver, phi_name, None)

@@ -117,7 +117,7 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         body_q=arr(np.tile([0, 0, 0, 0, 0, 0, 1], (worlds * 2, 1)).astype(np.float32), wp.transform)
     )
     augmented = SimpleNamespace(
-        joint_S_s=arr(motion, wp.spatial_vector), body_v_s=arr(body_velocity, wp.spatial_vector)
+        _joint_S_s=arr(motion, wp.spatial_vector), _body_v_s=arr(body_velocity, wp.spatial_vector)
     )
     contacts = SimpleNamespace(
         rigid_contact_count=arr([n], int),
@@ -193,16 +193,16 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
         preparer = DeviceTorsionPreparation(actual)
         preparer.prepare(state2, augmented2, contacts2)
         for name in (
-            "constraint_count",
-            "slot_counter",
-            "row_type",
-            "row_parent",
-            "row_mu",
-            "row_beta",
-            "row_cfm",
-            "phi",
-            "target_velocity",
-            "row_restitution",
+            "_constraint_count",
+            "_slot_counter",
+            "_row_type",
+            "_row_parent",
+            "_row_mu",
+            "_row_beta",
+            "_row_cfm",
+            "_phi",
+            "_target_velocity",
+            "_row_restitution",
             "_contact_torsion_group",
         ):
             np.testing.assert_allclose(
@@ -679,8 +679,6 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 solver.step(state, output, model.control(), contacts, 0.0025)
             with self.assertRaisesRegex(RuntimeError, "load ring"):
                 solver.check_constraint_capacity()
-            np.testing.assert_array_equal(output.joint_q.numpy(), state.joint_q.numpy())
-            np.testing.assert_array_equal(output.joint_qd.numpy(), state.joint_qd.numpy())
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_cold_capture_reports_errors_until_reset(self):
