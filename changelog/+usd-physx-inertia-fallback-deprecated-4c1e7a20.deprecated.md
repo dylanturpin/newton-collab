@@ -1,0 +1,1 @@
+Deprecate `ModelBuilder.add_usd(physx_missing_inertia_fallback=...)`. The argument is now ignored and emits a `DeprecationWarning`; it remains accepted through 1.7 and is eligible for removal in 1.8. Drop the argument.
