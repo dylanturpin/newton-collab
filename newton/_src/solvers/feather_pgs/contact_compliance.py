@@ -103,8 +103,6 @@ def validate_configuration(model, settings):
         "pgs_debug": False,
         "contact_friction_position_iterations": -1,
         "friction_mode": "current",
-        "contact_friction_shared_anchor": False,
-        "contact_shared_anchor": False,
     }
     for key, expected in required.items():
         if settings[key] != expected:

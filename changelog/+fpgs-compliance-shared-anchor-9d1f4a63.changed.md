@@ -1,0 +1,1 @@
+Allow `contact_shared_anchor` and `contact_friction_shared_anchor` with FeatherPGS `contact_compliance`. The compliant row law reads the contact separation and never the Jacobian point, so a shared anchor keeps the impulse pair momentum-exact; the validation gate that rejected the combination is removed and the native hydro fixture now also runs with shared anchors.

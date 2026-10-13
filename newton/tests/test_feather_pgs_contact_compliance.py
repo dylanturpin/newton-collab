@@ -154,7 +154,7 @@ def run_fixture(
         return np.asarray(trace), seen_paths, solver, float(model.body_mass.numpy()[body])
 
 
-def run_native_hydro_fixture(*, articulated=True):
+def run_native_hydro_fixture(*, articulated=True, shared_anchor=False):
     """Consume emitted SDF hydro coefficients unchanged on dense or MF sphere rows."""
     with wp.ScopedDevice(os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
@@ -210,6 +210,8 @@ def run_native_hydro_fixture(*, articulated=True):
                 model,
                 contact_compliance=enabled,
                 friction_anchor_beta=0.0,
+                contact_shared_anchor=shared_anchor,
+                contact_friction_shared_anchor=shared_anchor,
                 pgs_mode="matrix_free",
                 pgs_schedule="interleaved",
                 articulated_contact_response="immediate",
@@ -372,6 +374,20 @@ class TestContactComplianceIntegration(unittest.TestCase):
         )
         self.assertTrue(
             all(np.isfinite(list(result[key].values())).all() for key in ("compliant", "stock_law", "native_material"))
+        )
+
+    def test_native_hydro_material_pipeline_shared_anchor(self):
+        """Keep the compliant law available with shared contact anchors (momentum-exact rows)."""
+        per_body = run_native_hydro_fixture()
+        shared = run_native_hydro_fixture(shared_anchor=True)
+        self.assertEqual(
+            shared["compliant"]["consumed_compliant_contacts"], shared["native_material"]["positive_stiffness_contacts"]
+        )
+        self.assertTrue(np.isfinite(list(shared["compliant"].values())).all())
+        # The anchor only moves the Jacobian point by the (sub-millimetre) separation, so the
+        # compliant normal impulse must agree closely between the two anchor choices.
+        np.testing.assert_allclose(
+            shared["compliant"]["normal_impulse_N_s"], per_body["compliant"]["normal_impulse_N_s"], rtol=2.0e-2
         )
 
     def test_native_hydro_free_body_manifold(self):
