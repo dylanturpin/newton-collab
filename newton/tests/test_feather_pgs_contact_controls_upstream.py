@@ -29,7 +29,7 @@ def _free_body_model(device):
 def test_shared_anchors_warn_with_patch_friction(test, device):
     """Explain that patch anchors keep their friction points when shared anchors are requested."""
     model = _free_body_model(device)
-    for flag in ("_contact_shared_anchor", "_contact_friction_shared_anchor"):
+    for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
         with test.subTest(flag=flag), test.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
             SolverFeatherPGS(model, **{flag: True})
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0, **{flag: True})

@@ -75,7 +75,7 @@ class TestContactComplianceSafety(unittest.TestCase):
             start_step(solver, self.contacts(), 0.005)
         solver._contact_compliance = True
         with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
-            SolverFeatherPGS.step(solver, None, None, None, None, 0.005)
+            SolverFeatherPGS._run_step(solver, None, None, None, None, 0.005, None, None)
 
     def test_filtered_speculative_contacts_are_skipped(self):
         """Honor the normal allocator's positive-gap exclusion for compliant contacts."""

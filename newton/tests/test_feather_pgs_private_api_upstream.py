@@ -40,7 +40,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         size_group_loop = next(
             node
             for node in ast.walk(init_method)
-            if isinstance(node, ast.For) and isinstance(node.iter, ast.Attribute) and node.iter.attr == "size_groups"
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Attribute) and node.iter.attr == "_size_groups"
         )
         calls = {
             child.func.id: child.lineno

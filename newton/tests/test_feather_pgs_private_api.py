@@ -95,14 +95,15 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
     def _find_size_group_loop(function_node):
         for node in ast.walk(function_node):
             if isinstance(node, ast.For) and isinstance(node.iter, ast.Attribute):
-                if node.iter.attr == "size_groups":
+                if node.iter.attr == "_size_groups":
                     return node
-        raise AssertionError("_init_tiled_kernels does not iterate over self.size_groups")
+        raise AssertionError("_init_tiled_kernels does not iterate over self._size_groups")
 
     @staticmethod
     def _references_dense_max_constraints(node):
         return any(
-            isinstance(child, ast.Attribute) and child.attr == "articulation_constraint_max" for child in ast.walk(node)
+            isinstance(child, ast.Attribute) and child.attr == "_articulation_constraint_max"
+            for child in ast.walk(node)
         )
 
     @classmethod

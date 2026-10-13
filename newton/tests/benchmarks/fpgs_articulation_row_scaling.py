@@ -998,7 +998,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
-        f"dt {args.dt}, PGS iterations {args.iterations}, velocity iterations {args.velocity_iterations}, "
+        f"dt {args.dt}, PGS iterations {args.pgs_iterations}, velocity iterations {args.pgs_velocity_iterations}, "
         f"contact friction {'off' if args.no_friction else 'on'}, "
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
         f"scalar `H^-1 J^T` kernel pinned, "
