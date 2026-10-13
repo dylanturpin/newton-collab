@@ -4177,7 +4177,7 @@ def populate_connect_J_for_size(
     Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
     (small) closure table and, for closures belonging to its articulation, writes three
     rows: for world axis ``e_k``, ``phi = (p_A - p_B) . e_k`` and
-    ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
+    ``J = e_k . (Jpoint(parent, p_M) - Jpoint(child, p_M))`` with ``p_M`` the anchor midpoint, via the contact ancestor
     walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
     diagonal makes the sweep skip it. The anchors are the translations of the closure
     joint's ``joint_X_p`` / ``joint_X_c``, read every step.
@@ -4220,9 +4220,15 @@ def populate_connect_J_for_size(
                 v_a = v_com + wp.cross(omega, p_a - x_com)
         p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
         origin = articulation_origin[art]
-        rel_a = p_a - origin
-        rel_b = p_b - origin
         delta = p_a - p_b
+        # Shared anchor: both ancestor walks take their lever arm from the midpoint of
+        # the two anchors, so the impulse pair acts at one world point and applies no
+        # net wrench to the articulation however far the closure has drifted (the
+        # per-body form is a couple C x lambda that spins a floating base). Identical
+        # to the per-body Jacobian once the closure is satisfied.
+        p_m = p_a - 0.5 * delta
+        rel_a = p_m - origin
+        rel_b = rel_a
 
         for axis in range(3):
             slot = base_slot + axis
