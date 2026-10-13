@@ -139,6 +139,12 @@ The native MuJoCo CPU backend (``use_mujoco_cpu=True``) supports only
 ``SolverMuJoCo.ObservableFlags.QFRC_ACTUATOR``; body and contact observable
 requests are rejected. MuJoCo Warp supports body observables on both CPU and GPU.
 
+:class:`~newton.solvers.SolverFeatherPGS` accounts ``BODY_PARENT_F`` from the step's solved
+motion, including its contact, friction and loop-closure impulses, so loads carried by a subtree
+reach the joints that support it; see the solver's documentation for the cases it leaves out.
+:class:`~newton.solvers.SolverFeatherstone` reports the start-of-step inverse dynamics at zero
+joint acceleration instead.
+
 :class:`~newton.solvers.SolverFeatherPGS` reports only the linear part of each rigid
 contact force; the torque part is zero. Contacts without solved rows, such as rows
 dropped for capacity or skipped for sleeping islands, report zero. A sleeping body's
