@@ -272,7 +272,7 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
-# CUDA caps a block's static __shared__ arrays here; larger budgets need dynamic shared memory.
+# Conservative portable bound for static __shared__ arrays; some architectures accept more.
 _STATIC_SHARED_MEMORY_MAX_BYTES = 48 * 1024
 # Headroom for the static shared storage Warp adds to a kernel beyond the solver's own arrays.
 _WARP_STATIC_SHARED_RESERVE_BYTES = 2048
@@ -1057,7 +1057,7 @@ def _use_mfgs_torsion_links(
     has_drive_rows: bool,
     fuse_vel_limits: bool,
 ) -> bool:
-    """Select the linked contact-torsion sweep when its row lists fit the static shared-memory limit.
+    """Select the linked contact-torsion sweep when its row lists fit the portable static shared-memory bound.
 
     Otherwise the sweep scans every dense row for torsion groups, with identical results.
     """
