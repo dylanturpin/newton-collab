@@ -61,6 +61,7 @@ from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
     prepare_torsion_velocity_pass,
+    torque_links_source,
     torque_sweep_source,
     validate_torsion_step,
 )
@@ -26288,6 +26289,7 @@ def _get_pgs_solve_mf_gs_kernel(
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
     torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
     torsion_sweep = torque_sweep_source(D) if contact_torsion else ""
+    torsion_links = torque_links_source(M_D) if contact_torsion else ""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -26372,6 +26374,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
     // ═══════════════════════════════════════════════════════
+{torsion_links}
     // Dense pipeline registers
 {dense_pipe_decl}
 

@@ -484,21 +484,54 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._contact_torsion_group.assign(membership)
 
 
+def torque_links_source(max_constraints):
+    """Return the once-per-launch build of the torsion row lists the sweep walks.
+
+    Defines ``torsion_head``, the first torsion row, and two shared arrays: for a
+    torsion row, ``s_torsion_next`` is the next torsion row and ``s_torsion_first``
+    its first member contact row; for a member, ``s_torsion_next`` is the next member.
+    Every list ascends, so the sweep visits rows in the order of a full scan.
+    """
+    index_type = "short" if max_constraints <= 32767 else "int"
+    return f"""
+    __shared__ {index_type} s_torsion_next[{max_constraints}];
+    __shared__ {index_type} s_torsion_first[{max_constraints}];
+    int torsion_head = -1;
+    if (row_phase == 0) {{
+        if (lane == 0) {{
+            for (int n = m_dense - 1; n >= 0; --n) {{
+                if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
+                s_torsion_next[n] = torsion_head;
+                s_torsion_first[n] = -1;
+                torsion_head = n;
+            }}
+            for (int n = m_dense - 1; n >= 0; --n) {{
+                if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT}) continue;
+                int spin = world_torsion_group.data[off_dense + n];
+                if (spin < 0 || spin >= m_dense ||
+                    world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
+                s_torsion_next[n] = s_torsion_first[spin];
+                s_torsion_first[spin] = n;
+            }}
+        }}
+        torsion_head = __shfl_sync(MASK, torsion_head, 0);
+        __syncwarp();
+    }}
+"""
+
+
 def torque_sweep_source(dofs):
     """Return the coupled residual-budget angular solve inside each PGS sweep."""
     return f"""
         if (row_phase == 0) {{
-            for (int spin = 0; spin < m_dense; ++spin) {{
-                if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
+            for (int spin = torsion_head; spin >= 0; spin = s_torsion_next[spin]) {{
                 float radius = contact_torsion_radius;
                 // The torsion row carries its group's undivided coefficient. Persistent
                 // patches divide the anchor tangent rows' coefficient by the anchor count.
                 float mu = fmaxf(world_row_mu.data[off_dense + spin], 0.0f);
                 float normal_load = 0.0f;
                 float sliding_used = 0.0f;
-                for (int n = 0; n < m_dense; ++n) {{
-                    if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT} ||
-                        world_torsion_group.data[off_dense + n] != spin) continue;
+                for (int n = s_torsion_first[spin]; n >= 0; n = s_torsion_next[n]) {{
                     normal_load += fmaxf(s_lam_dense[n], 0.0f);
                     // Only a normal followed by its own tangent pair consumes sliding budget;
                     // under persistent patches, non-anchor normals occupy a single slot.
@@ -521,10 +554,8 @@ def torque_sweep_source(dofs):
                 if (sliding_used > normal_budget) {{
                     float scale = normal_budget / sliding_used;
                     sliding_used = 0.0f;
-                    for (int n = 0; n < m_dense; ++n) {{
-                        if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT} ||
-                            world_torsion_group.data[off_dense + n] != spin ||
-                            n + 2 >= m_dense ||
+                    for (int n = s_torsion_first[spin]; n >= 0; n = s_torsion_next[n]) {{
+                        if (n + 2 >= m_dense ||
                             world_row_type.data[off_dense + n + 1] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
                             world_row_parent.data[off_dense + n + 1] != n ||
                             world_row_type.data[off_dense + n + 2] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
