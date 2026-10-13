@@ -7476,6 +7476,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
+        self._double_buffer_selected = False
         if self._H_bufs is None or not self.model.device.is_cuda:
             self._memset_stream = None
             self._j_active_counts = None
@@ -9185,6 +9186,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         Returns:
             ``state_out``.
         """
+        try:
+            return self._run_step(state_in, state_out, control, contacts, dt, collide_done_event, observables)
+        except BaseException:
+            if self._double_buffer_selected:
+                self._double_buffer_selected = False
+                # An eager step that stops early left rows in its buffer set; clear it as a finished step
+                # would. Work recorded into a failed capture never ran.
+                if not wp.get_stream(self.model.device).is_capturing:
+                    self._clear_double_buffer()
+            raise
+
+    def _run_step(self, state_in, state_out, control, contacts, dt, collide_done_event, observables):
+        """Run :meth:`step` after its arguments are bound."""
         if self._sparse_mass_matrix_size is not None and (
             self._solve_mode != "matrix_free"
             or self._row_schedule != "interleaved"
@@ -9415,6 +9429,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         # Double-buffer: select the buffer set; its clear was joined when the previous step returned.
         if self._memset_stream is not None:
+            self._double_buffer_selected = True
             self._H_by_size = self._H_bufs[self._buf_idx]
             self._J_by_size = self._J_bufs[self._buf_idx]
             if self._jy_world_aliased:
@@ -9981,27 +9996,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # diagonal, structural zeros are never written after allocation, and
         # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
-            with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                wp.copy(self._j_active_counts[self._buf_idx], self._constraint_count)
-                with wp.ScopedStream(self._memset_stream, sync_enter=True, sync_exit=True):
-                    for size in self._size_groups:
-                        if self._mass_update_global_flag:
-                            self._H_bufs[self._buf_idx][size].zero_()
-                        wp.launch(
-                            clear_grouped_jacobian_active_rows,
-                            dim=self._n_arts_by_size[size] * 32,
-                            inputs=[
-                                self._group_to_art[size],
-                                self._art_to_world,
-                                self._j_active_counts[self._buf_idx],
-                                size,
-                                self._articulation_constraint_max,
-                            ],
-                            outputs=[self._J_bufs[self._buf_idx][size]],
-                            block_dim=256,
-                            device=self.model.device,
-                        )
-                self._buf_idx = 1 - self._buf_idx
+            self._clear_double_buffer()
 
         if self._row_watermark:
             self._accumulate_row_watermarks(contacts)
@@ -10010,6 +10005,31 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._device_torsion.end_step(state_out)
         self._step += 1
         return state_out
+
+    def _clear_double_buffer(self) -> None:
+        """Clear the buffer set of this step on the memset stream and switch to the other set."""
+        self._double_buffer_selected = False
+        with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
+            wp.copy(self._j_active_counts[self._buf_idx], self._constraint_count)
+            with wp.ScopedStream(self._memset_stream, sync_enter=True, sync_exit=True):
+                for size in self._size_groups:
+                    if self._mass_update_global_flag:
+                        self._H_bufs[self._buf_idx][size].zero_()
+                    wp.launch(
+                        clear_grouped_jacobian_active_rows,
+                        dim=self._n_arts_by_size[size] * 32,
+                        inputs=[
+                            self._group_to_art[size],
+                            self._art_to_world,
+                            self._j_active_counts[self._buf_idx],
+                            size,
+                            self._articulation_constraint_max,
+                        ],
+                        outputs=[self._J_bufs[self._buf_idx][size]],
+                        block_dim=256,
+                        device=self.model.device,
+                    )
+            self._buf_idx = 1 - self._buf_idx
 
     def _unsolvable_global_articulations(self, model) -> np.ndarray:
         """Return global articulations whose contacts with other worlds cannot be solved.
@@ -10093,7 +10113,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         their output, re-enable the joint and :meth:`reset` the affected worlds. A check that
         passes after the reset does not validate the earlier output. With
         ``contact_torsion_device``, also raises if contact torsion rejected its input since
-        the last :meth:`reset`; the failing step restored its output motion arrays to the input.
+        the last :meth:`reset`; a failing captured step restored its output motion arrays to the
+        input, while a failing eager step raised from :meth:`step`.
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
