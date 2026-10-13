@@ -1321,25 +1321,31 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         Joint-space rows (drives, limits, joint friction, mimic) enter through the accelerations.
         Bodies outside every articulation report zero.
 
-        The inverse dynamics uses the bodies' rigid inertia only. Joint armature
-        (:attr:`~newton.Model.joint_armature`) acts as a rotor inertia whose reaction is borne by
-        the parent, so it is not transmitted to the child. Projected onto a joint's motion
-        subspace, the wrench is the joint's generalized force less ``armature * qdd`` per DOF.
-        For example, a revolute joint driven by 10 N·m with armature 9 kg·m² on a body of axial
-        inertia 1 kg·m² reports 1 N·m about the axis. :class:`~newton.solvers.SolverMuJoCo` follows
-        the same convention (MuJoCo's ``cfrc_int``).
+        The reconstruction is rigid-body inverse dynamics: it uses the bodies' mass and inertia,
+        not :attr:`~newton.Model.joint_armature`, which the solve adds to the joint-space inertia.
+        For a dynamic DOF, the wrench projected onto the joint's motion subspace (in matching
+        frames) is therefore the DOF's generalized load, :attr:`~newton.Control.joint_f` plus its
+        joint-space rows, less ``armature * qdd``, where ``qdd`` is the solver's integration
+        acceleration. For example, a revolute joint driven by 10 N·m with armature 9 kg·m² on a
+        body of axial inertia 1 kg·m² reports 1 N·m about the axis.
+        :class:`~newton.solvers.SolverMuJoCo` reconstructs MuJoCo's ``cfrc_int`` the same way.
+        Kinematic DOFs are held by a large internal armature that is not part of the wrench, and
+        their ``qdd`` is zero. They report the rigid-body load of carrying their subtree along the
+        prescribed motion, such as the weight moment of a held arm.
 
         The accounting has these limits:
 
         - With ``enable_bilateral_preelimination`` the loop-closure reactions are not stored and
           are left out; requesting the wrench warns once.
         - A body whose inbound joint is FREE reports the residual of its discrete momentum
-          balance, which is the reaction of the FREE joint's armature, ``-armature * qdd`` in the
-          solver's joint coordinates. A forced or contact-stopped body with armature therefore
-          reports a nonzero wrench; without armature its force part is zero up to solver
-          tolerance. The stabilized gyroscopic update of single-body FREE articulations is not the
-          inverse dynamics' ``v x* (I v)`` term, so a spinning body with anisotropic inertia can
-          also report a torque residual.
+          balance: its FREE ``joint_f`` less ``armature * qdd``, in the solver's FREE coordinates.
+          Without ``joint_f`` it is ``-armature * qdd``, so a body pushed through
+          :attr:`~newton.State.body_f` or stopped by contact reports a nonzero wrench when its
+          FREE joint has armature; with neither, its force part is zero up to solver tolerance.
+          For a moving FREE body ``qdd`` differs from the change of ``joint_qd`` over ``dt`` by a
+          velocity-product transport term. The stabilized gyroscopic update of single-body FREE
+          articulations is not the inverse dynamics' ``v x* (I v)`` term, so a spinning body with
+          anisotropic inertia can also report a torque residual.
         - Coupled-solver forces that do not arrive through :attr:`~newton.State.body_f` are not
           included.
         - Contact wrenches are summed with atomics, so the last bits can differ run to run.

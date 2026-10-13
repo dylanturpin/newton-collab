@@ -780,10 +780,10 @@ def _step_armature_scene(model, state, control, solver):
 
 
 def test_parent_wrench_excludes_joint_armature(test, device):
-    """Leave each joint's armature reaction on its parent, as rotor inertia, on every joint type.
+    """Reconstruct every joint type's wrench without its armature.
 
-    Projected onto its motion subspace, every wrench is the applied joint force less ``armature * qdd``. A FREE
-    body therefore reports ``-armature * qdd``, and the weld reports its child's rigid-body wrench.
+    Projected onto its motion subspace, every wrench is the applied joint force less ``armature * qdd``. The FREE
+    body has no ``joint_f``, so it reports ``-armature * qdd``, and the weld reports its child's rigid-body wrench.
     """
     configurations = [{"pgs_mode": "split"}]
     if wp.get_device(device).is_cuda:
@@ -856,6 +856,55 @@ def test_parent_wrench_of_a_contact_stop_with_armature(test, device, pgs_mode="s
             test.assertAlmostEqual(contact_z + float(wrench[2]), mass * accel_z, delta=1.0e-3 * mass * accel_z)
 
 
+def test_parent_wrench_of_a_commanded_free_joint(test, device):
+    """Report a FREE joint's own generalized command less its armature reaction.
+
+    A 1 kg, unit-inertia body at rest driven through ``joint_f`` by 10 N and 10 N·m accelerates at
+    ``10 / (1 + armature)``, so it reports ``10 - armature * qdd``: 1 with armature 9 and 10 without.
+    """
+    for armature, expected in ((0.0, 10.0), (9.0, 1.0)):
+        with test.subTest(armature=armature):
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            builder.add_articulation([builder.add_joint_free(body)])
+            model = builder.finalize(device=device)
+            model.joint_armature.fill_(armature)
+            state = model.state()
+            control = model.control()
+            control.joint_f.assign(np.array([10.0, 0.0, 0.0, 0.0, 0.0, 10.0], dtype=np.float32))
+            solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0)
+            wrench, qdd = _step_armature_scene(model, state, control, solver)
+            np.testing.assert_allclose(qdd[[0, 5]], 10.0 / (1.0 + armature), rtol=1.0e-5)
+            np.testing.assert_allclose(wrench[0], [expected, 0.0, 0.0, 0.0, 0.0, expected], rtol=1.0e-4, atol=1.0e-4)
+
+
+def test_parent_wrench_of_a_held_kinematic_joint(test, device):
+    """Report the support load of a held kinematic hinge, whatever its armature.
+
+    The 1 kg hinge body sits on the axis and carries a welded 1 kg child 1 m out, so the hinge holds 2 g of
+    weight and the child's -g moment about its axis, with zero command and zero acceleration.
+    """
+    for armature in (0.0, 9.0):
+        with test.subTest(armature=armature):
+            builder = newton.ModelBuilder()
+            hinge = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
+            child = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            builder.add_articulation(
+                [
+                    builder.add_joint_revolute(-1, hinge, axis=(0.0, 1.0, 0.0)),
+                    builder.add_joint_fixed(
+                        hinge, child, parent_xform=wp.transform(wp.vec3(1.0, 0.0, 0.0), wp.quat_identity())
+                    ),
+                ]
+            )
+            model = builder.finalize(device=device)
+            model.joint_armature.fill_(armature)
+            solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0)
+            wrench, qdd = _step_armature_scene(model, model.state(), model.control(), solver)
+            test.assertEqual(float(qdd[0]), 0.0)
+            np.testing.assert_allclose(wrench[0], [0.0, 0.0, 2.0 * 9.81, 0.0, -9.81, 0.0], rtol=1.0e-5, atol=1.0e-4)
+
+
 def test_parent_wrench_matches_mujoco_with_armature(test, device):
     """Publish the same joint wrenches as SolverMuJoCo on one step of the armature scene, with and without armature."""
     for armature in (0.0, 9.0):
@@ -897,7 +946,12 @@ add_function_test(
     test_parent_wrench_matches_inverse_dynamics_on_every_path,
     devices=get_test_devices(),
 )
-for _name in ("test_parent_wrench_excludes_joint_armature", "test_parent_wrench_of_a_contact_stop_with_armature"):
+for _name in (
+    "test_parent_wrench_excludes_joint_armature",
+    "test_parent_wrench_of_a_contact_stop_with_armature",
+    "test_parent_wrench_of_a_commanded_free_joint",
+    "test_parent_wrench_of_a_held_kinematic_joint",
+):
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_test_devices())
 add_function_test(
     TestFeatherPGSParentWrench,

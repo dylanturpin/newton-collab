@@ -142,9 +142,10 @@ requests are rejected. MuJoCo Warp supports body observables on both CPU and GPU
 :class:`~newton.solvers.SolverFeatherPGS` accounts ``BODY_PARENT_F`` from the step's solved
 motion, including its contact, friction and loop-closure impulses, so loads carried by a subtree
 reach the joints that support it; see the solver's documentation for the cases it leaves out.
-Like :class:`~newton.solvers.SolverMuJoCo`, it accounts the bodies' rigid inertia only: joint
-armature reacts on the parent, so a joint reports its generalized force less ``armature * qdd``,
-and a FREE body with armature reports that reaction instead of zero.
+Like :class:`~newton.solvers.SolverMuJoCo`, it reconstructs the wrench from the bodies' rigid
+inertia, without joint armature, so a dynamic joint's projected wrench is its generalized load less
+``armature * qdd``. A FREE body with armature and no FREE ``joint_f`` therefore reports
+``-armature * qdd`` instead of zero; kinematic joints report the load of their prescribed motion.
 :class:`~newton.solvers.SolverFeatherstone` reports the start-of-step inverse dynamics at zero
 joint acceleration instead.
 
