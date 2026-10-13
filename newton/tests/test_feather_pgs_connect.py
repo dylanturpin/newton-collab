@@ -464,3 +464,131 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _build_floating_four_bar():
+    """A free-floating planar four-bar whose crank is driven against a locked rocker.
+
+    Nothing external acts on it (no gravity, no contacts), so the system's angular
+    momentum must stay constant however far the loop closure is pushed open.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    z0 = 0.6
+    base = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, z0), wp.quat_identity()))
+    b.add_shape_box(base, hx=0.25, hy=0.02, hz=0.02)
+    j_free = b.add_joint_free(child=base)
+    crank = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, z0 - 0.1), wp.quat_identity()))
+    b.add_shape_box(crank, hx=0.02, hy=0.02, hz=0.1)
+    j_crank = b.add_joint_revolute(
+        parent=base,
+        child=crank,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+    )
+    coupler = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, z0 - 0.2), wp.quat_identity()))
+    b.add_shape_box(coupler, hx=0.2, hy=0.02, hz=0.02)
+    j_coupler = b.add_joint_revolute(
+        parent=crank,
+        child=coupler,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    rocker = b.add_link(xform=wp.transform(wp.vec3(0.4, 0.0, z0 - 0.1), wp.quat_identity()))
+    b.add_shape_box(rocker, hx=0.02, hy=0.02, hz=0.1)
+    j_rocker = b.add_joint_revolute(
+        parent=base,
+        child=rocker,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+        limit_lower=0.0,
+        limit_upper=0.0,
+    )
+    b.add_articulation([j_free, j_crank, j_coupler, j_rocker], label="floating_four_bar")
+    b.add_joint_ball(
+        parent=coupler,
+        child=rocker,
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+    )
+    crank_dof = 6
+    b.joint_target_ke[crank_dof] = 50.0
+    b.joint_target_kd[crank_dof] = 1.0
+    b.joint_target_mode[crank_dof] = int(newton.JointTargetMode.POSITION)
+    b.joint_target_q[7 if newton.use_coord_layout_targets else crank_dof] = 0.8
+    return b
+
+
+def _quat_rotate(q, v):
+    u, w = q[:3], q[3]
+    t = 2.0 * np.cross(u, v)
+    return v + w * t + np.cross(u, t)
+
+
+def _quat_matrix(q):
+    x, y, z, w = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def _system_angular_momentum(model, pose_prev, pose, pose_next, dt):
+    """Angular momentum about the world origin [kg m^2/s] from central pose differences."""
+    mass, com, inertia = model.body_mass.numpy(), model.body_com.numpy(), model.body_inertia.numpy()
+    total = np.zeros(3)
+    for b in range(model.body_count):
+        if mass[b] <= 0.0:
+            continue
+        c_prev, c, c_next = (p[b, :3] + _quat_rotate(p[b, 3:], com[b]) for p in (pose_prev, pose, pose_next))
+        v = (c_next - c_prev) / (2.0 * dt)
+        q_next, q_prev = pose_next[b, 3:], pose_prev[b, 3:] * np.array([-1.0, -1.0, -1.0, 1.0])
+        ax, ay, az, aw = q_next
+        bx, by, bz, bw = q_prev
+        dq = np.array(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ]
+        )
+        if dq[3] < 0.0:
+            dq = -dq
+        omega = 2.0 * dq[:3] / (2.0 * dt)
+        rot = _quat_matrix(pose[b, 3:])
+        total += np.cross(c, mass[b] * v) + (rot @ inertia[b] @ rot.T) @ omega
+    return total
+
+
+class TestFeatherPGSConnectMomentum(unittest.TestCase):
+    def test_open_closure_on_floating_base_conserves_angular_momentum(self):
+        """An open loop closure must not spin a free-floating mechanism.
+
+        Two PGS iterations leave the loaded closure open by about 15 mm. The closure
+        impulses act at a shared anchor, so they apply no net wrench; with per-body
+        anchors they form a couple ``C x lambda`` and the system's angular momentum
+        grows at a constant rate (~80 mN m s over this run before the fix).
+        """
+        dt = 1.0 / 500.0
+        model = _build_floating_four_bar().finalize()
+        solver = newton.solvers.SolverFeatherPGS(
+            model, pgs_mode="matrix_free", pgs_iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
+        )
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
+        control = model.control()
+        poses = [state_0.body_q.numpy().reshape(-1, 7).astype(np.float64)]
+        for _ in range(300):
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+            poses.append(state_0.body_q.numpy().reshape(-1, 7).astype(np.float64))
+        self.assertGreater(_loop_anchor_gap(model, state_0), 5.0e-3, "the closure should be loaded open")
+        momentum = _system_angular_momentum(model, poses[-3], poses[-2], poses[-1], dt)
+        self.assertLess(np.linalg.norm(momentum), 1.0e-3)
