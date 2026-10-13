@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
 from newton.tests.test_feather_pgs_connect import _build_carried_load, _build_four_bar, _prescribe_carrier
+from newton.tests.test_feather_pgs_contact_force import _sphere_on_ground
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 120.0
@@ -719,6 +720,157 @@ def test_unattached_body_reports_zero(test, device):
     np.testing.assert_array_equal(observables.body_parent_f.numpy()[1], 0.0)
 
 
+ARMATURE_DT = 0.01
+
+
+def _armature_scene(device, armature):
+    """A FREE body, a revolute carrying a welded child, a prismatic and a ball, each joint with the given armature.
+
+    The FREE body starts at rest at its center of mass, so its joint coordinates are its world-frame motion.
+    """
+    builder = newton.ModelBuilder()
+    free = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3) * 0.2)
+    )
+    builder.add_articulation([builder.add_joint_free(free)])
+    arm = builder.add_link(mass=1.0, com=wp.vec3(0.1, 0.0, 0.0), inertia=wp.mat33(np.diag([0.15, 0.2, 0.3])))
+    welded = builder.add_link(mass=0.5, com=wp.vec3(0.0, 0.05, 0.0), inertia=wp.mat33(np.eye(3) * 0.01))
+    builder.add_articulation(
+        [
+            builder.add_joint_revolute(
+                -1, arm, axis=(0.0, 1.0, 0.0), parent_xform=wp.transform(wp.vec3(1.0, 0.0, 1.0), wp.quat_identity())
+            ),
+            builder.add_joint_fixed(arm, welded, parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity())),
+        ]
+    )
+    slider = builder.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(
+                -1, slider, axis=(0.0, 0.0, 1.0), parent_xform=wp.transform(wp.vec3(2.0, 0.0, 1.0), wp.quat_identity())
+            )
+        ]
+    )
+    pendulum = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, -0.2), inertia=wp.mat33(np.eye(3) * 0.05))
+    builder.add_articulation(
+        [builder.add_joint_ball(-1, pendulum, parent_xform=wp.transform(wp.vec3(3.0, 0.0, 1.0), wp.quat_identity()))]
+    )
+    model = builder.finalize(device=device)
+    model.joint_armature.fill_(armature)
+    state = model.state()
+    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    joint_qd[6:] = (0.7, -0.2, 0.2, -0.1, 0.3)
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+    body_f[free] = (1.0, -2.0, 10.0, 0.5, -0.3, 0.2)
+    state.body_f.assign(body_f)
+    control = model.control()
+    control.joint_f.assign(np.array([0.0] * 6 + [10.0, 5.0, 1.0, -2.0, 0.5], dtype=np.float32))
+    return model, state, control
+
+
+def _step_armature_scene(model, state, control, solver):
+    """Step once; return the published wrenches and the joint accelerations of the step."""
+    observables = solver.observables(FLAGS)
+    state_out = model.state()
+    solver.step(state, state_out, control, None, ARMATURE_DT, observables=observables)
+    qdd = (state_out.joint_qd.numpy() - state.joint_qd.numpy()) / ARMATURE_DT
+    return observables.body_parent_f.numpy(), qdd
+
+
+def test_parent_wrench_excludes_joint_armature(test, device):
+    """Leave each joint's armature reaction on its parent, as rotor inertia, on every joint type.
+
+    Projected onto its motion subspace, every wrench is the applied joint force less ``armature * qdd``. A FREE
+    body therefore reports ``-armature * qdd``, and the weld reports its child's rigid-body wrench.
+    """
+    configurations = [{"pgs_mode": "split"}]
+    if wp.get_device(device).is_cuda:
+        configurations.append({"pgs_mode": "matrix_free"})
+    for armature in (0.0, 9.0):
+        model, state, control = _armature_scene(device, armature)
+        joint_f = control.joint_f.numpy()
+        com_world = [
+            np.array(wp.transform_point(wp.transform(*X), wp.vec3(*com)))
+            for X, com in zip(state.body_q.numpy(), model.body_com.numpy(), strict=True)
+        ]
+        for options in configurations:
+            with test.subTest(armature=armature, **options):
+                solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
+                wrench, qdd = _step_armature_scene(model, state, control, solver)
+                expected = joint_f - armature * qdd
+                np.testing.assert_allclose(wrench[0], expected[:6], rtol=1.0e-4, atol=1.0e-4)
+                if armature:
+                    test.assertGreater(np.abs(wrench[0]).max(), 1.0)
+                hinge = np.array([1.0, 0.0, 1.0])
+                hinge_torque = wrench[1, 3:] + np.cross(com_world[1] - hinge, wrench[1, :3])
+                test.assertAlmostEqual(
+                    float(hinge_torque[1]), float(expected[6]), delta=1.0e-4 * abs(expected[6]) + 1.0e-4
+                )
+                test.assertAlmostEqual(
+                    float(wrench[3, 2]), float(expected[7]), delta=1.0e-4 * abs(expected[7]) + 1.0e-4
+                )
+                socket = np.array([3.0, 0.0, 1.0])
+                ball_torque = wrench[4, 3:] + np.cross(com_world[4] - socket, wrench[4, :3])
+                np.testing.assert_allclose(ball_torque, expected[8:11], rtol=1.0e-4, atol=1.0e-4)
+                # The weld carries its child's mass times its acceleration from the hinge's start velocity and qdd.
+                omega = np.array([0.0, state.joint_qd.numpy()[6], 0.0])
+                alpha = np.array([0.0, qdd[6], 0.0])
+                lever = com_world[2] - hinge
+                accel = np.cross(alpha, lever) + np.cross(omega, np.cross(omega, lever))
+                weld_force = model.body_mass.numpy()[2] * (accel - np.array([0.0, 0.0, -9.81]))
+                np.testing.assert_allclose(wrench[2, :3], weld_force, rtol=1.0e-4, atol=1.0e-4)
+                np.testing.assert_allclose(wrench[2, 3:], 0.01 * alpha, rtol=1.0e-4, atol=1.0e-4)
+
+
+def test_parent_wrench_of_a_contact_stop_with_armature(test, device, pgs_mode="split"):
+    """Report a contact-stopped FREE body's armature share of the impact as its joint wrench.
+
+    The contact impulse stops the armature-augmented inertia; the body's own mass takes ``m * dv / dt`` of it and
+    the FREE joint reports the remaining ``-armature * dv / dt``.
+    """
+    for armature in (0.0, 9.0):
+        with test.subTest(armature=armature):
+            model = _sphere_on_ground(device, armature, dense=False)
+            solver = SolverFeatherPGS(model, pgs_mode=pgs_mode, pgs_cfm=0.0)
+            observables = solver.observables(FLAGS)
+            state_in, state_out = model.state(), model.state()
+            qd = state_in.joint_qd.numpy()
+            qd[2] = -1.0
+            state_in.joint_qd.assign(qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, ARMATURE_DT, observables=observables)
+            solver.update_contacts(contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            contact_z = abs(float(contacts.rigid_contact_force.numpy()[:count, 2].sum()))
+            accel_z = float(state_out.joint_qd.numpy()[2] - qd[2]) / ARMATURE_DT
+            wrench = observables.body_parent_f.numpy()[0]
+            test.assertGreater(accel_z, 90.0)
+            test.assertAlmostEqual(float(wrench[2]), -armature * accel_z, delta=1.0e-4 * armature * accel_z + 1.0e-3)
+            np.testing.assert_allclose(wrench[[0, 1, 3, 4, 5]], 0.0, atol=1.0e-3)
+            mass = float(model.body_mass.numpy()[0])
+            test.assertAlmostEqual(contact_z + float(wrench[2]), mass * accel_z, delta=1.0e-3 * mass * accel_z)
+
+
+def test_parent_wrench_matches_mujoco_with_armature(test, device):
+    """Publish the same joint wrenches as SolverMuJoCo on one step of the armature scene, with and without armature."""
+    for armature in (0.0, 9.0):
+        with test.subTest(armature=armature):
+            model, state, control = _armature_scene(device, armature)
+            featherpgs, _ = _step_armature_scene(
+                model, state, control, SolverFeatherPGS(model, pgs_mode="matrix_free", angular_damping=0.0)
+            )
+            mujoco, _ = _step_armature_scene(
+                model, state, control, newton.solvers.SolverMuJoCo(model, integrator="euler")
+            )
+            test.assertGreater(np.abs(mujoco).max(), 1.0)
+            np.testing.assert_allclose(featherpgs, mujoco, rtol=1.0e-4, atol=1.0e-4)
+
+
 class TestFeatherPGSParentWrench(unittest.TestCase):
     pass
 
@@ -744,6 +896,21 @@ add_function_test(
     "test_parent_wrench_matches_inverse_dynamics_on_every_path",
     test_parent_wrench_matches_inverse_dynamics_on_every_path,
     devices=get_test_devices(),
+)
+for _name in ("test_parent_wrench_excludes_joint_armature", "test_parent_wrench_of_a_contact_stop_with_armature"):
+    add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_test_devices())
+add_function_test(
+    TestFeatherPGSParentWrench,
+    "test_parent_wrench_of_a_contact_stop_with_armature_matrix_free",
+    test_parent_wrench_of_a_contact_stop_with_armature,
+    devices=get_cuda_test_devices(),
+    pgs_mode="matrix_free",
+)
+add_function_test(
+    TestFeatherPGSParentWrench,
+    "test_parent_wrench_matches_mujoco_with_armature",
+    test_parent_wrench_matches_mujoco_with_armature,
+    devices=get_cuda_test_devices(),
 )
 for _name in (
     "test_parent_wrench_carries_a_load_resting_on_the_gripper",
