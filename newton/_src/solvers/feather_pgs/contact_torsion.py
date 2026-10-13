@@ -484,6 +484,11 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._contact_torsion_group.assign(membership)
 
 
+def torque_links_shared_bytes(max_constraints):
+    """Return the shared-memory footprint [B] of :func:`torque_links_source`'s two lists."""
+    return 2 * max_constraints * (2 if max_constraints <= 32767 else 4)
+
+
 def torque_links_source(max_constraints):
     """Return the once-per-launch build of the torsion row lists the sweep walks.
 
@@ -520,18 +525,35 @@ def torque_links_source(max_constraints):
 """
 
 
-def torque_sweep_source(dofs):
-    """Return the coupled residual-budget angular solve inside each PGS sweep."""
+def torque_sweep_source(dofs, *, linked):
+    """Return the coupled residual-budget angular solve inside each PGS sweep.
+
+    ``linked`` walks the lists of :func:`torque_links_source`; otherwise every dense row is scanned
+    for torsion rows and their members, in the same ascending order.
+    """
+    if linked:
+        torsion_rows = "for (int spin = torsion_head; spin >= 0; spin = s_torsion_next[spin]) {"
+        members = "for (int n = s_torsion_first[spin]; n >= 0; n = s_torsion_next[n]) {"
+        non_member = ""
+    else:
+        torsion_rows = f"""for (int spin = 0; spin < m_dense; ++spin) {{
+                if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;"""
+        members = "for (int n = 0; n < m_dense; ++n) {"
+        non_member = f"""world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT} ||
+                        world_torsion_group.data[off_dense + n] != spin"""
+    first_skip = f"if ({non_member}) continue;" if non_member else ""
+    rescale_skip = f"{non_member} ||" if non_member else ""
     return f"""
         if (row_phase == 0) {{
-            for (int spin = torsion_head; spin >= 0; spin = s_torsion_next[spin]) {{
+            {torsion_rows}
                 float radius = contact_torsion_radius;
                 // The torsion row carries its group's undivided coefficient. Persistent
                 // patches divide the anchor tangent rows' coefficient by the anchor count.
                 float mu = fmaxf(world_row_mu.data[off_dense + spin], 0.0f);
                 float normal_load = 0.0f;
                 float sliding_used = 0.0f;
-                for (int n = s_torsion_first[spin]; n >= 0; n = s_torsion_next[n]) {{
+                {members}
+                    {first_skip}
                     normal_load += fmaxf(s_lam_dense[n], 0.0f);
                     // Only a normal followed by its own tangent pair consumes sliding budget;
                     // under persistent patches, non-anchor normals occupy a single slot.
@@ -554,8 +576,9 @@ def torque_sweep_source(dofs):
                 if (sliding_used > normal_budget) {{
                     float scale = normal_budget / sliding_used;
                     sliding_used = 0.0f;
-                    for (int n = s_torsion_first[spin]; n >= 0; n = s_torsion_next[n]) {{
-                        if (n + 2 >= m_dense ||
+                    {members}
+                        if ({rescale_skip}
+                            n + 2 >= m_dense ||
                             world_row_type.data[off_dense + n + 1] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
                             world_row_parent.data[off_dense + n + 1] != n ||
                             world_row_type.data[off_dense + n + 2] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
