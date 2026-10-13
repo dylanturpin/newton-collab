@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.contact_torsion_device import DeviceTorsionPreparation
-from newton.tests.test_feather_pgs_torsion_device import run_oracle, synthetic_fixture
+from newton.tests.feather_pgs.test_torsion import run_oracle, synthetic_fixture
 
 
 def main():
