@@ -448,6 +448,32 @@ def devices():
     return ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
 
 
+def joint_axis_loads(model, state, wrench):
+    """Project each revolute/prismatic joint's published wrench onto its axis, about the joint anchor."""
+    body_q = state.body_q.numpy()
+    body_com = model.body_com.numpy()
+    loads = []
+    for joint, joint_type in enumerate(model.joint_type.numpy()):
+        if joint_type not in (int(newton.JointType.REVOLUTE), int(newton.JointType.PRISMATIC)):
+            continue
+        child = model.joint_child.numpy()[joint]
+        X_wc = wp.transform(*body_q[child])
+        X_wj = X_wc * wp.transform(*model.joint_X_c.numpy()[joint])
+        axis = np.array(
+            wp.quat_rotate(
+                wp.transform_get_rotation(X_wj), wp.vec3(*model.joint_axis.numpy()[model.joint_qd_start.numpy()[joint]])
+            )
+        )
+        force, torque = wrench[child, :3], wrench[child, 3:]
+        if joint_type == int(newton.JointType.PRISMATIC):
+            loads.append(float(np.dot(axis, force)))
+        else:
+            com = np.array(wp.transform_point(X_wc, wp.vec3(*body_com[child])))
+            anchor = np.array(wp.transform_get_translation(X_wj))
+            loads.append(float(np.dot(axis, torque + np.cross(com - anchor, force))))
+    return np.array(loads)
+
+
 class Scene:
     """Step one model with its own collision pipeline and record generalized velocities."""
 
@@ -851,18 +877,23 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
         np.testing.assert_array_equal(contact_f[0], scene.contacts.force.numpy()[0])
         np.testing.assert_array_equal(contact_f[count:], 0.0)
 
-    def test_body_parent_f_is_unchanged_by_angular_rows(self):
-        """BODY_PARENT_F is start-of-step inverse dynamics, so the angular rows change the step but not the wrench."""
-        wrenches, velocities = [], []
+    def test_body_parent_f_includes_angular_rows(self):
+        """Each joint's published wrench projects onto its axis as the applied joint torque.
+
+        Spin and roll torques on the sphere's hinges are resisted by the torsional and rolling rows; the projection
+        holds only when those rows' solved torques are part of the wrench.
+        """
+        applied = np.array([0.0, 0.0, 0.02, 0.05], dtype=np.float32)
         for enable in (False, True):
-            scene = ball(enable=enable)
-            observables = scene.solver.observables({SolverObservableFlags.BODY_PARENT_F})
-            scene.step(observables)
-            wrenches.append(observables.body_parent_f.numpy())
-            velocities.append(scene.state.joint_qd.numpy())
-        self.assertGreater(float(np.abs(wrenches[1]).max()), 1.0)
-        np.testing.assert_array_equal(wrenches[0], wrenches[1])
-        self.assertGreater(float(np.abs(velocities[0] - velocities[1]).max()), 1.0e-3)
+            with self.subTest(enable=enable):
+                scene = ball(enable=enable, mu_torsional=0.02, speed=0.0, rolling=False)
+                scene.control.joint_f.assign(applied)
+                observables = scene.solver.observables({SolverObservableFlags.BODY_PARENT_F})
+                for _ in range(5):
+                    state_in = scene.state
+                    scene.step(observables)
+                loads = joint_axis_loads(scene.model, state_in, observables.body_parent_f.numpy())
+                np.testing.assert_allclose(loads, applied, atol=1.0e-4)
 
     def test_coefficient_edits_reach_captured_graphs_at_notify(self):
         """Assigned or replaced torsional/rolling arrays take effect at the notify, in a graph captured before the edit."""
