@@ -22,6 +22,8 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_launch_config import _build_sparse_contact_friction_model
+from newton.tests.unittest_utils import StdOutCapture
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
@@ -464,7 +466,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         )
         self.assertFalse(quiet_solver._warn_constraint_overflow)
         self.assertFalse(quiet_solver._track_row_capacity)
-        self.assertIsNone(quiet_solver._row_overflow_warning_emitted)
+        self.assertIsNotNone(quiet_solver._row_overflow_warning_emitted)
 
     def test_new_contact_controls_preserve_legacy_positional_layout(self):
         """Append new controls without shifting established positional arguments."""
@@ -561,6 +563,87 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(result["slot"], -1)
         self.assertEqual(result["path"], -1)
         self.assertEqual(result["dense_count"], 0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free solve requires CUDA")
+    def test_friction_gap_max_keeps_the_constructed_row_layout(self):
+        """Reject a switch to or from ``None`` after construction, and match a fresh solver after an allowed edit."""
+        model = _build_sparse_contact_friction_model(device="cuda:0")
+        # Tilted boxes make the triple and normal-only schedules give different motion.
+        transforms = model.shape_transform.numpy()
+        transforms[model.shape_body.numpy() >= 0, 3:] = np.asarray(wp.quat_rpy(0.2, 0.3, 0.1))
+        model.shape_transform.assign(transforms)
+        options = {
+            "solve_mode": "matrix_free",
+            "iterations": 8,
+            "enable_joint_limits": True,
+            "articulation_constraint_max": 96,
+            "free_body_constraint_max": 32,
+            "use_parallel_streams": True,
+            "friction_anchor_beta": 0.0,
+        }
+        every_contact = SolverFeatherPGS(model, **options)
+        for value in (-float("inf"), -1.0, 0.01):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
+                every_contact.contact_friction_gap_max = value
+        every_contact.contact_friction_gap_max = float("inf")
+        gated = SolverFeatherPGS(model, **options, contact_friction_gap_max=0.01)
+        with self.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
+            gated.contact_friction_gap_max = None
+        gated.contact_friction_gap_max = -float("inf")
+        fresh = SolverFeatherPGS(model, **options, contact_friction_gap_max=-float("inf"))
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+        contacts = pipeline.contacts()
+        trajectories = []
+        for solver in (gated, fresh):
+            state, output = model.state(), model.state()
+            qd = state.joint_qd.numpy()
+            qd[:] = -0.3
+            state.joint_qd.assign(qd)
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            trajectory = []
+            for _ in range(4):
+                pipeline.collide(state, contacts)
+                solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+                solver.check_constraint_capacity()
+                state, output = output, state
+                trajectory.append(np.concatenate([state.joint_q.numpy(), state.joint_qd.numpy()]))
+            trajectories.append(np.stack(trajectory))
+        np.testing.assert_array_equal(trajectories[0], trajectories[1])
+
+    def test_overflow_warning_enabled_after_construction_latches(self):
+        """Latch the dense-row overflow warning when warnings are enabled after a quiet overflowing step."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        scene = newton.ModelBuilder()
+        scene.add_ground_plane()
+        xform = wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity())
+        body = scene.add_link(xform=xform)
+        scene.add_shape_box(body, hx=0.15, hy=0.1, hz=0.05)
+        scene.add_articulation([scene.add_joint_prismatic(-1, body, axis=newton.Axis.Z, parent_xform=xform)])
+        model = scene.finalize(device=device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+        state, output = model.state(), model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        solver = SolverFeatherPGS(
+            model, solve_mode="split", articulation_constraint_max=1, warn_constraint_overflow=False
+        )
+        solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+        self.assertTrue(solver.constraint_overflow.numpy().any())
+        self.assertEqual(solver._row_overflow_warning_emitted.numpy().tolist(), [0, 0, 0])
+        solver.warn_constraint_overflow = True
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+        finally:
+            try:
+                wp.synchronize()
+            finally:
+                printed = capture.end()
+        self.assertRegex(printed, "constraint-row overflow")
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertTrue(np.isfinite(output.joint_q.numpy()).all())
 
 
 if __name__ == "__main__":

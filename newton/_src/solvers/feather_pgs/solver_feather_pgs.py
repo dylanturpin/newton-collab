@@ -1211,6 +1211,22 @@ class _StepOption(_ConstructionOption):
         setattr(instance, self._private_name, value)
 
 
+class _FrictionGapOption(_StepOption):
+    """``contact_friction_gap_max``: construction fixes whether every contact gets friction rows."""
+
+    def __set_name__(self, owner, name: str) -> None:
+        super().__set_name__(owner, name)
+        self.__doc__ += " Switching to or from ``None`` (or ``inf``) requires a new solver."
+
+    def __set__(self, instance, value) -> None:
+        value = None if value is None else float(value)
+        if value is not None and np.isnan(value):
+            raise ValueError("contact_friction_gap_max must not be NaN")
+        if (value is None or bool(np.isposinf(value))) != instance._friction_every_contact:
+            raise ValueError("contact_friction_gap_max cannot switch to or from None after construction")
+        super().__set__(instance, value)
+
+
 class SolverFeatherPGS(SolverBase, CouplingInterface):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
@@ -1355,7 +1371,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     """
 
     update_mass_matrix_interval = _ConstructionOption()
-    contact_friction_gap_max = _StepOption()
+    contact_friction_gap_max = _FrictionGapOption()
     contact_friction_position_iterations = _ConstructionOption()
     contact_friction_shared_anchor = _ConstructionOption()
     contact_friction_scale = _ConstructionOption()
@@ -1767,7 +1783,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             contact_friction_gap_max (float | None, optional): Contacts with a gap [m] above this distance
                 get a normal row only. ``None`` (the default) gives every contact friction rows; a negative
                 value gives none of them friction rows, which saves the rows that zero friction
-                coefficients would keep.
+                coefficients would keep. Switching between ``None`` (or ``inf``) and a finite or
+                ``-inf`` value requires a new solver.
             contact_friction_position_iterations (int, optional): Number of biased PGS position
                 iterations that solve contact-friction rows. ``-1`` preserves legacy FeatherPGS
                 behavior by solving friction in every position iteration; ``0`` skips position-pass
@@ -3203,9 +3220,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         wm_device = model.device
         # Dropped-row accounting is unconditional (see _row_dropped_all below);
         # _track_row_capacity now gates only the optional warning/watermark readbacks.
-        self._row_overflow_warning_emitted = (
-            wp.zeros(3, dtype=wp.int32, device=wm_device) if self._warn_constraint_overflow else None
-        )
+        self._row_overflow_warning_emitted = wp.zeros(3, dtype=wp.int32, device=wm_device)
         self._row_watermarks = (
             wp.zeros(ROW_WATERMARK_CONTACT_SLOT + 1, dtype=wp.int32, device=wm_device) if self._row_watermark else None
         )
