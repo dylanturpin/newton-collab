@@ -1640,9 +1640,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 grouping and friction law while using preallocated GPU buffers.
                 It supports CUDA graph capture of :meth:`step`. Invalid torsion input
                 (for example rows beyond the capacity or hydroelastic contacts) makes the
-                failing step publish its input state unchanged. An eager step raises when
-                it returns; after graph replays, :meth:`check_constraint_capacity` raises,
-                and :meth:`reset` clears the error. No effect when the torsion radius is
+                failing step restore its output motion arrays (``joint_q``, ``joint_qd``,
+                ``body_q``, ``body_qd``, ``body_qdd``) to the input values; other outputs,
+                observables and solver history still advance. An eager step raises when it
+                returns; after graph replays, :meth:`check_constraint_capacity` raises.
+                Check before using replay results, discard failed output, fix the cause and
+                :meth:`reset`. The error is solver-wide: any reset clears it, and a cause
+                that persists latches it again on the next step. No effect when the torsion radius is
                 zero. The host reference cannot be captured.
                 Grouping currently runs serially within each world with worst-case
                 quadratic contact-count cost. Many small worlds can benefit, but
@@ -3563,8 +3567,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         from it, along with dense, matrix-free, and propagation impulse history,
         the carried friction anchors, and overflow status, is cleared. Mass
         factors for selected worlds refresh on the next step after a teleport;
-        other worlds retain their normal refresh cadence. Any reset also clears the solver-wide
-        contact torsion error and the disabled-tree-joint status of the selected worlds. A full reset (``world_mask=None``)
+        other worlds retain their normal refresh cadence. Any reset, whatever its mask, also clears the
+        solver-wide contact torsion error; it clears the disabled-tree-joint status of the selected worlds. A full reset (``world_mask=None``)
         also restarts the host-side step cadence for subsequent :meth:`step` calls. CUDA graphs
         captured before the reset keep their captured cadence and buffer schedule.
 
@@ -10047,7 +10051,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         their output, re-enable the joint and :meth:`reset` the affected worlds. A check that
         passes after the reset does not validate the earlier output. With
         ``contact_torsion_device``, also raises if contact torsion rejected its input since
-        the last :meth:`reset`; that step published its input state unchanged.
+        the last :meth:`reset`; the failing step restored its output motion arrays to the input.
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
