@@ -21,7 +21,6 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 )
 from newton.solvers import SolverFeatherPGS
 from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM
-from newton.tests.test_feather_pgs_contact_torsion import set_torsion_radius
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
