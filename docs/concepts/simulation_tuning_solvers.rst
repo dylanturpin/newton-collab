@@ -292,8 +292,8 @@ repository examples spend tuning effort, not a shared solver API.
        them as PGS rows together with contacts and limits instead, and each
        driven DOF then uses one row of ``articulation_constraint_max``. Rows beyond ``articulation_constraint_max``
        (articulated bodies) or ``free_body_constraint_max`` (free bodies) per world
-       are dropped and flagged in ``constraint_overflow`` (one entry per world
-       and a final entry for global articulations); call
+       are dropped and flagged in ``constraint_overflow`` (one entry per solver
+       world; global articulations solve in world 0); call
        ``check_constraint_capacity()`` at an observation boundary, and raise the
        capacity and reset the world when it reports a world. The same check
        reports a tree joint disabled through ``Model.joint_enabled`` after
