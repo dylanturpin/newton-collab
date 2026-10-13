@@ -62,6 +62,8 @@ from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
     prepare_torsion_velocity_pass,
+    torque_links_shared_bytes,
+    torque_links_source,
     torque_sweep_source,
     validate_torsion_step,
 )
@@ -281,6 +283,10 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
+# Conservative portable bound for static __shared__ arrays; some architectures accept more.
+_STATIC_SHARED_MEMORY_MAX_BYTES = 48 * 1024
+# Headroom for the static shared storage Warp adds to a kernel beyond the solver's own arrays.
+_WARP_STATIC_SHARED_RESERVE_BYTES = 2048
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
@@ -1028,11 +1034,54 @@ def _use_resident_mfgs_metadata(
     but larger shapes lose more throughput from the resulting occupancy drop.
     Keep at most one 4-KiB metadata working set resident and stream larger sets.
     """
-    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
-    metadata_bytes = 4 * max_constraints * metadata_arrays
-    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
-    total_shared_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
+    metadata_bytes = _mfgs_resident_metadata_bytes(
+        max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits
+    )
+    total_shared_bytes = _estimate_mfgs_shared_memory(
+        max_constraints, mf_max_constraints, max_world_dofs, metadata_bytes=metadata_bytes, torsion_links=False
+    )
     return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
+
+
+def _use_mfgs_torsion_links(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    max_shared_memory: int,
+    *,
+    shared_metadata: bool,
+    has_drive_rows: bool,
+    fuse_vel_limits: bool,
+) -> bool:
+    """Select the linked contact-torsion sweep when its row lists fit the portable static shared-memory bound.
+
+    Otherwise the sweep scans every dense row for torsion groups, with identical results.
+    """
+    metadata_bytes = (
+        _mfgs_resident_metadata_bytes(max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits)
+        if shared_metadata
+        else 0
+    )
+    total_shared_bytes = _estimate_mfgs_shared_memory(
+        max_constraints, mf_max_constraints, max_world_dofs, metadata_bytes=metadata_bytes, torsion_links=True
+    )
+    return total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
+        _STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory
+    )
+
+
+def _mfgs_resident_metadata_bytes(max_constraints: int, *, has_drive_rows: bool, fuse_vel_limits: bool) -> int:
+    """Return the MF-GS resident dense-row metadata footprint [B]."""
+    return 4 * max_constraints * (4 + 4 * int(has_drive_rows) + int(fuse_vel_limits))
+
+
+def _estimate_mfgs_shared_memory(
+    max_constraints: int, mf_max_constraints: int, max_world_dofs: int, *, metadata_bytes: int, torsion_links: bool
+) -> int:
+    """Estimate the MF-GS kernel's static shared-memory footprint [B]."""
+    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
+    links_bytes = torque_links_shared_bytes(max_constraints) if torsion_links else 0
+    return _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes + links_bytes
 
 
 _HINV_JT_MAX_CHUNK_SIZE = 32
@@ -7146,6 +7195,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             else None
         )
         self._pgs_solve_mf_gs_kernel = None
+        self._mfgs_torsion_links = False
         if (
             self._solve_mode == "matrix_free"
             and not self._sparse_diagonal_contact_solve
@@ -7163,6 +7213,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 has_drive_rows=has_drive_rows,
                 fuse_vel_limits=self._velocity_limits_fused,
             )
+            self._mfgs_torsion_links = self._contact_torsion_enabled and _use_mfgs_torsion_links(
+                self._articulation_constraint_max,
+                self._free_body_constraint_max,
+                self._max_world_dofs,
+                int(getattr(model.device, "max_shared_memory_per_block", 0)),
+                shared_metadata=shared_metadata,
+                has_drive_rows=has_drive_rows,
+                fuse_vel_limits=self._velocity_limits_fused,
+            )
             self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
                 self._articulation_constraint_max,
                 self._free_body_constraint_max,
@@ -7176,6 +7235,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
                 contact_torsion=self._contact_torsion_enabled,
+                torsion_links=self._mfgs_torsion_links,
                 factor_coordinates=self._paired_factor_coordinates,
                 angular_friction_cone=(
                     self._torsional_rolling_friction_cone if self._enable_torsional_rolling_friction else None
@@ -24713,6 +24773,7 @@ def _get_pgs_solve_mf_gs_kernel(
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
     contact_torsion: bool = False,
+    torsion_links: bool = False,
     factor_coordinates: bool = False,
     angular_friction_cone: str | None = None,
     angular_friction_creep_speed: float = 0.0,
@@ -24725,6 +24786,7 @@ def _get_pgs_solve_mf_gs_kernel(
     Phase 1 (dense): warp-parallel dot/update over D DOFs using J_world/Y_world.
     Phase 2 (MF): lanes 0-5 handle body_a, lanes 6-11 handle body_b (6 DOFs each).
     Phase 3 (``contact_torsion``): the contact torsion rows, which phase 1 skips.
+    ``torsion_links`` finds them through shared row lists built once per launch.
     Phase 4: the dense joint velocity-limit rows, the fused drive velocity clamp,
     and the MF rigid velocity-limit rows, so velocity limits have the last word.
 
@@ -25819,7 +25881,8 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
     torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
-    torsion_sweep = torque_sweep_source(D) if contact_torsion else ""
+    torsion_sweep = torque_sweep_source(D, linked=torsion_links) if contact_torsion else ""
+    torsion_link_build = torque_links_source(M_D) if contact_torsion and torsion_links else ""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -25904,6 +25967,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
     // ═══════════════════════════════════════════════════════
+{torsion_link_build}
     // Dense pipeline registers
 {dense_pipe_decl}
 
@@ -26507,7 +26571,7 @@ def _get_pgs_solve_mf_gs_kernel(
     if skip_local_internal_worlds:
         name += f"_local_fallback{local_internal_max_constraints}"
     if contact_torsion:
-        name += "_torsion"
+        name += "_torsion_links" if torsion_links else "_torsion"
     if factor_coordinates:
         name += "_factor"
     if angular_friction_cone is not None:
