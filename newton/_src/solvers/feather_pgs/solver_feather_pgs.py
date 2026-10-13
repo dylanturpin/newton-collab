@@ -251,6 +251,9 @@ from .sparse_mass_matrix import (
 )
 from .sparse_pgs import _get_pgs_solve_sparse_kernel
 
+# SolverFeatherPGS rejects models with ``requires_grad``, so no kernel needs an adjoint.
+wp.set_module_options({"enable_backward": False})
+
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
 # kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can

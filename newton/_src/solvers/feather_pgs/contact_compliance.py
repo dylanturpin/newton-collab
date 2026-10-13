@@ -23,6 +23,9 @@ import warp as wp
 
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
+# SolverFeatherPGS rejects models with ``requires_grad``, so no kernel needs an adjoint.
+wp.set_module_options({"enable_backward": False})
+
 # Match the float64 host arithmetic of the coefficient law.
 wp.set_module_options({"fuse_fp": False})
 

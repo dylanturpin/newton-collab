@@ -28,6 +28,9 @@ from ...sim.contacts import GENERATION_SENTINEL
 from .friction import friction_pair_candidate
 from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
+# SolverFeatherPGS rejects models with ``requires_grad``, so no kernel needs an adjoint.
+wp.set_module_options({"enable_backward": False})
+
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
 PGS_CONSTRAINT_TYPE_FRICTION = 2
@@ -1299,7 +1302,7 @@ def compute_link_velocity(
     return v_s, a_s
 
 
-@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
 def eval_rigid_fk_kinematics(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1395,7 +1398,7 @@ def eval_rigid_fk_kinematics(
     fk_id_cache_valid[index] = 1
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def finalize_body_dynamics(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -1467,7 +1470,7 @@ def finalize_body_dynamics(
     body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
 
 
-@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
 def eval_rigid_fk_id(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -2162,7 +2165,7 @@ def _get_tree_tau_kernel(lanes: int):
     return tree_tau
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def eval_rigid_tau(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -2224,7 +2227,7 @@ def eval_rigid_tau(
     )
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def eval_rigid_tau_add(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -2286,7 +2289,7 @@ def eval_rigid_tau_add(
     )
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def compute_composite_inertia(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -2397,7 +2400,7 @@ def cholesky_loop(
             L_group[group_idx, i, j] = s * inv_s
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def factor_diagonal_mass(
     H_group: wp.array3d[float],
     R_group: wp.array2d[float],
@@ -2417,7 +2420,7 @@ def factor_diagonal_mass(
         L_group[group, dof, dof] = wp.sqrt(mass)
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def compute_compact_diagonal_inverse_mass(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
@@ -2454,7 +2457,7 @@ def compute_compact_diagonal_inverse_mass(
     diagonal_inverse_mass[global_dof] = 1.0 / mass
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def prepare_fused_diagonal_joint_limits(
     world_dof_indices: wp.array2d[int],
     max_world_dofs: int,
@@ -2507,7 +2510,7 @@ def prepare_fused_diagonal_joint_limits(
     upper_rhs[world, local_dof] = rhs_upper
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def solve_diagonal_mass(
     L_group: wp.array3d[float],
     group_to_art: wp.array[int],
@@ -2531,7 +2534,7 @@ def solve_diagonal_mass(
     joint_qdd[global_dof] = value / diagonal
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def solve_compact_diagonal_mass(
     diagonal_inverse_mass: wp.array[float],
     group_to_art: wp.array[int],
@@ -3096,7 +3099,7 @@ def prepare_articulation_augmented_drives(
     row_counts[articulation] = slot
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def eval_rigid_tau_and_augmented_drives(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -3196,7 +3199,7 @@ def eval_rigid_tau_and_augmented_drives(
     )
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def prepare_augmented_joint_drives(
     articulation_start: wp.array[int],
     articulation_H_rows: wp.array[int],
@@ -11145,7 +11148,7 @@ def hinv_jt_par_row(
             Y_world[world, c, dof_offset + i] = Y_group[idx, c, i]
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def hinv_jt_diagonal(
     L_group: wp.array3d[float],
     J_group: wp.array3d[float],
@@ -11443,7 +11446,7 @@ def delassus_par_row_col(
 # =============================================================================
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def crba_fill_par_dof(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
