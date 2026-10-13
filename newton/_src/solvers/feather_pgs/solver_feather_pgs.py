@@ -275,6 +275,8 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 # Per-world preset of the first rejected row slot: no reservation was rejected.
+# Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
+_ATTRIBUTE_NAMESPACE = "physx"
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
@@ -1433,7 +1435,22 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register PhysX rigid-body attributes consumed by FeatherPGS."""
+        """Register the per-body attributes consumed by FeatherPGS in the ``physx`` namespace.
+
+        Each attribute maps to the matching PhysX rigid-body USD attribute:
+
+        - ``physx:max_linear_velocity`` [m/s] and ``physx:max_angular_velocity`` [rad/s]
+          bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
+          ``physxRigidBody:maxAngularVelocity``, default unbounded).
+        - ``physx:max_depenetration_velocity`` [m/s] bounds the contact correction velocity
+          of free bodies (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
+
+        The solver reads them from the model at every step, for example
+        ``model.physx.max_linear_velocity``. Models built without these attributes use the defaults.
+
+        Args:
+            builder: Model builder to register the attributes with.
+        """
 
         def _angular_velocity_deg_to_rad(value, _context):
             if value is None:
@@ -1445,7 +1462,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="rigid_body_max_linear_velocity",
+                name="max_linear_velocity",
+                namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
@@ -1455,7 +1473,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="rigid_body_max_angular_velocity",
+                name="max_angular_velocity",
+                namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
@@ -1466,7 +1485,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name="rigid_body_max_depenetration_velocity",
+                name="max_depenetration_velocity",
+                namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
@@ -1474,6 +1494,24 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
             )
         )
+
+    def _physx_attribute(self, name: str) -> wp.array | None:
+        """Return the model's ``physx:<name>`` custom attribute, or ``None`` when it is not registered."""
+        namespace = getattr(self.model, _ATTRIBUTE_NAMESPACE, None)
+        return getattr(namespace, name, None)
+
+    @property
+    def _rigid_body_max_linear_velocity(self) -> wp.array | None:
+        return self._physx_attribute("max_linear_velocity")
+
+    @property
+    def _rigid_body_max_angular_velocity(self) -> wp.array | None:
+        return self._physx_attribute("max_angular_velocity")
+
+    @property
+    def _rigid_body_max_depenetration_velocity(self) -> wp.array:
+        attribute = self._physx_attribute("max_depenetration_velocity")
+        return self._unbounded_body_velocity if attribute is None else attribute
 
     @property
     def velocity_limits_fused(self) -> bool:
@@ -2405,19 +2443,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         self._fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits)
         self._velocity_limits_fused = self._fuse_joint_velocity_limits and _fuse_applicable
-        self._rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
-        self._rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
-        self._rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
-        if self._rigid_body_max_depenetration_velocity is None:
-            self._rigid_body_max_depenetration_velocity = wp.full(
-                model.body_count,
-                float("inf"),
-                dtype=wp.float32,
-                device=model.device,
-                requires_grad=model.requires_grad,
-            )
+        # Stand-in for models without the physx depenetration attribute.
+        self._unbounded_body_velocity = wp.full(
+            model.body_count, float("inf"), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+        )
         self._has_rigid_body_velocity_limits = (
-            self._rigid_body_max_linear_velocity is not None and self._rigid_body_max_angular_velocity is not None
+            self._physx_attribute("max_linear_velocity") is not None
+            and self._physx_attribute("max_angular_velocity") is not None
         )
 
         # Select the contact update once, when specializing the matrix-free kernel.

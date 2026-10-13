@@ -157,7 +157,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
                     xform=wp.transform(wp.vec3(0, 0, 0.025), wp.quat_identity()),
                     mass=0.3,
                     inertia=inertia,
-                    custom_attributes={"rigid_body_max_angular_velocity": _VELOCITY_LIMIT},
+                    custom_attributes={"physx:max_angular_velocity": _VELOCITY_LIMIT},
                 )
                 builder.add_shape_box(free, hx=0.02, hy=0.015, hz=0.025, cfg=shape)
                 model = builder.finalize(device="cuda:0")
