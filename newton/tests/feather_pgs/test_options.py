@@ -241,7 +241,7 @@ _TILED_KERNEL_HELPERS = (
 class TestFeatherPGSPrivateApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        solver_path = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs" / "solver_feather_pgs.py"
+        solver_path = Path(__file__).parents[2] / "_src" / "solvers" / "feather_pgs" / "solver_feather_pgs.py"
         cls.solver_module = ast.parse(solver_path.read_text(encoding="utf-8"))
         cls.top_level_functions = {
             node.name: node for node in cls.solver_module.body if isinstance(node, ast.FunctionDef)
@@ -372,7 +372,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         return None
 
 
-_PACKAGE_DIR = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
+_PACKAGE_DIR = Path(__file__).parents[2] / "_src" / "solvers" / "feather_pgs"
 
 
 class TestFeatherPGSPrivateApiUpstream(unittest.TestCase):

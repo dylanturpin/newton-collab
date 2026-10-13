@@ -23,7 +23,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 
-BENCHMARKS_DIR = Path(__file__).parent / "benchmarks"
+BENCHMARKS_DIR = Path(__file__).parents[1] / "benchmarks"
 
 
 def _load_row_scaling_module():

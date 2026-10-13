@@ -1054,7 +1054,7 @@ def _reducer(fixture):
     )
 
 
-def _contact_rows(contacts):
+def _contact_snapshot(contacts):
     count = int(contacts.rigid_contact_count.numpy()[0])
     return (
         count,
@@ -1071,7 +1071,7 @@ class TestContactComplianceContactsLease(unittest.TestCase):
         """Eager and captured reducer writes both fail before touching the buffer."""
         contacts = episode.fixture.contacts
         state = episode.states[0]
-        before = _contact_rows(contacts)
+        before = _contact_snapshot(contacts)
         with self.assertRaisesRegex(RuntimeError, "unreduced-only solver configuration"):
             reducer.collide(state, contacts)
         capture = wp.ScopedCapture()
@@ -1083,7 +1083,7 @@ class TestContactComplianceContactsLease(unittest.TestCase):
             capture.__exit__(None, None, None)
         self.assertFalse(contacts.rigid_contacts_body_pair_reduced)
         self.assertFalse(contacts.rigid_contacts_body_pair_reduced_capture)
-        after = _contact_rows(contacts)
+        after = _contact_snapshot(contacts)
         self.assertEqual(before[0], after[0])
         np.testing.assert_array_equal(before[1], after[1])
         np.testing.assert_array_equal(before[2], after[2])
