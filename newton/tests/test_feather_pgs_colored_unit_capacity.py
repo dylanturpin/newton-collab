@@ -53,7 +53,7 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
         propagation_cached_response=False,
         articulation_constraint_max=3,
         free_body_constraint_max=3,
-        contact_friction_gap_threshold=FRICTION_GAP_THRESHOLD,
+        contact_friction_gap_max=FRICTION_GAP_THRESHOLD,
         contact_speculative_scale=0.0,
         use_parallel_streams=False,
     )

@@ -22,7 +22,7 @@ _PROFILE = {
     "contact_shared_anchor": True,
     "contact_friction_shared_anchor": True,
     "friction_anchor_beta": 0.2,
-    "contact_friction_gap_threshold": 0.001,
+    "contact_friction_gap_max": 0.001,
     "contact_torsion_radius": 0.01,
     "contact_torsion_device": True,
     "articulation_constraint_max": 512,

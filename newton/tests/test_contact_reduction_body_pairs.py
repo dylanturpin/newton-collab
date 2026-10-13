@@ -3228,7 +3228,7 @@ class TestBodyPairReductionTouchingFootprint(unittest.TestCase):
                 contact_regularization=0.01,
                 contact_warmstart=True,
                 friction_anchor_beta=0.2,
-                contact_friction_gap_threshold=0.001,
+                contact_friction_gap_max=0.001,
             )
             speeds, rots = [], []
             q_ref = None

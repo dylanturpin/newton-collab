@@ -323,9 +323,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             parameters[start : start + 2],
             ("contact_warmstart", "solve_mode"),
         )
-        self.assertGreater(
-            parameters.index("contact_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
-        )
+        self.assertGreater(parameters.index("contact_warmstart_decay"), parameters.index("contact_gap_gate"))
 
         model = newton.ModelBuilder().finalize(device="cpu")
         for value in (-1.0, float("inf"), float("nan")):
