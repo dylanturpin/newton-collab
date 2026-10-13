@@ -82,11 +82,11 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     metrics = wp.zeros(6, dtype=wp.float32, device=model.device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
-        pgs_warmstart=warm,
-        pgs_iterations=iterations,
+        solve_mode="matrix_free",
+        contact_warmstart=warm,
+        iterations=iterations,
         friction_mode=friction,
-        mf_max_constraints=max(128, objects * 128),
+        free_body_constraint_max=max(128, objects * 128),
     )
     pipeline = newton.CollisionPipeline(
         model,
@@ -114,7 +114,6 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     wp.synchronize()
     # One writer graph owns this stateful pipeline. No eager solve follows it.
     with wp.ScopedCapture() as capture:
-        solver.seed_double_buffer_events()
         step(True)
         step(True)
     samples = []
@@ -127,9 +126,9 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     if hasattr(solver, "check_constraint_capacity"):
         solver.check_constraint_capacity()
     observed = metrics.numpy().tolist()
-    counts = solver.mf_constraint_count.numpy()
-    impulses = solver.mf_impulses.numpy()
-    row_type = solver.mf_row_type.numpy()
+    counts = solver._mf_constraint_count.numpy()
+    impulses = solver._mf_impulses.numpy()
+    row_type = solver._mf_row_type.numpy()
     active = np.arange(impulses.shape[1])[None, :] < counts[:, None]
     normal = np.where(active & (row_type == 0), impulses, 0.0).sum(axis=1)
     expected = 2 * 9.81 * model.body_mass.numpy().reshape(worlds, objects).sum(axis=1) * DT
@@ -205,7 +204,9 @@ def main():
         "results": [],
     }
     for repeat in range(args.repeats):
-        result = run(args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations, "current")
+        result = run(
+            args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations, "fixed_normal"
+        )
         result["repeat"] = repeat
         report["results"].append(result)
         if args.output:

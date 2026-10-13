@@ -5,7 +5,7 @@
 
 Runs a small config matrix that isolates the three scaling axes (contact
 count, chain depth, articulation count) across the immediate, propagation,
-and propagation-fused response modes. For each point it reports:
+and propagation_fused response modes. For each point it reports:
 
 - per-step wall time (contacts precomputed, solver-only, restore-state loop),
 - analytic row/propagation buffer memory,
@@ -62,7 +62,7 @@ from fpgs_articulation_row_scaling import (
 import newton
 from newton.solvers import SolverFeatherPGS
 
-MODES = ("mf_immediate", "propagation", "propagation-fused", "propagation-colored")
+MODES = ("mf_immediate", "propagation", "propagation_fused", "propagation_colored")
 CONTACT_ROW_TYPE = 0
 
 
@@ -119,21 +119,19 @@ def _build_model(case: TempCase, world_count: int, device: str, gravity: float) 
     return builder.finalize(device=device)
 
 
-def _make_solver(model: newton.Model, case: TempCase, mode: str, pgs_iterations: int) -> SolverFeatherPGS:
+def _make_solver(model: newton.Model, case: TempCase, mode: str, iterations: int) -> SolverFeatherPGS:
     row_capacity = _planned_row_capacity(_bench_case(case, 1))
     with scalar_hinv_jt():
         return SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response="immediate" if mode not in PROPAGATION_PATHS else mode,
-            pgs_iterations=pgs_iterations,
-            pgs_velocity_iterations=0,
-            enable_contact_friction=True,
+            iterations=iterations,
+            velocity_iterations=0,
             contact_friction_position_iterations=-1,
-            dense_max_constraints=row_capacity,
-            mf_max_constraints=16,
-            pgs_warmstart=False,
-            mf_warmstart=False,
+            articulation_constraint_max=row_capacity,
+            free_body_constraint_max=16,
+            contact_warmstart=False,
         )
 
 
@@ -141,8 +139,8 @@ def _articulated_contact_penetration_m(solver: SolverFeatherPGS) -> float:
     """Max articulated-contact penetration over dense + propagation rows [m]."""
     peak = 0.0
     for count_name, phi_name, type_name in (
-        ("constraint_count", "phi", "row_type"),
-        ("propagation_constraint_count", "propagation_phi", "propagation_row_type"),
+        ("_constraint_count", "_phi", "_row_type"),
+        ("_propagation_constraint_count", "_propagation_phi", "_propagation_row_type"),
     ):
         counts = getattr(solver, count_name, None)
         phi = getattr(solver, phi_name, None)
@@ -211,7 +209,7 @@ def run_point(
     dt: float,
     repeats: int,
     warmups: int,
-    pgs_iterations: int,
+    iterations: int,
     settle_steps: int,
     settle_tail: int,
     timing_model_cache: dict,
@@ -229,18 +227,18 @@ def run_point(
         timing_model_cache[case.label] = (model, _snapshot_state(initial_state), contacts)
     model, initial, contacts = timing_model_cache[case.label]
 
-    solver = _make_solver(model, case, mode, pgs_iterations)
+    solver = _make_solver(model, case, mode, iterations)
     ms, final_state = _timed_loop(model, solver, contacts, initial, repeats=repeats, warmups=warmups, dt=dt)
     row_mib = _row_solver_bytes(solver) / (1024.0 * 1024.0)
     prop_extra_mib = _propagation_extra_bytes(solver) / (1024.0 * 1024.0)
-    prop_rows = getattr(solver, "propagation_constraint_count", None)
+    prop_rows = getattr(solver, "_propagation_constraint_count", None)
     prop_rows_total = int(np.sum(prop_rows.numpy())) if prop_rows is not None else 0
     del solver
 
     if case.label not in settle_model_cache:
         settle_model_cache[case.label] = _build_model(case, case.settle_world_count, device, gravity=-9.81)
     settle_model = settle_model_cache[case.label]
-    settle_solver = _make_solver(settle_model, case, mode, pgs_iterations)
+    settle_solver = _make_solver(settle_model, case, mode, iterations)
     settle_pen_m, settle_state = _settle_loop(settle_model, settle_solver, steps=settle_steps, dt=dt, tail=settle_tail)
     del settle_solver
 
@@ -312,7 +310,7 @@ def _print_table(rows: list[dict], baseline: dict[str, dict] | None) -> None:
         print()
 
 
-def _profile_kernels(case: TempCase, mode: str, *, device: str, dt: float, pgs_iterations: int, top: int = 20) -> None:
+def _profile_kernels(case: TempCase, mode: str, *, device: str, dt: float, iterations: int, top: int = 20) -> None:
     model = _build_model(case, case.world_count, device, gravity=0.0)
     initial_state = model.state()
     newton.eval_fk(model, initial_state.joint_q, initial_state.joint_qd, initial_state)
@@ -321,7 +319,7 @@ def _profile_kernels(case: TempCase, mode: str, *, device: str, dt: float, pgs_i
     contacts = collision_pipeline.contacts()
     collision_pipeline.collide(initial_state, contacts)
     initial = _snapshot_state(initial_state)
-    solver = _make_solver(model, case, mode, pgs_iterations)
+    solver = _make_solver(model, case, mode, iterations)
     # Warm every kernel before recording.
     _timed_loop(model, solver, contacts, initial, repeats=2, warmups=2, dt=dt)
 
@@ -392,7 +390,7 @@ def main() -> None:
             raise ValueError(
                 f"--kernels expects 'CASE|MODE' with CASE in {[c.label for c in TEMPERATURE_CASES]} and MODE in {MODES}"
             )
-        _profile_kernels(matches[0], mode, device=args.device, dt=args.dt, pgs_iterations=args.pgs_iterations)
+        _profile_kernels(matches[0], mode, device=args.device, dt=args.dt, iterations=args.pgs_iterations)
         return
 
     modes = tuple(dict.fromkeys(args.mode)) if args.mode else MODES
@@ -410,7 +408,7 @@ def main() -> None:
                     dt=args.dt,
                     repeats=args.repeats,
                     warmups=args.warmups,
-                    pgs_iterations=args.pgs_iterations,
+                    iterations=args.pgs_iterations,
                     settle_steps=args.settle_steps,
                     settle_tail=args.settle_tail,
                     timing_model_cache=timing_model_cache,

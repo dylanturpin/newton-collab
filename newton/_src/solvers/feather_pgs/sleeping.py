@@ -21,11 +21,11 @@ class _SleepState:
         if (
             model.requires_grad
             or model.particle_count
-            or solver.pgs_warmstart
+            or solver._contact_warmstart
             or solver._mf_warmstart_enabled
-            or solver.contact_compliance
-            or solver.pgs_velocity_iterations
-            or solver.articulated_contact_response != "immediate"
+            or solver._contact_compliance
+            or solver._velocity_iterations
+            or solver._articulated_contact_response != "immediate"
         ):
             raise ValueError(
                 "Experimental sleeping requires rigid immediate response, no compliance, warmstart or velocity passes"
@@ -39,14 +39,14 @@ class _SleepState:
         self.quiet_time = quiet_time
         # Also skips the articulated dynamics of islands that sleep through a step; their outputs are frozen anyway.
         self.skip_constraints = skip_constraints
-        body_nodes = solver.body_to_articulation.numpy().copy()
-        response_counts = solver.articulation_response_dof_count.numpy()
+        body_nodes = solver._body_to_articulation.numpy().copy()
+        response_counts = solver._articulation_response_dof_count.numpy()
         prescribed = (body_nodes >= 0) & (response_counts[np.maximum(body_nodes, 0)] == 0)
         body_nodes[prescribed] = -1
         device = model.device
         self.body_nodes = wp.array(body_nodes, dtype=int, device=device)
         self.body_prescribed = wp.array(prescribed.astype(np.int32), dtype=int, device=device)
-        self.contact_response_mask = wp.clone(solver.body_has_response_dofs)
+        self.contact_response_mask = wp.clone(solver._body_has_response_dofs)
         self.limit_q_index = wp.clone(solver._joint_limit_q_index)
         count = model.articulation_count
         self.parent = wp.empty(count, dtype=int, device=device)
@@ -104,7 +104,7 @@ class _SleepState:
         self.anchored = wp.array(fixed.astype(np.int32), dtype=int, device=device)
         # Loop and mimic rows are built for every articulation, so their owners never sleep.
         pinned = np.zeros(count, dtype=np.int32)
-        body_art = solver.body_to_articulation.numpy()
+        body_art = solver._body_to_articulation.numpy()
         loops = np.flatnonzero(solver._model_plan.loop_joint_articulation >= 0)
         for body in np.concatenate((model.joint_parent.numpy()[loops], model.joint_child.numpy()[loops])):
             if body >= 0 and body_art[body] >= 0:
@@ -151,7 +151,7 @@ class _SleepState:
             self.asleep_steps.zero_()
             return
         device = self.model.device
-        world = self.solver.art_to_world
+        world = self.solver._art_to_world
         wp.launch(
             _wake_worlds,
             self.art_awake.size,
@@ -182,7 +182,7 @@ class _SleepState:
                 continue
             for index, (name, snapshot, arts) in enumerate(entries):
                 # Read the model's current allocation: callers may replace an array instead of assigning into it.
-                current = getattr(self.model, name).numpy()
+                current = _model_array(self.model, name).numpy()
                 if current.shape != snapshot.shape:
                     raise ValueError(f"Model array {name!r} changed shape from {snapshot.shape} to {current.shape}.")
                 differs = (current != snapshot) & ~(_isnan(current) & _isnan(snapshot))
@@ -220,7 +220,7 @@ class _SleepState:
                     model.shape_body,
                     self.body_nodes,
                     model.body_flags,
-                    self.solver.art_to_world,
+                    self.solver._art_to_world,
                     self.parent,
                     self.incomplete,
                 ],
@@ -322,7 +322,7 @@ class _SleepState:
                 self.root_supported,
                 self.incomplete,
                 contacts._reduction_overflow if contacts is not None else self.incomplete,
-                self.solver.art_to_world,
+                self.solver._art_to_world,
                 self.solver.constraint_overflow,
                 self.root_veto,
             ],
@@ -398,7 +398,7 @@ class _SleepState:
             wp.launch(
                 _contact_response_mask,
                 model.body_count,
-                [self.body_nodes, self.art_awake, self.solver.body_has_response_dofs, self.contact_response_mask],
+                [self.body_nodes, self.art_awake, self.solver._body_has_response_dofs, self.contact_response_mask],
                 device=device,
             )
             wp.launch(
@@ -461,7 +461,7 @@ class _SleepState:
                 self.parent,
                 self.root_veto,
                 self.root_supported,
-                self.solver.art_to_world,
+                self.solver._art_to_world,
                 self.solver.constraint_overflow,
                 self.incomplete,
                 dt,
@@ -501,8 +501,8 @@ class _SleepState:
                 self.step_asleep,
                 self.root_veto,
                 state_out.joint_qd,
-                state_aug.joint_qdd,
-                self.solver.v_out,
+                state_aug._joint_qdd,
+                self.solver._v_out,
             ],
             device=device,
         )
@@ -1087,7 +1087,7 @@ def _entity_arrays(model, frequency, size):
     """Model arrays declared at ``frequency`` with one row per entity, so coincident counts never mix owners."""
     arrays = []
     for name, spec in model.attribute_specs.items():
-        value = vars(model).get(name)
+        value = _model_array(model, name)
         if (
             spec.frequency != frequency
             or spec.assignment not in (None, Model.AttributeAssignment.MODEL)
@@ -1097,6 +1097,14 @@ def _entity_arrays(model, frequency, size):
         if isinstance(value, wp.array) and value.ndim >= 1 and value.shape[0] == size and size > 0:
             arrays.append((name, value))
     return arrays
+
+
+def _model_array(model, name):
+    """Return the model array registered as ``name``, resolving ``namespace:attribute`` names."""
+    if ":" not in name:
+        return vars(model).get(name)
+    namespace, attribute = name.split(":", 1)
+    return getattr(getattr(model, namespace, None), attribute, None)
 
 
 def _isnan(values):

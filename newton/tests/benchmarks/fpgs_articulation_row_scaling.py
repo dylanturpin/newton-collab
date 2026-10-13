@@ -37,6 +37,7 @@ if str(_NEWTON_REPO) not in sys.path:
     sys.path.insert(0, str(_NEWTON_REPO))
 
 import newton  # noqa: E402
+from newton._src.solvers.feather_pgs._testing import kernel_overrides  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
@@ -48,15 +49,11 @@ def scalar_hinv_jt():
     cost curves isolate contact-row scaling from tiled-kernel occupancy effects;
     keep them comparable by pinning it through the solver's private test hook.
     """
-    previous = SolverFeatherPGS._kernel_overrides
-    SolverFeatherPGS._kernel_overrides = {**previous, "hinv_jt_kernel": "par_row"}
-    try:
+    with kernel_overrides({"hinv_jt_kernel": "par_row"}):
         yield
-    finally:
-        SolverFeatherPGS._kernel_overrides = previous
 
 
-PROPAGATION_PATHS = ("propagation", "propagation-fused", "propagation-colored")
+PROPAGATION_PATHS = ("propagation", "propagation_fused", "propagation_colored")
 
 
 @dataclass(frozen=True)
@@ -340,57 +337,57 @@ def _row_solver_bytes(solver: SolverFeatherPGS) -> int:
         "Y_world",
         "diag",
         "rhs",
-        "rhs_unbiased",
-        "impulses",
-        "row_type",
-        "row_parent",
-        "row_mu",
-        "row_cfm",
-        "phi",
-        "mf_rhs",
-        "mf_rhs_unbiased",
-        "mf_impulses",
-        "mf_eff_mass_inv",
-        "mf_row_type",
-        "mf_row_parent",
-        "mf_row_mu",
-        "mf_J_a",
-        "mf_J_b",
-        "mf_MiJt_a",
-        "mf_MiJt_b",
-        "mf_dof_a",
-        "mf_dof_b",
-        "propagation_rhs",
-        "propagation_rhs_unbiased",
-        "propagation_impulses",
-        "propagation_eff_mass_inv",
-        "propagation_row_type",
-        "propagation_row_parent",
-        "propagation_row_mu",
-        "propagation_phi",
-        "propagation_J_a",
-        "propagation_J_b",
-        "propagation_MiJt_a",
-        "propagation_MiJt_b",
-        "propagation_body_a",
-        "propagation_body_b",
+        "_rhs_unbiased",
+        "_impulses",
+        "_row_type",
+        "_row_parent",
+        "_row_mu",
+        "_row_cfm",
+        "_phi",
+        "_mf_rhs",
+        "_mf_rhs_unbiased",
+        "_mf_impulses",
+        "_mf_eff_mass_inv",
+        "_mf_row_type",
+        "_mf_row_parent",
+        "_mf_row_mu",
+        "_mf_J_a",
+        "_mf_J_b",
+        "_mf_MiJt_a",
+        "_mf_MiJt_b",
+        "_mf_dof_a",
+        "_mf_dof_b",
+        "_propagation_rhs",
+        "_propagation_rhs_unbiased",
+        "_propagation_impulses",
+        "_propagation_eff_mass_inv",
+        "_propagation_row_type",
+        "_propagation_row_parent",
+        "_propagation_row_mu",
+        "_propagation_phi",
+        "_propagation_J_a",
+        "_propagation_J_b",
+        "_propagation_MiJt_a",
+        "_propagation_MiJt_b",
+        "_propagation_body_a",
+        "_propagation_body_b",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
 
 def _propagation_extra_bytes(solver: SolverFeatherPGS) -> int:
     names = (
-        "propagation_body_response",
-        "propagation_body_qd",
-        "propagation_body_impulses",
-        "propagation_tree_Ia",
-        "propagation_tree_U",
-        "propagation_tree_D_chol",
-        "propagation_tree_D_inv",
-        "propagation_tree_pA",
-        "propagation_tree_u",
-        "propagation_tree_qdd",
-        "propagation_tree_body_delta",
+        "_propagation_body_response",
+        "_propagation_body_qd",
+        "_propagation_body_impulses",
+        "_propagation_tree_Ia",
+        "_propagation_tree_U",
+        "_propagation_tree_D_chol",
+        "_propagation_tree_D_inv",
+        "_propagation_tree_pA",
+        "_propagation_tree_u",
+        "_propagation_tree_qdd",
+        "_propagation_tree_body_delta",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
@@ -535,8 +532,8 @@ def _run_case_path(
     repeats: int,
     warmups: int,
     dt: float,
-    pgs_iterations: int,
-    pgs_velocity_iterations: int,
+    iterations: int,
+    velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
     model: newton.Model | None = None,
@@ -563,16 +560,15 @@ def _run_case_path(
     with scalar_hinv_jt():
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
-            pgs_iterations=pgs_iterations,
-            pgs_velocity_iterations=pgs_velocity_iterations,
-            enable_contact_friction=enable_contact_friction,
+            iterations=iterations,
+            velocity_iterations=velocity_iterations,
+            contact_friction_scale=1.0 if enable_contact_friction else 0.0,
             contact_friction_position_iterations=contact_friction_position_iterations,
-            dense_max_constraints=dense_capacity,
-            mf_max_constraints=mf_capacity,
-            pgs_warmstart=False,
-            mf_warmstart=False,
+            articulation_constraint_max=dense_capacity,
+            free_body_constraint_max=mf_capacity,
+            contact_warmstart=False,
         )
     wp.synchronize()
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
@@ -596,16 +592,16 @@ def _run_case_path(
     process_peak_gpu_mem_bytes = max(process_peak_gpu_mem_bytes, current_process_bytes)
     process_gpu_mem_delta_bytes = max(0, process_peak_gpu_mem_bytes - process_gpu_mem_baseline_bytes)
 
-    dense_counts = solver.constraint_count.numpy().astype(np.int64, copy=False)
-    mf_counts = solver.mf_constraint_count.numpy().astype(np.int64, copy=False)
-    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    dense_counts = solver._constraint_count.numpy().astype(np.int64, copy=False)
+    mf_counts = solver._mf_constraint_count.numpy().astype(np.int64, copy=False)
+    propagation_count_array = getattr(solver, "_propagation_constraint_count", None)
     if propagation_count_array is None:
         propagation_counts = np.zeros_like(dense_counts)
     else:
         propagation_counts = propagation_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
     propagation_active = bool(
-        solver.articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
+        solver._articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
     )
 
     result = RunResult(
@@ -622,9 +618,9 @@ def _run_case_path(
         world_count=model.world_count,
         body_count=model.body_count,
         joint_dof_count=model.joint_dof_count,
-        dense_row_capacity=int(solver.dense_max_constraints),
-        mf_row_capacity=int(solver.mf_max_constraints),
-        propagation_row_capacity=int(getattr(solver, "propagation_max_constraints", propagation_capacity)),
+        dense_row_capacity=int(solver._articulation_constraint_max),
+        mf_row_capacity=int(solver._free_body_constraint_max),
+        propagation_row_capacity=int(getattr(solver, "_propagation_max_constraints", propagation_capacity)),
         dense_rows_total=int(np.sum(dense_counts)),
         dense_rows_max_world=int(np.max(dense_counts)) if dense_counts.size else 0,
         mf_rows_total=int(np.sum(mf_counts)),
@@ -998,7 +994,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("This report uses real `SolverFeatherPGS.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
     lines.append("- `propagation`: fixed-size articulated contact rows plus tree response/propagation.")
-    lines.append("- `propagation-fused`: same response model with the fused propagation kernel where supported.")
+    lines.append("- `propagation_fused`: same response model with the fused propagation kernel where supported.")
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
@@ -1129,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("mf_immediate", *PROPAGATION_PATHS),
         default=None,
-        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation-fused.",
+        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation_fused.",
     )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument(
@@ -1178,7 +1174,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation-fused")
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation_fused")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:
@@ -1189,8 +1185,8 @@ def main() -> None:
                 repeats=args.repeats,
                 warmups=args.warmups,
                 dt=args.dt,
-                pgs_iterations=args.pgs_iterations,
-                pgs_velocity_iterations=args.pgs_velocity_iterations,
+                iterations=args.pgs_iterations,
+                velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
                 model=model,
