@@ -728,23 +728,24 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_fused_crba_covers_articulations_wider_than_the_block(self):
         """Match separate assembly when the tiled block has fewer threads than the articulation has DOFs."""
         dense = {"sparse_mass_matrix": False}
-        for links in (33, 64):
-            model = _build_chain_model(num_links=links, num_worlds=1)
-            with kernel_overrides(dense):
-                reference = SolverFeatherPGS(model, enable_joint_limits=False, use_parallel_streams=False)
-            self.assertIsNone(reference._crba_cholesky_kernels_by_size[links])
-            q_ref, qd_ref = _chain_trajectory(model, reference)
-            for tile_threads in (32, 64):
-                with self.subTest(links=links, tile_threads=tile_threads):
-                    with kernel_overrides({**dense, "tile_threads": tile_threads}):
-                        fused = SolverFeatherPGS(model, enable_joint_limits=False)
-                    self.assertIsNotNone(fused._crba_cholesky_kernels_by_size[links])
-                    q, qd = _chain_trajectory(model, fused)
-                    np.testing.assert_allclose(
-                        fused._L_by_size[links].numpy(), reference._L_by_size[links].numpy(), atol=2.0e-5
-                    )
-                    np.testing.assert_allclose(q, q_ref, rtol=1.0e-5, atol=2.0e-5)
-                    np.testing.assert_allclose(qd, qd_ref, rtol=1.0e-5, atol=2.0e-4)
+        # With 32 threads, 33 DOFs leave the second force-staging round one lane wide; both widths share its tile kernels.
+        links = 33
+        model = _build_chain_model(num_links=links, num_worlds=1)
+        with kernel_overrides(dense):
+            reference = SolverFeatherPGS(model, enable_joint_limits=False, use_parallel_streams=False)
+        self.assertIsNone(reference._crba_cholesky_kernels_by_size[links])
+        q_ref, qd_ref = _chain_trajectory(model, reference)
+        for tile_threads in (32, 64):
+            with self.subTest(tile_threads=tile_threads):
+                with kernel_overrides({**dense, "tile_threads": tile_threads}):
+                    fused = SolverFeatherPGS(model, enable_joint_limits=False)
+                self.assertIsNotNone(fused._crba_cholesky_kernels_by_size[links])
+                q, qd = _chain_trajectory(model, fused)
+                np.testing.assert_allclose(
+                    fused._L_by_size[links].numpy(), reference._L_by_size[links].numpy(), atol=2.0e-5
+                )
+                np.testing.assert_allclose(q, q_ref, rtol=1.0e-5, atol=2.0e-5)
+                np.testing.assert_allclose(qd, qd_ref, rtol=1.0e-5, atol=2.0e-4)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
