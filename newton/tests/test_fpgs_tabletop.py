@@ -73,7 +73,9 @@ for count in (1, 2, 3, 4):
 def test_wrecking_ball_idle(test, device):
     """The unstruck building must stand for the entire demonstration."""
     with wp.ScopedDevice(device):
-        example = Example(ViewerNull(), SimpleNamespace(substeps=4, iterations=12, test=True))
+        example = Example(
+            ViewerNull(), SimpleNamespace(substeps=4, iterations=12, contact_response="immediate", test=True)
+        )
         example.autoplay = False
         for _ in range(900):
             example.step()

@@ -17,6 +17,12 @@ from ._tabletop_demo import TabletopDemo
 class Example(TabletopDemo):
     task = "sweep"
 
+    @staticmethod
+    def create_parser():
+        parser = TabletopDemo.create_parser()
+        parser.set_defaults(contact_response="propagation_colored")
+        return parser
+
     def populate(self, builder, info, ee, down, fingers):
         _bolt_sweep.populate(builder, info, ee, down, wp.get_device())
 

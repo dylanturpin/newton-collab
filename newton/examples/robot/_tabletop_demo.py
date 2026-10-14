@@ -117,6 +117,7 @@ class TabletopDemo:
         self.solver = SolverFeatherPGS(
             self.model,
             solve_mode="matrix_free",
+            articulated_contact_response=args.contact_response,
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
@@ -145,6 +146,12 @@ class TabletopDemo:
         parser.set_defaults(num_frames=900)
         parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
         parser.add_argument("--iterations", type=int, default=12, help="FPGS sweeps per substep")
+        parser.add_argument(
+            "--contact-response",
+            choices=("immediate", "propagation", "propagation_fused", "propagation_colored"),
+            default="immediate",
+            help="FPGS matrix-free articulated contact response",
+        )
         return parser
 
     def reset(self):
