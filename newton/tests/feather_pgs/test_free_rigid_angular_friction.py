@@ -422,8 +422,13 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         with self.assertRaises(ValueError):
             SolverFeatherPGS(model, solve_mode="split", free_rigid_rolling_friction=1.0e-3)
         with self.assertRaises(ValueError):
+            # Point friction: bisection with persistent patches would warn before the rejection under test.
             SolverFeatherPGS(
-                model, solve_mode="matrix_free", friction_mode="bisection", free_rigid_rolling_friction=1.0e-3
+                model,
+                solve_mode="matrix_free",
+                friction_mode="bisection",
+                friction_anchor_beta=0.0,
+                free_rigid_rolling_friction=1.0e-3,
             )
         model.feather_pgs.condim.fill_(7)
         with self.assertRaises(ValueError):
