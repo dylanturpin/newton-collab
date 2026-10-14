@@ -1,0 +1,1 @@
+Fix the `SolverFeatherPGS` motion subspace of D6 joints with two or three angular axes, which disagreed with forward kinematics and left out the bias acceleration of the configuration-dependent axes. FeatherPGS now shares `SolverFeatherstone`'s joint motion computation.
