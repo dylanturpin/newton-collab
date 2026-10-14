@@ -3384,6 +3384,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._free_rigid_angular_rows:
             self._free_rigid_mu_torsional = wp.zeros(material_count, dtype=wp.float32, device=model.device)
             self._free_rigid_mu_rolling = wp.zeros(material_count, dtype=wp.float32, device=model.device)
+            self._free_rigid_condim_dummy = wp.full(material_count, 3, dtype=wp.int32, device=model.device)
         self._refresh_shape_materials()
 
         self._init_double_buffer_stream()

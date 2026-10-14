@@ -45,6 +45,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     build_mf_angular_friction_rows,
+    gate_free_rigid_angular_coefficients,
     populate_world_angular_friction_rows,
 )
 
@@ -78,28 +79,41 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
 
 
 def refresh_free_rigid_angular_friction(solver) -> None:
-    """Write each shape's free-rigid torsional and rolling coefficients [m], zero where its condim excludes them."""
+    """Write each shape's free-rigid torsional and rolling coefficients [m] on the device, zero where condim excludes them.
+
+    Capturable; outside capture it also rejects a condim above 3 on a solver constructed without angular rows.
+    """
     model = solver.model
-    condim = _shape_condim(model)
+    attribute = _condim_attribute(model)
     if not solver._free_rigid_angular_rows:
-        if condim is not None and np.any(condim >= 4):
-            raise ValueError("feather_pgs:condim above 3 needs a solver constructed with it; construct a new solver")
+        if attribute is not None and model.shape_count and not wp.get_stream(model.device).is_capturing:
+            if np.any(attribute.numpy() >= 4):
+                raise ValueError(
+                    "feather_pgs:condim above 3 needs a solver constructed with it; construct a new solver"
+                )
         return
     if not model.shape_count:
         return
-    overridden = solver._free_rigid_torsional_friction is not None or solver._free_rigid_rolling_friction is not None
-    # An override stands for every shape at condim 6 with that coefficient.
-    dims = np.full(model.shape_count, 6, dtype=np.int32) if overridden or condim is None else condim
-    for buffer, values, override, minimum in (
-        (solver._free_rigid_mu_torsional, model.shape_material_mu_torsional, solver._free_rigid_torsional_friction, 4),
-        (solver._free_rigid_mu_rolling, model.shape_material_mu_rolling, solver._free_rigid_rolling_friction, 6),
-    ):
-        coefficients = np.zeros(model.shape_count, dtype=np.float32) if values is None else values.numpy()
-        if override is not None:
-            coefficients = np.full(model.shape_count, override, dtype=np.float32)
-        coefficients = np.nan_to_num(coefficients, nan=0.0, posinf=0.0, neginf=0.0)
-        coefficients = np.where((dims >= minimum) & (coefficients > 0.0), coefficients, 0.0).astype(np.float32)
-        buffer.assign(np.pad(coefficients, (0, buffer.shape[0] - model.shape_count)))
+    torsional, rolling = solver._free_rigid_torsional_friction, solver._free_rigid_rolling_friction
+    wp.launch(
+        gate_free_rigid_angular_coefficients,
+        dim=model.shape_count,
+        inputs=[
+            attribute if attribute is not None else solver._free_rigid_condim_dummy,
+            int(attribute is not None),
+            solver._shape_mu_torsional,
+            solver._shape_mu_rolling,
+            -1.0 if torsional is None else torsional,
+            -1.0 if rolling is None else rolling,
+        ],
+        outputs=[solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling],
+        device=model.device,
+    )
+
+
+def _condim_attribute(model):
+    namespace = getattr(model, "feather_pgs", None)
+    return getattr(namespace, "condim", None)
 
 
 def _shape_condim(model) -> np.ndarray | None:

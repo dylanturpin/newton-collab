@@ -315,6 +315,30 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         np.testing.assert_array_equal(first, second)
         np.testing.assert_array_equal(first, captured)
 
+    def test_one_override_keeps_the_other_coefficient_on_condim(self):
+        """Override only the rolling coefficient: shapes at condim 3 get the rolling pair and no spin row."""
+        seen = {}
+
+        def observe(solver, contacts, observables):
+            seen["slots"] = int(solver._contact_slots_needed.numpy()[0])
+
+        _simulate("sphere", 0.0, steps=1, free_rigid_rolling_friction=0.001, observe=observe)
+        self.assertEqual(seen["slots"], 5)
+        _simulate("sphere", 0.0, steps=1, condim=4, free_rigid_rolling_friction=0.001, observe=observe)
+        self.assertEqual(seen["slots"], 6)
+
+    def test_shape_notify_inside_graph_capture_refreshes_coefficients(self):
+        """Capture a shape-property notify that changes mu_rolling, and replay it into the rows' bound."""
+        model, _ = _scene("sphere")
+        model.feather_pgs.condim.fill_(6)
+        model.shape_material_mu_rolling.fill_(0.001)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free")
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        model.shape_material_mu_rolling.fill_(0.003)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(solver._free_rigid_mu_rolling.numpy()[: model.shape_count], 0.003)
+
     def test_default_condim_and_zero_coefficients_match_the_base(self):
         """Match the default bit for bit at condim 3, and add no rows for zero coefficients at condim 6."""
         default, _, _ = _simulate("sphere", 0.3, **_ROLLING)
