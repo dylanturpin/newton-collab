@@ -145,6 +145,7 @@ from .kernels import (
     compute_contact_spatial_force_from_impulses,
     compute_delta_and_accumulate,
     compute_effective_joint_armature,
+    compute_free_root_rotation,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -183,6 +184,7 @@ from .kernels import (
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
     gather_dense_warmstart,
+    gather_free_root_anchors,
     gather_group_armature,
     gather_JY_to_world,
     gather_mf_warmstart,
@@ -3559,6 +3561,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:
+            self._refresh_free_root_anchors()
             # Joint frames move the bodies the mass matrix is built from.
             self._mass_update_requested.fill_(1)
         check_friction = self._enable_joint_friction and flags & dof_force
@@ -5809,6 +5812,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._is_free_rigid = None
             self._free_rigid_body_indices = None
             self._free_rigid_body_count = 0
+            self._free_root_anchor = None
             return
 
         is_free_rigid = self._model_plan.is_free_rigid
@@ -5828,6 +5832,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._is_free_rigid = wp.array(is_free_rigid, dtype=wp.int32, device=model.device)
         self._free_rigid_body_indices = wp.array(
             self._model_plan.response_free_rigid_body_indices, dtype=wp.int32, device=model.device
+        )
+        self._free_root_anchor = wp.empty(model.articulation_count, dtype=wp.quat, device=model.device)
+        self._free_root_rotation = wp.empty(max(self._free_root_joint_count, 1), dtype=wp.quat, device=model.device)
+        self._refresh_free_root_anchors()
+
+    def _refresh_free_root_anchors(self) -> None:
+        """Gather each free rigid body's FREE-joint parent-anchor rotation, the frame of its ``joint_qd``."""
+        if self._free_root_anchor is None:
+            return
+        wp.launch(
+            gather_free_root_anchors,
+            dim=self.model.articulation_count,
+            inputs=[self.model.articulation_start, self._is_free_rigid, self.model.joint_X_p],
+            outputs=[self._free_root_anchor],
+            device=self.model.device,
         )
 
     def _compute_world_response_dof_mapping(self, model):
@@ -11470,6 +11489,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             return
         if self._free_rigid_body_count:
             wp.launch(
+                compute_free_root_rotation,
+                dim=self._free_root_joint_count,
+                inputs=[
+                    self._free_root_joint_indices,
+                    model.joint_child,
+                    self._body_to_articulation,
+                    self._free_root_anchor,
+                    state_in.body_q,
+                ],
+                outputs=[self._free_root_rotation],
+                device=model.device,
+            )
+            wp.launch(
                 apply_free_root_velocity_corrections,
                 dim=self._free_root_joint_count,
                 inputs=[
@@ -11480,7 +11512,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._is_free_rigid,
                     self._art_group_idx,
                     self._kinematic_joint_mask,
-                    state_in.body_q,
+                    self._free_root_rotation,
                     model.body_inertia,
                     self._L_by_size[6],
                     stage3_qd,
@@ -12524,6 +12556,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._free_root_anchor,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12638,6 +12671,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         builder_unit_count,
                         self._propagation_max_constraints,
                         builder_use_unit_order,
+                        self._free_root_anchor,
                     ],
                     outputs=[
                         self._propagation_body_a,
@@ -12882,6 +12916,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._rigid_body_max_angular_velocity,
                         self._articulation_root_dof_start,
                         self._v_hat,
+                        self._free_root_anchor,
                         self._velocity_limit_activation_fraction,
                         self._free_body_constraint_max,
                         self._constraint_art_active,
@@ -12911,6 +12946,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._rigid_body_max_angular_velocity,
                     self._rigid_velocity_limit_slot,
                     self._rigid_velocity_limit_sign,
+                    self._free_root_anchor,
                 ],
                 outputs=[
                     self._mf_body_a,
@@ -13931,6 +13967,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 model.body_flags,
                 self._articulation_dof_start,
                 self._joint_armature_device,
+                self._free_root_anchor,
             ],
             outputs=[self._mf_body_Hinv],
             device=model.device,
