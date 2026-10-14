@@ -660,6 +660,39 @@ class TestFeatherPGSRowAllocation(unittest.TestCase):
         )
         self.assertLess(int(propagation_routed._articulation_constraint_max), 320)
 
+    def test_propagation_constraint_max_sizes_the_propagation_family(self):
+        """``propagation_constraint_max`` sets the propagation row capacity on its own.
+
+        In the propagation responses every contact row lives on the propagation family, so its
+        capacity defaulted to the sum of the free-body and articulation budgets: shrinking the
+        matrix-free budget to the rows it still holds (joint velocity limits) also starved the
+        contact rows. The explicit capacity decouples the two.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.add_ground_plane()
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize()
+        model.rigid_contact_max = 256
+        kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        summed = newton.solvers.SolverFeatherPGS(
+            model, articulation_constraint_max=32, free_body_constraint_max=256, **kwargs
+        )
+        self.assertEqual(int(summed._propagation_max_constraints), 256 + 32)
+        self.assertIsNone(summed.propagation_constraint_max)
+        decoupled = newton.solvers.SolverFeatherPGS(
+            model,
+            articulation_constraint_max=32,
+            free_body_constraint_max=16,
+            propagation_constraint_max=288,
+            **kwargs,
+        )
+        self.assertEqual(int(decoupled._propagation_max_constraints), 288)
+        self.assertEqual(decoupled.propagation_constraint_max, 288)
+        self.assertEqual(int(decoupled._free_body_constraint_max), 16)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFeatherPGS(model, propagation_constraint_max=0, **kwargs)
+
 
 def _scene(device):
     """Two worlds: a box on the ground next to a fixed-base slider resting on it, one world without contacts."""
