@@ -36,6 +36,23 @@ def _hull(points):
     return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int32).reshape(-1)
 
 
+def _prism(sides, first_side=0):
+    """Return a regular prism whose cap vertices are numbered starting at ``first_side``."""
+    angles = 2.0 * np.pi * np.roll(np.arange(sides), first_side) / sides
+    ring = np.stack([0.02 * np.cos(angles), 0.02 * np.sin(angles)], axis=1)
+    bottom = np.hstack([ring, np.full((sides, 1), -0.01)])
+    top = np.hstack([ring, np.full((sides, 1), 0.01)])
+    vertices = np.vstack([bottom, top]).astype(np.float32)
+    order = np.argsort(np.roll(np.arange(sides), first_side))
+    faces = []
+    for i in range(1, sides - 1):
+        faces += [[order[0], order[i + 1], order[i]], [sides + order[0], sides + order[i], sides + order[i + 1]]]
+    for i in range(sides):
+        a, b = order[i], order[(i + 1) % sides]
+        faces += [[a, b, sides + b], [a, sides + b, sides + a]]
+    return vertices, np.asarray(faces, dtype=np.int32).reshape(-1)
+
+
 def _quat_from_euler_deg(rx, ry, rz):
     q = wp.quat_identity()
     for axis, angle in ((wp.vec3(1.0, 0.0, 0.0), rx), (wp.vec3(0.0, 1.0, 0.0), ry), (wp.vec3(0.0, 0.0, 1.0), rz)):
@@ -47,7 +64,7 @@ def _rotate(q, points):
     return np.array([np.array(wp.quat_rotate(q, wp.vec3(*p))) for p in points])
 
 
-def _build(device, support, vertices, indices, rotation, penetration, offset_xy=(0.0, 0.0)):
+def _build(device, support, vertices, indices, rotation, penetration, offset_xy=(0.0, 0.0), scale=(1.0, 1.0, 1.0)):
     builder = newton.ModelBuilder()
     support_cfg = newton.ModelBuilder.ShapeConfig(gap=SHAPE_GAP)
     if support == "plane":
@@ -58,10 +75,10 @@ def _build(device, support, vertices, indices, rotation, penetration, offset_xy=
         builder.add_shape_box(
             body=-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=0.1, hy=0.1, hz=0.05, cfg=support_cfg
         )
-    z = -_rotate(rotation, vertices)[:, 2].min() - penetration
+    z = -_rotate(rotation, vertices * np.asarray(scale))[:, 2].min() - penetration
     body = builder.add_body(xform=wp.transform((offset_xy[0], offset_xy[1], z), rotation))
     builder.add_shape_convex_hull(
-        body, mesh=newton.Mesh(vertices, indices), cfg=newton.ModelBuilder.ShapeConfig(gap=SHAPE_GAP)
+        body, mesh=newton.Mesh(vertices, indices), scale=scale, cfg=newton.ModelBuilder.ShapeConfig(gap=SHAPE_GAP)
     )
     return builder.finalize(device=device)
 
@@ -69,7 +86,7 @@ def _build(device, support, vertices, indices, rotation, penetration, offset_xy=
 def _world_contacts(model, convex_face_clip):
     """Return world contact points on the hull, normals and signed distances, sorted by position."""
     state = model.state()
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", convex_face_clip=convex_face_clip)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, convex_face_clip=convex_face_clip)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     count = int(contacts.rigid_contact_count.numpy()[0])
@@ -100,6 +117,10 @@ def _raw_contacts(model, convex_face_clip):
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, convex_face_clip=convex_face_clip)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
+    return _contact_arrays(contacts)
+
+
+def _contact_arrays(contacts):
     count = int(contacts.rigid_contact_count.numpy()[0])
     return tuple(
         getattr(contacts, name).numpy()[:count].copy()
@@ -140,7 +161,7 @@ def test_rounded_hull_rests_on_face(test, device):
 
 
 def test_hull_clipped_to_box_face(test, device):
-    """A hull overhanging the box edge keeps only contacts on the box's top face."""
+    """Check that a hull overhanging the box edge keeps only contacts on the box's top face."""
     vertices, indices = _cube_hull(0.02)
     rotation = wp.quat_identity()
     model = _build(device, "box", vertices, indices, rotation, penetration=1.0e-4, offset_xy=(0.1, 0.0))
@@ -153,7 +174,7 @@ def test_hull_clipped_to_box_face(test, device):
 
 
 def test_cube_hull_matches_legacy_corners(test, device):
-    """Where perturbed support mapping already finds the face, face clipping keeps the same corners."""
+    """Check that face clipping keeps the corners perturbed support mapping already finds."""
     vertices, indices = _cube_hull(0.02)
     for support in ("plane", "box"):
         for yaw in (0.0, 30.0):
@@ -168,7 +189,7 @@ def test_cube_hull_matches_legacy_corners(test, device):
 
 
 def test_cube_hull_on_edge(test, device):
-    """A cube hull balanced on an edge touches along that edge only."""
+    """Check that a cube hull balanced on an edge touches along that edge only."""
     vertices, indices = _cube_hull(0.02)
     model = _build(device, "plane", vertices, indices, _quat_from_euler_deg(45.0, 0.0, 0.0), penetration=1.0e-4)
     points, _, distances = _world_contacts(model, True)
@@ -178,8 +199,27 @@ def test_cube_hull_on_edge(test, device):
     np.testing.assert_allclose(touching[:, 1], 0.0, atol=1.0e-6)
 
 
+def test_many_sided_face_spans_footprint(test, device):
+    """Check that a face with more vertices than the patch capacity keeps contacts around its footprint."""
+    for sides in (16, 32, 64):
+        contact_sets = []
+        for first_side in (0, sides // 4, sides // 2):
+            vertices, indices = _prism(sides, first_side)
+            model = _build(device, "plane", vertices, indices, wp.quat_identity(), penetration=1.0e-4)
+            points, _, _ = _world_contacts(model, True)
+            label = f"{sides}-gon from side {first_side}"
+            test.assertGreaterEqual(len(points), 3, label)
+            centroid = points[:, :2].mean(axis=0)
+            test.assertLess(np.linalg.norm(centroid), 0.006, f"{label}: contacts bunch at {centroid}")
+            test.assertGreater(np.ptp(points[:, 0]), 0.03, label)
+            test.assertGreater(np.ptp(points[:, 1]), 0.03, label)
+            contact_sets.append(points)
+        for points in contact_sets[1:]:
+            np.testing.assert_allclose(points, contact_sets[0], atol=1.0e-6)
+
+
 def test_face_clip_leaves_other_pairs_unchanged(test, device):
-    """Pairs other than box/plane versus convex mesh produce identical contacts with the flag set."""
+    """Check that pairs other than box/plane versus convex mesh are bitwise unchanged by the flag."""
     hull_vertices, hull_indices = _rounded_hull((0.012, 0.009, 0.008), 12, 7)
     builder = newton.ModelBuilder()
     builder.default_shape_cfg.gap = SHAPE_GAP
@@ -205,16 +245,35 @@ def test_face_clip_leaves_other_pairs_unchanged(test, device):
 
 
 def test_face_clip_deterministic(test, device):
+    """Check that repeated collides into one persistent buffer match a fresh pipeline bitwise."""
     vertices, indices = _rounded_hull((0.012, 0.009, 0.008))
     model = _build(device, "box", vertices, indices, _quat_from_euler_deg(20.0, 0.0, 10.0), penetration=2.0e-4)
-    first = _raw_contacts(model, True)
+    fresh = _raw_contacts(model, True)
+    state = model.state()
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, convex_face_clip=True)
+    contacts = pipeline.contacts()
     for _ in range(3):
-        for before, after in zip(first, _raw_contacts(model, True), strict=True):
+        pipeline.collide(state, contacts)
+        for before, after in zip(fresh, _contact_arrays(contacts), strict=True):
             np.testing.assert_array_equal(before, after)
 
 
+def test_runtime_scale_matches_baked_vertices(test, device):
+    """Check that an anisotropic shape scale gives the contacts of the equivalently scaled vertices."""
+    vertices, indices = _rounded_hull((1.0, 1.0, 1.0))
+    radii = np.array([0.012, 0.009, 0.008], dtype=np.float32)
+    rotation = _quat_from_euler_deg(20.0, 0.0, 10.0)
+    baked = _world_contacts(_build(device, "box", vertices * radii, indices, rotation, penetration=2.0e-4), True)
+    scaled = _world_contacts(
+        _build(device, "box", vertices, indices, rotation, penetration=2.0e-4, scale=tuple(radii)), True
+    )
+    test.assertGreaterEqual(len(scaled[0]), 3)
+    for a, b in zip(baked, scaled, strict=True):
+        np.testing.assert_allclose(a, b, atol=1.0e-6)
+
+
 def test_rounded_hull_settles(test, device):
-    """A small rounded hull settles on a facet with face clipping and keeps rolling without it."""
+    """Check that a small rounded hull settles with face clipping and keeps rolling without it."""
     vertices, indices = _rounded_hull((0.012, 0.009, 0.008))
     tail_speed = {}
     for convex_face_clip in (False, True):
@@ -240,7 +299,6 @@ def test_rounded_hull_settles(test, device):
             model,
             broad_phase="nxn",
             deterministic=True,
-            contact_matching="sticky",
             convex_face_clip=convex_face_clip,
         )
         contacts = pipeline.contacts()
@@ -271,11 +329,20 @@ add_function_test(TestConvexFaceClip, "test_hull_clipped_to_box_face", test_hull
 add_function_test(
     TestConvexFaceClip, "test_cube_hull_matches_legacy_corners", test_cube_hull_matches_legacy_corners, devices=devices
 )
+add_function_test(
+    TestConvexFaceClip, "test_many_sided_face_spans_footprint", test_many_sided_face_spans_footprint, devices=devices
+)
 add_function_test(TestConvexFaceClip, "test_cube_hull_on_edge", test_cube_hull_on_edge, devices=devices)
 add_function_test(
     TestConvexFaceClip,
     "test_face_clip_leaves_other_pairs_unchanged",
     test_face_clip_leaves_other_pairs_unchanged,
+    devices=devices,
+)
+add_function_test(
+    TestConvexFaceClip,
+    "test_runtime_scale_matches_baked_vertices",
+    test_runtime_scale_matches_baked_vertices,
     devices=devices,
 )
 add_function_test(TestConvexFaceClip, "test_face_clip_deterministic", test_face_clip_deterministic, devices=devices)

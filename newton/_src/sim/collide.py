@@ -1904,11 +1904,14 @@ class CollisionPipeline:
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
             convex_face_clip: Build box/plane versus convex-mesh manifolds by
-                clipping the hull's contact patch (its vertices within the contact
-                gap) against the box or plane reference face, keeping up to 4
-                points. Rounded hulls then rest on their facets instead of a single
-                support vertex. Cannot be combined with a prebuilt ``narrow_phase``.
-                Defaults to False.
+                clipping the hull's incident face against the box or plane
+                reference face, keeping up to 4 points; pairs the face does not
+                explain fall back to perturbed support mapping. This gives rounded
+                hulls a multi-point support patch where the default manifold
+                often keeps a single support vertex. Selected at construction and
+                fixed for the pipeline's lifetime. Experimental: the option and
+                its contacts may change without a deprecation period. Cannot be
+                combined with a prebuilt ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for

@@ -40,6 +40,8 @@ COS_DEEPEST_CONTACT_THRESHOLD_ANGLE = wp.static(math.cos(0.1 * math.pi / 180.0))
 COS_FACE_CLIP_MAX_ANGLE = wp.constant(math.cos(15.0 * math.pi / 180.0))
 # Vertices kept on the boundary of the incident face.
 FACE_CLIP_PATCH_CAPACITY = wp.constant(16)
+# Angle between the in-plane directions that sample an incident face with more vertices than the capacity.
+FACE_CLIP_DIRECTION_STEP = wp.constant(2.0 * math.pi / 16.0)
 # Face capacity plus one vertex per clip plane (four side planes and the contact gap).
 FACE_CLIP_POLYGON_CAPACITY = 21
 # Hull vertices within this distance [m] of the incident face plane belong to the face.
@@ -760,10 +762,46 @@ def face_clip_incident_face(
         c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
         if face_count == 0 or c[0] < start[0] or (c[0] == start[0] and c[1] < start[1]):
             start = c
-        face_vertices[face_count] = c
+        if face_count < FACE_CLIP_PATCH_CAPACITY:
+            face_vertices[face_count] = c
         face_count += 1
-        if face_count == FACE_CLIP_PATCH_CAPACITY:
-            break
+
+    if face_count > FACE_CLIP_PATCH_CAPACITY:
+        # Too many face vertices to wrap: keep the extreme vertex along evenly spaced in-plane directions.
+        polygon_count = int(0)
+        for k in range(FACE_CLIP_PATCH_CAPACITY):
+            angle = float(k) * FACE_CLIP_DIRECTION_STEP
+            direction_u = wp.cos(angle)
+            direction_v = wp.sin(angle)
+            best = wp.vec3(0.0)
+            best_dot = float(0.0)
+            has_best = bool(False)
+            for i in range(vertex_count):
+                p = wp.cw_mul(points[i], scale)
+                if wp.abs(wp.dot(p - plane_point, plane_normal)) > FACE_CLIP_COPLANAR_DISTANCE:
+                    continue
+                c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
+                d = c[0] * direction_u + c[1] * direction_v
+                if (
+                    not has_best
+                    or d > best_dot
+                    or (d == best_dot and (c[0] < best[0] or (c[0] == best[0] and c[1] < best[1])))
+                ):
+                    best = c
+                    best_dot = d
+                    has_best = True
+            if polygon_count > 0:
+                du = best[0] - polygon[polygon_count - 1][0]
+                dv = best[1] - polygon[polygon_count - 1][1]
+                if du * du + dv * dv <= FACE_CLIP_MERGE_DISTANCE_SQ:
+                    continue
+                du = best[0] - polygon[0][0]
+                dv = best[1] - polygon[0][1]
+                if du * du + dv * dv <= FACE_CLIP_MERGE_DISTANCE_SQ:
+                    continue
+            polygon[polygon_count] = best
+            polygon_count += 1
+        return polygon_count
 
     # Counter-clockwise Jarvis march; collinear vertices resolve to the farthest.
     current = start

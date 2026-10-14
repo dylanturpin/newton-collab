@@ -2535,8 +2535,9 @@ class NarrowPhase:
                 hydroelastic contact processing. When omitted, :class:`~newton.CollisionPipeline`
                 supplies the model's table. A supplied table must match that model's shape count and device.
             contact_writer_warp_func: Optional custom contact writer function (first arg: ContactData, second arg: custom struct type)
-            convex_face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's contact
-                patch against the box or plane reference face. Defaults to False.
+            convex_face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's incident
+                face against the box or plane reference face. Selected at construction; experimental.
+                Defaults to False.
             hydroelastic_sdf: Optional SDF hydroelastic instance. Set is_hydroelastic=True on shapes to enable hydroelastic collisions.
             has_meshes: Whether the scene contains any mesh shapes (GeoType.MESH). When False, mesh-related
                 kernel launches are skipped, improving performance for scenes with only primitive shapes.
