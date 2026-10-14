@@ -10,7 +10,7 @@ minimizes its kinetic energy relative to the supports through its world inverse 
 impulse that stops the tangent relative angular velocity when the bound allows, otherwise the
 energy minimizer on the bound, found by a fixed 48-step bisection. For finite inputs with positive-definite
 inertia, static supports never gain kinetic energy in exact arithmetic; a bound below ``MIN_BUDGET_FRACTION``
-of the full-stop impulse, or a non-finite intermediate, leaves the velocity unchanged.
+of the full-stop impulse, or a non-finite impulse, leaves the velocity unchanged.
 
 Sums use fixed-point int64 atomics, so they do not depend on contact order while every sum stays
 below ``2**63 / SUPPORT_LOAD_SCALE``: about 9.2e6 N s of normal impulse, and 9.2e6 N s rad/s of
@@ -206,7 +206,7 @@ def apply_free_rigid_rolling_resistance(
     h = wp.inverse(a) * b
     stop_impulse = wp.length(h)
     if stop_impulse > budget:
-        # A budget below this fraction of the stopping impulse changes nothing representable; skip it.
+        # Skip budgets below this fraction of the stopping impulse to bound the normalized search.
         if budget <= MIN_BUDGET_FRACTION * stop_impulse:
             return
         # The bounded energy minimizer is (a + mu I)^-1 b with |h| = budget; |h| falls as mu grows.
