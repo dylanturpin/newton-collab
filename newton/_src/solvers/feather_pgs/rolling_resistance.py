@@ -8,7 +8,9 @@ load-weighted angular velocity. A single-body free rigid articulation then recei
 impulse ``h`` in the plane tangent to ``n``, with ``|h| <= rolling_resistance * lambda_n``, that
 minimizes its kinetic energy relative to the supports through its world inverse inertia: the
 impulse that stops the tangent relative angular velocity when the bound allows, otherwise the
-energy minimizer on the bound. With static supports this never adds kinetic energy.
+energy minimizer on the bound, found by a fixed 48-step bisection. For finite inputs with positive-definite
+inertia, static supports never gain kinetic energy in exact arithmetic; a bound below ``MIN_BUDGET_FRACTION``
+of the full-stop impulse, or a non-finite intermediate, leaves the velocity unchanged.
 
 Sums use fixed-point int64 atomics, so they do not depend on contact order while every sum stays
 below ``2**63 / SUPPORT_LOAD_SCALE``: about 9.2e6 N s of normal impulse, and 9.2e6 N s rad/s of
@@ -25,6 +27,8 @@ wp.set_module_options({"enable_backward": False})
 # Fixed-point scale of the accumulated sums [counts per N s] and [counts per N s rad/s].
 SUPPORT_LOAD_SCALE = 1.0e12
 SUPPORT_LOAD_FIELDS = 7
+# Bounds below this fraction of the full-stop impulse leave the velocity unchanged.
+MIN_BUDGET_FRACTION = 1.0e-6
 
 
 @wp.func
@@ -200,17 +204,26 @@ def apply_free_rigid_rolling_resistance(
 
     budget = rolling_resistance * normal_impulse
     h = wp.inverse(a) * b
-    if wp.length(h) > budget:
+    stop_impulse = wp.length(h)
+    if stop_impulse > budget:
+        # A budget below this fraction of the stopping impulse changes nothing representable; skip it.
+        if budget <= MIN_BUDGET_FRACTION * stop_impulse:
+            return
         # The bounded energy minimizer is (a + mu I)^-1 b with |h| = budget; |h| falls as mu grows.
+        # Bisect on mu / scale with a / scale, so the bracket stays O(1 / MIN_BUDGET_FRACTION).
+        scale = 0.5 * (a[0, 0] + a[1, 1])
+        unit = a / scale
         low = float(0.0)
-        high = wp.length(b) / budget
+        high = wp.length(b) / (scale * budget)
         for _ in range(48):
             mid = 0.5 * (low + high)
-            if wp.length(_solve_shifted(a, mid, b)) > budget:
+            if wp.length(_solve_shifted(unit, mid, b)) > budget * scale:
                 low = mid
             else:
                 high = mid
-        h = _solve_shifted(a, high, b)
+        h = _solve_shifted(unit, high, b) / scale
+    if not (wp.isfinite(h[0]) and wp.isfinite(h[1])):
+        return
     omega = omega + r1 * h[0] + r2 * h[1]
     joint_qd[ds + 3] = omega[0]
     joint_qd[ds + 4] = omega[1]

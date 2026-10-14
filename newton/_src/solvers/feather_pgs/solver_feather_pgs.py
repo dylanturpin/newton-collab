@@ -1849,7 +1849,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 free rigid articulations resting on static or kinematic shapes. After each solve, such a body
                 receives an angular impulse tangent to the supports' load-weighted normal, bounded by this
                 length times the step's solved normal impulse, that minimizes its kinetic energy relative to
-                the supports; with static supports it never adds energy. It is a post-solve velocity update,
+                the supports (non-increasing with static supports for finite, positive-definite inputs; bounds
+                below a millionth of the stopping impulse are skipped). It is a post-solve velocity update,
                 not a contact row: contacts with dynamic bodies, linear velocity, velocity limits, parent
                 wrenches and contact-force outputs do not see it. Independent of the shape material rolling
                 coefficients and of ``enable_torsional_rolling_friction``. Zero (default) disables it.

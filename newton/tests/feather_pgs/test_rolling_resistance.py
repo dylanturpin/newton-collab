@@ -136,17 +136,18 @@ class TestFreeRigidRollingResistance(unittest.TestCase):
         """Never end a step with more kinetic energy than the same step without resistance (anisotropic body)."""
         inertia = _ANISOTROPIC * 4.0e-5
         spin = {"angular": (1.0, 0.0, -3.0), "inertia": inertia, "steps": 1}
-        _, twist_free, _ = _simulate("sphere", 0.0, **spin)
 
-        def energy(twist):
-            return 0.5 * _MASS * float(twist[:3] @ twist[:3]) + 0.5 * float(twist[3:6] @ inertia @ twist[3:6])
+        def energy(pose, twist):
+            rotation = np.array(wp.quat_to_matrix(wp.quat(*pose[3:7].tolist()))).reshape(3, 3)
+            world_inertia = rotation @ inertia @ rotation.T
+            return 0.5 * _MASS * float(twist[:3] @ twist[:3]) + 0.5 * float(twist[3:6] @ world_inertia @ twist[3:6])
 
+        free = energy(*_simulate("sphere", 0.0, **spin)[:2])
         # A full stop (large length) and a partial clamp (budget below the stopping impulse).
         for resistance in (1.0, 1.0e-3):
             with self.subTest(resistance=resistance):
-                _, twist, _ = _simulate("sphere", 0.0, free_rigid_rolling_resistance=resistance, **spin)
-                self.assertLessEqual(energy(twist), energy(twist_free) * (1.0 + 1.0e-5))
-                self.assertLess(energy(twist), energy(twist_free))
+                resisted = energy(*_simulate("sphere", 0.0, free_rigid_rolling_resistance=resistance, **spin)[:2])
+                self.assertLess(resisted, free)
 
     def test_toppling_spin_and_sliding_cube_are_unchanged(self):
         """Leave a toppling, spinning or sliding cube within 2 mm of the option-off pose."""
@@ -273,6 +274,15 @@ class TestRollingResistanceLaw(unittest.TestCase):
                     self.assertLessEqual(0.5 * out @ inertia @ out, 0.5 * omega @ inertia @ omega * (1.0 + 1.0e-5))
                     self.assertLessEqual(np.linalg.norm(impulse), budget * (1.0 + 1.0e-4))
                     self.assertLess(abs(impulse @ normal), 1.0e-4 * max(budget, 1.0))
+
+    def test_negligible_budget_leaves_velocity_finite_and_unchanged(self):
+        """Skip bounds far below the stopping impulse, including float32-underflowing ones, without NaNs."""
+        for device in self.devices:
+            for budget in (1.0e-39, 1.0e-50, 0.0):
+                for inertia in (np.eye(3), _ANISOTROPIC):
+                    with self.subTest(device=device, budget=budget):
+                        out = self._apply(device, (1.0, 0.0, -3.0), inertia, budget)
+                        np.testing.assert_array_equal(out, np.array([1.0, 0.0, -3.0], dtype=np.float32))
 
     def test_anisotropic_full_stop_zeroes_the_tangent_rate(self):
         """Stop the tangent angular velocity when the budget allows, letting the normal rate follow the inertia."""
