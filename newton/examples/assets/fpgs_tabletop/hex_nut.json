@@ -1,0 +1,310 @@
+{
+  "name": "hex_nut",
+  "family": "tool_studio",
+  "parameters": {
+    "kind": "hex_nut",
+    "metric_size": 8,
+    "source_spec": {
+      "schema": "matched-fastener-1",
+      "diameter": 0.008,
+      "pitch": 0.00125,
+      "key_af": 0.006,
+      "nut_af": 0.013,
+      "head_diameter": 0.013,
+      "head_height": 0.008,
+      "nut_height": 0.0065,
+      "radial_clearance": 8.750000000000001e-05,
+      "drive_clearance": 7.2e-05,
+      "segments": 24,
+      "handedness": "right",
+      "included_flank_angle_deg": 60,
+      "lead": 0.00125,
+      "scope": "Metric-style truncated profile; explicit simulation clearance, not ISO tolerance certification"
+    }
+  },
+  "root": "chrome",
+  "joints": [],
+  "bodies": [
+    {
+      "id": "chrome",
+      "mass": 0.00403643042863295,
+      "com": [
+        -5.328147309022879e-19,
+        -9.324257790790039e-19,
+        0.0024999999999999996
+      ],
+      "inertia": [
+        [
+          6.958893807954438e-08,
+          6.51081614958731e-24,
+          3.7332179696424005e-24
+        ],
+        [
+          6.51081614958731e-24,
+          6.958893807954438e-08,
+          -1.1915416471549044e-10
+        ],
+        [
+          3.7332179696424005e-24,
+          -1.1915416471549044e-10,
+          1.2235941603978473e-07
+        ]
+      ],
+      "home": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "visuals": [
+        {
+          "prefix": "b0_v0",
+          "material": "chrome",
+          "color": [
+            0.42,
+            0.48,
+            0.51
+          ]
+        }
+      ],
+      "collisions": [
+        {
+          "prefix": "macro_b0_c0",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c1",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c2",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c3",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c4",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c5",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c6",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c7",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c8",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c9",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c10",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "prefix": "macro_b0_c11",
+          "kind": "convex",
+          "center": [
+            0,
+            0,
+            0
+          ],
+          "quaternion": [
+            1,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "bounds": [
+        [
+          -0.007505553499465133,
+          -0.006500000000000001,
+          0.0
+        ],
+        [
+          0.007505553499465134,
+          0.0065,
+          0.005
+        ]
+      ]
+    }
+  ],
+  "features": {
+    "fastener_interfaces": {
+      "nut.thread": {
+        "schema": "matched-fastener-1",
+        "diameter": 0.008,
+        "pitch": 0.00125,
+        "key_af": 0.006,
+        "nut_af": 0.013,
+        "head_diameter": 0.013,
+        "head_height": 0.008,
+        "nut_height": 0.0065,
+        "radial_clearance": 8.750000000000001e-05,
+        "drive_clearance": 7.2e-05,
+        "segments": 24,
+        "handedness": "right",
+        "included_flank_angle_deg": 60,
+        "lead": 0.00125,
+        "scope": "Metric-style truncated profile; explicit simulation clearance, not ISO tolerance certification",
+        "internal": true,
+        "length": 0.005
+      }
+    }
+  },
+  "collision_scope": "Macro convex fastener surfaces with open bore/socket; thread microcontacts omitted for bulk handling"
+}
