@@ -2025,6 +2025,7 @@ class TestTorsionSweepLinks(unittest.TestCase):
 class TestMfgsRowCaches(unittest.TestCase):
     """Solve with and without the per-launch friction-pair and row caches and require bitwise equal outputs."""
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cached_solve_matches_uncached(self):
         """Match every fixture output bitwise with the caches selected and disabled, for both metadata modes."""
         options = {**PATCH_OPTIONS, "iterations": 8, "spin": 10.0, "sliding": 1.0}
