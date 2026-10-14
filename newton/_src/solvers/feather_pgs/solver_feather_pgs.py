@@ -1046,10 +1046,14 @@ def _prefetch_streamed_dense_metadata(snippet: str) -> str:
     phase = after_line(phase, "const int init_jy_base = ", loads("dense_lo", " " * 12))
     phase = after_line(phase, "int next_jy_base = ", loads("i + 1", " " * 16))
     phase = _replace_once(phase, "int row_type = world_row_type.data[off_dense + i];", "int row_type = cur_row_type;")
-    phase = phase.replace("world_row_parent.data[off_dense + i]", "cur_row_parent")
-    phase = phase.replace("world_diag.data[off_dense + (i)]", "cur_diag")
-    phase = phase.replace("rhs_bias.data[off_dense + (i)]", "cur_rhs")
-    phase = phase.replace("world_row_w.data[off_dense + i]", "cur_row_w")
+    # Value reads only: an address such as the angular block's &rhs_bias[...] spans several rows.
+    for source, register in (
+        ("world_row_parent.data[off_dense + i]", "cur_row_parent"),
+        ("world_diag.data[off_dense + (i)]", "cur_diag"),
+        ("rhs_bias.data[off_dense + (i)]", "cur_rhs"),
+        ("world_row_w.data[off_dense + i]", "cur_row_w"),
+    ):
+        phase = re.sub(r"(?<!&)" + re.escape(source), register, phase)
     return _replace_once(
         snippet[:start] + phase + snippet[end:],
         "    // Dense pipeline registers\n",
