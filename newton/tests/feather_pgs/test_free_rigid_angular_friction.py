@@ -337,6 +337,65 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             self.assertEqual(angular[3], 0)
             self.assertEqual(angular[6], 1)
 
+    def test_articulated_contacts_group_patches_regardless_of_condim(self):
+        """Group an articulated body's patches as without angular rows: mixed condim matches the condim 3 control."""
+        seen = {}
+        for mixed in (False, True):
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            SolverFeatherPGS.register_custom_attributes(builder)
+            table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
+            builder.add_shape_box(table, hx=1.0, hy=1.0, hz=0.05)
+            # A free sphere elsewhere keeps the matrix-free route, and with it the angular rows, in use.
+            sphere_inertia = wp.mat33(*(np.eye(3) * 0.4 * _MASS * _RADIUS**2).astype(np.float32).ravel())
+            free = builder.add_body(
+                xform=wp.transform((0.5, 0.5, _RADIUS), wp.quat_identity()),
+                mass=_MASS,
+                inertia=sphere_inertia,
+                lock_inertia=True,
+            )
+            builder.add_shape_sphere(free, radius=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+            inertia = wp.mat33(*(np.eye(3) * 1.0e-4).astype(np.float32).ravel())
+            link = builder.add_link(mass=_MASS, inertia=inertia, lock_inertia=True)
+            joint = builder.add_joint_prismatic(
+                -1, link, parent_xform=wp.transform((0.0, 0.0, 0.0201), wp.quat_identity()), axis=newton.Axis.X
+            )
+            builder.add_articulation([joint])
+            for x, condim in ((-0.02, 3), (0.02, 6 if mixed else 3)):
+                builder.add_shape_box(
+                    link,
+                    xform=wp.transform((x, 0.0, 0.0), wp.quat_identity()),
+                    hx=0.02,
+                    hy=0.02,
+                    hz=0.02,
+                    cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu_torsional=0.01, mu_rolling=0.002),
+                    custom_attributes={"feather_pgs:condim": condim},
+                )
+            model = builder.finalize()
+            solver = SolverFeatherPGS(
+                model,
+                solve_mode="matrix_free",
+                iterations=32,
+                friction_anchor_beta=0.2,
+                free_rigid_rolling_friction=0.001 if mixed else None,
+            )
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            for _ in range(3):
+                state_0.clear_forces()
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, _DT)
+                state_0, state_1 = state_1, state_0
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            dense = solver._contact_path.numpy()[:count] == 0
+            seen[mixed] = (
+                solver._contact_slots_needed.numpy()[:count][dense].tolist(),
+                solver._friction_patches.view.weight.numpy()[:count][dense].tolist(),
+                solver._constraint_count.numpy().tolist(),
+            )
+        self.assertTrue(len(seen[False][0]) > 0)
+        self.assertEqual(seen[True], seen[False])
+
     def test_toppling_and_sliding_cube_are_unchanged(self):
         """Leave a toppling or sliding cube within 2 mm of the option-off pose; the spinning cube slows at most."""
         for kwargs in ({"tilt_deg": 40.0}, {"linear": (0.5, 0.0, 0.0)}, {"angular": (0.0, 0.0, 6.0)}):

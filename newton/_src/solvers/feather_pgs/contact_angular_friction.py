@@ -122,6 +122,25 @@ def _shape_condim(model) -> np.ndarray | None:
     return None if attribute is None or not model.shape_count else attribute.numpy()
 
 
+def free_rigid_route_bodies(solver) -> wp.array | None:
+    """Mark the bodies whose contacts can take the matrix-free free-rigid route; ``None`` without angular rows.
+
+    A contact takes that route when each side is a free rigid body or has no response DOFs, as the allocator decides.
+    """
+    if not solver._free_rigid_angular_rows:
+        return None
+    model = solver.model
+    count = max(model.body_count, 1)
+    route = np.zeros(count, dtype=np.int32)
+    if model.body_count and solver._has_free_rigid_bodies:
+        body_art = solver._body_to_articulation.numpy()[: model.body_count]
+        response = solver._articulation_response_dof_count.numpy()
+        free = solver._is_free_rigid.numpy()
+        safe = np.maximum(body_art, 0)
+        route[: model.body_count] = (body_art < 0) | (response[safe] == 0) | (free[safe] != 0)
+    return wp.array(route, dtype=wp.int32, device=model.device)
+
+
 def validate_free_rigid_angular_friction_mode(solver) -> None:
     """Reject solver options whose matrix-free solves do not visit the free-rigid angular rows."""
     if not solver._free_rigid_angular_rows:

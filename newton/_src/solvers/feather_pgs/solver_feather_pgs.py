@@ -58,6 +58,7 @@ from .contact_angular_friction import (
     free_rigid_angular_friction_gs_sources,
     launch_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
+    free_rigid_route_bodies,
     validate_free_rigid_angular_friction_mode,
     launch_angular_friction_rows,
     validate_torsional_rolling_friction_coefficients,
@@ -3554,6 +3555,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 raise ValueError("enable_torsional_rolling_friction requires the fused matrix-free GS solve")
             validate_torsional_rolling_friction_coefficients(self)
         validate_free_rigid_angular_friction_mode(self)
+        self._free_rigid_route_body = free_rigid_route_bodies(self)
 
         # Coupled resets pass the SolverBase mask, shape (model.world_count + 1,); it is
         # translated into this solver-world mask so masked resets stay capturable.
@@ -12392,7 +12394,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     friction_gap_limit=self._friction_gap,
                     frozen_bodies=self._sleeping.patch_frozen_bodies if self._sleeping is not None else None,
                     shape_material_mu=self._shape_mu,
-                    angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling)
+                    angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling, self._free_rigid_route_body)
                     if self._free_rigid_angular_rows
                     else None,
                 )

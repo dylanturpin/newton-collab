@@ -121,6 +121,7 @@ def _prepare(
     angular_enabled: int,
     shape_mu_torsional: wp.array[float],
     shape_mu_rolling: wp.array[float],
+    free_rigid_route_body: wp.array[wp.int32],
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
@@ -196,9 +197,15 @@ def _prepare(
     if sb >= 0:
         mu_b = shape_mu[sb]
     frame.mu[c] = wp.vec2(mu_a, mu_b)
-    # One patch carries one set of angular rows, so its contacts must share the angular coefficients.
+    # One patch carries one set of angular rows, so its free-rigid contacts must share the angular coefficients.
+    # Contacts that cannot take the free-rigid route keep a zero key and group as without angular rows.
     angular = wp.vec2(0.0)
-    if angular_enabled != 0:
+    free_rigid_route = angular_enabled != 0
+    if free_rigid_route and a >= 0:
+        free_rigid_route = free_rigid_route_body[a] != 0
+    if free_rigid_route and b >= 0:
+        free_rigid_route = free_rigid_route_body[b] != 0
+    if free_rigid_route:
         for s in range(2):
             shape = sa
             if s == 1:
@@ -1345,8 +1352,9 @@ class _FrictionPatchState:
     ):
         """Build this step's friction patches.
 
-        ``angular_mu`` is the (torsional, rolling) pair of gated per-shape coefficient arrays [m] when free-rigid
-        angular rows are enabled; contacts then share a patch only if their pair coefficients match.
+        ``angular_mu`` is (torsional, rolling, route) when free-rigid angular rows are enabled: the gated per-shape
+        coefficient arrays [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
+        contacts then share a patch only if their pair coefficients match; other contacts group as before.
         """
         wp.launch(
             _prepare,
@@ -1370,6 +1378,7 @@ class _FrictionPatchState:
                 int(angular_mu is not None),
                 angular_mu[0] if angular_mu is not None else model.shape_gap,
                 angular_mu[1] if angular_mu is not None else model.shape_gap,
+                angular_mu[2] if angular_mu is not None else self._no_frozen_bodies,
                 self.current,
                 self.view,
             ],
