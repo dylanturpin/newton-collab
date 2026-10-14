@@ -243,7 +243,7 @@ from .kernels import (
     warmstart_dt_scale,
     zero_unattached_parent_wrenches,
 )
-from .rolling_resistance import accumulate_support_load, apply_free_root_rolling_resistance
+from .rolling_resistance import SUPPORT_LOAD_FIELDS, accumulate_support_load, apply_free_root_rolling_resistance
 from .sleeping import _SleepState
 from .sparse_contact import (
     _get_sparse_contact_response_kernel,
@@ -1742,7 +1742,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
         torsional_rolling_friction_creep_speed: float = 0.0,
         free_rigid_rolling_resistance: float = 0.0,
-        free_rigid_rolling_damping: float = 0.0,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
         enable_sleeping: bool = False,
@@ -1846,11 +1845,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 torsional/rolling stiction: below the bound, the coefficient times the relative angular
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
                 of mass. Zero sticks rigidly. Construction-only.
-            free_rigid_rolling_resistance: Experimental Coulomb rolling-resistance lever arm [m] for free
-                root bodies on static or kinematic shapes, applied to the angular velocity after the solve
-                and bounded by this times the solved normal impulse. Zero disables it.
-            free_rigid_rolling_damping: Experimental viscous rate [1/s] on the same rolling axes while
-                the body rests on a static or kinematic shape. Zero disables it.
+            free_rigid_rolling_resistance: Experimental Coulomb rolling-resistance length [m] for free
+                articulation roots resting on static or kinematic shapes. After each solve, the root's angular
+                velocity relative to those supports, about the axes tangent to their load-weighted normal,
+                loses at most this length times the step's solved normal impulse of angular momentum. Contacts
+                with dynamic bodies, spin about the normal and linear velocity are unaffected. Independent of
+                the shape material rolling coefficients and of ``enable_torsional_rolling_friction``. Zero
+                (default) disables it. Construction-only; requires ``velocity_iterations=0``.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -2274,12 +2275,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         _validate_equality_constraints(model)
         _validate_tree_joints_enabled(model)
 
-        # Experimental: see rolling_resistance.py.
         self._free_rigid_rolling_resistance = float(free_rigid_rolling_resistance)
-        self._free_rigid_rolling_damping = float(free_rigid_rolling_damping)
-        if not (self._free_rigid_rolling_resistance >= 0.0 and self._free_rigid_rolling_damping >= 0.0):
-            raise ValueError("free_rigid_rolling_resistance and free_rigid_rolling_damping must be non-negative")
-        self._rolling_load = None
+        if not (math.isfinite(self._free_rigid_rolling_resistance) and self._free_rigid_rolling_resistance >= 0.0):
+            raise ValueError("free_rigid_rolling_resistance must be finite and non-negative [m]")
+        self._rolling_support_load = None
+        if self._free_rigid_rolling_resistance > 0.0:
+            self._rolling_support_load = wp.zeros(
+                (max(model.body_count, 1), SUPPORT_LOAD_FIELDS), dtype=wp.int64, device=model.device
+            )
         # Stand-in for models without the physx angular damping attribute.
         self._default_angular_damping = wp.full(
             max(model.body_count, 1), _DEFAULT_ANGULAR_DAMPING, dtype=wp.float32, device=model.device
@@ -2496,6 +2499,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if solve_mode not in ("split", "matrix_free"):
             raise ValueError(f"solve_mode must be 'split' or 'matrix_free', got {solve_mode!r}")
         self._solve_mode = solve_mode
+        if self._rolling_support_load is not None and self._solve_mode == "matrix_free" and self._velocity_iterations:
+            raise NotImplementedError("free_rigid_rolling_resistance requires velocity_iterations=0")
         if self._enable_joint_velocity_limits and self._solve_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires solve_mode='matrix_free'")
         if model.requires_grad:
@@ -10079,7 +10084,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._stage6b_mf_pgs(state_aug, dt)
 
         self._stage6_clamp_rigid_velocity_limits()
-        self._accumulate_rolling_support_load(contacts)
+        self._accumulate_rolling_support_load(state_in, contacts)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
@@ -14162,26 +14167,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
 
             self._compute_parent_wrenches(state_in, state_aug, dt)
-            self._apply_free_root_rolling_resistance(state_out, dt)
+            self._apply_free_root_rolling_resistance(state_out)
             self._stage7_update_kinematics(state_out, state_aug)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
-    def _rolling_resistance_enabled(self) -> bool:
-        return self._free_rigid_rolling_resistance > 0.0 or self._free_rigid_rolling_damping > 0.0
-
-    def _accumulate_rolling_support_load(self, contacts: Contacts | None) -> None:
-        """Sum this step's solved normal impulses from static/kinematic supports per body."""
-        if not self._rolling_resistance_enabled() or not self._has_root_free:
+    def _accumulate_rolling_support_load(self, state_in: State, contacts: Contacts | None) -> None:
+        """Sum this step's solved normal impulses from static or kinematic supports per body."""
+        if self._rolling_support_load is None or not self._has_root_free:
             return
-        if self._solve_mode == "matrix_free" and self._velocity_iterations > 0:
-            raise ValueError("free-rigid rolling resistance requires velocity_iterations=0 in matrix_free mode")
-        model = self.model
-        if self._rolling_load is None:
-            self._rolling_load = wp.zeros((max(model.body_count, 1), 4), dtype=wp.int64, device=model.device)
-        self._rolling_load.zero_()
+        self._rolling_support_load.zero_()
         if contacts is None or contacts.rigid_contact_count is None or not contacts.rigid_contact_max:
             return
+        model = self.model
         wp.launch(
             accumulate_support_load,
             dim=contacts.rigid_contact_max,
@@ -14191,14 +14189,16 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 contacts.rigid_contact_shape1,
                 model.shape_body,
                 model.body_flags,
+                state_in.body_qd,
+                # The force inputs without inv_dt, read as impulses.
                 *self._contact_force_inputs(contacts, 1.0)[1:-1],
             ],
-            outputs=[self._rolling_load],
+            outputs=[self._rolling_support_load],
             device=model.device,
         )
 
-    def _apply_free_root_rolling_resistance(self, state_out: State, dt: float) -> None:
-        if not self._rolling_resistance_enabled() or not self._has_root_free or self._rolling_load is None:
+    def _apply_free_root_rolling_resistance(self, state_out: State) -> None:
+        if self._rolling_support_load is None or not self._has_root_free:
             return
         model = self.model
         wp.launch(
@@ -14208,16 +14208,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 model.articulation_start,
                 model.joint_child,
                 model.joint_q_start,
+                model.joint_X_p,
                 model.joint_X_c,
                 model.body_flags,
                 model.body_inertia,
                 self._articulation_root_is_free,
                 self._articulation_root_dof_start,
                 self._dynamics_art_active,
-                self._rolling_load,
+                self._rolling_support_load,
                 self._free_rigid_rolling_resistance,
-                self._free_rigid_rolling_damping,
-                dt,
                 state_out.joint_q,
             ],
             outputs=[state_out.joint_qd],
