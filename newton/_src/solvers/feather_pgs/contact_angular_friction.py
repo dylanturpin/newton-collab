@@ -739,6 +739,19 @@ def free_rigid_angular_friction_gs_sources() -> list[tuple[str, str]]:
     angular = f"(mf_rt == {rolling} || mf_rt == {spin})"
     return [
         (
+            "        for (int i = 0; i < mf_contact_end; i++) {",
+            "        // The pooled normal load of the anchor whose sliding pair this sweep visited last.\n"
+            "        int angular_load_parent = -1;\n"
+            "        float angular_load = 0.0f;\n"
+            "        for (int i = 0; i < mf_contact_end; i++) {",
+        ),
+        (
+            "                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);",
+            "                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);\n"
+            "                angular_load_parent = parent;\n"
+            "                angular_load = lambda_n;",
+        ),
+        (
             "            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;",
             f"            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2 && !{angular}) continue;",
         ),
@@ -766,9 +779,13 @@ def free_rigid_angular_friction_gs_sources() -> list[tuple[str, str]]:
 _ANGULAR_PRECHECK = """            float angular_radius = 0.0f;
             if (__ANGULAR__) {
                 int parent = packed_tp >> 16;
-                float lambda_n = s_lam_mf[parent];
-                for (int patch_row = (mf_meta.data[off_meta + parent * 4 + 3] >> 16); patch_row >= 0 && patch_row != parent; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                    lambda_n += s_lam_mf[patch_row];
+                // The contact's own sliding pair, visited just before in this sweep, pooled the same normals.
+                float lambda_n = angular_load;
+                if (parent != angular_load_parent) {
+                    lambda_n = s_lam_mf[parent];
+                    for (int patch_row = (mf_meta.data[off_meta + parent * 4 + 3] >> 16); patch_row >= 0 && patch_row != parent; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                        lambda_n += s_lam_mf[patch_row];
+                }
                 angular_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                 // A zero bound with no carried impulse cannot change velocity.
                 if (angular_radius == 0.0f && s_lam_mf[i] == 0.0f && (mf_rt != __ROLLING_TYPE__ || s_lam_mf[i + 1] == 0.0f))
