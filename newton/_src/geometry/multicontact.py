@@ -44,6 +44,8 @@ FACE_CLIP_PATCH_CAPACITY = wp.constant(16)
 FACE_CLIP_DIRECTION_STEP = wp.constant(2.0 * math.pi / 16.0)
 # Face capacity plus one vertex per clip plane (four side planes and the contact gap).
 FACE_CLIP_POLYGON_CAPACITY = 21
+# Smallest incident-plane normal component along the reference normal for which face depths are flattened.
+FACE_CLIP_MIN_PLANE_DEPTH_SLOPE = wp.constant(1.0e-3)
 # Hull vertices within this distance [m] of the incident face plane belong to the face.
 FACE_CLIP_COPLANAR_DISTANCE = wp.constant(1.0e-5)
 # Patch points closer than this [m] are merged.
@@ -718,8 +720,10 @@ def face_clip_incident_face(
     offset: wp.vec3,
     face_vertices: wp.array[wp.vec3],
     polygon: wp.array[wp.vec3],
-) -> int:
-    """Write the hull's incident face as a convex (u, v, depth) polygon and return its vertex count.
+):
+    """Write the hull's incident face as a convex (u, v, depth) polygon.
+
+    Returns the vertex count and the incident plane's normal and a point on it, in (u, v, depth) coordinates.
 
     The incident face is the hull face through the deepest vertex most anti-parallel to the reference
     face, together with its coplanar vertices. Axes are in the hull's frame; ``offset`` holds the hull
@@ -752,6 +756,13 @@ def face_clip_incident_face(
         if alignment > best_alignment:
             best_alignment = alignment
             plane_normal = n / length
+
+    plane_uvd_normal = wp.vec3(
+        wp.dot(plane_normal, axis_u), wp.dot(plane_normal, axis_v), wp.dot(plane_normal, face_normal)
+    )
+    plane_uvd_point = (
+        wp.vec3(wp.dot(plane_point, axis_u), wp.dot(plane_point, axis_v), wp.dot(plane_point, face_normal)) + offset
+    )
 
     face_count = int(0)
     start = wp.vec3(0.0)
@@ -801,7 +812,7 @@ def face_clip_incident_face(
                     continue
             polygon[polygon_count] = best
             polygon_count += 1
-        return polygon_count
+        return polygon_count, plane_uvd_normal, plane_uvd_point
 
     # Counter-clockwise Jarvis march; collinear vertices resolve to the farthest.
     current = start
@@ -835,16 +846,36 @@ def face_clip_incident_face(
         if du_start * du_start + dv_start * dv_start <= FACE_CLIP_MERGE_DISTANCE_SQ:
             break
         current = next_point
-    return polygon_count
+    return polygon_count, plane_uvd_normal, plane_uvd_point
 
 
 @wp.func
 def face_clip_side(
-    src: wp.array[wp.vec3], src_count: int, dst: wp.array[wp.vec3], coordinate: int, sign: float, limit: float
+    src: wp.array[wp.vec3],
+    src_count: int,
+    dst: wp.array[wp.vec3],
+    coordinate: int,
+    sign: float,
+    limit: float,
 ) -> int:
-    """Sutherland-Hodgman clip of a (u, v, depth) polygon to ``sign * p[coordinate] <= limit``."""
-    if src_count == 0:
-        return 0
+    """Sutherland-Hodgman clip of a (u, v, depth) polygon to ``sign * p[coordinate] <= limit``.
+
+    Returns -1 without writing when the result would exceed ``dst``'s capacity.
+    """
+    if src_count <= 0:
+        return src_count
+    # Each kept vertex and each sign change emits one point; count them before writing.
+    required = int(0)
+    prev_dist = sign * src[src_count - 1][coordinate] - limit
+    for i in range(src_count):
+        cur_dist = sign * src[i][coordinate] - limit
+        if (cur_dist <= 0.0) != (prev_dist <= 0.0):
+            required += 1
+        if cur_dist <= 0.0:
+            required += 1
+        prev_dist = cur_dist
+    if required > dst.shape[0]:
+        return -1
     dst_count = int(0)
     prev = src[src_count - 1]
     prev_dist = sign * prev[coordinate] - limit
@@ -1029,7 +1060,7 @@ def create_build_manifold(
         mesh = wp.mesh_get(unpack_mesh_ptr(geom_b.auxiliary))
         polygon = wp.zeros(shape=(FACE_CLIP_POLYGON_CAPACITY,), dtype=wp.vec3f)
         scratch = wp.zeros(shape=(FACE_CLIP_POLYGON_CAPACITY,), dtype=wp.vec3f)
-        count = face_clip_incident_face(
+        count, plane_normal, plane_point = face_clip_incident_face(
             mesh.points,
             mesh.indices,
             geom_b.scale,
@@ -1044,7 +1075,26 @@ def create_build_manifold(
         count = face_clip_side(scratch, count, polygon, 0, -1.0, half_u)
         count = face_clip_side(polygon, count, scratch, 1, 1.0, half_v)
         count = face_clip_side(scratch, count, polygon, 1, -1.0, half_v)
-        count = face_clip_side(polygon, count, scratch, 2, 1.0, depth_max)
+        if count < 0:
+            return 0
+        clipped_count = face_clip_side(polygon, count, scratch, 2, 1.0, depth_max)
+        if clipped_count < 0:
+            # Face vertices lie within the coplanarity tolerance, so their depths can cross the gap plane many
+            # times; flattening them onto the incident plane makes the depth clip add at most one vertex.
+            if wp.abs(plane_normal[2]) <= FACE_CLIP_MIN_PLANE_DEPTH_SLOPE:
+                return 0
+            for i in range(count):
+                p = polygon[i]
+                depth = (
+                    plane_point[2]
+                    - (plane_normal[0] * (p[0] - plane_point[0]) + plane_normal[1] * (p[1] - plane_point[1]))
+                    / plane_normal[2]
+                )
+                polygon[i] = wp.vec3(p[0], p[1], depth)
+            clipped_count = face_clip_side(polygon, count, scratch, 2, 1.0, depth_max)
+            if clipped_count < 0:
+                return 0
+        count = clipped_count
 
         # Reduce to the deepest point, the farthest point, then the largest triangle and quadrilateral.
         chosen = wp.zeros(shape=(4,), dtype=wp.vec3f)

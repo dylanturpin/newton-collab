@@ -3,6 +3,8 @@
 
 """Tests for convex-mesh manifolds clipped against a box or plane reference face."""
 
+import subprocess
+import sys
 import unittest
 
 import numpy as np
@@ -51,6 +53,43 @@ def _prism(sides, first_side=0):
         a, b = order[i], order[(i + 1) % sides]
         faces += [[a, b, sides + b], [a, sides + b, sides + a]]
     return vertices, np.asarray(faces, dtype=np.int32).reshape(-1)
+
+
+def _ring_hull(sides, ring_height, jitters, phase=0.0):
+    """Return a two-ring convex hull whose bottom ring heights deviate by ``jitters`` [m] from ``ring_height``."""
+    angles = 2.0 * np.pi * np.arange(sides) / sides + phase
+    bottom = np.stack([0.02 * np.cos(angles), 0.02 * np.sin(angles), ring_height + np.asarray(jitters)], axis=1)
+    top = np.stack([0.02 * np.cos(angles), 0.02 * np.sin(angles), np.full(sides, 0.02)], axis=1)
+    return _hull(np.vstack([bottom, top]))
+
+
+def _ring_scene_hulls():
+    """Return the alternating-height hull from review plus seeded rings with random sub-tolerance bottom heights."""
+    hulls = [_ring_hull(16, 0.003, 4.0e-6 * np.where(np.arange(16) % 2, 1.0, -1.0))]
+    rng = np.random.default_rng(7)
+    for sides in (8, 12, 16, 20, 24, 32, 40, 48):
+        for _ in range(2):
+            hulls.append(_ring_hull(sides, 0.003, rng.uniform(-4.5e-6, 4.5e-6, sides), rng.uniform(0.0, 2.0 * np.pi)))
+    return hulls
+
+
+def _check_ring_scene(test, device):
+    """Check that rings whose bottom heights straddle the contact gap within tolerance keep bounded manifolds."""
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(gap=SHAPE_GAP)
+    builder.add_ground_plane(cfg=cfg)
+    hull_shapes = []
+    for k, (vertices, indices) in enumerate(_ring_scene_hulls()):
+        body = builder.add_body(xform=wp.transform((0.1 * k, 0.0, 0.0), wp.quat_identity()))
+        hull_shapes.append(builder.add_shape_convex_hull(body, mesh=newton.Mesh(vertices, indices), cfg=cfg))
+    model = builder.finalize(device=device)
+    shape0, shape1, _, point1, normal, _, _ = _raw_contacts(model, True)
+    for shape in hull_shapes:
+        rows = (shape0 == shape) | (shape1 == shape)
+        assert 3 <= rows.sum() <= 4, (shape, int(rows.sum()))
+        np.testing.assert_allclose(normal[rows], np.tile([0.0, 0.0, 1.0], (int(rows.sum()), 1)), atol=1.0e-5)
+        span = np.ptp(point1[rows, :2], axis=0)
+        assert span.min() > 0.02, (shape, span)
 
 
 def _quat_from_euler_deg(rx, ry, rz):
@@ -218,6 +257,27 @@ def test_many_sided_face_spans_footprint(test, device):
             np.testing.assert_allclose(points, contact_sets[0], atol=1.0e-6)
 
 
+def test_non_planar_face_stays_within_capacity(test, device):
+    """Check that faces with heights inside the coplanarity tolerance keep 3 to 4 spanning contacts."""
+    _check_ring_scene(test, device)
+
+
+def test_non_planar_face_clip_is_bounds_checked(test, device):
+    """Check that the non-planar ring scene runs on CPU with Warp's array bounds checks enabled."""
+    script = (
+        "import warp as wp\n"
+        "wp.config.mode = 'debug'\n"
+        "from newton.tests import test_convex_face_clip as t\n"
+        "t._check_ring_scene(None, 'cpu')\n"
+        "print('RING_SCENE_OK', flush=True)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200, check=False)
+    output = result.stdout + result.stderr
+    test.assertEqual(result.returncode, 0, output[-4000:])
+    test.assertIn("RING_SCENE_OK", result.stdout)
+    test.assertNotIn("Assertion failed", output)
+
+
 def test_face_clip_leaves_other_pairs_unchanged(test, device):
     """Check that pairs other than box/plane versus convex mesh are bitwise unchanged by the flag."""
     hull_vertices, hull_indices = _rounded_hull((0.012, 0.009, 0.008), 12, 7)
@@ -346,6 +406,18 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestConvexFaceClip, "test_face_clip_deterministic", test_face_clip_deterministic, devices=devices)
+add_function_test(
+    TestConvexFaceClip,
+    "test_non_planar_face_stays_within_capacity",
+    test_non_planar_face_stays_within_capacity,
+    devices=devices,
+)
+add_function_test(
+    TestConvexFaceClip,
+    "test_non_planar_face_clip_is_bounds_checked",
+    test_non_planar_face_clip_is_bounds_checked,
+    devices=["cpu"],
+)
 add_function_test(TestConvexFaceClip, "test_rounded_hull_settles", test_rounded_hull_settles, devices=cuda_devices)
 
 
