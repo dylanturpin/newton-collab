@@ -1,0 +1,1 @@
+Add `friction_history_compact` and `friction_locations_max` to `SolverFeatherPGS`: carry the friction-anchor history as a packed table of the live friction locations instead of a mirror of the whole contact frame, with the same results, less memory and a cheaper per-step store; `friction_history_status()` reports the table's high-water mark and dropped records.
