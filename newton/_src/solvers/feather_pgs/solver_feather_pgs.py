@@ -1009,6 +1009,56 @@ def _replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new)
 
 
+def _prefetch_streamed_dense_metadata(snippet: str) -> str:
+    """Load row i+1's streamed metadata with its prefetched J/Y rows in the MF-GS dense loop.
+
+    The dense rows form a serial chain, so each row otherwise waits on these global loads.
+    The arrays are read-only in the kernel, so every read sees the same value.
+    """
+
+    def loads(row: str, indent: str) -> str:
+        return "".join(
+            f"{indent}{line}\n"
+            for line in (
+                f"pre_row_type = world_row_type.data[off_dense + {row}];",
+                f"pre_row_parent = world_row_parent.data[off_dense + {row}];",
+                f"pre_diag = world_diag.data[off_dense + {row}];",
+                f"pre_rhs = rhs_bias.data[off_dense + {row}];",
+                f"pre_row_w = regularize ? world_row_w.data[off_dense + {row}] : 1.0f;",
+            )
+        )
+
+    def after_line(source: str, prefix: str, text: str) -> str:
+        if source.count(prefix) != 1:
+            raise RuntimeError(f"Expected one generated-source fragment: {prefix.strip()!r}")
+        line_end = source.index("\n", source.index(prefix)) + 1
+        return source[:line_end] + text + source[line_end:]
+
+    start = snippet.index("// ── Phase 1: Dense constraints")
+    end = snippet.index("// ── Phase 2: MF constraints")
+    phase = snippet[start:end]
+    phase = after_line(
+        phase,
+        "// Consume prefetched J/Y for constraint i",
+        "            const int cur_row_type = pre_row_type, cur_row_parent = pre_row_parent;\n"
+        "            const float cur_diag = pre_diag, cur_rhs = pre_rhs, cur_row_w = pre_row_w;\n",
+    )
+    phase = after_line(phase, "const int init_jy_base = ", loads("dense_lo", " " * 12))
+    phase = after_line(phase, "int next_jy_base = ", loads("i + 1", " " * 16))
+    phase = _replace_once(phase, "int row_type = world_row_type.data[off_dense + i];", "int row_type = cur_row_type;")
+    phase = phase.replace("world_row_parent.data[off_dense + i]", "cur_row_parent")
+    phase = phase.replace("world_diag.data[off_dense + (i)]", "cur_diag")
+    phase = phase.replace("rhs_bias.data[off_dense + (i)]", "cur_rhs")
+    phase = phase.replace("world_row_w.data[off_dense + i]", "cur_row_w")
+    return _replace_once(
+        snippet[:start] + phase + snippet[end:],
+        "    // Dense pipeline registers\n",
+        "    // Dense pipeline registers\n"
+        "    int pre_row_type = 0, pre_row_parent = -1;\n"
+        "    float pre_diag = 0.0f, pre_rhs = 0.0f, pre_row_w = 1.0f;\n",
+    )
+
+
 def _validate_dense_metadata_encoding(max_constraints: int) -> None:
     """Validate packed dense-row metadata against its signed 32-bit layout."""
     if PGS_CONSTRAINT_TYPE_COUNT > _DENSE_META_ROW_TYPE_MASK + 1:
@@ -25789,7 +25839,10 @@ def _get_pgs_solve_mf_gs_kernel(
     dense_velocity_limit_phase = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
-            for (int i = 0; i < m_dense; i++) {{
+            // Velocity-limit rows occupy the [bounds[0], bounds[1]) slot segment.
+            const int vlim_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            const int vlim_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+            for (int i = vlim_lo; i < vlim_hi; i++) {{
                 if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
                 float denom = s_diag_dense[i];
                 if (denom <= 0.0f) continue;
@@ -26386,6 +26439,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 "MF-GS shared-memory diet failed to stream s_meta_dense; "
                 "the generated snippet still references the resident array"
             )
+        snippet = _prefetch_streamed_dense_metadata(snippet)
 
     # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
     # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
