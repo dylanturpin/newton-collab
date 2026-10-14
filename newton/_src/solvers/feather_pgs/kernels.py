@@ -1956,6 +1956,12 @@ def subtract_arrays(a: wp.array[float], b: wp.array[float], out: wp.array[float]
 
 
 @wp.func
+def _add_torque(body: int, torque: wp.vec3, body_wrench: wp.array[wp.spatial_vector]):
+    if body >= 0:
+        wp.atomic_add(body_wrench, body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque))
+
+
+@wp.func
 def _add_point_force(
     body: int,
     force: wp.vec3,
@@ -2158,6 +2164,8 @@ def accumulate_connect_wrenches_from_impulses(
     connect_body_p: wp.array[wp.int32],
     connect_body_c: wp.array[wp.int32],
     connect_joint: wp.array[wp.int32],
+    connect_rows: wp.array[wp.int32],
+    connect_axis: wp.array[wp.vec3],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     connect_row_inv_norm: wp.array2d[float],
@@ -2174,8 +2182,9 @@ def accumulate_connect_wrenches_from_impulses(
 ):
     """Add each loop closure's solved point-coincidence force to its parent and child bodies.
 
-    The rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse maps
-    back to a force along ``e_k`` at each anchor.
+    The point rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse
+    maps back to a force along ``e_k`` at each anchor; a REVOLUTE closure's two axis rows map back to an equal and
+    opposite torque about their direction.
     """
     k = wp.tid()
     base_slot = connect_slot[k]
@@ -2202,6 +2211,22 @@ def accumulate_connect_wrenches_from_impulses(
         force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
         _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
         _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
+    if connect_rows[k] < 5:
+        return
+    _a_p, _a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, connect_axis[k], joint_X_p, joint_X_c, body_q)
+    for i in range(2):
+        slot = base_slot + 3 + i
+        if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
+            continue
+        inv_norm = connect_row_inv_norm[k, 3 + i]
+        if inv_norm == 0.0:
+            continue
+        e = e1
+        if i == 1:
+            e = e2
+        torque = e * (world_impulses[world, slot] * inv_dt * inv_norm)
+        _add_torque(body_p, torque, body_contact_wrench)
+        _add_torque(body_c, -torque, body_contact_wrench)
 
 
 @wp.kernel
@@ -4114,6 +4139,7 @@ def invalidate_fk_id_cache_for_articulations(
 @wp.kernel
 def allocate_connect_slots(
     connect_joint: wp.array[int],
+    connect_rows: wp.array[int],
     joint_enabled: wp.array[bool],
     connect_world: wp.array[int],
     max_constraints: int,
@@ -4123,18 +4149,50 @@ def allocate_connect_slots(
     row_slot_mode: int,
     element_row_cursor: wp.array[int],
 ):
-    """Allocate three consecutive dense slots per loop closure enabled in ``Model.joint_enabled``.
+    """Allocate consecutive dense slots per loop closure enabled in ``Model.joint_enabled``.
 
-    Launched with ``dim = n_connect``. If the buffer cannot hold all three rows the
-    closure is dropped whole (``connect_slot = -1``) rather than partially enforced.
+    Launched with ``dim = n_connect``. A BALL closure takes three rows, a REVOLUTE
+    closure five (``connect_rows``). If the buffer cannot hold all of them the closure
+    is dropped whole (``connect_slot = -1``) rather than partially enforced.
     """
     k = wp.tid()
     connect_slot[k] = -1
     if not joint_enabled[connect_joint[k]]:
         return
-    slot = reserve_world_rows(row_slot_mode, world_slot_counter, connect_world[k], 3, element_row_cursor, k)
-    if slot + 2 < max_constraints:
+    rows = connect_rows[k]
+    slot = reserve_world_rows(row_slot_mode, world_slot_counter, connect_world[k], rows, element_row_cursor, k)
+    if slot + rows - 1 < max_constraints:
         connect_slot[k] = slot
+
+
+@wp.func
+def _connect_hinge_frame(
+    body_p: int,
+    body_c: int,
+    joint: int,
+    axis_local: wp.vec3,
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+):
+    """World hinge axis of a REVOLUTE closure seen from its parent and child anchor frames.
+
+    Returns ``(a_p, a_c, e1, e2)``: the hinge axis carried by the parent anchor frame, the
+    same local axis carried by the child anchor frame, and two unit directions
+    perpendicular to ``a_p`` (the parent frame's images of a fixed orthonormal pair built
+    around the local axis), which are the two rotations a hinge must forbid.
+    """
+    q_p = wp.transform_get_rotation(joint_X_p[joint])
+    if body_p >= 0:
+        q_p = wp.transform_get_rotation(body_q[body_p]) * q_p
+    q_c = wp.transform_get_rotation(body_q[body_c]) * wp.transform_get_rotation(joint_X_c[joint])
+    u = wp.normalize(axis_local)
+    helper = wp.vec3(0.0, 0.0, 1.0)
+    if wp.abs(u[2]) > 0.9:
+        helper = wp.vec3(1.0, 0.0, 0.0)
+    t1 = wp.normalize(wp.cross(u, helper))
+    t2 = wp.cross(u, t1)
+    return wp.quat_rotate(q_p, u), wp.quat_rotate(q_c, u), wp.quat_rotate(q_p, t1), wp.quat_rotate(q_p, t2)
 
 
 @wp.kernel
@@ -4148,6 +4206,8 @@ def populate_connect_J_for_size(
     connect_joint: wp.array[int],
     connect_body_p: wp.array[int],
     connect_body_c: wp.array[int],
+    connect_rows: wp.array[int],
+    connect_axis: wp.array[wp.vec3],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     connect_parent_prescribed: wp.array[int],
@@ -4173,6 +4233,13 @@ def populate_connect_J_for_size(
     connect_row_inv_norm: wp.array2d[float],
 ):
     """Populate Jacobian and metadata for connect (loop-closure) rows.
+
+    A BALL closure contributes the three point rows below. A REVOLUTE closure adds two
+    axis-alignment rows, ``J = e_i . (omega_parent - omega_child)`` for the two
+    directions ``e_i`` perpendicular to the hinge axis, with position error
+    ``phi_i = e_i . (a_child x a_parent)`` (the small rotation that would realign the
+    child's hinge axis onto the parent's). Those rows are pure couples, so they need no
+    shared anchor.
 
     Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
     (small) closure table and, for closures belonging to its articulation, writes three
@@ -4299,6 +4366,77 @@ def populate_connect_J_for_size(
             world_row_cfm[world, slot] = pgs_cfm
             world_phi[world, slot] = phi_axis
             world_target_velocity[world, slot] = target
+        if connect_rows[k] < 5:
+            continue
+        # REVOLUTE closure: two axis-alignment rows, pure couples about e1 / e2.
+        a_p, a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, connect_axis[k], joint_X_p, joint_X_c, body_q)
+        misalign = wp.cross(a_c, a_p)
+        omega_a = wp.vec3(0.0, 0.0, 0.0)
+        if prescribed and body_p >= 0:
+            omega_a = wp.spatial_bottom(body_qd[body_p])
+        for i in range(2):
+            slot = base_slot + 3 + i
+            e = e1
+            if i == 1:
+                e = e2
+            for d in range(n_dofs):
+                J_group[group_idx, slot, d] = 0.0
+            target = float(0.0)
+            if prescribed:
+                target = -wp.dot(e, omega_a)
+            else:
+                accumulate_angular_jacobian_row_world(
+                    body_p,
+                    1.0,
+                    e,
+                    body_to_joint,
+                    joint_ancestor,
+                    joint_qd_start,
+                    joint_S_s,
+                    dof_start,
+                    n_dofs,
+                    group_idx,
+                    slot,
+                    J_group,
+                )
+            accumulate_angular_jacobian_row_world(
+                body_c,
+                -1.0,
+                e,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start,
+                n_dofs,
+                group_idx,
+                slot,
+                J_group,
+            )
+            norm_sq = float(0.0)
+            for d in range(n_dofs):
+                norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
+            phi_axis = wp.dot(e, misalign)
+            inv_norm = float(0.0)
+            if norm_sq > 1.0e-8:
+                inv_norm = 1.0 / wp.sqrt(norm_sq)
+                for d in range(n_dofs):
+                    J_group[group_idx, slot, d] *= inv_norm
+                phi_axis *= inv_norm
+                target *= inv_norm
+            else:
+                for d in range(n_dofs):
+                    J_group[group_idx, slot, d] = 0.0
+                phi_axis = 0.0
+                target = 0.0
+            connect_row_inv_norm[k, 3 + i] = inv_norm
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_row_beta[world, slot] = pgs_beta
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = phi_axis
+            world_target_velocity[world, slot] = target
 
 
 # =============================================================================
@@ -4358,6 +4496,7 @@ def preelim_setup_for_size(
     n_mimic: int,
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
+    connect_rows: wp.array[int],
     n_connect: int,
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
@@ -4398,7 +4537,7 @@ def preelim_setup_for_size(
                 n += 1
     for k in range(n_connect):
         if connect_art[k] == art and connect_slot[k] >= 0:
-            for a in range(3):
+            for a in range(connect_rows[k]):
                 if n < PREELIM_MAX_ROWS:
                     preelim_slots[base + n] = connect_slot[k] + a
                     n += 1

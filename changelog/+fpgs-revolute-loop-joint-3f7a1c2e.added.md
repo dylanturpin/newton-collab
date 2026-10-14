@@ -1,0 +1,1 @@
+Added REVOLUTE loop-closing joints to SolverFeatherPGS: a revolute joint outside its articulation now contributes five CONNECT rows (the three shared-anchor point rows plus two hinge-axis alignment rows) instead of being ignored, so spatial closed loops such as the ankle linkages of the Disney Research legs keep their hinge axis; BALL closures are unchanged.

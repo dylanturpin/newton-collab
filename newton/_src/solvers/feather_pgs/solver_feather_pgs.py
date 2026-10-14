@@ -2728,7 +2728,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._init_joint_friction_check(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
-                "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
+                "SolverFeatherPGS: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
                 f"only supported with articulated_contact_response='immediate' "
                 f"(got {self._articulated_contact_response!r})."
             )
@@ -4570,11 +4570,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing BALL joints are excluded from FK/ID by
-        :meth:`_FeatherPGSModelPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. Their stored owner comes from
-        the child body's tree articulation, independent of joint ordering. FIXED (weld)
-        loop joints warn and are ignored for now. All buffers are allocated once
+        Loop-closing BALL and REVOLUTE joints are excluded from FK/ID by
+        :meth:`_FeatherPGSModelPlan.build` and enforced here as bilateral rows: three
+        pinning the joint's parent/child anchors together, plus, for a REVOLUTE closure,
+        two aligning the child's hinge axis with the parent's. Their stored owner comes
+        from the child body's tree articulation, independent of joint ordering. FIXED
+        (weld) loop joints warn and are ignored for now. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
         :attr:`~newton.Model.joint_enabled` and the translations of its
         :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step.
@@ -4594,18 +4595,24 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         joint_type = model.joint_type.numpy()
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+        joint_axis = model.joint_axis.numpy() if model.joint_axis is not None else None
         articulation_world = self._model_plan.articulation_world
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
 
-        art_l, body_p, body_c, world_l, joint_l, prescribed_l = [], [], [], [], [], []
+        art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l, axis_l = [], [], [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
-            if int(joint_type[j]) != int(JointType.BALL):
+            if int(joint_type[j]) == int(JointType.BALL):
+                rows, axis = 3, (0.0, 0.0, 0.0)
+            elif int(joint_type[j]) == int(JointType.REVOLUTE) and joint_axis is not None:
+                rows, axis = 5, tuple(float(x) for x in joint_axis[int(joint_qd_start[j])])
+            else:
                 warnings.warn(
                     f"SolverFeatherPGS: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
+                    f"{int(joint_type[j])} (only BALL/connect and REVOLUTE closures are enforced); ignored.",
                     stacklevel=2,
                 )
                 continue
@@ -4629,6 +4636,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             world_l.append(int(articulation_world[art]))
             joint_l.append(int(j))
             prescribed_l.append(prescribed)
+            rows_l.append(rows)
+            axis_l.append(axis)
 
         n = len(art_l)
         if n == 0:
@@ -4643,7 +4652,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
-        self._connect_row_inv_norm = wp.zeros((n, 3), dtype=float, device=device)
+        self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
+        self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
+        self._connect_axis = wp.array(np.asarray(axis_l, dtype=np.float32), dtype=wp.vec3, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
@@ -4730,7 +4742,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             connect_art_np = self._connect_art.numpy()
             for k in range(self._connect_count):
                 a = int(connect_art_np[k])
-                counts[a] = counts.get(a, 0) + 3
+                counts[a] = counts.get(a, 0) + int(self._connect_rows_np[k])
         if not counts:
             return
         n_b_max = max(counts.values())
@@ -4781,6 +4793,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 int(self._mimic_count or 0) if self._bilateral_preelimination_include_mimics else 0,
                 self._connect_slot if self._connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
+                self._connect_rows if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),
                 self._J_by_size[size],
                 self._Y_by_size[size],
@@ -5005,8 +5018,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if has_connect_rows and self._connect_world_np is not None:
             # Model.joint_enabled can engage any closure at runtime, so each one counts.
             connect_worlds = self._connect_world_np
-            in_range = connect_worlds[(connect_worlds >= 0) & (connect_worlds < per_world.shape[0])]
-            np.add.at(per_world, in_range, 3)
+            valid = (connect_worlds >= 0) & (connect_worlds < per_world.shape[0])
+            np.add.at(per_world, connect_worlds[valid], self._connect_rows_np[valid])
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
@@ -9460,6 +9473,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._connect_body_p,
                     self._connect_body_c,
                     self._connect_joint,
+                    self._connect_rows,
+                    self._connect_axis,
                     model.joint_X_p,
                     model.joint_X_c,
                     self._connect_row_inv_norm,
@@ -11762,6 +11777,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     dim=self._connect_count,
                     inputs=[
                         self._connect_joint,
+                        self._connect_rows,
                         model.joint_enabled,
                         self._connect_world,
                         max_constraints,
@@ -11790,6 +11806,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._connect_joint,
                         self._connect_body_p,
                         self._connect_body_c,
+                        self._connect_rows,
+                        self._connect_axis,
                         model.joint_X_p,
                         model.joint_X_c,
                         self._connect_parent_prescribed,
