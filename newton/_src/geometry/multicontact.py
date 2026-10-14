@@ -714,13 +714,14 @@ def face_clip_incident_face(
     axis_v: wp.vec3,
     face_normal: wp.vec3,
     offset: wp.vec3,
+    face_vertices: wp.array[wp.vec3],
     polygon: wp.array[wp.vec3],
 ) -> int:
     """Write the hull's incident face as a convex (u, v, depth) polygon and return its vertex count.
 
     The incident face is the hull face through the deepest vertex most anti-parallel to the reference
     face, together with its coplanar vertices. Axes are in the hull's frame; ``offset`` holds the hull
-    origin's (u, v, depth).
+    origin's (u, v, depth); ``face_vertices`` is scratch storage.
     """
     vertex_count = points.shape[0]
     deepest_index = int(0)
@@ -750,17 +751,21 @@ def face_clip_incident_face(
             best_alignment = alignment
             plane_normal = n / length
 
-    # Counter-clockwise Jarvis march over the face's vertices; collinear vertices resolve to the farthest.
+    face_count = int(0)
     start = wp.vec3(0.0)
-    has_start = bool(False)
     for i in range(vertex_count):
         p = wp.cw_mul(points[i], scale)
         if wp.abs(wp.dot(p - plane_point, plane_normal)) > FACE_CLIP_COPLANAR_DISTANCE:
             continue
         c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
-        if not has_start or c[0] < start[0] or (c[0] == start[0] and c[1] < start[1]):
+        if face_count == 0 or c[0] < start[0] or (c[0] == start[0] and c[1] < start[1]):
             start = c
-            has_start = True
+        face_vertices[face_count] = c
+        face_count += 1
+        if face_count == FACE_CLIP_PATCH_CAPACITY:
+            break
+
+    # Counter-clockwise Jarvis march; collinear vertices resolve to the farthest.
     current = start
     polygon_count = int(0)
     while polygon_count < FACE_CLIP_PATCH_CAPACITY:
@@ -769,11 +774,8 @@ def face_clip_incident_face(
         has_next = bool(False)
         next_point = current
         next_dist_sq = float(0.0)
-        for i in range(vertex_count):
-            p = wp.cw_mul(points[i], scale)
-            if wp.abs(wp.dot(p - plane_point, plane_normal)) > FACE_CLIP_COPLANAR_DISTANCE:
-                continue
-            c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
+        for i in range(face_count):
+            c = face_vertices[i]
             du = c[0] - current[0]
             dv = c[1] - current[1]
             dist_sq = du * du + dv * dv
@@ -997,6 +999,7 @@ def create_build_manifold(
             wp.quat_rotate_inv(relative_orientation_b, axis_v),
             wp.quat_rotate_inv(relative_orientation_b, face_normal),
             offset,
+            scratch,
             polygon,
         )
         count = face_clip_side(polygon, count, scratch, 0, 1.0, half_u)
