@@ -79,6 +79,7 @@ def _simulate(
     steps=None,
     rolling_material=None,
     count=1,
+    support_angular=None,
     observe=None,
     parent_f=False,
     **solver_kwargs,
@@ -99,6 +100,10 @@ def _simulate(
         dof = int(model.joint_qd_start.numpy()[joint])
         qd[dof : dof + 3] = linear
         qd[dof + 3 : dof + 6] = angular
+    if support_angular is not None:
+        joint = int(np.flatnonzero(model.joint_child.numpy() == 0)[0])
+        dof = int(model.joint_qd_start.numpy()[joint])
+        qd[dof + 3 : dof + 6] = support_angular
     state_0.joint_qd.assign(qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     control = model.control()
@@ -135,7 +140,7 @@ def _simulate(
 @unittest.skipUnless(wp.is_cuda_available(), "FeatherPGS matrix-free requires CUDA")
 class TestFreeRigidAngularFriction(unittest.TestCase):
     def test_rolling_sphere_stops_at_the_coulomb_distance(self):
-        """Stop a rolling sphere within 15% of the analytic Coulomb distance; keep it rolling when off."""
+        """Stop a rolling sphere within 5% of the analytic Coulomb distance; keep it rolling when off."""
         _, twist_free, travel_free = _simulate("sphere", 1.0, **_ROLLING)
         self.assertGreater(np.linalg.norm(twist_free[3:6]), 9.0)
         self.assertGreater(travel_free, 0.25)
@@ -144,7 +149,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                 _, twist, travel = _simulate("sphere", 1.5, free_rigid_rolling_friction=rolling, **_ON, **_ROLLING)
                 self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
                 expected = _coulomb_stopping_distance(0.3, rolling)
-                self.assertAlmostEqual(travel, expected, delta=0.15 * expected)
+                self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
 
     def test_material_coefficient_matches_the_override(self):
         """Read the shape material rolling coefficient when no override is given."""
@@ -202,6 +207,23 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                 self.assertLessEqual(energy(twist), start + _MASS * _GRAVITY * 1.0e-3 * _DT)
                 self.assertLessEqual(energy(twist), energy(twist_free) * (1.0 + 1.0e-4))
 
+    def test_spin_is_relative_to_a_turning_support(self):
+        """Spin a resting sphere up to a kinematic turntable's rate at mu_s m g / I; leave it still when off."""
+        torsional = 5.0e-4
+        table = (0.0, 0.0, 2.0)
+        _, free, _ = _simulate("sphere", 0.5, support_angular=table)
+        self.assertLess(abs(free[5]), 1.0e-3)
+        options = {"free_rigid_torsional_friction": torsional, "free_rigid_rolling_friction": 0.0}
+        rate = torsional * _GRAVITY / (0.4 * _RADIUS**2)
+        _, twist, _ = _simulate(
+            "sphere", 0.1, support_angular=table, enable_free_rigid_angular_friction=True, **options
+        )
+        self.assertAlmostEqual(twist[5], rate * 0.1, delta=0.05)
+        _, twist, _ = _simulate(
+            "sphere", 0.5, support_angular=table, enable_free_rigid_angular_friction=True, **options
+        )
+        self.assertAlmostEqual(twist[5], 2.0, delta=1.0e-3)
+
     def test_toppling_and_sliding_cube_are_unchanged(self):
         """Leave a toppling or sliding cube within 2 mm of the option-off pose; the spinning cube slows at most."""
         for kwargs in ({"tilt_deg": 40.0}, {"linear": (0.5, 0.0, 0.0)}, {"angular": (0.0, 0.0, 6.0)}):
@@ -227,7 +249,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                     "sphere", 1.5, free_rigid_rolling_friction=0.002, **_ON, **_ROLLING, **options
                 )
                 self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
-                self.assertAlmostEqual(travel, expected, delta=0.15 * expected)
+                self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
 
     def test_patch_anchors_share_one_budget(self):
         """Divide a patch's rolling and spin coefficients among its anchors, like its sliding coefficient."""
