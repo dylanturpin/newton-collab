@@ -229,6 +229,9 @@ from .kernels import (
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     rhs_accum_world_par_row,
+    rotate_mf_body_Hinv_to_free_root_anchor,
+    rotate_mf_rows_to_free_root_anchor,
+    rotate_propagation_rows_to_free_root_anchor,
     scan_world_row_requests,
     scatter_qdd_from_groups,
     snapshot_contact_warmstart,
@@ -8266,6 +8269,22 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # not seed propagation rows from the previous solve's final velocity.
         with self._sync_timed("prop_setup_prepare_v"):
             self._stage6_prepare_world_velocity()
+        if self._has_free_rigid_bodies:
+            # Free rigid bodies' rows are built in world axes; their velocity is in the FREE-joint anchor frame.
+            wp.launch(
+                rotate_propagation_rows_to_free_root_anchor,
+                dim=self._world_count * self._propagation_max_constraints,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_max_constraints,
+                    self._body_to_articulation,
+                    self._free_root_anchor,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                ],
+                outputs=[self._propagation_J_a, self._propagation_J_b],
+                device=self.model.device,
+            )
         # No zeroing of propagation_body_response or the tree factor buffers is
         # needed here: factor_propagation_tree_* initializes Ia/U/D_chol/D_inv
         # for every joint/body it covers, the tree response kernels write
@@ -12556,7 +12575,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
-                        self._free_root_anchor,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12671,7 +12689,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         builder_unit_count,
                         self._propagation_max_constraints,
                         builder_use_unit_order,
-                        self._free_root_anchor,
                     ],
                     outputs=[
                         self._propagation_body_a,
@@ -12946,7 +12963,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._rigid_body_max_angular_velocity,
                     self._rigid_velocity_limit_slot,
                     self._rigid_velocity_limit_sign,
-                    self._free_root_anchor,
                 ],
                 outputs=[
                     self._mf_body_a,
@@ -13955,6 +13971,22 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         """MF PGS setup: compute Hinv, compute effective mass and RHS."""
         model = self.model
 
+        # Rows are built in world axes; express them in each free body's FREE-joint anchor frame.
+        wp.launch(
+            rotate_mf_rows_to_free_root_anchor,
+            dim=self._world_count * self._free_body_constraint_max,
+            inputs=[
+                self._mf_constraint_count,
+                self._free_body_constraint_max,
+                self._body_to_articulation,
+                self._free_root_anchor,
+                self._mf_body_a,
+                self._mf_body_b,
+            ],
+            outputs=[self._mf_J_a, self._mf_J_b],
+            device=model.device,
+        )
+
         # Compute H^-1 = inverse(body_I_s + diag(armature)) for free rigid bodies
         wp.launch(
             compute_mf_body_Hinv,
@@ -13963,6 +13995,20 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._free_rigid_body_indices,
                 state_aug._body_I_s,
                 self._is_free_rigid,
+                self._body_to_articulation,
+                model.body_flags,
+                self._articulation_dof_start,
+                self._joint_armature_device,
+            ],
+            outputs=[self._mf_body_Hinv],
+            device=model.device,
+        )
+        wp.launch(
+            rotate_mf_body_Hinv_to_free_root_anchor,
+            dim=self._free_rigid_body_count,
+            inputs=[
+                self._free_rigid_body_indices,
+                state_aug._body_I_s,
                 self._body_to_articulation,
                 model.body_flags,
                 self._articulation_dof_start,

@@ -2904,14 +2904,6 @@ def _is_identity_rotation(q: wp.quat):
 
 
 @wp.func
-def _world_to_anchor(anchor: wp.quat, v: wp.vec3):
-    """Express a world vector in a FREE root's parent-anchor frame, the frame of its ``joint_qd``."""
-    if _is_identity_rotation(anchor):
-        return v
-    return wp.quat_rotate_inv(anchor, v)
-
-
-@wp.func
 def _anchor_to_world(anchor: wp.quat, v: wp.vec3):
     if _is_identity_rotation(anchor):
         return v
@@ -2936,6 +2928,17 @@ def _spatial_matrix_world_to_anchor(M: wp.spatial_matrix, anchor: wp.quat):
                 for c in range(3):
                     out[3 * bi + r, 3 * bj + c] = block[r, c]
     return out
+
+
+@wp.func
+def _rotate_row_to_anchor(J: wp.array3d[float], world: int, row: int, anchor: wp.quat):
+    if _is_identity_rotation(anchor):
+        return
+    linear = wp.quat_rotate_inv(anchor, wp.vec3(J[world, row, 0], J[world, row, 1], J[world, row, 2]))
+    angular = wp.quat_rotate_inv(anchor, wp.vec3(J[world, row, 3], J[world, row, 4], J[world, row, 5]))
+    for k in range(3):
+        J[world, row, k] = linear[k]
+        J[world, row, 3 + k] = angular[k]
 
 
 @wp.kernel
@@ -7315,7 +7318,6 @@ def _build_mf_contact_row(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
-    free_root_anchor: wp.array[wp.quat],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7335,7 +7337,6 @@ def _build_mf_contact_row(
     point is the root body's world-space COM position. The MF contact Jacobian
     uses contact position relative to that point:
         J = [d, r x d]   (r = p_contact - p_com_world)
-    expressed in each body's FREE-joint parent-anchor frame, the frame of its ``joint_qd``.
     """
     if contact_path[c] != 1:
         return
@@ -7440,12 +7441,10 @@ def _build_mf_contact_row(
             art_a = contact_art_a[c]
             origin_a = articulation_origin[art_a]
             r_a = point_a_row_world - origin_a
-            anchor_a = free_root_anchor[art_a]
-            lin_a = _world_to_anchor(anchor_a, d)
-            ang_a = _world_to_anchor(anchor_a, wp.cross(r_a, d))
-            mf_J_a[world, row_idx, 0] = lin_a[0]
-            mf_J_a[world, row_idx, 1] = lin_a[1]
-            mf_J_a[world, row_idx, 2] = lin_a[2]
+            ang_a = wp.cross(r_a, d)
+            mf_J_a[world, row_idx, 0] = d[0]
+            mf_J_a[world, row_idx, 1] = d[1]
+            mf_J_a[world, row_idx, 2] = d[2]
             mf_J_a[world, row_idx, 3] = ang_a[0]
             mf_J_a[world, row_idx, 4] = ang_a[1]
             mf_J_a[world, row_idx, 5] = ang_a[2]
@@ -7455,12 +7454,10 @@ def _build_mf_contact_row(
             art_b = contact_art_b[c]
             origin_b = articulation_origin[art_b]
             r_b = point_b_row_world - origin_b
-            anchor_b = free_root_anchor[art_b]
-            lin_b = _world_to_anchor(anchor_b, d)
-            ang_b = _world_to_anchor(anchor_b, wp.cross(r_b, d))
-            mf_J_b[world, row_idx, 0] = -lin_b[0]
-            mf_J_b[world, row_idx, 1] = -lin_b[1]
-            mf_J_b[world, row_idx, 2] = -lin_b[2]
+            ang_b = wp.cross(r_b, d)
+            mf_J_b[world, row_idx, 0] = -d[0]
+            mf_J_b[world, row_idx, 1] = -d[1]
+            mf_J_b[world, row_idx, 2] = -d[2]
             mf_J_b[world, row_idx, 3] = -ang_b[0]
             mf_J_b[world, row_idx, 4] = -ang_b[1]
             mf_J_b[world, row_idx, 5] = -ang_b[2]
@@ -7531,7 +7528,6 @@ def build_mf_contact_rows(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
-    free_root_anchor: wp.array[wp.quat],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7576,7 +7572,6 @@ def build_mf_contact_rows(
             contact_shared_anchor,
             friction_patches,
             friction_anchor_beta,
-            free_root_anchor,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -7621,7 +7616,6 @@ def build_propagation_contact_rows(
     world_unit_count: wp.array[int],
     unit_capacity: int,
     use_unit_order: int,
-    free_root_anchor: wp.array[wp.quat],
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -7634,9 +7628,6 @@ def build_propagation_contact_rows(
     propagation_row_restitution: wp.array2d[float],
 ):
     """Build fixed-size body-space rows for contacts touching non-free articulations.
-
-    A free rigid body's row is expressed in its FREE joint's parent-anchor frame, the frame
-    of its ``joint_qd``, so its body velocity and response stay copies of the generalized ones.
 
     With ``use_unit_order`` the launch runs over color-sorted unit positions
     (worlds x capacity) instead of raw contact indices, so row WRITES land
@@ -7743,14 +7734,10 @@ def build_propagation_contact_rows(
             if row_offset > 0 and friction_patches.enabled != 0:
                 point_a_row_world = friction_patches.point_a[c]
             r_a = point_a_row_world - com_a
-            anchor_a = wp.quat_identity()
-            if contact_art_a[c] >= 0:
-                anchor_a = free_root_anchor[contact_art_a[c]]
-            lin_a = _world_to_anchor(anchor_a, d)
-            ang_a = _world_to_anchor(anchor_a, wp.cross(r_a, d))
-            propagation_J_a[world, row_idx, 0] = lin_a[0]
-            propagation_J_a[world, row_idx, 1] = lin_a[1]
-            propagation_J_a[world, row_idx, 2] = lin_a[2]
+            ang_a = wp.cross(r_a, d)
+            propagation_J_a[world, row_idx, 0] = d[0]
+            propagation_J_a[world, row_idx, 1] = d[1]
+            propagation_J_a[world, row_idx, 2] = d[2]
             propagation_J_a[world, row_idx, 3] = ang_a[0]
             propagation_J_a[world, row_idx, 4] = ang_a[1]
             propagation_J_a[world, row_idx, 5] = ang_a[2]
@@ -7762,14 +7749,10 @@ def build_propagation_contact_rows(
             if row_offset > 0 and friction_patches.enabled != 0:
                 point_b_row_world = friction_patches.point_b[c]
             r_b = point_b_row_world - com_b
-            anchor_b = wp.quat_identity()
-            if contact_art_b[c] >= 0:
-                anchor_b = free_root_anchor[contact_art_b[c]]
-            lin_b = _world_to_anchor(anchor_b, d)
-            ang_b = _world_to_anchor(anchor_b, wp.cross(r_b, d))
-            propagation_J_b[world, row_idx, 0] = -lin_b[0]
-            propagation_J_b[world, row_idx, 1] = -lin_b[1]
-            propagation_J_b[world, row_idx, 2] = -lin_b[2]
+            ang_b = wp.cross(r_b, d)
+            propagation_J_b[world, row_idx, 0] = -d[0]
+            propagation_J_b[world, row_idx, 1] = -d[1]
+            propagation_J_b[world, row_idx, 2] = -d[2]
             propagation_J_b[world, row_idx, 3] = -ang_b[0]
             propagation_J_b[world, row_idx, 4] = -ang_b[1]
             propagation_J_b[world, row_idx, 5] = -ang_b[2]
@@ -8364,7 +8347,6 @@ def populate_rigid_velocity_limit_rows(
     rigid_body_max_angular_velocity: wp.array[float],
     rigid_velocity_limit_slot: wp.array[int],
     rigid_velocity_limit_sign: wp.array[float],
-    free_root_anchor: wp.array[wp.quat],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -8375,7 +8357,7 @@ def populate_rigid_velocity_limit_rows(
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
 ):
-    """Populate MF rows for rigid-body world-axis linear/angular velocity limits."""
+    """Populate MF rows for rigid-body linear/angular velocity limits."""
     candidate = wp.tid()
     body = free_rigid_body_indices[candidate]
     art = body_to_articulation[body]
@@ -8407,11 +8389,7 @@ def populate_rigid_velocity_limit_rows(
             for k in range(6):
                 mf_J_a[world, slot, k] = 0.0
                 mf_J_b[world, slot, k] = 0.0
-            world_axis = wp.vec3(0.0)
-            world_axis[axis % 3] = sign
-            local_axis = _world_to_anchor(free_root_anchor[art], world_axis)
-            for k in range(3):
-                mf_J_a[world, slot, 3 * (axis // 3) + k] = local_axis[k]
+            mf_J_a[world, slot, axis] = sign
 
             mf_body_a[world, slot] = body
             mf_body_b[world, slot] = -1
@@ -8541,16 +8519,14 @@ def compute_mf_body_Hinv(
     body_flags: wp.array[wp.int32],
     articulation_dof_start: wp.array[int],
     joint_armature: wp.array[float],
-    free_root_anchor: wp.array[wp.quat],
     # outputs
     mf_body_Hinv: wp.array[wp.spatial_matrix],
 ):
-    """Compute H^-1 = inverse(S' body_I_s S + diag(armature)) for free rigid bodies.
+    """Compute H^-1 = inverse(body_I_s + diag(armature)) for free rigid bodies.
 
-    For root free joints, H is body_I_s in articulation-local coordinates expressed in the
-    FREE joint's parent-anchor frame (S = diag(R, R)), plus the free joint's armature on the
-    diagonal as in the articulated mass matrix. This remains a full 6x6 matrix for bodies
-    with non-zero CoM offsets.
+    For root free joints, H = body_I_s in articulation-local coordinates, plus the free
+    joint's armature on the diagonal as in the articulated mass matrix. This remains a
+    full 6x6 matrix for bodies with non-zero CoM offsets.
     """
     b = free_rigid_body_indices[wp.tid()]
     art = body_to_articulation[b]
@@ -8562,7 +8538,98 @@ def compute_mf_body_Hinv(
         mf_body_Hinv[b] = wp.spatial_matrix(0.0)
         return
 
-    H = _spatial_matrix_world_to_anchor(body_I_s[b], free_root_anchor[art])
+    H = body_I_s[b]
+    dof_start = articulation_dof_start[art]
+    for k in range(6):
+        H[k, k] = H[k, k] + joint_armature[dof_start + k]
+    mf_body_Hinv[b] = spatial_matrix_block_inverse(H)
+
+
+@wp.kernel
+def rotate_mf_rows_to_free_root_anchor(
+    mf_constraint_count: wp.array[int],
+    mf_max_constraints: int,
+    body_to_articulation: wp.array[int],
+    free_root_anchor: wp.array[wp.quat],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    # in-out
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+):
+    """Express this step's world-frame matrix-free rows in each body's FREE-joint parent-anchor frame.
+
+    A free rigid body's ``joint_qd`` is expressed in that frame. World-aligned anchors are skipped, so the
+    row builders' arithmetic is unchanged for them.
+    """
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    row = tid - world * mf_max_constraints
+    if row >= mf_constraint_count[world]:
+        return
+    body_a = mf_body_a[world, row]
+    if body_a >= 0:
+        _rotate_row_to_anchor(mf_J_a, world, row, free_root_anchor[body_to_articulation[body_a]])
+    body_b = mf_body_b[world, row]
+    if body_b >= 0:
+        _rotate_row_to_anchor(mf_J_b, world, row, free_root_anchor[body_to_articulation[body_b]])
+
+
+@wp.kernel
+def rotate_propagation_rows_to_free_root_anchor(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    body_to_articulation: wp.array[int],
+    free_root_anchor: wp.array[wp.quat],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    # in-out
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+):
+    """Express free rigid bodies' propagation rows in their FREE-joint parent-anchor frame.
+
+    Their propagation velocity and response are plain copies of the generalized ones, so only the rows rotate.
+    Articulated links and world-aligned anchors are skipped.
+    """
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    row = tid - world * propagation_max_constraints
+    if row >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    body_a = propagation_body_a[world, row]
+    if body_a >= 0 and body_to_articulation[body_a] >= 0:
+        _rotate_row_to_anchor(propagation_J_a, world, row, free_root_anchor[body_to_articulation[body_a]])
+    body_b = propagation_body_b[world, row]
+    if body_b >= 0 and body_to_articulation[body_b] >= 0:
+        _rotate_row_to_anchor(propagation_J_b, world, row, free_root_anchor[body_to_articulation[body_b]])
+
+
+@wp.kernel
+def rotate_mf_body_Hinv_to_free_root_anchor(
+    free_rigid_body_indices: wp.array[int],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_to_articulation: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    articulation_dof_start: wp.array[int],
+    joint_armature: wp.array[float],
+    free_root_anchor: wp.array[wp.quat],
+    # in-out
+    mf_body_Hinv: wp.array[wp.spatial_matrix],
+):
+    """Recompute H^-1 = inverse(S' body_I_s S + diag(armature)) for free rigid bodies with a rotated anchor.
+
+    S = diag(R, R) for the anchor rotation R. World-aligned anchors and kinematic bodies keep
+    :func:`compute_mf_body_Hinv`'s result.
+    """
+    b = free_rigid_body_indices[wp.tid()]
+    art = body_to_articulation[b]
+    if art < 0:
+        return
+    anchor = free_root_anchor[art]
+    if _is_identity_rotation(anchor) or (body_flags[b] & BodyFlags.KINEMATIC) != 0:
+        return
+    H = _spatial_matrix_world_to_anchor(body_I_s[b], anchor)
     dof_start = articulation_dof_start[art]
     for k in range(6):
         H[k, k] = H[k, k] + joint_armature[dof_start + k]
