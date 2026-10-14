@@ -3,11 +3,16 @@
 """Experimental Coulomb rolling resistance for free rigid bodies on static or kinematic supports.
 
 After the contact solve, each dynamic body sums the solved normal impulse ``lambda_n`` of its
-contacts with static or kinematic shapes, their load-weighted normal and the supports'
-load-weighted angular velocity. When the body is a free articulation root, its angular velocity
-relative to the supports, projected off the mean normal, loses at most
-``rolling_resistance * lambda_n`` of angular momentum, as in the XPBD rolling-friction clamp.
-Sums use fixed-point int64 atomics, so the result does not depend on contact order.
+contacts with static or kinematic shapes, their load-weighted normal ``n`` and the supports'
+load-weighted angular velocity. A single-body free rigid articulation then receives an angular
+impulse ``h`` in the plane tangent to ``n``, with ``|h| <= rolling_resistance * lambda_n``, that
+minimizes its kinetic energy relative to the supports through its world inverse inertia: the
+impulse that stops the tangent relative angular velocity when the bound allows, otherwise the
+energy minimizer on the bound. With static supports this never adds kinetic energy.
+
+Sums use fixed-point int64 atomics, so they do not depend on contact order while every sum stays
+below ``2**63 / SUPPORT_LOAD_SCALE``: about 9.2e6 N s of normal impulse, and 9.2e6 N s rad/s of
+impulse-weighted support angular velocity, per body and step.
 """
 
 import warp as wp
@@ -116,16 +121,31 @@ def accumulate_support_load(
         _add_load(load, body1, normal, _support_omega(body0, body_qd), normal_impulse)
 
 
+@wp.func
+def _tangent_basis(normal: wp.vec3):
+    """Return two unit vectors spanning the plane orthogonal to ``normal``."""
+    reference = wp.vec3(1.0, 0.0, 0.0)
+    if wp.abs(normal[0]) > 0.57735:
+        reference = wp.vec3(0.0, 1.0, 0.0)
+    t1 = wp.normalize(wp.cross(normal, reference))
+    return t1, wp.cross(normal, t1)
+
+
+@wp.func
+def _solve_shifted(a: wp.mat22, shift: float, b: wp.vec2):
+    return wp.inverse(a + wp.mat22(shift, 0.0, 0.0, shift)) * b
+
+
 @wp.kernel
-def apply_free_root_rolling_resistance(
+def apply_free_rigid_rolling_resistance(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
     joint_q_start: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     body_flags: wp.array[wp.int32],
-    body_inertia: wp.array[wp.mat33],
-    articulation_root_is_free: wp.array[int],
+    body_inv_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[wp.int32],
     articulation_root_dof_start: wp.array[int],
     articulation_active: wp.array[int],
     load: wp.array2d[wp.int64],
@@ -134,9 +154,9 @@ def apply_free_root_rolling_resistance(
     # in/out
     joint_qd: wp.array[float],
 ):
-    """Remove up to ``rolling_resistance * lambda_n`` of angular momentum about the supports' tangent axes."""
+    """Apply the bounded tangent angular impulse that minimizes support-relative kinetic energy."""
     art = wp.tid()
-    if articulation_active[art] == 0 or articulation_root_is_free[art] == 0:
+    if articulation_active[art] == 0 or is_free_rigid[art] == 0:
         return
     root_joint = articulation_start[art]
     body = joint_child[root_joint]
@@ -156,9 +176,11 @@ def apply_free_root_rolling_resistance(
 
     ds = articulation_root_dof_start[art]
     omega = wp.vec3(joint_qd[ds + 3], joint_qd[ds + 4], joint_qd[ds + 5])
+    t1, t2 = _tangent_basis(normal)
     relative = omega - support_omega
-    rolling = relative - wp.dot(relative, normal) * normal
-    if wp.length(rolling) <= 0.0:
+    # Impulse coordinates (h1, h2) along (t1, t2); the full stop solves a h = b.
+    b = wp.vec2(-wp.dot(t1, relative), -wp.dot(t2, relative))
+    if b[0] == 0.0 and b[1] == 0.0:
         return
 
     qs = joint_q_start[root_joint]
@@ -169,14 +191,27 @@ def apply_free_root_rolling_resistance(
         * wp.quat_inverse(wp.transform_get_rotation(joint_X_c[root_joint]))
     )
     rotation = wp.quat_to_matrix(orientation)
-    momentum = rotation * body_inertia[body] * wp.transpose(rotation) * rolling
-    momentum = momentum - wp.dot(momentum, normal) * normal
-    magnitude = wp.length(momentum)
+    inv_inertia = rotation * body_inv_inertia[body] * wp.transpose(rotation)
+    r1 = inv_inertia * t1
+    r2 = inv_inertia * t2
+    a = wp.mat22(wp.dot(t1, r1), wp.dot(t1, r2), wp.dot(t2, r1), wp.dot(t2, r2))
+    if wp.determinant(a) <= 0.0:
+        return
+
     budget = rolling_resistance * normal_impulse
-    keep = float(0.0)
-    if magnitude > budget:
-        keep = 1.0 - budget / magnitude
-    omega = omega - rolling * (1.0 - keep)
+    h = wp.inverse(a) * b
+    if wp.length(h) > budget:
+        # The bounded energy minimizer is (a + mu I)^-1 b with |h| = budget; |h| falls as mu grows.
+        low = float(0.0)
+        high = wp.length(b) / budget
+        for _ in range(48):
+            mid = 0.5 * (low + high)
+            if wp.length(_solve_shifted(a, mid, b)) > budget:
+                low = mid
+            else:
+                high = mid
+        h = _solve_shifted(a, high, b)
+    omega = omega + r1 * h[0] + r2 * h[1]
     joint_qd[ds + 3] = omega[0]
     joint_qd[ds + 4] = omega[1]
     joint_qd[ds + 5] = omega[2]
