@@ -1576,15 +1576,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         One per-shape attribute adds angular friction rows to free-rigid contacts:
 
-        - ``feather_pgs:condim`` selects the shape's contact dimensionality as MuJoCo's ``condim`` does
-          (default 3). At 4 or more a free-rigid contact gets a spin row bounded by its torsional coefficient
-          (:attr:`~newton.Model.shape_material_mu_torsional`) [m] times the normal load; at 6 also a
-          rolling pair bounded by its rolling coefficient (:attr:`~newton.Model.shape_material_mu_rolling`).
-          As in MuJoCo, a pair takes the larger dimensionality of its shapes, and its coefficient is the
-          largest among the shapes whose dimensionality includes it. Only contacts between free bodies,
-          and free bodies on static or kinematic geometry, read it; values below 4 add nothing. Shape edits
-          take effect at :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without
-          angular rows must be rebuilt to gain them.
+        - ``feather_pgs:condim`` (default 3) opts a shape into angular rows, borrowing MuJoCo's 3/4/6
+          dimensionality convention. At 4 or more, a shape contributes its torsional coefficient
+          (:attr:`~newton.Model.shape_material_mu_torsional`) [m] to a spin row bounded by that coefficient
+          times the normal load; at 6, also its rolling coefficient
+          (:attr:`~newton.Model.shape_material_mu_rolling`) to a rolling pair. A contact's coefficient is
+          the largest contributed by its two shapes. This differs from MuJoCo's parameter combination,
+          which takes the larger coefficient regardless of each shape's condim and honours priority.
+          Only contacts between free bodies, and free bodies on static or kinematic geometry, read it.
+          Values below 4 add nothing; 1 and 2 do not remove sliding friction. Shape edits take effect at
+          :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without angular rows must
+          be rebuilt to gain them.
 
         The solver reads them from the model at every step, for example
         ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
@@ -1881,13 +1883,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
                 of mass. Zero sticks rigidly. Construction-only.
             free_rigid_torsional_friction: Experimental torsional coefficient [m] for every free-rigid
-                contact, in place of the shapes' ``feather_pgs:condim`` and
-                :attr:`~newton.Model.shape_material_mu_torsional`; ``None`` keeps the shape data. Meant for
-                sweeps that cannot edit shape data. Construction-only.
+                contact, replacing the shapes' ``feather_pgs:condim`` gate and
+                :attr:`~newton.Model.shape_material_mu_torsional` for that coefficient only; ``None`` keeps the
+                shape data. Meant for sweeps that cannot edit shape data. Construction-only.
             free_rigid_rolling_friction: Experimental rolling coefficient [m] for every free-rigid contact,
-                in place of the shapes' ``feather_pgs:condim`` and
-                :attr:`~newton.Model.shape_material_mu_rolling`; ``None`` keeps the shape data.
-                Construction-only.
+                replacing the shapes' ``feather_pgs:condim`` gate and
+                :attr:`~newton.Model.shape_material_mu_rolling` for that coefficient only; ``None`` keeps the
+                shape data. Construction-only.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and

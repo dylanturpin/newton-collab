@@ -34,7 +34,7 @@ def _coulomb_stopping_distance(speed: float, rolling: float) -> float:
     return speed**2 * 1.4 / (2.0 * rolling * _GRAVITY / _RADIUS)
 
 
-def _scene(body: str, tilt_deg: float = 0.0, inertia=None, count: int = 1):
+def _scene(body: str, tilt_deg: float = 0.0, inertia=None, count: int = 1, anchor_deg=None):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     SolverFeatherPGS.register_custom_attributes(builder)
     table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
@@ -51,12 +51,16 @@ def _scene(body: str, tilt_deg: float = 0.0, inertia=None, count: int = 1):
             moments = np.eye(3) * _MASS * (2.0 * _RADIUS) ** 2 / 6.0
             tilt = math.radians(tilt_deg)
             z = _RADIUS * (math.cos(tilt) + math.sin(tilt)) + 1.0e-4
-        obj = builder.add_body(
-            xform=wp.transform((x, 0.0, z), rotation),
-            mass=_MASS,
-            inertia=wp.mat33(*np.asarray(moments, dtype=np.float32).ravel()),
-            lock_inertia=True,
-        )
+        inertia_matrix = wp.mat33(*np.asarray(moments, dtype=np.float32).ravel())
+        pose = wp.transform((x, 0.0, z), rotation)
+        if anchor_deg is None:
+            obj = builder.add_body(xform=pose, mass=_MASS, inertia=inertia_matrix, lock_inertia=True)
+        else:
+            # A FREE root whose parent anchor is rotated: joint_qd is expressed in that rotated frame.
+            obj = builder.add_link(xform=pose, mass=_MASS, inertia=inertia_matrix, lock_inertia=True)
+            anchor = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), math.radians(anchor_deg))
+            joint = builder.add_joint_free(obj, parent_xform=wp.transform((0.0, 0.0, 0.0), anchor))
+            builder.add_articulation([joint])
         if body == "sphere":
             builder.add_shape_sphere(obj, radius=_RADIUS, cfg=massless)
         else:
@@ -84,9 +88,10 @@ def _simulate(
     support_angular=None,
     observe=None,
     parent_f=False,
+    anchor_deg=None,
     **solver_kwargs,
 ):
-    model, bodies = _scene(body, tilt_deg, inertia, count)
+    model, bodies = _scene(body, tilt_deg, inertia, count, anchor_deg)
     if torsion_radius:
         set_torsion_radius(model, torsion_radius)
     if rolling_material is not None:
@@ -112,6 +117,14 @@ def _simulate(
         qd[dof + 3 : dof + 6] = support_angular
     state_0.joint_qd.assign(qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    if anchor_deg is not None:
+        # Initial velocities are world-frame twists; recover the joint coordinates of the rotated anchor.
+        body_qd = state_0.body_qd.numpy()
+        for obj in bodies:
+            body_qd[obj] = (*linear, *angular)
+        state_0.body_qd.assign(body_qd)
+        newton.eval_ik(model, state_0, state_0.joint_q, state_0.joint_qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     control = model.control()
     obj = bodies[0]
     start = state_0.body_q.numpy()[obj][:3].copy()
@@ -235,6 +248,43 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         self.assertAlmostEqual(twist[5], rate * 0.1, delta=0.05)
         _, twist, _ = _simulate("sphere", 0.5, support_angular=table, **options)
         self.assertAlmostEqual(twist[5], 2.0, delta=1.0e-3)
+
+    def test_rows_act_in_world_frame_under_a_rotated_free_root_anchor(self):
+        """Match the identity-anchor result with a FREE root parent anchor rotated by 45 and 90 degrees about y.
+
+        A sphere spinning about the contact normal keeps its spin under rolling rows, rolls about the same world axis
+        to the same stop, and slows its spin at the same rate under the spin row, eagerly and in a captured graph.
+        """
+        cases = {
+            "normal spin, rolling rows": {
+                "seconds": 0.5,
+                "angular": (0.0, 0.0, 6.0),
+                "free_rigid_rolling_friction": 0.01,
+            },
+            "rolling stop": {"seconds": 1.5, "free_rigid_rolling_friction": 0.002, **_ROLLING},
+            "spin row": {"seconds": 0.2, "angular": (0.0, 0.0, 6.0), "free_rigid_torsional_friction": 5.0e-4},
+        }
+        for name, case in cases.items():
+            kwargs = {"free_rigid_torsional_friction": 0.0, "free_rigid_rolling_friction": 0.0, **case}
+            _, reference, travel = _simulate("sphere", anchor_deg=0.0, **kwargs)
+            if name == "normal spin, rolling rows":
+                np.testing.assert_allclose(reference[3:6], (0.0, 0.0, 6.0 * (1.0 - 0.05 * _DT) ** 240), atol=1.0e-3)
+            for anchor in (45.0, 90.0):
+                for graph in (False, True):
+                    with self.subTest(case=name, anchor=anchor, graph=graph):
+                        _, twist, rotated_travel = _simulate("sphere", anchor_deg=anchor, graph=graph, **kwargs)
+                        np.testing.assert_allclose(twist, reference, atol=2.0e-4)
+                        self.assertAlmostEqual(rotated_travel, travel, delta=1.0e-4)
+
+    def test_rows_reject_propagation_responses(self):
+        """Reject the angular rows when articulated or free-free contacts take the propagation response."""
+        model, _ = _scene("sphere", anchor_deg=45.0)
+        for options in (
+            {"articulated_contact_response": "propagation"},
+            {"articulated_contact_response": "propagation_colored"},
+        ):
+            with self.subTest(**options), self.assertRaises(ValueError):
+                SolverFeatherPGS(model, solve_mode="matrix_free", free_rigid_rolling_friction=1.0e-3, **options)
 
     def test_toppling_and_sliding_cube_are_unchanged(self):
         """Leave a toppling or sliding cube within 2 mm of the option-off pose; the spinning cube slows at most."""
