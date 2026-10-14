@@ -2062,7 +2062,9 @@ def accumulate_contact_wrenches_from_impulses(
                     world_impulses[world, slot + 3], world_impulses[world, slot + 4], world_impulses[world, slot + 5]
                 )
     if contact_path[c] == 1 and slot >= 0:
-        angular = mf_angular_friction_impulses(contact_world[c], slot, mf_impulses, mf_constraint_count, mf_row_type, mf_row_parent)
+        angular = mf_angular_friction_impulses(
+            contact_world[c], slot, mf_impulses, mf_constraint_count, mf_row_type, mf_row_parent
+        )
     if (
         lam[0] == 0.0
         and lam[1] == 0.0
@@ -3379,7 +3381,11 @@ def mf_angular_friction_impulses(
             angular[1] = mf_impulses[world, row]
             angular[2] = mf_impulses[world, row + 1]
         row += 2
-    if row < count and mf_row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT_SPIN and mf_row_parent[world, row] == slot:
+    if (
+        row < count
+        and mf_row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
+        and mf_row_parent[world, row] == slot
+    ):
         angular[0] = mf_impulses[world, row]
     return angular
 
