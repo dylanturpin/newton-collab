@@ -134,7 +134,8 @@ def test_rounded_hull_rests_on_face(test, device):
             for p in points:
                 gap = np.min(np.linalg.norm(hull_vertices - p, axis=1))
                 test.assertLess(gap, 1.0e-5, f"{label}: contact {p} is not a hull vertex")
-            span = np.cross(points[1, :2] - points[0, :2], points[2, :2] - points[0, :2])
+            edge_1, edge_2 = points[1, :2] - points[0, :2], points[2, :2] - points[0, :2]
+            span = edge_1[0] * edge_2[1] - edge_1[1] * edge_2[0]
             test.assertGreater(abs(float(span)), 1.0e-7, f"{label}: contacts are collinear")
 
 
