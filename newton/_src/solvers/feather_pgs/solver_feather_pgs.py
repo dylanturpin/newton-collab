@@ -1165,8 +1165,13 @@ def _use_mfgs_pair_cache(
     torsion_links: bool,
     has_drive_rows: bool,
     fuse_vel_limits: bool,
+    world_count: int,
+    sm_count: int,
 ) -> bool:
-    """Select the per-launch friction-pair operator cache when it fits the portable static shared-memory bound."""
+    """Select the per-launch friction-pair operator cache when it fits and every world stays resident with it.
+
+    The cache shortens each world's serial chain but lowers blocks per SM, which only costs when worlds queue.
+    """
     metadata_bytes = (
         _mfgs_resident_metadata_bytes(max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits)
         if shared_metadata
@@ -1180,9 +1185,13 @@ def _use_mfgs_pair_cache(
         torsion_links=torsion_links,
         pair_cache=True,
     )
+    block_bytes = total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES
+    resident_worlds = sm_count * (max_shared_memory // block_bytes)
     # Row parents are stored as short.
-    return max_constraints <= 32767 and total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
-        _STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory
+    return (
+        max_constraints <= 32767
+        and block_bytes <= min(_STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory)
+        and world_count <= resident_worlds
     )
 
 
@@ -7337,6 +7346,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     torsion_links=self._mfgs_torsion_links,
                     has_drive_rows=has_drive_rows,
                     fuse_vel_limits=self._velocity_limits_fused,
+                    world_count=self._world_count,
+                    sm_count=int(getattr(model.device, "sm_count", 0)),
                 )
             )
             self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
