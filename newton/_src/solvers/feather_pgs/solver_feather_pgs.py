@@ -1501,6 +1501,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     contact_warmstart_decay = _StepOption()
     warn_constraint_overflow = _StepOption()
     friction_anchor_beta = _ConstructionOption()
+    friction_history_compact = _ConstructionOption()
+    friction_locations_max = _ConstructionOption()
     enable_joint_friction = _ConstructionOption()
     bilateral_preelimination_include_mimics = _ConstructionOption()
     contact_torsion_device = _ConstructionOption()
@@ -1736,6 +1738,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
+        friction_history_compact: bool = False,
+        friction_locations_max: int | None = None,
         contact_torsion_device: bool = False,
         enable_torsional_rolling_friction: bool = False,
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
@@ -1962,6 +1966,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 pre-eliminated and mimic rows remain in the iterative sweep. This avoids
                 making the Schur block singular when a mimic row is nearly dependent on
                 the loop-closure rows. Defaults to True.
+            friction_history_compact (bool, optional): Carry the friction-anchor history as a packed
+                table of the live friction locations (the carried fields only, in key order) instead
+                of mirroring the whole contact frame. The solve is unchanged; the history costs less
+                memory and the per-step store touches only the live records. Defaults to False.
+            friction_locations_max (int | None, optional): Size of that table in records (total over
+                all worlds). ``None`` keeps one record per contact slot, so no live friction location
+                is ever dropped; a smaller budget shrinks the table, and records past it are dropped
+                and counted (see :meth:`friction_history_status`). Needs ``friction_history_compact``.
+                Defaults to None.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -2309,6 +2322,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if not np.isfinite(self._friction_anchor_beta) or self._friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
         self._friction_anchors_enabled = self._friction_anchor_beta > 0.0
+        self._friction_history_compact = bool(friction_history_compact)
+        self._friction_locations_max = None if friction_locations_max is None else int(friction_locations_max)
+        if self._friction_locations_max is not None and not self._friction_history_compact:
+            raise ValueError("friction_locations_max needs friction_history_compact=True")
+        if self._friction_history_compact and enable_sleeping:
+            raise NotImplementedError("friction_history_compact does not support enable_sleeping yet")
         if self._contact_compliance and self._friction_anchors_enabled:
             raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
         if self._friction_anchors_enabled and friction_mode != "fixed_normal":
@@ -6275,6 +6294,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             max_contacts,
             self._friction_anchors_enabled,
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
+            compact=self._friction_history_compact,
+            history_max=self._friction_locations_max,
         )
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self._contact_warmstart else None
@@ -10379,6 +10400,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._row_watermarks],
                 device=self.model.device,
             )
+
+    def friction_history_status(self) -> dict[str, int]:
+        """Return the compact friction-history table size, its record high-water mark and the records
+        dropped past it since construction; empty unless ``friction_history_compact`` is on with anchors."""
+        patches = getattr(self, "_friction_patches", None)
+        if patches is None or not patches.view.enabled or not patches.compact:
+            return {}
+        return patches.history_status()
 
     def constraint_row_watermarks(self) -> dict[str, int]:
         """Return the row high-water marks accumulated since construction (``row_watermark`` only).

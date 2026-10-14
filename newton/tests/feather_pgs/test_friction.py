@@ -381,6 +381,82 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(bq)))
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
+    def test_compact_history_matches_the_full_frame(self):
+        """Carry the anchor history as a packed table of live locations without changing the solve."""
+        steps = int(1.5 / 0.005)
+        drift_full, solver_full, state_full = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
+        drift_compact, solver_compact, state_compact = _run_squeeze(
+            5.0, steps, friction_anchor_beta=0.05, friction_history_compact=True
+        )
+        np.testing.assert_array_equal(state_compact.body_q.numpy(), state_full.body_q.numpy())
+        self.assertEqual(drift_compact, drift_full)
+        self.assertEqual(solver_full.friction_history_status(), {})
+        status = solver_compact.friction_history_status()
+        pool = solver_compact._friction_patches.capacity
+        self.assertEqual(status["friction_history_max"], pool)
+        self.assertGreater(status["friction_history_high_water"], 0)
+        self.assertEqual(status["friction_history_dropped"], 0)
+        # The packed previous frame holds the carried fields only; the full frame mirrors every field.
+        self.assertEqual(solver_compact._friction_patches.previous.center.shape[0], 0)
+        self.assertEqual(solver_full._friction_patches.previous.center.shape[0], pool)
+
+    def test_compact_history_budget_counts_dropped_records(self):
+        """A table smaller than the live friction locations drops the excess, counted, never silently."""
+        steps = int(1.0 / 0.005)
+        _drift, solver, state = _run_squeeze(
+            5.0, steps, friction_anchor_beta=0.05, friction_history_compact=True, friction_locations_max=1
+        )
+        self.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+        status = solver.friction_history_status()
+        self.assertEqual(status["friction_history_max"], 1)
+        self.assertGreater(status["friction_history_high_water"], 1)
+        self.assertGreater(status["friction_history_dropped"], 0)
+        model, _jaws, _box = _build_v_jaws(5.0)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFeatherPGS(
+                model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.05, friction_locations_max=4
+            )
+        model.rigid_contact_max = 256
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFeatherPGS(
+                model,
+                **_SQUEEZE_SOLVER,
+                friction_anchor_beta=0.05,
+                friction_history_compact=True,
+                friction_locations_max=0,
+            )
+
+    def test_compact_history_graph_capture_replays(self):
+        """Replay the packed history store (flags, scan, compact store) under a CUDA graph."""
+        model, jaws, box = _build_v_jaws(5.0)
+        solver = newton.solvers.SolverFeatherPGS(
+            model, friction_anchor_beta=0.05, friction_history_compact=True, **_SQUEEZE_SOLVER
+        )
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest")
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+
+        def step():
+            nonlocal s0, s1
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 0.005)
+            s0, s1 = s1, s0
+
+        for _ in range(4):
+            step()
+        with wp.ScopedCapture(device=model.device) as capture:
+            step()
+            step()
+        for _ in range(200):
+            wp.capture_launch(capture.graph)
+        bq = s0.body_q.numpy()
+        self.assertTrue(np.all(np.isfinite(bq)))
+        self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
+        self.assertEqual(solver.friction_history_status()["friction_history_dropped"], 0)
+
 
 def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, device="cpu"):
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
