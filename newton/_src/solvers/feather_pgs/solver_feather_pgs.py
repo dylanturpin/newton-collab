@@ -243,6 +243,7 @@ from .kernels import (
     warmstart_dt_scale,
     zero_unattached_parent_wrenches,
 )
+from .rolling_resistance import accumulate_support_load, apply_free_root_rolling_resistance
 from .sleeping import _SleepState
 from .sparse_contact import (
     _get_sparse_contact_response_kernel,
@@ -1740,6 +1741,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         enable_torsional_rolling_friction: bool = False,
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
         torsional_rolling_friction_creep_speed: float = 0.0,
+        free_rigid_rolling_resistance: float = 0.0,
+        free_rigid_rolling_damping: float = 0.0,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
         enable_sleeping: bool = False,
@@ -1843,6 +1846,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 torsional/rolling stiction: below the bound, the coefficient times the relative angular
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
                 of mass. Zero sticks rigidly. Construction-only.
+            free_rigid_rolling_resistance: Experimental Coulomb rolling-resistance lever arm [m] for free
+                root bodies on static or kinematic shapes, applied to the angular velocity after the solve
+                and bounded by this times the solved normal impulse. Zero disables it.
+            free_rigid_rolling_damping: Experimental viscous rate [1/s] on the same rolling axes while
+                the body rests on a static or kinematic shape. Zero disables it.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -2266,6 +2274,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         _validate_equality_constraints(model)
         _validate_tree_joints_enabled(model)
 
+        # Experimental: see rolling_resistance.py.
+        self._free_rigid_rolling_resistance = float(free_rigid_rolling_resistance)
+        self._free_rigid_rolling_damping = float(free_rigid_rolling_damping)
+        if not (self._free_rigid_rolling_resistance >= 0.0 and self._free_rigid_rolling_damping >= 0.0):
+            raise ValueError("free_rigid_rolling_resistance and free_rigid_rolling_damping must be non-negative")
+        self._rolling_load = None
         # Stand-in for models without the physx angular damping attribute.
         self._default_angular_damping = wp.full(
             max(model.body_count, 1), _DEFAULT_ANGULAR_DAMPING, dtype=wp.float32, device=model.device
@@ -10065,6 +10079,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._stage6b_mf_pgs(state_aug, dt)
 
         self._stage6_clamp_rigid_velocity_limits()
+        self._accumulate_rolling_support_load(contacts)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
@@ -14147,9 +14162,67 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
 
             self._compute_parent_wrenches(state_in, state_aug, dt)
+            self._apply_free_root_rolling_resistance(state_out, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
         self.integrate_particles(model, state_in, state_out, dt)
+
+    def _rolling_resistance_enabled(self) -> bool:
+        return self._free_rigid_rolling_resistance > 0.0 or self._free_rigid_rolling_damping > 0.0
+
+    def _accumulate_rolling_support_load(self, contacts: Contacts | None) -> None:
+        """Sum this step's solved normal impulses from static/kinematic supports per body."""
+        if not self._rolling_resistance_enabled() or not self._has_root_free:
+            return
+        if self._solve_mode == "matrix_free" and self._velocity_iterations > 0:
+            raise ValueError("free-rigid rolling resistance requires velocity_iterations=0 in matrix_free mode")
+        model = self.model
+        if self._rolling_load is None:
+            self._rolling_load = wp.zeros((max(model.body_count, 1), 4), dtype=wp.int64, device=model.device)
+        self._rolling_load.zero_()
+        if contacts is None or contacts.rigid_contact_count is None or not contacts.rigid_contact_max:
+            return
+        wp.launch(
+            accumulate_support_load,
+            dim=contacts.rigid_contact_max,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                model.shape_body,
+                model.body_flags,
+                *self._contact_force_inputs(contacts, 1.0)[1:-1],
+            ],
+            outputs=[self._rolling_load],
+            device=model.device,
+        )
+
+    def _apply_free_root_rolling_resistance(self, state_out: State, dt: float) -> None:
+        if not self._rolling_resistance_enabled() or not self._has_root_free or self._rolling_load is None:
+            return
+        model = self.model
+        wp.launch(
+            apply_free_root_rolling_resistance,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_X_c,
+                model.body_flags,
+                model.body_inertia,
+                self._articulation_root_is_free,
+                self._articulation_root_dof_start,
+                self._dynamics_art_active,
+                self._rolling_load,
+                self._free_rigid_rolling_resistance,
+                self._free_rigid_rolling_damping,
+                dt,
+                state_out.joint_q,
+            ],
+            outputs=[state_out.joint_qd],
+            device=model.device,
+        )
 
     def _stage6_integrate_position_from_velocity(
         self,
