@@ -86,7 +86,7 @@ def refresh_free_rigid_angular_friction(solver) -> None:
     model = solver.model
     attribute = _condim_attribute(model)
     if not solver._free_rigid_angular_rows:
-        if attribute is not None and model.shape_count and not wp.get_stream(model.device).is_capturing:
+        if attribute is not None and model.shape_count and not model.device.is_capturing:
             if np.any(attribute.numpy() >= 4):
                 raise ValueError(
                     "feather_pgs:condim above 3 needs a solver constructed with it; construct a new solver"
