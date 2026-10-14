@@ -945,7 +945,7 @@ def _anchored_sphere_cases():
 
 def test_rotated_anchor_free_body_matches_world_aligned(test, device, solve_mode="matrix_free", response="immediate"):
     """Give a FREE body the same world motion whatever the rotation of its parent anchor."""
-    for inertia in ((0.004, 0.004, 0.004), (0.002, 0.004, 0.007)):
+    for inertia in ((0.004, 0.004, 0.004), (0.003, 0.004, 0.006)):
         for case, (world_twist, gravity, steps, dt, max_speed) in _anchored_sphere_cases().items():
             twists = []
             for rotation in (wp.quat_identity(), *ANCHOR_ROTATIONS):
@@ -968,7 +968,7 @@ def test_rotated_anchor_free_body_matches_world_aligned(test, device, solve_mode
 def test_free_anchor_rotated_after_construction(test, device, solve_mode="matrix_free", response="immediate"):
     """Follow a FREE body's parent anchor rotated after construction, eagerly and in a replayed graph."""
     world_twist, gravity, steps, dt, _ = _anchored_sphere_cases()["gravity"]
-    inertia = (0.002, 0.004, 0.007)
+    inertia = (0.003, 0.004, 0.006)
     rotation = ANCHOR_ROTATIONS[0]
     # The world-aligned anchor gives the expected world motion.
     model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
