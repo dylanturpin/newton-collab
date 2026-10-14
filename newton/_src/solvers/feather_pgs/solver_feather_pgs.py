@@ -1168,9 +1168,9 @@ def _use_mfgs_pair_cache(
     world_count: int,
     sm_count: int,
 ) -> bool:
-    """Select the per-launch friction-pair operator cache when it fits and every world stays resident with it.
+    """Select the per-launch friction-pair operator cache when it fits and a shared-memory estimate keeps all worlds resident.
 
-    The cache shortens each world's serial chain but lowers blocks per SM, which only costs when worlds queue.
+    The estimate ignores block, register and carveout limits and concurrent work; it is a heuristic, not a guarantee.
     """
     metadata_bytes = (
         _mfgs_resident_metadata_bytes(max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits)
@@ -1186,6 +1186,7 @@ def _use_mfgs_pair_cache(
         pair_cache=True,
     )
     block_bytes = total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES
+    # Heuristic: shared memory per SM approximated by the per-block maximum.
     resident_worlds = sm_count * (max_shared_memory // block_bytes)
     # Row parents are stored as short.
     return (

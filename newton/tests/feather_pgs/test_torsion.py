@@ -2026,6 +2026,7 @@ class TestMfgsRowCaches(unittest.TestCase):
     """Solve with and without the per-launch friction-pair and row caches and require bitwise equal outputs."""
 
     def test_cached_solve_matches_uncached(self):
+        """Match every fixture output bitwise with the caches selected and disabled, for both metadata modes."""
         options = {**PATCH_OPTIONS, "iterations": 8, "spin": 10.0, "sliding": 1.0}
         for resident in (True, False):
             with (
@@ -2044,6 +2045,7 @@ class TestMfgsRowCaches(unittest.TestCase):
                     np.testing.assert_array_equal(np.asarray(value), np.asarray(plain[name]), err_msg=name)
 
     def test_selection_requires_static_fit_and_resident_worlds(self):
+        """Select the caches only within the static shared-memory bound and the estimated resident world count."""
         options = {"shared_metadata": False, "torsion_links": True, "has_drive_rows": False, "fuse_vel_limits": False}
         limit = 101376
         self.assertTrue(_use_mfgs_pair_cache(1024, 4096, 30, limit, world_count=123, sm_count=188, **options))
