@@ -23,6 +23,8 @@ from newton._src.math import orthonormal_basis
 
 from .contact_data import ContactData
 from .mpr import create_support_map_function
+from .support_function import unpack_mesh_ptr
+from .types import GeoType
 
 # Constants
 EPS = 0.00001
@@ -33,6 +35,25 @@ SIN_TILT_ANGLE = wp.static(math.sin(TILT_ANGLE_RAD))
 COS_TILT_ANGLE = wp.static(math.cos(TILT_ANGLE_RAD))
 
 COS_DEEPEST_CONTACT_THRESHOLD_ANGLE = wp.static(math.cos(0.1 * math.pi / 180.0))
+
+# Face clipping applies while the collision normal is within this angle of a reference face normal.
+COS_FACE_CLIP_MAX_ANGLE = wp.constant(math.cos(15.0 * math.pi / 180.0))
+# Vertices kept on the boundary of the incident face.
+FACE_CLIP_PATCH_CAPACITY = wp.constant(16)
+# Angle between the in-plane directions that sample an incident face with more vertices than the capacity.
+FACE_CLIP_DIRECTION_STEP = wp.constant(2.0 * math.pi / 16.0)
+# Face capacity plus one vertex per clip plane (four side planes and the contact gap).
+FACE_CLIP_POLYGON_CAPACITY = 21
+# Smallest incident-plane normal component along the reference normal for which face depths are flattened.
+FACE_CLIP_MIN_PLANE_DEPTH_SLOPE = wp.constant(1.0e-3)
+# Hull vertices within this distance [m] of the incident face plane belong to the face.
+FACE_CLIP_COPLANAR_DISTANCE = wp.constant(1.0e-5)
+# Patch points closer than this [m] are merged.
+FACE_CLIP_MERGE_DISTANCE_SQ = wp.constant(1.0e-8)
+# Twice the triangle area [m^2] below which a patch point adds no support.
+FACE_CLIP_MIN_DOUBLE_AREA = wp.constant(1.0e-10)
+# Allowed excess [m] of the patch depth over the MPR/GJK depth before falling back.
+FACE_CLIP_DEPTH_TOLERANCE = wp.constant(1.0e-4)
 
 
 @wp.func
@@ -648,7 +669,238 @@ def add_avoid_duplicates_vec2(arr: wp.array[wp.vec2], arr_count: int, vec: wp.ve
     return arr_count + 1, True
 
 
-def create_build_manifold(support_func: Any, writer_func: Any, post_process_contact: Any, _support_funcs: Any = None):
+@wp.func
+def face_clip_reference_face(geom: Any, normal: wp.vec3):
+    """Return the box or plane face whose outward normal is closest to ``normal``, in the shape's frame.
+
+    Returns ``(valid, face_normal, axis_u, axis_v, face_offset, half_extent_u, half_extent_v)``;
+    ``valid`` is false when ``normal`` is farther than the face-clip angle from that face normal.
+    """
+    axis = int(2)
+    face_offset = float(0.0)
+    if geom.shape_type == int(GeoType.BOX):
+        abs_x = wp.abs(normal[0])
+        abs_y = wp.abs(normal[1])
+        abs_z = wp.abs(normal[2])
+        if abs_x >= abs_y and abs_x >= abs_z:
+            axis = 0
+        elif abs_y >= abs_z:
+            axis = 1
+        face_offset = geom.scale[axis]
+    axis_u_index = (axis + 1) % 3
+    axis_v_index = (axis + 2) % 3
+    sign = 1.0 if normal[axis] >= 0.0 else -1.0
+    face_normal = wp.vec3(
+        sign if axis == 0 else 0.0,
+        sign if axis == 1 else 0.0,
+        sign if axis == 2 else 0.0,
+    )
+    axis_u = wp.vec3(
+        1.0 if axis_u_index == 0 else 0.0,
+        1.0 if axis_u_index == 1 else 0.0,
+        1.0 if axis_u_index == 2 else 0.0,
+    )
+    axis_v = wp.vec3(
+        1.0 if axis_v_index == 0 else 0.0,
+        1.0 if axis_v_index == 1 else 0.0,
+        1.0 if axis_v_index == 2 else 0.0,
+    )
+    valid = wp.abs(normal[axis]) >= COS_FACE_CLIP_MAX_ANGLE
+    return valid, face_normal, axis_u, axis_v, face_offset, geom.scale[axis_u_index], geom.scale[axis_v_index]
+
+
+@wp.func
+def face_clip_incident_face(
+    points: wp.array[wp.vec3],
+    indices: wp.array[wp.int32],
+    scale: wp.vec3,
+    axis_u: wp.vec3,
+    axis_v: wp.vec3,
+    face_normal: wp.vec3,
+    offset: wp.vec3,
+    face_vertices: wp.array[wp.vec3],
+    polygon: wp.array[wp.vec3],
+):
+    """Write the hull's incident face as a convex (u, v, depth) polygon.
+
+    Returns the vertex count and the incident plane's normal and a point on it, in (u, v, depth) coordinates.
+
+    The incident face is the hull face through the deepest vertex most anti-parallel to the reference
+    face, together with its coplanar vertices. Axes are in the hull's frame; ``offset`` holds the hull
+    origin's (u, v, depth); ``face_vertices`` is scratch storage.
+    """
+    vertex_count = points.shape[0]
+    deepest_index = int(0)
+    deepest_depth = float(0.0)
+    for i in range(vertex_count):
+        depth = wp.dot(wp.cw_mul(points[i], scale), face_normal)
+        if i == 0 or depth < deepest_depth:
+            deepest_depth = depth
+            deepest_index = i
+
+    best_alignment = float(-1.0)
+    plane_normal = face_normal
+    plane_point = wp.cw_mul(points[deepest_index], scale)
+    for t in range(indices.shape[0] // 3):
+        i0 = int(indices[3 * t])
+        i1 = int(indices[3 * t + 1])
+        i2 = int(indices[3 * t + 2])
+        if i0 != deepest_index and i1 != deepest_index and i2 != deepest_index:
+            continue
+        p0 = wp.cw_mul(points[i0], scale)
+        n = wp.cross(wp.cw_mul(points[i1], scale) - p0, wp.cw_mul(points[i2], scale) - p0)
+        length = wp.length(n)
+        if length <= 0.0:
+            continue
+        alignment = wp.abs(wp.dot(n, face_normal)) / length
+        if alignment > best_alignment:
+            best_alignment = alignment
+            plane_normal = n / length
+
+    plane_uvd_normal = wp.vec3(
+        wp.dot(plane_normal, axis_u), wp.dot(plane_normal, axis_v), wp.dot(plane_normal, face_normal)
+    )
+    plane_uvd_point = (
+        wp.vec3(wp.dot(plane_point, axis_u), wp.dot(plane_point, axis_v), wp.dot(plane_point, face_normal)) + offset
+    )
+
+    face_count = int(0)
+    start = wp.vec3(0.0)
+    for i in range(vertex_count):
+        p = wp.cw_mul(points[i], scale)
+        if wp.abs(wp.dot(p - plane_point, plane_normal)) > FACE_CLIP_COPLANAR_DISTANCE:
+            continue
+        c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
+        if face_count == 0 or c[0] < start[0] or (c[0] == start[0] and c[1] < start[1]):
+            start = c
+        if face_count < FACE_CLIP_PATCH_CAPACITY:
+            face_vertices[face_count] = c
+        face_count += 1
+
+    if face_count > FACE_CLIP_PATCH_CAPACITY:
+        # Too many face vertices to wrap: keep the extreme vertex along evenly spaced in-plane directions.
+        polygon_count = int(0)
+        for k in range(FACE_CLIP_PATCH_CAPACITY):
+            angle = float(k) * FACE_CLIP_DIRECTION_STEP
+            direction_u = wp.cos(angle)
+            direction_v = wp.sin(angle)
+            best = wp.vec3(0.0)
+            best_dot = float(0.0)
+            has_best = bool(False)
+            for i in range(vertex_count):
+                p = wp.cw_mul(points[i], scale)
+                if wp.abs(wp.dot(p - plane_point, plane_normal)) > FACE_CLIP_COPLANAR_DISTANCE:
+                    continue
+                c = wp.vec3(wp.dot(p, axis_u), wp.dot(p, axis_v), wp.dot(p, face_normal)) + offset
+                d = c[0] * direction_u + c[1] * direction_v
+                if (
+                    not has_best
+                    or d > best_dot
+                    or (d == best_dot and (c[0] < best[0] or (c[0] == best[0] and c[1] < best[1])))
+                ):
+                    best = c
+                    best_dot = d
+                    has_best = True
+            if polygon_count > 0:
+                du = best[0] - polygon[polygon_count - 1][0]
+                dv = best[1] - polygon[polygon_count - 1][1]
+                if du * du + dv * dv <= FACE_CLIP_MERGE_DISTANCE_SQ:
+                    continue
+                du = best[0] - polygon[0][0]
+                dv = best[1] - polygon[0][1]
+                if du * du + dv * dv <= FACE_CLIP_MERGE_DISTANCE_SQ:
+                    continue
+            polygon[polygon_count] = best
+            polygon_count += 1
+        return polygon_count, plane_uvd_normal, plane_uvd_point
+
+    # Counter-clockwise Jarvis march; collinear vertices resolve to the farthest.
+    current = start
+    polygon_count = int(0)
+    while polygon_count < FACE_CLIP_PATCH_CAPACITY:
+        polygon[polygon_count] = current
+        polygon_count += 1
+        has_next = bool(False)
+        next_point = current
+        next_dist_sq = float(0.0)
+        for i in range(face_count):
+            c = face_vertices[i]
+            du = c[0] - current[0]
+            dv = c[1] - current[1]
+            dist_sq = du * du + dv * dv
+            if dist_sq <= FACE_CLIP_MERGE_DISTANCE_SQ:
+                continue
+            if not has_next:
+                has_next = True
+                next_point = c
+                next_dist_sq = dist_sq
+                continue
+            cross = (next_point[0] - current[0]) * dv - (next_point[1] - current[1]) * du
+            if cross < -FACE_CLIP_MIN_DOUBLE_AREA or (cross <= FACE_CLIP_MIN_DOUBLE_AREA and dist_sq > next_dist_sq):
+                next_point = c
+                next_dist_sq = dist_sq
+        if not has_next:
+            break
+        du_start = next_point[0] - start[0]
+        dv_start = next_point[1] - start[1]
+        if du_start * du_start + dv_start * dv_start <= FACE_CLIP_MERGE_DISTANCE_SQ:
+            break
+        current = next_point
+    return polygon_count, plane_uvd_normal, plane_uvd_point
+
+
+@wp.func
+def face_clip_side(
+    src: wp.array[wp.vec3],
+    src_count: int,
+    dst: wp.array[wp.vec3],
+    coordinate: int,
+    sign: float,
+    limit: float,
+) -> int:
+    """Sutherland-Hodgman clip of a (u, v, depth) polygon to ``sign * p[coordinate] <= limit``.
+
+    Returns -1 without writing when the result would exceed ``dst``'s capacity.
+    """
+    if src_count <= 0:
+        return src_count
+    # Each kept vertex and each sign change emits one point; count them before writing.
+    required = int(0)
+    prev_dist = sign * src[src_count - 1][coordinate] - limit
+    for i in range(src_count):
+        cur_dist = sign * src[i][coordinate] - limit
+        if (cur_dist <= 0.0) != (prev_dist <= 0.0):
+            required += 1
+        if cur_dist <= 0.0:
+            required += 1
+        prev_dist = cur_dist
+    if required > dst.shape[0]:
+        return -1
+    dst_count = int(0)
+    prev = src[src_count - 1]
+    prev_dist = sign * prev[coordinate] - limit
+    for i in range(src_count):
+        cur = src[i]
+        cur_dist = sign * cur[coordinate] - limit
+        if (cur_dist <= 0.0) != (prev_dist <= 0.0):
+            t = prev_dist / (prev_dist - cur_dist)
+            dst[dst_count] = prev + t * (cur - prev)
+            dst_count += 1
+        if cur_dist <= 0.0:
+            dst[dst_count] = cur
+            dst_count += 1
+        prev = cur
+        prev_dist = cur_dist
+    return dst_count
+
+
+def create_build_manifold(
+    support_func: Any,
+    writer_func: Any,
+    post_process_contact: Any,
+    _support_funcs: Any = None,
+    face_clip: bool = False,
+):
     """
     Factory function to create manifold generation functions with a specific support mapping function.
 
@@ -661,6 +913,8 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                      (geometry, direction, data_provider) and returns a support point
         writer_func: Function to write contact data (signature: (ContactData, writer_data) -> None)
         post_process_contact: Function to post-process contact data
+        face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's contact patch
+            against the box or plane reference face, falling back to perturbed support mapping.
 
     Returns:
         build_manifold function that generates up to 5 contact points between two shapes
@@ -776,6 +1030,131 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
         return loop_count, normal_dot
 
     @wp.func
+    def build_face_clip_manifold(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_a: wp.quat,
+        position_a_world: wp.vec3,
+        relative_orientation_b: wp.quat,
+        relative_position_b: wp.vec3,
+        p_a: wp.vec3,
+        p_b: wp.vec3,
+        normal: wp.vec3,
+        writer_data: Any,
+        contact_template: ContactData,
+    ) -> int:
+        """Write up to 4 contacts from the convex mesh B's patch clipped to box or plane A's reference face.
+
+        Writes nothing and returns 0 when the reference face does not explain the MPR/GJK contact.
+        """
+        valid, face_normal, axis_u, axis_v, face_offset, half_u, half_v = face_clip_reference_face(geom_a, normal)
+        if not valid:
+            return 0
+
+        depth_max = contact_template.gap_sum + contact_template.margin_a + contact_template.margin_b
+        offset = wp.vec3(
+            wp.dot(relative_position_b, axis_u),
+            wp.dot(relative_position_b, axis_v),
+            wp.dot(relative_position_b, face_normal) - face_offset,
+        )
+        mesh = wp.mesh_get(unpack_mesh_ptr(geom_b.auxiliary))
+        polygon = wp.zeros(shape=(FACE_CLIP_POLYGON_CAPACITY,), dtype=wp.vec3f)
+        scratch = wp.zeros(shape=(FACE_CLIP_POLYGON_CAPACITY,), dtype=wp.vec3f)
+        count, plane_normal, plane_point = face_clip_incident_face(
+            mesh.points,
+            mesh.indices,
+            geom_b.scale,
+            wp.quat_rotate_inv(relative_orientation_b, axis_u),
+            wp.quat_rotate_inv(relative_orientation_b, axis_v),
+            wp.quat_rotate_inv(relative_orientation_b, face_normal),
+            offset,
+            scratch,
+            polygon,
+        )
+        count = face_clip_side(polygon, count, scratch, 0, 1.0, half_u)
+        count = face_clip_side(scratch, count, polygon, 0, -1.0, half_u)
+        count = face_clip_side(polygon, count, scratch, 1, 1.0, half_v)
+        count = face_clip_side(scratch, count, polygon, 1, -1.0, half_v)
+        if count < 0:
+            return 0
+        clipped_count = face_clip_side(polygon, count, scratch, 2, 1.0, depth_max)
+        if clipped_count < 0:
+            # Face vertices lie within the coplanarity tolerance, so their depths can cross the gap plane many
+            # times; flattening them onto the incident plane makes the depth clip add at most one vertex.
+            if wp.abs(plane_normal[2]) <= FACE_CLIP_MIN_PLANE_DEPTH_SLOPE:
+                return 0
+            for i in range(count):
+                p = polygon[i]
+                depth = (
+                    plane_point[2]
+                    - (plane_normal[0] * (p[0] - plane_point[0]) + plane_normal[1] * (p[1] - plane_point[1]))
+                    / plane_normal[2]
+                )
+                polygon[i] = wp.vec3(p[0], p[1], depth)
+            clipped_count = face_clip_side(polygon, count, scratch, 2, 1.0, depth_max)
+            if clipped_count < 0:
+                return 0
+        count = clipped_count
+
+        # Reduce to the deepest point, the farthest point, then the largest triangle and quadrilateral.
+        chosen = wp.zeros(shape=(4,), dtype=wp.vec3f)
+        chosen_count = int(0)
+        for i in range(count):
+            if chosen_count == 0 or scratch[i][2] < chosen[0][2]:
+                chosen[0] = scratch[i]
+                chosen_count = 1
+        if chosen_count == 0 or chosen[0][2] > wp.dot(p_b - p_a, normal) + FACE_CLIP_DEPTH_TOLERANCE:
+            return 0
+
+        p0 = chosen[0]
+        best_dist_sq = float(FACE_CLIP_MERGE_DISTANCE_SQ)
+        for i in range(count):
+            du = scratch[i][0] - p0[0]
+            dv = scratch[i][1] - p0[1]
+            dist_sq = du * du + dv * dv
+            if dist_sq > best_dist_sq:
+                best_dist_sq = dist_sq
+                chosen[1] = scratch[i]
+                chosen_count = 2
+        if chosen_count == 2:
+            eu = chosen[1][0] - p0[0]
+            ev = chosen[1][1] - p0[1]
+            best_area = float(FACE_CLIP_MIN_DOUBLE_AREA)
+            side = float(0.0)
+            for i in range(count):
+                area = eu * (scratch[i][1] - p0[1]) - ev * (scratch[i][0] - p0[0])
+                if wp.abs(area) > best_area:
+                    best_area = wp.abs(area)
+                    side = wp.sign(area)
+                    chosen[2] = scratch[i]
+                    chosen_count = 3
+            if chosen_count == 3:
+                best_area = float(FACE_CLIP_MIN_DOUBLE_AREA)
+                for i in range(count):
+                    area = -side * (eu * (scratch[i][1] - p0[1]) - ev * (scratch[i][0] - p0[0]))
+                    if area > best_area:
+                        best_area = area
+                        chosen[3] = scratch[i]
+                        chosen_count = 4
+
+        normal_world = wp.quat_rotate(orientation_a, face_normal)
+        position_b_ws = wp.quat_rotate(orientation_a, relative_position_b) + position_a_world
+        quaternion_b_ws = orientation_a * relative_orientation_b
+        for slot in range(chosen_count):
+            point = chosen[slot]
+            center_local = point[0] * axis_u + point[1] * axis_v + (face_offset + 0.5 * point[2]) * face_normal
+            contact_data = contact_template
+            contact_data.contact_point_center = wp.quat_rotate(orientation_a, center_local) + position_a_world
+            contact_data.contact_normal_a_to_b = normal_world
+            contact_data.contact_distance = point[2]
+            contact_data.sort_sub_key = (contact_template.sort_sub_key << 3) | slot
+            contact_data = post_process_contact(
+                contact_data, geom_a, position_a_world, orientation_a, geom_b, position_b_ws, quaternion_b_ws
+            )
+            writer_func(contact_data, writer_data, -1)
+        return chosen_count
+
+    @wp.func
     def build_manifold(
         geom_a: Any,
         geom_b: Any,
@@ -814,6 +1193,25 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
         Returns:
             Number of valid contact points written (0-5).
         """
+        if wp.static(face_clip):
+            if (
+                geom_a.shape_type == int(GeoType.BOX) or geom_a.shape_type == int(GeoType.PLANE)
+            ) and geom_b.shape_type == int(GeoType.CONVEX_MESH):
+                face_clip_count = build_face_clip_manifold(
+                    geom_a,
+                    geom_b,
+                    orientation_a,
+                    position_a_world,
+                    relative_orientation_b,
+                    relative_position_b,
+                    p_a,
+                    p_b,
+                    normal,
+                    writer_data,
+                    contact_template,
+                )
+                if face_clip_count > 0:
+                    return face_clip_count
 
         # Precomputed cos/sin for 5 evenly spaced pentagonal angles (0, 72, 144, 216, 288 deg).
         PENT_COS_0 = float(1.0)
