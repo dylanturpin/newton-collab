@@ -26038,17 +26038,10 @@ def _get_pgs_solve_mf_gs_kernel(
     torsion_sweep = torque_sweep_source(D, linked=torsion_links) if contact_torsion else ""
     torsion_link_build = torque_links_source(M_D) if contact_torsion and torsion_links else ""
     pair_cache_capacity = _mfgs_pair_cache_capacity(M_D)
-    prologue_cross_code = "\n".join(
+    # Streamed metadata rereads row types and parents on every sweep (patch chains, torsion members).
+    row_cache = pair_cache and not shared_metadata
+    row_cache_build = (
         f"""
-            if ({f"lane + {k * 32}" if k > 0 else "lane"} < {D}) {{
-                cross += {dense_j_read("row_base", f"lane + {k * 32}" if k > 0 else "lane")}"""
-        f""" * Y_world.data[sib_row_base + {f"lane + {k * 32}" if k > 0 else "lane"}];
-            }}"""
-        for k in range(ELEMS_PER_LANE)
-    )
-    pair_cache_build = (
-        f"""
-    // Row types and parents are walked many times per sweep (patch chains, torsion members); keep a compact copy.
     __shared__ unsigned char s_row_type[{M_D}];
     __shared__ short s_row_parent[{M_D}];
     {{
@@ -26060,7 +26053,21 @@ def _get_pgs_solve_mf_gs_kernel(
         }}
         __syncwarp();
     }}
-    // Each friction pair's 2x2 operator depends only on its rows, so it is set up once per launch.
+"""
+        if row_cache
+        else ""
+    )
+    prologue_cross_code = "\n".join(
+        f"""
+            if ({f"lane + {k * 32}" if k > 0 else "lane"} < {D}) {{
+                cross += {dense_j_read("row_base", f"lane + {k * 32}" if k > 0 else "lane")}"""
+        f""" * Y_world.data[sib_row_base + {f"lane + {k * 32}" if k > 0 else "lane"}];
+            }}"""
+        for k in range(ELEMS_PER_LANE)
+    )
+    pair_cache_build = (
+        f"""
+{row_cache_build}    // Each friction pair's 2x2 operator depends only on its rows, so it is set up once per launch.
     __shared__ short s_pair_slot[{M_D}];
     __shared__ float s_pair_op[5][{pair_cache_capacity}];
     {{
@@ -26604,7 +26611,7 @@ def _get_pgs_solve_mf_gs_kernel(
             )
         snippet = _prefetch_streamed_dense_metadata(snippet)
 
-    if pair_cache:
+    if row_cache:
         # Every later row type/parent read comes from the compact shared copy.
         snippet = re.sub(r"world_row_type\.data\[off_dense \+ ([^\]]+)\]", r"s_row_type[\1]", snippet)
         snippet = re.sub(r"world_row_parent\.data\[off_dense \+ ([^\]]+)\]", r"s_row_parent[\1]", snippet)
