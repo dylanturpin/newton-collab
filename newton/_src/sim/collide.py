@@ -1802,6 +1802,7 @@ class CollisionPipeline:
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
         box_box_sat: bool = False,
+        convex_face_clip: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1902,6 +1903,12 @@ class CollisionPipeline:
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
+            convex_face_clip: Build box/plane versus convex-mesh manifolds by
+                clipping the hull's contact patch (its vertices within the contact
+                gap) against the box or plane reference face, keeping up to 4
+                points. Rounded hulls then rest on their facets instead of a single
+                support vertex. Cannot be combined with a prebuilt ``narrow_phase``.
+                Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -2113,6 +2120,11 @@ class CollisionPipeline:
                 raise ValueError(
                     "box_box_sat cannot be used when narrow_phase is provided; "
                     "construct the NarrowPhase with box_box_sat=True instead"
+                )
+            if convex_face_clip:
+                raise ValueError(
+                    "convex_face_clip cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with convex_face_clip=True instead"
                 )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
@@ -2418,6 +2430,7 @@ class CollisionPipeline:
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 box_box_sat=box_box_sat,
+                convex_face_clip=convex_face_clip,
                 convex_support_acceleration=model._convex_support_lut.shape[0] > 1,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,

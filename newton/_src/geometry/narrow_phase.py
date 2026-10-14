@@ -1159,6 +1159,7 @@ def create_narrow_phase_kernel_gjk_mpr(
     support_func: Any = None,
     post_process_contact: Any = None,
     speculative: bool = False,
+    face_clip: bool = False,
 ):
     """
     Create a GJK/MPR narrow phase kernel for complex convex shape collisions.
@@ -1174,7 +1175,9 @@ def create_narrow_phase_kernel_gjk_mpr(
     """
     _sf = support_func.__name__ if support_func is not None else "default"
     _ppc = post_process_contact.__name__ if post_process_contact is not None else "default"
-    _module = f"narrow_phase_gjk_mpr_{external_aabb}_{speculative}_{writer_func.__name__}_{_sf}_{_ppc}"
+    _module = (
+        f"narrow_phase_gjk_mpr_{external_aabb}_{speculative}_{writer_func.__name__}_{_sf}_{_ppc}_fc{int(face_clip)}"
+    )
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
 
@@ -1344,7 +1347,12 @@ def create_narrow_phase_kernel_gjk_mpr(
 
             # Find and write contacts using GJK/MPR
             wp.static(
-                create_find_contacts(writer_func, support_func=support_func, post_process_contact=post_process_contact)
+                create_find_contacts(
+                    writer_func,
+                    support_func=support_func,
+                    post_process_contact=post_process_contact,
+                    face_clip=face_clip,
+                )
             )(
                 pos_a,
                 pos_b,
@@ -1374,6 +1382,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     support_func: Any = None,
     post_process_contact: Any = None,
     speculative: bool = False,
+    face_clip: bool = False,
 ):
     """Create graph-capturable MPR, GJK/refinement, and manifold work-queue kernels."""
     if support_func is None:
@@ -1386,10 +1395,11 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
-        support_func, writer_func, post_process_contact, use_precomputed_center=True
+        support_func, writer_func, post_process_contact, use_precomputed_center=True, face_clip=face_clip
     )
     suffix = (
         f"{external_aabb}_{writer_func.__name__}_{support_func.__name__}_{post_process_contact.__name__}_{speculative}"
+        f"_fc{int(face_clip)}"
     )
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
@@ -2484,6 +2494,7 @@ class NarrowPhase:
         shape_voxel_resolution: wp.array[wp.vec3i] | None = None,
         contact_writer_warp_func: Any | None = None,
         box_box_sat: bool = False,
+        convex_face_clip: bool = False,
         hydroelastic_sdf: HydroelasticSDF | None = None,
         has_meshes: bool = True,
         has_heightfields: bool = False,
@@ -2524,6 +2535,8 @@ class NarrowPhase:
                 hydroelastic contact processing. When omitted, :class:`~newton.CollisionPipeline`
                 supplies the model's table. A supplied table must match that model's shape count and device.
             contact_writer_warp_func: Optional custom contact writer function (first arg: ContactData, second arg: custom struct type)
+            convex_face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's contact
+                patch against the box or plane reference face. Defaults to False.
             hydroelastic_sdf: Optional SDF hydroelastic instance. Set is_hydroelastic=True on shapes to enable hydroelastic collisions.
             has_meshes: Whether the scene contains any mesh shapes (GeoType.MESH). When False, mesh-related
                 kernel launches are skipped, improving performance for scenes with only primitive shapes.
@@ -2715,6 +2728,7 @@ class NarrowPhase:
                 support_func=support_map_lean_accelerated if convex_support_acceleration else support_map_lean,
                 post_process_contact=post_process_minkowski_only,
                 speculative=speculative,
+                face_clip=convex_face_clip,
             )
         else:
             self.narrow_phase_kernel = create_narrow_phase_kernel_gjk_mpr(
@@ -2722,6 +2736,7 @@ class NarrowPhase:
                 writer_func,
                 support_func=support_map_accelerated if convex_support_acceleration else support_map,
                 speculative=speculative,
+                face_clip=convex_face_clip,
             )
 
         if self.split_gjk_mpr:
@@ -2741,6 +2756,7 @@ class NarrowPhase:
                 support_func=split_support,
                 post_process_contact=split_post_process,
                 speculative=speculative,
+                face_clip=convex_face_clip,
             )
         else:
             self.narrow_phase_mpr_kernel = None

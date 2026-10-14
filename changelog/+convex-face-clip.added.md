@@ -1,0 +1,1 @@
+Add `CollisionPipeline(convex_face_clip=True)` to build box and plane versus convex-mesh manifolds by clipping the hull's incident face against the box or plane reference face. Rounded convex hulls then rest on their facets with up to 4 contacts instead of rolling on a single support vertex.
