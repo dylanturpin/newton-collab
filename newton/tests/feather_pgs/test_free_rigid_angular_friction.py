@@ -26,7 +26,7 @@ _GRAVITY = 9.81
 _ROLLING = {"linear": (0.0, -0.3, 0.0), "angular": (10.0, 0.0, 0.0)}
 # Principal moments 0.6, 1 and 1.4 with an x-z product: a physically valid anisotropic inertia.
 _ANISOTROPIC = np.array([[1.0, 0.0, 0.4], [0.0, 1.0, 0.0], [0.4, 0.0, 1.0]])
-_ON = {"enable_free_rigid_angular_friction": True, "free_rigid_torsional_friction": 0.0}
+_ON = {"free_rigid_torsional_friction": 0.0}
 
 
 def _coulomb_stopping_distance(speed: float, rolling: float) -> float:
@@ -78,6 +78,8 @@ def _simulate(
     inertia=None,
     steps=None,
     rolling_material=None,
+    torsional_material=None,
+    condim=None,
     count=1,
     support_angular=None,
     observe=None,
@@ -89,6 +91,10 @@ def _simulate(
         set_torsion_radius(model, torsion_radius)
     if rolling_material is not None:
         model.shape_material_mu_rolling.fill_(rolling_material)
+    if torsional_material is not None:
+        model.shape_material_mu_torsional.fill_(torsional_material)
+    if condim is not None:
+        model.feather_pgs.condim.fill_(condim)
     options = {"solve_mode": "matrix_free", "iterations": 32, "deterministic": True, **solver_kwargs}
     solver = SolverFeatherPGS(model, **options)
     pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching=contact_matching)
@@ -151,19 +157,30 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                 expected = _coulomb_stopping_distance(0.3, rolling)
                 self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
 
-    def test_material_coefficient_matches_the_override(self):
-        """Read the shape material rolling coefficient when no override is given."""
-        material, _, _ = _simulate("sphere", 0.5, rolling_material=0.002, **_ON, **_ROLLING)
+    def test_condim_and_materials_match_the_override(self):
+        """Read the shape materials where feather_pgs:condim is 6, as the solver-wide override does everywhere."""
+        material, _, _ = _simulate("sphere", 0.5, condim=6, rolling_material=0.002, torsional_material=0.0, **_ROLLING)
         override, _, _ = _simulate(
             "sphere", 0.5, rolling_material=0.0, free_rigid_rolling_friction=0.002, **_ON, **_ROLLING
         )
         np.testing.assert_array_equal(material, override)
 
+    def test_condim_selects_the_rows(self):
+        """Add a spin row at condim 4 and a rolling pair at 6, from the builder's default coefficients."""
+        for condim, expected in ((3, 3), (4, 4), (6, 6)):
+            seen = {}
+
+            def observe(solver, contacts, observables, seen=seen):
+                seen["slots"] = int(solver._contact_slots_needed.numpy()[0])
+
+            with self.subTest(condim=condim):
+                _simulate("sphere", 0.0, steps=1, condim=condim, observe=observe)
+                self.assertEqual(seen["slots"], expected)
+
     def test_spin_row_stops_a_spinning_sphere_at_the_coulomb_rate(self):
         """Decelerate a sphere spinning on its contact point at mu_s m g / I, and stop it."""
         torsional = 5.0e-4
         options = {
-            "enable_free_rigid_angular_friction": True,
             "free_rigid_torsional_friction": torsional,
             "free_rigid_rolling_friction": 0.0,
         }
@@ -199,7 +216,6 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                     0.0,
                     free_rigid_rolling_friction=rolling,
                     free_rigid_torsional_friction=rolling,
-                    enable_free_rigid_angular_friction=True,
                     **kwargs,
                 )
                 start = 0.5 * float(np.asarray(omega) @ inertia @ np.asarray(omega))
@@ -215,13 +231,9 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         self.assertLess(abs(free[5]), 1.0e-3)
         options = {"free_rigid_torsional_friction": torsional, "free_rigid_rolling_friction": 0.0}
         rate = torsional * _GRAVITY / (0.4 * _RADIUS**2)
-        _, twist, _ = _simulate(
-            "sphere", 0.1, support_angular=table, enable_free_rigid_angular_friction=True, **options
-        )
+        _, twist, _ = _simulate("sphere", 0.1, support_angular=table, **options)
         self.assertAlmostEqual(twist[5], rate * 0.1, delta=0.05)
-        _, twist, _ = _simulate(
-            "sphere", 0.5, support_angular=table, enable_free_rigid_angular_friction=True, **options
-        )
+        _, twist, _ = _simulate("sphere", 0.5, support_angular=table, **options)
         self.assertAlmostEqual(twist[5], 2.0, delta=1.0e-3)
 
     def test_toppling_and_sliding_cube_are_unchanged(self):
@@ -279,7 +291,6 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             0.0,
             steps=3,
             friction_anchor_beta=0.2,
-            enable_free_rigid_angular_friction=True,
             free_rigid_rolling_friction=0.002,
             free_rigid_torsional_friction=0.001,
             observe=observe,
@@ -304,21 +315,12 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         np.testing.assert_array_equal(first, second)
         np.testing.assert_array_equal(first, captured)
 
-    def test_off_and_zero_coefficients_match_the_default(self):
-        """Match the default bit for bit when disabled, and add no rows for zero coefficients."""
+    def test_default_condim_and_zero_coefficients_match_the_base(self):
+        """Match the default bit for bit at condim 3, and add no rows for zero coefficients at condim 6."""
         default, _, _ = _simulate("sphere", 0.3, **_ROLLING)
-        disabled, _, _ = _simulate(
-            "sphere", 0.3, enable_free_rigid_angular_friction=False, free_rigid_rolling_friction=0.01, **_ROLLING
-        )
-        zero, _, _ = _simulate(
-            "sphere",
-            0.3,
-            enable_free_rigid_angular_friction=True,
-            free_rigid_rolling_friction=0.0,
-            free_rigid_torsional_friction=0.0,
-            **_ROLLING,
-        )
-        np.testing.assert_array_equal(default, disabled)
+        condim3, _, _ = _simulate("sphere", 0.3, condim=3, **_ROLLING)
+        zero, _, _ = _simulate("sphere", 0.3, condim=6, rolling_material=0.0, torsional_material=0.0, **_ROLLING)
+        np.testing.assert_array_equal(default, condim3)
         np.testing.assert_array_equal(default, zero)
 
     def test_body_parent_f_balances_the_rolling_torque(self):
@@ -338,17 +340,25 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         self.assertLess(float(np.linalg.norm(seen["parent"][3:])), 0.02 * torque)
 
     def test_invalid_options_raise(self):
-        """Reject negative and non-finite coefficients and unsupported solve modes."""
+        """Reject bad coefficients and condim, unsupported solve modes, and a condim raise without rebuilding."""
         model, _ = _scene("sphere")
         for value in (-1.0e-3, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                SolverFeatherPGS(model, enable_free_rigid_angular_friction=True, free_rigid_rolling_friction=value)
+                SolverFeatherPGS(model, free_rigid_rolling_friction=value)
         with self.assertRaises(ValueError):
-            SolverFeatherPGS(model, solve_mode="split", enable_free_rigid_angular_friction=True)
+            SolverFeatherPGS(model, solve_mode="split", free_rigid_rolling_friction=1.0e-3)
         with self.assertRaises(ValueError):
             SolverFeatherPGS(
-                model, solve_mode="matrix_free", friction_mode="bisection", enable_free_rigid_angular_friction=True
+                model, solve_mode="matrix_free", friction_mode="bisection", free_rigid_rolling_friction=1.0e-3
             )
+        model.feather_pgs.condim.fill_(7)
+        with self.assertRaises(ValueError):
+            SolverFeatherPGS(model, solve_mode="matrix_free")
+        model.feather_pgs.condim.fill_(3)
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free")
+        model.feather_pgs.condim.fill_(6)
+        with self.assertRaises(ValueError):
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
 
 if __name__ == "__main__":

@@ -4945,6 +4945,25 @@ def contact_angular_friction_coefficients(
 
 
 @wp.func
+def free_rigid_angular_friction_coefficients(
+    shape_a: int,
+    shape_b: int,
+    shape_mu_torsional: wp.array[float],
+    shape_mu_rolling: wp.array[float],
+):
+    """Return a free-rigid pair's torsional and rolling coefficients [m]: the larger of its shapes' gated values."""
+    torsional = float(0.0)
+    rolling = float(0.0)
+    if shape_a >= 0:
+        torsional = wp.max(torsional, shape_mu_torsional[shape_a])
+        rolling = wp.max(rolling, shape_mu_rolling[shape_a])
+    if shape_b >= 0:
+        torsional = wp.max(torsional, shape_mu_torsional[shape_b])
+        rolling = wp.max(rolling, shape_mu_rolling[shape_b])
+    return torsional, rolling
+
+
+@wp.func
 def _first_patch_anchor(patches: FrictionPatches, c: int):
     """Return whether no anchor of contact ``c``'s friction patch precedes it in contact order."""
     row = patches.next_contact[c]
@@ -4997,6 +5016,8 @@ def _allocate_world_contact_slot(
     angular_friction_enabled: int,
     shape_material_mu_torsional: wp.array[float],
     shape_material_mu_rolling: wp.array[float],
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
     classify_only: int,
     # outputs
     contact_world: wp.array[int],
@@ -5173,8 +5194,8 @@ def _allocate_world_contact_slot(
             if torsional > 0.0 or rolling > 0.0:
                 slots_needed = 6
         if (angular_friction_enabled & ANGULAR_FRICTION_FREE_RIGID) != 0 and is_mf != 0:
-            torsional, rolling = contact_angular_friction_coefficients(
-                shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+            torsional, rolling = free_rigid_angular_friction_coefficients(
+                shape_a, shape_b, free_rigid_mu_torsional, free_rigid_mu_rolling
             )
             # A friction patch carries one set of angular rows, on its first anchor, with the patch's whole budget.
             if friction_patches.enabled == 0 or _first_patch_anchor(friction_patches, c):
@@ -5275,6 +5296,8 @@ def allocate_world_contact_slots(
     angular_friction_enabled: int,
     shape_material_mu_torsional: wp.array[float],
     shape_material_mu_rolling: wp.array[float],
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
     classify_only: int,
     # outputs
     contact_world: wp.array[int],
@@ -5352,6 +5375,8 @@ def allocate_world_contact_slots(
             angular_friction_enabled,
             shape_material_mu_torsional,
             shape_material_mu_rolling,
+            free_rigid_mu_torsional,
+            free_rigid_mu_rolling,
             classify_only,
             contact_world,
             contact_slot,
@@ -7670,8 +7695,8 @@ def build_mf_angular_friction_rows(
     body_v_s: wp.array[wp.spatial_vector],
     prescribed_articulation: wp.array[int],
     has_target_velocity: int,
-    shape_material_mu_torsional: wp.array[float],
-    shape_material_mu_rolling: wp.array[float],
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7698,8 +7723,8 @@ def build_mf_angular_friction_rows(
         world = contact_world[c]
         shape_a = contact_shape0[c]
         shape_b = contact_shape1[c]
-        torsional, rolling = contact_angular_friction_coefficients(
-            shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+        torsional, rolling = free_rigid_angular_friction_coefficients(
+            shape_a, shape_b, free_rigid_mu_torsional, free_rigid_mu_rolling
         )
         body_a = -1
         body_b = -1

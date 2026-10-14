@@ -63,21 +63,54 @@ def configure_torsional_rolling_friction(solver, enabled: bool, cone: str, creep
     solver._torsional_rolling_friction_creep_speed = creep_speed
 
 
-def configure_free_rigid_angular_friction(
-    solver, enabled: bool, torsional: float | None, rolling: float | None
-) -> None:
-    """Record the free-rigid opt-in and its optional coefficient overrides [m]."""
+def configure_free_rigid_angular_friction(solver, model, torsional: float | None, rolling: float | None) -> None:
+    """Decide from the shapes' ``feather_pgs:condim`` and the overrides whether free-rigid contacts get angular rows."""
     for name, value in (("free_rigid_torsional_friction", torsional), ("free_rigid_rolling_friction", rolling)):
         if value is not None and (not np.isfinite(float(value)) or float(value) < 0.0):
             raise ValueError(f"{name} must be finite and non-negative [m], or None")
-    solver._enable_free_rigid_angular_friction = bool(enabled)
     solver._free_rigid_torsional_friction = None if torsional is None else float(torsional)
     solver._free_rigid_rolling_friction = None if rolling is None else float(rolling)
+    condim = _shape_condim(model)
+    if condim is not None and np.any((condim < 1) | (condim > 6)):
+        raise ValueError("feather_pgs:condim must be between 1 and 6")
+    overridden = torsional is not None or rolling is not None
+    solver._free_rigid_angular_rows = bool(overridden or (condim is not None and np.any(condim >= 4)))
+
+
+def refresh_free_rigid_angular_friction(solver) -> None:
+    """Write each shape's free-rigid torsional and rolling coefficients [m], zero where its condim excludes them."""
+    model = solver.model
+    condim = _shape_condim(model)
+    if not solver._free_rigid_angular_rows:
+        if condim is not None and np.any(condim >= 4):
+            raise ValueError("feather_pgs:condim above 3 needs a solver constructed with it; construct a new solver")
+        return
+    if not model.shape_count:
+        return
+    overridden = solver._free_rigid_torsional_friction is not None or solver._free_rigid_rolling_friction is not None
+    # An override stands for every shape at condim 6 with that coefficient.
+    dims = np.full(model.shape_count, 6, dtype=np.int32) if overridden or condim is None else condim
+    for buffer, values, override, minimum in (
+        (solver._free_rigid_mu_torsional, model.shape_material_mu_torsional, solver._free_rigid_torsional_friction, 4),
+        (solver._free_rigid_mu_rolling, model.shape_material_mu_rolling, solver._free_rigid_rolling_friction, 6),
+    ):
+        coefficients = np.zeros(model.shape_count, dtype=np.float32) if values is None else values.numpy()
+        if override is not None:
+            coefficients = np.full(model.shape_count, override, dtype=np.float32)
+        coefficients = np.nan_to_num(coefficients, nan=0.0, posinf=0.0, neginf=0.0)
+        coefficients = np.where((dims >= minimum) & (coefficients > 0.0), coefficients, 0.0).astype(np.float32)
+        buffer.assign(np.pad(coefficients, (0, buffer.shape[0] - model.shape_count)))
+
+
+def _shape_condim(model) -> np.ndarray | None:
+    namespace = getattr(model, "feather_pgs", None)
+    attribute = getattr(namespace, "condim", None)
+    return None if attribute is None or not model.shape_count else attribute.numpy()
 
 
 def validate_free_rigid_angular_friction_mode(solver) -> None:
     """Reject solver options whose matrix-free solves do not visit the free-rigid angular rows."""
-    if not solver._enable_free_rigid_angular_friction:
+    if not solver._free_rigid_angular_rows:
         return
     model = solver.model
     if (
@@ -93,18 +126,10 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         or (solver._has_free_rigid_bodies and solver._pgs_solve_mf_gs_kernel is None)
     ):
         raise ValueError(
-            "enable_free_rigid_angular_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "
+            "Free-rigid angular friction (feather_pgs:condim above 3) requires CUDA non-differentiable matrix_free/immediate/interleaved "
             "solving with friction_mode='fixed_normal', the fused matrix-free GS kernel, and no contact compliance "
             "or free-free propagation routing"
         )
-
-
-def apply_free_rigid_angular_friction_overrides(solver) -> None:
-    """Replace the solver's torsional and rolling material buffers with the configured overrides."""
-    if solver._free_rigid_torsional_friction is not None:
-        solver._shape_mu_torsional.fill_(solver._free_rigid_torsional_friction)
-    if solver._free_rigid_rolling_friction is not None:
-        solver._shape_mu_rolling.fill_(solver._free_rigid_rolling_friction)
 
 
 def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
@@ -129,8 +154,8 @@ def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads
             state_aug._body_v_s,
             solver._prescribed_articulation,
             int(solver._has_prescribed_response),
-            solver._shape_mu_torsional,
-            solver._shape_mu_rolling,
+            solver._free_rigid_mu_torsional,
+            solver._free_rigid_mu_rolling,
         ],
         outputs=[
             solver._mf_body_a,
@@ -179,7 +204,7 @@ def validate_torsional_rolling_friction_coefficients(solver) -> None:
     if (
         not solver._enable_torsional_rolling_friction
         or not solver._has_free_rigid_bodies
-        or solver._enable_free_rigid_angular_friction
+        or solver._free_rigid_angular_rows
     ):
         return
     model = solver.model
