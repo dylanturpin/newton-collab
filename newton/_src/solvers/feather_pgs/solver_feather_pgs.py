@@ -1147,7 +1147,7 @@ def _estimate_mfgs_shared_memory(
 
 def _mfgs_pair_cache_capacity(max_constraints: int) -> int:
     """Return the most dense friction pairs a world holds: each pair owns its normal row and two tangent rows."""
-    return max_constraints // 3
+    return max(max_constraints // 3, 1)
 
 
 def _mfgs_pair_cache_bytes(max_constraints: int) -> int:
