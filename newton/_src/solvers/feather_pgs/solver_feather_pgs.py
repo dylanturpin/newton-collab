@@ -1151,8 +1151,8 @@ def _mfgs_pair_cache_capacity(max_constraints: int) -> int:
 
 
 def _mfgs_pair_cache_bytes(max_constraints: int) -> int:
-    """Return the shared-memory footprint [B] of the per-launch friction-pair operator cache."""
-    return 2 * max_constraints + 4 * 5 * _mfgs_pair_cache_capacity(max_constraints)
+    """Return the shared-memory footprint [B] of the per-launch row type/parent copy and friction-pair cache."""
+    return 5 * max_constraints + 4 * 5 * _mfgs_pair_cache_capacity(max_constraints)
 
 
 def _use_mfgs_pair_cache(
@@ -1180,7 +1180,8 @@ def _use_mfgs_pair_cache(
         torsion_links=torsion_links,
         pair_cache=True,
     )
-    return total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
+    # Row parents are stored as short.
+    return max_constraints <= 32767 and total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
         _STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory
     )
 
@@ -26047,6 +26048,18 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     pair_cache_build = (
         f"""
+    // Row types and parents are walked many times per sweep (patch chains, torsion members); keep a compact copy.
+    __shared__ unsigned char s_row_type[{M_D}];
+    __shared__ short s_row_parent[{M_D}];
+    {{
+        const int* row_type_source = &world_row_type.data[off_dense];
+        const int* row_parent_source = &world_row_parent.data[off_dense];
+        for (int r = lane; r < m_dense; r += 32) {{
+            s_row_type[r] = (unsigned char)row_type_source[r];
+            s_row_parent[r] = (short)row_parent_source[r];
+        }}
+        __syncwarp();
+    }}
     // Each friction pair's 2x2 operator depends only on its rows, so it is set up once per launch.
     __shared__ short s_pair_slot[{M_D}];
     __shared__ float s_pair_op[5][{pair_cache_capacity}];
@@ -26170,7 +26183,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
     // ═══════════════════════════════════════════════════════
-{torsion_link_build}{pair_cache_build}
+{pair_cache_build}{torsion_link_build}
     // Dense pipeline registers
 {dense_pipe_decl}
 
@@ -26590,6 +26603,11 @@ def _get_pgs_solve_mf_gs_kernel(
                 "the generated snippet still references the resident array"
             )
         snippet = _prefetch_streamed_dense_metadata(snippet)
+
+    if pair_cache:
+        # Every later row type/parent read comes from the compact shared copy.
+        snippet = re.sub(r"world_row_type\.data\[off_dense \+ ([^\]]+)\]", r"s_row_type[\1]", snippet)
+        snippet = re.sub(r"world_row_parent\.data\[off_dense \+ ([^\]]+)\]", r"s_row_parent[\1]", snippet)
 
     # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
     # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
