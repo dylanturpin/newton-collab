@@ -1576,15 +1576,20 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         One per-shape attribute adds angular friction rows to free-rigid contacts:
 
-        - ``feather_pgs:condim`` (default 3) opts a shape into angular rows, borrowing MuJoCo's 3/4/6
-          dimensionality convention. At 4 or more, a shape contributes its torsional coefficient
+        - ``feather_pgs:condim`` (default 3), experimental, opts a shape into angular rows, borrowing MuJoCo's
+          3/4/6 dimensionality convention. It is FeatherPGS-owned: the MJCF and URDF importers never read it
+          (MuJoCo's own ``condim`` stays with :class:`~newton.solvers.SolverMuJoCo`), and USD reads it only from an
+          explicitly authored ``newton:feather_pgs:condim``. Set it through ``model.feather_pgs.condim`` or
+          ``custom_attributes`` on the shape. At 4 or more, a shape contributes its torsional coefficient
           (:attr:`~newton.Model.shape_material_mu_torsional`) [m] to a spin row bounded by that coefficient
           times the normal load; at 6, also its rolling coefficient
           (:attr:`~newton.Model.shape_material_mu_rolling`) to a rolling pair. A contact's coefficient is
           the largest contributed by its two shapes. This differs from MuJoCo's parameter combination,
           which takes the larger coefficient regardless of each shape's condim and honours priority.
           Only contacts between free bodies, and free bodies on static or kinematic geometry, read it.
-          Values below 4 add nothing; 1 and 2 do not remove sliding friction. Shape edits take effect at
+          Values below 4 add nothing; 1 and 2 do not remove sliding friction. Under persistent friction patches,
+          contacts share a patch only if their angular coefficients match, so each patch's angular rows are
+          independent of contact order. Shape edits take effect at
           :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without angular rows must
           be rebuilt to gain them.
 
@@ -1656,6 +1661,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.int32,
                 default=3,
+                # Experimental and FeatherPGS-owned: importers never fill it from MuJoCo's ``condim``.
+                mjcf_attribute_name="feather_pgs:condim",
+                urdf_attribute_name="feather_pgs:condim",
+                usd_attribute_name="newton:feather_pgs:condim",
             )
         )
         builder.add_custom_attribute(
@@ -12253,6 +12262,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     friction_gap_limit=self._friction_gap,
                     frozen_bodies=self._sleeping.patch_frozen_bodies if self._sleeping is not None else None,
                     shape_material_mu=self._shape_mu,
+                    angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling)
+                    if self._free_rigid_angular_rows
+                    else None,
                 )
 
             wp.launch(

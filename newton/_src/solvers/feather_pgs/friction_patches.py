@@ -56,6 +56,8 @@ class _PatchFrame:
     normal: wp.array[wp.vec3]
     displacement: wp.array[wp.vec3]
     mu: wp.array[wp.vec2]
+    # Gated free-rigid (torsional, rolling) pair coefficients [m]; zero unless angular rows are enabled.
+    angular: wp.array[wp.vec2]
     radius: wp.array[float]
     body_a: wp.array[int]
     body_b: wp.array[int]
@@ -116,6 +118,9 @@ def _prepare(
     q: wp.array[wp.transform],
     contact_gap_limit: float,
     friction_gap_limit: float,
+    angular_enabled: int,
+    shape_mu_torsional: wp.array[float],
+    shape_mu_rolling: wp.array[float],
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
@@ -191,6 +196,18 @@ def _prepare(
     if sb >= 0:
         mu_b = shape_mu[sb]
     frame.mu[c] = wp.vec2(mu_a, mu_b)
+    # One patch carries one set of angular rows, so its contacts must share the angular coefficients.
+    angular = wp.vec2(0.0)
+    if angular_enabled != 0:
+        for s in range(2):
+            shape = sa
+            if s == 1:
+                shape = sb
+            if shape >= 0:
+                angular = wp.vec2(
+                    wp.max(angular[0], shape_mu_torsional[shape]), wp.max(angular[1], shape_mu_rolling[shape])
+                )
+    frame.angular[c] = angular
     r = float(1.0e10)
     if a >= 0:
         r = wp.min(r, body_radius[a])
@@ -207,6 +224,8 @@ def _compatible(frame: _PatchFrame, seed: int, c: int):
         wp.dot(frame.normal[seed], frame.normal[c]) >= 0.995
         and frame.mu[seed][0] == frame.mu[c][0]
         and frame.mu[seed][1] == frame.mu[c][1]
+        and frame.angular[seed][0] == frame.angular[c][0]
+        and frame.angular[seed][1] == frame.angular[c][1]
         and wp.abs(wp.dot(d, frame.normal[seed])) <= 0.02 * r
         and wp.length_sq(d) <= 4.0 * r * r
     )
@@ -305,6 +324,7 @@ _FLOOD_CUDA = """
         const wp::vec3 seed_center = center.data[seed];
         const wp::vec3 seed_normal = normal.data[seed];
         const wp::vec2 seed_mu = mu.data[seed];
+        const wp::vec2 seed_angular = angular.data[seed];
         const float r = radius.data[seed];
         int cursor = seed;
         int expanded_a = -2, expanded_b = -2;
@@ -324,8 +344,10 @@ _FLOOD_CUDA = """
                         if (owner.data[c] < 0) {
                             const wp::vec3 d = wp::sub(center.data[c], seed_center);
                             const wp::vec2 cmu = mu.data[c];
+                            const wp::vec2 cangular = angular.data[c];
                             const bool compatible = wp::dot(seed_normal, normal.data[c]) >= 0.995f
                                 && seed_mu[0] == cmu[0] && seed_mu[1] == cmu[1]
+                                && seed_angular[0] == cangular[0] && seed_angular[1] == cangular[1]
                                 && wp::abs(wp::dot(d, seed_normal)) <= 0.02f * r
                                 && wp::length_sq(d) <= 4.0f * r * r;
                             if (compatible && shapes_adjacent(sa, shape_a.data[c]) && shapes_adjacent(sb, shape_b.data[c]))
@@ -431,6 +453,7 @@ def _flood_native(
     center: wp.array[wp.vec3],
     normal: wp.array[wp.vec3],
     mu: wp.array[wp.vec2],
+    angular: wp.array[wp.vec2],
     radius: wp.array[float],
     shape_a: wp.array[int],
     shape_b: wp.array[int],
@@ -523,6 +546,7 @@ def _flood_regions(
         frame.center,
         frame.normal,
         frame.mu,
+        frame.angular,
         frame.radius,
         frame.shape_a,
         frame.shape_b,
@@ -1284,6 +1308,7 @@ class _FrictionPatchState:
         ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
+        frame.angular = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
         frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
         frame.separation = wp.zeros(n, dtype=float, device=device)
@@ -1316,7 +1341,13 @@ class _FrictionPatchState:
         friction_gap_limit=float("inf"),
         frozen_bodies=None,
         shape_material_mu=None,
+        angular_mu=None,
     ):
+        """Build this step's friction patches.
+
+        ``angular_mu`` is the (torsional, rolling) pair of gated per-shape coefficient arrays [m] when free-rigid
+        angular rows are enabled; contacts then share a patch only if their pair coefficients match.
+        """
         wp.launch(
             _prepare,
             dim=self.capacity,
@@ -1336,6 +1367,9 @@ class _FrictionPatchState:
                 state.body_q,
                 contact_gap_limit,
                 friction_gap_limit,
+                int(angular_mu is not None),
+                angular_mu[0] if angular_mu is not None else model.shape_gap,
+                angular_mu[1] if angular_mu is not None else model.shape_gap,
                 self.current,
                 self.view,
             ],

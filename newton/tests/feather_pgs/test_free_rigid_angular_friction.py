@@ -286,6 +286,57 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             with self.subTest(**options), self.assertRaises(ValueError):
                 SolverFeatherPGS(model, solve_mode="matrix_free", free_rigid_rolling_friction=1.0e-3, **options)
 
+    def test_patch_angular_rows_do_not_depend_on_contact_order(self):
+        """Keep each material's angular rows when two shapes of one body with different angular coefficients rest
+        side by side, whichever shape's contacts come first."""
+        results = []
+        for order in ((3, 6), (6, 3)):
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            SolverFeatherPGS.register_custom_attributes(builder)
+            table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
+            builder.add_shape_box(table, hx=1.0, hy=1.0, hz=0.05)
+            inertia = wp.mat33(*(np.eye(3) * 1.0e-4).astype(np.float32).ravel())
+            body = builder.add_body(
+                xform=wp.transform((0.0, 0.0, 0.0201), wp.quat_identity()),
+                mass=_MASS,
+                inertia=inertia,
+                lock_inertia=True,
+            )
+            shapes = {}
+            for condim in order:
+                x = -0.02 if condim == 3 else 0.02
+                shapes[condim] = builder.add_shape_box(
+                    body,
+                    xform=wp.transform((x, 0.0, 0.0), wp.quat_identity()),
+                    hx=0.02,
+                    hy=0.02,
+                    hz=0.02,
+                    cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu_torsional=0.01, mu_rolling=0.002),
+                    custom_attributes={"feather_pgs:condim": condim},
+                )
+            model = builder.finalize()
+            solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=32, friction_anchor_beta=0.2)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            for _ in range(3):
+                state_0.clear_forces()
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, _DT)
+                state_0, state_1 = state_1, state_0
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+            shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+            slots = solver._contact_slots_needed.numpy()[:count]
+            angular = {}
+            for condim, shape in shapes.items():
+                mask = (shape0 == shape) | (shape1 == shape)
+                angular[condim] = int(np.count_nonzero(slots[mask] == 6))
+            results.append(angular)
+        for angular in results:
+            self.assertEqual(angular[3], 0)
+            self.assertEqual(angular[6], 1)
+
     def test_toppling_and_sliding_cube_are_unchanged(self):
         """Leave a toppling or sliding cube within 2 mm of the option-off pose; the spinning cube slows at most."""
         for kwargs in ({"tilt_deg": 40.0}, {"linear": (0.5, 0.0, 0.0)}, {"angular": (0.0, 0.0, 6.0)}):
@@ -438,6 +489,34 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model.feather_pgs.condim.fill_(6)
         with self.assertRaises(ValueError):
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+
+
+class TestFreeRigidAngularFrictionImport(unittest.TestCase):
+    """MJCF ``condim`` stays with MuJoCo: registering the FeatherPGS attributes never enables angular rows."""
+
+    def test_mjcf_condim_does_not_enable_angular_rows(self):
+        """Construct the same split solver for MJCF condim 3/4/6, direct or inherited, with and without registration."""
+        for registered in (False, True):
+            for condim in (3, 4, 6):
+                for inherited in (False, True):
+                    with self.subTest(registered=registered, condim=condim, inherited=inherited):
+                        default = f'<default><geom condim="{condim}"/></default>' if inherited else ""
+                        geom = "" if inherited else f' condim="{condim}"'
+                        mjcf = (
+                            f"<mujoco>{default}<worldbody>"
+                            '<geom type="plane" size="1 1 0.1"/>'
+                            f'<body pos="0 0 0.1"><freejoint/><geom type="sphere" size="0.03"{geom}/></body>'
+                            "</worldbody></mujoco>"
+                        )
+                        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+                        if registered:
+                            SolverFeatherPGS.register_custom_attributes(builder)
+                        builder.add_mjcf(mjcf)
+                        model = builder.finalize(device="cpu")
+                        if registered:
+                            np.testing.assert_array_equal(model.feather_pgs.condim.numpy(), 3)
+                        solver = SolverFeatherPGS(model, solve_mode="split")
+                        self.assertFalse(solver._free_rigid_angular_rows)
 
 
 if __name__ == "__main__":
