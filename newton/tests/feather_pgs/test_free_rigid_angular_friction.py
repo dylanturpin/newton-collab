@@ -251,8 +251,8 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                 self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
                 self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
 
-    def test_patch_anchors_share_one_budget(self):
-        """Divide a patch's rolling and spin coefficients among its anchors, like its sliding coefficient."""
+    def test_patch_carries_one_set_of_angular_rows(self):
+        """Give a friction patch's first anchor the angular rows with the whole coefficient; the other keeps sliding only."""
         seen = {}
 
         def observe(solver, contacts, observables):
@@ -261,16 +261,18 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             slot = solver._contact_slot.numpy()[:count]
             types = solver._mf_row_type.numpy()[0]
             mu = solver._mf_row_mu.numpy()[0]
-            anchors = [int(s) for s, n in zip(slot, slots, strict=True) if n == 6]
-            seen["anchors"] = len(anchors)
-            for s in anchors:
+            anchors = [int(s) for s, n in zip(slot, slots, strict=True) if n >= 3]
+            angular = [int(s) for s, n in zip(slot, slots, strict=True) if n == 6]
+            seen["anchors"], seen["angular"] = len(anchors), len(angular)
+            for s in angular:
                 self.assertEqual(types[s], PGS_CONSTRAINT_TYPE_CONTACT)
                 self.assertEqual(types[s + 1], PGS_CONSTRAINT_TYPE_FRICTION)
                 self.assertEqual(types[s + 3], PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
                 self.assertEqual(types[s + 4], PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
                 self.assertEqual(types[s + 5], PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
-                self.assertAlmostEqual(mu[s + 3] * len(anchors), 0.002, places=7)
-                self.assertAlmostEqual(mu[s + 5] * len(anchors), 0.001, places=7)
+                self.assertAlmostEqual(mu[s + 3], 0.002, places=7)
+                self.assertAlmostEqual(mu[s + 5], 0.001, places=7)
+                self.assertAlmostEqual(mu[s + 1] * len(anchors), 1.0, places=6)
 
         _simulate(
             "box",
@@ -282,7 +284,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             free_rigid_torsional_friction=0.001,
             observe=observe,
         )
-        self.assertEqual(seen["anchors"], 2)
+        self.assertEqual((seen["anchors"], seen["angular"]), (2, 1))
 
     def test_repeated_and_captured_runs_are_bitwise_identical(self):
         """Match two eager runs and a CUDA-graph replay bit for bit, with several worlds of bodies."""

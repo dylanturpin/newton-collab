@@ -1477,8 +1477,9 @@ def link_patch_rows(
 ):
     """Link only allocated rows and divide the Coulomb budget among surviving anchors.
 
-    Row builders write the unscaled friction coefficients; this kernel divides every friction row of an
-    anchor by the number of anchors that actually received rows, so the pooled normal load is shared once.
+    Row builders write the unscaled friction coefficient; this kernel divides it by
+    the number of anchors that actually received rows, so the pooled normal load
+    is shared exactly once. Angular rows sit on one anchor per patch and keep the whole coefficient.
     """
     c = wp.tid()
     if c >= count[0] or slot[c] < 0 or path[c] != route:
@@ -1499,7 +1500,7 @@ def link_patch_rows(
         row = patches.next_contact[row]
     parents[world[c], slot[c]] = next_slot
     if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
-        for t in range(1, slots_needed[c]):
+        for t in range(1, 3):
             mu[world[c], slot[c] + t] /= float(anchors)
 
 

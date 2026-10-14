@@ -4945,6 +4945,17 @@ def contact_angular_friction_coefficients(
 
 
 @wp.func
+def _first_patch_anchor(patches: FrictionPatches, c: int):
+    """Return whether no anchor of contact ``c``'s friction patch precedes it in contact order."""
+    row = patches.next_contact[c]
+    while row >= 0 and row != c:
+        if row < c and patches.weight[row] > 0.0:
+            return False
+        row = patches.next_contact[row]
+    return True
+
+
+@wp.func
 def free_rigid_angular_slots(torsional: float, rolling: float):
     """Return a matrix-free contact's row count with sliding friction: normal, sliding pair, rolling pair, spin."""
     slots = int(3)
@@ -5165,7 +5176,9 @@ def _allocate_world_contact_slot(
             torsional, rolling = contact_angular_friction_coefficients(
                 shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
             )
-            slots_needed = free_rigid_angular_slots(torsional, rolling)
+            # A friction patch carries one set of angular rows, on its first anchor, with the patch's whole budget.
+            if friction_patches.enabled == 0 or _first_patch_anchor(friction_patches, c):
+                slots_needed = free_rigid_angular_slots(torsional, rolling)
     contact_slots_needed[c] = slots_needed
 
     if classify_only != 0:
