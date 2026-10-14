@@ -1477,9 +1477,8 @@ def link_patch_rows(
 ):
     """Link only allocated rows and divide the Coulomb budget among surviving anchors.
 
-    Row builders write the unscaled friction coefficient; this kernel divides it by
-    the number of anchors that actually received rows, so the pooled normal load
-    is shared exactly once.
+    Row builders write the unscaled friction coefficients; this kernel divides every friction row of an
+    anchor by the number of anchors that actually received rows, so the pooled normal load is shared once.
     """
     c = wp.tid()
     if c >= count[0] or slot[c] < 0 or path[c] != route:
@@ -1488,19 +1487,19 @@ def link_patch_rows(
     if row < 0:
         return
     next_slot = slot[c]
-    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] == 3)
+    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
     while row != c:
         if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
             if next_slot == slot[c]:
                 next_slot = slot[row]
-            if patches.weight[row] > 0.0 and slots_needed[row] == 3:
+            if patches.weight[row] > 0.0 and slots_needed[row] >= 3:
                 anchors += 1
             if patches.weight[c] == 0.0:
                 break
         row = patches.next_contact[row]
     parents[world[c], slot[c]] = next_slot
-    if patches.weight[c] > 0.0 and slots_needed[c] == 3 and anchors > 0:
-        for t in range(1, 3):
+    if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
+        for t in range(1, slots_needed[c]):
             mu[world[c], slot[c] + t] /= float(anchors)
 
 
@@ -1537,7 +1536,7 @@ def seed_patch_impulses(
     Anchors without patch history keep the contact-matched warm start, bounded by the region's load.
     """
     c = wp.tid()
-    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
+    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] < 3:
         return
     w = world[c]
     s = slot[c]
@@ -1611,7 +1610,7 @@ def finish_patch_impulses(
         # and apply that error when it later lands (common on curved meshes).
         frame.valid[c] = 0
         return
-    if slots_needed[c] != 3:
+    if slots_needed[c] < 3:
         # Friction was filtered, but its normal rows still prove support.
         return
     n = frame.normal[c]

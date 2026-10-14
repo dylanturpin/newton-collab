@@ -53,7 +53,12 @@ from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
 from .contact_angular_friction import (
     angular_friction_gs_sources,
+    apply_free_rigid_angular_friction_overrides,
+    configure_free_rigid_angular_friction,
     configure_torsional_rolling_friction,
+    free_rigid_angular_friction_gs_sources,
+    launch_free_rigid_angular_friction_rows,
+    validate_free_rigid_angular_friction_mode,
     launch_angular_friction_rows,
     validate_torsional_rolling_friction_coefficients,
     validate_torsional_rolling_friction_mode,
@@ -70,6 +75,7 @@ from .contact_torsion import (
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
+    ANGULAR_FRICTION_FREE_RIGID,
     CONTACT_GENERATION_NONE,
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -1512,6 +1518,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     enable_torsional_rolling_friction = _ConstructionOption()
     torsional_rolling_friction_cone = _ConstructionOption()
     torsional_rolling_friction_creep_speed = _ConstructionOption()
+    enable_free_rigid_angular_friction = _ConstructionOption()
+    free_rigid_torsional_friction = _ConstructionOption()
+    free_rigid_rolling_friction = _ConstructionOption()
     contact_compliance = _ConstructionOption()
     parallel_tree = _ConstructionOption()
     enable_sleeping = _ConstructionOption()
@@ -1745,6 +1754,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         enable_torsional_rolling_friction: bool = False,
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
         torsional_rolling_friction_creep_speed: float = 0.0,
+        enable_free_rigid_angular_friction: bool = False,
+        free_rigid_torsional_friction: float | None = None,
+        free_rigid_rolling_friction: float | None = None,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
         enable_sleeping: bool = False,
@@ -1848,6 +1860,27 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 torsional/rolling stiction: below the bound, the coefficient times the relative angular
                 rate settles at this speed times the load fraction ``|tau| / (mu_i * f_n)``, independent
                 of mass. Zero sticks rigidly. Construction-only.
+            enable_free_rigid_angular_friction: Experimental opt-in rolling and torsional friction on the
+                matrix-free free-rigid contact route (free bodies on static, kinematic or other free
+                bodies). Each such contact with sliding friction gets two rolling rows about its tangents
+                when the pair rolling coefficient [m] is positive, and one spin row about its normal when
+                the pair torsional coefficient [m] is positive. Pair coefficients are the shape means of
+                :attr:`~newton.Model.shape_material_mu_rolling` and
+                :attr:`~newton.Model.shape_material_mu_torsional`. The rolling pair is bounded by a disk and
+                the spin row by an interval, each of radius coefficient times the contact's normal impulse
+                (a persistent friction patch's pooled load, shared among its anchors), independently of the
+                sliding disk. Gauss-Seidel solves each block exactly at fixed load, so the rows only
+                dissipate. They start cold every step, also under warm start. Requires CUDA
+                ``matrix_free``/``immediate``/``interleaved`` solving with ``friction_mode="fixed_normal"``,
+                the fused matrix-free GS kernel, no contact compliance, and no free-free propagation routing.
+                Construction-only. Reported contact forces exclude the angular impulses; body contact
+                wrenches include them.
+            free_rigid_torsional_friction: Experimental torsional coefficient [m] that replaces every
+                shape's :attr:`~newton.Model.shape_material_mu_torsional` inside this solver; ``None`` keeps
+                the materials. Construction-only.
+            free_rigid_rolling_friction: Experimental rolling coefficient [m] that replaces every shape's
+                :attr:`~newton.Model.shape_material_mu_rolling` inside this solver; ``None`` keeps the
+                materials. Construction-only.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -2265,6 +2298,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             enable_torsional_rolling_friction,
             torsional_rolling_friction_cone,
             torsional_rolling_friction_creep_speed,
+        )
+        configure_free_rigid_angular_friction(
+            self, enable_free_rigid_angular_friction, free_rigid_torsional_friction, free_rigid_rolling_friction
         )
         self._compliance = None
         super().__init__(model)
@@ -2755,7 +2791,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Nor does it apply the compliant residual, which only the general and paired-factor owners carry.
         sparse_diagonal_pair = (
             None
-            if contact_torsion_requested or self._enable_torsional_rolling_friction or contact_compliance
+            if contact_torsion_requested
+            or self._enable_torsional_rolling_friction
+            or self._enable_free_rigid_angular_friction
+            or contact_compliance
             else self._select_sparse_diagonal_response_pair()
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
@@ -2848,6 +2887,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             # construction, so gate on the shapes' radii here.
             and not contact_torsion_requested
             and not self._enable_torsional_rolling_friction
+            and not self._enable_free_rigid_angular_friction
             # The local owners rebuild the response diagonal inside the solve, after compliant rows replace it.
             and not contact_compliance
         )
@@ -3179,6 +3219,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             # The factor-coordinate owner does not solve the appended torsion row.
             and not self._contact_torsion_enabled
             and not self._enable_torsional_rolling_friction
+            and not self._enable_free_rigid_angular_friction
         )
         # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
         # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
@@ -3377,6 +3418,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             if self._pgs_solve_mf_gs_kernel is None:
                 raise ValueError("enable_torsional_rolling_friction requires the fused matrix-free GS solve")
             validate_torsional_rolling_friction_coefficients(self)
+        validate_free_rigid_angular_friction_mode(self)
 
         # Coupled resets pass the SolverBase mask, shape (model.world_count + 1,); it is
         # translated into this solver-world mask so masked resets stay capturable.
@@ -4914,6 +4956,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         ):
             if values is not None and model.shape_count:
                 wp.copy(buffer, values, count=model.shape_count)
+        apply_free_rigid_angular_friction_overrides(self)
 
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -5473,6 +5516,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and not self._preelim_active
             and not self._contact_torsion_enabled
             and not self._enable_torsional_rolling_friction
+            and not self._enable_free_rigid_angular_friction
             and not self._contact_compliance
             and not self._mimic_count
             and not self._connect_count
@@ -7264,6 +7308,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 ),
                 angular_friction_creep_speed=self._torsional_rolling_friction_creep_speed,
                 contact_compliance=self._contact_compliance,
+                free_rigid_angular_friction=self._enable_free_rigid_angular_friction,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -12235,7 +12280,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._propagation_max_constraints,
                     self._friction_gap,
                     self._friction_patches.view,
-                    int(self._enable_torsional_rolling_friction),
+                    int(self._enable_torsional_rolling_friction)
+                    | (ANGULAR_FRICTION_FREE_RIGID if self._enable_free_rigid_angular_friction else 0),
                     self._shape_mu_torsional,
                     self._shape_mu_rolling,
                     int(self._deterministic),
@@ -12590,6 +12636,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     ],
                     device=model.device,
                 )
+                if self._enable_free_rigid_angular_friction:
+                    launch_free_rigid_angular_friction_rows(self, state_aug, contacts, contact_build_threads)
 
             if propagation_active and self._propagation_colored:
                 # v4 pre-build coloring: gather propagation contacts into
@@ -24861,6 +24909,7 @@ def _get_pgs_solve_mf_gs_kernel(
     angular_friction_cone: str | None = None,
     angular_friction_creep_speed: float = 0.0,
     contact_compliance: bool = False,
+    free_rigid_angular_friction: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -24888,6 +24937,9 @@ def _get_pgs_solve_mf_gs_kernel(
 
     ``contact_compliance`` adds ``gamma * lambda`` to every contact-normal
     residual in each sweep; ``gamma`` is zero on hard rows.
+
+    ``free_rigid_angular_friction`` solves the rolling pair and spin rows that follow
+    matrix-free contacts' sliding pairs in phase 2.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
     stateless joint-velocity clamp as an end-of-iteration pass over the
@@ -24918,6 +24970,8 @@ def _get_pgs_solve_mf_gs_kernel(
         or contact_compliance
     ):
         raise ValueError("torsional/rolling friction rows require the general current-friction solve")
+    if free_rigid_angular_friction and (friction_mode != "fixed_normal" or factor_coordinates or contact_compliance):
+        raise ValueError("free-rigid angular friction rows require the general current-friction solve")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -26377,6 +26431,10 @@ def _get_pgs_solve_mf_gs_kernel(
 #endif
 """
 
+    if free_rigid_angular_friction:
+        for anchor, replacement in free_rigid_angular_friction_gs_sources():
+            snippet = _replace_once(snippet, anchor, replacement)
+
     if contact_compliance:
         snippet = _replace_once(
             snippet,
@@ -26661,6 +26719,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_angular_{angular_friction_cone}_creep{round(angular_friction_creep_speed * 1.0e9)}nm"
     if contact_compliance:
         name += "_compliance"
+    if free_rigid_angular_friction:
+        name += "_free_rigid_angular"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
