@@ -120,6 +120,7 @@ class TabletopDemo:
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
+            enable_joint_friction=self.task == "crane",
             friction_anchor_beta=0.0,
             articulation_constraint_max=512,
             free_body_constraint_max=4096,

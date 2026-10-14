@@ -178,7 +178,11 @@ def populate(b, info, ee, down, device, variant):
         if b.joint_label[j] == "crane/boom.lift.q":
             b.joint_limit_upper[vi] = 0
             b.joint_damping[vi] = 0.05
-        elif b.joint_label[j] in ("crane/crane.slew.q", "crane/hook.swing.q"):
+        elif b.joint_label[j] == "crane/crane.slew.q":
+            # A dry slew brake resists back-driving but yields to the gripper.
+            b.joint_friction[vi] = 3.0
+            b.joint_damping[vi] = 0.006
+        elif b.joint_label[j] == "crane/hook.swing.q":
             b.joint_damping[vi] = 0.006
     handle = b.add_link(xform=tf(base), label="crane_grasp_handle")
     b.add_joint_fixed(mapping["crane.slew"], handle, label="crane_handle_mount")

@@ -12,7 +12,9 @@ slider, or reset. Drag dynamic bodies with the viewer's picking tool to apply
 forces. The path slider changes actuator targets; it never overwrites object
 poses. The crane's slew, boom, chain and ball are passive. Its arm releases
 the yellow side handle after slewing. Its broad opposing faces let the
-gripper turn the crane through contact without a grasp weld or crane motor. All three rack plates are free bodies.
+gripper turn the crane through contact without a grasp weld or crane motor.
+A 3 N m dry-friction slew brake resists back-driving by the swinging ball;
+it yields when the gripper supplies enough torque. All three rack plates are free bodies.
 
 The default budget is four substeps at 60 Hz and 12 PGS iterations. Override
 with ``--substeps`` and ``--iterations``. Run ``--viewer null --test`` for the

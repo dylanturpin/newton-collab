@@ -25,6 +25,8 @@ class Example(TabletopDemo):
         self.ball_struck_building = False
         self.slew_min = self.slew_max = 0.0
         self.grasp_frames = 0
+        self.release_angle = None
+        self.max_release_drift = 0.0
 
     def test_post_step(self):
         """Require grasp, slew and ball impact, not a spontaneous collapse."""
@@ -34,6 +36,10 @@ class Example(TabletopDemo):
         angle = float(2 * np.arctan2(q[2], q[3]))
         self.slew_min = min(self.slew_min, angle)
         self.slew_max = max(self.slew_max, angle)
+        if self.sim_time >= 6.3:
+            if self.release_angle is None:
+                self.release_angle = angle
+            self.max_release_drift = max(self.max_release_drift, abs(angle - self.release_angle))
         count = int(self.contacts.rigid_contact_count.numpy()[0])
         owners = self.model.shape_body.numpy()
         shapes_a = self.contacts.rigid_contact_shape0.numpy()[:count]
@@ -59,6 +65,7 @@ class Example(TabletopDemo):
         assert self.grasp_frames >= 20, f"Handle was not held between both fingers: {self.grasp_frames} frames"
         assert self.slew_max - self.slew_min > 1.0, "Crane did not rotate through the strike"
         assert self.ball_struck_building, "Ball never contacted the building"
+        assert self.max_release_drift < 0.05, f"Ball back-drove the crane after release: {self.max_release_drift} rad"
         poses = self.state_0.body_q.numpy()
         floors = self.info["demolition_upper_floors"]
         drop = self.initial.body_q.numpy()[floors, 2] - poses[floors, 2]
