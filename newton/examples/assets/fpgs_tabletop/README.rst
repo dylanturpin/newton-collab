@@ -11,7 +11,8 @@ Use the side panel to stop automatic robot commands, move the robot path
 slider, or reset. Drag dynamic bodies with the viewer's picking tool to apply
 forces. The path slider changes actuator targets; it never overwrites object
 poses. The crane's slew, boom, chain and ball are passive. Its arm releases
-the handle after slewing. All three rack plates are free bodies.
+the yellow side handle after slewing. Its broad opposing faces let the
+gripper turn the crane through contact without a grasp weld or crane motor. All three rack plates are free bodies.
 
 The default budget is four substeps at 60 Hz and 12 PGS iterations. Override
 with ``--substeps`` and ``--iterations``. Run ``--viewer null --test`` for the

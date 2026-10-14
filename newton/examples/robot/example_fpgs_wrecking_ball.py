@@ -20,17 +20,45 @@ class Example(TabletopDemo):
     def populate(self, builder, info, ee, down, fingers):
         _wrecking_crane.populate(builder, info, ee, down, wp.get_device(), 0)
 
+    def reset(self):
+        super().reset()
+        self.ball_struck_building = False
+        self.slew_min = self.slew_max = 0.0
+        self.grasp_frames = 0
+
     def test_post_step(self):
-        """Keep the building stable until the arm starts the strike."""
+        """Require grasp, slew and ball impact, not a spontaneous collapse."""
         super().test_post_step()
-        if 3.8 < self.sim_time < 4.0:
+        poses = self.state_0.body_q.numpy()
+        q = poses[self.info["crane_slew"], 3:]
+        angle = float(2 * np.arctan2(q[2], q[3]))
+        self.slew_min = min(self.slew_min, angle)
+        self.slew_max = max(self.slew_max, angle)
+        count = int(self.contacts.rigid_contact_count.numpy()[0])
+        owners = self.model.shape_body.numpy()
+        shapes_a = self.contacts.rigid_contact_shape0.numpy()[:count]
+        shapes_b = self.contacts.rigid_contact_shape1.numpy()[:count]
+        pairs = {(int(owners[a]), int(owners[b])) for a, b in zip(shapes_a, shapes_b, strict=True) if a >= 0 and b >= 0}
+
+        def touching(a, b):
+            return (a, b) in pairs or (b, a) in pairs
+
+        if all(touching(finger, self.info["crane_handle"]) for finger in self.info["crane_fingers"]):
+            self.grasp_frames += 1
+        self.ball_struck_building |= any(
+            touching(self.info["tracked_body"], body) for body in self.info["demolition_structure"]
+        )
+        if not self.ball_struck_building:
             floors = self.info["demolition_upper_floors"]
-            drop = self.initial.body_q.numpy()[floors, 2] - self.state_0.body_q.numpy()[floors, 2]
-            assert np.max(np.abs(drop)) < 0.025, f"Building collapsed before impact: {drop}"
+            drop = self.initial.body_q.numpy()[floors, 2] - poses[floors, 2]
+            assert np.max(np.abs(drop)) < 0.025, f"Building moved before ball impact: {drop}"
 
     def test_final(self):
         """Verify that the ball stays attached and the upper floors collapse."""
         self.check_capacity()
+        assert self.grasp_frames >= 20, f"Handle was not held between both fingers: {self.grasp_frames} frames"
+        assert self.slew_max - self.slew_min > 1.0, "Crane did not rotate through the strike"
+        assert self.ball_struck_building, "Ball never contacted the building"
         poses = self.state_0.body_q.numpy()
         floors = self.info["demolition_upper_floors"]
         drop = self.initial.body_q.numpy()[floors, 2] - poses[floors, 2]
