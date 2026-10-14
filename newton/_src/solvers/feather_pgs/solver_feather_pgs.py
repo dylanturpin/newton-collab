@@ -1130,12 +1130,59 @@ def _mfgs_resident_metadata_bytes(max_constraints: int, *, has_drive_rows: bool,
 
 
 def _estimate_mfgs_shared_memory(
-    max_constraints: int, mf_max_constraints: int, max_world_dofs: int, *, metadata_bytes: int, torsion_links: bool
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    *,
+    metadata_bytes: int,
+    torsion_links: bool,
+    pair_cache: bool = False,
 ) -> int:
     """Estimate the MF-GS kernel's static shared-memory footprint [B]."""
     base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
     links_bytes = torque_links_shared_bytes(max_constraints) if torsion_links else 0
-    return _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes + links_bytes
+    pair_bytes = _mfgs_pair_cache_bytes(max_constraints) if pair_cache else 0
+    return _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes + links_bytes + pair_bytes
+
+
+def _mfgs_pair_cache_capacity(max_constraints: int) -> int:
+    """Return the most dense friction pairs a world holds: each pair owns its normal row and two tangent rows."""
+    return max_constraints // 3
+
+
+def _mfgs_pair_cache_bytes(max_constraints: int) -> int:
+    """Return the shared-memory footprint [B] of the per-launch friction-pair operator cache."""
+    return 2 * max_constraints + 4 * 5 * _mfgs_pair_cache_capacity(max_constraints)
+
+
+def _use_mfgs_pair_cache(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    max_shared_memory: int,
+    *,
+    shared_metadata: bool,
+    torsion_links: bool,
+    has_drive_rows: bool,
+    fuse_vel_limits: bool,
+) -> bool:
+    """Select the per-launch friction-pair operator cache when it fits the portable static shared-memory bound."""
+    metadata_bytes = (
+        _mfgs_resident_metadata_bytes(max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits)
+        if shared_metadata
+        else 0
+    )
+    total_shared_bytes = _estimate_mfgs_shared_memory(
+        max_constraints,
+        mf_max_constraints,
+        max_world_dofs,
+        metadata_bytes=metadata_bytes,
+        torsion_links=torsion_links,
+        pair_cache=True,
+    )
+    return total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
+        _STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory
+    )
 
 
 _HINV_JT_MAX_CHUNK_SIZE = 32
@@ -7250,6 +7297,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         self._pgs_solve_mf_gs_kernel = None
         self._mfgs_torsion_links = False
+        self._mfgs_pair_cache = False
         if (
             self._solve_mode == "matrix_free"
             and not self._sparse_diagonal_contact_solve
@@ -7276,6 +7324,20 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 has_drive_rows=has_drive_rows,
                 fuse_vel_limits=self._velocity_limits_fused,
             )
+            self._mfgs_pair_cache = (
+                self._friction_mode == "fixed_normal"
+                and not self._paired_factor_coordinates
+                and _use_mfgs_pair_cache(
+                    self._articulation_constraint_max,
+                    self._free_body_constraint_max,
+                    self._max_world_dofs,
+                    int(getattr(model.device, "max_shared_memory_per_block", 0)),
+                    shared_metadata=shared_metadata,
+                    torsion_links=self._mfgs_torsion_links,
+                    has_drive_rows=has_drive_rows,
+                    fuse_vel_limits=self._velocity_limits_fused,
+                )
+            )
             self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
                 self._articulation_constraint_max,
                 self._free_body_constraint_max,
@@ -7296,6 +7358,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 ),
                 angular_friction_creep_speed=self._torsional_rolling_friction_creep_speed,
                 contact_compliance=self._contact_compliance,
+                pair_cache=self._mfgs_pair_cache,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -24832,6 +24895,7 @@ def _get_pgs_solve_mf_gs_kernel(
     angular_friction_cone: str | None = None,
     angular_friction_creep_speed: float = 0.0,
     contact_compliance: bool = False,
+    pair_cache: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -24889,6 +24953,8 @@ def _get_pgs_solve_mf_gs_kernel(
         or contact_compliance
     ):
         raise ValueError("torsional/rolling friction rows require the general current-friction solve")
+    if pair_cache and (friction_mode != "fixed_normal" or factor_coordinates):
+        raise ValueError("the friction-pair cache requires the fixed-normal pair solve")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -24981,12 +25047,53 @@ def _get_pgs_solve_mf_gs_kernel(
                         cross += cur_dJ_{k} * Y_world.data[sib_row_base + {d_expr}];
                     }}""")
     dense_pair_dot_code = "\n".join(dense_pair_dot_parts)
+    dense_sib_dot_code = "\n".join(
+        f"""
+                    if ({f"lane + {k * 32}" if k > 0 else "lane"} < {D}) {{
+                        sibling_residual += {dense_j_read("sib_row_base", f"lane + {k * 32}" if k > 0 else "lane")}"""
+        f""" * s_v[{f"lane + {k * 32}" if k > 0 else "lane"}];
+                    }}"""
+        for k in range(ELEMS_PER_LANE)
+    )
     # The pair solve at the first friction row also writes the second, so that row is a no-op.
     dense_second_friction_skip = (
         f"if (row_type == 2 && i != ((s_meta_dense[i] >> {_DENSE_META_ROW_TYPE_BITS}) - 1) + 1) continue;"
         if friction_mode == "fixed_normal"
         else ""
     )
+
+    dense_pair_solve_uncached = f"""
+                    float sibling_residual = 0.0f;
+                    float cross = 0.0f;
+                    {dense_pair_dot_code}
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                        cross += __shfl_down_sync(MASK, cross, offset);
+                    }}
+                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
+                    cross = __shfl_sync(MASK, cross, 0);
+                    float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
+                        residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
+"""
+    # The cache holds each pair's operator from the launch prologue; only the sibling residual changes per sweep.
+    dense_pair_solve_cached = f"""
+                    const int pair_slot = s_pair_slot[i];
+                    float2 pair;
+                    if (pair_slot >= 0) {{
+                        float sibling_residual = 0.0f;
+                        {dense_sib_dot_code}
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                        sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
+                        pair = radius > 0.0f
+                            ? friction_pair_solve(s_pair_op[0][pair_slot], s_pair_op[1][pair_slot],
+                                s_pair_op[2][pair_slot], s_pair_op[3][pair_slot], s_pair_op[4][pair_slot],
+                                residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega)
+                            : make_float2(0.0f, 0.0f);
+                    }} else {{{dense_pair_solve_uncached.replace("float2 pair = ", "pair = ")}
+                    }}
+"""
+    dense_pair_solve = dense_pair_solve_cached if pair_cache else dense_pair_solve_uncached
 
     # Dense friction-row projection.  The dense rows carry articulated
     # contacts such as finger/cube; leaving them on the legacy per-row
@@ -25167,18 +25274,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
                         lambda_n += s_lam_dense[patch_row];
                     float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
-                    float sibling_residual = 0.0f;
-                    float cross = 0.0f;
-                    {dense_pair_dot_code}
-                    for (int offset = 16; offset > 0; offset >>= 1) {{
-                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                        cross += __shfl_down_sync(MASK, cross, offset);
-                    }}
-                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
-                    cross = __shfl_sync(MASK, cross, 0);
-                    float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
-                        residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
-                    float a = pair.x;
+{dense_pair_solve}                    float a = pair.x;
                     float b = pair.y;
                     float mag = sqrtf(a * a + b * b);
                     float scale = mag > radius ? radius / mag : 1.0f;
@@ -25940,6 +26036,56 @@ def _get_pgs_solve_mf_gs_kernel(
     torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
     torsion_sweep = torque_sweep_source(D, linked=torsion_links) if contact_torsion else ""
     torsion_link_build = torque_links_source(M_D) if contact_torsion and torsion_links else ""
+    pair_cache_capacity = _mfgs_pair_cache_capacity(M_D)
+    prologue_cross_code = "\n".join(
+        f"""
+            if ({f"lane + {k * 32}" if k > 0 else "lane"} < {D}) {{
+                cross += {dense_j_read("row_base", f"lane + {k * 32}" if k > 0 else "lane")}"""
+        f""" * Y_world.data[sib_row_base + {f"lane + {k * 32}" if k > 0 else "lane"}];
+            }}"""
+        for k in range(ELEMS_PER_LANE)
+    )
+    pair_cache_build = (
+        f"""
+    // Each friction pair's 2x2 operator depends only on its rows, so it is set up once per launch.
+    __shared__ short s_pair_slot[{M_D}];
+    __shared__ float s_pair_op[5][{pair_cache_capacity}];
+    {{
+        int pairs = 0;
+        for (int i = dense_lo; i < dense_hi; i++) {{
+            int row_type = s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK};
+            if (row_type != 2) continue;
+            if (i != ((s_meta_dense[i] >> {_DENSE_META_ROW_TYPE_BITS}) - 1) + 1) continue;
+            if (pairs >= {pair_cache_capacity}) {{
+                if (lane == 0) s_pair_slot[i] = -1;
+                continue;
+            }}
+            int sib = i + 1;
+            int row_base = jy_world_base + i * {D};
+            int sib_row_base = jy_world_base + sib * {D};
+            float cross = 0.0f;
+            {prologue_cross_code}
+            for (int offset = 16; offset > 0; offset >>= 1)
+                cross += __shfl_down_sync(MASK, cross, offset);
+            cross = __shfl_sync(MASK, cross, 0);
+            float scale, largest, smallest, vx, vy;
+            friction_pair_setup(s_diag_dense[i], cross, s_diag_dense[sib], scale, largest, smallest, vx, vy);
+            if (lane == 0) {{
+                s_pair_slot[i] = pairs;
+                s_pair_op[0][pairs] = scale;
+                s_pair_op[1][pairs] = largest;
+                s_pair_op[2][pairs] = smallest;
+                s_pair_op[3][pairs] = vx;
+                s_pair_op[4][pairs] = vy;
+            }}
+            ++pairs;
+        }}
+        __syncwarp();
+    }}
+"""
+        if pair_cache
+        else ""
+    )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -26024,7 +26170,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
     // ═══════════════════════════════════════════════════════
-{torsion_link_build}
+{torsion_link_build}{pair_cache_build}
     // Dense pipeline registers
 {dense_pipe_decl}
 
@@ -26636,6 +26782,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_angular_{angular_friction_cone}_creep{round(angular_friction_creep_speed * 1.0e9)}nm"
     if contact_compliance:
         name += "_compliance"
+    if pair_cache:
+        name += "_paircache"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
