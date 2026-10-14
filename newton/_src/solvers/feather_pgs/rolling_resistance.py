@@ -178,8 +178,10 @@ def apply_free_rigid_rolling_resistance(
         SUPPORT_LOAD_SCALE * normal_impulse
     )
 
+    # The FREE joint's angular velocity is expressed in the root's parent-anchor frame.
+    parent_anchor = wp.transform_get_rotation(joint_X_p[root_joint])
     ds = articulation_root_dof_start[art]
-    omega = wp.vec3(joint_qd[ds + 3], joint_qd[ds + 4], joint_qd[ds + 5])
+    omega = wp.quat_rotate(parent_anchor, wp.vec3(joint_qd[ds + 3], joint_qd[ds + 4], joint_qd[ds + 5]))
     t1, t2 = _tangent_basis(normal)
     relative = omega - support_omega
     # Impulse coordinates (h1, h2) along (t1, t2); the full stop solves a h = b.
@@ -189,11 +191,7 @@ def apply_free_rigid_rolling_resistance(
 
     qs = joint_q_start[root_joint]
     anchor = wp.quat(joint_q[qs + 3], joint_q[qs + 4], joint_q[qs + 5], joint_q[qs + 6])
-    orientation = (
-        wp.transform_get_rotation(joint_X_p[root_joint])
-        * anchor
-        * wp.quat_inverse(wp.transform_get_rotation(joint_X_c[root_joint]))
-    )
+    orientation = parent_anchor * anchor * wp.quat_inverse(wp.transform_get_rotation(joint_X_c[root_joint]))
     rotation = wp.quat_to_matrix(orientation)
     inv_inertia = rotation * body_inv_inertia[body] * wp.transpose(rotation)
     r1 = inv_inertia * t1
@@ -224,7 +222,7 @@ def apply_free_rigid_rolling_resistance(
         h = _solve_shifted(unit, high, b) / scale
     if not (wp.isfinite(h[0]) and wp.isfinite(h[1])):
         return
-    omega = omega + r1 * h[0] + r2 * h[1]
+    omega = wp.quat_rotate_inv(parent_anchor, omega + r1 * h[0] + r2 * h[1])
     joint_qd[ds + 3] = omega[0]
     joint_qd[ds + 4] = omega[1]
     joint_qd[ds + 5] = omega[2]

@@ -31,12 +31,31 @@ def _coulomb_stopping_distance(speed: float, resistance: float) -> float:
     return speed**2 * 1.4 / (2.0 * resistance * 9.81 / _RADIUS)
 
 
-def _scene(body: str, tilt_deg: float = 0.0, inertia=None):
+def _anchor(anchor_deg: float):
+    """Return the FREE joint's parent-anchor rotation, about +y."""
+    return wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), math.radians(anchor_deg))
+
+
+def _scene(body: str, tilt_deg: float = 0.0, inertia=None, anchor_deg: float = 0.0):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     SolverFeatherPGS.register_custom_attributes(builder)
     table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
     builder.add_shape_box(table, hx=2.0, hy=2.0, hz=0.05)
     rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.radians(tilt_deg))
+    if body == "sphere" and anchor_deg:
+        # Same world pose as add_body, through a FREE joint whose parent anchor is rotated.
+        obj = builder.add_link(xform=wp.transform((0.0, 0.0, _RADIUS), rotation), mass=_MASS)
+        builder.add_shape_sphere(obj, radius=_RADIUS)
+        parent_xform = wp.transform(wp.vec3(0.0), _anchor(anchor_deg))
+        builder.add_articulation([builder.add_joint_free(child=obj, parent_xform=parent_xform)])
+        model = builder.finalize()
+        joint = int(np.flatnonzero(model.joint_child.numpy() == obj)[0])
+        start = int(model.joint_q_start.numpy()[joint])
+        local = wp.transform_inverse(parent_xform) * wp.transform((0.0, 0.0, _RADIUS), rotation)
+        joint_q = model.joint_q.numpy()
+        joint_q[start : start + 7] = np.array([*local.p, *local.q], dtype=np.float32)
+        model.joint_q.assign(joint_q)
+        return model, obj
     if body == "sphere":
         if inertia is None:
             obj = builder.add_body(xform=wp.transform((0.0, 0.0, _RADIUS), rotation), mass=_MASS)
@@ -199,6 +218,62 @@ class TestFreeRigidRollingResistance(unittest.TestCase):
             SolverFeatherPGS(
                 model, solve_mode="matrix_free", velocity_iterations=1, free_rigid_rolling_resistance=1.0e-3
             )
+
+
+class TestRotatedParentAnchor(unittest.TestCase):
+    """The production update and public FK on a FREE joint whose parent anchor is rotated."""
+
+    devices = ("cpu", "cuda") if wp.is_cuda_available() else ("cpu",)
+
+    def _world_omega_after_update(self, device, anchor_deg, omega_world, resistance, graph=False):
+        with wp.ScopedDevice(device):
+            model, obj = _scene("sphere", anchor_deg=anchor_deg)
+        solver = SolverFeatherPGS(
+            model, solve_mode="split" if device == "cpu" else "matrix_free", free_rigid_rolling_resistance=resistance
+        )
+        state = model.state()
+        joint = int(np.flatnonzero(model.joint_child.numpy() == obj)[0])
+        dof = int(model.joint_qd_start.numpy()[joint])
+        qd = state.joint_qd.numpy()
+        qd[dof + 3 : dof + 6] = wp.quat_rotate_inv(_anchor(anchor_deg), wp.vec3(*omega_world))
+        state.joint_qd.assign(qd)
+        normal_impulse = 0.004
+        load = np.zeros((model.body_count, SUPPORT_LOAD_FIELDS), dtype=np.int64)
+        load[obj, 2] = load[obj, 6] = round(normal_impulse * SUPPORT_LOAD_SCALE)
+        solver._rolling_support_load.assign(load)
+        if graph:
+            with wp.ScopedCapture(device=device) as capture:
+                solver._apply_free_rigid_rolling_resistance(state)
+            wp.capture_launch(capture.graph)
+        else:
+            solver._apply_free_rigid_rolling_resistance(state)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        body_q = state.body_q.numpy()[obj]
+        np.testing.assert_allclose(body_q[:3], (0.0, 0.0, _RADIUS), atol=1.0e-6)
+        self.assertGreater(abs(float(body_q[6])), 1.0 - 1.0e-6)
+        inertia = float(model.body_inertia.numpy()[obj][0, 0])
+        return state.body_qd.numpy()[obj][3:6].astype(np.float64), inertia
+
+    def _cases(self):
+        for device in self.devices:
+            for graph in (False, True) if device == "cuda" else (False,):
+                for anchor_deg in (0.0, 45.0, 90.0):
+                    yield device, graph, anchor_deg
+
+    def test_normal_spin_is_unchanged_on_any_parent_anchor(self):
+        """Keep a pure spin about the support normal for identity, 45 and 90 degree parent anchors."""
+        for device, graph, anchor_deg in self._cases():
+            with self.subTest(device=device, graph=graph, anchor_deg=anchor_deg):
+                omega, _ = self._world_omega_after_update(device, anchor_deg, (0.0, 0.0, 6.0), 1.0, graph)
+                np.testing.assert_allclose(omega, (0.0, 0.0, 6.0), atol=1.0e-4)
+
+    def test_rolling_is_resisted_about_the_world_axis_on_any_parent_anchor(self):
+        """Remove the same world-frame rolling momentum for identity, 45 and 90 degree parent anchors."""
+        for device, graph, anchor_deg in self._cases():
+            with self.subTest(device=device, graph=graph, anchor_deg=anchor_deg):
+                omega, inertia = self._world_omega_after_update(device, anchor_deg, (6.0, 0.0, 0.0), 0.025, graph)
+                expected = 6.0 - 0.025 * 0.004 / inertia
+                np.testing.assert_allclose(omega, (expected, 0.0, 0.0), rtol=1.0e-4, atol=1.0e-4)
 
 
 class TestRollingResistanceLaw(unittest.TestCase):
