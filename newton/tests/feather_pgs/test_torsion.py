@@ -35,6 +35,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _estimate_mfgs_shared_memory,
     _get_pgs_solve_mf_gs_kernel,
+    _use_mfgs_pair_cache,
     _use_mfgs_torsion_links,
 )
 from newton.solvers import SolverFeatherPGS, SolverObservableFlags
@@ -2019,6 +2020,38 @@ class TestTorsionSweepLinks(unittest.TestCase):
         self.assertTrue(np.any(result["impulses"][0, :count][torsion_rows] != 0.0))
         for name in ("body_q", "body_qd", "impulses"):
             self.assertTrue(np.all(np.isfinite(result[name])), name)
+
+
+class TestMfgsRowCaches(unittest.TestCase):
+    """Solve with and without the per-launch friction-pair and row caches and require bitwise equal outputs."""
+
+    def test_cached_solve_matches_uncached(self):
+        options = {**PATCH_OPTIONS, "iterations": 8, "spin": 10.0, "sliding": 1.0}
+        for resident in (True, False):
+            with (
+                self.subTest(resident_metadata=resident),
+                patch.object(solver_feather_pgs, "_use_resident_mfgs_metadata", return_value=resident),
+            ):
+                cached, solver, *_ = fixture(0.0075, **options)
+                self.assertTrue(solver._mfgs_pair_cache)
+                self.assertIn("_paircache", solver._pgs_solve_mf_gs_kernel.key)
+                with patch.object(solver_feather_pgs, "_use_mfgs_pair_cache", return_value=False):
+                    plain, solver, *_ = fixture(0.0075, **options)
+                self.assertFalse(solver._mfgs_pair_cache)
+                self.assertNotIn("_paircache", solver._pgs_solve_mf_gs_kernel.key)
+                self.assertTrue(np.any(cached["row_type"] == PGS_CONSTRAINT_TYPE_TORSION))
+                for name, value in cached.items():
+                    np.testing.assert_array_equal(np.asarray(value), np.asarray(plain[name]), err_msg=name)
+
+    def test_selection_requires_static_fit_and_resident_worlds(self):
+        options = {"shared_metadata": False, "torsion_links": True, "has_drive_rows": False, "fuse_vel_limits": False}
+        limit = 101376
+        self.assertTrue(_use_mfgs_pair_cache(1024, 4096, 30, limit, world_count=123, sm_count=188, **options))
+        # Two cached blocks fit per SM, so 1024 worlds would queue.
+        self.assertFalse(_use_mfgs_pair_cache(1024, 4096, 30, limit, world_count=1024, sm_count=188, **options))
+        self.assertFalse(_use_mfgs_pair_cache(4096, 4096, 30, limit, world_count=1, sm_count=188, **options))
+        self.assertFalse(_use_mfgs_pair_cache(1024, 4096, 30, 32 * 1024, world_count=1, sm_count=188, **options))
+        self.assertTrue(_use_mfgs_pair_cache(2, 8, 2, limit, world_count=1, sm_count=1, **options))
 
 
 def _link_layouts():
