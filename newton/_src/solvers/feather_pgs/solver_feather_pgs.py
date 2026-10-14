@@ -26799,6 +26799,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_gmeta"
     if skip_local_internal_worlds:
         name += f"_local_fallback{local_internal_max_constraints}"
+    if pair_cache:
+        name += "_paircache"
     if contact_torsion:
         name += "_torsion_links" if torsion_links else "_torsion"
     if factor_coordinates:
@@ -26807,8 +26809,6 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_angular_{angular_friction_cone}_creep{round(angular_friction_creep_speed * 1.0e9)}nm"
     if contact_compliance:
         name += "_compliance"
-    if pair_cache:
-        name += "_paircache"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
