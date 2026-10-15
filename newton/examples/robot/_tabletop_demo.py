@@ -104,8 +104,12 @@ class TabletopDemo:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.initial = self.model.state()
         self.initial.assign(self.state_0)
+        # Deterministic contacts make the outcome checks reproducible; the solver
+        # supports this mode only with the immediate articulated contact response.
+        deterministic = args.contact_response == "immediate"
         self.pipeline = newton.CollisionPipeline(
             self.model,
+            deterministic=deterministic,
             broad_phase="sap",
             rigid_contact_max=16384,
             reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
@@ -118,6 +122,7 @@ class TabletopDemo:
             self.model,
             solve_mode="matrix_free",
             articulated_contact_response=args.contact_response,
+            deterministic=deterministic,
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,

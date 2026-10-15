@@ -1,5 +1,5 @@
 FPGS tabletop assets
-===================
+====================
 
 The three examples run on CUDA through SolverFeatherPGS's matrix-free path::
 

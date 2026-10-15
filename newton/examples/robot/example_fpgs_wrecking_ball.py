@@ -17,6 +17,14 @@ from ._tabletop_demo import TabletopDemo
 class Example(TabletopDemo):
     task = "crane"
 
+    @staticmethod
+    def create_parser():
+        parser = TabletopDemo.create_parser()
+        # At 12 sweeps the under-converged chain-ball contacts pump spin into the
+        # ball after the strike until it back-drives the slew brake.
+        parser.set_defaults(iterations=32)
+        return parser
+
     def populate(self, builder, info, ee, down, fingers):
         _wrecking_crane.populate(builder, info, ee, down, wp.get_device(), 0)
 

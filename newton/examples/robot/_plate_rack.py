@@ -67,7 +67,7 @@ def populate(b, info, ee, fingers, device, variant):
     seated_rotation = wp.quat_rpy(0.0, 0.19, 0.0) * down
     poses = [(*pose, seated_rotation) if pose[0] >= 4.3 else pose for pose in poses]
     # IK only sees the robot; add all dish bodies after its self filters.
-    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1034), poses, device, desired_rotation=down, cartesian_step=0.12)
+    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1034), poses, device, desired_rotation=down, waypoint_dt=0.12)
     import_object(b, "plate_rack", tf(rack_origin))
     resting = []
     for i in (0, 1):

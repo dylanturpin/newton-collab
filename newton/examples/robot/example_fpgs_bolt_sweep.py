@@ -27,7 +27,7 @@ class Example(TabletopDemo):
         _bolt_sweep.populate(builder, info, ee, down, wp.get_device())
 
     def test_final(self):
-        """Verify that at least 90 fasteners reach the collection bin."""
+        """Verify that at least ``pile_required_count`` fasteners reach the collection bin."""
         self.check_capacity()
         poses = self.state_0.body_q.numpy()
         lo, hi = np.asarray(self.info["pile_bin_bounds"])
@@ -38,7 +38,8 @@ class Example(TabletopDemo):
             ]
         )
         count = np.count_nonzero(np.all((centers >= lo) & (centers <= hi), axis=1))
-        assert count >= 90, f"Only {count}/96 fasteners collected"
+        required, total = self.info["pile_required_count"], len(self.info["pile_bodies"])
+        assert count >= required, f"Only {count}/{total} fasteners collected"
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ def populate(b, info, ee, down, device):
         (10.0, (0.18, 0.44, 0.46), None),
         (15, (0.18, -0.50, 0.35), None),
     ]
-    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.13), poses, device, desired_rotation=down, cartesian_step=0.12)
+    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.13), poses, device, desired_rotation=down, waypoint_dt=0.12)
     info["dense_waypoints"] = True
     info["pile_bodies"] = []
     info["pile_piece_centers"] = []

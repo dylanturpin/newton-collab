@@ -21,8 +21,12 @@ def box(b, p, size, color, body=-1, label=""):
     return b.add_shape_box(body, xform=tf(p), hx=size[0], hy=size[1], hz=size[2], color=color, label=label)
 
 
-def plan_ik(b, ee, offset, poses, device, desired_rotation=None, cartesian_step=None):
-    """Solve a sparse waypoint path; the simulated drives track its interpolation."""
+def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=None):
+    """Solve a sparse waypoint path; the simulated drives track its interpolation.
+
+    When ``waypoint_dt`` [s] is given, each segment is subdivided into eased
+    Cartesian waypoints spaced at most ``waypoint_dt`` apart in time.
+    """
     robot_shapes = [i for i, body in enumerate(b.shape_body) if body >= 0]
     for i, a in enumerate(robot_shapes):
         for c in robot_shapes[i + 1 :]:
@@ -31,10 +35,10 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, cartesian_step=
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     rotation = wp.quat(1.0, 0.0, 0.0, 0.0) if desired_rotation is None else desired_rotation
-    if cartesian_step is not None:
+    if waypoint_dt is not None:
         dense = [poses[0]]
         for a, c in pairwise(poses):
-            n = max(1, math.ceil((c[0] - a[0]) / cartesian_step))
+            n = max(1, math.ceil((c[0] - a[0]) / waypoint_dt))
             qa = rotation if len(a) == 3 else a[3]
             qc = rotation if len(c) == 3 else c[3]
             for j in range(1, n + 1):

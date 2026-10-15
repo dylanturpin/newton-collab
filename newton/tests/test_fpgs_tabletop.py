@@ -3,12 +3,12 @@
 """Check state-buffer reuse in the interactive tabletop examples."""
 
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
 import newton
+import newton.examples
 from newton.examples.robot._tabletop_demo import TabletopDemo
 from newton.examples.robot.example_fpgs_wrecking_ball import Example
 from newton.solvers import SolverFeatherPGS
@@ -71,11 +71,11 @@ for count in (1, 2, 3, 4):
 
 
 def test_wrecking_ball_idle(test, device):
-    """The unstruck building must stand for the entire demonstration."""
+    """Keep the unstruck building standing for the entire demonstration."""
     with wp.ScopedDevice(device):
-        example = Example(
-            ViewerNull(), SimpleNamespace(substeps=4, iterations=12, contact_response="immediate", test=True)
-        )
+        args = newton.examples.default_args(Example.create_parser())
+        args.test = True
+        example = Example(ViewerNull(), args)
         example.autoplay = False
         for _ in range(900):
             example.step()
