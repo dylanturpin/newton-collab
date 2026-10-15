@@ -3,6 +3,7 @@
 
 """Experimental rolling and torsional friction rows on SolverFeatherPGS matrix-free free-rigid contacts."""
 
+import gc
 import math
 import unittest
 
@@ -651,17 +652,53 @@ class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
         model, box, pad = _padded_body_scene(4)
         merged, _ = build_reduction_groups(model)
         self.assertEqual(merged[box], merged[pad])
-        _spin_solver(model)
+        solver = _spin_solver(model)
         groups, _ = build_reduction_groups(model)
         self.assertNotEqual(groups[box], groups[pad])
         for body in ("articulated", "kinematic"):
             with self.subTest(body=body):
                 model, box, pad = _padded_body_scene(4, body)
                 core, _ = build_reduction_groups(model)
-                _spin_solver(model)
+                solver = _spin_solver(model)
+                self.assertTrue(solver._free_rigid_angular_rows)
                 groups, _ = build_reduction_groups(model)
                 np.testing.assert_array_equal(groups, core)
                 self.assertEqual(groups[box], groups[pad])
+
+    def test_reduction_keeps_every_live_solvers_groups(self):
+        """Keep the pad's group while its solver lives, whatever other FeatherPGS solvers are built on the model."""
+        model, box, pad = _padded_body_scene(4)
+        first = _spin_solver(model)
+        pipeline = newton.CollisionPipeline(
+            model, reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True)
+        )
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+        def pad_contacts():
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            shapes = contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count]
+            return int(np.count_nonzero((shapes[0] == pad) | (shapes[1] == pad)))
+
+        expected = pad_contacts()
+        self.assertGreater(expected, 0)
+        zero = SolverFeatherPGS(
+            model, solve_mode="matrix_free", free_rigid_torsional_friction=0.0, free_rigid_rolling_friction=0.0
+        )
+        self.assertEqual(pad_contacts(), expected)
+        model.feather_pgs.condim.fill_(3)
+        rows_off = SolverFeatherPGS(model, solve_mode="matrix_free")
+        self.assertFalse(rows_off._free_rigid_angular_rows)
+        pipeline.refresh_body_pair_reduction_groups()
+        self.assertEqual(pad_contacts(), expected)
+        groups, _ = build_reduction_groups(model)
+        self.assertNotEqual(groups[box], groups[pad])
+        del first, zero
+        gc.collect()
+        groups, _ = build_reduction_groups(model)
+        self.assertEqual(groups[box], groups[pad])
 
 
 class TestFreeRigidAngularFrictionImport(unittest.TestCase):

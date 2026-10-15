@@ -2720,10 +2720,10 @@ class CollisionPipeline:
         synchronous ``O(shape_count)`` host rebuild intended for infrequent
         material changes, not per-frame use.  Call it outside CUDA graph capture.
         Raises if the new class count exceeds the group-id budget.  No-op when
-        reduction is disabled.  A solver that sets a per-shape material key
-        (``set_reduction_material_key``)
-        after this pipeline was built triggers this rebuild at the next
-        :meth:`collide` outside capture.
+        reduction is disabled.  A solver that adds a per-shape material key
+        (``add_reduction_material_key``) after this pipeline grouped its
+        shapes triggers this rebuild at the next :meth:`collide` outside
+        capture.
         """
         if self._body_pair_reducer is None:
             return
@@ -3290,7 +3290,7 @@ class CollisionPipeline:
                     "solver graph first"
                 )
             if reduction_material_key_version(self.model) != self._reduction_material_key_version:
-                # A solver constructed after this pipeline set its material key.
+                # A solver added a material key since this pipeline grouped its shapes.
                 if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
                     raise RuntimeError("A solver changed body-pair reduction groups; collide once outside capture.")
                 self.refresh_body_pair_reduction_groups()

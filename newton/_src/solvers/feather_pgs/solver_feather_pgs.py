@@ -31,7 +31,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...geometry.contact_reduction_body_pairs import set_reduction_material_key
+from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian
@@ -1704,7 +1704,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           Only contacts between free bodies, and free bodies on static or kinematic geometry, read it.
           Values below 4 add nothing; 1 and 2 do not remove sliding friction. Under persistent friction patches,
           contacts share a patch only if their angular coefficients match, so each patch's angular rows are
-          independent of contact order; once this solver is constructed, body-pair contact reduction likewise
+          independent of contact order; while this solver is alive, body-pair contact reduction likewise
           groups the shapes of free-rigid-route bodies by these coefficients. Shape edits take effect at
           :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` and, under body-pair reduction,
           :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups`; a solver built without angular
@@ -3560,7 +3560,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             validate_torsional_rolling_friction_coefficients(self)
         validate_free_rigid_angular_friction_mode(self)
         self._free_rigid_route_body = free_rigid_route_bodies(self)
-        set_reduction_material_key(model, free_rigid_reduction_material_key(self))
 
         # Coupled resets pass the SolverBase mask, shape (model.world_count + 1,); it is
         # translated into this solver-world mask so masked resets stay capturable.
@@ -3575,6 +3574,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and model.articulation_world is not None
             and np.any(model.articulation_world.numpy() < 0)
         )
+        # Last, so a failed construction leaves the model's reduction keys untouched.
+        reduction_key = free_rigid_reduction_material_key(self)
+        if reduction_key is not None:
+            add_reduction_material_key(model, self, reduction_key)
 
     def validate_contact_compliance(self) -> None:
         """Raise the first latched contact-compliance error, then clear it.

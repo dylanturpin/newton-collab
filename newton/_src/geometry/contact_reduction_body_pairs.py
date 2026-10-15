@@ -240,24 +240,28 @@ _MATERIAL_FIELDS = (
     "shape_material_restitution",
 )
 
-# Per-model (provider, version) set by the solver whose contact law reads per-shape
-# data beyond these fields. A provider returns a ``(shape_count, k)`` array whose
-# columns join the exactly compared signature. Weak keys: a model's entry dies with it.
+# Per-model keys of the live solvers whose contact laws read per-shape data beyond
+# these fields, by owner. A provider returns a ``(shape_count, k)`` array whose
+# columns join the exactly compared signature; every live owner's key applies.
+# Weak keys: an entry dies with its model or owner. Adding one bumps the model's
+# version, which tells pipelines to regroup; a collected owner's key drops out at
+# the next regroup.
 _SOLVER_MATERIAL_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_SOLVER_MATERIAL_KEY_VERSIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
-def set_reduction_material_key(model, provider) -> None:
-    """Attach a solver's per-shape material key to ``model``; pipelines regroup at their next uncaptured collide."""
-    entry = _SOLVER_MATERIAL_KEYS.get(model)
-    if entry is None and provider is None:
-        return
-    _SOLVER_MATERIAL_KEYS[model] = (provider, reduction_material_key_version(model) + 1)
+def add_reduction_material_key(model, owner, provider) -> None:
+    """Add ``owner``'s per-shape material key to ``model`` while ``owner`` lives.
+
+    Pipelines regroup at their next uncaptured collide.
+    """
+    _SOLVER_MATERIAL_KEYS.setdefault(model, weakref.WeakKeyDictionary())[owner] = provider
+    _SOLVER_MATERIAL_KEY_VERSIONS[model] = reduction_material_key_version(model) + 1
 
 
 def reduction_material_key_version(model) -> int:
-    """Return how many times a solver has set ``model``'s reduction material key."""
-    entry = _SOLVER_MATERIAL_KEYS.get(model)
-    return 0 if entry is None else entry[1]
+    """Return how many solver material keys were added to ``model``."""
+    return _SOLVER_MATERIAL_KEY_VERSIONS.get(model, 0)
 
 
 def build_reduction_groups(model) -> tuple:
@@ -266,7 +270,7 @@ def build_reduction_groups(model) -> tuple:
     Static shapes keep unique ids so distinct static colliders never merge.
     Dynamic shapes share a group only per (body, exact material signature):
     a body whose colliders differ in any solver-visible material field, or in
-    the key a solver set with :func:`set_reduction_material_key`, gets one
+    a key a live solver added with :func:`add_reduction_material_key`, gets one
     group per material class, so contacts carrying different physics never
     compete for the same slots.
 
@@ -281,8 +285,7 @@ def build_reduction_groups(model) -> tuple:
         arr = getattr(model, name, None)
         if arr is not None:
             mats.append(arr.numpy())
-    provider = _SOLVER_MATERIAL_KEYS.get(model, (None, 0))[0]
-    if provider is not None:
+    for provider in list(_SOLVER_MATERIAL_KEYS.get(model, {}).values()):
         mats.extend(np.asarray(provider()).reshape(n, -1).T)
     ids = np.zeros(n, dtype=np.int32)
     class_ids: dict = {}
