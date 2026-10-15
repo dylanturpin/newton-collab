@@ -12,7 +12,7 @@ import newton.examples
 from newton.examples.robot._tabletop_demo import TabletopDemo
 from newton.examples.robot.example_fpgs_wrecking_ball import Example
 from newton.solvers import SolverFeatherPGS
-from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
+from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_selected_cuda_test_devices
 from newton.viewer import ViewerNull
 
 
@@ -84,6 +84,7 @@ def test_wrecking_ball_idle(test, device):
         example.check_capacity()
 
 
+@unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
 class TestWreckingBallStability(unittest.TestCase):
     pass
 
