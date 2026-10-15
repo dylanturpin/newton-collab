@@ -1,0 +1,247 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="pelican_penny_farthing">
+  <compiler angle="radian" meshdir="../cad" inertiafromgeom="false" autolimits="true" />
+  <option timestep="0.00025" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="100" tolerance="1e-10" cone="elliptic" />
+  <default>
+    <geom contype="0" conaffinity="0" condim="1" friction="0.02 0.001 0.0001" solref="0.003 1" solimp="0.95 0.99 0.001" margin="5e-06" />
+    <joint damping="1e-05" armature="1e-9" />
+  </default>
+  <visual>
+    <global offwidth="1500" offheight="1200" />
+    <headlight diffuse="0.8 0.8 0.8" ambient="0.4 0.4 0.4" />
+  </visual>
+  <statistic center="0 0 0.15" extent="0.38" />
+  <asset>
+    <mesh name="display_plinth" file="display_plinth.stl" scale="0.001 0.001 0.001" />
+    <mesh name="bicycle_frame" file="bicycle_frame.stl" scale="0.001 0.001 0.001" />
+    <mesh name="bearings_stands_guides" file="bearings_stands_guides.stl" scale="0.001 0.001 0.001" />
+    <mesh name="saddle" file="saddle.stl" scale="0.001 0.001 0.001" />
+    <mesh name="handle_grip_-1" file="handle_grip_-1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="handle_grip_1" file="handle_grip_1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="pelican_body" file="pelican_body.stl" scale="0.001 0.001 0.001" />
+    <mesh name="upper_bill" file="upper_bill.stl" scale="0.001 0.001 0.001" />
+    <mesh name="eye_-1" file="eye_-1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="eye_1" file="eye_1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="front_tire" file="front_tire.stl" scale="0.001 0.001 0.001" />
+    <mesh name="front_rim" file="front_rim.stl" scale="0.001 0.001 0.001" />
+    <mesh name="front_spokes" file="front_spokes.stl" scale="0.001 0.001 0.001" />
+    <mesh name="rear_tire" file="rear_tire.stl" scale="0.001 0.001 0.001" />
+    <mesh name="rear_rim" file="rear_rim.stl" scale="0.001 0.001 0.001" />
+    <mesh name="rear_spokes" file="rear_spokes.stl" scale="0.001 0.001 0.001" />
+    <mesh name="axle_cranks_pedal_pins" file="axle_cranks_pedal_pins.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wheel_drive_gear_24T" file="wheel_drive_gear_24T.stl" scale="0.001 0.001 0.001" />
+    <mesh name="camshaft_gear_48T" file="camshaft_gear_48T.stl" scale="0.001 0.001 0.001" />
+    <mesh name="camshaft" file="camshaft.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_eccentric_cam" file="wing_eccentric_cam.stl" scale="0.001 0.001 0.001" />
+    <mesh name="beak_C2_dwell_cam" file="beak_C2_dwell_cam.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_lifting_fork" file="wing_lifting_fork.stl" scale="0.001 0.001 0.001" />
+    <mesh name="beak_lifting_rod" file="beak_lifting_rod.stl" scale="0.001 0.001 0.001" />
+    <mesh name="lower_bill_pouch" file="lower_bill_pouch.stl" scale="0.001 0.001 0.001" />
+    <mesh name="jaw_counterweight" file="jaw_counterweight.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_left" file="wing_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="feather_tips_left" file="feather_tips_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="thigh_left" file="thigh_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="knee_pin_left" file="knee_pin_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="shin_left" file="shin_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="webbed_foot_left" file="webbed_foot_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_right" file="wing_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="feather_tips_right" file="feather_tips_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="thigh_right" file="thigh_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="knee_pin_right" file="knee_pin_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="shin_right" file="shin_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="webbed_foot_right" file="webbed_foot_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="tooth_24" file="collision_tooth_24.stl" scale="0.001 0.001 0.001" />
+    <mesh name="tooth_48" file="collision_tooth_48.stl" scale="0.001 0.001 0.001" />
+  </asset>
+  <worldbody>
+    <light pos="-0.3 -0.4 0.7" dir="0.4 0.4 -1" />
+    <geom name="display_plinth_visual" type="mesh" mesh="display_plinth" rgba="0.3 0.23 0.16 1" group="1" />
+    <geom name="bicycle_frame_visual" type="mesh" mesh="bicycle_frame" rgba="0.12 0.34 0.34 1" group="1" />
+    <geom name="bearings_stands_guides_visual" type="mesh" mesh="bearings_stands_guides" rgba="0.21 0.24 0.27 1" group="1" />
+    <geom name="saddle_visual" type="mesh" mesh="saddle" rgba="0.1 0.12 0.14 1" group="1" />
+    <geom name="handle_grip_-1_visual" type="mesh" mesh="handle_grip_-1" rgba="0.1 0.12 0.14 1" group="1" />
+    <geom name="handle_grip_1_visual" type="mesh" mesh="handle_grip_1" rgba="0.1 0.12 0.14 1" group="1" />
+    <geom name="pelican_body_visual" type="mesh" mesh="pelican_body" rgba="0.93 0.91 0.82 1" group="1" />
+    <geom name="upper_bill_visual" type="mesh" mesh="upper_bill" rgba="0.98 0.68 0.2 1" group="1" />
+    <geom name="eye_-1_visual" type="mesh" mesh="eye_-1" rgba="0.055 0.065 0.07 1" group="1" />
+    <geom name="eye_1_visual" type="mesh" mesh="eye_1" rgba="0.055 0.065 0.07 1" group="1" />
+    <body name="input" pos="0.038 0 0.09">
+      <joint name="wheel_angle" type="hinge" axis="0 1 0" damping="4e-05" />
+      <inertial mass="0.18224355913190066" pos="-1.85707736464e-10 0.00112699944996 1.22295068669e-10" fullinertia="0.00036807440821 0.000387278680869 0.000374865790261 2.21162323768e-05 1.34246613449e-14 -1.87867152531e-12" />
+      <geom name="front_tire_visual" type="mesh" mesh="front_tire" rgba="0.1 0.12 0.14 1" group="1" />
+      <geom name="front_rim_visual" type="mesh" mesh="front_rim" rgba="0.63 0.68 0.68 1" group="1" />
+      <geom name="front_spokes_visual" type="mesh" mesh="front_spokes" rgba="0.65 0.68 0.69 1" group="1" />
+      <geom name="axle_cranks_pedal_pins_visual" type="mesh" mesh="axle_cranks_pedal_pins" rgba="0.65 0.68 0.69 1" group="1" />
+      <geom name="wheel_drive_gear_24T_visual" type="mesh" mesh="wheel_drive_gear_24T" rgba="0.78 0.57 0.25 1" group="1" />
+      <geom name="input_gear_root" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.0215 0.003" pos="0 0.034 0" quat="0.707106781187 -0.707106781187 -0 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_0" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="0.288675134595 -0 -0.957427107756 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_1" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="0.161236164097 -0 -0.986915852232 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_2" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="0.0310383981278 -0 -0.999518192852 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_3" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.0996904434385 -0 -0.995018500073 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_4" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.228713553878 -0 -0.973493764886 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_5" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.353823312 -0 -0.935312281479 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_6" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.472879055154 -0 -0.881127345618 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_7" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.583843706569 -0 -0.811866076579 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_8" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.684818630291 -0 -0.728713553878 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_9" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.774076117382 -0 -0.633092540233 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_10" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.85008894749 -0 -0.526639137697 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_11" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.911556520018 -0 -0.411174793504 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_12" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.957427107756 -0 -0.288675134595 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_13" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.986915852232 -0 -0.161236164097 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_14" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.999518192852 -0 -0.0310383981278 -0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_15" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.995018500073 0 0.0996904434385 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_16" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.973493764886 0 0.228713553878 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_17" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.935312281479 0 0.353823312 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_18" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.881127345618 0 0.472879055154 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_19" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.811866076579 0 0.583843706569 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_20" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.728713553878 0 0.684818630291 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_21" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.633092540233 0 0.774076117382 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_22" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.526639137697 0 0.85008894749 0" contype="1" conaffinity="1" />
+      <geom name="input_tooth_23" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_24" pos="0 0.034 0" quat="-0.411174793504 0 0.911556520018 0" contype="1" conaffinity="1" />
+      <site name="pedal_left" pos="0.022 -0.072 0" size="0.001" rgba="0 0 0 0" />
+      <site name="pedal_right" pos="-0.022 0.072 0" size="0.001" rgba="0 0 0 0" />
+    </body>
+    <body name="output" pos="-0.022 0 0.129799497484">
+      <joint name="cam_angle" type="hinge" axis="0 1 0" damping="5e-06" />
+      <inertial mass="0.062966670568862" pos="-1.75093755371e-07 0.0504357927995 -0.00184814131895" fullinertia="3.30580935434e-05 3.12079157411e-05 3.15547169175e-05 -1.87477288383e-10 -7.66397255217e-12 6.84624822834e-07" />
+      <geom name="camshaft_gear_48T_visual" type="mesh" mesh="camshaft_gear_48T" rgba="0.78 0.57 0.25 1" group="1" />
+      <geom name="camshaft_visual" type="mesh" mesh="camshaft" rgba="0.65 0.68 0.69 1" group="1" />
+      <geom name="wing_eccentric_cam_visual" type="mesh" mesh="wing_eccentric_cam" rgba="0.88 0.43 0.18 1" group="1" />
+      <geom name="beak_C2_dwell_cam_visual" type="mesh" mesh="beak_C2_dwell_cam" rgba="0.88 0.43 0.18 1" group="1" />
+      <geom name="output_gear_root" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.0455 0.003" pos="0 0.034 0" quat="0.707106781187 -0.707106781187 -0 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_0" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.947469303655 -0 -0.319846711147 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_1" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.96635967493 -0 -0.257194437478 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_2" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.981111945718 -0 -0.193440817743 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_3" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.991662944532 -0 -0.128858854728 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_4" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.997967490375 -0 -0.0637250983146 -0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_5" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.999998586213 0 0.00168153875302 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_6" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.997747534582 0 0.0670809752135 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_7" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.991223974831 0 0.13219316064 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_8" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.980455841845 0 0.196739274657 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_9" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.965489246421 0 0.260442920897 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_10" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.94638827782 0 0.323031310565 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_11" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.92323472932 0 0.384236430569 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_12" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.896127747973 0 0.443796191188 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_13" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.865183410032 0 0.501455548384 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_14" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.830534223905 0 0.556967595937 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_15" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.792328562724 0 0.610094622736 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_16" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.750730028998 0 0.660609130698 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_17" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.705916754033 0 0.708294808943 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_18" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.658080635153 0 0.752947460077 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_19" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.607426513963 0 0.794375874593 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_20" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.554171299186 0 0.832402649658 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_21" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.498543037829 0 0.866864948785 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_22" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.440779938645 0 0.897615199118 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_23" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.381129352095 0 0.924521723364 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_24" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.319846711147 0 0.947469303655 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_25" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.257194437478 0 0.96635967493 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_26" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.193440817743 0 0.981111945718 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_27" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.128858854728 0 0.991662944532 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_28" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="-0.0637250983146 0 0.997967490375 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_29" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.00168153875302 0 0.999998586213 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_30" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.0670809752135 0 0.997747534582 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_31" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.13219316064 0 0.991223974831 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_32" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.196739274657 0 0.980455841845 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_33" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.260442920897 0 0.965489246421 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_34" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.323031310565 0 0.94638827782 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_35" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.384236430569 0 0.92323472932 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_36" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.443796191188 0 0.896127747973 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_37" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.501455548384 0 0.865183410032 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_38" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.556967595937 0 0.830534223905 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_39" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.610094622736 0 0.792328562724 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_40" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.660609130698 0 0.750730028998 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_41" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.708294808943 0 0.705916754033 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_42" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.752947460077 0 0.658080635153 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_43" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.794375874593 0 0.607426513963 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_44" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.832402649658 0 0.554171299186 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_45" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.866864948785 0 0.498543037829 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_46" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.897615199118 0 0.440779938645 0" contype="1" conaffinity="1" />
+      <geom name="output_tooth_47" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="tooth_48" pos="0 0.034 0" quat="0.924521723364 0 0.381129352095 0" contype="1" conaffinity="1" />
+      <geom name="wing_cam_surface" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.019 0.003" pos="0 0.05 -0.009" quat="0.707106781187 -0.707106781187 -0 -0" />
+      <geom name="beak_cam_surface" type="mesh" group="3" rgba="0.2 0.4 0.6 0" mesh="beak_C2_dwell_cam" />
+    </body>
+    <body name="rear" pos="-0.111 0 0.044">
+      <joint name="rear_angle" type="hinge" axis="0 1 0" damping="5e-06" />
+      <inertial mass="0.01824961853885333" pos="4.01823546472e-19 -8.37234909255e-20 6.16559579251e-19" fullinertia="4.5608335723e-06 8.75843344891e-06 4.5608335723e-06 7.88680971723e-25 8.33990470178e-22 -7.19562647694e-23" />
+      <geom name="rear_tire_visual" type="mesh" mesh="rear_tire" rgba="0.1 0.12 0.14 1" group="1" />
+      <geom name="rear_rim_visual" type="mesh" mesh="rear_rim" rgba="0.63 0.68 0.68 1" group="1" />
+      <geom name="rear_spokes_visual" type="mesh" mesh="rear_spokes" rgba="0.65 0.68 0.69 1" group="1" />
+    </body>
+    <body name="fork" pos="0 0 0.139799497484">
+      <joint name="fork_z" type="slide" axis="0 0 1" range="-0.002 0.022" damping="0.025" />
+      <inertial mass="0.008108328844276938" pos="-0.0504517814251 0.0213023972672 0.0338421777437" fullinertia="1.45797569773e-05 7.50483272981e-06 1.3060118561e-05 -3.15252956091e-06 2.52841303493e-06 3.16278004786e-06" />
+      <geom name="wing_lifting_fork_visual" type="mesh" mesh="wing_lifting_fork" rgba="0.15 0.53 0.68 1" group="1" />
+      <geom name="wing_cam_foot" type="box" group="3" rgba="0.2 0.4 0.6 0" size="0.018 0.005 0.002" pos="-0.022 0.05 0.002" />
+      <geom name="fork_shelf_-1" type="box" group="3" rgba="0.2 0.4 0.6 0" size="0.004 0.006 0.002" pos="-0.064 -0.0395 0.0792005025157" />
+      <geom name="fork_shelf_1" type="box" group="3" rgba="0.2 0.4 0.6 0" size="0.004 0.006 0.002" pos="-0.064 0.0395 0.0792005025157" />
+    </body>
+    <body name="beak_slider" pos="0 0 0.155799497484">
+      <joint name="beak_slider_z" type="slide" axis="0 0 1" range="-0.002 0.011" damping="0.025" />
+      <inertial mass="0.005353928844276932" pos="-0.0102988358975 0.0355457422789 0.0446649810301" fullinertia="9.94795629143e-06 8.57095394926e-06 6.00597155023e-06 1.66301642569e-06 -2.81283312161e-06 4.2903743962e-06" />
+      <geom name="beak_lifting_rod_visual" type="mesh" mesh="beak_lifting_rod" rgba="0.15 0.53 0.68 1" group="1" />
+      <geom name="beak_cam_foot" type="box" group="3" rgba="0.2 0.4 0.6 0" size="0.016 0.005 0.002" pos="-0.022 0.065 0.002" />
+      <geom name="jaw_shelf" type="box" group="3" rgba="0.2 0.4 0.6 0" size="0.005 0.0035 0.002" pos="0.033 0.009 0.103700502516" />
+    </body>
+    <body name="wing_left" pos="-0.017 -0.023 0.233" quat="0.965925826289 0.258819045103 -0 -0">
+      <joint name="wing_left_angle" type="hinge" axis="-1 0 0" ref="-0.5235987755982988" range="-0.663225115758 0.663225115758" damping="1e-05" />
+      <inertial mass="0.00932626218195951" pos="-0.00791809904837 -0.0373296607893 5.63154873574e-05" fullinertia="5.74735868589e-06 2.75869527874e-06 8.48280098827e-06 7.03796630697e-07 5.27465644509e-10 1.82812574679e-08" />
+      <geom name="wing_left_visual" type="mesh" mesh="wing_left" rgba="0.9 0.9 0.85 1" group="1" />
+      <geom name="feather_tips_left_visual" type="mesh" mesh="feather_tips_left" rgba="0.18 0.21 0.24 1" group="1" />
+      <geom name="wing_left_shoe" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.003 0.006" pos="-0.045 -0.018 0" quat="0.707106781187 0 0.707106781187 0" />
+    </body>
+    <body name="wing_right" pos="-0.017 0.023 0.233" quat="0.965925826289 -0.258819045103 -0 -0">
+      <joint name="wing_right_angle" type="hinge" axis="1 0 0" ref="-0.5235987755982988" range="-0.663225115758 0.663225115758" damping="1e-05" />
+      <inertial mass="0.009326262181959514" pos="-0.00791809904837 0.0373296607893 5.63154873574e-05" fullinertia="5.74735868589e-06 2.75869527874e-06 8.48280098827e-06 -7.03796630697e-07 5.27465644509e-10 -1.82812574679e-08" />
+      <geom name="wing_right_visual" type="mesh" mesh="wing_right" rgba="0.9 0.9 0.85 1" group="1" />
+      <geom name="feather_tips_right_visual" type="mesh" mesh="feather_tips_right" rgba="0.18 0.21 0.24 1" group="1" />
+      <geom name="wing_right_shoe" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.003 0.006" pos="-0.045 0.018 0" quat="0.707106781187 0 0.707106781187 0" />
+    </body>
+    <body name="jaw" pos="0.055 0 0.264">
+      <joint name="jaw_angle" type="hinge" axis="0 1 0" range="0 0.488692190558" damping="2e-06" />
+      <inertial mass="0.028564448548927937" pos="-0.0117973656584 -0.00523366649201 -0.00245474540103" fullinertia="1.73640150668e-06 3.31203933811e-05 3.29274232804e-05 -3.32980648244e-06 2.9948522443e-06 3.66976575477e-07" />
+      <geom name="lower_bill_pouch_visual" type="mesh" mesh="lower_bill_pouch" rgba="0.87 0.42 0.15 1" group="1" />
+      <geom name="jaw_counterweight_visual" type="mesh" mesh="jaw_counterweight" rgba="0.65 0.68 0.69 1" group="1" />
+      <geom name="jaw_shoe" type="cylinder" group="3" rgba="0.2 0.4 0.6 0" size="0.0025 0.007" pos="-0.024 0.006 0" quat="0.707106781187 -0.707106781187 -0 -0" />
+    </body>
+    <body name="thigh_left" pos="-0.01 -0.066 0.188" quat="0.814466773728 -0 -0.580210198542 -0">
+      <joint name="hip_left" type="hinge" axis="0 1 0" ref="-1.2379734962607876" damping="5e-06" />
+      <inertial mass="0.003398285677561082" pos="-5.03670339872e-20 -0.00252378662598 -0.0554556158453" fullinertia="1.59397992009e-06 1.55289307664e-06 5.76209908268e-08 -4.29460902757e-27 -1.21880592951e-23 -1.07587512135e-07" />
+      <geom name="thigh_left_visual" type="mesh" mesh="thigh_left" rgba="0.88 0.57 0.24 1" group="1" />
+      <geom name="knee_pin_left_visual" type="mesh" mesh="knee_pin_left" rgba="0.65 0.68 0.69 1" group="1" />
+      <body name="shin_left" pos="0 -0.006 -0.068" quat="0.835780719905 0 0.549063373606 0">
+        <joint name="knee_left" type="hinge" axis="0 1 0" ref="1.1624863287216158" damping="5e-06" />
+        <inertial mass="0.001884137943193167" pos="0.00320559955449 -0.000151656346445 -0.0472850793145" fullinertia="1.4702574737e-06 1.53801175671e-06 8.60146671709e-08 3.51111468893e-09 1.82496147966e-07 -8.63590822763e-09" />
+        <geom name="shin_left_visual" type="mesh" mesh="shin_left" rgba="0.88 0.57 0.24 1" group="1" />
+        <geom name="webbed_foot_left_visual" type="mesh" mesh="webbed_foot_left" rgba="0.87 0.42 0.15 1" group="1" />
+        <site name="ankle_left" pos="0 0 -0.076" size="0.001" rgba="0 0 0 0" />
+      </body>
+    </body>
+    <body name="thigh_right" pos="-0.01 0.066 0.188" quat="0.850773926358 -0 -0.525531850823 -0">
+      <joint name="hip_right" type="hinge" axis="0 1 0" ref="-1.1066802602928376" damping="5e-06" />
+      <inertial mass="0.003398285677561082" pos="-5.03670339872e-20 0.00252378662598 -0.0554556158453" fullinertia="1.59397992009e-06 1.55289307664e-06 5.76209908268e-08 2.06634289626e-25 -1.21880592951e-23 1.07587512135e-07" />
+      <geom name="thigh_right_visual" type="mesh" mesh="thigh_right" rgba="0.88 0.57 0.24 1" group="1" />
+      <geom name="knee_pin_right_visual" type="mesh" mesh="knee_pin_right" rgba="0.65 0.68 0.69 1" group="1" />
+      <body name="shin_right" pos="0 0.006 -0.068" quat="0.702990075634 0 0.711199658015 0">
+        <joint name="knee_right" type="hinge" axis="0 1 0" ref="1.5824064947479148" damping="5e-06" />
+        <inertial mass="0.001884137943193167" pos="0.00320559955449 -0.000151656346445 -0.0472850793145" fullinertia="1.4702574737e-06 1.53801175671e-06 8.60146671709e-08 3.51111468893e-09 1.82496147966e-07 -8.63590822763e-09" />
+        <geom name="shin_right_visual" type="mesh" mesh="shin_right" rgba="0.88 0.57 0.24 1" group="1" />
+        <geom name="webbed_foot_right_visual" type="mesh" mesh="webbed_foot_right" rgba="0.87 0.42 0.15 1" group="1" />
+        <site name="ankle_right" pos="0 0 -0.076" size="0.001" rgba="0 0 0 0" />
+      </body>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="ankle_pin_left" site1="ankle_left" site2="pedal_left" solref="0.002 1" solimp="0.95 0.99 0.001" />
+    <connect name="ankle_pin_right" site1="ankle_right" site2="pedal_right" solref="0.002 1" solimp="0.95 0.99 0.001" />
+  </equality>
+  <contact>
+    <pair geom1="wing_cam_surface" geom2="wing_cam_foot" condim="1" margin="5e-06" />
+    <pair geom1="wing_left_shoe" geom2="fork_shelf_-1" condim="1" margin="5e-06" />
+    <pair geom1="wing_right_shoe" geom2="fork_shelf_1" condim="1" margin="5e-06" />
+    <pair geom1="beak_cam_surface" geom2="beak_cam_foot" condim="1" margin="5e-06" />
+    <pair geom1="jaw_shoe" geom2="jaw_shelf" condim="1" margin="5e-06" />
+  </contact>
+  <actuator>
+    <velocity name="wheel_drive" joint="wheel_angle" kv="0.025" forcerange="-0.04 0.04" ctrlrange="-14 14" />
+  </actuator>
+</mujoco>

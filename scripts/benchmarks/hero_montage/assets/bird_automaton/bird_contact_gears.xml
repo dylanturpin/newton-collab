@@ -1,0 +1,188 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="contact_driven_bird">
+  <compiler angle="radian" meshdir="../cad" inertiafromgeom="false" autolimits="true" />
+  <option timestep="0.0005" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="80" tolerance="1e-10" cone="elliptic" />
+  <default>
+    <geom contype="0" conaffinity="0" condim="1" friction="0.03 0.001 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001" margin="1e-05" />
+    <joint damping="1e-05" armature="1e-8" />
+  </default>
+  <visual>
+    <global offwidth="1600" offheight="1200" />
+    <headlight diffuse="0.8 0.8 0.8" ambient="0.4 0.4 0.4" />
+  </visual>
+  <statistic center="-0.005 -0.015 0.13" extent="0.34" />
+  <asset>
+    <mesh name="frame" file="frame.stl" scale="0.001 0.001 0.001" />
+    <mesh name="fixed_bird_body" file="fixed_bird_body.stl" scale="0.001 0.001 0.001" />
+    <mesh name="input_gear" file="input_gear.stl" scale="0.001 0.001 0.001" />
+    <mesh name="idler_gear" file="idler_gear.stl" scale="0.001 0.001 0.001" />
+    <mesh name="output_gear_shaft" file="output_gear_shaft.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_eccentric_cam" file="wing_eccentric_cam.stl" scale="0.001 0.001 0.001" />
+    <mesh name="beak_dwell_cam" file="beak_dwell_cam.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_lifting_fork" file="wing_lifting_fork.stl" scale="0.001 0.001 0.001" />
+    <mesh name="beak_pushrod" file="beak_pushrod.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_right" file="wing_right.stl" scale="0.001 0.001 0.001" />
+    <mesh name="wing_left" file="wing_left.stl" scale="0.001 0.001 0.001" />
+    <mesh name="lower_beak" file="lower_beak.stl" scale="0.001 0.001 0.001" />
+    <mesh name="beak_counterweight" file="beak_counterweight.stl" scale="0.001 0.001 0.001" />
+    <mesh name="eye_-1" file="eye_-1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="eye_1" file="eye_1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="tooth_24" file="tooth_24.stl" scale="0.001 0.001 0.001" />
+    <mesh name="tooth_20" file="tooth_20.stl" scale="0.001 0.001 0.001" />
+    <mesh name="tooth_36" file="tooth_36.stl" scale="0.001 0.001 0.001" />
+  </asset>
+  <worldbody>
+    <light pos="-0.2 -0.4 0.7" dir="0.3 0.4 -1" diffuse="0.7 0.7 0.7" />
+    <camera name="overview" pos="-0.41 -0.59 0.34" xyaxes="0.821 -0.571 0 0.186 0.267 0.946" />
+    <geom name="frame_visual" type="mesh" mesh="frame" pos="0 0 0" rgba="0.28 0.32 0.36 1" group="1" />
+    <geom name="fixed_bird_body_visual" type="mesh" mesh="fixed_bird_body" pos="0 0 0" rgba="0.89 0.85 0.74 1" group="1" />
+    <geom name="eye_-1_visual" type="mesh" mesh="eye_-1" pos="0 0 0" rgba="0.3 0.33 0.37 1" group="1" />
+    <geom name="eye_1_visual" type="mesh" mesh="eye_1" pos="0 0 0" rgba="0.3 0.33 0.37 1" group="1" />
+    <body name="input_rotor" pos="-0.068 -0.1 0.065">
+      <joint name="input_angle" type="hinge" axis="1 0 0" damping="1e-05" />
+      <inertial mass="0.01209925250412816" pos="-0.001394072455 3.688957653e-17 -0.001524794729" fullinertia="3.384281324e-06 2.35820056e-06 1.995939276e-06 5.886418168e-21 -3.350706807e-07 -1.29228698e-19" />
+      <geom name="input_gear_visual" type="mesh" mesh="input_gear" pos="0 0 0" rgba="0.79 0.64 0.32 1" group="1" />
+      <geom name="input_root" type="cylinder" size="0.0215 0.004" quat="0.7071067812 0 0.7071067812 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_0" type="mesh" mesh="tooth_24" quat="1 0 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_1" type="mesh" mesh="tooth_24" quat="0.9914448614 0.1305261922 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_2" type="mesh" mesh="tooth_24" quat="0.9659258263 0.2588190451 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_3" type="mesh" mesh="tooth_24" quat="0.9238795325 0.3826834324 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_4" type="mesh" mesh="tooth_24" quat="0.8660254038 0.5 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_5" type="mesh" mesh="tooth_24" quat="0.7933533403 0.608761429 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_6" type="mesh" mesh="tooth_24" quat="0.7071067812 0.7071067812 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_7" type="mesh" mesh="tooth_24" quat="0.608761429 0.7933533403 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_8" type="mesh" mesh="tooth_24" quat="0.5 0.8660254038 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_9" type="mesh" mesh="tooth_24" quat="0.3826834324 0.9238795325 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_10" type="mesh" mesh="tooth_24" quat="0.2588190451 0.9659258263 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_11" type="mesh" mesh="tooth_24" quat="0.1305261922 0.9914448614 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_12" type="mesh" mesh="tooth_24" quat="6.123233996e-17 1 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_13" type="mesh" mesh="tooth_24" quat="-0.1305261922 0.9914448614 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_14" type="mesh" mesh="tooth_24" quat="-0.2588190451 0.9659258263 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_15" type="mesh" mesh="tooth_24" quat="-0.3826834324 0.9238795325 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_16" type="mesh" mesh="tooth_24" quat="-0.5 0.8660254038 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_17" type="mesh" mesh="tooth_24" quat="-0.608761429 0.7933533403 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_18" type="mesh" mesh="tooth_24" quat="-0.7071067812 0.7071067812 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_19" type="mesh" mesh="tooth_24" quat="-0.7933533403 0.608761429 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_20" type="mesh" mesh="tooth_24" quat="-0.8660254038 0.5 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_21" type="mesh" mesh="tooth_24" quat="-0.9238795325 0.3826834324 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_22" type="mesh" mesh="tooth_24" quat="-0.9659258263 0.2588190451 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="input_tooth_23" type="mesh" mesh="tooth_24" quat="-0.9914448614 0.1305261922 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+    </body>
+    <body name="idler_rotor" pos="-0.068 -0.056 0.065">
+      <joint name="idler_angle" type="hinge" axis="1 0 0" damping="1e-05" />
+      <inertial mass="0.0078098950975616244" pos="0.0002375836215 2.234582881e-15 2.177505533e-15" fullinertia="1.449049612e-06 8.421834727e-07 8.421834727e-07 3.864362899e-21 5.41801906e-21 6.235728964e-21" />
+      <geom name="idler_gear_visual" type="mesh" mesh="idler_gear" pos="0 0 0" rgba="0.79 0.64 0.32 1" group="1" />
+      <geom name="idler_root" type="cylinder" size="0.0175 0.004" quat="0.7071067812 0 0.7071067812 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_0" type="mesh" mesh="tooth_20" quat="0.9969173337 0.07845909573 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_1" type="mesh" mesh="tooth_20" quat="0.9723699204 0.2334453639 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_2" type="mesh" mesh="tooth_20" quat="0.9238795325 0.3826834324 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_3" type="mesh" mesh="tooth_20" quat="0.8526401644 0.5224985647 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_4" type="mesh" mesh="tooth_20" quat="0.7604059656 0.6494480483 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_5" type="mesh" mesh="tooth_20" quat="0.6494480483 0.7604059656 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_6" type="mesh" mesh="tooth_20" quat="0.5224985647 0.8526401644 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_7" type="mesh" mesh="tooth_20" quat="0.3826834324 0.9238795325 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_8" type="mesh" mesh="tooth_20" quat="0.2334453639 0.9723699204 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_9" type="mesh" mesh="tooth_20" quat="0.07845909573 0.9969173337 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_10" type="mesh" mesh="tooth_20" quat="-0.07845909573 0.9969173337 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_11" type="mesh" mesh="tooth_20" quat="-0.2334453639 0.9723699204 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_12" type="mesh" mesh="tooth_20" quat="-0.3826834324 0.9238795325 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_13" type="mesh" mesh="tooth_20" quat="-0.5224985647 0.8526401644 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_14" type="mesh" mesh="tooth_20" quat="-0.6494480483 0.7604059656 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_15" type="mesh" mesh="tooth_20" quat="-0.7604059656 0.6494480483 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_16" type="mesh" mesh="tooth_20" quat="-0.8526401644 0.5224985647 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_17" type="mesh" mesh="tooth_20" quat="-0.9238795325 0.3826834324 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_18" type="mesh" mesh="tooth_20" quat="-0.9723699204 0.2334453639 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="idler_tooth_19" type="mesh" mesh="tooth_20" quat="-0.9969173337 0.07845909573 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+    </body>
+    <body name="output_rotor" pos="-0.068 0 0.065">
+      <joint name="output_angle" type="hinge" axis="1 0 0" damping="1e-05" />
+      <inertial mass="0.048249180712536636" pos="0.03572369038 1.769401452e-15 -0.003196947889" fullinertia="2.075018452e-05 9.384557747e-05 9.251519573e-05 9.704361219e-19 3.561123301e-06 -9.190692445e-19" />
+      <geom name="output_gear_shaft_visual" type="mesh" mesh="output_gear_shaft" pos="0 0 0" rgba="0.79 0.64 0.32 1" group="1" />
+      <geom name="output_root" type="cylinder" size="0.0335 0.004" quat="0.7071067812 0 0.7071067812 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_0" type="mesh" mesh="tooth_36" quat="1 0 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_1" type="mesh" mesh="tooth_36" quat="0.9961946981 0.08715574275 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_2" type="mesh" mesh="tooth_36" quat="0.984807753 0.1736481777 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_3" type="mesh" mesh="tooth_36" quat="0.9659258263 0.2588190451 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_4" type="mesh" mesh="tooth_36" quat="0.9396926208 0.3420201433 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_5" type="mesh" mesh="tooth_36" quat="0.906307787 0.4226182617 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_6" type="mesh" mesh="tooth_36" quat="0.8660254038 0.5 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_7" type="mesh" mesh="tooth_36" quat="0.8191520443 0.5735764364 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_8" type="mesh" mesh="tooth_36" quat="0.7660444431 0.6427876097 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_9" type="mesh" mesh="tooth_36" quat="0.7071067812 0.7071067812 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_10" type="mesh" mesh="tooth_36" quat="0.6427876097 0.7660444431 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_11" type="mesh" mesh="tooth_36" quat="0.5735764364 0.8191520443 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_12" type="mesh" mesh="tooth_36" quat="0.5 0.8660254038 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_13" type="mesh" mesh="tooth_36" quat="0.4226182617 0.906307787 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_14" type="mesh" mesh="tooth_36" quat="0.3420201433 0.9396926208 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_15" type="mesh" mesh="tooth_36" quat="0.2588190451 0.9659258263 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_16" type="mesh" mesh="tooth_36" quat="0.1736481777 0.984807753 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_17" type="mesh" mesh="tooth_36" quat="0.08715574275 0.9961946981 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_18" type="mesh" mesh="tooth_36" quat="6.123233996e-17 1 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_19" type="mesh" mesh="tooth_36" quat="-0.08715574275 0.9961946981 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_20" type="mesh" mesh="tooth_36" quat="-0.1736481777 0.984807753 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_21" type="mesh" mesh="tooth_36" quat="-0.2588190451 0.9659258263 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_22" type="mesh" mesh="tooth_36" quat="-0.3420201433 0.9396926208 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_23" type="mesh" mesh="tooth_36" quat="-0.4226182617 0.906307787 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_24" type="mesh" mesh="tooth_36" quat="-0.5 0.8660254038 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_25" type="mesh" mesh="tooth_36" quat="-0.5735764364 0.8191520443 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_26" type="mesh" mesh="tooth_36" quat="-0.6427876097 0.7660444431 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_27" type="mesh" mesh="tooth_36" quat="-0.7071067812 0.7071067812 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_28" type="mesh" mesh="tooth_36" quat="-0.7660444431 0.6427876097 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_29" type="mesh" mesh="tooth_36" quat="-0.8191520443 0.5735764364 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_30" type="mesh" mesh="tooth_36" quat="-0.8660254038 0.5 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_31" type="mesh" mesh="tooth_36" quat="-0.906307787 0.4226182617 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_32" type="mesh" mesh="tooth_36" quat="-0.9396926208 0.3420201433 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_33" type="mesh" mesh="tooth_36" quat="-0.9659258263 0.2588190451 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_34" type="mesh" mesh="tooth_36" quat="-0.984807753 0.1736481777 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="output_tooth_35" type="mesh" mesh="tooth_36" quat="-0.9961946981 0.08715574275 0 0" contype="1" conaffinity="1" group="3" rgba="0.5 0.5 0.5 0" />
+      <geom name="wing_eccentric_cam_visual" type="mesh" mesh="wing_eccentric_cam" pos="0.044 0 0" rgba="0.84 0.4 0.18 1" group="1" />
+      <geom name="beak_dwell_cam_visual" type="mesh" mesh="beak_dwell_cam" pos="0.101 0 0" rgba="0.84 0.4 0.18 1" group="1" />
+      <geom name="wing_cam_contact" type="cylinder" size="0.02 0.004" pos="0.044 0 -0.01032437585" quat="0.7071067812 0 0.7071067812 0" group="3" rgba="1 0 0 0" />
+      <geom name="beak_cam_contact" type="mesh" mesh="beak_dwell_cam" pos="0.101 0 0" group="3" rgba="1 0 0 0" />
+    </body>
+    <body name="wing_fork" pos="0 0 0.07467562415">
+      <joint name="fork_z" type="slide" axis="0 0 1" range="-0.002 0.024" damping="0.03" />
+      <inertial mass="0.0094116" pos="-0.04121704067 -4.25196214e-18 0.03606171108" fullinertia="1.506655684e-05 9.360249109e-06 7.812629435e-06 1.127316769e-22 1.723091043e-06 -1.443109147e-21" />
+      <geom name="wing_lifting_fork_visual" type="mesh" mesh="wing_lifting_fork" pos="0 0 0" rgba="0.12 0.52 0.64 1" group="1" />
+      <geom name="fork_cam_foot" type="box" size="0.005 0.018 0.002" pos="-0.024 0 0.002" group="3" rgba="0 0 1 0" />
+      <geom name="fork_pad_-1" type="box" size="0.004 0.005 0.002" pos="-0.048 -0.0383 0.1" group="3" rgba="0 0 1 0" />
+      <geom name="fork_pad_1" type="box" size="0.004 0.005 0.002" pos="-0.048 0.0383 0.1" group="3" rgba="0 0 1 0" />
+    </body>
+    <body name="wing_left" pos="0 0.022 0.19" quat="0.9537169507 -0.3007057995 0 0">
+      <joint name="wing_left_angle" type="hinge" axis="1 0 0" ref="-0.6108652381980153" range="-0.7330382858 0.7853981634" damping="1e-05" />
+      <inertial mass="0.008999045401400804" pos="-0.01105768111 0.03217206375 9.835250713e-18" fullinertia="3.999833116e-06 2.213123176e-06 6.18966701e-06 -4.357148953e-07 -2.723980867e-22 2.736721361e-21" />
+      <geom name="wing_left_visual" type="mesh" mesh="wing_left" pos="0 0 0" rgba="0.78 0.62 0.37 1" group="1" />
+      <geom name="wing_left_shoe" type="cylinder" size="0.003 0.007" pos="-0.045 0.018 0" quat="0.7071067812 0 0.7071067812 0" group="3" rgba="1 0 1 0" />
+    </body>
+    <body name="wing_right" pos="0 -0.022 0.19" quat="0.9537169507 0.3007057995 0 0">
+      <joint name="wing_right_angle" type="hinge" axis="-1 0 0" ref="-0.6108652381980153" range="-0.7330382858 0.7853981634" damping="1e-05" />
+      <inertial mass="0.008999045401401293" pos="-0.01105768111 -0.03217206375 8.764319614e-17" fullinertia="3.999833116e-06 2.213123176e-06 6.18966701e-06 4.357148953e-07 1.600116128e-20 -1.954460871e-20" />
+      <geom name="wing_right_visual" type="mesh" mesh="wing_right" pos="0 0 0" rgba="0.78 0.62 0.37 1" group="1" />
+      <geom name="wing_right_shoe" type="cylinder" size="0.003 0.007" pos="-0.045 -0.018 0" quat="0.7071067812 0 0.7071067812 0" group="3" rgba="1 0 1 0" />
+    </body>
+    <body name="beak_slider" pos="0 0 0.083">
+      <joint name="beak_slide_z" type="slide" axis="0 0 1" range="-0.002 0.011" damping="0.03" />
+      <inertial mass="0.004484206961932009" pos="0.03304317374 -0.005488073121 0.05162391326" fullinertia="1.011540933e-05 9.94710332e-06 2.08161244e-07 4.863090438e-10 -1.527041039e-08 5.589637589e-07" />
+      <geom name="beak_pushrod_visual" type="mesh" mesh="beak_pushrod" pos="0 0 0" rgba="0.12 0.52 0.64 1" group="1" />
+      <geom name="beak_cam_foot" type="box" size="0.005 0.016 0.002" pos="0.033 0 0.002" group="3" rgba="0 0 1 0" />
+      <geom name="beak_lifting_pad" type="box" size="0.0055 0.004 0.002" pos="0.0335 -0.008 0.1305" group="3" rgba="0 0 1 0" />
+    </body>
+    <body name="jaw" pos="0.05 0 0.218">
+      <joint name="jaw_angle" type="hinge" axis="0 1 0" range="0 0.6108652382" damping="2e-06" />
+      <inertial mass="0.009921457170935575" pos="-0.02525794717 -0.0001038995655 -1.066140169e-05" fullinertia="1.920093188e-07 9.840037037e-07 1.035735107e-06 7.481746616e-09 3.844964797e-09 1.099014697e-11" />
+      <geom name="lower_beak_visual" type="mesh" mesh="lower_beak" pos="0 0 0" rgba="0.82 0.43 0.19 1" group="1" />
+      <geom name="beak_counterweight_visual" type="mesh" mesh="beak_counterweight" pos="0 0 0" rgba="0.3 0.33 0.37 1" group="1" />
+      <geom name="jaw_shoe" type="cylinder" size="0.0025 0.007" pos="-0.018 -0.005 0" quat="0.7071067812 0.7071067812 0 0" group="3" rgba="1 0 1 0" />
+    </body>
+  </worldbody>
+  <contact>
+    <pair geom1="wing_cam_contact" geom2="fork_cam_foot" condim="1" margin="1e-05" />
+    <pair geom1="wing_left_shoe" geom2="fork_pad_1" condim="1" margin="1e-05" />
+    <pair geom1="wing_right_shoe" geom2="fork_pad_-1" condim="1" margin="1e-05" />
+    <pair geom1="beak_cam_contact" geom2="beak_cam_foot" condim="1" margin="1e-05" />
+    <pair geom1="jaw_shoe" geom2="beak_lifting_pad" condim="1" margin="1e-05" />
+  </contact>
+  <actuator>
+    <velocity name="crank_drive" joint="input_angle" kv="0.025" forcerange="-0.05 0.05" ctrlrange="-10 10" />
+  </actuator>
+</mujoco>

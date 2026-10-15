@@ -9,33 +9,39 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-# First demonstrations share a six-second window; later cuts show variety.
+# Four opening seconds, then quick cuts and complete final demonstrations.
 ROWS = [
     [
-        ("07-lighter-contact", 0, 4.5, 6),
-        ("drawer", 2.5, 2, 2),
-        ("06-knife-insertion", 1, 2, 2),
-        ("13-toy-assembly", 1, 2, 2),
-        ("15-quadruped", 1, 2, 2),
+        ("07-lighter-contact", 0, 4.5, 4),
+        ("drawer", 2.5, 2, 1.8),
+        ("15-quadruped", 1, 2, 1.8),
+        ("13-toy-assembly", 1, 2, 1.8),
+        ("06-knife-insertion", 1, 5, 4.6),
     ],
     [
-        ("04-hardware-bin", 0, 6, 6),
-        ("05-wrecking-ball", 3, 2, 2),
-        ("10-hockey", 1, 2, 2),
-        ("02-balance-scale", 1, 2, 2),
-        ("14-humanoid", 1, 2, 2),
+        ("04-hardware-bin", 0, 6, 4),
+        ("05-wrecking-ball", 3, 2, 1.8),
+        ("10-hockey", 1, 2, 1.8),
+        ("14-humanoid", 1, 2, 1.8),
+        ("02-balance-scale", 1, 5, 4.6),
     ],
     [
-        ("08-plate-rack", 0, 6, 6),
-        ("01-allegro", 1, 2, 2),
-        ("12-brick-chutes", 1.5, 2, 2),
-        ("11-jenga", 2, 2, 2),
-        ("09-toy-truck", 1, 2, 2),
+        ("08-plate-rack", 0, 6, 4),
+        ("01-allegro", 1, 2, 1.8),
+        ("12-brick-chutes", 1.5, 2, 1.8),
+        ("11-jenga", 2, 2, 1.8),
+        ("09-toy-truck", 1, 5, 4.6),
     ],
 ]
 
 
 def assemble(root):
+    total_duration = sum(item[3] for item in ROWS[0])
+    assert all(sum(item[3] for item in row) == total_duration for row in ROWS)
+    frame_count = round(total_duration * 30)
+    wide_report = json.loads((root / "reports" / "16-final-zoom-out.json").read_text())
+    wide_duration = wide_report["frames"] / wide_report["fps"]
+    assert abs(wide_duration - total_duration) < 1 / 30
     output = root / "montage"
     output.mkdir(exist_ok=True)
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -106,7 +112,7 @@ def assemble(root):
             "-map",
             "[out]",
             "-frames:v",
-            "420",
+            str(frame_count),
             "-r",
             "30",
             *codec,
@@ -117,7 +123,7 @@ def assemble(root):
     reader = imageio_ffmpeg.read_frames(str(destination))
     metadata = next(reader)
     frames = sum(1 for _ in reader)
-    assert frames == 420 and metadata["size"] == (1920, 956)
+    assert frames == frame_count and metadata["size"] == (1920, 956)
     (output / "report.json").write_text(
         json.dumps(
             {

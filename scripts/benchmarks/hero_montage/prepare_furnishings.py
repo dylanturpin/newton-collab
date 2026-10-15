@@ -42,8 +42,13 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "assets" / "furnishings")
     parser.add_argument("--only", default="")
+    parser.add_argument("--source-commit", help="Commit of an archived source checkout")
     args = parser.parse_args()
     selected = set(args.only.split(",")) if args.only else None
+    source_commit = (
+        args.source_commit
+        or subprocess.check_output(["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
+    )
     sys.path[:0] = [str(args.source.resolve()), str(args.source.resolve() / "src")]
     from assetgen import registry  # noqa: PLC0415 -- source checkout is selected above
     from assetgen.design import PALETTES, Program  # noqa: PLC0415
@@ -53,7 +58,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = {
         "source": "https://github.com/LuckyIYI/proc-gen-3d",
-        "commit": subprocess.check_output(["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip(),
+        "commit": source_commit,
         "scope": "Original material surfaces for fixed set dressing; task physics is separate.",
         "assets": {},
     }
@@ -168,9 +173,7 @@ def main():
             records.append(record)
         np.savez_compressed(args.output / f"{name}.npz", **data)
         manifest["assets"][name] = {
-            "source_commit": subprocess.check_output(
-                ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True
-            ).strip(),
+            "source_commit": source_commit,
             "family": program.family,
             "parameters": program.parameters,
             "regions": records,
@@ -203,6 +206,9 @@ def main():
             )
             p["phase"] = 0.0
         program = plugin.build_program(p, quality="standard")
+        if name == "toy_tangram":
+            # Place the loose puzzle pieces directly on the scene's tabletop.
+            program.parts[:] = [part for part in program.parts if part.name != "board"]
         if name == "desk_task_lamp":
             repair_lamp_support(program)
         if name in ("hex_key", "fastener_set"):
@@ -289,25 +295,9 @@ def main():
     family("knife_block", "utensil_holder_studio", "knife_block")
     family("parts_tray", "drawer_organizer_studio", "modular_bins")
     family("plant", "plant_studio", "rosette")
-    for branch in (
-        "pen",
-        "pencil",
-        "stapler",
-        "paper_clip",
-        "binder_clip",
-        "ruler",
-        "scissors",
-        "tape_dispenser",
-        "sticky_notes",
-        "index_cards",
-        "clipboard",
-        "document_tray",
-        "pen_cup",
-        "eraser",
-        "highlighter",
-        "hole_punch",
-    ):
-        family("office_" + branch, "office_clutter_studio", branch, seed=43)
+    # Only explicitly selected props are baked; no generic stationery catalog
+    # for automatic table filling. This clipboard belongs to curated layouts.
+    family("office_clipboard", "office_clutter_studio", "clipboard", seed=43)
 
     for name, branch, finish in (
         ("toy_excavator", "excavator", "ochre"),
@@ -358,7 +348,16 @@ def main():
     family("radio_table", "audio_studio", "table_radio", {"wood": "ivory", "grille": "exposed"}, seed=71)
     family("speaker_portable", "audio_studio", "portable_speaker", {"finish": "chrome", "accent": "ivory"}, seed=71)
     family("desk_fan", "climate_studio", "desk_fan", {"finish_color": "sage", "metal": "chrome"}, seed=71)
+    family("party_citrus_basket", "fruit_basket_studio", "citrus", {"basket": "bamboo_slats", "count": 4}, seed=71)
+    family(
+        "desktop_abacus",
+        "office_clutter_studio",
+        "abacus",
+        {"wood": "ash", "abacus_style": "compact", "abacus_rows": 8},
+        seed=91,
+    )
     family("clock_twin", "clock_studio", "twin_bell", {"frame": "chrome", "radius": 0.11}, seed=71)
+    family("toy_tangram", "board_game_studio", "tangram", {"variant": 0, "wood": "ash"}, seed=71)
     family("toy_puzzle", "hard_toy_studio", "shape_puzzle", {"variant": 1, "finish_color": "petrol"}, seed=71)
     family("ring_stack", "board_game_studio", "ring_stack", {"wood": "ash", "finish_color": "petrol"}, seed=71)
     family("tool_caddy", "utensil_holder_studio", "tool_slot_caddy", {"filled": True}, seed=71)

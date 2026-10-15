@@ -21,25 +21,6 @@ def metadata():
     return json.loads((ROOT / "manifest.json").read_text())["assets"]
 
 
-def footprint(name, p, angle, scale):
-    bounds = np.asarray(metadata()[name]["bounds"])
-    sx, sy = (scale, scale) if np.isscalar(scale) else scale[:2]
-    points = np.array([[x * sx, y * sy] for x in bounds[:, 0] for y in bounds[:, 1]])
-    rotation = np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
-    points = points @ rotation.T + np.asarray(p[:2])
-    return points.min(axis=0), points.max(axis=0)
-
-
-@cache
-def tabletop(name):
-    from scipy.spatial import ConvexHull
-
-    with np.load(ROOT / f"{name}.npz") as data:
-        vertices = np.concatenate([data[f"v{i}"] for i in range(len(metadata()[name]["regions"]))])
-    surface = vertices[vertices[:, 2] > -0.006, :2]
-    return ConvexHull(surface).equations
-
-
 @cache
 def wood_texture(material):
     """Offline wood fields fitted from the source repository's CC0 profiles."""
@@ -78,21 +59,20 @@ def catalog(name):
     return result
 
 
-def asset(b, name, p=(0, 0, 0), angle=0, scale=1, body=-1):
+def asset(b, name, p=(0, 0, 0), angle=0, scale=1, body=-1, top_color=None):
     for i, (mesh, color) in enumerate(catalog(name)):
+        region_color = color
+        if top_color is not None and metadata()[name]["regions"][i]["material"] == "plastic":
+            region_color = tuple(top_color)
         b.add_shape_mesh(
             body,
             xform=wp.transform(wp.vec3(*p), wp.quat_rpy(0.0, 0.0, float(angle))),
             mesh=mesh,
             scale=(scale,) * 3 if np.isscalar(scale) else scale,
-            color=color,
+            color=region_color,
             cfg=visual_cfg(b),
             label=f"furnishing/{name}/{i}",
         )
-    if body == -1 and not name.startswith("bench_"):
-        if not hasattr(b, "_hero_decor_footprints"):
-            b._hero_decor_footprints = []
-        b._hero_decor_footprints.append(footprint(name, p, angle, scale))
 
 
 @cache
@@ -201,6 +181,19 @@ def dress(b, kind, variant, info, color):
         if label in ("plinth", "accent"):
             b.shape_flags[i] &= ~int(newton.ShapeFlags.VISIBLE)
     tables = {
+        "lava_fall": ("bench_lab", "bench_white"),
+        "yoyo": ("bench_white", "bench_lab"),
+        "toaster": ("bench_lab", "bench_white"),
+        "cereal": ("bench_lab", "bench_white"),
+        "unpacking": ("bench_lab", "bench_white"),
+        "well": ("bench_lab", "bench_white"),
+        "box_turn": ("bench_lab", "bench_white"),
+        "bottle_flip": ("bench_lab", "bench_white"),
+        "pelican": ("bench_lab", "bench_white"),
+        "bird_automaton": ("bench_lab", "bench_white"),
+        "spinning_top": ("bench_white", "bench_lab"),
+        "screw": ("bench_white", "bench_lab"),
+        "beer_pong": ("bench_lab", "bench_white"),
         "lift": ("bench_ash", "bench_white"),
         "stack": ("bench_walnut", "bench_round"),
         "sort": ("bench_oak", "bench_white"),
@@ -224,8 +217,16 @@ def dress(b, kind, variant, info, color):
         ("stack", 3): "bench_white",
         ("serve", 3): "bench_lab",
     }.get((kind, variant), table)
+    table_style = json.loads((ROOT.parent / "task_tables.json").read_text()).get(kind, {})
+    table = table_style.get("asset", table)
     footprint_size = 0.88 if kind in ("hand", "gear", "stack") else 1.0
-    asset(b, table, p=(0, 0, -0.001), scale=(footprint_size, footprint_size, 1.0))
+    asset(
+        b, table, p=(0, 0, -0.001), scale=(footprint_size, footprint_size, 1.0), top_color=table_style.get("top_color")
+    )
+    task_decor = json.loads((ROOT.parent / "task_decor.json").read_text()).get(kind)
+    if task_decor:
+        for prop in task_decor:
+            asset(b, prop["asset"], prop["position"], angle=prop["angle"], scale=prop["scale"])
     # Furnish by activity. No accessory is stamped onto every workstation.
     if kind == "lift":
         asset(b, "office_clipboard", (0.66, -0.64, 0.002), angle=0.17, scale=0.75)
@@ -306,35 +307,22 @@ def dress(b, kind, variant, info, color):
                 b.shape_flags[i] &= ~int(newton.ShapeFlags.VISIBLE)
         asset(b, "hockey", (0.18, 0.08, 0))
         asset(b, "mug", (-0.84, -0.67, 0))
-    # Different, mildly untidy office clusters occupy the edges of each bench.
-    # Keep the central manipulation corridor clear; these are visible set props.
-    seed = sum((i + 1) * ord(char) for i, char in enumerate(kind)) + 73 * variant
-    rng = np.random.default_rng(seed)
-    clusters = [
-        ("office_sticky_notes", "office_pen", "office_pencil", "office_paper_clip", "office_binder_clip"),
-        ("office_index_cards", "office_highlighter", "office_eraser", "office_ruler", "office_paper_clip"),
-        ("office_stapler", "office_pen", "office_tape_dispenser", "office_scissors", "office_binder_clip"),
-        ("office_pen_cup", "office_document_tray", "office_index_cards", "office_pencil", "office_hole_punch"),
-    ]
-    decor = []
-    surface = tabletop(table)
-    for cluster_index, center in enumerate(((0.74, -0.67), (-0.74, 0.67))):
-        selection = clusters[(seed + cluster_index) % len(clusters)]
-        for name in selection:
-            for _ in range(600):
-                pos = np.add(center, rng.uniform(-0.20, 0.20, size=2))
-                angle = float(rng.uniform(-0.55, 0.55))
-                low, high = footprint(name, (*pos, 0), angle, 0.65)
-                corners = np.array([[x, y] for x in (low[0], high[0]) for y in (low[1], high[1])])
-                if np.max((corners / footprint_size) @ surface[:, :2].T + surface[:, 2]) > -0.015:
-                    continue
-                occupied = getattr(b, "_hero_decor_footprints", [])
-                if any(np.all(high + 0.012 > a) and np.all(low - 0.012 < c) for a, c in occupied):
-                    continue
-                asset(b, name, (*pos, 0.002), angle=angle, scale=0.65)
-                decor.append({"asset": name, "position": pos.tolist(), "angle": angle})
-                break
+    # Deliberate per-task/per-class decorations only. An absent or empty
+    # task_decor entry must never trigger generic filler or random scatter.
     title = {
+        "lava_fall": "MINIATURE LAVA FALL",
+        "yoyo": "29 / YO-YO RETURN",
+        "toaster": "28 / TOAST FOR TWO",
+        "cereal": "27 / ALPHABET CEREAL",
+        "unpacking": "21 / UNPACKING",
+        "well": "20 / TOY WELL",
+        "box_turn": "24 / BOX TURN",
+        "bottle_flip": "23 / BOTTLE FLIP",
+        "pelican": "22 / PELICAN REMOTE",
+        "bird_automaton": "19 / BIRD AUTOMATON",
+        "spinning_top": "18 / SPINNING TOP",
+        "screw": "17 / THREAD ASSEMBLY",
+        "beer_pong": "16 / BEER PONG",
         "lift": "01 / BALANCE SCALE",
         "stack": "02 / BALANCE",
         "sort": "03 / AIR HOCKEY",
@@ -363,5 +351,5 @@ def dress(b, kind, variant, info, color):
         "source": "proc-gen-3d",
         "table": table,
         "collision_scope": "visual-only set dressing",
-        "office_clutter": decor,
+        "task_decor": task_decor or [],
     }

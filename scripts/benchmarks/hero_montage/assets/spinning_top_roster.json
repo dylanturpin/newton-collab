@@ -1,0 +1,11 @@
+{
+  "stations": [
+    {
+      "kind": "spinning_top",
+      "variant": 0
+    }
+  ],
+  "display_order": [
+    "spinning_top-0"
+  ]
+}

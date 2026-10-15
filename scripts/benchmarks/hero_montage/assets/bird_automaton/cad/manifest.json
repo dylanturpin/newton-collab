@@ -1,0 +1,242 @@
+{
+  "frame": {
+    "color": [
+      0.28,
+      0.32,
+      0.36
+    ],
+    "origin": [
+      0,
+      0,
+      0
+    ],
+    "axis": null,
+    "motion": null,
+    "volume_mm3": 538337.4289799498,
+    "valid": true
+  },
+  "fixed_bird_body": {
+    "color": [
+      0.89,
+      0.85,
+      0.74
+    ],
+    "origin": [
+      0,
+      0,
+      0
+    ],
+    "axis": null,
+    "motion": null,
+    "volume_mm3": 33962.96095234523,
+    "valid": true
+  },
+  "input_gear": {
+    "color": [
+      0.79,
+      0.64,
+      0.32
+    ],
+    "origin": [
+      -68.0,
+      -100.0,
+      65
+    ],
+    "axis": "x",
+    "motion": "input",
+    "volume_mm3": 16132.336672172216,
+    "valid": true
+  },
+  "idler_gear": {
+    "color": [
+      0.79,
+      0.64,
+      0.32
+    ],
+    "origin": [
+      -68.0,
+      -56.0,
+      65
+    ],
+    "axis": "x",
+    "motion": "idler",
+    "volume_mm3": 10413.193463416826,
+    "valid": true
+  },
+  "output_gear_shaft": {
+    "color": [
+      0.79,
+      0.64,
+      0.32
+    ],
+    "origin": [
+      -68.0,
+      0.0,
+      65
+    ],
+    "axis": "x",
+    "motion": "output",
+    "volume_mm3": 35554.15249794675,
+    "valid": true
+  },
+  "wing_eccentric_cam": {
+    "color": [
+      0.84,
+      0.4,
+      0.18
+    ],
+    "origin": [
+      -24,
+      0,
+      65
+    ],
+    "axis": "x",
+    "motion": "output",
+    "volume_mm3": 9811.570848279353,
+    "valid": true
+  },
+  "beak_dwell_cam": {
+    "color": [
+      0.84,
+      0.4,
+      0.18
+    ],
+    "origin": [
+      33,
+      0,
+      65
+    ],
+    "axis": "x",
+    "motion": "output",
+    "volume_mm3": 9809.853096344057,
+    "valid": true
+  },
+  "wing_lifting_fork": {
+    "color": [
+      0.12,
+      0.52,
+      0.64
+    ],
+    "origin": [
+      0,
+      0,
+      74.67562414568117
+    ],
+    "axis": "z",
+    "motion": "qw",
+    "volume_mm3": 8555.999999999998,
+    "valid": true
+  },
+  "beak_pushrod": {
+    "color": [
+      0.12,
+      0.52,
+      0.64
+    ],
+    "origin": [
+      0,
+      0,
+      83.0
+    ],
+    "axis": "z",
+    "motion": "qb",
+    "volume_mm3": 4076.551783574557,
+    "valid": true
+  },
+  "wing_right": {
+    "color": [
+      0.78,
+      0.62,
+      0.37
+    ],
+    "origin": [
+      0,
+      -22,
+      190
+    ],
+    "axis": "x",
+    "motion": "alpha-1",
+    "volume_mm3": 11998.727201868598,
+    "valid": true
+  },
+  "wing_left": {
+    "color": [
+      0.78,
+      0.62,
+      0.37
+    ],
+    "origin": [
+      0,
+      22,
+      190
+    ],
+    "axis": "x",
+    "motion": "alpha1",
+    "volume_mm3": 11998.7272018686,
+    "valid": true
+  },
+  "lower_beak": {
+    "color": [
+      0.82,
+      0.43,
+      0.19
+    ],
+    "origin": [
+      50,
+      0,
+      218
+    ],
+    "axis": "y",
+    "motion": "beta",
+    "volume_mm3": 1368.4689754153148,
+    "valid": true
+  },
+  "beak_counterweight": {
+    "color": [
+      0.3,
+      0.33,
+      0.37
+    ],
+    "origin": [
+      50,
+      0,
+      218
+    ],
+    "axis": "y",
+    "motion": "beta",
+    "volume_mm3": 1140.3981332530948,
+    "valid": true
+  },
+  "eye_-1": {
+    "color": [
+      0.3,
+      0.33,
+      0.37
+    ],
+    "origin": [
+      0,
+      0,
+      0
+    ],
+    "axis": null,
+    "motion": null,
+    "volume_mm3": 20.10619298297467,
+    "valid": true
+  },
+  "eye_1": {
+    "color": [
+      0.3,
+      0.33,
+      0.37
+    ],
+    "origin": [
+      0,
+      0,
+      0
+    ],
+    "axis": null,
+    "motion": null,
+    "volume_mm3": 20.10619298297467,
+    "valid": true
+  }
+}

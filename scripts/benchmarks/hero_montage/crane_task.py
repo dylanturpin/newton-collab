@@ -105,12 +105,11 @@ def building(b, center):
 
 
 def populate(b, info, ee, down, device, variant):
-    from scene import box, plan_ik, tf  # noqa: PLC0415 -- shared scene helpers
+    from scene import plan_ik, tf  # noqa: PLC0415 -- shared scene helpers
 
     base = np.array([0.18, 0.25, 0])
     for body, label in enumerate(b.body_label):
         if label.endswith(("/fr3_leftfinger", "/fr3_rightfinger")):
-            box(b, (0, 0, 0.085), (0.006, 0.006, 0.055), (0.31, 0.36, 0.40), body, "crane_long_jaw")
             for shape, owner in enumerate(b.shape_body):
                 if owner == body:
                     b.shape_material_mu[shape] = 1.3
@@ -122,41 +121,39 @@ def populate(b, info, ee, down, device, variant):
             vi = b.joint_qd_start[j]
             b.joint_target_ke[vi], b.joint_target_kd[vi] = 4000, 40
             b.joint_effort_limit[vi] = 40
-    pivot = base + np.array([0, -0.06, 0.142])
-    lever = np.array([0, -0.20, 0.268])
+    # Stock fingers pinch the existing rear counterweight across its 52 mm
+    # depth. The tracked base stays fixed; contact turns the upper body.
+    lever = np.array([0.040, 0.116, 0.151])
 
-    def control_point(lift, slew):
-        q = wp.quat_rpy(0.0, 0.0, float(slew))
-        rotated_pivot = base + np.asarray(wp.quat_rotate(q, wp.vec3(*(pivot - base))))
-        return rotated_pivot + np.asarray(wp.quat_rotate(wp.quat_rpy(float(lift), 0.0, float(slew)), wp.vec3(*lever)))
+    def control_point(slew):
+        return base + np.asarray(wp.quat_rotate(wp.quat_rpy(0.0, 0.0, float(slew)), wp.vec3(*lever)))
 
-    first = control_point(0, 0)
-    poses = [(0, first + np.array([0, 0, 0.17]), 0.018), (1, first, 0.018), (1.8, first, 0.004)]
+    first = control_point(0)
+    poses = [(0, first + np.array([0, 0, 0.17]), 0.04), (1, first, 0.04), (1.8, first, 0.018)]
     phases = [
-        (3.2, -0.12, -0.4),
-        (4.0, -0.12, -0.4),
-        (5.4, -0.12, 1.65),
-        (5.55, -0.12, 1.65),
+        (3.2, -0.4),
+        (4.0, -0.4),
+        (5.4, 1.65),
+        (5.55, 1.65),
     ]
-    previous_time, previous_lift, previous_slew = 1.8, 0.0, 0.0
-    for time, lift, slew in phases:
+    previous_time, previous_slew = 1.8, 0.0
+    for time, slew in phases:
         count = max(1, math.ceil((time - previous_time) / 0.055))
         for j in range(1, count + 1):
             u = j / count
             ease = u * u * (3 - 2 * u)
             angle = previous_slew + ease * (slew - previous_slew)
-            tilt = previous_lift + ease * (lift - previous_lift)
             poses.append(
                 (
                     previous_time + (time - previous_time) * u,
-                    control_point(tilt, angle),
-                    0.004,
+                    control_point(angle),
+                    0.018,
                     wp.quat_rpy(0.0, 0.0, angle) * down,
                 )
             )
-        previous_time, previous_lift, previous_slew = time, lift, slew
+        previous_time, previous_slew = time, slew
     turned = wp.quat_rpy(0.0, 0.0, 1.65) * down
-    last = control_point(-0.12, 1.65)
+    last = control_point(1.65)
     poses.extend(
         [
             (5.85, last, 0.035, turned),
@@ -165,9 +162,12 @@ def populate(b, info, ee, down, device, variant):
             (15, last + np.array([0, 0, 0.18]), 0.035, turned),
         ]
     )
-    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1934), poses, device, desired_rotation=down)
+    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1034), poses, device, desired_rotation=down)
     info["dense_waypoints"] = True
+    info["integral_drive_count"] = 6
     joint_start = b.joint_count
+    # The imported crane joints stay unarticulated; one articulation below also
+    # spans the rotating body, chain and ball.
     mapping, _ = import_object(
         b,
         "crane",
@@ -182,9 +182,12 @@ def populate(b, info, ee, down, device, variant):
         if b.joint_label[j] == "crane/boom.lift.q":
             b.joint_limit_upper[vi] = 0
             b.joint_damping[vi] = 0.05
-        elif b.joint_label[j] in ("crane/crane.slew.q", "crane/hook.swing.q"):
+        elif b.joint_label[j] == "crane/crane.slew.q":
+            # A dry slew brake resists back-driving but yields to the gripper.
+            b.joint_friction[vi] = 3.0
             b.joint_damping[vi] = 0.006
-    box(b, (first[0], first[1], first[2] - 0.025), (0.022, 0.024, 0.012), (0.31, 0.36, 0.40), label="crane_boom_stop")
+        elif b.joint_label[j] == "crane/hook.swing.q":
+            b.joint_damping[vi] = 0.006
     hook_local = np.array([0, -0.338, 0.416])
     top = base + hook_local
     count, link_length, radius = 5, 0.025, 0.049
@@ -248,6 +251,11 @@ def populate(b, info, ee, down, device, variant):
         demolition_half_sizes=sizes,
         demolition_upper_floors=floors,
         demolition_furniture=furniture,
+        crane_grasp_body=mapping["crane.slew"],
+        crane_grasp_feature="original rear counterweight",
+        crane_fingers=[
+            i for i, label in enumerate(b.body_label) if label.endswith(("/fr3_leftfinger", "/fr3_rightfinger"))
+        ],
         crane_slew=mapping["crane.slew"],
         crane_boom=mapping["boom.lift"],
         crane_hook=mapping["hook.swing"],

@@ -1,0 +1,4 @@
+{
+  "stations": [{"kind": "beer_pong", "variant": 0}],
+  "display_order": ["beer_pong-0"]
+}

@@ -1,5 +1,10 @@
 # FPGS hero montage
 
+**Set-dressing rule:** use deliberate task- or class-specific decorations only.
+No automatic clutter, random stationery scatter, or generic edge-filling fallback.
+An absent or empty decoration plan leaves the table undecorated except for its
+explicit class-specific props. See [AGENTS.md](AGENTS.md).
+
 The curated roster contains 20 stations across 15 task families. All worlds
 step together on an NVIDIA RTX A6000 with `SolverFeatherPGS`, matrix-free
 solving, immediate articulated contact response, eight substeps and 32
@@ -31,6 +36,79 @@ There are no titles, HUD overlays or animated object pose assignments.
 | Brick chutes | A stock uncapped glass jar pours six shapes of studded toy bricks into three inclined runs and terminal pockets |
 | Toy assembly | Different arms seat removable viaduct tiers on keyed tube connectors |
 | G1 and Go2 | Public pretrained locomotion policies run through Warp-NN CUDA inference |
+
+### Beer-pong addition
+
+`beer_pong_task.py` adds a separate seven-second Franka shot without changing
+the accepted montage roster. The gripper picks up a 40 mm, 2.7 g ball from a
+small tee, accelerates it, and opens its jaws. The free ball bounces once on
+the table and lands in an open tapered cup. Only the arm and finger joints
+are actuated: no ball pose assignment, launch impulse, attachment, or flight
+controller is used. Cup collision walls follow the rendered hollow profile.
+Ten cups form four triangular rows (1, 2, 3, 4), with the blue landing cup
+at the front and nine teal cups behind it.
+
+```bash
+uv run --with imageio-ffmpeg --with pyyaml python scripts/benchmarks/hero_montage/run.py \
+  --assets /path/to/hero-assets.json \
+  --roster scripts/benchmarks/hero_montage/assets/beer_pong_roster.json \
+  --output /tmp/beer-pong --duration 7 --substeps 8 --iterations 16 --no-render
+```
+
+The task audit requires a successful lift, exactly one table bounce outside
+the cup, measured free-flight acceleration within 0.1 m/s² of gravity, and
+containment for the final second. It uses the tapered inner wall rather than
+a cylindrical approximation when checking the settled ball. The standalone
+roster also works with `export_metal.py`; the packed geometry and recorded
+poses use the existing AVBD/Cycles replay pipeline and studio lighting.
+
+### Thread assembly and spinning top
+
+`screw_task.py` uses two physical grippers: a Franka holds the bolt head while
+a UR10 turns the nut through one full revolution. The threaded meshes come
+from the same Isaac Gym factory assets as Newton's nut/bolt SDF example,
+at twice their original scale. Both objects are free bodies. The second arm
+holds its axial target fixed; thread contact produces the nut's axial travel.
+The audit checks rotation, descent, thread alignment, and bolt stability.
+
+`spinning_top_task.py` creates a painted toy with a light shell, a dense low
+rim, and a rounded tip. A UR10-mounted rotary chuck grips its stem, spins it
+up, opens, and withdraws. Only robot/chuck joints receive motor targets;
+the released top has no drive, attachment, or imposed angular velocity.
+The audit requires multiple free revolutions with an upright axis and
+bounded travel after withdrawal.
+
+Run either standalone roster with the same runner and replay exporters:
+`assets/screw_roster.json` for 10 seconds or
+`assets/spinning_top_roster.json` for 9 seconds, with 8 substeps and
+16 solver iterations. These additions leave the accepted montage roster
+unchanged.
+
+### Bird automaton
+
+`bird_automaton_task.py` imports the user-supplied CAD and contact-gear MJCF
+from `assets/bird_automaton` at 2.5× scale. The original crank actuator is
+removed. The UR10 grasps the existing cylindrical crank handle and traces a
+57.5 mm radius circle around the input axle. Its wrist follows the handle,
+keeping the jaws tangent to the crank path. There is no rotary chuck, hub
+extension, added visible grip, or driven joint in the mechanism.
+
+The handle collider matches the original CAD cylinder exactly: radius 4 mm,
+length 17 mm, center (-21, 0, -23) mm before scaling. The original CAD inertia
+is preserved. Gear-tooth contacts drive the camshaft; wings, jaw, and followers
+remain passive. Slide limits are scaled explicitly to match geometry scaling.
+CAD visuals retain flat face normals.
+
+Use `assets/bird_automaton_roster.json`, a 12-second duration, 8 substeps, and
+16 iterations. The accepted run turns the input 1.498 revolutions and the
+output 0.997 revolutions, sweeping the wings 70° and the beak 30°. The audit
+checks the hand's actual circular orbit, proximity to the original handle,
+input rotation, the 24:36 gear ratio, and wing/beak travel. Disabling only
+robot–handle contacts leaves the crank stationary despite identical arm
+commands. This replaces the rejected hub-driven preview. Sources, physical
+recordings, controls, geometry verification, and the Cycles video are saved in
+`newton/tests/outputs/bird-crank-20261014/`. The supplied asset README documents
+the original design; its ideal-gear validation is separate from these Newton runs.
 
 The lighter has a passive bistable spring-detent potential and a freely
 simulated case; its hinge has no position target or motor. The previous assisted opening has been rejected. Direct hinge and contact-gated
@@ -92,11 +170,10 @@ after the gripper releases. Acceptance measures clipped blade clearance and the
 native handle's supporting surface, rather than treating a tilted knife's
 centerline as its physical envelope.
 
-`prepare_furnishings.py` compiles varied tables, tools, plants and 16 office-clutter
-designs. `furnishings.py` places small, irregular clusters of pens, stationery,
-clips and other props at table edges, checking their footprints against the
-actual tabletop and existing decor. These fixed decorations are visual-only
-and are not counted as simulated manipulation tasks. Wood albedo fields come
+`prepare_furnishings.py` compiles selected tables and curated decorative assets.
+`furnishings.py` places explicit task layouts and class-specific decorations;
+it does not generate clutter or fill empty table edges. These fixed decorations
+are visual-only and are not counted as simulated manipulation tasks. Wood albedo fields come
 from the source repository’s CC0 scan-fitted directional spectra. Manufactured
 edges retain crease-aware normals. Robot materials preserve their native look;
 manipulated handles and weights use the kitchen scene’s blue, teal and gold.
@@ -434,3 +511,295 @@ six seconds of composite recordings over the full 14-second pullback.
 
 The baked knife-holder atlases restore their original Blender UV orientation
 on import; the Metal replay stores their vertical texture coordinates flipped.
+
+## Open toy well (October 14)
+
+`well_task.py` adds a tall open frame, passive spool and crank, freely rotating
+handle, 44-link rope, and hanging bucket. The UR10 follows a circular crank path
+and turns its wrist with the crank so that the jaws transmit tangential force
+through contact. Only the robot joints receive targets. The 30 mm radius drum
+allows the rope to wind over itself for more than one full revolution.
+The rope has fixed-length capsules and passive planar hinges; it bends in the
+spool plane, while the bucket's bail connection is a passive spherical joint.
+Drum contact physically winds the rope; no rope shortening or bucket drive is used.
+
+```bash
+uv run python scripts/benchmarks/hero_montage/run.py \
+  --assets ASSETS.json --cases well:0 --duration 12 \
+  --iterations 16 --substeps 8 --no-render --output OUTPUT
+```
+
+The grip closes over one second with 1200 N/m stiffness and a 12 N effort limit.
+The original instant closure with 6000 N/m stiffness caused visible contact
+chatter. On `fpgs-main` commit `14cf39b775dc4786f63903d4068c42aaad03f3ce`,
+changing only the grip reduced resting finger travel from approximately 0.8 mm
+to 0.002 mm at the same solver budget. No solver modification was needed.
+
+The thinner-drum recording turns the spool 1.654 revolutions and raises the
+bucket 0.377 m, with 34 wrapped rope segments and 1.714 turns of rope winding.
+The audit checks winding, bucket rise, finite state, joint anchors, and resting
+contact/rope vibration. Use `assets/well_roster.json` to export the recorded replay.
+Source snapshots, an adapter for the current FPGS constructor names, comparison
+recordings, validation reports, Blender input, and the Cycles preview are under
+`newton/tests/outputs/well-stability-20261014/`. The original preview is preserved
+under `newton/tests/outputs/well-20261014/`.
+
+The negative control disables only robot–mechanism contacts, preserving all
+robot commands and mechanism joints. Opening the jaws alone is not an isolating
+control: the moving fingers can still push the crank.
+
+## Buried mug unpacking (October 14)
+
+`unpacking_task.py` places a blue proc-gen ceramic mug inside an open carton
+beneath 275 lightweight white packing pieces. Each piece is a free rigid body
+with a capsule collider, density 18 kg/m³, and a softly irregular visible shell.
+The carton is fixed; only robot joints are actuated. The robot pushes through
+the packing, closes its jaws around the mug, lifts it clear, and places it on a
+coaster outside the carton. Packing and mug poses are never prescribed.
+
+```bash
+uv run python scripts/benchmarks/hero_montage/run.py \
+  --assets ASSETS.json --cases unpacking:0 --duration 15 \
+  --iterations 16 --substeps 8 --no-render --output OUTPUT
+```
+
+The presentation starts after three seconds of physical settling. The accepted
+run displaces 36 packing pieces by more than 4 cm, lifts the mug 0.323 m, and
+places it upright within 12 mm of the coaster target. The opening-frame
+visibility check casts 4,026 surface rays toward the mug and finds no visible
+mug surfaces. The first, less-filled prototype exposed the blue rim and was
+rejected despite passing the placement check.
+
+Use `assets/unpacking_roster.json` for replay export. The local package at
+`newton/tests/outputs/unpacking-20261014/` retains the accepted `probe04` trace,
+source snapshot, visibility check, Cycles scene, and video. Fine foam and paper
+surface finishes are added by its saved `pack_unpacking.py`; they do not change
+collision geometry or recorded motion.
+
+### Pelican bicycle with a physical remote fader
+
+`--cases pelican:0 --duration 14` retains the complete supplied pelican bicycle,
+including its handlebars. A UR10 grips a passive 240 mm slider on a separate
+remote console and moves it from zero to full scale. Each physics substep reads
+the actual slider coordinate and maps it to a 0–60 rpm wheel velocity target,
+with a finite 0.20 Nm motor torque limit. Only the robot and this explicitly
+requested electric drive are actuated; gears, cams, wings, beak, and pedal
+linkages remain passive. One fixed imported root keeps the two physical ankle
+connect constraints inside the same articulation.
+
+The source CAD and contact MJCF live in `assets/pelican_bicycle/`, and
+`assets/pelican_roster.json` exports the scene through the existing replay
+rendering pipeline. The task audit checks slider travel, wheel rotation,
+gear ratio, wing/beak motion, initial standstill, and ankle closure.
+
+### Contact-driven bottle flip
+
+`--cases bottle_flip:0 --duration 7 --iterations 16 --substeps 8` adds a UR10
+that grips, lifts, and flips a passive bottle. The robot uses the joint targets
+in `assets/bottle_flip_throw.json`; the bottle receives no pose commands,
+release impulses, attachments, or flight correction. The swing stays in a
+vertical plane to reduce sideways rotation. Visible tapered geometry follows
+the convex collision envelope.
+
+The bottle uses a rigid partial-fill approximation: 185 g total mass, a 30 mm
+center of mass, and fixed inertia. This is not a liquid/slosh simulation.
+The audit requires one complete turn, a ballistic airborne interval, and an
+upright, stationary finish on the tabletop. The accepted standalone recording
+uses the unchanged FPGS solver at `14cf39b775dc4786f63903d4068c42aaad03f3ce`.
+The motion is a calibrated demonstration, not a robust bottle-flipping policy;
+small solver or contact differences can change whether the landing succeeds.
+
+`assets/bottle_flip_roster.json` exports this scene. The local package under
+`newton/tests/outputs/bottle-flip-20261014/` retains the accepted `timing-01`
+recording, its audit, a robot-contact-disabled negative control, source snapshot,
+and the Cycles replay/video. Replays preserve the recorded motion at real time.
+
+### Two-arm box quarter-turns
+
+`box_turn_task.py` adds a free cardboard box and two UR10 arms with the
+original Franka gripper collision geometry. Both grippers keep a fixed
+12 mm per-finger aperture. Opposing fingertip contacts lift the box, roll it
+approximately 90 degrees, yaw it 90 degrees, and lower it onto the table.
+Only robot joint targets are commanded; the box has no drive, attachment,
+pose override, or applied task force. Box markings are visual-only.
+
+```bash
+uv run --extra examples python scripts/benchmarks/hero_montage/run.py \
+  --assets assets.json --cases box_turn:0 --duration 13 \
+  --substeps 8 --iterations 16 --no-render --output box-turn
+```
+
+The validated local package is `newton/tests/outputs/box-turn-20261015/`.
+The accepted `probe12` take has 5.29 degrees of intermediate flip error,
+0.72 degrees of final orientation error, and no measured motion during the
+last second. A separate contact-instrumented rerun also passes. Its contact
+log contains only the two original finger collision shapes per robot and
+the table touching the box. The negative control disables robot-box
+contacts while keeping table contacts: the box stays at its starting pose
+and correctly fails the task gate. The grippers remain at fixed aperture
+throughout both runs. This is a calibrated robot trajectory, not a learned
+or disturbance-robust manipulation policy.
+
+Simulation used solver snapshot `14cf39b775dc4786f63903d4068c42aaad03f3ce`
+at 50 Hz. The Cycles preview replays the accepted physical trace at 30 fps
+and real-time speed; rendering does not resimulate or alter the box motion.
+
+### Task-specific dressing and bird cameras
+
+`assets/task_decor.json` defines 27 larger proc-gen props across the nine
+new tasks. `furnishings.dress()` uses these explicit layouts. The former
+generic office-scatter fallback has been removed. All additions are visual-only and remain inside the
+table footprint. Existing older-task dressing is preserved.
+
+`style_task_replays.py` applies the same layouts to saved Blender replays,
+preserves their lighting and recorded motion, and saves separate editable
+scenes plus Cycles/Metal previews. The bird automaton uses a closer oblique
+view of the crank hand and bird profile; the pelican view retains both the
+fader interaction and complete bird silhouette. Bird flat normals are
+preserved. The original replay packages are not overwritten.
+
+The nine updated replay packages, preview sheet, and unchanged-motion hash
+checks are in `newton/tests/outputs/styled-scenes-20261015/`. Each package
+contains `scene.blend`, `motion.npz`, `camera.json`, `metadata.json`,
+`dressing.json`, and `preview.png`; it can be passed directly to the existing
+Cycles video renderer. The saved configuration reproduces the previews:
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender -b --python \
+  scripts/benchmarks/hero_montage/style_task_replays.py -- \
+  newton/tests/outputs/styled-scenes-20261015/config.json
+```
+
+### Orbit close-ups and expanded demo edit
+
+The saved `orbit-montage-20261015` output package preserves the approved
+close-up recordings and adds a five-degree eased camera arc to seven of the
+nine newer tasks, beginning at 2.5 seconds. Beer pong and bottle flip keep
+fixed cameras for their fast flight trajectories. The package includes
+reproducible preparation and assembly scripts, camera previews, and motion
+hash validation. The bottle cap clearance fix and tangram without its backing
+board are retained.
+
+Its overview keeps 384 linked collection instances and replaces 156 tiles
+with the nine newer decorated tasks. All nine are represented near the final
+view center, with no matching eight-neighbor task pairs. The 10-second camera
+path starts at the wrecking ball and retains the approved boundary-free end
+framing. This overview combines accepted recorded replays; it is not a new
+384-world simulation. The older overview recordings retain their previous
+playback timing, while the new task recordings advance at native speed.
+
+The full edit follows the pullback with a staggered 2x2 grid of all 25 robot
+demos. Intermediate close-ups use 3.6-second action excerpts, with changes spaced
+0.9 seconds apart in top-left, top-right, bottom-left, bottom-right order.
+Only the final clip in each cell plays through its ending. Quick excerpts
+use the earlier teaser speed of 2/1.8 (1.111x); finals use 5/4.6 (1.087x). The nine-task
+3x3 montage and latest-video collection are refreshed from the same clips.
+
+### Toaster loading
+
+`toaster_task.py` adds a two-slice breakfast task. One free bread body rests
+in the raised carriage; the UR10 inserts the other, releases it, approaches
+from the front, depresses the paddle, and withdraws. The original proc-gen
+`toaster_studio` retro housing retains its open wells and articulated lift.
+A passive return spring, spring-loaded rear ratchet, and tapered centering
+wires complete the mechanism. The ratchet catches through collision with a
+carriage tab. Only robot joint targets vary over time; neither bread nor the
+carriage receives a scripted trajectory or assisted force. This is a rigid
+mechanism demonstration, without thermal cooking or deformable bread.
+
+Generate the source asset with `prepare_toaster_asset.py --source PROC_GEN`,
+then record with:
+
+```bash
+uv run scripts/benchmarks/hero_montage/run_toaster.py --assets ASSETS.json --output OUTPUT
+```
+
+The runner requires the current FPGS `matrix_free` API and CUDA. It verifies
+insertion, carriage travel, pre-press support, final bread support, resting
+motion, and solver capacity. Export with `export_metal.py` and
+`assets/toaster_roster.json`; the existing Cycles replay pipeline supplies
+studio lighting and a subtle camera orbit. The bread outline and crumb
+texture are generated locally in the task source.
+
+### Video style reference (2026-10-15 correction)
+
+Use `video_style_reference.py` for all new close-up cameras and edit timing.
+The user rejected the negative-azimuth camera path: the required orbit is
+**positive world-Z azimuth**, usually 5 degrees (6 for the kitchen/Unitree
+shots), starting around 2.5 seconds with the existing smooth interpolation.
+Do not negate it based on apparent subject rotation. The helper checks the
+positive cross product explicitly. Keep accepted static shots static.
+
+Preserve `export_cycles_replays.studio`: AgX / Medium High Contrast, exposure
+0, gamma 1, world strength 0.5, existing warm key/cool fill and soft sun.
+Use the saved scene lighting for rerenders. Cycles OptiX, 1080p30, 16 samples
+and denoising are the close-up baseline. Preserve the soft green, light
+bluish gray, cream and neutral wood table mixture; no blanket recoloring.
+Props should be sizable, coherent with the task, and clear of manipulation.
+Task objects must follow recorded physics; editing changes camera/playback
+only. Keep a hash of the replay and preserve the original videos.
+
+For a new packed camera:
+
+```bash
+uv run scripts/benchmarks/hero_montage/video_style_reference.py input-camera.json camera.json
+```
+
+Keep the 10-second wrecking-ball zoom-out and boundary-free framing. In the
+2x2 montage, stagger the first cells by 0/0.9/1.8/2.7 seconds, then use
+3.6-second core-action excerpts. Only each cell's final clip may run long;
+end the montage when the last final action finishes. Do not substitute
+full-length intermediate sources. Select source trim windows visually.
+
+### HQ wrecking crane: interactive branch brake
+
+The October 15 HQ revision ports the side grasp handle and 3 N·m dry slew
+brake from `codex/fpgs-interactive-scenes` (commit `51f909129`). The arm
+moves the handle in a circle through contact, then releases and retreats.
+The passive brake resists the ball back-driving the core; it is not a
+pose target. Crane masses match the branch's USD asset.
+
+Use `run_wrecking.py` with current FPGS (joint-friction support required),
+4 substeps at 60 Hz and 32 iterations. It enables joint friction explicitly
+and checks bilateral handle contact, impact, collapse, chain attachment and
+less than 0.05 rad core drift after release. The legacy batch runner does
+not enable this brake; use this dedicated runner for new HQ crane traces.
+Export with `assets/wrecking_roster.json`, retaining the existing visual
+trim and `video_style_reference.py` camera direction. The overview is not
+rerendered as part of this close-up revision.
+
+When refreshing an existing HQ scene's physics, restore its approved dressing
+from the previous exported `scene.json` and mesh buffers with
+`restore_scene_dressing.py SOURCE REFERENCE OUTPUT` before packing Cycles.
+The builder defaults are not the approved editorial decorations. For the
+wrecking scene, the approved props are the excavator and dump truck, using
+their original transforms and materials; no parts tray or office clutter.
+
+### Miniature G1 lava fall
+
+`lava_fall_task.py` builds a rigid 30%-scale G1 toy with spread arms on a
+cantilevered stand, a deep blue pot, and 200 lightweight flame-shaped pieces.
+The toy's mass and inertia derive from the imported G1, with per-link convex
+collision shapes added because its walking USD omits limb collisions. Gravity
+starts the backward fall; neither the figure nor the pieces receive animated
+poses, release impulses, or sinking forces.
+
+Run `run_lava_fall.py --assets ASSETS.json --output OUTPUT` with the current FPGS
+CUDA environment. `ASSETS.json` needs a `unitree_g1` asset-directory entry.
+The checked-in `assets/lava_settled_pile.npz` is a physical initial packing.
+Regenerate it with `--prepare-pile --duration 3`; that preparatory trace is not
+a demonstration. The normal run checks contact capacity and that the complete
+visible figure ends inside the pot and below the pile surface. Use
+`assets/lava_fall_roster.json` for replay export, then the shared Cycles lighting
+and `video_style_reference.counterclockwise_camera` for rendering.
+
+### Wrecking crane: stock fingers and rear-body grasp
+
+The current `crane_task.py` grips the original rear counterweight directly,
+across its 52 mm depth. The yellow side handle and long jaw extensions are
+removed; the stock finger geometry and normal 103.4 mm TCP offset are used.
+The passive 3 N·m slew brake, articulated chain, building, approved excavator,
+dump truck, and original table remain. `run_wrecking.py` checks bilateral
+contact against the rotating crane body and rejects the obsolete added shapes.
+The validated replacement recording is `wrecking-rear-grasp-20261015/probe1`;
+older handle-based recordings are historical references only.

@@ -21,7 +21,7 @@ repos:
       - id: check-added-large-files
         args: [--maxkb=500]
         # Archived mesh, policy, and texture inputs (largest is 3.4 MB).
-        exclude: ^scripts/benchmarks/hero_montage/assets/(hora/(weights\.npz|meshes/allegro/(digitv2|base_link_left)\.obj)|furnishings/(ash|oak|walnut)\.png)$
+        exclude: ^scripts/benchmarks/hero_montage/assets/(hora/(weights\.npz|meshes/allegro/(digitv2|base_link_left)\.obj)|furnishings/((ash|oak|walnut)\.png|desktop_abacus\.npz)|pelican_bicycle/cad/(bicycle_frame|camshaft_gear_48T)\.stl)$
       - id: check-case-conflict
       - id: check-illegal-windows-names
       - id: check-json

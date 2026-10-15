@@ -1,0 +1,11 @@
+{
+  "stations": [
+    {
+      "kind": "screw",
+      "variant": 0
+    }
+  ],
+  "display_order": [
+    "screw-0"
+  ]
+}

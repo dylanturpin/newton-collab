@@ -163,6 +163,17 @@ class Example:
         (args.output / "model-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
+        self.pelican_drives = wp.array(
+            np.asarray(
+                [
+                    [w["q_start"] + w["pelican_fader_q"], w["v_start"] + w["pelican_wheel_v"]]
+                    for w in self.worlds
+                    if "pelican_fader_q" in w
+                ],
+                dtype=np.int32,
+            ).reshape(-1, 2),
+            dtype=int,
+        )
         self.lighter_q = wp.array(
             [w["q_start"] + w["lighter_lid_q"] for w in self.worlds if w.get("lighter")], dtype=int
         )
@@ -343,6 +354,14 @@ class Example:
     def physics(self):
         for _ in range(self.args.substeps):
             self.state_0.clear_forces()
+            if self.pelican_drives.shape[0]:
+                from pelican_task import fader_drive  # noqa: PLC0415
+
+                wp.launch(
+                    fader_drive,
+                    dim=self.pelican_drives.shape[0],
+                    inputs=[self.pelican_drives, self.state_0.joint_q, self.control.joint_target_qd],
+                )
             if len(self.lighter_q):
                 wp.launch(
                     lighter_cam,

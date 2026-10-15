@@ -73,3 +73,11 @@ uvx --with virtualenv asv run --launch-method spawn main^!
   - Implement `test_final()` or `test_post_step()`; an example may implement both.
   - In test mode, `test_post_step()` runs after each simulation step and `test_final()` runs after the example completes.
 - Register the example in `README.md` with its `python -m newton.examples <name>` command and a 320x320 JPEG screenshot.
+
+## Hero scene decoration
+
+For scene generation and rendering, follow
+[`scripts/benchmarks/hero_montage/AGENTS.md`](scripts/benchmarks/hero_montage/AGENTS.md).
+Automatic table clutter and random filler scatter are retired. Use deliberate
+per-task or per-class decoration layouts only. Do not restore clutter code from
+historical output/source snapshots.

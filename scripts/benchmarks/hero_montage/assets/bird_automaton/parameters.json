@@ -1,0 +1,40 @@
+{
+  "wing_hinge_z": 190.0,
+  "shoulder_y": 22.0,
+  "wing_arm": 18.0,
+  "wing_angle_deg": 35.0,
+  "wing_shoe_r": 3.0,
+  "wing_shoe_x": -48.0,
+  "camshaft_z": 65.0,
+  "wing_cam_x": -24.0,
+  "wing_cam_r": 20.0,
+  "beak_cam_x": 33.0,
+  "beak_cam_r": 18.0,
+  "beak_lift": 9.0,
+  "jaw_hinge_x": 50.0,
+  "jaw_hinge_z": 218.0,
+  "jaw_arm": 18.0,
+  "jaw_shoe_r": 2.5,
+  "beak_tip": 32.0,
+  "beak_counterweight_x": -28.0,
+  "module": 2.0,
+  "pressure_angle": 20.0,
+  "gear_teeth": [
+    24,
+    20,
+    36
+  ],
+  "gear_y": [
+    -100.0,
+    -56.0,
+    0.0
+  ],
+  "gear_x": -68.0,
+  "output_hz": 0.6,
+  "backlash": 0.2,
+  "wing_e": 10.324375854318829,
+  "wing_foot_z": 74.67562414568117,
+  "wing_pad_offset": 102.0,
+  "beak_foot_z": 83.0,
+  "beak_pad_offset": 132.5
+}

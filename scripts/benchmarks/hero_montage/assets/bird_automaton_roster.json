@@ -1,0 +1,4 @@
+{
+  "stations": [{"kind": "bird_automaton", "variant": 0}],
+  "display_order": ["bird_automaton-0"]
+}

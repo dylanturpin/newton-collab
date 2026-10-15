@@ -261,7 +261,43 @@ def audit(folder):
             check.update({"pass": False, "reason": "Non-finite world state"})
             result["tasks"].append(check)
             continue
-        if world.get("demolition"):
+        if kind == "unpacking":
+            from unpacking_task import check as check_unpacking  # noqa: PLC0415
+
+            check.update(check_unpacking(world, poses, fps))
+        elif kind == "well":
+            from well_task import check as check_well  # noqa: PLC0415
+
+            check.update(check_well(world, poses, fps))
+        elif kind == "box_turn":
+            from box_turn_task import check as check_box  # noqa: PLC0415
+
+            check.update(check_box(world, poses, fps))
+        elif kind == "bottle_flip":
+            from bottle_flip_task import check as check_bottle  # noqa: PLC0415
+
+            check.update(check_bottle(world, poses, fps))
+        elif kind == "pelican":
+            from pelican_task import check as check_pelican  # noqa: PLC0415
+
+            check.update(check_pelican(world, poses, fps))
+        elif kind == "bird_automaton":
+            from bird_automaton_task import check as check_bird  # noqa: PLC0415
+
+            check.update(check_bird(world, poses, fps))
+        elif kind == "spinning_top":
+            from spinning_top_task import check as check_top  # noqa: PLC0415 -- task-specific optional imports
+
+            check.update(check_top(world, poses, fps))
+        elif kind == "screw":
+            from screw_task import check as check_screw  # noqa: PLC0415 -- task-specific optional imports
+
+            check.update(check_screw(world, poses, fps))
+        elif kind == "beer_pong":
+            from beer_pong_task import check as check_pong  # noqa: PLC0415 -- task-specific optional imports
+
+            check.update(check_pong(world, poses, fps))
+        elif world.get("demolition"):
             check.update(demolition_check(world, poses, fps))
         elif "catalog_task" in world:
             check.update(catalog_check(world, poses, fps))

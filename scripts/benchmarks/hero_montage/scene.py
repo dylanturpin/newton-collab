@@ -387,7 +387,59 @@ def build_template(kind, variant, assets, device, reference=False):
     # Separate, low plinths make each world read as an individual exhibit.
     box(b, (0, 0, -0.065), (1.15, 1.15, 0.065), (0.76, 0.81, 0.86), label="plinth")
     box(b, (0, -1.11, 0.002), (0.95, 0.014, 0.003), color, label="accent")
-    if kind in ("lift", "insert"):
+    if kind == "lava_fall":
+        from lava_fall_task import populate  # noqa: PLC0415 -- task imports shared scene helpers
+
+        populate(b, info, variant, assets, device)
+    elif kind == "yoyo":
+        from yoyo_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "toaster":
+        from toaster_task import populate  # noqa: PLC0415 -- task imports shared scene helpers
+
+        populate(b, info, variant, assets, device)
+    elif kind == "cereal":
+        from cereal_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "unpacking":
+        from unpacking_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "well":
+        from well_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "box_turn":
+        from box_turn_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "bottle_flip":
+        from bottle_flip_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "pelican":
+        from pelican_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind == "bird_automaton":
+        from bird_automaton_task import populate  # noqa: PLC0415 -- shared task helpers
+
+        populate(b, info, variant, assets, device)
+    elif kind == "spinning_top":
+        from spinning_top_task import populate  # noqa: PLC0415 -- shared task helpers
+
+        populate(b, info, variant, assets, device)
+    elif kind == "screw":
+        from screw_task import populate  # noqa: PLC0415 -- shared task helpers
+
+        populate(b, info, variant, assets, device)
+    elif kind == "beer_pong":
+        from beer_pong_task import populate  # noqa: PLC0415
+
+        populate(b, info, variant, assets, device)
+    elif kind in ("lift", "insert"):
         from catalog_tasks import populate  # noqa: PLC0415 -- shared scene helpers
 
         populate(b, info, kind, variant, assets, device)
