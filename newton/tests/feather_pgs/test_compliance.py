@@ -655,6 +655,26 @@ class TestContactComplianceSafety(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dt"):
                 start_step(solver, contacts, dt)
 
+    def test_missing_material_arrays_rejected(self):
+        """Require the per-contact material arrays that the compliant law reads."""
+        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
+        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+            contacts = self.contacts()
+            setattr(contacts, name, None)
+            with self.subTest(missing=name), self.assertRaisesRegex(ValueError, "per-contact material arrays"):
+                start_step(solver, contacts, 0.005)
+        with self.assertRaisesRegex(ValueError, "per-contact material arrays"):
+            start_step(solver, None, 0.005)
+
+    def test_invalid_contact_stiffness_rejected(self):
+        """Reject a negative or non-finite contact stiffness before writing compliant rows."""
+        for stiffness in (-1.0, float("nan")):
+            with (
+                self.subTest(stiffness=stiffness),
+                self.assertRaisesRegex(ValueError, "Invalid exported contact stiffness"),
+            ):
+                run_fixture(articulated=True, enabled=True, steps=1, stiffness=stiffness)
+
     def test_persistent_patch_guard(self):
         """Reject positive persistent-anchor bias but permit a disabled dummy patch buffer."""
         solver = SimpleNamespace(
