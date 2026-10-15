@@ -31,6 +31,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
+from ...geometry.contact_reduction_body_pairs import register_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian
@@ -56,11 +57,13 @@ from .contact_angular_friction import (
     configure_free_rigid_angular_friction,
     configure_torsional_rolling_friction,
     free_rigid_angular_friction_gs_sources,
+    free_rigid_reduction_material_key,
+    free_rigid_route_bodies,
+    launch_angular_friction_rows,
     launch_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
-    free_rigid_route_bodies,
+    shape_condim,
     validate_free_rigid_angular_friction_mode,
-    launch_angular_friction_rows,
     validate_torsional_rolling_friction_coefficients,
     validate_torsional_rolling_friction_mode,
 )
@@ -723,6 +726,31 @@ class _FeatherPGSModelPlan:
         for array in arrays:
             array.setflags(write=False)
         return cls(*arrays, world_count)
+
+
+def _free_rigid_reduction_material_key(model: Model) -> np.ndarray | None:
+    """Key body-pair reduction groups by the free-rigid angular coefficients the solver reads (see ``feather_pgs:condim``)."""
+    condim = shape_condim(model)
+    if condim is None or not np.any(condim >= 4) or not model.articulation_count or not model.joint_count:
+        return None
+    plan = _FeatherPGSModelPlan.build(
+        model, np.zeros(model.joint_dof_count, dtype=np.int32), enable_prescribed_response=False
+    )
+    if not np.any(plan.is_free_rigid):
+        return None
+    # A contact takes the free-rigid route only between bodies that are free rigid, outside any
+    # articulation, or in one without DOFs, as free_rigid_route_bodies() marks them.
+    route = np.ones(model.body_count, dtype=np.int32)
+    articulation_start = model.articulation_start.numpy()
+    joint_child = model.joint_child.numpy()
+    for art in range(model.articulation_count):
+        if plan.is_free_rigid[art] == 0 and plan.articulation_dof_count[art] != 0:
+            children = joint_child[articulation_start[art] : plan.articulation_joint_end[art]]
+            route[children[children >= 0]] = 0
+    return free_rigid_reduction_material_key(model, condim, route)
+
+
+register_reduction_material_key(_free_rigid_reduction_material_key)
 
 
 @dataclass(frozen=True)
@@ -1702,9 +1730,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           Only contacts between free bodies, and free bodies on static or kinematic geometry, read it.
           Values below 4 add nothing; 1 and 2 do not remove sliding friction. Under persistent friction patches,
           contacts share a patch only if their angular coefficients match, so each patch's angular rows are
-          independent of contact order. Shape edits take effect at
-          :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without angular rows must
-          be rebuilt to gain them.
+          independent of contact order; body-pair contact reduction likewise groups a free body's shapes
+          by these coefficients. Shape edits take effect at :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``
+          and, under body-pair reduction, :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups`;
+          a solver built without angular rows must be rebuilt to gain them.
 
         The solver reads them from the model at every step, for example
         ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.

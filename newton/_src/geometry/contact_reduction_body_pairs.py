@@ -239,15 +239,28 @@ _MATERIAL_FIELDS = (
     "shape_material_restitution",
 )
 
+# Solver-owned per-shape contact laws join the material signature through these
+# providers. Each maps a model to a ``(shape_count, k)`` array of exactly
+# compared values, or ``None`` when the model does not use its law; ``None``
+# leaves the grouping exactly as the core fields alone produce it.
+_SOLVER_MATERIAL_KEYS: list = []
+
+
+def register_reduction_material_key(provider) -> None:
+    """Add a solver's per-shape material key to the body-pair reduction signature."""
+    if provider not in _SOLVER_MATERIAL_KEYS:
+        _SOLVER_MATERIAL_KEYS.append(provider)
+
 
 def build_reduction_groups(model) -> tuple:
     """Assign each shape a reduction-group id (host side, at construction).
 
     Static shapes keep unique ids so distinct static colliders never merge.
     Dynamic shapes share a group only per (body, exact material signature):
-    a body whose colliders differ in any solver-visible material field gets
-    one group per material class, so contacts carrying different physics never
-    compete for the same slots.
+    a body whose colliders differ in any solver-visible material field, or in
+    a key a solver registered with :func:`register_reduction_material_key`,
+    gets one group per material class, so contacts carrying different physics
+    never compete for the same slots.
 
     Returns:
         ``(ids, group_count)`` where ids is an int32 array of length
@@ -260,6 +273,10 @@ def build_reduction_groups(model) -> tuple:
         arr = getattr(model, name, None)
         if arr is not None:
             mats.append(arr.numpy())
+    for provider in _SOLVER_MATERIAL_KEYS:
+        key = provider(model)
+        if key is not None:
+            mats.extend(np.asarray(key).reshape(n, -1).T)
     ids = np.zeros(n, dtype=np.int32)
     class_ids: dict = {}
     next_id = 0

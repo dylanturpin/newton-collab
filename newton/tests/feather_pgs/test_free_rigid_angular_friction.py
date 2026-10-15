@@ -5,11 +5,14 @@
 
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry import contact_reduction_body_pairs
+from newton._src.geometry.contact_reduction_body_pairs import build_reduction_groups
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -400,8 +403,8 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         """Leave a toppling or sliding cube within 2 mm of the option-off pose; the spinning cube slows at most."""
         for kwargs in ({"tilt_deg": 40.0}, {"linear": (0.5, 0.0, 0.0)}, {"angular": (0.0, 0.0, 6.0)}):
             with self.subTest(**kwargs):
-                pose_free, twist_free, _ = _simulate("box", 1.0, **kwargs)
-                pose, twist, _ = _simulate("box", 1.0, free_rigid_rolling_friction=0.002, **_ON, **kwargs)
+                pose_free, _, _ = _simulate("box", 1.0, **kwargs)
+                pose, _, _ = _simulate("box", 1.0, free_rigid_rolling_friction=0.002, **_ON, **kwargs)
                 np.testing.assert_allclose(pose[:3], pose_free[:3], atol=2.0e-3)
                 self.assertGreater(abs(float(np.dot(pose[3:7], pose_free[3:7]))), 0.999)
 
@@ -548,6 +551,96 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model.feather_pgs.condim.fill_(6)
         with self.assertRaises(ValueError):
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+
+
+def _padded_body_scene(pad_condim: int, articulated: bool = False, register: bool = True):
+    """Build a body whose wide condim-3 box carries an inset pad, 2 um shallower, with the same raw materials."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    if register:
+        SolverFeatherPGS.register_custom_attributes(builder)
+    ground = newton.ModelBuilder.ShapeConfig(mu=0.0, mu_torsional=0.0, mu_rolling=0.0)
+    builder.add_shape_box(
+        -1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=1.0, hy=1.0, hz=0.05, cfg=ground
+    )
+    inertia = wp.mat33(*(np.eye(3) * 1.0e-3).astype(np.float32).ravel())
+    pose = wp.transform((0.0, 0.0, 0.02), wp.quat_identity())
+    if articulated:
+        body = builder.add_link(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
+        joint = builder.add_joint_revolute(-1, body, parent_xform=pose, axis=newton.Axis.Z)
+        builder.add_articulation([joint])
+        # A free sphere elsewhere keeps the free-rigid route in use.
+        free = builder.add_body(xform=wp.transform((0.5, 0.5, _RADIUS), wp.quat_identity()), mass=_MASS)
+        builder.add_shape_sphere(free, radius=_RADIUS)
+    else:
+        body = builder.add_body(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
+    material = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0, mu_torsional=0.01, mu_rolling=0.0)
+    extra = (lambda condim: {"custom_attributes": {"feather_pgs:condim": condim}}) if register else (lambda condim: {})
+    box = builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.02, cfg=material, **extra(3))
+    pad = builder.add_shape_box(
+        body,
+        xform=wp.transform((0.0, 0.0, -0.015 + 2.0e-6), wp.quat_identity()),
+        hx=0.02,
+        hy=0.02,
+        hz=0.005,
+        cfg=material,
+        **extra(pad_condim),
+    )
+    return builder.finalize(), box, pad
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "FeatherPGS matrix-free requires CUDA")
+class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
+    def _spin(self, pad_condim: int, body_pairs: bool):
+        model, _, pad = _padded_body_scene(pad_condim)
+        solver = SolverFeatherPGS(
+            model, solve_mode="matrix_free", iterations=16, deterministic=True, friction_anchor_beta=0.0
+        )
+        reduction = newton.CollisionPipeline.ContactReductionConfig(body_pairs=body_pairs)
+        pipeline = newton.CollisionPipeline(model, deterministic=True, reduce_contacts=reduction)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        qd = state_0.joint_qd.numpy()
+        qd[5] = 6.0
+        state_0.joint_qd.assign(qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pad_spin_rows = 0
+        for _ in range(100):
+            state_0.clear_forces()
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, _DT)
+            state_0, state_1 = state_1, state_0
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            on_pad = (contacts.rigid_contact_shape0.numpy()[:count] == pad) | (
+                contacts.rigid_contact_shape1.numpy()[:count] == pad
+            )
+            pad_spin_rows += int(np.count_nonzero(solver._contact_slots_needed.numpy()[:count][on_pad] >= 4))
+        return float(state_0.body_qd.numpy()[0][5]), pad_spin_rows
+
+    def test_reduction_keeps_a_condim_pad_of_matching_material(self):
+        """Keep every spin row of a condim-4 pad under body-pair reduction, though it shares the box's raw materials."""
+        spin_full, rows_full = self._spin(4, body_pairs=False)
+        spin_reduced, rows_reduced = self._spin(4, body_pairs=True)
+        spin_control, _ = self._spin(3, body_pairs=True)
+        self.assertGreater(rows_full, 0)
+        self.assertEqual(rows_reduced, rows_full)
+        self.assertAlmostEqual(spin_reduced, spin_full, delta=1.0e-4)
+        self.assertLess(abs(spin_reduced), 1.0)
+        self.assertGreater(spin_control, 5.9)
+
+    def test_reduction_groups_split_only_by_rows_the_solver_can_apply(self):
+        """Split the pad's group on a free body only; keep the core grouping at condim 3, on an articulated body and
+        without the FeatherPGS attributes."""
+        model, box, pad = _padded_body_scene(4)
+        groups, _ = build_reduction_groups(model)
+        self.assertNotEqual(groups[box], groups[pad])
+        for pad_condim, articulated, register in ((3, False, True), (4, True, True), (4, False, False)):
+            with self.subTest(pad_condim=pad_condim, articulated=articulated, register=register):
+                model, box, pad = _padded_body_scene(pad_condim, articulated, register)
+                groups, _ = build_reduction_groups(model)
+                with mock.patch.object(contact_reduction_body_pairs, "_SOLVER_MATERIAL_KEYS", []):
+                    core, _ = build_reduction_groups(model)
+                np.testing.assert_array_equal(groups, core)
+                self.assertEqual(groups[box], groups[pad])
 
 
 class TestFreeRigidAngularFrictionImport(unittest.TestCase):
