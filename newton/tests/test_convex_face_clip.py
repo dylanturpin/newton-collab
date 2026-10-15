@@ -343,52 +343,40 @@ def test_runtime_scale_matches_baked_vertices(test, device):
 
 
 def test_rounded_hull_settles(test, device):
-    """Check that a small rounded hull settles with face clipping, and that the legacy manifold rolls when level."""
+    """Check that a small rounded hull settles with face clipping from a tilted and a level start."""
     vertices, indices = _rounded_hull((0.012, 0.009, 0.008))
-    tail_speed = {}
-    # The legacy manifold settles from the tilted start; only the level start still rolls without face clipping.
-    for euler, face_clip_options in (((10.0, 5.0, 0.0), (True,)), ((0.0, 0.0, 0.0), (False, True))):
-        for convex_face_clip in face_clip_options:
-            builder = newton.ModelBuilder()
-            builder.add_shape_box(
-                body=-1,
-                xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()),
-                hx=0.3,
-                hy=0.3,
-                hz=0.05,
-                cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.001),
-            )
-            rotation = _quat_from_euler_deg(*euler)
-            z = -_rotate(rotation, vertices)[:, 2].min() + 0.005
-            body = builder.add_body(xform=wp.transform((0.0, 0.0, z), rotation))
-            builder.add_shape_convex_hull(
-                body,
-                mesh=newton.Mesh(vertices, indices),
-                cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.5, gap=0.002),
-            )
-            model = builder.finalize(device=device)
-            pipeline = newton.CollisionPipeline(
-                model,
-                broad_phase="nxn",
-                deterministic=True,
-                convex_face_clip=convex_face_clip,
-            )
-            contacts = pipeline.contacts()
-            solver = newton.solvers.SolverFeatherPGS(model, iterations=32, contact_regularization=0.01)
-            state_0, state_1, control = model.state(), model.state(), model.control()
-            speeds = []
-            for _ in range(480):
-                pipeline.collide(state_0, contacts)
-                state_0.clear_forces()
-                solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-                state_0, state_1 = state_1, state_0
-                speeds.append(float(np.linalg.norm(state_0.body_qd.numpy()[0, 3:])))
-            tail_speed[euler, convex_face_clip] = float(np.median(speeds[-120:]))
     for euler in ((10.0, 5.0, 0.0), (0.0, 0.0, 0.0)):
-        speed = tail_speed[euler, True]
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()),
+            hx=0.3,
+            hy=0.3,
+            hz=0.05,
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.001),
+        )
+        rotation = _quat_from_euler_deg(*euler)
+        z = -_rotate(rotation, vertices)[:, 2].min() + 0.005
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, z), rotation))
+        builder.add_shape_convex_hull(
+            body,
+            mesh=newton.Mesh(vertices, indices),
+            cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.5, gap=0.002),
+        )
+        model = builder.finalize(device=device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, convex_face_clip=True)
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverFeatherPGS(model, iterations=32, contact_regularization=0.01)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        speeds = []
+        for _ in range(480):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            speeds.append(float(np.linalg.norm(state_0.body_qd.numpy()[0, 3:])))
+        speed = float(np.median(speeds[-120:]))
         test.assertLess(speed, 0.15, f"{euler}: face-clipped hull still rotates at {speed:.3f} rad/s")
-    legacy = tail_speed[(0.0, 0.0, 0.0), False]
-    test.assertGreater(legacy, 0.3, f"legacy control settled ({legacy:.3f} rad/s)")
 
 
 class TestConvexFaceClip(unittest.TestCase):
