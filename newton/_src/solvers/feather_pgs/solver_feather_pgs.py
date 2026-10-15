@@ -1363,6 +1363,29 @@ class _FeatherPGSExecutionPlan:
         return size in self.hinv_jt_fused_sizes
 
 
+def _finite_non_negative(name: str, value) -> float:
+    """Return ``value`` as a float, raising :class:`ValueError` unless it is finite and non-negative."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite and non-negative, got {value!r}") from exc
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative, got {value!r}")
+    return result
+
+
+def _optional_finite_non_negative(name: str, value) -> float | None:
+    """Return ``None`` unchanged, otherwise :func:`_finite_non_negative`."""
+    return None if value is None else _finite_non_negative(name, value)
+
+
+def _velocity_drive_mode(name: str, value) -> str:
+    """Return ``value``, raising :class:`ValueError` unless it is ``"active"`` or ``"freeze"``."""
+    if value not in ("active", "freeze"):
+        raise ValueError(f"{name} must be 'active' or 'freeze', got {value!r}")
+    return value
+
+
 class _ConstructionOption:
     """Read-only view of a constructor option stored as ``_<name>``."""
 
@@ -1379,7 +1402,13 @@ class _ConstructionOption:
 
 
 class _StepOption(_ConstructionOption):
-    """Constructor option that the solver reads at every step; a captured graph keeps its capture-time value."""
+    """Constructor option that the solver reads at every step; a captured graph keeps its capture-time value.
+
+    ``convert(name, value)`` validates and normalizes every assignment, including the constructor's.
+    """
+
+    def __init__(self, convert=None):
+        self._convert = convert
 
     def __set_name__(self, owner, name: str) -> None:
         super().__set_name__(owner, name)
@@ -1389,6 +1418,8 @@ class _StepOption(_ConstructionOption):
         )
 
     def __set__(self, instance, value) -> None:
+        if self._convert is not None:
+            value = self._convert(self._public_name, value)
         setattr(instance, self._private_name, value)
 
 
@@ -1599,11 +1630,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     fuse_joint_velocity_limits = _ConstructionOption()
     iterations = _ConstructionOption()
     velocity_iterations = _ConstructionOption()
-    baumgarte = _StepOption()
+    baumgarte = _StepOption(lambda name, value: float(value))
     cfm = _ConstructionOption()
-    relaxation = _StepOption()
+    relaxation = _StepOption(lambda name, value: float(value))
     contact_regularization = _ConstructionOption()
-    velocity_drive_mode = _StepOption()
+    velocity_drive_mode = _StepOption(_velocity_drive_mode)
     articulation_constraint_max = _ConstructionOption()
     contact_warmstart = _ConstructionOption()
     solve_mode = _ConstructionOption()
@@ -1618,12 +1649,12 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     double_buffer = _ConstructionOption()
     drive_mode = _ConstructionOption()
     row_watermark = _ConstructionOption()
-    restitution_velocity_threshold = _StepOption()
-    contact_speculative_scale = _StepOption()
-    contact_gap_gate = _StepOption()
+    restitution_velocity_threshold = _StepOption(_finite_non_negative)
+    contact_speculative_scale = _StepOption(_finite_non_negative)
+    contact_gap_gate = _StepOption(_optional_finite_non_negative)
     enable_restitution = _ConstructionOption()
-    contact_warmstart_decay = _StepOption()
-    warn_constraint_overflow = _StepOption()
+    contact_warmstart_decay = _StepOption(_finite_non_negative)
+    warn_constraint_overflow = _StepOption(lambda name, value: bool(value))
     friction_anchor_beta = _ConstructionOption()
     enable_joint_friction = _ConstructionOption()
     bilateral_preelimination_include_mimics = _ConstructionOption()
@@ -2497,20 +2528,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 UserWarning,
                 stacklevel=2,
             )
-        try:
-            self._contact_speculative_scale = float(contact_speculative_scale)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("contact_speculative_scale must be finite and non-negative") from exc
-        if not np.isfinite(self._contact_speculative_scale) or self._contact_speculative_scale < 0.0:
-            raise ValueError("contact_speculative_scale must be finite and non-negative")
-        self._contact_gap_gate = None
-        if contact_gap_gate is not None:
-            try:
-                self._contact_gap_gate = float(contact_gap_gate)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("contact_gap_gate must be finite and non-negative") from exc
-            if not np.isfinite(self._contact_gap_gate) or self._contact_gap_gate < 0.0:
-                raise ValueError("contact_gap_gate must be finite and non-negative")
+        self.contact_speculative_scale = contact_speculative_scale
+        self.contact_gap_gate = contact_gap_gate
         self._contact_shared_anchor = bool(contact_shared_anchor)
         if self._contact_friction_position_iterations < -1:
             raise ValueError(
@@ -2543,7 +2562,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             # explicit never-activate kill-switch.
             raise ValueError("velocity_limit_activation_fraction must be in [0, 1] or inf")
         self._iterations = iterations
-        self._baumgarte = baumgarte
+        self.baumgarte = baumgarte
         self._contact_regularization = float(contact_regularization)
         if not math.isfinite(self._contact_regularization) or self._contact_regularization < 0.0:
             raise ValueError("contact_regularization must be finite and non-negative")
@@ -2557,21 +2576,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._contact_w = float(np.float32(1.0 / (1.0 + self._contact_regularization)))
         self._regularization_enabled = self._contact_w < 1.0
         self._cfm = cfm
-        self._relaxation = relaxation
+        self.relaxation = relaxation
         self._velocity_iterations = max(int(velocity_iterations), 0)
         self._enable_restitution = bool(enable_restitution)
-        threshold_error = "restitution_velocity_threshold must be finite and non-negative"
-        try:
-            self._restitution_velocity_threshold = float(restitution_velocity_threshold)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(threshold_error) from exc
-        if not np.isfinite(self._restitution_velocity_threshold) or self._restitution_velocity_threshold < 0.0:
-            raise ValueError(threshold_error)
-        if velocity_drive_mode not in ("active", "freeze"):
-            raise ValueError(f"velocity_drive_mode must be 'active' or 'freeze', got {velocity_drive_mode!r}")
-        self._velocity_drive_mode = velocity_drive_mode
+        self.restitution_velocity_threshold = restitution_velocity_threshold
+        self.velocity_drive_mode = velocity_drive_mode
         self._requested_dense_max_constraints = int(articulation_constraint_max)
-        self._warn_constraint_overflow = bool(warn_constraint_overflow)
+        self.warn_constraint_overflow = warn_constraint_overflow
         if articulated_contact_response not in (
             "immediate",
             "propagation",
@@ -2613,13 +2624,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             "propagation",
             "propagation_colored",
         )
-        requested_pgs_decay = float(contact_warmstart_decay)
-        if not math.isfinite(requested_pgs_decay) or requested_pgs_decay < 0.0:
-            raise ValueError(
-                f"contact_warmstart_decay must be finite and non-negative, got {contact_warmstart_decay!r}"
-            )
         self._contact_warmstart = bool(contact_warmstart)
-        self._contact_warmstart_decay = requested_pgs_decay
+        self.contact_warmstart_decay = contact_warmstart_decay
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
         self._ws_prev_dense_row_parent = None
