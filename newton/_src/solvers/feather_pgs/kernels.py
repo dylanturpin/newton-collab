@@ -2174,8 +2174,10 @@ def accumulate_connect_wrenches_from_impulses(
 ):
     """Add each loop closure's solved point-coincidence force to its parent and child bodies.
 
-    The rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse maps
-    back to a force along ``e_k`` at each anchor.
+    The rows are built at the shared anchor ``p_M``, the midpoint of the two anchors (see
+    ``populate_connect_J_for_size``), scaled by the row builder's stored inverse norm, so the impulse maps back to
+    an equal and opposite force along ``e_k`` applied to both bodies at ``p_M``: the readout carries no couple across
+    an open closure, exactly like the solve.
     """
     k = wp.tid()
     base_slot = connect_slot[k]
@@ -2190,6 +2192,8 @@ def accumulate_connect_wrenches_from_impulses(
     if body_p >= 0:
         p_a = wp.transform_point(body_q[body_p], anchor_p)
     p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
+    # Same shared anchor as the Jacobian: the solved impulse pair acts at one world point.
+    p_m = p_a - 0.5 * (p_a - p_b)
     for axis_index in range(3):
         slot = base_slot + axis_index
         if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
@@ -2200,8 +2204,8 @@ def accumulate_connect_wrenches_from_impulses(
         axis = wp.vec3(0.0)
         axis[axis_index] = 1.0
         force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
-        _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
-        _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_p, force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_c, -force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
 
 
 @wp.kernel
