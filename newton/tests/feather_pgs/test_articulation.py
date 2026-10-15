@@ -4553,7 +4553,7 @@ class TestFeatherPGSConnectMomentum(unittest.TestCase):
         dt = 1.0 / 500.0
         model = _build_floating_four_bar().finalize()
         solver = newton.solvers.SolverFeatherPGS(
-            model, solve_mode="matrix_free", iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
+            model, solve_mode=_pgs_mode(), iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
         )
         state_0, state_1 = model.state(), model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
