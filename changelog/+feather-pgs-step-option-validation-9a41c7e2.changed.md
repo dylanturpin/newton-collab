@@ -1,0 +1,1 @@
+Validate assignments to the runtime-assignable `SolverFeatherPGS` options (`baumgarte`, `relaxation`, `velocity_drive_mode`, `contact_warmstart_decay`, `restitution_velocity_threshold`, `contact_speculative_scale`, `contact_gap_gate`, `warn_constraint_overflow`) like the constructor does. An invalid assignment raises `ValueError` and keeps the previous value.
