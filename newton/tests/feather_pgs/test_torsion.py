@@ -680,13 +680,13 @@ class TestContactTorsionRegressions(unittest.TestCase):
 
     def test_hydro_contact_input_is_rejected(self):
         """Reject actual positive hydro contact stiffness, not a synthetic solver flag."""
-        for device_preparation in (False, True):
+        for device_preparation, stepped in ((False, True), (False, False), (True, False)):
             _, solver, model, initial, contacts = fixture(
-                0.01, center_only=True, contact_torsion_device=device_preparation, step=False
+                0.01, center_only=True, contact_torsion_device=device_preparation, step=stepped
             )
             contacts.rigid_contact_stiffness = wp.ones(contacts.rigid_contact_max, device=model.device)
             with (
-                self.subTest(device_preparation=device_preparation),
+                self.subTest(device_preparation=device_preparation, stepped=stepped),
                 self.assertRaisesRegex(ValueError, "hydroelastic"),
             ):
                 solver.step(initial, model.state(), model.control(), contacts, 0.0025)
