@@ -3673,7 +3673,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._body_prescribed.assign(prescribed)
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array[wp.bool] | None = None) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
         ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES`` and its narrow inertial and force flags,
@@ -3957,7 +3957,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
 
-    def _solver_world_mask(self, world_mask: wp.array[wp.bool] | None) -> wp.array[wp.bool] | None:
+    def _solver_world_mask(self, world_mask: "wp.array[wp.bool] | None") -> "wp.array[wp.bool] | None":
         """Map a per-solver-world or ``model.world_count + 1`` mask to one entry per solver world."""
         if world_mask is None or world_mask.shape[0] == self._world_count:
             return world_mask
@@ -4012,8 +4012,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     @override
     def coupling_eval_gravity_acceleration(
         self,
-        out_body_acceleration: wp.array[wp.vec3] | None,
-        out_particle_acceleration: wp.array[wp.vec3] | None,
+        out_body_acceleration: "wp.array[wp.vec3] | None",
+        out_particle_acceleration: "wp.array[wp.vec3] | None",
     ) -> None:
         """Evaluate gravity acceleration, omitting bodies with ``body_disable_gravity`` set."""
         super().coupling_eval_gravity_acceleration(out_body_acceleration, out_particle_acceleration)
@@ -4055,7 +4055,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         endpoint_index: wp.array[int],
         endpoint_local_pos: wp.array[wp.vec3],
         out_mass: wp.array[float],
-        out_inertia: wp.array[wp.mat33] | None = None,
+        out_inertia: "wp.array[wp.mat33] | None" = None,
     ) -> None:
         """Evaluate articulated effective mass and inertia for coupling endpoints.
 
@@ -4737,7 +4737,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._mimic_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._mimic_count = n
 
-    def _build_tree_joint_world(self, model) -> wp.array[int] | None:
+    def _build_tree_joint_world(self, model) -> "wp.array[int] | None":
         """Return the solver world of each tree joint the step checks for disabling, ``-1`` elsewhere."""
         if not model.joint_count or model.joint_articulation is None or self._art_to_world is None:
             return None
