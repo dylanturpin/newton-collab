@@ -1053,6 +1053,16 @@ add_example_test(
 )
 
 
+for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack"):
+    add_example_test(
+        TestRobotExamples,
+        name=f"robot.example_fpgs_{tabletop_task}",
+        devices=cuda_test_devices,
+        test_options={"usd_required": True, "num-frames": 900},
+        use_viewer=True,
+    )
+
+
 class TestRobotPolicyExamples(unittest.TestCase):
     pass
 

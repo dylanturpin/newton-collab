@@ -31,6 +31,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
+from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian
@@ -55,11 +56,12 @@ from .contact_angular_friction import (
     configure_free_rigid_angular_friction,
     configure_torsional_rolling_friction,
     free_rigid_angular_friction_gs_sources,
+    free_rigid_reduction_material_key,
+    free_rigid_route_bodies,
+    launch_angular_friction_rows,
     launch_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
-    free_rigid_route_bodies,
     validate_free_rigid_angular_friction_mode,
-    launch_angular_friction_rows,
     validate_torsional_rolling_friction_coefficients,
     validate_torsional_rolling_friction_mode,
 )
@@ -1732,9 +1734,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           Only contacts between free bodies, and free bodies on static or kinematic geometry, read it.
           Values below 4 add nothing; 1 and 2 do not remove sliding friction. Under persistent friction patches,
           contacts share a patch only if their angular coefficients match, so each patch's angular rows are
-          independent of contact order. Shape edits take effect at
-          :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without angular rows must
-          be rebuilt to gain them.
+          independent of contact order; while this solver is alive, body-pair contact reduction likewise
+          groups the shapes of free-rigid-route bodies by these coefficients. Shape edits take effect at
+          :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` and, under body-pair reduction,
+          :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups`; a solver built without angular
+          rows must be rebuilt to gain them.
 
         The solver reads them from the model at every step, for example
         ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
@@ -3575,6 +3579,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and model.articulation_world is not None
             and np.any(model.articulation_world.numpy() < 0)
         )
+        # Last, so a failed construction leaves the model's reduction keys untouched.
+        reduction_key = free_rigid_reduction_material_key(self)
+        if reduction_key is not None:
+            add_reduction_material_key(model, self, reduction_key)
 
     def validate_contact_compliance(self) -> None:
         """Raise the first latched contact-compliance error, then clear it.
@@ -3678,7 +3686,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._body_prescribed.assign(prescribed)
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array[wp.bool] | None = None) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
         """Refresh cached solver data after supported model changes and invalidate affected impulse history.
 
         ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES`` and its narrow inertial and force flags,
@@ -3962,7 +3970,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._fk_id_cache_source_state = state
         self._clear_warmstart_history(world_mask)
 
-    def _solver_world_mask(self, world_mask: wp.array[wp.bool] | None) -> wp.array[wp.bool] | None:
+    def _solver_world_mask(self, world_mask: "wp.array[wp.bool] | None") -> "wp.array[wp.bool] | None":
         """Map a per-solver-world or ``model.world_count + 1`` mask to one entry per solver world."""
         if world_mask is None or world_mask.shape[0] == self._world_count:
             return world_mask
@@ -4017,8 +4025,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     @override
     def coupling_eval_gravity_acceleration(
         self,
-        out_body_acceleration: wp.array[wp.vec3] | None,
-        out_particle_acceleration: wp.array[wp.vec3] | None,
+        out_body_acceleration: "wp.array[wp.vec3] | None",
+        out_particle_acceleration: "wp.array[wp.vec3] | None",
     ) -> None:
         """Evaluate gravity acceleration, omitting bodies with ``body_disable_gravity`` set."""
         super().coupling_eval_gravity_acceleration(out_body_acceleration, out_particle_acceleration)
@@ -4060,7 +4068,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         endpoint_index: wp.array[int],
         endpoint_local_pos: wp.array[wp.vec3],
         out_mass: wp.array[float],
-        out_inertia: wp.array[wp.mat33] | None = None,
+        out_inertia: "wp.array[wp.mat33] | None" = None,
     ) -> None:
         """Evaluate articulated effective mass and inertia for coupling endpoints.
 
@@ -4742,7 +4750,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._mimic_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._mimic_count = n
 
-    def _build_tree_joint_world(self, model) -> wp.array[int] | None:
+    def _build_tree_joint_world(self, model) -> "wp.array[int] | None":
         """Return the solver world of each tree joint the step checks for disabling, ``-1`` elsewhere."""
         if not model.joint_count or model.joint_articulation is None or self._art_to_world is None:
             return None
