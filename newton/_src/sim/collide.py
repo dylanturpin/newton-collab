@@ -32,6 +32,7 @@ from ..geometry.contact_reduction_body_pairs import (
     BodyPairContactReducer,
     build_reduction_group_pair_bound,
     build_reduction_groups,
+    reduction_material_key_version,
 )
 from ..geometry.contact_reduction_global import CONTACT_ID_BITS
 from ..geometry.contact_sort import ContactSorter
@@ -2635,6 +2636,7 @@ class CollisionPipeline:
             # build_reduction_groups). Group ids must pack exactly into the
             # reduction key: aliasing two groups could evict a patch's deepest
             # contact.
+            self._reduction_material_key_version = reduction_material_key_version(model)
             shape_group, group_count = build_reduction_groups(model)
             if group_count > MAX_GROUP_ID + 1:
                 # ids are 0-based: MAX_GROUP_ID is the largest representable id
@@ -2718,7 +2720,10 @@ class CollisionPipeline:
         synchronous ``O(shape_count)`` host rebuild intended for infrequent
         material changes, not per-frame use.  Call it outside CUDA graph capture.
         Raises if the new class count exceeds the group-id budget.  No-op when
-        reduction is disabled.
+        reduction is disabled.  A solver that sets a per-shape material key
+        (``set_reduction_material_key``)
+        after this pipeline was built triggers this rebuild at the next
+        :meth:`collide` outside capture.
         """
         if self._body_pair_reducer is None:
             return
@@ -2727,12 +2732,14 @@ class CollisionPipeline:
                 "refresh_body_pair_reduction_groups() mutates reducer topology; "
                 "call it when no CUDA graph capture is active on this device"
             )
+        version = reduction_material_key_version(self.model)
         shape_group, group_count = build_reduction_groups(self.model)
         if group_count > MAX_GROUP_ID + 1:
             raise ValueError(
                 f"body-pair contact reduction supports at most {MAX_GROUP_ID + 1} reduction groups, got {group_count}"
             )
         self._body_pair_reducer.shape_group.assign(shape_group)
+        self._reduction_material_key_version = version
         # Winners recorded under the old classes are not comparable to the new
         # grouping; severing history is the conservative continuation.
         self._body_pair_reducer.reset_history()
@@ -3282,6 +3289,11 @@ class CollisionPipeline:
                     "for an unreduced-only solver configuration is live; destroy every reference to that "
                     "solver graph first"
                 )
+            if reduction_material_key_version(self.model) != self._reduction_material_key_version:
+                # A solver constructed after this pipeline set its material key.
+                if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
+                    raise RuntimeError("A solver changed body-pair reduction groups; collide once outside capture.")
+                self.refresh_body_pair_reduction_groups()
             device = self._body_pair_reducer.device
             graph = contacts._current_warp_capture_graph()
             current_stream_is_capturing = graph is not None

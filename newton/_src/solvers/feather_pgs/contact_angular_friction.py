@@ -71,7 +71,7 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
             raise ValueError(f"{name} must be finite and non-negative [m], or None")
     solver._free_rigid_torsional_friction = None if torsional is None else float(torsional)
     solver._free_rigid_rolling_friction = None if rolling is None else float(rolling)
-    condim = shape_condim(model)
+    condim = _shape_condim(model)
     if condim is not None and np.any((condim < 1) | (condim > 6)):
         raise ValueError("feather_pgs:condim must be between 1 and 6")
     overridden = torsional is not None or rolling is not None
@@ -111,20 +111,30 @@ def refresh_free_rigid_angular_friction(solver) -> None:
     )
 
 
-def free_rigid_reduction_material_key(model, condim: np.ndarray, route_body: np.ndarray) -> np.ndarray:
-    """Return each shape's free-rigid (torsional, rolling) coefficients [m] behind condim.
+def free_rigid_reduction_material_key(solver):
+    """Return the body-pair reduction key provider for the solver's free-rigid angular coefficients, or ``None``.
 
-    Shapes on bodies outside ``route_body`` never get angular rows and keep a zero key.
+    The key is each shape's gated (torsional, rolling) coefficient [m], zero on bodies off the free-rigid route.
     """
-    key = np.zeros((model.shape_count, 2), dtype=np.float32)
-    for column, (material, threshold) in enumerate(
-        ((model.shape_material_mu_torsional, 4), (model.shape_material_mu_rolling, 6))
-    ):
-        mu = material.numpy()
-        key[:, column] = np.where((condim >= threshold) & np.isfinite(mu) & (mu > 0.0), mu, 0.0)
-    shape_body = model.shape_body.numpy()
-    dynamic = shape_body >= 0
-    key[dynamic & (route_body[np.maximum(shape_body, 0)] == 0)] = 0.0
+    if solver._free_rigid_route_body is None or not solver.model.shape_count:
+        return None
+    if not np.any(solver._free_rigid_route_body.numpy()):
+        return None
+    shape_count = solver.model.shape_count
+    shape_body = solver.model.shape_body
+    torsional, rolling, route = (
+        solver._free_rigid_mu_torsional,
+        solver._free_rigid_mu_rolling,
+        solver._free_rigid_route_body,
+    )
+
+    def key():
+        # Captures device arrays only: a reference to the model or solver would keep them alive.
+        coefficients = np.stack((torsional.numpy()[:shape_count], rolling.numpy()[:shape_count]), axis=1)
+        body = shape_body.numpy()
+        coefficients[(body >= 0) & (route.numpy()[np.maximum(body, 0)] == 0)] = 0.0
+        return coefficients
+
     return key
 
 
@@ -133,7 +143,7 @@ def _condim_attribute(model):
     return getattr(namespace, "condim", None)
 
 
-def shape_condim(model) -> np.ndarray | None:
+def _shape_condim(model) -> np.ndarray | None:
     namespace = getattr(model, "feather_pgs", None)
     attribute = getattr(namespace, "condim", None)
     return None if attribute is None or not model.shape_count else attribute.numpy()

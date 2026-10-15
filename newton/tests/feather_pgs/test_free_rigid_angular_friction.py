@@ -5,13 +5,11 @@
 
 import math
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry import contact_reduction_body_pairs
 from newton._src.geometry.contact_reduction_body_pairs import build_reduction_groups
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -553,50 +551,67 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
 
-def _padded_body_scene(pad_condim: int, articulated: bool = False, register: bool = True):
-    """Build a body whose wide condim-3 box carries an inset pad, 2 um shallower, with the same raw materials."""
+def _padded_body_scene(pad_condim: int, body: str = "free"):
+    """Build a body whose wide condim-3 box carries an inset pad, 2 um shallower, with the same raw materials.
+
+    ``body`` is ``"free"``, ``"articulated"`` (a prismatic link beside a free sphere) or ``"kinematic"`` (a kinematic
+    free body beside a prismatic link, so no dynamic free body keeps the free-rigid route).
+    """
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-    if register:
-        SolverFeatherPGS.register_custom_attributes(builder)
+    SolverFeatherPGS.register_custom_attributes(builder)
     ground = newton.ModelBuilder.ShapeConfig(mu=0.0, mu_torsional=0.0, mu_rolling=0.0)
     builder.add_shape_box(
         -1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=1.0, hy=1.0, hz=0.05, cfg=ground
     )
     inertia = wp.mat33(*(np.eye(3) * 1.0e-3).astype(np.float32).ravel())
     pose = wp.transform((0.0, 0.0, 0.02), wp.quat_identity())
-    if articulated:
-        body = builder.add_link(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
-        joint = builder.add_joint_revolute(-1, body, parent_xform=pose, axis=newton.Axis.Z)
-        builder.add_articulation([joint])
-        # A free sphere elsewhere keeps the free-rigid route in use.
-        free = builder.add_body(xform=wp.transform((0.5, 0.5, _RADIUS), wp.quat_identity()), mass=_MASS)
-        builder.add_shape_sphere(free, radius=_RADIUS)
+    if body == "free":
+        padded = builder.add_body(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
     else:
-        body = builder.add_body(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
+        link_pose = wp.transform((0.5, 0.5, 0.02), wp.quat_identity())
+        link = builder.add_link(xform=link_pose, mass=2.0, inertia=inertia, lock_inertia=True)
+        joint = builder.add_joint_prismatic(-1, link, parent_xform=link_pose, axis=newton.Axis.X)
+        builder.add_articulation([joint])
+        builder.add_shape_box(link, hx=0.02, hy=0.02, hz=0.02)
+        if body == "articulated":
+            free = builder.add_body(xform=wp.transform((-0.5, -0.5, _RADIUS), wp.quat_identity()), mass=_MASS)
+            builder.add_shape_sphere(free, radius=_RADIUS)
+            padded = builder.add_link(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True)
+            joint = builder.add_joint_prismatic(-1, padded, parent_xform=pose, axis=newton.Axis.Y)
+            builder.add_articulation([joint])
+        else:
+            padded = builder.add_body(xform=pose, mass=2.0, inertia=inertia, lock_inertia=True, is_kinematic=True)
     material = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0, mu_torsional=0.01, mu_rolling=0.0)
-    extra = (lambda condim: {"custom_attributes": {"feather_pgs:condim": condim}}) if register else (lambda condim: {})
-    box = builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.02, cfg=material, **extra(3))
+    box = builder.add_shape_box(
+        padded, hx=0.05, hy=0.05, hz=0.02, cfg=material, custom_attributes={"feather_pgs:condim": 3}
+    )
     pad = builder.add_shape_box(
-        body,
+        padded,
         xform=wp.transform((0.0, 0.0, -0.015 + 2.0e-6), wp.quat_identity()),
         hx=0.02,
         hy=0.02,
         hz=0.005,
         cfg=material,
-        **extra(pad_condim),
+        custom_attributes={"feather_pgs:condim": pad_condim},
     )
     return builder.finalize(), box, pad
 
 
+def _spin_solver(model):
+    return SolverFeatherPGS(
+        model, solve_mode="matrix_free", iterations=16, deterministic=True, friction_anchor_beta=0.0
+    )
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "FeatherPGS matrix-free requires CUDA")
 class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
-    def _spin(self, pad_condim: int, body_pairs: bool):
+    def _spin(self, pad_condim: int, body_pairs: bool, solver_first: bool = True):
         model, _, pad = _padded_body_scene(pad_condim)
-        solver = SolverFeatherPGS(
-            model, solve_mode="matrix_free", iterations=16, deterministic=True, friction_anchor_beta=0.0
-        )
+        solver = _spin_solver(model) if solver_first else None
         reduction = newton.CollisionPipeline.ContactReductionConfig(body_pairs=body_pairs)
         pipeline = newton.CollisionPipeline(model, deterministic=True, reduce_contacts=reduction)
+        if solver is None:
+            solver = _spin_solver(model)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
         qd = state_0.joint_qd.numpy()
@@ -617,28 +632,34 @@ class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
         return float(state_0.body_qd.numpy()[0][5]), pad_spin_rows
 
     def test_reduction_keeps_a_condim_pad_of_matching_material(self):
-        """Keep every spin row of a condim-4 pad under body-pair reduction, though it shares the box's raw materials."""
+        """Keep every spin row of a condim-4 pad under body-pair reduction, though it shares the box's raw materials,
+        whether the solver or the pipeline is built first."""
         spin_full, rows_full = self._spin(4, body_pairs=False)
-        spin_reduced, rows_reduced = self._spin(4, body_pairs=True)
         spin_control, _ = self._spin(3, body_pairs=True)
         self.assertGreater(rows_full, 0)
-        self.assertEqual(rows_reduced, rows_full)
-        self.assertAlmostEqual(spin_reduced, spin_full, delta=1.0e-4)
-        self.assertLess(abs(spin_reduced), 1.0)
+        self.assertLess(abs(spin_full), 1.0)
         self.assertGreater(spin_control, 5.9)
+        for solver_first in (True, False):
+            with self.subTest(solver_first=solver_first):
+                spin, rows = self._spin(4, body_pairs=True, solver_first=solver_first)
+                self.assertEqual(rows, rows_full)
+                self.assertAlmostEqual(spin, spin_full, delta=1.0e-4)
 
-    def test_reduction_groups_split_only_by_rows_the_solver_can_apply(self):
-        """Split the pad's group on a free body only; keep the core grouping at condim 3, on an articulated body and
-        without the FeatherPGS attributes."""
+    def test_reduction_groups_split_only_where_the_solver_applies_rows(self):
+        """Split a free body's condim-4 pad into its own group once FeatherPGS is built; keep the core grouping
+        without the solver, on an articulated body, and on a kinematic free body with no free-rigid route."""
         model, box, pad = _padded_body_scene(4)
+        merged, _ = build_reduction_groups(model)
+        self.assertEqual(merged[box], merged[pad])
+        _spin_solver(model)
         groups, _ = build_reduction_groups(model)
         self.assertNotEqual(groups[box], groups[pad])
-        for pad_condim, articulated, register in ((3, False, True), (4, True, True), (4, False, False)):
-            with self.subTest(pad_condim=pad_condim, articulated=articulated, register=register):
-                model, box, pad = _padded_body_scene(pad_condim, articulated, register)
+        for body in ("articulated", "kinematic"):
+            with self.subTest(body=body):
+                model, box, pad = _padded_body_scene(4, body)
+                core, _ = build_reduction_groups(model)
+                _spin_solver(model)
                 groups, _ = build_reduction_groups(model)
-                with mock.patch.object(contact_reduction_body_pairs, "_SOLVER_MATERIAL_KEYS", []):
-                    core, _ = build_reduction_groups(model)
                 np.testing.assert_array_equal(groups, core)
                 self.assertEqual(groups[box], groups[pad])
 

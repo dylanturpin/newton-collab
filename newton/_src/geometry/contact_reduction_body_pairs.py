@@ -143,6 +143,7 @@ reduced-contact provenance until ``Contacts.clear`` or a subsequent Python
 from __future__ import annotations
 
 import math
+import weakref
 
 import numpy as np
 import warp as wp
@@ -239,17 +240,24 @@ _MATERIAL_FIELDS = (
     "shape_material_restitution",
 )
 
-# Solver-owned per-shape contact laws join the material signature through these
-# providers. Each maps a model to a ``(shape_count, k)`` array of exactly
-# compared values, or ``None`` when the model does not use its law; ``None``
-# leaves the grouping exactly as the core fields alone produce it.
-_SOLVER_MATERIAL_KEYS: list = []
+# Per-model (provider, version) set by the solver whose contact law reads per-shape
+# data beyond these fields. A provider returns a ``(shape_count, k)`` array whose
+# columns join the exactly compared signature. Weak keys: a model's entry dies with it.
+_SOLVER_MATERIAL_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
-def register_reduction_material_key(provider) -> None:
-    """Add a solver's per-shape material key to the body-pair reduction signature."""
-    if provider not in _SOLVER_MATERIAL_KEYS:
-        _SOLVER_MATERIAL_KEYS.append(provider)
+def set_reduction_material_key(model, provider) -> None:
+    """Attach a solver's per-shape material key to ``model``; pipelines regroup at their next uncaptured collide."""
+    entry = _SOLVER_MATERIAL_KEYS.get(model)
+    if entry is None and provider is None:
+        return
+    _SOLVER_MATERIAL_KEYS[model] = (provider, reduction_material_key_version(model) + 1)
+
+
+def reduction_material_key_version(model) -> int:
+    """Return how many times a solver has set ``model``'s reduction material key."""
+    entry = _SOLVER_MATERIAL_KEYS.get(model)
+    return 0 if entry is None else entry[1]
 
 
 def build_reduction_groups(model) -> tuple:
@@ -258,9 +266,9 @@ def build_reduction_groups(model) -> tuple:
     Static shapes keep unique ids so distinct static colliders never merge.
     Dynamic shapes share a group only per (body, exact material signature):
     a body whose colliders differ in any solver-visible material field, or in
-    a key a solver registered with :func:`register_reduction_material_key`,
-    gets one group per material class, so contacts carrying different physics
-    never compete for the same slots.
+    the key a solver set with :func:`set_reduction_material_key`, gets one
+    group per material class, so contacts carrying different physics never
+    compete for the same slots.
 
     Returns:
         ``(ids, group_count)`` where ids is an int32 array of length
@@ -273,10 +281,9 @@ def build_reduction_groups(model) -> tuple:
         arr = getattr(model, name, None)
         if arr is not None:
             mats.append(arr.numpy())
-    for provider in _SOLVER_MATERIAL_KEYS:
-        key = provider(model)
-        if key is not None:
-            mats.extend(np.asarray(key).reshape(n, -1).T)
+    provider = _SOLVER_MATERIAL_KEYS.get(model, (None, 0))[0]
+    if provider is not None:
+        mats.extend(np.asarray(provider()).reshape(n, -1).T)
     ids = np.zeros(n, dtype=np.int32)
     class_ids: dict = {}
     next_id = 0
