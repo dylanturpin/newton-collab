@@ -14775,7 +14775,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         element_row_cursor: wp.array[int],
     ): ...
 
-    def joint_limit_warp_template(
+    def joint_limit_warp_template(  # pragma: no cover - compiled by wp.kernel
         articulation_count: int,
         articulation_dof_start: wp.array[int],
         art_to_world: wp.array[int],
@@ -14923,7 +14923,7 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
         element_row_cursor: wp.array[int],
     ): ...
 
-    def joint_friction_warp_template(
+    def joint_friction_warp_template(  # pragma: no cover - compiled by wp.kernel
         articulation_count: int,
         articulation_dof_start: wp.array[int],
         art_to_world: wp.array[int],
@@ -14988,7 +14988,7 @@ def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "
     if N <= 0:
         raise ValueError("direct diagonal inertia requires a positive DOF count")
 
-    def compute_direct_diagonal_inverse_mass_template(
+    def compute_direct_diagonal_inverse_mass_template(  # pragma: no cover - compiled by wp.kernel
         articulation_start: wp.array[int],
         articulation_dof_start: wp.array[int],
         mass_update_mask: wp.array[int],
@@ -15052,7 +15052,7 @@ def _get_partitioned_inverse_dynamics_kernels(direct_dofs: int, device_arch: str
     if N <= 0:
         raise ValueError("partitioned inverse dynamics requires a positive direct DOF count")
 
-    def selected_articulation_tau_template(
+    def selected_articulation_tau_template(  # pragma: no cover - compiled by wp.kernel
         selected_articulations: wp.array[int],
         articulation_start: wp.array[int],
         articulation_joint_end: wp.array[int],
@@ -15113,7 +15113,7 @@ def _get_partitioned_inverse_dynamics_kernels(direct_dofs: int, device_arch: str
             tau,
         )
 
-    def direct_branch_tau_template(
+    def direct_branch_tau_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         dof_joint_offset: wp.array[int],
         articulation_start: wp.array[int],
@@ -15276,7 +15276,7 @@ def _get_composite_inertia_warp_kernel(
             body_I_c: wp.array[wp.spatial_matrix],
         ): ...
 
-        def composite_inertia_warp_compact_template(
+        def composite_inertia_warp_compact_template(  # pragma: no cover - compiled by wp.kernel
             composite_articulation_count: int,
             composite_articulations: wp.array[int],
             articulation_start: wp.array[int],
@@ -15322,7 +15322,7 @@ def _get_composite_inertia_warp_kernel(
         body_I_c: wp.array[wp.spatial_matrix],
     ): ...
 
-    def composite_inertia_warp_template(
+    def composite_inertia_warp_template(  # pragma: no cover - compiled by wp.kernel
         composite_articulation_count: int,
         composite_articulations: wp.array[int],
         articulation_start: wp.array[int],
@@ -15376,7 +15376,7 @@ def _get_hinv_jt_plain_kernel(
     WRITE_WORLD = wp.constant(1 if write_world else 0)
     WRITE_GROUP = wp.constant(1 if write_group else 0)
 
-    def hinv_jt_tiled_template(
+    def hinv_jt_tiled_template(  # pragma: no cover - compiled by wp.kernel
         L_group: wp.array3d[float],
         J_group: wp.array3d[float],
         group_to_art: wp.array[int],
@@ -15450,7 +15450,7 @@ def _get_hinv_jt_kernel(
     WRITE_WORLD = wp.constant(1 if write_world else 0)
     WRITE_GROUP = wp.constant(1 if write_group else 0)
 
-    def hinv_jt_tiled_template(
+    def hinv_jt_tiled_template(  # pragma: no cover - compiled by wp.kernel
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
         J_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
         group_to_art: wp.array[int],
@@ -15519,7 +15519,7 @@ def _get_hinv_jt_fused_kernel(
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
     TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
 
-    def hinv_jt_tiled_fused_template(
+    def hinv_jt_tiled_fused_template(  # pragma: no cover - compiled by wp.kernel
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
         J_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
         group_to_art: wp.array[int],
@@ -15637,7 +15637,7 @@ for (int ci = 0; ci < num_chunks; ci++) {{
         world_diag: wp.array2d[float],
     ): ...
 
-    def delassus_template(
+    def delassus_template(  # pragma: no cover - compiled by wp.kernel
         J_group: wp.array3d[float],
         Y_group: wp.array3d[float],
         group_to_art: wp.array[int],
@@ -15770,7 +15770,7 @@ def _get_crba_cholesky_warp_kernel(n_dofs: int, device_arch: str, *, warps_per_b
         L_group: wp.array3d[float],
     ): ...
 
-    def crba_cholesky_warp_template(
+    def crba_cholesky_warp_template(  # pragma: no cover - compiled by wp.kernel
         n_arts: int,
         articulation_start: wp.array[int],
         articulation_dof_start: wp.array[int],
@@ -15821,7 +15821,7 @@ def _get_crba_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int =
     element_rounds = (int(n_dofs) * int(n_dofs) + int(tile_threads) - 1) // int(tile_threads)
     tile_stride = wp.constant(int(tile_threads))
 
-    def crba_cholesky_template(
+    def crba_cholesky_template(  # pragma: no cover - compiled by wp.kernel
         articulation_start: wp.array[int],
         articulation_dof_start: wp.array[int],
         mass_update_mask: wp.array[int],
@@ -15902,7 +15902,7 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) 
     # Convert to Python int to ensure wp.constant() accepts them
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
-    def cholesky_tiled_template(
+    def cholesky_tiled_template(  # pragma: no cover - compiled by wp.kernel
         H_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
         R_group: wp.array2d[float],  # [n_arts, n_dofs] armature
         group_to_art: wp.array[int],
@@ -15940,7 +15940,7 @@ def _get_cholesky_inverse_tiled_kernel(n_dofs: int, device_arch: str, tile_threa
     del device_arch
     dofs = wp.constant(int(n_dofs))
 
-    def cholesky_inverse_tiled_template(
+    def cholesky_inverse_tiled_template(  # pragma: no cover - compiled by wp.kernel
         H_group: wp.array3d[float],
         R_group: wp.array2d[float],
         identity: wp.array2d[float],
@@ -16020,7 +16020,7 @@ def _get_inverse_cholesky_register_kernel(n_dofs: int, device_arch: str, *, lowe
         Hinv_group: wp.array3d[float],
     ): ...
 
-    def inverse_cholesky_register_template(
+    def inverse_cholesky_register_template(  # pragma: no cover - compiled by wp.kernel
         L_group: wp.array3d[float],
         group_to_art: wp.array[int],
         mass_update_mask: wp.array[int],
@@ -16205,7 +16205,7 @@ def _get_paired_hinv_jt_kernel(
         world_diag: wp.array2d[float],
     ): ...
 
-    def paired_hinv_jt_template(
+    def paired_hinv_jt_template(  # pragma: no cover - compiled by wp.kernel
         primary_Hinv: wp.array3d[float],
         primary_Linv: wp.array3d[float],
         primary_J: wp.array3d[float],
@@ -16652,7 +16652,7 @@ def _get_pgs_solve_paired_factor_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_paired_factor_template(
+    def pgs_solve_paired_factor_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
@@ -16730,7 +16730,7 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
     """
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
-    def trisolve_tiled_template(
+    def trisolve_tiled_template(  # pragma: no cover - compiled by wp.kernel
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
         tau_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
         group_to_art: wp.array[int],
@@ -16967,7 +16967,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
         iteration_offset: int,
     ): ...
 
-    def pgs_solve_tiled_template(
+    def pgs_solve_tiled_template(  # pragma: no cover - compiled by wp.kernel
         world_constraint_count: wp.array[int],
         world_diag: wp.array2d[float],
         world_C: wp.array3d[float],
@@ -17226,7 +17226,7 @@ def _get_pgs_solve_tiled_contact_kernel(max_constraints: int, device_arch: str) 
         world_row_mu: wp.array2d[float],
     ): ...
 
-    def pgs_solve_tiled_contact_template(
+    def pgs_solve_tiled_contact_template(  # pragma: no cover - compiled by wp.kernel
         world_constraint_count: wp.array[int],
         world_C: wp.array3d[float],
         world_rhs: wp.array2d[float],
@@ -17495,7 +17495,7 @@ def _get_pgs_solve_streaming_kernel(max_constraints: int, device_arch: str, pgs_
         world_row_mu: wp.array2d[float],
     ): ...
 
-    def pgs_solve_streaming_template(
+    def pgs_solve_streaming_template(  # pragma: no cover - compiled by wp.kernel
         world_constraint_count: wp.array[int],
         world_C: wp.array3d[float],
         world_rhs: wp.array2d[float],
@@ -17777,7 +17777,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         iteration_offset: int,
     ): ...
 
-    def pgs_solve_mf_template(
+    def pgs_solve_mf_template(  # pragma: no cover - compiled by wp.kernel
         mf_constraint_count: wp.array[int],
         mf_body_count: wp.array[int],
         mf_body_dof_start: wp.array2d[int],
@@ -17881,7 +17881,7 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
         mf_meta: wp.array2d[int],
     ): ...
 
-    def pack_mf_meta_template(
+    def pack_mf_meta_template(  # pragma: no cover - compiled by wp.kernel
         mf_constraint_count: wp.array[int],
         mf_dof_a: wp.array2d[int],
         mf_dof_b: wp.array2d[int],
@@ -18198,7 +18198,7 @@ def _get_color_propagation_prebuild_kernel(
         unit_sorted_contact: wp.array[int],
     ): ...
 
-    def color_propagation_prebuild_template(
+    def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         world_unit_cursor: wp.array[int],
         unit_contact: wp.array[int],
@@ -18301,7 +18301,7 @@ def _get_colored_friction_setup_kernel(propagation_max_constraints: int, n_color
         unit_friction_setup: wp.array[float],
     ): ...
 
-    def colored_friction_setup_template(
+    def colored_friction_setup_template(  # pragma: no cover - compiled by wp.kernel
         world_color_offsets: wp.array[int],
         propagation_constraint_count: wp.array[int],
         propagation_unit_meta: wp.array[int],
@@ -18408,7 +18408,7 @@ def _get_colored_payload_pack_kernel(propagation_max_constraints: int, n_color_e
         unit_payload: wp.array[float],
     ): ...
 
-    def colored_payload_pack_template(
+    def colored_payload_pack_template(  # pragma: no cover - compiled by wp.kernel
         world_color_offsets: wp.array[int],
         propagation_constraint_count: wp.array[int],
         propagation_unit_meta: wp.array[int],
@@ -19467,7 +19467,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         propagation_body_impulses: wp.array2d[float],
     ): ...
 
-    def pgs_solve_propagation_colored_warp_template(
+    def pgs_solve_propagation_colored_warp_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
@@ -19924,7 +19924,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
         propagation_body_impulses: wp.array2d[float],
     ): ...
 
-    def pgs_solve_propagation_colored_block_template(
+    def pgs_solve_propagation_colored_block_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
@@ -20210,7 +20210,7 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_body_impulses: wp.array2d[float],
     ): ...
 
-    def pgs_solve_propagation_template(
+    def pgs_solve_propagation_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
@@ -21237,7 +21237,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_propagation_full_iteration_template(
+    def pgs_solve_propagation_full_iteration_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
@@ -21737,7 +21737,7 @@ def _get_factor_propagation_tree_revolute_kernel(
         propagation_tree_D_inv: wp.array3d[float],
     ): ...
 
-    def factor_propagation_tree_revolute_template(
+    def factor_propagation_tree_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
@@ -22020,7 +22020,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
         propagation_body_response: wp.array3d[float],
     ): ...
 
-    def propagation_tree_body_response_revolute_template(
+    def propagation_tree_body_response_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
@@ -22367,7 +22367,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def propagate_tree_impulses_revolute_template(
+    def propagate_tree_impulses_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
@@ -22791,7 +22791,7 @@ def _get_propagation_tree_cached_response_kernel(
         propagation_cache_B: wp.array4d[float],
     ): ...
 
-    def propagation_tree_cached_response_template(
+    def propagation_tree_cached_response_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
@@ -22970,7 +22970,7 @@ def _get_propagation_cached_gemv_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def propagation_cached_gemv_template(
+    def propagation_cached_gemv_template(  # pragma: no cover - compiled by wp.kernel
         world_count: int,
         cache_world_flag: wp.array[int],
         propagation_body_count: wp.array[int],
@@ -23126,7 +23126,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
         propagation_body_qd: wp.array2d[float],
     ): ...
 
-    def refresh_propagation_tree_body_qd_warp_template(
+    def refresh_propagation_tree_body_qd_warp_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
         art_to_world: wp.array[int],
         dense_contact_world_flag: wp.array[int],
@@ -24263,7 +24263,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
     if sparse_size <= 0:
         raise ValueError("sparse response DOFs must be positive")
 
-    def mark_independent_sparse_contact_candidates_template(
+    def mark_independent_sparse_contact_candidates_template(  # pragma: no cover - compiled by wp.kernel
         contact_count: wp.array[int],
         total_num_workers: int,
         contact_world: wp.array[int],
@@ -24430,7 +24430,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
         serial_normals: wp.array2d[int],
     ): ...
 
-    def build_independent_sparse_contact_groups_template(
+    def build_independent_sparse_contact_groups_template(  # pragma: no cover - compiled by wp.kernel
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
         sparse_row_dof: wp.array3d[int],
@@ -24970,7 +24970,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_sparse_diagonal_template(
+    def pgs_solve_sparse_diagonal_template(  # pragma: no cover - compiled by wp.kernel
         world_constraint_count: wp.array[int],
         world_dof_indices: wp.array2d[int],
         rhs_bias: wp.array2d[float],
@@ -26868,7 +26868,7 @@ def _get_pgs_solve_mf_gs_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_mf_gs_template(
+    def pgs_solve_mf_gs_template(  # pragma: no cover - compiled by wp.kernel
         general_world_count: wp.array[int],
         general_worlds: wp.array[int],
         general_world_grid_stride: int,
