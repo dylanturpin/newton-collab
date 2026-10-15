@@ -111,6 +111,33 @@ def refresh_free_rigid_angular_friction(solver) -> None:
     )
 
 
+def free_rigid_reduction_material_key(solver):
+    """Return the body-pair reduction key provider for the solver's free-rigid angular coefficients, or ``None``.
+
+    The key is each shape's gated (torsional, rolling) coefficient [m], zero on bodies off the free-rigid route.
+    """
+    if solver._free_rigid_route_body is None or not solver.model.shape_count:
+        return None
+    if not np.any(solver._free_rigid_route_body.numpy()):
+        return None
+    shape_count = solver.model.shape_count
+    shape_body = solver.model.shape_body
+    torsional, rolling, route = (
+        solver._free_rigid_mu_torsional,
+        solver._free_rigid_mu_rolling,
+        solver._free_rigid_route_body,
+    )
+
+    def key():
+        # Captures device arrays only: a reference to the model or solver would keep them alive.
+        coefficients = np.stack((torsional.numpy()[:shape_count], rolling.numpy()[:shape_count]), axis=1)
+        body = shape_body.numpy()
+        coefficients[(body >= 0) & (route.numpy()[np.maximum(body, 0)] == 0)] = 0.0
+        return coefficients
+
+    return key
+
+
 def _condim_attribute(model):
     namespace = getattr(model, "feather_pgs", None)
     return getattr(namespace, "condim", None)
