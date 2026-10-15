@@ -5,7 +5,7 @@
 import numpy as np
 import warp as wp
 
-from ._tabletop_assets import COLORS, collision_bounds, import_object, load
+from ._tabletop_assets import COLORS, collision_bounds, import_object
 from ._tabletop_common import box, plan_ik, tf
 
 
@@ -33,7 +33,7 @@ def populate(b, info, ee, down, device):
     for j in range(96):
         name = "hex_bolt" if j % 8 < 6 else "hex_nut" if j % 8 == 6 else "washer"
         rotation = wp.quat_rpy(0.2 * (j % 3), 0.45, j * 0.71)
-        low, high = collision_bounds(name, 3.0, rotation)
+        low, high = collision_bounds(b, name, rotation)
         center = np.array((0.18 + ((j % 6) - 2.5) * 0.080, -0.20 + (((j // 6) % 8) - 3.5) * 0.080, 0.0))
         p = center - (low + high) / 2
         p[2] = 0.206 + (j // 48) * 0.080 - low[2]
@@ -42,17 +42,15 @@ def populate(b, info, ee, down, device):
             np.any(bounds[0] > other[1] + 0.002) or np.any(other[0] > bounds[1] + 0.002) for other in spawn_bounds
         )
         spawn_bounds.append(bounds)
-        mapping, _ = import_object(
+        [body] = import_object(
             b,
             name,
             tf(p, rotation),
-            scale=3.0,
             free_root=True,
-            variant=j % 3,
             finish_color=COLORS[int(np.random.default_rng(20261006 + j).integers(3))],
-        )
-        info["pile_bodies"].append(mapping[load(name)[0]["root"]])
-        local_low, local_high = collision_bounds(name, 3.0, wp.quat_identity())
+        ).values()
+        info["pile_bodies"].append(body)
+        local_low, local_high = collision_bounds(b, name, wp.quat_identity())
         info["pile_piece_centers"].append(((local_low + local_high) / 2).tolist())
     box(b, (0.18, -0.22, 0.100), (0.27, 0.42, 0.100), (0.29, 0.34, 0.38), label="hardware_work_deck")
     b.shape_material_mu[-1] = 0.20

@@ -102,7 +102,7 @@ def building(b, center):
     return structure, half_sizes, upper_floors, furniture
 
 
-def populate(b, info, ee, down, device, variant):
+def populate(b, info, ee, down, device):
 
     base = np.array([0.18, 0.25, 0])
     for body, label in enumerate(b.body_label):
@@ -164,34 +164,28 @@ def populate(b, info, ee, down, device, variant):
     info["dense_waypoints"] = True
     info["integral_drive_count"] = 6
     joint_start = b.joint_count
-    mapping, _ = import_object(
-        b,
-        "crane",
-        tf(base),
-        scale=2,
-        moving={"crane.slew", "boom.lift", "hook.swing"},
-        variant=variant,
-        register_articulations=False,
-    )
+    # The imported crane joints stay unarticulated; one articulation below also
+    # spans the handle, chain and ball.
+    mapping = import_object(b, "crane", tf(base))
     for j in range(joint_start, b.joint_count):
         vi = b.joint_qd_start[j]
-        if b.joint_label[j] == "crane/boom.lift.q":
+        if b.joint_label[j] == "/crane/joints/boom_lift_q":
             b.joint_limit_upper[vi] = 0
             b.joint_damping[vi] = 0.05
-        elif b.joint_label[j] == "crane/crane.slew.q":
+        elif b.joint_label[j] == "/crane/joints/crane_slew_q":
             # A dry slew brake resists back-driving but yields to the gripper.
             b.joint_friction[vi] = 3.0
             b.joint_damping[vi] = 0.006
-        elif b.joint_label[j] == "crane/hook.swing.q":
+        elif b.joint_label[j] == "/crane/joints/hook_swing_q":
             b.joint_damping[vi] = 0.006
     handle = b.add_link(xform=tf(base), label="crane_grasp_handle")
-    b.add_joint_fixed(mapping["crane.slew"], handle, label="crane_handle_mount")
+    b.add_joint_fixed(mapping["crane_slew"], handle, label="crane_handle_mount")
     box(b, (0.07, 0, 0.12), (0.07, 0.015, 0.015), (0.96, 0.61, 0.065), handle, "handle_support")
     box(b, (0.14, 0, 0.21), (0.015, 0.018, 0.09), (0.96, 0.61, 0.065), handle, "grasp_handle")
     hook_local = np.array([0, -0.338, 0.416])
     top = base + hook_local
     count, link_length, radius = 5, 0.025, 0.049
-    previous, anchor = mapping["hook.swing"], hook_local
+    previous, anchor = mapping["hook_swing"], hook_local
     chain, anchors = [], []
     steel = b.default_shape_cfg.copy()
     steel.density, steel.mu, steel.gap = 7800, 0.3, 0.0002
@@ -255,9 +249,9 @@ def populate(b, info, ee, down, device, variant):
         crane_fingers=[
             i for i, label in enumerate(b.body_label) if label.endswith(("/fr3_leftfinger", "/fr3_rightfinger"))
         ],
-        crane_slew=mapping["crane.slew"],
-        crane_boom=mapping["boom.lift"],
-        crane_hook=mapping["hook.swing"],
+        crane_slew=mapping["crane_slew"],
+        crane_boom=mapping["boom_lift"],
+        crane_hook=mapping["hook_swing"],
         demolition_windup_time=4.0,
         crane_release_time=5.85,
         crane_retreat_time=7.1,

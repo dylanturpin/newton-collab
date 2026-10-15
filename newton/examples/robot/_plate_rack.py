@@ -7,7 +7,7 @@ import math
 import numpy as np
 import warp as wp
 
-from ._tabletop_assets import COLORS, import_object, load
+from ._tabletop_assets import COLORS, import_object
 from ._tabletop_common import plan_ik, tf
 
 
@@ -15,10 +15,10 @@ def populate(b, info, ee, fingers, device, variant):
 
     plate_rotation = wp.quat_rpy(math.pi / 2, 0.0, math.pi / 2)
     rack_origin = np.array([0.19, 0.27, 0.0])
-    fit = load("plate_rack")[0]["features"]["dish_fit"]
-    pitch = fit["slot_pitch_m"]
+    # Rack slot pitch [m] and the seated plate's thickness center along the rack axis [m].
+    pitch = 0.032
     slots = 4
-    thickness_center = np.mean(np.asarray(fit["rotated_bounds"]), axis=0)[0]
+    thickness_center = 0.012
     roots = [rack_origin + np.array([(i - (slots - 1) / 2) * pitch - thickness_center, 0, 0.106]) for i in range(slots)]
     source = np.array([0.12, -0.31, 0.118])
     # A narrow staging cradle leaves the upper rim accessible to both jaws.
@@ -71,15 +71,15 @@ def populate(b, info, ee, fingers, device, variant):
     import_object(b, "plate_rack", tf(rack_origin))
     resting = []
     for i in (0, 1):
-        mapping, _ = import_object(
-            b, "rack_plate", tf(roots[i], plate_rotation), free_root=True, variant=i, finish_color=COLORS[i]
-        )
-        resting.append(mapping[load("rack_plate")[0]["root"]])
-    mapping, _ = import_object(
-        b, "rack_plate", tf(source, plate_rotation), free_root=True, variant=2, finish_color=COLORS[2]
-    )
+        [plate] = import_object(
+            b, "rack_plate", tf(roots[i], plate_rotation), free_root=True, finish_color=COLORS[i]
+        ).values()
+        resting.append(plate)
+    [plate] = import_object(
+        b, "rack_plate", tf(source, plate_rotation), free_root=True, finish_color=COLORS[2]
+    ).values()
     info.update(
-        tracked_body=mapping[load("rack_plate")[0]["root"]],
+        tracked_body=plate,
         arm_dofs=len(info["waypoints"][0][1]),
         dense_waypoints=True,
         plate_rack=True,

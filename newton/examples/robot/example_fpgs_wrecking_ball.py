@@ -26,7 +26,7 @@ class Example(TabletopDemo):
         return parser
 
     def populate(self, builder, info, ee, down, fingers):
-        _wrecking_crane.populate(builder, info, ee, down, wp.get_device(), 0)
+        _wrecking_crane.populate(builder, info, ee, down, wp.get_device())
 
     def reset(self):
         super().reset()
