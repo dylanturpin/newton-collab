@@ -7154,6 +7154,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 (total_rows * PROPAGATION_UNIT_FRICTION_SETUP,), dtype=wp.float32, device=device
             )
             self._color_unit_meta_stale = True
+            self._color_fold_rhs = None
             # Rows with prescribed sides removed and their constant velocity term folded into the right-hand side.
             self._color_body_a = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
             self._color_body_b = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
@@ -8918,23 +8919,26 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         body_a, body_b = self._propagation_body_a, self._propagation_body_b
         if self._has_prescribed_bodies:
             # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
-            wp.launch(
-                fold_prescribed_propagation_sides,
-                dim=(self._world_count, self._propagation_max_constraints),
-                inputs=[
-                    self._propagation_constraint_count,
-                    body_a,
-                    body_b,
-                    self._propagation_J_a,
-                    self._propagation_J_b,
-                    self._body_prescribed,
-                    self._propagation_body_qd,
-                    rhs,
-                    self._propagation_max_constraints,
-                ],
-                outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
-                device=device,
-            )
+            # A pass's right-hand side and the prescribed velocities are fixed within a step: fold once per pass.
+            if self._color_fold_rhs is not rhs:
+                self._color_fold_rhs = rhs
+                wp.launch(
+                    fold_prescribed_propagation_sides,
+                    dim=(self._world_count, self._propagation_max_constraints),
+                    inputs=[
+                        self._propagation_constraint_count,
+                        body_a,
+                        body_b,
+                        self._propagation_J_a,
+                        self._propagation_J_b,
+                        self._body_prescribed,
+                        self._propagation_body_qd,
+                        rhs,
+                        self._propagation_max_constraints,
+                    ],
+                    outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
+                    device=device,
+                )
             body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
         if self._pgs_solve_propagation_colored_warp_kernel is not None:
             # The unit records depend only on this step's colored row layout, so they are
@@ -12885,6 +12889,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 )
                 # This step's colored rows are rebuilt below; the unit records follow them.
                 self._color_unit_meta_stale = True
+                self._color_fold_rhs = None
                 wp.launch_tiled(
                     self._color_propagation_prebuild_kernel,
                     dim=[self._world_count],

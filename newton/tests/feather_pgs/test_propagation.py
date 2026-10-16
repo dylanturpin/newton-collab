@@ -2188,6 +2188,11 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
         model.rigid_contact_max = 8192
         tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
         tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
+        for velocity_iterations in (0, 2):
+            with self.subTest(velocity_iterations=velocity_iterations):
+                self._check_kinematic_hub(model, tray, tray_dof, velocity_iterations)
+
+    def _check_kinematic_hub(self, model, tray, tray_dof, velocity_iterations):
         results = {}
         for response in ("propagation_colored", "immediate"):
             solver = SolverFeatherPGS(
@@ -2195,6 +2200,7 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 solve_mode="matrix_free",
                 articulated_contact_response=response,
                 deterministic=True,
+                velocity_iterations=velocity_iterations,
                 iterations=16,
                 free_body_constraint_max=8192,
                 articulation_constraint_max=64,
@@ -2239,7 +2245,8 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
         colored_vx = float(np.mean(body_qd[bottom, 0]))
         immediate_vx = float(np.mean(results["immediate"][2][bottom, 0]))
         self.assertGreater(colored_vx, 0.05)
-        self.assertLess(abs(colored_vx - immediate_vx), 0.05)
+        # Measured gate, not a derived bound.
+        self.assertLess(abs(colored_vx - immediate_vx), 0.01)
 
 
 @wp.kernel
