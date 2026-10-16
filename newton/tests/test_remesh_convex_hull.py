@@ -165,14 +165,15 @@ class TestRemeshConvexHullFull3D(unittest.TestCase):
             rotation, _ = np.linalg.qr(thin_rng.normal(size=(3, 3)))
             pts = (pts @ rotation).astype(np.float32)
             clouds += [(pts, {}), (pts, {"eps": 1e-12})]
+        hulls = []
+
+        class RecordingHull(ConvexHull):
+            def __init__(self, points, *args, **kw):
+                super().__init__(points, *args, **kw)
+                hulls.append((np.asarray(points), self))
+
         for pts, kwargs in clouds:
-            hulls = []
-
-            class RecordingHull(ConvexHull):
-                def __init__(self, points, *args, **kw):
-                    super().__init__(points, *args, **kw)
-                    hulls.append((np.asarray(points), self))
-
+            hulls.clear()
             with patch("scipy.spatial.ConvexHull", RecordingHull):
                 verts, faces = remesh_convex_hull(pts, **kwargs)
             points, hull = hulls[-1]
