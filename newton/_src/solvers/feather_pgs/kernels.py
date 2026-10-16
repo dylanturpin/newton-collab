@@ -10202,6 +10202,7 @@ def flush_propagation_free_body_qd_to_vout(
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     dynamics_art_active: wp.array[int],
+    skip_inactive: int,
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
@@ -10216,9 +10217,12 @@ def flush_propagation_free_body_qd_to_vout(
     art = body_to_articulation[body]
     if art < 0:
         return
-    # A skipped sleeping body has no rows, so its round trip through the propagation velocity is a no-op.
-    if is_free_rigid[art] == 0 or dynamics_art_active[art] == 0:
+    if is_free_rigid[art] == 0:
         return
+    # A skipped sleeping body has no rows, so its round trip through the propagation velocity is a no-op.
+    if skip_inactive != 0:
+        if dynamics_art_active[art] == 0:
+            return
 
     dof_start = articulation_root_dof_start[art]
     for r in range(6):
@@ -10234,6 +10238,7 @@ def refresh_propagation_free_body_qd_from_vout(
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     dynamics_art_active: wp.array[int],
+    skip_inactive: int,
     v_out: wp.array[float],
     # out
     propagation_body_qd: wp.array2d[float],
@@ -10247,8 +10252,11 @@ def refresh_propagation_free_body_qd_from_vout(
     art = body_to_articulation[body]
     if art < 0:
         return
-    if is_free_rigid[art] == 0 or dynamics_art_active[art] == 0:
+    if is_free_rigid[art] == 0:
         return
+    if skip_inactive != 0:
+        if dynamics_art_active[art] == 0:
+            return
 
     dof_start = articulation_root_dof_start[art]
     for r in range(6):

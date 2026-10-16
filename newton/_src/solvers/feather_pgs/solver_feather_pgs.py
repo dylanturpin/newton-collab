@@ -8519,6 +8519,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._is_free_rigid,
                 self._articulation_root_dof_start,
                 self._dynamics_art_active,
+                self._skip_sleeping_dynamics(),
                 self._v_out,
             ],
             outputs=[self._propagation_body_qd],
@@ -9198,6 +9199,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
 
+    def _skip_sleeping_dynamics(self) -> int:
+        return int(self._sleeping is not None and self._sleeping.skip_constraints)
+
     def _flush_propagation_free_body_response(self) -> None:
         if (
             not self._propagation_contacts_enabled()
@@ -9214,6 +9218,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._is_free_rigid,
                 self._articulation_root_dof_start,
                 self._dynamics_art_active,
+                self._skip_sleeping_dynamics(),
             ],
             outputs=[
                 self._propagation_body_qd,
