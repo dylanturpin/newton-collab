@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gc
 import unittest
 
 import numpy as np
@@ -75,6 +76,48 @@ def test_capacity_failure_is_observable(test, device, solve_mode="matrix_free"):
     solver.check_constraint_capacity()
 
 
+def test_status_snapshot_reports_status_at_snapshot(test, device):
+    """Report the status as copied by snapshot_constraint_status, unchanged by later steps and resets."""
+    model = _box_on_ground(device)
+    solver = SolverFeatherPGS(model, free_body_constraint_max=1, warn_constraint_overflow=False)
+    with test.assertRaisesRegex(RuntimeError, "snapshot_constraint_status"):
+        solver.check_constraint_capacity(snapshot=True)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    solver.snapshot_constraint_status()
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+    solver.check_constraint_capacity(snapshot=True)
+    solver.snapshot_constraint_status()
+    solver.reset(state_out)
+    solver.check_constraint_capacity()
+    with test.assertRaisesRegex(RuntimeError, "capacity"):
+        solver.check_constraint_capacity(snapshot=True)
+    solver.snapshot_constraint_status()
+    solver.check_constraint_capacity(snapshot=True)
+    solver._disabled_tree_joint.fill_(True)
+    solver.snapshot_constraint_status()
+    with test.assertRaisesRegex(RuntimeError, "articulation tree joint"):
+        solver.check_constraint_capacity(snapshot=True)
+
+
+def test_released_snapshot_solver_keeps_another_capture_valid(test, device):
+    """Release a solver that took and read a snapshot while another graph is being captured."""
+    model = _box_on_ground(device)
+    solver = SolverFeatherPGS(model, free_body_constraint_max=1, warn_constraint_overflow=False)
+    solver.snapshot_constraint_status()
+    solver.check_constraint_capacity(snapshot=True)
+    counter = wp.zeros(1, dtype=int, device=device)
+    with wp.ScopedCapture(device) as capture:
+        counter.fill_(1)
+        del solver
+        gc.collect()
+        counter.fill_(2)
+    wp.capture_launch(capture.graph)
+    test.assertEqual(int(counter.numpy()[0]), 2)
+
+
 class TestFeatherPGSCapacityStatusUpstream(unittest.TestCase):
     pass
 
@@ -87,6 +130,18 @@ add_function_test(
     "test_capacity_failure_is_observable",
     test_capacity_failure_is_observable,
     devices=devices,
+)
+add_function_test(
+    TestFeatherPGSCapacityStatusUpstream,
+    "test_released_snapshot_solver_keeps_another_capture_valid",
+    test_released_snapshot_solver_keeps_another_capture_valid,
+    devices=devices,
+)
+add_function_test(
+    TestFeatherPGSCapacityStatusUpstream,
+    "test_status_snapshot_reports_status_at_snapshot",
+    test_status_snapshot_reports_status_at_snapshot,
+    devices=get_test_devices(),
 )
 
 

@@ -1515,6 +1515,27 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
         self.assertFalse(np.array_equal(output.joint_q.numpy(), state.joint_q.numpy()))
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+    def test_cuda_status_snapshot_reports_a_replay_error(self):
+        """Report a replay's torsion error from a snapshot taken after it, and not from an earlier one."""
+        _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, iterations=16)
+        output = model.state()
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.step(state, output, model.control(), contacts, 0.0025)
+        wp.capture_launch(capture.graph)
+        solver.snapshot_constraint_status()
+        solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
+        wp.capture_launch(capture.graph)
+        solver.check_constraint_capacity(snapshot=True)
+        solver.snapshot_constraint_status()
+        with self.assertRaisesRegex(RuntimeError, "load ring"):
+            solver.check_constraint_capacity(snapshot=True)
+        np.testing.assert_array_equal(output.joint_q.numpy(), state.joint_q.numpy())
+        solver.reset(state)
+        wp.capture_launch(capture.graph)
+        solver.snapshot_constraint_status()
+        solver.check_constraint_capacity(snapshot=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_full_solver_graph(self):
         """Match captured and eager solves through the default-off public device API."""
 
