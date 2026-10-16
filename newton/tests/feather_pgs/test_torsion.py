@@ -2662,6 +2662,9 @@ class TestPropagationTorsion(unittest.TestCase):
                 fixture(0.01, step=False, **options)
 
 
+# A saturated group's residual budget r (mu N - sliding) cancels in float32; the colored kernel matches its
+# own float32 bound, which a float64 reconstruction can undercut by about 1e-7 of r mu N.
+_GROUP_SLACK = 1.0e-6
 _COLORED_TORSION = {
     "articulated_contact_response": "propagation_colored",
     "contact_torsion_device": True,
@@ -2716,7 +2719,7 @@ class TestColoredPropagationTorsion(unittest.TestCase):
                         **options,
                     )
                     self.assertTrue(any(sweep["offset"] < sweep["friction_start"] for sweep in sweeps))
-                    saturated, sliding_saturated = _assert_torsion_budgets(self, sweeps)
+                    saturated, sliding_saturated = _assert_torsion_budgets(self, sweeps, group_slack=_GROUP_SLACK)
                     if case == "center":
                         self.assertTrue(saturated, "No torsion row reached its residual budget")
                     else:
@@ -2860,7 +2863,7 @@ class TestColoredPropagationTorsion(unittest.TestCase):
                 # The tail sweeps its units in slot order, which places the host's rows after its members'.
                 self.assertEqual(int(slots[host]), max(int(slots[c]) for c in tail))
                 np.testing.assert_allclose(output.body_qd.numpy(), uncapped["body_qd"], rtol=0.0, atol=1.0e-5)
-                _assert_torsion_budgets(self, sweeps)
+                _assert_torsion_budgets(self, sweeps, group_slack=_GROUP_SLACK)
 
     def test_dropped_members_leave_the_highest_kept_host(self):
         """Host a group whose members overflowed the row cap after its last kept member, budgeting kept members only."""
@@ -3173,9 +3176,12 @@ def _record_propagation_sweeps(radius, on_solver=None, response=None, **options)
     return sweeps
 
 
-def _assert_torsion_budgets(test, sweeps):
+def _assert_torsion_budgets(test, sweeps, group_slack=0.0):
     """Check every torsion impulse against its group's residual budget; return whether a torsion row and a
-    group's sliding pairs reached their bounds."""
+    group's sliding pairs reached their bounds.
+
+    ``group_slack`` adds that fraction of ``r mu N`` to each bound, for float32 cancellation in a saturated group.
+    """
     saturated = sliding_saturated = False
     for sweep in sweeps:
         impulses = sweep["after"]
@@ -3189,7 +3195,10 @@ def _assert_torsion_budgets(test, sweeps):
                 test.assertEqual(torsion, 0.0, f"row {spin} moved before friction start")
                 continue
             test.assertLessEqual(sliding, budget * (1.0 + 1.0e-6) + 1.0e-12, f"group {spin} slides past its load")
-            test.assertLessEqual(torsion, bound * (1.0 + 1.0e-6) + 1.0e-12, f"row {spin} exceeds its residual budget")
+            slack = group_slack * float(sweep["radius"][spin]) * budget
+            test.assertLessEqual(
+                torsion, bound * (1.0 + 1.0e-6) + 1.0e-12 + slack, f"row {spin} exceeds its residual budget"
+            )
             saturated |= torsion > 0.99 * bound > 0.0
             sliding_saturated |= sliding > 0.99 * budget > 0.0
     return saturated, sliding_saturated
