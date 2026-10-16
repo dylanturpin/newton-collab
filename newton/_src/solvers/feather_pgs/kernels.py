@@ -9431,6 +9431,36 @@ def build_propagation_body_map_partitioned(
 
 
 @wp.kernel
+def rank_propagation_body_map(
+    propagation_body_count: wp.array[int],
+    propagation_cache_body_count: wp.array[int],
+    max_propagation_bodies: int,
+    claimed_body_list: wp.array2d[int],
+    # outputs
+    propagation_body_list: wp.array2d[int],
+    propagation_body_local_slot: wp.array[int],
+):
+    """Order each world's claimed bodies by body index, separately within the cache-eligible prefix and the rest."""
+    world, i = wp.tid()
+    n = wp.min(propagation_body_count[world], max_propagation_bodies)
+    if i >= n:
+        return
+    split = wp.min(propagation_cache_body_count[world], n)
+    lo = int(0)
+    hi = split
+    if i >= split:
+        lo = split
+        hi = n
+    body = claimed_body_list[world, i]
+    rank = lo
+    for j in range(lo, hi):
+        if claimed_body_list[world, j] < body:
+            rank += 1
+    propagation_body_list[world, rank] = body
+    propagation_body_local_slot[body] = rank
+
+
+@wp.kernel
 def compute_propagation_cache_world_flag(
     propagation_cache_body_count: wp.array[int],
     cache_max_bodies: int,
