@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
+import sys
+import tempfile
+import types
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -30,7 +34,7 @@ from newton.tests.feather_pgs._fixtures import (
     _contact_rows,
     set_torsion_radius,
 )
-from newton.tests.unittest_utils import StdOutCapture
+from newton.tests.unittest_utils import LIBC
 
 DT = 1.0 / 240.0
 
@@ -2090,10 +2094,7 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
     def test_overflow_with_limit_rows_is_bitwise_repeatable(self):
         """Repeat bitwise while dense joint-limit, velocity-limit and propagation rows overflow their capacity."""
         model = _build_arm_heap_model("cuda:0", tight_limits=True)
-        wp.synchronize()
-        capture = StdOutCapture()
-        capture.begin()
-        try:
+        with _capture_device_stdout() as printed:
             stepper = self._assert_bitwise(
                 model,
                 enable_joint_velocity_limits=True,
@@ -2101,14 +2102,9 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 free_body_constraint_max=160,
                 articulation_constraint_max=24,
             )
-        finally:
-            try:
-                wp.synchronize()
-            finally:
-                printed = capture.end()
         # Each of the two rollouts warns once per overflowing row family.
-        self.assertEqual(printed.count("dense constraint-row overflow"), 2, printed)
-        self.assertEqual(printed.count("propagation constraint-row overflow"), 2, printed)
+        self.assertEqual(printed.text.count("dense constraint-row overflow"), 2, printed.text)
+        self.assertEqual(printed.text.count("propagation constraint-row overflow"), 2, printed.text)
         marks = stepper.solver.constraint_row_watermarks()
         self.assertGreater(marks["propagation_overflow_world_steps"], 0, "scene must overflow its propagation rows")
 
@@ -3420,6 +3416,32 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                 np.testing.assert_allclose(
                     getattr(state, name).numpy(), getattr(reference, name).numpy(), rtol=3e-6, atol=3e-6, err_msg=name
                 )
+
+
+@contextlib.contextmanager
+def _capture_device_stdout():
+    """Capture what reaches file descriptor 1, where device printf writes, also inside an enclosing capture."""
+    wp.synchronize()
+    sys.stdout.flush()
+    if LIBC is not None:
+        LIBC.fflush(None)
+    captured = types.SimpleNamespace(text="")
+    saved_fd = os.dup(1)
+    with tempfile.TemporaryFile() as sink:
+        os.dup2(sink.fileno(), 1)
+        try:
+            yield captured
+        finally:
+            try:
+                wp.synchronize()
+                sys.stdout.flush()
+                if LIBC is not None:
+                    LIBC.fflush(None)
+            finally:
+                os.dup2(saved_fd, 1)
+                os.close(saved_fd)
+            sink.seek(0)
+            captured.text = sink.read().decode("utf-8", errors="replace")
 
 
 if __name__ == "__main__":
