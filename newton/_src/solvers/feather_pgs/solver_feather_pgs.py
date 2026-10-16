@@ -3496,15 +3496,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Tree joints disabled after construction, which the solver does not simulate.
         self._disabled_tree_joint = wp.zeros(self._world_count, dtype=wp.bool, device=model.device)
         self._tree_joint_world = self._build_tree_joint_world(model)
-        # Pinned host copies of the reported status, written by snapshot_constraint_status().
-        pinned = model.device.is_cuda
+        # Device copies of the reported status taken by snapshot_constraint_status(), and their host copies.
+        # The host copies are pageable: freeing pinned memory during another stream's capture invalidates it.
         self._status_snapshot = {
-            "disabled_tree_joint": wp.zeros(self._world_count, dtype=wp.bool, device="cpu", pinned=pinned),
-            "constraint_overflow": wp.zeros(self._world_count, dtype=wp.bool, device="cpu", pinned=pinned),
-            "torsion": wp.zeros(1, dtype=int, device="cpu", pinned=pinned),
+            "disabled_tree_joint": wp.zeros(self._world_count, dtype=wp.bool, device=model.device),
+            "constraint_overflow": wp.zeros(self._world_count, dtype=wp.bool, device=model.device),
+            "torsion": wp.zeros(1, dtype=int, device=model.device),
         }
+        self._status_snapshot_host = (
+            {name: wp.zeros_like(array, device="cpu") for name, array in self._status_snapshot.items()}
+            if model.device.is_cuda
+            else self._status_snapshot
+        )
         self._status_snapshot_taken = False
         self._status_snapshot_event = None
+        self._status_readback_stream = None
         self._joint_friction_invalid = wp.zeros(self._world_count, dtype=wp.bool, device=model.device)
         self._row_dropped_all = wp.zeros((3, max(self._world_count, 1)), dtype=wp.int32, device=model.device)
         self._row_dropped_dense = self._row_dropped_all[0]
@@ -10563,7 +10569,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
 
     def snapshot_constraint_status(self) -> None:
-        """Start a non-blocking copy of the status that :meth:`check_constraint_capacity` reports.
+        """Copy the status that :meth:`check_constraint_capacity` reports on the device, without waiting.
 
         Call outside capture after the steps to observe; ``check_constraint_capacity(snapshot=True)`` then
         raises from this copy, waiting only for the work enqueued before this call.
@@ -10608,9 +10614,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if snapshot:
             if not self._status_snapshot_taken:
                 raise RuntimeError("check_constraint_capacity(snapshot=True) needs snapshot_constraint_status() first")
+            arrays = self._status_snapshot_host
             if self._status_snapshot_event is not None:
-                wp.synchronize_event(self._status_snapshot_event)
-            arrays = self._status_snapshot
+                # A side stream orders the readback after the snapshot only, not after later steps.
+                if self._status_readback_stream is None:
+                    self._status_readback_stream = wp.Stream(self.model.device)
+                stream = self._status_readback_stream
+                stream.wait_event(self._status_snapshot_event)
+                for name, array in self._status_snapshot.items():
+                    wp.copy(arrays[name], array, stream=stream)
         else:
             arrays = {"disabled_tree_joint": self._disabled_tree_joint, "constraint_overflow": self.constraint_overflow}
         if self._device_torsion is not None:
