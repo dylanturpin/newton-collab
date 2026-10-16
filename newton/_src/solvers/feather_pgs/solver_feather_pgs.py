@@ -228,6 +228,7 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    rank_propagation_body_map,
     record_warmstart_dt,
     refine_same_articulation_propagation_rows,
     refresh_masked_body_inertia,
@@ -6947,6 +6948,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._propagation_tree_body_delta = None
             self._propagation_body_count = None
             self._propagation_body_list = None
+            self._propagation_body_claim_list = None
             self._propagation_cache_body_count = None
             self._max_propagation_bodies = 0
             self._propagation_cache_max_bodies = 0
@@ -6983,6 +6985,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._propagation_body_list = wp.full(
             (worlds, self._max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        # Bodies in atomic claim order, ranked into propagation_body_list on the cached-response path.
+        self._propagation_body_claim_list = wp.full(
+            (worlds, self._max_propagation_bodies), -1, dtype=wp.int32, device=device
         )
         # Length of the cache-eligible slot prefix of propagation_body_list
         # (== propagation_body_count after pass 1 of the partitioned build);
@@ -12993,7 +12999,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                                 self._propagation_body_seen,
                             ],
                             outputs=[
-                                self._propagation_body_list,
+                                self._propagation_body_claim_list,
                                 self._propagation_body_count,
                                 self._propagation_body_local_slot,
                             ],
@@ -13004,6 +13010,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             # prefix length; pass 2 keeps counting on the same
                             # array toward the total.
                             wp.copy(self._propagation_cache_body_count, self._propagation_body_count)
+                    # The cached GEMV sums over slots in order, so slots must not follow the atomic claim order.
+                    wp.launch(
+                        rank_propagation_body_map,
+                        dim=(self._world_count, self._max_propagation_bodies),
+                        inputs=[
+                            self._propagation_body_count,
+                            self._propagation_cache_body_count,
+                            self._max_propagation_bodies,
+                            self._propagation_body_claim_list,
+                        ],
+                        outputs=[self._propagation_body_list, self._propagation_body_local_slot],
+                        device=model.device,
+                    )
                 elif (
                     self._propagation_tree_requires_body_map
                     or self._propagation_full_fused_iterations
