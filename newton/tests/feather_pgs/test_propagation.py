@@ -666,15 +666,19 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
             np.testing.assert_array_equal(qd[:, world * dofs : (world + 1) * dofs], qd[:, :dofs])
 
     def test_colored_is_bitwise_repeatable(self):
+        """Repeat colored steps bitwise across runs and identical worlds."""
         self._assert_repeatable("propagation_colored", mu=0.7)
 
     def test_colored_frictionless_is_bitwise_repeatable(self):
+        """Repeat frictionless colored steps bitwise across runs and identical worlds."""
         self._assert_repeatable("propagation_colored", mu=0.0)
 
     def test_plain_frictionless_is_bitwise_repeatable(self):
+        """Repeat frictionless plain propagation steps bitwise across runs and identical worlds."""
         self._assert_repeatable("propagation", mu=0.0)
 
     def test_body_list_is_sorted_within_partitions(self):
+        """Sort each partition of the body list by body index and keep the slot map its inverse."""
         model = _build_clutter_model("cuda:0", n_boxes=2)
         for response in ("propagation", "propagation_colored"):
             _, solver, _ = _cached_rollout(model, response, 20, cache_max_bodies=4)
@@ -749,11 +753,15 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
         _, solver, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
         active = int(solver._propagation_cache_body_count.numpy().min())
         self.assertGreaterEqual(active, 2)
-        for cap, flag in ((active, 1), (active - 1, 0)):
+        for cap in (active, active - 1):
             stats, _, test = _run_lockstep(self, model, "propagation_colored", 30, cache_max_bodies=cap)
             flags = test._propagation_cache_world_flag.numpy()
             counts = test._propagation_cache_body_count.numpy()
-            self.assertTrue(np.all(flags[counts == active] == flag), f"cap {cap}: flags {flags} counts {counts}")
+            np.testing.assert_array_equal(flags, (counts <= cap).astype(flags.dtype), err_msg=f"cap {cap}")
+            if cap == active:
+                self.assertTrue(np.any(counts == cap), f"no world exactly at cap {cap}: counts {counts}")
+            else:
+                self.assertTrue(np.any(counts > cap), f"no world over cap {cap}: counts {counts}")
             for key, diff in stats.max_diffs.items():
                 self.assertLessEqual(diff, TestPropagationCachedResponse.TOL, f"cap {cap} {key}: {diff:.3e}")
             first, _, _ = _cached_rollout(model, "propagation_colored", 30, cache_max_bodies=cap)
