@@ -2249,8 +2249,8 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
         colored_vx = float(np.mean(body_qd[bottom, 0]))
         immediate_vx = float(np.mean(immediate_qd[bottom, 0]))
         self.assertGreater(colored_vx, 0.05)
-        # Measured gate, not a derived bound.
-        self.assertLess(abs(colored_vx - immediate_vx), 0.01)
+        # Measured gate with margin across GPU architectures, not a derived bound.
+        self.assertLess(abs(colored_vx - immediate_vx), 0.03)
 
 
 @wp.kernel
