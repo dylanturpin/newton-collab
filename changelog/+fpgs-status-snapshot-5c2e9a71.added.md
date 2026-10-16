@@ -1,0 +1,1 @@
+Add `SolverFeatherPGS.snapshot_constraint_status()` and `check_constraint_capacity(snapshot=True)` to report the capacity, disabled-tree-joint and contact torsion status from a non-blocking pinned-memory copy instead of a synchronous read after every step.
