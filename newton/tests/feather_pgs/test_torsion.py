@@ -680,10 +680,29 @@ class TestContactTorsionRegressions(unittest.TestCase):
 
     def test_hydro_contact_input_is_rejected(self):
         """Reject actual positive hydro contact stiffness, not a synthetic solver flag."""
-        _, solver, model, initial, contacts = fixture(0.01, center_only=True)
-        contacts.rigid_contact_stiffness = wp.ones(contacts.rigid_contact_max, device=model.device)
-        with self.assertRaisesRegex(ValueError, "hydroelastic"):
-            solver.step(initial, model.state(), model.control(), contacts, 0.0025)
+        for device_preparation, stepped in ((False, True), (False, False), (True, False)):
+            _, solver, model, initial, contacts = fixture(
+                0.01, center_only=True, contact_torsion_device=device_preparation, step=stepped
+            )
+            contacts.rigid_contact_stiffness = wp.ones(contacts.rigid_contact_max, device=model.device)
+            with (
+                self.subTest(device_preparation=device_preparation, stepped=stepped),
+                self.assertRaisesRegex(ValueError, "hydroelastic"),
+            ):
+                solver.step(initial, model.state(), model.control(), contacts, 0.0025)
+
+    def test_contact_input_overflow_is_rejected(self):
+        """Reject a contact count beyond the buffer instead of grouping a truncated input."""
+        for device_preparation in (False, True):
+            _, solver, model, initial, contacts = fixture(
+                0.01, center_only=True, contact_torsion_device=device_preparation, step=False
+            )
+            contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
+            with (
+                self.subTest(device_preparation=device_preparation),
+                self.assertRaisesRegex(RuntimeError, "Contact input overflow"),
+            ):
+                solver.step(initial, model.state(), model.control(), contacts, 0.0025)
 
 
 _VELOCITY_LIMIT = 0.1

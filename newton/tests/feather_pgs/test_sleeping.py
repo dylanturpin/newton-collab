@@ -85,6 +85,12 @@ class TestSleeping(unittest.TestCase):
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, enable_sleeping=True, friction_anchor_beta=0, **kwargs)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        empty = builder.finalize(device=model.device)
+        newton.solvers.SolverFeatherPGS(empty, friction_anchor_beta=0)
+        with self.assertRaisesRegex(ValueError, "at least one articulation"):
+            newton.solvers.SolverFeatherPGS(empty, enable_sleeping=True, friction_anchor_beta=0)
 
     def test_default_and_explicit_disabled_match(self):
         """Preserve the existing trajectory with sleeping explicitly disabled."""

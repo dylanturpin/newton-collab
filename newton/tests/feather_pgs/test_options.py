@@ -390,6 +390,41 @@ class TestFeatherPGSPrivateApiUpstream(unittest.TestCase):
         )
         cls.solver_methods = {node.name: node for node in cls.solver_class.body if isinstance(node, ast.FunctionDef)}
 
+    def test_step_option_assignment_validates_like_the_constructor(self):
+        """Reject invalid step-option assignments, keep the previous value, and normalize valid ones."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+        builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, solve_mode="split", friction_anchor_beta=0.0)
+        invalid = {
+            "velocity_drive_mode": "frozen",
+            "contact_warmstart_decay": -1.0,
+            "restitution_velocity_threshold": float("nan"),
+            "contact_speculative_scale": float("inf"),
+            "contact_gap_gate": -0.01,
+            "baumgarte": "stiff",
+            "relaxation": None,
+        }
+        for name, value in invalid.items():
+            with self.subTest(option=name, value=value):
+                before = getattr(solver, name)
+                with self.assertRaises((ValueError, TypeError)):
+                    setattr(solver, name, value)
+                self.assertEqual(getattr(solver, name), before)
+        solver.velocity_drive_mode = "active"
+        solver.contact_gap_gate = None
+        solver.contact_gap_gate = np.float32(0.02)
+        solver.baumgarte = np.float32(0.25)
+        solver.warn_constraint_overflow = 0
+        self.assertEqual(solver.velocity_drive_mode, "active")
+        self.assertIs(type(solver.contact_gap_gate), float)
+        self.assertIs(type(solver.baumgarte), float)
+        self.assertIs(solver.warn_constraint_overflow, False)
+        with self.assertRaisesRegex(ValueError, "velocity_drive_mode must be 'active' or 'freeze'"):
+            SolverFeatherPGS(model, solve_mode="split", friction_anchor_beta=0.0, velocity_drive_mode="frozen")
+
     def test_solver_is_exported_once_from_newton_solvers(self):
         """Expose the solver through newton.solvers only."""
         self.assertIn("SolverFeatherPGS", newton.solvers.__all__)
