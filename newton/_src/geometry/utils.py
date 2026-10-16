@@ -868,20 +868,18 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
     verts = vertices.astype(np.float32)
     faces = hull.simplices.astype(np.int32)
 
-    # fix winding order of faces
+    # fix winding order of faces so every normal points away from the centroid
     centre_f = verts.mean(0)
-    for i, tri in enumerate(faces):
-        a, b, c = verts[tri]
-        normal = np.cross(b - a, c - a)
-        if np.dot(normal, a - centre_f) < 0:
-            faces[i] = tri[[0, 2, 1]]
+    a, b, c = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    normal = np.cross(b - a, c - a)
+    offset = a - centre_f
+    inward = normal[:, 0] * offset[:, 0] + normal[:, 1] * offset[:, 1] + normal[:, 2] * offset[:, 2] < 0
+    faces[inward] = faces[inward][:, [0, 2, 1]]
 
     # trim vertices to only those that are used in the faces
-    unique_verts = np.unique(faces.flatten())
+    unique_verts, faces_flat = np.unique(faces, return_inverse=True)
     verts = verts[unique_verts]
-    # update face indices to use the new vertex indices
-    mapping = {v: i for i, v in enumerate(unique_verts)}
-    faces = np.array([mapping[v] for v in faces.flatten()], dtype=np.int32).reshape(faces.shape)
+    faces = faces_flat.reshape(faces.shape).astype(np.int32)
 
     return verts, faces
 

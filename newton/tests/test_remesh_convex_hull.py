@@ -146,6 +146,31 @@ class TestRemeshConvexHullFull3D(unittest.TestCase):
         self.assertLessEqual(verts_limited.shape[0], 16)
         self.assertTrue(_has_outward_winding(verts_limited, faces_limited))
 
+    def test_matches_per_face_reference(self):
+        # Winding is fixed one triangle at a time, then unused input rows are dropped in input order.
+        from scipy.spatial import ConvexHull
+
+        rng = np.random.default_rng(7)
+        for trial in range(60):
+            pts = rng.standard_normal((int(rng.integers(4, 300)), 3)) * rng.uniform(1e-3, 1e3, 3)
+            maxhullvert = (0, 16, 64)[trial % 3]
+            options = "Qt" + (f" TA{maxhullvert - 4}" if maxhullvert else "")
+            ref_verts = pts.astype(np.float32)
+            ref_faces = ConvexHull(pts, qhull_options=options).simplices.astype(np.int32)
+            centre = ref_verts.mean(0)
+            for i, tri in enumerate(ref_faces):
+                a, b, c = ref_verts[tri]
+                if np.dot(np.cross(b - a, c - a), a - centre) < 0:
+                    ref_faces[i] = tri[[0, 2, 1]]
+            used = np.unique(ref_faces)
+            ref_faces = np.searchsorted(used, ref_faces).astype(np.int32)
+
+            verts, faces = remesh_convex_hull(pts, maxhullvert=maxhullvert)
+
+            np.testing.assert_array_equal(verts, ref_verts[used])
+            np.testing.assert_array_equal(faces, ref_faces)
+            self.assertEqual(faces.dtype, np.int32)
+
 
 class TestRemeshConvexHullDegenerate(unittest.TestCase):
     """Degeneracy handling added by the diff."""
