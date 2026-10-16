@@ -12539,6 +12539,47 @@ def gather_propagation_unit_meta(
 
 
 @wp.kernel(enable_backward=False)
+def fold_prescribed_propagation_sides(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    body_prescribed: wp.array[int],
+    propagation_body_qd: wp.array2d[float],
+    rhs: wp.array2d[float],
+    propagation_max_constraints: int,
+    # outputs
+    colored_body_a: wp.array2d[int],
+    colored_body_b: wp.array2d[int],
+    colored_rhs: wp.array2d[float],
+):
+    """Drop each row's prescribed side and move its constant ``J v`` term into the row's right-hand side.
+
+    A prescribed body has no response, so its velocity is fixed for the whole sweep.
+    """
+    world, i = wp.tid()
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    body_a = propagation_body_a[world, i]
+    body_b = propagation_body_b[world, i]
+    r = rhs[world, i]
+    if body_a >= 0:
+        if body_prescribed[body_a] != 0:
+            for k in range(6):
+                r += propagation_J_a[world, i, k] * propagation_body_qd[body_a, k]
+            body_a = -1
+    if body_b >= 0:
+        if body_prescribed[body_b] != 0:
+            for k in range(6):
+                r += propagation_J_b[world, i, k] * propagation_body_qd[body_b, k]
+            body_b = -1
+    colored_body_a[world, i] = body_a
+    colored_body_b[world, i] = body_b
+    colored_rhs[world, i] = r
+
+
+@wp.kernel(enable_backward=False)
 def collect_propagation_units(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
