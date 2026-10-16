@@ -1316,6 +1316,21 @@ def eval_rigid_fk_kinematics(
     fk_id_cache_valid[index] = 1
 
 
+@wp.kernel(enable_backward=False)
+def copy_unarticulated_body_state(
+    bodies: wp.array[int],
+    body_q_in: wp.array[wp.transform],
+    body_qd_in: wp.array[wp.spatial_vector],
+    # outputs
+    body_q_out: wp.array[wp.transform],
+    body_qd_out: wp.array[wp.spatial_vector],
+):
+    """Pass the prescribed state of bodies outside every articulation through the step."""
+    body = bodies[wp.tid()]
+    body_q_out[body] = body_q_in[body]
+    body_qd_out[body] = body_qd_in[body]
+
+
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE, enable_backward=False)
 def finalize_body_dynamics(
     body_to_articulation: wp.array[int],
@@ -1345,12 +1360,10 @@ def finalize_body_dynamics(
     if body_active[body] == 0:
         return
     articulation = body_to_articulation[body]
-    v_s = body_v_s[body]
+    # copy_unarticulated_body_state publishes bodies outside every articulation.
     if articulation < 0:
-        com_world = wp.transform_point(body_q[body], body_com[body])
-        v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_world)
-        body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
         return
+    v_s = body_v_s[body]
 
     origin = articulation_origin[articulation]
     X_sm = body_q_com[body]
@@ -6777,7 +6790,8 @@ def update_body_qd_from_featherstone(
     body_qd_out: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
-    if body_active[tid] == 0:
+    art = body_to_articulation[tid]
+    if body_active[tid] == 0 or art < 0:
         return
 
     twist = body_v_s[tid]  # spatial twist about origin
@@ -6787,11 +6801,7 @@ def update_body_qd_from_featherstone(
     X_wb = body_q[tid]
     com_local = body_com[tid]
     com_world = wp.transform_point(X_wb, com_local)
-    art = body_to_articulation[tid]
-    origin = wp.vec3()
-    if art >= 0:
-        origin = articulation_origin[art]
-    com_rel = com_world - origin
+    com_rel = com_world - articulation_origin[art]
 
     v_com = v0 + wp.cross(w, com_rel)
 
