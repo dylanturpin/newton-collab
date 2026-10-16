@@ -1,0 +1,1 @@
+Fix a masked `SolverFeatherPGS.reset()` with experimental sleeping keeping the selected worlds' sleep history: their state-change baseline now restarts from the reset state and their asleep counters clear.
