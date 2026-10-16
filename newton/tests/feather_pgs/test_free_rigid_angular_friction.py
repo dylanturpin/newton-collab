@@ -509,6 +509,54 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         np.testing.assert_array_equal(default, condim3)
         np.testing.assert_array_equal(default, zero)
 
+    def test_inactive_friction_zeroes_both_rows_of_each_pair(self):
+        """Hold both rows of a sliding and a rolling pair at zero until friction activates, then solve both."""
+        model, _ = _scene("sphere")
+        solver = SolverFeatherPGS(
+            model,
+            solve_mode="matrix_free",
+            iterations=32,
+            deterministic=True,
+            contact_warmstart=True,
+            free_rigid_rolling_friction=0.002,
+            **_ON,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky")
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        qd = states[0].joint_qd.numpy()
+        qd[:3] = (0.4, 0.25, 0.0)
+        states[0].joint_qd.assign(qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+
+        def pair_impulses():
+            states[0].clear_forces()
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, _DT)
+            states.reverse()
+            count = int(solver._mf_constraint_count.numpy()[0])
+            row_type = solver._mf_row_type.numpy()[0, :count]
+            impulses = solver._mf_impulses.numpy()[0, :count]
+            return impulses[row_type == PGS_CONSTRAINT_TYPE_FRICTION], impulses[
+                row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+            ]
+
+        for _ in range(4):
+            sliding, rolling = pair_impulses()
+        self.assertEqual((sliding.size, rolling.size), (2, 2))
+        self.assertTrue(np.all(sliding != 0.0))
+        # The constructor rejects delayed friction with warm starting; set it directly so the second tangent row
+        # starts the solve with a carried impulse that only the zeroing of inactive pairs clears.
+        solver._contact_friction_position_iterations = 0
+        sliding, rolling = pair_impulses()
+        np.testing.assert_array_equal(sliding, 0.0)
+        np.testing.assert_array_equal(rolling, 0.0)
+        solver._contact_friction_position_iterations = 8
+        sliding, rolling = pair_impulses()
+        self.assertTrue(np.all(sliding != 0.0))
+        self.assertTrue(np.all(rolling != 0.0))
+
     def test_body_parent_f_balances_the_rolling_torque(self):
         """Keep a rolling free sphere's parent wrench at zero: its contact wrench carries the rolling torque."""
         seen = {}
