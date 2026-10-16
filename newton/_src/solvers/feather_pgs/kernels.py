@@ -2089,6 +2089,39 @@ def accumulate_torsion_wrenches_from_impulses(
 
 
 @wp.kernel
+def accumulate_propagation_torsion_wrenches_from_impulses(
+    propagation_constraint_count: wp.array[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_body_a: wp.array2d[wp.int32],
+    propagation_body_b: wp.array2d[wp.int32],
+    propagation_J_a: wp.array3d[wp.float32],
+    propagation_J_b: wp.array3d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    inv_dt: float,
+    # outputs
+    body_contact_wrench: wp.array[wp.spatial_vector],
+):
+    """Add each solved propagation torsion row's torque about its lead contact's normal to the row's bodies."""
+    world, row = wp.tid()
+    if (
+        row >= propagation_constraint_count[world]
+        or propagation_row_type[world, row] != PGS_CONSTRAINT_TYPE_TORSION
+        or propagation_impulses[world, row] == 0.0
+    ):
+        return
+    impulse = propagation_impulses[world, row] * inv_dt
+    # The row is pure angular: its Jacobian holds the lead normal on body A and its negative on body B.
+    body_a = propagation_body_a[world, row]
+    if body_a >= 0:
+        torque = wp.vec3(propagation_J_a[world, row, 3], propagation_J_a[world, row, 4], propagation_J_a[world, row, 5])
+        wp.atomic_add(body_contact_wrench, body_a, wp.spatial_vector(wp.vec3(0.0), impulse * torque))
+    body_b = propagation_body_b[world, row]
+    if body_b >= 0:
+        torque = wp.vec3(propagation_J_b[world, row, 3], propagation_J_b[world, row, 4], propagation_J_b[world, row, 5])
+        wp.atomic_add(body_contact_wrench, body_b, wp.spatial_vector(wp.vec3(0.0), impulse * torque))
+
+
+@wp.kernel
 def accumulate_connect_wrenches_from_impulses(
     connect_slot: wp.array[wp.int32],
     connect_art: wp.array[wp.int32],
@@ -4915,6 +4948,17 @@ def free_rigid_angular_slots(torsional: float, rolling: float):
 
 
 @wp.func
+def propagation_torsion_spare(shape_a: int, shape_b: int, shape_torsion_radius: wp.array[float]):
+    """Return whether a dense-origin propagation contact of this shape pair reserves a contact torsion row."""
+    radius = float(0.0)
+    if shape_a >= 0:
+        radius = shape_torsion_radius[shape_a]
+    if shape_b >= 0:
+        radius = wp.max(radius, shape_torsion_radius[shape_b])
+    return radius > 0.0
+
+
+@wp.func
 def _allocate_world_contact_slot(
     c: int,
     contact_shape0: wp.array[int],
@@ -4948,6 +4992,8 @@ def _allocate_world_contact_slot(
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
     classify_only: int,
+    shape_torsion_radius: wp.array[float],
+    torsion_spares: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -4965,6 +5011,7 @@ def _allocate_world_contact_slot(
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
     propagation_first_rejected_slot: wp.array[int],
+    contact_mf_origin: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -4980,6 +5027,7 @@ def _allocate_world_contact_slot(
     """
     shape_a = contact_shape0[c]
     shape_b = contact_shape1[c]
+    contact_mf_origin[c] = 0
 
     # Get bodies and articulations
     body_a = -1
@@ -5092,6 +5140,7 @@ def _allocate_world_contact_slot(
             is_mf = 1
     # The pair's free-rigid classification, before free/free routing can move its rows to the propagation family.
     free_rigid_pair = is_mf
+    contact_mf_origin[c] = free_rigid_pair
     if propagation_free_free != 0 and is_mf == 1:
         # Opt-in: route free/free (and free/ground) contact rows to the
         # propagation family. The row math is identical (free bodies use the
@@ -5131,6 +5180,14 @@ def _allocate_world_contact_slot(
             # A friction patch carries one set of angular rows, on its first anchor, with the patch's whole budget.
             if friction_patches.enabled == 0 or _first_patch_anchor(friction_patches, c):
                 slots_needed = free_rigid_angular_slots(torsional, rolling)
+    if (
+        torsion_spares != 0
+        and is_propagation != 0
+        and free_rigid_pair == 0
+        and propagation_torsion_spare(shape_a, shape_b, shape_torsion_radius)
+    ):
+        # The last row is a contact torsion spare: the group's torsion row or an inert placeholder.
+        slots_needed += 1
     contact_slots_needed[c] = slots_needed
 
     if classify_only != 0:
@@ -5230,6 +5287,8 @@ def allocate_world_contact_slots(
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
     classify_only: int,
+    shape_torsion_radius: wp.array[float],
+    torsion_spares: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -5247,6 +5306,7 @@ def allocate_world_contact_slots(
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
     propagation_first_rejected_slot: wp.array[int],
+    contact_mf_origin: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
@@ -5309,6 +5369,8 @@ def allocate_world_contact_slots(
             free_rigid_mu_torsional,
             free_rigid_mu_rolling,
             classify_only,
+            shape_torsion_radius,
+            torsion_spares,
             contact_world,
             contact_slot,
             contact_art_a,
@@ -5325,6 +5387,7 @@ def allocate_world_contact_slots(
             dense_first_rejected_slot,
             mf_first_rejected_slot,
             propagation_first_rejected_slot,
+            contact_mf_origin,
         )
 
 
@@ -7754,6 +7817,7 @@ def build_propagation_angular_friction_rows(
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
+    contact_mf_origin: wp.array[int],
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
     # outputs
@@ -7775,8 +7839,8 @@ def build_propagation_angular_friction_rows(
     for c in range(wp.tid(), total_contacts, total_num_threads):
         slots = contact_slots_needed[c]
         slot = contact_slot[c]
-        # Only free-rigid pairs reserve more than three propagation rows.
-        if contact_path[c] != 2 or slot < 0 or slots <= 3:
+        # A dense-origin contact's extra row is its contact torsion spare.
+        if contact_path[c] != 2 or slot < 0 or slots <= 3 or contact_mf_origin[c] == 0:
             continue
         world = contact_world[c]
         torsional, rolling = free_rigid_angular_friction_coefficients(
@@ -7803,6 +7867,54 @@ def build_propagation_angular_friction_rows(
 
 
 @wp.kernel
+def clear_propagation_torsion_spares(
+    contact_count: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    contact_mf_origin: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_torsion_radius: wp.array[float],
+    # outputs
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_phi: wp.array2d[float],
+    propagation_row_restitution: wp.array2d[float],
+    propagation_torsion_row_radius: wp.array2d[float],
+):
+    """Write every reserved contact torsion spare as an inert torsion row with no bodies.
+
+    Must run before the propagation body map is built; contact torsion preparation then fills each group's host spare.
+    """
+    c = wp.tid()
+    slot = contact_slot[c]
+    if c >= contact_count[0] or contact_path[c] != 2 or slot < 0 or contact_mf_origin[c] != 0:
+        return
+    if not propagation_torsion_spare(contact_shape0[c], contact_shape1[c], shape_torsion_radius):
+        return
+    world = contact_world[c]
+    row = slot + contact_slots_needed[c] - 1
+    for k in range(6):
+        propagation_J_a[world, row, k] = 0.0
+        propagation_J_b[world, row, k] = 0.0
+    propagation_body_a[world, row] = -1
+    propagation_body_b[world, row] = -1
+    propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
+    propagation_row_parent[world, row] = -1
+    propagation_row_mu[world, row] = 0.0
+    propagation_phi[world, row] = 0.0
+    propagation_row_restitution[world, row] = 0.0
+    propagation_torsion_row_radius[world, row] = 0.0
+
+
+@wp.kernel
 def build_propagation_contact_rows(
     contact_count: wp.array[int],
     contact_point0: wp.array[wp.vec3],
@@ -7815,6 +7927,7 @@ def build_propagation_contact_rows(
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     shape_body: wp.array[int],
@@ -7919,9 +8032,9 @@ def build_propagation_contact_rows(
     friction_mu = mu * contact_friction_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = phi <= contact_friction_gap_limit
-    if friction_patches.enabled != 0:
-        will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
+    # Allocation owns the row extent; recomputing eligibility can cross a floating-point threshold and
+    # overwrite the following rows. A torsion spare makes 1 or 3 base rows 2 or 4, and angular rows only follow 3.
+    will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     com_a = wp.vec3(0.0)

@@ -248,6 +248,7 @@ def launch_propagation_free_rigid_angular_friction_rows(solver, contacts, thread
             solver._contact_slot,
             solver._contact_path,
             solver._contact_slots_needed,
+            solver._contact_mf_origin,
             solver._free_rigid_mu_torsional,
             solver._free_rigid_mu_rolling,
         ],

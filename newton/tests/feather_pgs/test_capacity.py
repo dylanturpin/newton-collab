@@ -353,6 +353,8 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 0,
+                wp.zeros((1,), dtype=wp.float32, device=device),
+                0,
             ],
             outputs=[
                 contact_world,
@@ -371,6 +373,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+                wp.zeros((contact_count,), dtype=wp.int32, device=device),
             ],
             device=device,
         )
@@ -500,6 +503,8 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 0,
+                wp.zeros((1,), dtype=wp.float32, device=device),
+                0,
             ],
             outputs=[
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -518,6 +523,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+                wp.zeros((capacity,), dtype=wp.int32, device=device),
             ],
             device=device,
         )
@@ -616,6 +622,8 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
         ],
         outputs=[
             contact_world,
@@ -634,6 +642,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
             wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
             first_rejected,
+            wp.zeros((contact_count,), dtype=wp.int32, device=device),
         ],
         device=device,
     )
