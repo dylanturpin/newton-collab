@@ -538,6 +538,237 @@ class TestPropagationCachedResponse(unittest.TestCase):
         self.assertEqual(float(np.max(np.abs(solver._propagation_body_impulses.numpy()))), 0.0)
 
 
+def _build_arm_world_model(device: str, *, mu: float, base_z: tuple[float, ...], gravity: float = -9.81):
+    """Identical fixed-base arms with contact spheres on links 0, 3 and 5, one per world, at the given base heights."""
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
+    for z in base_z:
+        world = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
+        world.default_shape_cfg.density = 1000.0
+        world.default_shape_cfg.mu = mu
+        _add_fixed_chain(world, n_links=6, base_z=z, base_y=0.0, spheres=("base", "mid", "deep"))
+        scene.add_world(world)
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+def _cached_rollout(model, response, n_steps, **solver_kwargs):
+    """Step a cached-response solver on deterministic contacts; return per-step joint state and the solver."""
+    solver = _make_solver(model, response, cached=True, articulation_constraint_max=64, **solver_kwargs)
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    control = model.control()
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    history = []
+    max_active = 0
+    for _ in range(n_steps):
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, DT)
+        history.append(np.concatenate([state_out.joint_q.numpy(), state_out.joint_qd.numpy()]))
+        max_active = max(max_active, int(solver._propagation_body_count.numpy().max()))
+        state_in, state_out = state_out, state_in
+    return np.stack(history), solver, max_active
+
+
+@wp.kernel
+def _rank_propagation_body_map_descending(
+    propagation_body_count: wp.array[int],
+    propagation_cache_body_count: wp.array[int],
+    max_propagation_bodies: int,
+    claimed_body_list: wp.array2d[int],
+    propagation_body_list: wp.array2d[int],
+    propagation_body_local_slot: wp.array[int],
+):
+    """Same partitions as the solver's ranking, but in descending body order: a fixed, different slot order."""
+    world, i = wp.tid()
+    n = wp.min(propagation_body_count[world], max_propagation_bodies)
+    if i >= n:
+        return
+    split = wp.min(propagation_cache_body_count[world], n)
+    lo = int(0)
+    hi = split
+    if i >= split:
+        lo = split
+        hi = n
+    body = claimed_body_list[world, i]
+    rank = lo
+    for j in range(lo, hi):
+        if claimed_body_list[world, j] > body:
+            rank += 1
+    propagation_body_list[world, rank] = body
+    propagation_body_local_slot[body] = rank
+
+
+@wp.kernel
+def _claim_propagation_body_map_reversed(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    max_propagation_bodies: int,
+    body_to_articulation: wp.array[int],
+    propagation_cache_art_eligible: wp.array[int],
+    want_eligible: int,
+    propagation_body_seen: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_local_slot: wp.array[int],
+):
+    """Claim like the partitioned map, but one thread per world walking rows backwards: an adverse claim order."""
+    world = wp.tid()
+    m = wp.min(propagation_constraint_count[world], propagation_max_constraints)
+    for r in range(m):
+        i = m - 1 - r
+        for side in range(2):
+            body = propagation_body_a[world, i]
+            if side == 0:
+                body = propagation_body_b[world, i]
+            if body < 0:
+                continue
+            art = body_to_articulation[body]
+            elig = int(0)
+            if art >= 0:
+                elig = propagation_cache_art_eligible[art]
+            if elig != want_eligible or propagation_body_seen[body] != 0:
+                continue
+            propagation_body_seen[body] = 1
+            slot = propagation_body_count[world]
+            propagation_body_count[world] = slot + 1
+            if slot < max_propagation_bodies:
+                propagation_body_list[world, slot] = body
+                propagation_body_local_slot[body] = slot
+
+
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+class TestPropagationBodyMapOrder(unittest.TestCase):
+    """The cached response must not depend on the order in which GPU threads claim body slots.
+
+    The solver runs with ``deterministic=False`` (its default); contacts come from
+    ``CollisionPipeline(deterministic=True)`` so their order is fixed. Frictionless spheres
+    give one row per contact body, so the plain serial sweep is order-free too.
+    """
+
+    STEPS = 60
+
+    def _assert_repeatable(self, response, mu):
+        model = _build_arm_world_model("cuda:0", mu=mu, base_z=(0.095,) * N_WORLDS)
+        first, solver, max_active = _cached_rollout(model, response, self.STEPS)
+        second, _, _ = _cached_rollout(model, response, self.STEPS)
+        self.assertTrue(solver._propagation_cached_response_active)
+        self.assertGreaterEqual(max_active, 2, "scene must keep several bodies of one arm contact-active")
+        np.testing.assert_array_equal(first, second, err_msg="run-to-run")
+        coords = model.joint_coord_count // N_WORLDS
+        dofs = model.joint_dof_count // N_WORLDS
+        q, qd = first[:, : model.joint_coord_count], first[:, model.joint_coord_count :]
+        for world in range(1, N_WORLDS):
+            np.testing.assert_array_equal(q[:, world * coords : (world + 1) * coords], q[:, :coords])
+            np.testing.assert_array_equal(qd[:, world * dofs : (world + 1) * dofs], qd[:, :dofs])
+
+    def test_colored_is_bitwise_repeatable(self):
+        """Repeat colored steps bitwise across runs and identical worlds."""
+        self._assert_repeatable("propagation_colored", mu=0.7)
+
+    def test_colored_frictionless_is_bitwise_repeatable(self):
+        """Repeat frictionless colored steps bitwise across runs and identical worlds."""
+        self._assert_repeatable("propagation_colored", mu=0.0)
+
+    def test_plain_frictionless_is_bitwise_repeatable(self):
+        """Repeat frictionless plain propagation steps bitwise across runs and identical worlds."""
+        self._assert_repeatable("propagation", mu=0.0)
+
+    def test_body_list_is_sorted_within_partitions(self):
+        """Sort each partition of the body list by body index and keep the slot map its inverse."""
+        model = _build_clutter_model("cuda:0", n_boxes=2)
+        for response in ("propagation", "propagation_colored"):
+            _, solver, _ = _cached_rollout(model, response, 20, cache_max_bodies=4)
+            counts = solver._propagation_body_count.numpy()
+            split = solver._propagation_cache_body_count.numpy()
+            body_list = solver._propagation_body_list.numpy()
+            local_slot = solver._propagation_body_local_slot.numpy()
+            for world in range(body_list.shape[0]):
+                n, k = int(counts[world]), int(split[world])
+                self.assertGreater(k, 0)
+                self.assertGreater(n, k, "scene must fill both partitions")
+                for part in (body_list[world, :k], body_list[world, k:n]):
+                    self.assertTrue(np.all(np.diff(part) > 0), f"{response} world {world}: {part}")
+                np.testing.assert_array_equal(local_slot[body_list[world, :n]], np.arange(n))
+
+    def test_slot_order_changes_the_cached_sum(self):
+        """Fail-before reproducer: a fixed descending slot order changes the result, so claim order mattered."""
+        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
+        ascending, _, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        module = inspect.getmodule(SolverFeatherPGS)
+        with patch.object(module, "rank_propagation_body_map", _rank_propagation_body_map_descending):
+            descending, _, max_active = _cached_rollout(model, "propagation_colored", self.STEPS)
+        self.assertGreaterEqual(max_active, 2)
+        differs = np.any(ascending != descending, axis=1)
+        self.assertTrue(differs.any(), "slot order did not reach the cached sum")
+        # The first difference is reassociation-sized; later steps compound it.
+        first = int(np.argmax(differs))
+        self.assertLess(float(np.max(np.abs(ascending[first] - descending[first]))), 1.0e-5)
+
+    def test_adverse_claim_order_gives_the_same_step(self):
+        """Claiming bodies in reverse row order must not change any result."""
+        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
+        reference, _, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        module = inspect.getmodule(SolverFeatherPGS)
+        launch = wp.launch
+
+        def adverse_launch(kernel, dim, *args, **kwargs):
+            if kernel is module.build_propagation_body_map_partitioned:
+                kernel, dim = _claim_propagation_body_map_reversed, model.world_count
+            return launch(kernel, dim, *args, **kwargs)
+
+        with patch.object(module.wp, "launch", adverse_launch):
+            adverse, solver, max_active = _cached_rollout(model, "propagation_colored", self.STEPS)
+        self.assertGreaterEqual(max_active, 2)
+        np.testing.assert_array_equal(adverse, reference)
+        claimed = solver._propagation_body_claim_list.numpy()
+        ranked = solver._propagation_body_list.numpy()
+        counts = solver._propagation_body_count.numpy()
+        self.assertTrue(
+            any(not np.array_equal(claimed[w, : counts[w]], ranked[w, : counts[w]]) for w in range(len(counts))),
+            "the adverse claim order never differed from the ranked order",
+        )
+
+    def test_zero_and_one_active_body_worlds(self):
+        """A world with no contacts and a world with one contact body rank without touching other slots."""
+        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(1.0, 0.095), gravity=0.0)
+        # Only the second world's base sphere starts in contact; its other spheres are lifted clear.
+        q = model.joint_q.numpy()
+        q[model.joint_coord_count // 2 :] = np.array([0.0, -0.6, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        model.joint_q.assign(q)
+        first, solver, _ = _cached_rollout(model, "propagation_colored", 20)
+        second, _, _ = _cached_rollout(model, "propagation_colored", 20)
+        np.testing.assert_array_equal(first, second)
+        self.assertTrue(np.isfinite(first).all())
+        np.testing.assert_array_equal(solver._propagation_body_count.numpy(), [0, 1])
+        self.assertEqual(int(solver._propagation_cache_body_count.numpy()[1]), 1)
+        self.assertGreaterEqual(int(solver._propagation_body_list.numpy()[1, 0]), 0)
+
+    def test_cache_capacity_boundary(self):
+        """At exactly the cap the world stays cached and matches the tree walk; one over the cap falls back."""
+        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
+        _, solver, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        active = int(solver._propagation_cache_body_count.numpy().min())
+        self.assertGreaterEqual(active, 2)
+        for cap in (active, active - 1):
+            stats, _, test = _run_lockstep(self, model, "propagation_colored", 30, cache_max_bodies=cap)
+            flags = test._propagation_cache_world_flag.numpy()
+            counts = test._propagation_cache_body_count.numpy()
+            np.testing.assert_array_equal(flags, (counts <= cap).astype(flags.dtype), err_msg=f"cap {cap}")
+            if cap == active:
+                self.assertTrue(np.any(counts == cap), f"no world exactly at cap {cap}: counts {counts}")
+            else:
+                self.assertTrue(np.any(counts > cap), f"no world over cap {cap}: counts {counts}")
+            for key, diff in stats.max_diffs.items():
+                self.assertLessEqual(diff, TestPropagationCachedResponse.TOL, f"cap {cap} {key}: {diff:.3e}")
+            first, _, _ = _cached_rollout(model, "propagation_colored", 30, cache_max_bodies=cap)
+            second, _, _ = _cached_rollout(model, "propagation_colored", 30, cache_max_bodies=cap)
+            np.testing.assert_array_equal(first, second, err_msg=f"cap {cap}")
+
+
 PROPAGATION_RESPONSES = ("propagation", "propagation_fused")
 
 

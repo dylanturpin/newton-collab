@@ -227,6 +227,7 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    rank_propagation_body_map,
     record_warmstart_dt,
     refine_same_articulation_propagation_rows,
     refresh_masked_body_inertia,
@@ -6946,6 +6947,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._propagation_tree_body_delta = None
             self._propagation_body_count = None
             self._propagation_body_list = None
+            self._propagation_body_claim_list = None
             self._propagation_cache_body_count = None
             self._max_propagation_bodies = 0
             self._propagation_cache_max_bodies = 0
@@ -6983,6 +6985,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._propagation_body_list = wp.full(
             (worlds, self._max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
         )
+        # Allocated with the cached response, the only path whose result depends on slot order.
+        self._propagation_body_claim_list = None
         # Length of the cache-eligible slot prefix of propagation_body_list
         # (== propagation_body_count after pass 1 of the partitioned build);
         # only written when the cached-response path is active.
@@ -7708,6 +7712,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 )
             if any(k is not None for k in self._cached_response_tree_warp_kernels_by_size.values()):
                 self._propagation_cached_response_active = True
+                # Bodies in atomic claim order, ranked into propagation_body_list each step.
+                self._propagation_body_claim_list = wp.full(
+                    (self._world_count, self._max_propagation_bodies), -1, dtype=wp.int32, device=model.device
+                )
                 self._propagation_cached_gemv_kernel = _get_propagation_cached_gemv_kernel(
                     self._propagation_cache_max_bodies,
                     self._propagation_response_max_dofs,
@@ -12992,7 +13000,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                                 self._propagation_body_seen,
                             ],
                             outputs=[
-                                self._propagation_body_list,
+                                self._propagation_body_claim_list,
                                 self._propagation_body_count,
                                 self._propagation_body_local_slot,
                             ],
@@ -13003,6 +13011,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             # prefix length; pass 2 keeps counting on the same
                             # array toward the total.
                             wp.copy(self._propagation_cache_body_count, self._propagation_body_count)
+                    # The cached GEMV sums over slots in order, so slots must not follow the atomic claim order.
+                    wp.launch(
+                        rank_propagation_body_map,
+                        dim=(self._world_count, self._max_propagation_bodies),
+                        inputs=[
+                            self._propagation_body_count,
+                            self._propagation_cache_body_count,
+                            self._max_propagation_bodies,
+                            self._propagation_body_claim_list,
+                        ],
+                        outputs=[self._propagation_body_list, self._propagation_body_local_slot],
+                        device=model.device,
+                    )
                 elif (
                     self._propagation_tree_requires_body_map
                     or self._propagation_full_fused_iterations
