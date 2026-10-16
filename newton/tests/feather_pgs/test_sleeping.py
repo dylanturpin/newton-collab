@@ -77,7 +77,12 @@ class TestSleeping(unittest.TestCase):
         builder.replicate(box, 2)
         model = builder.finalize(device="cpu")
         solver = newton.solvers.SolverFeatherPGS(
-            model, enable_sleeping=True, sleep_quiet_time=0.05, iterations=16, friction_anchor_beta=0, solve_mode="split"
+            model,
+            enable_sleeping=True,
+            sleep_quiet_time=0.05,
+            iterations=16,
+            friction_anchor_beta=0,
+            solve_mode="split",
         )
         sleeping = solver._sleeping
         state = model.state()
@@ -90,8 +95,12 @@ class TestSleeping(unittest.TestCase):
         sleeping.valid.fill_(1)
         previous_root = sleeping.previous_root.numpy().copy()
         solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
-        sources = dict(last_q=state.joint_q, last_qd=state.joint_qd, last_body_q=state.body_q,
-                       last_body_qd=state.body_qd)
+        sources = {
+            "last_q": state.joint_q,
+            "last_qd": state.joint_qd,
+            "last_body_q": state.body_q,
+            "last_body_qd": state.body_qd,
+        }
         for name in _HISTORY:
             history = getattr(sleeping, name).numpy()
             half = history.shape[0] // 2
@@ -580,8 +589,12 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 before_steps = sleeping.asleep_steps.numpy().copy()
                 solver.reset(current, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
                 after = {n: getattr(sleeping, n).numpy() for n in _HISTORY}
-                state_rows = dict(last_q=current.joint_q, last_qd=current.joint_qd, last_body_q=current.body_q,
-                                  last_body_qd=current.body_qd)
+                state_rows = {
+                    "last_q": current.joint_q,
+                    "last_qd": current.joint_qd,
+                    "last_body_q": current.body_q,
+                    "last_body_qd": current.body_qd,
+                }
                 for name in _HISTORY:
                     half = after[name].shape[0] // 2
                     np.testing.assert_array_equal(after[name][:half], state_rows[name].numpy()[:half], err_msg=name)
