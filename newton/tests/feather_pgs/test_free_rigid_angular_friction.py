@@ -15,6 +15,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_reduction_body_pairs import build_reduction_groups
+from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -1250,6 +1251,31 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
             spins, 40, **_COLORED, free_rigid_rolling_friction=0.0, free_rigid_torsional_friction=0.0
         )
         self.assertGreater(float(np.abs(off - first).max()), 1.0e-2)
+
+    def test_serial_tail_solves_the_rows(self):
+        """Solve the rows of units that overflow a two-color cap in the serial tail, as with the full cap.
+
+        The row-loop bodies sweep the tail in the same order and arithmetic, so they match bitwise. The straight-line
+        bodies sum in a different order in the tail; they are compared over one step, as the straight-line check in
+        test_propagation does, since a pile amplifies that rounding over later steps.
+        """
+        for variant, steps in (("row loop", 20), ("block", 20), ("packed", 1), ("reference", 1)):
+            with self.subTest(variant=variant):
+                env, _ = _COLORED_VARIANTS[variant]
+                with mock.patch.dict(os.environ, env):
+                    for key in _COLORED_SWITCHES:
+                        if key not in env:
+                            os.environ.pop(key, None)
+                    uncapped, _ = _pile_rollout((4.0, 1.0), steps, **_COLORED)
+                    with mock.patch.object(solver_feather_pgs, "PROPAGATION_COLOR_TAIL", 2):
+                        capped, solver = _pile_rollout((4.0, 1.0), steps, **_COLORED)
+                        entries = solver._color_world_offsets.shape[0] // solver._world_count
+                        offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, entries)
+                self.assertTrue(np.all(offsets[:, -1] - offsets[:, -2] > 0), "no unit reached the serial tail")
+                if steps > 1:
+                    np.testing.assert_array_equal(capped, uncapped)
+                else:
+                    np.testing.assert_allclose(capped, uncapped, rtol=1e-4, atol=1e-6)
 
     def test_captured_steps_match_eager_steps(self):
         """Replay captured colored steps bit for bit against eager steps, on each colored body."""
