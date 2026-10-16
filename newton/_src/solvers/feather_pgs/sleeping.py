@@ -140,8 +140,11 @@ class _SleepState:
         """Bodies whose friction-patch history can be carried; only row-free sleeping qualifies."""
         return self.frozen_bodies if self.skip_constraints else None
 
-    def wake(self, world_mask=None):
-        """Wake every component and invalidate state-change history, or wake only the masked worlds."""
+    def wake(self, world_mask=None, state=None):
+        """Wake every component and invalidate state-change history, or do both for the masked worlds only.
+
+        A masked wake restarts the selected worlds' history from ``state``, the next step's input state.
+        """
         requested = self.solver._mass_update_requested
         if world_mask is None:
             wp.launch(_wake_all, self.art_awake.size, [self.art_awake, requested], device=self.model.device)
@@ -155,13 +158,33 @@ class _SleepState:
         wp.launch(
             _wake_worlds,
             self.art_awake.size,
-            [world_mask, world, self.art_awake, self.quiet_age, requested],
+            [world_mask, world, self.art_awake, self.quiet_age, self.asleep_steps, requested],
             device=device,
         )
         wp.launch(
             _wake_world_bodies,
             self.body_awake.size,
             [world_mask, world, self.body_nodes, self.body_awake],
+            device=device,
+        )
+        # The masked counterpart of valid=0: the selected worlds see no state change on the next step.
+        wp.launch(
+            _restart_world_body_history,
+            self.model.body_count,
+            [world_mask, world, self.body_nodes, self.model.body_world, state.body_q, state.body_qd,
+             self.last_body_q, self.last_body_qd],
+            device=device,
+        )
+        wp.launch(
+            _restart_world_history,
+            self.model.joint_coord_count,
+            [world_mask, world, self.coord_art, state.joint_q, self.last_q],
+            device=device,
+        )
+        wp.launch(
+            _restart_world_history,
+            self.model.joint_dof_count,
+            [world_mask, world, self.dof_art, state.joint_qd, self.last_qd],
             device=device,
         )
 
@@ -602,7 +625,12 @@ def _wake_all(awake: wp.array[int], requested: wp.array[int]):
 
 @wp.kernel(enable_backward=False)
 def _wake_worlds(
-    mask: wp.array[wp.bool], world: wp.array[int], awake: wp.array[int], age: wp.array[float], requested: wp.array[int]
+    mask: wp.array[wp.bool],
+    world: wp.array[int],
+    awake: wp.array[int],
+    age: wp.array[float],
+    asleep_steps: wp.array[int],
+    requested: wp.array[int],
 ):
     i = wp.tid()
     if world[i] >= 0 and mask[world[i]]:
@@ -610,6 +638,37 @@ def _wake_worlds(
             requested[i] = 1
         awake[i] = 1
         age[i] = 0.0
+        asleep_steps[i] = 0
+
+
+@wp.kernel(enable_backward=False)
+def _restart_world_body_history(
+    mask: wp.array[wp.bool],
+    world: wp.array[int],
+    nodes: wp.array[int],
+    body_world: wp.array[int],
+    q: wp.array[wp.transform],
+    qd: wp.array[wp.spatial_vector],
+    last_q: wp.array[wp.transform],
+    last_qd: wp.array[wp.spatial_vector],
+):
+    i = wp.tid()
+    w = body_world[i]
+    if nodes[i] >= 0:
+        w = world[nodes[i]]
+    if w >= 0 and mask[w]:
+        last_q[i] = q[i]
+        last_qd[i] = qd[i]
+
+
+@wp.kernel(enable_backward=False)
+def _restart_world_history(
+    mask: wp.array[wp.bool], world: wp.array[int], nodes: wp.array[int], value: wp.array[float], last: wp.array[float]
+):
+    i = wp.tid()
+    node = nodes[i]
+    if node >= 0 and world[node] >= 0 and mask[world[node]]:
+        last[i] = value[i]
 
 
 @wp.kernel(enable_backward=False)

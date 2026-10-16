@@ -484,6 +484,37 @@ class TestSleepingProductionProfile(unittest.TestCase):
         _advance_sleeping_production(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver._sleeping.art_awake.numpy(), [1, 0])
 
+    def test_masked_reset_restarts_state_change_history(self):
+        """A world given another world's live state by a masked reset of both continues bitwise like it."""
+        model, pipeline, solver, states = _two_world_boxes(self)
+        q = model.joint_q.numpy()
+        q[model.joint_q_start.numpy()[1] + 2] = 0.3
+        model.joint_q.assign(q)
+        for state in states:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        control = model.control()
+        _advance_sleeping_production(pipeline, solver, states, control, 400)
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+        for state in states:
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                values = getattr(state, name).numpy()
+                half = values.shape[0] // 2
+                values[half:] = values[:half]
+                getattr(state, name).assign(values)
+        solver.reset(states[0], world_mask=wp.array([True, True], dtype=wp.bool, device="cuda:0"))
+        contacts = pipeline.contacts()
+        force = np.zeros((model.body_count, 6), dtype=np.float32)
+        force[:, 2] = 30.0
+        for step in range(150):
+            states[0].clear_forces()
+            if step == 60:
+                states[0].body_f.assign(force)
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, 0.005)
+            states.reverse()
+        body_q = states[0].body_q.numpy()
+        np.testing.assert_array_equal(body_q[0], body_q[1])
+
     def test_property_notification_wakes_only_changed_islands(self):
         """Wake the island whose mass changed, and nothing for a notification without a change."""
         model, pipeline, solver, states = _two_world_boxes(self)
