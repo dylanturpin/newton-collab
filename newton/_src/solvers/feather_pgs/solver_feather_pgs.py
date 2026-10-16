@@ -1960,8 +1960,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
                 physics in either mode: size the row capacities to avoid them.
                 Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation"``, and contacts from
-                ``CollisionPipeline(deterministic=True)``; with ``"propagation"`` the warm-start seed of each body is
-                also summed in row order. Adds a
+                ``CollisionPipeline(deterministic=True)``. With ``"propagation"`` on several worlds, every body with
+                shapes must belong to a world (global static geometry has no body), and the warm-start seed of each
+                body is also summed in row order. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -2604,6 +2605,13 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._deterministic = bool(deterministic)
         if self._deterministic and articulated_contact_response not in ("immediate", "propagation"):
             raise ValueError("deterministic=True requires articulated_contact_response='immediate' or 'propagation'")
+        if self._deterministic and articulated_contact_response == "propagation" and model.world_count > 1:
+            # Rows of several worlds may reference a body outside every world, so per-world ordering cannot cover it.
+            shape_body = model.shape_body.numpy()
+            if np.any(model.body_world.numpy()[shape_body[shape_body >= 0]] < 0):
+                raise ValueError(
+                    "deterministic=True with 'propagation' requires every body with shapes to belong to a world"
+                )
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
@@ -14178,42 +14186,31 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._propagation_cache_qd_base],
                 device=self.model.device,
             )
-        rows = [
-            self._propagation_constraint_count,
-            self._propagation_body_a,
-            self._propagation_body_b,
-            self._propagation_J_a,
-            self._propagation_J_b,
-            self._propagation_MiJt_a,
-            self._propagation_MiJt_b,
-            self._propagation_impulses,
-            self._propagation_max_constraints,
-        ]
-        outputs = [self._propagation_body_qd, self._propagation_body_impulses]
         # Deterministic mode sums each body's seeded impulses in row order; the default scatters them atomically.
         if self._deterministic:
-            wp.launch(
-                accumulate_propagation_warmstart_body_impulses_ordered,
-                dim=self._world_count * 6,
-                inputs=[
-                    *rows,
-                    self.model.body_world,
-                    self.model.body_flags,
-                    self._body_to_articulation,
-                    self._articulation_response_dof_count,
-                    self._body_has_response_dofs,
-                ],
-                outputs=outputs,
-                device=self.model.device,
-            )
+            kernel, dim = accumulate_propagation_warmstart_body_impulses_ordered, self._world_count * 6
         else:
-            wp.launch(
+            kernel, dim = (
                 accumulate_propagation_warmstart_body_impulses,
-                dim=self._world_count * self._propagation_max_constraints,
-                inputs=rows,
-                outputs=outputs,
-                device=self.model.device,
+                self._world_count * self._propagation_max_constraints,
             )
+        wp.launch(
+            kernel,
+            dim=dim,
+            inputs=[
+                self._propagation_constraint_count,
+                self._propagation_body_a,
+                self._propagation_body_b,
+                self._propagation_J_a,
+                self._propagation_J_b,
+                self._propagation_MiJt_a,
+                self._propagation_MiJt_b,
+                self._propagation_impulses,
+                self._propagation_max_constraints,
+            ],
+            outputs=[self._propagation_body_qd, self._propagation_body_impulses],
+            device=self.model.device,
+        )
         self._propagate_response()
         self._flush_propagation_free_body_response()
 
