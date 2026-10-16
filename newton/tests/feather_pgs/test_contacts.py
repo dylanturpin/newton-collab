@@ -113,6 +113,7 @@ def _launch_contact_allocator(
             wp.array([int(responsive)], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             0,
+            wp.zeros((1,), dtype=wp.int32, device=device),
             wp.array([int(is_free)], dtype=wp.int32, device=device),
             1,
             int(propagation_enabled),

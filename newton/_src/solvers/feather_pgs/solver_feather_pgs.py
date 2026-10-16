@@ -1963,8 +1963,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 ``CollisionPipeline(deterministic=True)``. With ``"propagation"`` on several worlds, each body with
                 shapes and all of its shapes must belong to one world (global static geometry has no body), and a
                 contact that joins a prescribed body to another world's body, as explicit shape pairs can, is
-                dropped and flagged in ``constraint_overflow`` like an overflowing row, so only one world's rows
-                reference each body; the warm-start seed of each body is also summed in row order. Adds a
+                dropped, flagged in ``constraint_overflow``, reported once by a device-side error message, and
+                raised by :meth:`check_constraint_capacity`, so only one world's rows reference each body; the
+                warm-start seed of each body is also summed in row order. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -2621,6 +2622,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._isolate_prescribed_bodies = (
             self._deterministic and articulated_contact_response == "propagation" and model.world_count > 1
         )
+        self._cross_world_warning = wp.zeros(1, dtype=wp.int32, device=model.device)
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
@@ -10670,8 +10672,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             raise RuntimeError(
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
                 f" ({worlds.size} invalid worlds), or contacts were dropped that cannot be solved per world;"
-                " increase capacities, or for contacts between a global articulation and another world change"
-                " the scene (see the class documentation), and reset before accepting transitions."
+                " increase capacities, or for contacts between a global articulation and another world, or under"
+                " deterministic propagation between a body and another world, change the scene or contact pairs"
+                " (see the class documentation), and reset before accepting transitions."
             )
 
     def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
@@ -12516,6 +12519,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     else self._body_has_response_dofs,
                     model.body_world,
                     int(self._isolate_prescribed_bodies),
+                    self._cross_world_warning,
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,

@@ -4921,6 +4921,7 @@ def _allocate_world_contact_slot(
     body_has_response_dofs: wp.array[int],
     body_world: wp.array[int],
     isolate_prescribed_bodies: int,
+    cross_world_warning: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5020,9 +5021,20 @@ def _allocate_world_contact_slot(
             world = -2
         # A prescribed body of another world would take rows of several worlds; deterministic propagation drops them.
         if isolate_prescribed_bodies != 0:
+            foreign = -1
             if not a_can_respond and body_a >= 0 and body_world[body_a] != world:
-                world = -2
+                foreign = body_a
             if not b_can_respond and body_b >= 0 and body_world[body_b] != world:
+                foreign = body_b
+            if foreign >= 0:
+                if wp.atomic_exch(cross_world_warning, 0, 1) == 0:
+                    wp.printf(
+                        "Error: FeatherPGS deterministic propagation dropped contacts between body %d of world %d and "
+                        "world %d; contact pairs must stay within one world. check_constraint_capacity() raises.\n",
+                        foreign,
+                        body_world[foreign],
+                        world,
+                    )
                 world = -2
     if world == -2:
         if art_a >= 0:
@@ -5209,6 +5221,7 @@ def allocate_world_contact_slots(
     body_has_response_dofs: wp.array[int],
     body_world: wp.array[int],
     isolate_prescribed_bodies: int,
+    cross_world_warning: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5290,6 +5303,7 @@ def allocate_world_contact_slots(
             body_has_response_dofs,
             body_world,
             isolate_prescribed_bodies,
+            cross_world_warning,
             is_free_rigid,
             has_free_rigid,
             propagation_articulated_contacts,

@@ -747,7 +747,7 @@ def test_deterministic_propagation_rejects_bodies_shared_by_worlds(test, device)
 
 
 def test_deterministic_propagation_drops_explicit_cross_world_pairs(test, device):
-    """Keep a world's prescribed body in that world's rows when explicit pairs join it to another world's shapes."""
+    """Drop explicit pairs joining a world's prescribed body to another world, report them, and fail the status check."""
     builder = newton.ModelBuilder()
     first = _build_heap_arm_world(0)
     floor = first.add_link(is_kinematic=True)
@@ -771,8 +771,22 @@ def test_deterministic_propagation_drops_explicit_cross_world_pairs(test, device
         )
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
-        pipeline.collide(state_0, contacts)
-        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            for _ in range(2):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+            wp.synchronize_device(device)
+        finally:
+            output = capture.end()
+        messages = output.count("FeatherPGS deterministic propagation dropped contacts")
+        test.assertEqual(messages, int(deterministic), output)
+        if deterministic:
+            with test.assertRaisesRegex(RuntimeError, "between a body and another world"):
+                solver.check_constraint_capacity()
+        else:
+            solver.check_constraint_capacity()
         counts = solver._propagation_constraint_count.numpy()
         sides = [solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()]
         rows_by_world[deterministic] = [
@@ -1000,6 +1014,7 @@ for _device in get_test_devices():
             "test_deterministic_propagation_drops_explicit_cross_world_pairs",
             test_deterministic_propagation_drops_explicit_cross_world_pairs,
             devices=[_device],
+            check_output=False,
         )
 
 
