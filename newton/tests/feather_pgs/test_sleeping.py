@@ -2159,18 +2159,38 @@ class TestSleepingColoredPropagation(unittest.TestCase):
             force[:] = 0.0
         self.assertEqual(int(captured.solver._sleeping.body_awake.numpy()[asleep[0]]), 1)
 
-    def test_heap_settles_asleep_like_immediate(self):
-        """Measured gates, set before validation: asleep fraction and per-articulation sleep state against immediate."""
-        # First-sleep timing is compared only on separated boxes: on a heap, island membership varies between modes.
-        final_asleep = {}
+    def test_separated_stacks_sleep_at_immediate_steps(self):
+        """Measured gates, set before validation: separated box stacks sleep like immediate and leave no colored units."""
+        scene_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        for _ in range(4):
+            world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            for ix in range(3):
+                for iy in range(3):
+                    for iz in range(3):
+                        body = world.add_body(
+                            xform=wp.transform(wp.vec3(0.3 * ix, 0.3 * iy, 0.051 + 0.102 * iz), wp.quat_identity())
+                        )
+                        world.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            scene_builder.add_world(world)
+        scene_builder.add_ground_plane()
+        model = scene_builder.finalize(device="cuda:0")
+        model.rigid_contact_max = 8192
+        first_sleep, final_asleep = {}, {}
         for response in ("immediate", "propagation_colored"):
-            scene = _Heap(response, heap=(4, 3, 2))
-            scene.step(480)
-            final_asleep[response] = scene.solver._sleeping.art_awake.numpy() == 0
-        immediate, colored = final_asleep["immediate"], final_asleep["propagation_colored"]
-        self.assertGreater(int(immediate.sum()), 0)
-        self.assertLessEqual(abs(colored.mean() - immediate.mean()), 0.05)
-        self.assertLessEqual(int(np.sum(immediate != colored)), scene.model.world_count)
+            scene = _Heap(response, model=model)
+            first = np.full(model.articulation_count, -1)
+            for k in range(360):
+                scene.step()
+                asleep = scene.solver._sleeping.art_awake.numpy() == 0
+                first[(first < 0) & asleep] = k
+                if response == "propagation_colored" and k == 0:
+                    self.assertGreater(len(scene.units()[0]), 0)
+            first_sleep[response], final_asleep[response] = first, asleep
+        self.assertEqual(len(scene.units()[0]), 0)
+        self.assertTrue(final_asleep["immediate"].all())
+        self.assertTrue(final_asleep["propagation_colored"].all())
+        delta = np.abs(first_sleep["propagation_colored"] - first_sleep["immediate"])
+        self.assertLessEqual(int(delta.max()), 6)
 
 
 class TestFeatherPGSSleepWorkSkipping(unittest.TestCase):
