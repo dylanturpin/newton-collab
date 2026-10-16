@@ -60,6 +60,7 @@ from .contact_angular_friction import (
     free_rigid_route_bodies,
     launch_angular_friction_rows,
     launch_free_rigid_angular_friction_rows,
+    launch_propagation_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
     validate_free_rigid_angular_friction_mode,
     validate_torsional_rolling_friction_coefficients,
@@ -85,6 +86,8 @@ from .kernels import (
     FRICTION_MODE_CURRENT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
+    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_COUNT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
@@ -1738,7 +1741,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           groups the shapes of free-rigid-route bodies by these coefficients. Shape edits take effect at
           :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` and, under body-pair reduction,
           :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups`; a solver built without angular
-          rows must be rebuilt to gain them.
+          rows must be rebuilt to gain them. Supported with ``articulated_contact_response`` ``"immediate"``
+          and ``"propagation"``; the rows start cold every step, also under ``contact_warmstart``.
 
         The solver reads them from the model at every step, for example
         ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
@@ -7582,6 +7586,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._propagation_max_constraints,
                 device_arch,
                 worlds_per_block=self._propagation_gs_worlds_per_block,
+                free_rigid_angular=self._free_rigid_angular_rows,
             )
             fused_size = getattr(self, "_propagation_full_fused_size", None)
             if self._propagation_full_fused_iterations and fused_size is not None:
@@ -12924,6 +12929,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     ],
                     device=model.device,
                 )
+                if self._free_rigid_angular_rows:
+                    launch_propagation_free_rigid_angular_friction_rows(self, contacts, contact_build_threads)
 
             if propagation_active:
                 wp.launch(
@@ -20004,7 +20011,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 
 
 def _get_pgs_solve_propagation_contact_kernel(
-    propagation_max_constraints: int, device_arch: str, worlds_per_block: int = 1
+    propagation_max_constraints: int, device_arch: str, worlds_per_block: int = 1, free_rigid_angular: bool = False
 ) -> "wp.Kernel":
     """Build a one-warp propagation contact GS kernel for fixed-size body rows.
 
@@ -20013,11 +20020,37 @@ def _get_pgs_solve_propagation_contact_kernel(
     capped by the hardware block-slot limit at 24 warps/SM; packing two
     worlds per 64-thread block reaches the full 48 warps/SM, doubling the
     number of concurrently resident serial GS chains.
+    ``free_rigid_angular`` solves the rolling pair (a disk) and spin row (a box) that follow a free-rigid
+    contact's sliding pair, bounded by their coefficient times the pooled normal load.
     """
     M = propagation_max_constraints
     W = max(int(worlds_per_block), 1)
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    rolling_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    # Both disk blocks share the sliding pair's solve; only the rows that start a block and the sibling differ.
+    is_disk = (
+        f"(row_type == {friction_type} || row_type == {rolling_type})"
+        if free_rigid_angular
+        else f"(row_type == {friction_type})"
+    )
+    is_bounded = (
+        f"(row_type == {friction_type} || row_type == {rolling_type} || row_type == {spin_type})"
+        if free_rigid_angular
+        else f"(row_type == {friction_type})"
+    )
+    spin_projection = (
+        f"""}} else if (row_type == {spin_type}) {{
+                    const int parent_idx = propagation_row_parent.data[off];
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
+                    const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
+                    new_impulse = fminf(fmaxf(new_impulse, -radius), radius);"""
+        if free_rigid_angular
+        else ""
+    )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -20083,13 +20116,13 @@ def _get_pgs_solve_propagation_contact_kernel(
                 }}
             }}
 
-            if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+            if ({is_bounded} && global_iter < friction_start_iteration) {{
                 if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
                 continue;
             }}
 
-            if (eff_inv <= 0.0f && row_type != 2) {{
+            if (eff_inv <= 0.0f && !{is_disk}) {{
                 __syncwarp();
                 continue;
             }}
@@ -20128,16 +20161,18 @@ def _get_pgs_solve_propagation_contact_kernel(
 
                 if (row_type == {contact_type}) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
-                }} else if (row_type == {friction_type}) {{
+                }} else if ({is_disk}) {{
                     const int parent_idx = propagation_row_parent.data[off];
                     float lambda_n = propagation_impulses.data[world_base + parent_idx];
                     for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                         lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (i != parent_idx + 1) {{
+                    // A disk block is solved at its first row: the sliding pair at parent + 1, the rolling pair at + 3.
+                    const int block_start = row_type == {friction_type} ? parent_idx + 1 : parent_idx + 3;
+                    if (i != block_start) {{
                         new_impulse = old_impulse;
                     }} else {{
-                        sib = parent_idx + 2;
+                        sib = i + 1;
                         const int sib_off = world_base + sib;
                         const float other = propagation_impulses.data[sib_off];
                         float sibling_residual = propagation_rhs.data[sib_off];
@@ -20160,6 +20195,7 @@ def _get_pgs_solve_propagation_contact_kernel(
                         sib_delta = sib_new - other;
                         propagation_impulses.data[sib_off] = sib_new;
                     }}
+                {spin_projection}
                 }}
 
                 delta_impulse = new_impulse - old_impulse;
@@ -20274,7 +20310,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}"
+    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}{'_free_rigid_angular' if free_rigid_angular else ''}"
     pgs_solve_propagation_template.__name__ = name
     pgs_solve_propagation_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
