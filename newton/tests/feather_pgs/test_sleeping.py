@@ -2179,6 +2179,19 @@ class TestSleepingColoredPropagation(unittest.TestCase):
             for name in _FIELDS:
                 np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} step {k}")
 
+    def test_heap_settles_asleep_like_immediate(self):
+        """Measured gates, set before validation: asleep fraction and per-articulation sleep state against immediate."""
+        # First-sleep timing is compared only on separated boxes: on a heap, island membership varies between modes.
+        final_asleep = {}
+        for response in ("immediate", "propagation_colored"):
+            scene = _Heap(response, heap=(4, 3, 2))
+            scene.step(480)
+            final_asleep[response] = scene.solver._sleeping.art_awake.numpy() == 0
+        immediate, colored = final_asleep["immediate"], final_asleep["propagation_colored"]
+        self.assertGreater(int(immediate.sum()), 0)
+        self.assertLessEqual(abs(colored.mean() - immediate.mean()), 0.05)
+        self.assertLessEqual(int(np.sum(immediate != colored)), scene.model.world_count)
+
 
 class TestFeatherPGSSleepWorkSkipping(unittest.TestCase):
     pass
