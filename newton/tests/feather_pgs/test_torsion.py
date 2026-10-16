@@ -2440,6 +2440,16 @@ class TestPropagationTorsion(unittest.TestCase):
         self.assertLessEqual(gaps[128], gaps[32] + 1.0e-6, gaps)
         self.assertLessEqual(gaps[512], gaps[128] + 1.0e-6, gaps)
 
+    def test_worlds_solve_as_if_isolated(self):
+        """Solve each world of an odd world count, packed two per block, as the same world alone."""
+        spins = (4.0, 1.14, 0.3)
+        together, solver = _spinner("propagation", 32, 0.01, spin=spins, steps=2)
+        self.assertEqual(solver._propagation_gs_worlds_per_block, 2)
+        for world, spin in enumerate(spins):
+            self.assertEqual(len(_propagation_torsion_rows(solver, world)), 3)
+            alone, _ = _spinner("propagation", 32, 0.01, spin=spin, steps=2)
+            np.testing.assert_allclose(together.reshape(-1, 2)[world], alone, atol=1.0e-6)
+
     def test_contact_order_changes_the_result_no_more_than_on_immediate(self):
         """Reorder the contact buffer: plain's change stays within immediate's order floor plus float noise."""
         results = {}
@@ -2662,8 +2672,10 @@ def _spinner(response, iterations, radius, *, spin, steps=1, graph=False):
     """Press three spheres fixed to one spinning slider onto the ground and return its joint velocity.
 
     The feet share the slider's two DOFs, so the propagation sweep splits their mass; the middle foot
-    sits on the spin axis, where only its torsion row resists the spin.
+    sits on the spin axis, where only its torsion row resists the spin. A sequence ``spin`` replicates
+    one world per rate.
     """
+    spins = np.atleast_1d(np.asarray(spin, dtype=np.float32))
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.mu = 0.5
     slider = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
@@ -2685,6 +2697,10 @@ def _spinner(response, iterations, radius, *, spin, steps=1, graph=False):
         )
     builder.add_articulation(joints)
     builder.add_ground_plane()
+    if len(spins) > 1:
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        scene.replicate(builder, len(spins), spacing=(1.0, 0.0, 0.0))
+        builder = scene
     model = builder.finalize(device="cuda:0")
     set_torsion_radius(model, radius)
     solver = SolverFeatherPGS(
@@ -2701,7 +2717,7 @@ def _spinner(response, iterations, radius, *, spin, steps=1, graph=False):
         contact_torsion_device=True,
     )
     state, output = model.state(), model.state()
-    state.joint_qd.assign(np.array([-1.0, spin], dtype=np.float32))
+    state.joint_qd.assign(np.stack([np.full_like(spins, -1.0), spins], axis=1).reshape(-1))
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
