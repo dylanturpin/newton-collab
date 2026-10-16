@@ -698,7 +698,7 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
             "free_rigid_torsional_friction": 0.001,
         }
         pose_immediate, twist_immediate, _ = _simulate("sphere", 0.0, **kwargs)
-        pose_off, twist_off, _ = _simulate("sphere", 0.0, steps=60, linear=kwargs["linear"], angular=kwargs["angular"])
+        _, twist_off, _ = _simulate("sphere", 0.0, steps=60, linear=kwargs["linear"], angular=kwargs["angular"])
         pose, twist, _ = _simulate("sphere", 0.0, **kwargs, **_PROPAGATION)
         np.testing.assert_allclose(twist, twist_immediate, atol=1.0e-5)
         np.testing.assert_allclose(pose[:3], pose_immediate[:3], atol=1.0e-6)
