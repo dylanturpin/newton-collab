@@ -7752,6 +7752,7 @@ def build_propagation_contact_rows(
     contact_path: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -7816,6 +7817,13 @@ def build_propagation_contact_rows(
         body_a = shape_body[shape_a]
     if shape_b >= 0:
         body_b = shape_body[shape_b]
+    # As in the matrix-free rows, a body with no response DOFs is static to the solve; worlds may share it.
+    response_body_a = -1
+    response_body_b = -1
+    if body_a >= 0 and contact_art_a[c] >= 0 and articulation_response_dof_count[contact_art_a[c]] > 0:
+        response_body_a = body_a
+    if body_b >= 0 and contact_art_b[c] >= 0 and articulation_response_dof_count[contact_art_b[c]] > 0:
+        response_body_b = body_b
 
     thickness_a = contact_thickness0[c]
     thickness_b = contact_thickness1[c]
@@ -7879,7 +7887,7 @@ def build_propagation_contact_rows(
         else:
             d = t1
 
-        if body_a >= 0:
+        if response_body_a >= 0:
             point_a_row_world = point_a_world
             if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
                 point_a_row_world = contact_anchor_world
@@ -7894,7 +7902,7 @@ def build_propagation_contact_rows(
             propagation_J_a[world, row_idx, 4] = ang_a[1]
             propagation_J_a[world, row_idx, 5] = ang_a[2]
 
-        if body_b >= 0:
+        if response_body_b >= 0:
             point_b_row_world = point_b_world
             if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
                 point_b_row_world = contact_anchor_world
@@ -7909,8 +7917,8 @@ def build_propagation_contact_rows(
             propagation_J_b[world, row_idx, 4] = -ang_b[1]
             propagation_J_b[world, row_idx, 5] = -ang_b[2]
 
-        propagation_body_a[world, row_idx] = body_a
-        propagation_body_b[world, row_idx] = body_b
+        propagation_body_a[world, row_idx] = response_body_a
+        propagation_body_b[world, row_idx] = response_body_b
 
         if row_offset == 0:
             propagation_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT

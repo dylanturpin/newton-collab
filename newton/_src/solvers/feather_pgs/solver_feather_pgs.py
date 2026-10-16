@@ -9344,7 +9344,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._propagation_row_type,
                 self._propagation_row_parent,
                 self._propagation_row_mu,
-                self._body_has_response_dofs,
                 1,
                 omega,
                 int(regularize and self._regularization_enabled),
@@ -12968,6 +12967,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._contact_path,
                         self._contact_art_a,
                         self._contact_art_b,
+                        self._articulation_response_dof_count,
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
@@ -20182,15 +20182,12 @@ def _get_pgs_solve_propagation_contact_kernel(
             }}
 
             int active_body = -1;
-            int active_responds = 0;
             int active_k = -1;
             float active_J = 0.0f;
             float active_MiJt = 0.0f;
             float partial = 0.0f;
-            // A body without response DOFs keeps no scratch; several worlds may share it.
             if (lane < 6 && ba >= 0) {{
                 active_body = ba;
-                active_responds = body_has_response_dofs.data[ba];
                 active_k = lane;
                 active_J = my_J;
                 active_MiJt = my_MiJt;
@@ -20198,7 +20195,6 @@ def _get_pgs_solve_propagation_contact_kernel(
             }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
                 const int k = lane - 6;
                 active_body = bb;
-                active_responds = body_has_response_dofs.data[bb];
                 active_k = k;
                 active_J = my_J;
                 active_MiJt = my_MiJt;
@@ -20263,10 +20259,10 @@ def _get_pgs_solve_propagation_contact_kernel(
                 const int sib_off = world_base + sib;
                 const int sib_ba = propagation_body_a.data[sib_off];
                 const int sib_bb = propagation_body_b.data[sib_off];
-                if (lane < 6 && sib_ba >= 0 && (sib_ba == ba ? active_responds : body_has_response_dofs.data[sib_ba]) != 0) {{
+                if (lane < 6 && sib_ba >= 0) {{
                     propagation_body_qd.data[sib_ba * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
                     propagation_body_impulses.data[sib_ba * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
-                }} else if (lane >= 6 && lane < 12 && sib_bb >= 0 && (sib_bb == bb ? active_responds : body_has_response_dofs.data[sib_bb]) != 0) {{
+                }} else if (lane >= 6 && lane < 12 && sib_bb >= 0) {{
                     const int k = lane - 6;
                     propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
                     propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
@@ -20274,7 +20270,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             }}
 
             delta_impulse = __shfl_sync(0xffffffff, delta_impulse, 0);
-            if (delta_impulse != 0.0f && active_body >= 0 && active_responds != 0) {{
+            if (delta_impulse != 0.0f && active_body >= 0) {{
                 propagation_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
                 propagation_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
             }}
@@ -20304,7 +20300,6 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
-        body_has_response_dofs: wp.array[int],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20330,7 +20325,6 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
-        body_has_response_dofs: wp.array[int],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20357,7 +20351,6 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_row_type,
             propagation_row_parent,
             propagation_row_mu,
-            body_has_response_dofs,
             iterations,
             omega,
             regularize,
