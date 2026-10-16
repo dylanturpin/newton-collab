@@ -4245,7 +4245,8 @@ def populate_connect_J_for_size(
             e[axis] = 1.0
             target = float(0.0)
 
-            # J = e . (Jpoint(parent, p_a) - Jpoint(child, p_b)): ancestor walks with
+            # J = e . (Jpoint(parent, p_m) - Jpoint(child, p_m)) with p_m the anchors'
+            # midpoint, so the impulse pair acts at one world point: ancestor walks with
             # opposite signs; shared ancestors partially cancel automatically.
             if prescribed:
                 target = -wp.dot(e, v_a)
