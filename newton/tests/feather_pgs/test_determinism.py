@@ -746,6 +746,47 @@ def test_deterministic_propagation_rejects_bodies_shared_by_worlds(test, device)
     SolverFeatherPGS(single, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
 
 
+def test_deterministic_propagation_drops_explicit_cross_world_pairs(test, device):
+    """Keep a world's prescribed body in that world's rows when explicit pairs join it to another world's shapes."""
+    builder = newton.ModelBuilder()
+    first = _build_heap_arm_world(0)
+    floor = first.add_link(is_kinematic=True)
+    floor_shape = first.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+    builder.add_world(first)
+    builder.add_world(_build_heap_arm_world(1))
+    model = builder.finalize(device=device)
+    pairs = np.array(
+        [[floor_shape, shape] for shape in range(model.shape_count) if shape != floor_shape], dtype=np.int32
+    )
+    rows_by_world = {}
+    for deterministic in (False, True):
+        solver = SolverFeatherPGS(
+            model, deterministic=deterministic, warn_constraint_overflow=False, **PROPAGATION_SOLVER_OPTIONS
+        )
+        pipeline = newton.CollisionPipeline(
+            model,
+            deterministic=True,
+            broad_phase="explicit",
+            shape_pairs_filtered=wp.array(pairs, dtype=wp.vec2i, device=device),
+        )
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        counts = solver._propagation_constraint_count.numpy()
+        sides = [solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()]
+        rows_by_world[deterministic] = [
+            int(sum(np.count_nonzero(side[world, :count] == floor) for side in sides))
+            for world, count in enumerate(counts)
+        ]
+        overflow = solver.constraint_overflow.numpy()
+    # Without the flag the pairs reach both worlds' rows; with it only the floor's own world keeps them.
+    test.assertGreater(min(rows_by_world[False]), 0)
+    test.assertGreater(rows_by_world[True][0], 0)
+    test.assertEqual(rows_by_world[True][1], 0)
+    test.assertTrue(overflow[1])
+
+
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
     """Drive, joint-limit and velocity-limit rows of a world take their slots in articulation order."""
     arts_per_world = 40
@@ -952,6 +993,12 @@ for _device in get_test_devices():
             TestFeatherPGSDeterminism,
             "test_deterministic_propagation_rejects_bodies_shared_by_worlds",
             test_deterministic_propagation_rejects_bodies_shared_by_worlds,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_drops_explicit_cross_world_pairs",
+            test_deterministic_propagation_drops_explicit_cross_world_pairs,
             devices=[_device],
         )
 

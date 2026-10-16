@@ -1961,9 +1961,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 physics in either mode: size the row capacities to avoid them.
                 Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation"``, and contacts from
                 ``CollisionPipeline(deterministic=True)``. With ``"propagation"`` on several worlds, each body with
-                shapes and all of its shapes must belong to one world (global static geometry has no body), so only
-                that world's rows reference the body; the warm-start seed of each body is also summed in row order.
-                Adds a
+                shapes and all of its shapes must belong to one world (global static geometry has no body), and a
+                contact that joins a prescribed body to another world's body, as explicit shape pairs can, is
+                dropped and flagged in ``constraint_overflow`` like an overflowing row, so only one world's rows
+                reference each body; the warm-start seed of each body is also summed in row order. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -2616,6 +2617,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 raise ValueError(
                     "deterministic=True with 'propagation' requires each shaped body and its shapes to share one world"
                 )
+        # Explicit or custom contact pairs can still join shapes of different worlds; drop those rows and flag them.
+        self._isolate_prescribed_bodies = (
+            self._deterministic and articulated_contact_response == "propagation" and model.world_count > 1
+        )
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
@@ -12509,6 +12514,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._sleeping.contact_response_mask
                     if self._sleeping is not None
                     else self._body_has_response_dofs,
+                    model.body_world,
+                    int(self._isolate_prescribed_bodies),
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,

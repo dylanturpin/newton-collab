@@ -4919,6 +4919,8 @@ def _allocate_world_contact_slot(
     articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
     body_has_response_dofs: wp.array[int],
+    body_world: wp.array[int],
+    isolate_prescribed_bodies: int,
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5016,6 +5018,12 @@ def _allocate_world_contact_slot(
             world = -2
         if not b_can_respond and b_has_dofs and art_to_world[art_b] != world:
             world = -2
+        # A prescribed body of another world would take rows of several worlds; deterministic propagation drops them.
+        if isolate_prescribed_bodies != 0:
+            if not a_can_respond and body_a >= 0 and body_world[body_a] != world:
+                world = -2
+            if not b_can_respond and body_b >= 0 and body_world[body_b] != world:
+                world = -2
     if world == -2:
         if art_a >= 0:
             wp.atomic_add(dense_dropped_contact_rows, art_to_world[art_a], 3)
@@ -5199,6 +5207,8 @@ def allocate_world_contact_slots(
     articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
     body_has_response_dofs: wp.array[int],
+    body_world: wp.array[int],
+    isolate_prescribed_bodies: int,
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5278,6 +5288,8 @@ def allocate_world_contact_slots(
             articulation_response_dof_count,
             body_flags,
             body_has_response_dofs,
+            body_world,
+            isolate_prescribed_bodies,
             is_free_rigid,
             has_free_rigid,
             propagation_articulated_contacts,
