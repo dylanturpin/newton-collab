@@ -1745,8 +1745,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
           groups the shapes of free-rigid-route bodies by these coefficients. Shape edits take effect at
           :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` and, under body-pair reduction,
           :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups`; a solver built without angular
-          rows must be rebuilt to gain them. Supported with ``articulated_contact_response`` ``"immediate"``
-          and ``"propagation"``; the rows start cold every step, also under ``contact_warmstart``.
+          rows must be rebuilt to gain them. Supported with ``articulated_contact_response`` ``"immediate"``,
+          ``"propagation"`` and ``"propagation_colored"``, which solves them inside their contact's colored
+          unit; the rows start cold every step, also under ``contact_warmstart``.
 
         The solver reads them from the model at every step, for example
         ``model.feather_pgs.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
@@ -7584,6 +7585,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._propagation_colored_block_dim,
                 int(getattr(self, "_max_propagation_bodies", 0)),
                 device_arch,
+                free_rigid_angular=self._free_rigid_angular_rows,
             )
             self._pgs_solve_propagation_colored_warp_kernel = None
             mb = int(getattr(self, "_max_propagation_bodies", 0))
@@ -7626,6 +7628,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     staged=staged,
                     packed=packed,
                     straight_line=self._propagation_colored_straight_line,
+                    free_rigid_angular=self._free_rigid_angular_rows,
                 )
             # The coloring keeps a world's used-color masks (16 words per body) in shared
             # memory when its unit bodies span few enough indices. Size that span from the
@@ -18826,8 +18829,124 @@ def _colored_standard_unit_reference(friction: str = "true") -> str:
     return _colored_standard_unit(acc, ring, setup, friction=friction)
 
 
+def _colored_unit_angular_rows(first: str, *, shared: bool, end: str = "") -> str:
+    """CUDA solving the free-rigid rows after a colored unit's sliding pair, from unit row ``first``.
+
+    They are a rolling pair, solved as a disk at its first row (parent + 3), and a spin row, solved as a
+    box; both are bounded by their coefficient times the pooled patch load, as on the plain sweep.
+    ``shared`` reads the twists from the color loop's local slots, otherwise from the global bodies.
+    ``end`` is an extra condition that ends the unit.
+    """
+    rolling_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    if shared:
+        locate = """const int la = (ba >= 0) ? propagation_body_local_slot.data[ba] : -1;
+                const int lb = (bb >= 0) ? propagation_body_local_slot.data[bb] : -1;"""
+
+        def qd(side: str, k: str) -> str:
+            return f"s_qd[l{side} * 6 + {k}]"
+
+        def imp(side: str, k: str) -> str:
+            return f"s_imp[l{side} * 6 + {k}]"
+
+    else:
+        locate = "const int la = ba;\n                const int lb = bb;"
+
+        def qd(side: str, k: str) -> str:
+            return f"propagation_body_qd.data[l{side} * 6 + {k}]"
+
+        def imp(side: str, k: str) -> str:
+            return f"propagation_body_impulses.data[l{side} * 6 + {k}]"
+
+    def apply(row_off: str, delta: str) -> str:
+        return f"""for (int e = 0; e < 6; ++e) {{
+                        if (la >= 0) {{
+                            {qd("a", "e")} += propagation_MiJt_a.data[({row_off}) * 6 + e] * {delta};
+                            {imp("a", "e")} += propagation_J_a.data[({row_off}) * 6 + e] * {delta};
+                        }}
+                        if (lb >= 0) {{
+                            {qd("b", "e")} += propagation_MiJt_b.data[({row_off}) * 6 + e] * {delta};
+                            {imp("b", "e")} += propagation_J_b.data[({row_off}) * 6 + e] * {delta};
+                        }}
+                    }}"""
+
+    end_check = f"if ({end}) break;" if end else ""
+    return f"""
+            for (int xr = {first}; ; ++xr) {{
+                {end_check}
+                const int slot = start_slot + xr;
+                if (slot >= m) break;
+                const int off = world_base + slot;
+                const int row_type = propagation_row_type.data[off];
+                if (row_type != {rolling_type} && row_type != {spin_type}) break;
+                if (global_iter < friction_start_iteration) {{
+                    propagation_impulses.data[off] = 0.0f;
+                    continue;
+                }}
+                const int parent_idx = propagation_row_parent.data[off];
+                // The rolling pair's second row is solved together with its first, at parent_idx + 3.
+                if (row_type == {rolling_type} && slot != parent_idx + 3) continue;
+                const float eff_inv = propagation_eff_mass_inv.data[off];
+                if (eff_inv <= 0.0f && row_type == {spin_type}) continue;
+                const int ba = propagation_body_a.data[off];
+                const int bb = propagation_body_b.data[off];
+                {locate}
+                float jv = 0.0f;
+                for (int k = 0; k < 6; ++k) {{
+                    if (la >= 0) jv += propagation_J_a.data[off * 6 + k] * {qd("a", "k")};
+                    if (lb >= 0) jv += propagation_J_b.data[off * 6 + k] * {qd("b", "k")};
+                }}
+                const float residual = jv + propagation_rhs.data[off];
+                const float old_impulse = propagation_impulses.data[off];
+                const float w = regularize ? propagation_row_w.data[off] : 1.0f;
+                float new_impulse = old_impulse + omega * (-residual * eff_inv * w - (1.0f - w) * old_impulse);
+                float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                    lambda_n += propagation_impulses.data[world_base + patch_row];
+                const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
+                if (row_type == {spin_type}) {{
+                    new_impulse = fminf(fmaxf(new_impulse, -radius), radius);
+                }} else {{
+                    const int sib_off = off + 1;
+                    const float other = propagation_impulses.data[sib_off];
+                    float sibling_residual = propagation_rhs.data[sib_off];
+                    float cross = 0.0f;
+                    for (int k = 0; k < 6; ++k) {{
+                        if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * {qd("a", "k")};
+                        if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                        if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * {qd("b", "k")};
+                        if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                    }}
+                    const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                    float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                        residual, sibling_residual, old_impulse, other, radius, omega);
+                    new_impulse = pair.x;
+                    const float trial_sib = pair.y;
+                    const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                    const float scale = mag > radius ? radius / mag : 1.0f;
+                    new_impulse *= scale;
+                    const float sib_new = trial_sib * scale;
+                    const float sib_delta = sib_new - other;
+                    propagation_impulses.data[sib_off] = sib_new;
+                    if (sib_delta != 0.0f) {{
+                    {apply("sib_off", "sib_delta")}
+                    }}
+                }}
+                const float delta_impulse = new_impulse - old_impulse;
+                propagation_impulses.data[off] = new_impulse;
+                if (delta_impulse != 0.0f) {{
+                    {apply("off", "delta_impulse")}
+                }}
+            }}
+"""
+
+
 def _colored_prefetch_unit_body(
-    contact_type: int, friction_type: int, staged: bool = False, packed: bool = False
+    contact_type: int,
+    friction_type: int,
+    staged: bool = False,
+    packed: bool = False,
+    free_rigid_angular: bool = False,
 ) -> str:
     """CUDA body solving one contact unit on a single lane with its rows prefetched.
 
@@ -18842,6 +18961,7 @@ def _colored_prefetch_unit_body(
     With ``staged`` the lane's first unit of each color reads its payload from the
     shared buffer ``s_pay`` that the color loop filled with ``cp.async`` during the
     previous color (layout: :func:`_get_colored_payload_pack_kernel`); other units load directly.
+    ``free_rigid_angular`` also solves the free-rigid angular rows recorded past a unit's sliding pair.
     """
     P = 3
 
@@ -19140,6 +19260,11 @@ def _colored_prefetch_unit_body(
                         #pragma unroll
                         for (int q = 0; q < 5; ++q) fp[q] = u_fp[q];"""
     standard = _colored_standard_unit(acc, ring, setup, friction=f"um[{PROPAGATION_UNIT_STD_WORD}] == 1")
+    angular = (
+        _colored_unit_angular_rows(str(P), shared=True, end=f"xr >= um[{5 + PROPAGATION_UNIT_RING}]")
+        if free_rigid_angular
+        else ""
+    )
     return f"""
             {{
                 int p_type[{P}], p_ba[{P}], p_bb[{P}], p_par[{P}];
@@ -19200,6 +19325,7 @@ def _colored_prefetch_unit_body(
                         const int off = world_base + slot;
 {tail}
                     }}
+{angular}
                 }}
                 }}
             }}
@@ -19218,6 +19344,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     staged: bool = False,
     packed: bool = False,
     straight_line: bool = True,
+    free_rigid_angular: bool = False,
 ) -> "wp.Kernel":
     """Build the warp-per-world colored solver with sub-warp unit cooperation.
 
@@ -19231,6 +19358,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     velocity and deferred impulse live in per-warp shared-memory staging.
     Row solve order and results match the serial semantics (group branches
     are row-uniform); only float summation order inside a row's dot differs.
+    ``free_rigid_angular`` solves the rolling pair and spin row that follow a free-rigid contact's sliding
+    pair inside its unit (see :func:`_colored_unit_angular_rows`).
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -19247,9 +19376,28 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 
     # The next row's dot reads entries other lanes of the group just wrote.
     row_sync = f"                __syncwarp({gmask});" if R > 1 else ""
+    rolling_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    angular = _colored_unit_angular_rows("rr", shared=True) if free_rigid_angular else ""
+    coop_angular = angular
+    if free_rigid_angular and R > 1:
+        # The group leader solves the angular rows alone, between barriers over the group.
+        coop_angular = f"""
+            __syncwarp({gmask});
+            if (gl == 0) {{
+{angular}
+            }}
+            __syncwarp({gmask});"""
+    # A standard unit's sliding pair is the unit's last row unless angular rows follow it.
+    standard_end = (
+        f"(row_after != {friction_type} && row_after != {rolling_type} && row_after != {spin_type})"
+        if free_rigid_angular
+        else f"row_after != {friction_type}"
+    )
 
     coop_body = f"""
-            for (int rr = 0; ; ++rr) {{
+            int rr = 0;
+            for (; ; ++rr) {{
                 const int slot = start_slot + rr;
                 if (slot >= m) break;
                 const int off = world_base + slot;
@@ -19353,10 +19501,12 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                 }}
 {row_sync}
             }}
+{coop_angular}
 """
 
     tail_body = f"""
-            for (int rr = 0; ; ++rr) {{
+            int rr = 0;
+            for (; ; ++rr) {{
                 const int slot = start_slot + rr;
                 if (slot >= m) break;
                 const int off = world_base + slot;
@@ -19439,6 +19589,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     }}
                 }}
             }}
+{angular}
 """
 
     if R == 1 and straight_line:
@@ -19446,7 +19597,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         coop_body = f"""
             int std_la = -1, std_lb = -1;
             bool standard = false;
-            if (start_slot + 2 < m && (start_slot + 3 >= m || propagation_row_type.data[world_base + start_slot + 3] != {friction_type})) {{
+            const int row_after = (start_slot + 3 < m) ? propagation_row_type.data[world_base + start_slot + 3] : -1;
+            if (start_slot + 2 < m && {standard_end}) {{
                 const int o = world_base + start_slot;
                 const int ba = propagation_body_a.data[o];
                 const int bb = propagation_body_b.data[o];
@@ -19477,7 +19629,9 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             }}"""
     _prefetch = R == 1 and bool(prefetch)
     if _prefetch:
-        coop_body = _colored_prefetch_unit_body(contact_type, friction_type, staged=staged, packed=packed or staged)
+        coop_body = _colored_prefetch_unit_body(
+            contact_type, friction_type, staged=staged, packed=packed or staged, free_rigid_angular=free_rigid_angular
+        )
     staged = bool(staged) and _prefetch
     if staged:
         # Two-deep software pipeline for one world per block. While color c solves, the
@@ -19764,7 +19918,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}_pk{int(bool(packed or staged))}_sl{int(bool(straight_line))}"
+    name = (
+        f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
+        f"_pk{int(bool(packed or staged))}_sl{int(bool(straight_line))}{'_fra' if free_rigid_angular else ''}"
+    )
     pgs_solve_propagation_colored_warp_template.__name__ = name
     pgs_solve_propagation_colored_warp_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_warp_template)
@@ -19777,6 +19934,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     block_dim: int,
     max_propagation_bodies: int,
     device_arch: str,
+    free_rigid_angular: bool = False,
 ) -> "wp.Kernel":
     """Build the block-local colored propagation solver over contact units.
 
@@ -19787,6 +19945,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     exact Gauss-Seidel, while units of one color share no body and write
     race-free. The tail segment (color-cap overflow) runs ordered on
     thread 0. One launch per PGS iteration regardless of color count.
+    ``free_rigid_angular`` solves a free-rigid contact's angular rows inside its unit.
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -19798,9 +19957,12 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     # global-memory path (no per-step behavior switches).
     MB = max(int(max_propagation_bodies), 1)
     use_staging = MB <= 384
+    angular_global = _colored_unit_angular_rows("rr", shared=False) if free_rigid_angular else ""
+    angular_staged = _colored_unit_angular_rows("rr", shared=True) if free_rigid_angular else ""
 
     unit_solve_body = f"""
-            for (int rr = 0; ; ++rr) {{
+            int rr = 0;
+            for (; ; ++rr) {{
                 const int slot = start_slot + rr;
                 if (slot >= m) break;
                 const int off = world_base + slot;
@@ -19927,10 +20089,12 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     }}
                 }}
             }}
+{angular_global}
 """
 
     unit_solve_body_staged = f"""
-            for (int rr = 0; ; ++rr) {{
+            int rr = 0;
+            for (; ; ++rr) {{
                 const int slot = start_slot + rr;
                 if (slot >= m) break;
                 const int off = world_base + slot;
@@ -20060,6 +20224,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     }}
                 }}
             }}
+{angular_staged}
 """
 
     body = unit_solve_body_staged if use_staging else unit_solve_body
@@ -20214,7 +20379,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
         )
 
     stag = "sb" if use_staging else "gb"
-    name = f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}_{stag}{MB}"
+    name = f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}_{stag}{MB}{'_fra' if free_rigid_angular else ''}"
     pgs_solve_propagation_colored_block_template.__name__ = name
     pgs_solve_propagation_colored_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_block_template)

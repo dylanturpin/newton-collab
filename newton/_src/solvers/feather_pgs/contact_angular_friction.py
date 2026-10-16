@@ -178,7 +178,7 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         not model.device.is_cuda
         or model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response not in ("immediate", "propagation")
+        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._contact_compliance
@@ -187,8 +187,9 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
     ):
         raise ValueError(
             "Free-rigid angular friction (feather_pgs:condim above 3) requires CUDA non-differentiable matrix_free "
-            "solving with articulated_contact_response 'immediate' or 'propagation', row_schedule='interleaved', "
-            "friction_mode='fixed_normal', the fused matrix-free GS kernel, and no contact compliance"
+            "solving with articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
+            "row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
+            "and no contact compliance"
         )
 
 
