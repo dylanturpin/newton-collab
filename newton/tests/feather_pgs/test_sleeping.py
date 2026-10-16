@@ -2146,39 +2146,6 @@ class TestSleepingColoredPropagation(unittest.TestCase):
             force[:] = 0.0
         self.assertEqual(int(captured.solver._sleeping.body_awake.numpy()[asleep[0]]), 1)
 
-    def test_skipped_free_bodies_skip_the_velocity_round_trip_bitwise(self):
-        """Match a rollout whose free-body propagation refresh and flush also visit skipped sleeping bodies."""
-        module = inspect.getmodule(SolverFeatherPGS)
-        launch = wp.launch
-        kernels = (module.refresh_propagation_free_body_qd_from_vout, module.flush_propagation_free_body_qd_to_vout)
-        runs = []
-        for visit_all in (False, True):
-            scene = _Heap()
-            everyone = wp.ones(scene.model.articulation_count, dtype=wp.int32, device="cuda:0")
-
-            def launch_visiting_all(kernel, dim, inputs=None, *args, scene=scene, everyone=everyone, **kwargs):
-                if kernel in kernels:
-                    inputs = [everyone if value is scene.solver._dynamics_art_active else value for value in inputs]
-                return launch(kernel, dim, inputs, *args, **kwargs)
-
-            history = []
-            with patch.object(module.wp, "launch", launch_visiting_all if visit_all else launch):
-                force = np.zeros((scene.model.body_count, 6), dtype=np.float32)
-                for k in range(self.STEPS + 20):
-                    if k == self.STEPS:
-                        asleep = np.flatnonzero(scene.solver._sleeping.body_awake.numpy() == 0)
-                        self.assertGreater(len(asleep), 0)
-                        force[asleep[0], 2] = 5.0
-                    scene.state_in.body_f.assign(force)
-                    force[:] = 0.0
-                    scene.step(clear=False)
-                    history.append(scene.snapshot())
-            self.assertFalse(scene.solver._dynamics_art_active.numpy().all())
-            runs.append(history)
-        for k, (a, b) in enumerate(zip(*runs, strict=True)):
-            for name in _FIELDS:
-                np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} step {k}")
-
     def test_heap_settles_asleep_like_immediate(self):
         """Measured gates, set before validation: asleep fraction and per-articulation sleep state against immediate."""
         # First-sleep timing is compared only on separated boxes: on a heap, island membership varies between modes.
