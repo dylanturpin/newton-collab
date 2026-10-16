@@ -26596,7 +26596,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
         }}
 
-        for (int i = 0; i < mf_contact_end; i++) {{
+        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {{
             // Consume prefetched data for constraint i
             int4 meta = pre_meta;
             float cur_Ja = pre_Ja;
@@ -26604,10 +26604,14 @@ def _get_pgs_solve_mf_gs_kernel(
             float cur_MiJta = pre_MiJta;
             float cur_MiJtb = pre_MiJtb;
 
-            // Prefetch constraint i+1 (loads issued now, complete during compute)
-            if (i + 1 < mf_contact_end) {{
-                int next_mf6 = mf6_base + (i + 1) * 6;
-                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+            // The first row of a sliding pair also solves the second, so the sweep steps over it.
+            next_i = i + 1;
+            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;
+
+            // Prefetch the next visited constraint (loads issued now, complete during compute)
+            if (next_i < mf_contact_end) {{
+                int next_mf6 = mf6_base + next_i * 6;
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + next_i * 4]);
                 if (lane < 6) {{
                     pre_Ja = mf_J_a.data[next_mf6 + lane];
                     pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
@@ -26630,6 +26634,7 @@ def _get_pgs_solve_mf_gs_kernel(
             if (row_phase == 0 && mf_rt == 4) continue;
             if (mf_rt == 2 && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
+                if (next_i == i + 2) s_lam_mf[i + 1] = 0.0f;
                 __syncwarp();
                 continue;
             }}
