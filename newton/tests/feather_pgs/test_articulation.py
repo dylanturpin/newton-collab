@@ -4437,10 +4437,6 @@ for _name in (
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_cuda_test_devices())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _build_floating_four_bar():
     """A free-floating planar four-bar whose crank is driven against a locked rocker.
 
@@ -4541,55 +4537,74 @@ def _system_angular_momentum(model, pose_prev, pose, pose_next, dt):
     return total
 
 
+def _pgs_mode_for(device):
+    return "matrix_free" if wp.get_device(device).is_cuda else "split"
+
+
+def test_open_closure_on_floating_base_conserves_angular_momentum(test, device):
+    """An open loop closure must not spin a free-floating mechanism.
+
+    Two PGS iterations leave the loaded closure open by about 15 mm. The closure
+    impulses act at a shared anchor, so they apply no net wrench; with per-body
+    anchors they form a couple ``C x lambda`` and the system's angular momentum
+    grows at a constant rate (~80 mN m s over this run before the fix).
+    """
+    dt = 1.0 / 500.0
+    model = _build_floating_four_bar().finalize(device=device)
+    solver = SolverFeatherPGS(
+        model, solve_mode=_pgs_mode_for(device), iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
+    )
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
+    control = model.control()
+    poses = [state_0.body_q.numpy().reshape(-1, 7).astype(np.float64)]
+    for _ in range(300):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+        poses.append(state_0.body_q.numpy().reshape(-1, 7).astype(np.float64))
+    test.assertGreater(_loop_anchor_gap(model, state_0), 5.0e-3, "the closure should be loaded open")
+    momentum = _system_angular_momentum(model, poses[-3], poses[-2], poses[-1], dt)
+    test.assertLess(np.linalg.norm(momentum), 1.0e-3)
+
+
+def test_open_closure_parent_wrench_carries_no_couple(test, device):
+    """``BODY_PARENT_F`` must apply the solved closure impulses where the solve applied them.
+
+    The floating base hangs on a free joint, so its reported parent wrench is the
+    inverse-dynamics residual after the solved closure wrench is subtracted. Reading that
+    wrench back at the separate per-body anchors leaves a couple ``gap x force`` in the
+    root's torque that the shared-anchor solve never applied; at the shared anchor the
+    residual stays near zero.
+    """
+    dt = 1.0 / 500.0
+    model = _build_floating_four_bar().finalize(device=device)
+    solver = SolverFeatherPGS(
+        model, solve_mode=_pgs_mode_for(device), iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
+    )
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
+    control = model.control()
+    observables = solver.observables({SolverObservableFlags.BODY_PARENT_F})
+    for _ in range(300):
+        solver.step(state_0, state_1, control, None, dt, observables=observables)
+        state_0, state_1 = state_1, state_0
+    test.assertGreater(_loop_anchor_gap(model, state_0), 5.0e-3, "the closure should be loaded open")
+    root_wrench = observables.body_parent_f.numpy()[0]
+    test.assertLess(np.linalg.norm(root_wrench), 1.0e-3, f"free-joint root reports {root_wrench}")
+
+
 class TestFeatherPGSConnectMomentum(unittest.TestCase):
-    def test_open_closure_on_floating_base_conserves_angular_momentum(self):
-        """An open loop closure must not spin a free-floating mechanism.
+    pass
 
-        Two PGS iterations leave the loaded closure open by about 15 mm. The closure
-        impulses act at a shared anchor, so they apply no net wrench; with per-body
-        anchors they form a couple ``C x lambda`` and the system's angular momentum
-        grows at a constant rate (~80 mN m s over this run before the fix).
-        """
-        dt = 1.0 / 500.0
-        model = _build_floating_four_bar().finalize()
-        solver = newton.solvers.SolverFeatherPGS(
-            model, solve_mode=_pgs_mode(), iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
-        )
-        state_0, state_1 = model.state(), model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
-        control = model.control()
-        poses = [state_0.body_q.numpy().reshape(-1, 7).astype(np.float64)]
-        for _ in range(300):
-            solver.step(state_0, state_1, control, None, dt)
-            state_0, state_1 = state_1, state_0
-            poses.append(state_0.body_q.numpy().reshape(-1, 7).astype(np.float64))
-        self.assertGreater(_loop_anchor_gap(model, state_0), 5.0e-3, "the closure should be loaded open")
-        momentum = _system_angular_momentum(model, poses[-3], poses[-2], poses[-1], dt)
-        self.assertLess(np.linalg.norm(momentum), 1.0e-3)
 
-    def test_open_closure_parent_wrench_carries_no_couple(self):
-        """``BODY_PARENT_F`` must apply the solved closure impulses where the solve applied them.
+for _name in (
+    "test_open_closure_on_floating_base_conserves_angular_momentum",
+    "test_open_closure_parent_wrench_carries_no_couple",
+):
+    add_function_test(TestFeatherPGSConnectMomentum, _name, globals()[_name], devices=get_test_devices())
 
-        The floating base hangs on a free joint, so its reported parent wrench is the
-        inverse-dynamics residual after the solved closure wrench is subtracted. Reading that
-        wrench back at the separate per-body anchors leaves a couple ``gap x force`` in the
-        root's torque that the shared-anchor solve never applied; at the shared anchor the
-        residual stays near zero.
-        """
-        dt = 1.0 / 500.0
-        model = _build_floating_four_bar().finalize()
-        solver = newton.solvers.SolverFeatherPGS(
-            model, solve_mode=_pgs_mode(), iterations=2, enable_joint_limits=True, update_mass_matrix_interval=1
-        )
-        state_0, state_1 = model.state(), model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
-        control = model.control()
-        observables = solver.observables({SolverObservableFlags.BODY_PARENT_F})
-        for _ in range(300):
-            solver.step(state_0, state_1, control, None, dt, observables=observables)
-            state_0, state_1 = state_1, state_0
-        self.assertGreater(_loop_anchor_gap(model, state_0), 5.0e-3, "the closure should be loaded open")
-        root_wrench = observables.body_parent_f.numpy()[0]
-        self.assertLess(np.linalg.norm(root_wrench), 1.0e-3, f"free-joint root reports {root_wrench}")
+
+if __name__ == "__main__":
+    unittest.main()
