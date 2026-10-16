@@ -1106,6 +1106,7 @@ class TestModelMesh(unittest.TestCase):
         self.assertEqual(decompose("1.0.14", fake_threadpoolctl), [])
         with self.assertWarnsRegex(UserWarning, "coacd<1.0.14"):
             self.assertEqual(decompose("1.0.13", None), [])
+
     def test_mesh_approximation_coacd_limits_hull_vertices(self):
         """Limit each CoACD part to the source mesh's maxhullvert."""
 

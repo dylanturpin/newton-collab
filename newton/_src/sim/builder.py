@@ -9545,7 +9545,9 @@ class ModelBuilder:
                             )
                             if mesh.maxhullvert > 0:
                                 # Merged hulls keep the maxhullvert cap every decomposed hull has.
-                                vertex_limit = min(vertex_limit, mesh.maxhullvert) if vertex_limit > 0 else mesh.maxhullvert
+                                vertex_limit = (
+                                    min(vertex_limit, mesh.maxhullvert) if vertex_limit > 0 else mesh.maxhullvert
+                                )
                             decomposition = _merge_nearest_hulls(decomposition, hull_budget, vertex_limit)
                         decompositions[cache_key] = decomposition
                     if len(decomposition) == 0:
