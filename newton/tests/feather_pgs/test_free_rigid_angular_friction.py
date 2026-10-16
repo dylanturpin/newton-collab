@@ -94,6 +94,7 @@ def _simulate(
     parent_f=False,
     anchor_deg=None,
     on_solver=None,
+    on_step=None,
     **solver_kwargs,
 ):
     model, bodies = _scene(body, tilt_deg, inertia, count, anchor_deg)
@@ -147,6 +148,8 @@ def _simulate(
         for _ in range(steps):
             step(state_0, state_1)
             state_0, state_1 = state_1, state_0
+            if on_step is not None:
+                on_step(state_0.body_q.numpy()[obj], state_0.body_qd.numpy()[obj])
     elif graph:
         with wp.ScopedCapture(device=model.device) as capture:
             step(state_0, state_1)
@@ -772,9 +775,9 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
                 self.assertLessEqual(energy(twist), energy(twist_free) * (1.0 + 1.0e-4))
 
     def test_trajectory_matches_the_immediate_response(self):
-        """Track the immediate response's free-sphere trajectory with rolling and spin rows on.
+        """Track the immediate response's free-sphere trajectory at every step with rolling and spin rows on.
 
-        A lone free body has its exact inverse inertia on both routes, so the gap is row order and rounding.
+        The bound is empirical for this fixture: the two routes round differently, so their twists drift apart.
         """
         kwargs = {
             "steps": 60,
@@ -783,13 +786,22 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
             "free_rigid_rolling_friction": 0.002,
             "free_rigid_torsional_friction": 0.001,
         }
-        pose_immediate, twist_immediate, _ = _simulate("sphere", 0.0, **kwargs)
+        runs = {}
+        for name, options in (("immediate", kwargs), ("propagation", {**kwargs, **_PROPAGATION})):
+            poses, twists = [], []
+            _simulate(
+                "sphere",
+                0.0,
+                on_step=lambda pose, twist, p=poses, t=twists: (p.append(pose), t.append(twist)),
+                **options,
+            )
+            runs[name] = np.array(poses), np.array(twists)
         _, twist_off, _ = _simulate("sphere", 0.0, steps=60, linear=kwargs["linear"], angular=kwargs["angular"])
-        pose, twist, _ = _simulate("sphere", 0.0, **kwargs, **_PROPAGATION)
-        np.testing.assert_allclose(twist, twist_immediate, atol=1.0e-5)
-        np.testing.assert_allclose(pose[:3], pose_immediate[:3], atol=1.0e-6)
+        (pose_immediate, twist_immediate), (pose, twist) = runs["immediate"], runs["propagation"]
+        np.testing.assert_allclose(twist, twist_immediate, rtol=0.0, atol=5.0e-5)
+        np.testing.assert_allclose(pose[:, :3], pose_immediate[:, :3], rtol=0.0, atol=1.0e-6)
         # The rows change the trajectory far beyond that gap, so this is no silent drop.
-        self.assertGreater(float(np.max(np.abs(twist_immediate - twist_off))), 1.0)
+        self.assertGreater(float(np.max(np.abs(twist_immediate[-1] - twist_off))), 1.0)
 
     def test_rows_start_cold_under_warm_start(self):
         """Carry the normal and sliding impulses but start the angular rows at zero, as the immediate route does."""
