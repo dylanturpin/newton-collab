@@ -38,7 +38,6 @@ from ...sim.articulation import eval_fk, eval_jacobian
 from ...sim.enums import BodyFlags, JointType
 from ..coupled.interface import CouplingInterface
 from ..coupled.model_view import ModelView
-from ..observables import SolverObservableFlags, SolverObservables
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -1560,8 +1559,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     existing representation. Selection uses topology and resources, not task names.
 
     Solver observables:
-        :attr:`~newton.solvers.SolverObservables.body_parent_f` is populated when
-        :attr:`~newton.solvers.SolverObservableFlags.BODY_PARENT_F` is requested from
+        :attr:`~newton.solvers.SolverBase.Observables.body_parent_f` is populated when
+        :attr:`~newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F` is requested from
         :meth:`~newton.solvers.SolverBase.observables`, or when the deprecated
         :attr:`~newton.State.body_parent_f` is allocated. It is the wrench the parent applies to
         each body through its inbound joint, accounted from the step's solved motion: inverse
@@ -1606,8 +1605,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         With sleeping enabled the solver computes the wrench every step into its own history, so
         a sleeping body reports its last awake wrench in whichever output the caller passes.
 
-        :attr:`~newton.solvers.SolverObservables.contact_f` is populated when
-        :attr:`~newton.solvers.SolverObservableFlags.CONTACT_F` is requested. Each live rigid
+        :attr:`~newton.solvers.SolverBase.Observables.contact_f` is populated when
+        :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` is requested. Each live rigid
         contact row holds the force [N] on shape 0's body, in world frame, from the solved
         normal and friction impulses of the step divided by ``dt``; the torque part is zero (torsional and rolling
         friction are not reported). Compliant contact rows report their solved impulse like
@@ -1676,7 +1675,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     sleep_skip_constraints = _ConstructionOption()
     deterministic = _ConstructionOption()
 
-    SUPPORTED_OBSERVABLE_FLAGS = frozenset({SolverObservableFlags.BODY_PARENT_F, SolverObservableFlags.CONTACT_F})
+    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.BODY_PARENT_F, SolverBase.ObservableKind.CONTACT_F})
 
     # The default configuration is conformance-tested against body-pair-reduced
     # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
@@ -9531,7 +9530,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         dt: float,
         collide_done_event=None,
         *,
-        observables: SolverObservables | None = None,
+        observables: SolverBase.Observables | None = None,
     ):
         """Advance the simulation by one time step.
 
@@ -9616,11 +9615,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
                 )
         body_parent_f = state_out.body_parent_f
-        if observables is not None and observables.is_requested(SolverObservableFlags.BODY_PARENT_F):
+        if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F):
             body_parent_f = observables.body_parent_f
         self._step_stages(state_in, state_out, control, contacts, dt, collide_done_event, observables, body_parent_f)
         self._publish_parent_wrenches(state_out, body_parent_f)
-        if observables is not None and observables.is_requested(SolverObservableFlags.CONTACT_F):
+        if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             # Rows are built only for articulated models; without joints every contact reports zero.
             inv_dt = 1.0 / dt if self.model.joint_count else 0.0
             wp.launch(
@@ -9799,7 +9798,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         contacts: Contacts,
         dt: float,
         collide_done_event,
-        observables: SolverObservables | None,
+        observables: SolverBase.Observables | None,
         body_parent_f: wp.array | None,
     ):
         """Run :meth:`step` after its inputs are validated and its observable outputs are resolved."""

@@ -610,6 +610,10 @@ def test_admm_no_contact_matches_standalone(test, device):
 
 def test_admm_box_rests_on_cable(test, device):
     """A box dropped on two free VBD cables is supported by them through ADMM contact rows."""
+    test.skipTest(
+        "Known flake: near-duplicate box-edge contacts on two cable segments (from the squared duplicate "
+        "tolerance in multicontact.py) tip the box in about 40% of runs; see newton-physics/newton#4756."
+    )
     model, box, rod_bodies, rod_joints = _build_box_rod(device)
     rollout = _Rollout(model, _admm(model, box, rod_bodies, rod_joints))
     rod_z0 = rollout.state_0.body_q.numpy()[rod_bodies, 2].copy()

@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     crba_fill_par_dof,
 )
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
 # Free root, then two ball joints: every joint has several DOFs.
@@ -259,7 +259,7 @@ def test_warm_started_full_reset_matches_fresh_solver(test, device):
     def simulate(solver, steps):
         pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
         contacts = pipeline.contacts()
-        observables = solver.observables({SolverObservableFlags.CONTACT_F})
+        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
         state_0, state_1, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
         _actuate(model, control)
