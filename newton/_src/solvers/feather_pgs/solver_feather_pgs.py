@@ -1960,9 +1960,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
                 physics in either mode: size the row capacities to avoid them.
                 Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation_colored"``; the colored
-                response is repeatable within itself but sweeps rows in color order, so it never matches an
-                immediate run bitwise. With the colored response ``contact_warmstart`` must be False. Adds a
-                per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
+                response is repeatable within itself but sweeps rows in color order, so bitwise agreement with an
+                immediate run is not guaranteed. With the colored response ``contact_warmstart`` must be False.
+                Adds a per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity
+                slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.
@@ -2885,6 +2886,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._joint_armature_device = wp.zeros(max(model.joint_dof_count, 1), dtype=wp.float32, device=model.device)
         self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
         self._has_prescribed_bodies = False
+        self._color_unit_meta = None
+        self._color_body_a = None
         self._update_kinematic_state()
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping, which would desynchronize it from the
@@ -3694,6 +3697,18 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             prescribed[free_bodies] = kinematic[free_bodies]
         self._body_prescribed.assign(prescribed)
         self._has_prescribed_bodies = bool(np.any(prescribed))
+        self._ensure_color_fold_buffers()
+
+    def _ensure_color_fold_buffers(self) -> None:
+        """Allocate the colored sweep's folded rows once colored buffers exist and some body is prescribed."""
+        if self._color_body_a is not None or self._color_unit_meta is None or not self._has_prescribed_bodies:
+            return
+        shape = (self._world_count, self._propagation_max_constraints)
+        device = self.model.device
+        # Rows with prescribed sides removed and their constant velocity term folded into the right-hand side.
+        self._color_body_a = wp.zeros(shape, dtype=wp.int32, device=device)
+        self._color_body_b = wp.zeros(shape, dtype=wp.int32, device=device)
+        self._color_rhs = wp.zeros(shape, dtype=wp.float32, device=device)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
@@ -7155,10 +7170,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
             self._color_unit_meta_stale = True
             self._color_fold_rhs = None
-            # Rows with prescribed sides removed and their constant velocity term folded into the right-hand side.
-            self._color_body_a = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
-            self._color_body_b = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
-            self._color_rhs = wp.zeros((worlds, propagation_max_c), dtype=wp.float32, device=device)
+            self._color_body_a = None
+            self._ensure_color_fold_buffers()
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
