@@ -873,7 +873,13 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
     a, b, c = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
     normal = np.cross(b - a, c - a)
     offset = a - centre_f
-    inward = normal[:, 0] * offset[:, 0] + normal[:, 1] * offset[:, 1] + normal[:, 2] * offset[:, 2] < 0
+    alignment = np.einsum("ij,ij->i", normal, offset)
+    # Summation order can flip the sign of a near-zero dot product, so faces within a few float32
+    # rounding errors of zero take the scalar np.dot decision, face by face.
+    magnitude = np.einsum("ij,ij->i", np.abs(normal).astype(np.float64), np.abs(offset).astype(np.float64))
+    for i in np.flatnonzero(np.abs(alignment) <= 8.0 * np.finfo(np.float32).eps * magnitude):
+        alignment[i] = np.dot(normal[i], offset[i])
+    inward = alignment < 0
     faces[inward] = faces[inward][:, [0, 2, 1]]
 
     # trim vertices to only those that are used in the faces
