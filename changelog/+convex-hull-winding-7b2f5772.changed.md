@@ -1,0 +1,1 @@
+Speed up convex-hull remeshing in `Mesh.compute_convex_hull()`, `newton.utils.remesh_mesh(method="convex_hull")` and `ModelBuilder.approximate_meshes()` for hulls with many faces by orienting the faces with array operations. The returned vertices and faces are unchanged.
