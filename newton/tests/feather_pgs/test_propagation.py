@@ -2183,7 +2183,7 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} step {k}")
 
     def test_moving_kinematic_hub_is_never_written(self):
-        """Keep the sweep off a moving kinematic tray shared by many units of one color, while it still drives the heap."""
+        """Keep the sweep off a moving kinematic tray shared by many units of one color; it still drives the heap, repeatably."""
         model, tray = _heap(nx=5, ny=5, nz=2, kinematic_tray=True)
         model.rigid_contact_max = 8192
         tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
@@ -2193,8 +2193,7 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 self._check_kinematic_hub(model, tray, tray_dof, velocity_iterations)
 
     def _check_kinematic_hub(self, model, tray, tray_dof, velocity_iterations):
-        results = {}
-        for response in ("propagation_colored", "immediate"):
+        def rollout(response):
             solver = SolverFeatherPGS(
                 model,
                 solve_mode="matrix_free",
@@ -2218,8 +2217,13 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 pipeline.collide(state_in, contacts)
                 solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
                 state_in, state_out = state_out, state_in
-            results[response] = (solver, contacts, state_in.body_qd.numpy().copy(), state_in.body_q.numpy().copy())
-        solver, contacts, body_qd, body_q = results["propagation_colored"]
+            return solver, contacts, state_in.body_qd.numpy().copy(), state_in.body_q.numpy().copy()
+
+        solver, contacts, body_qd, body_q = rollout("propagation_colored")
+        _, _, repeat_qd, repeat_q = rollout("propagation_colored")
+        np.testing.assert_array_equal(body_qd, repeat_qd)
+        np.testing.assert_array_equal(body_q, repeat_q)
+        immediate_qd = rollout("immediate")[2]
         shape_body = model.shape_body.numpy()
         shape0 = contacts.rigid_contact_shape0.numpy()
         shape1 = contacts.rigid_contact_shape1.numpy()
@@ -2243,7 +2247,7 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
         bottom = [b for b in range(model.body_count) if b != tray and body_q[b, 2] < 0.065]
         self.assertGreater(len(bottom), 10)
         colored_vx = float(np.mean(body_qd[bottom, 0]))
-        immediate_vx = float(np.mean(results["immediate"][2][bottom, 0]))
+        immediate_vx = float(np.mean(immediate_qd[bottom, 0]))
         self.assertGreater(colored_vx, 0.05)
         # Measured gate, not a derived bound.
         self.assertLess(abs(colored_vx - immediate_vx), 0.01)
