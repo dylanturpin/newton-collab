@@ -2867,9 +2867,10 @@ class TestColoredPropagationTorsion(unittest.TestCase):
 
     def test_dropped_members_leave_the_highest_kept_host(self):
         """Host a group whose members overflowed the row cap after its last kept member, budgeting kept members only."""
+        # A slow spin leaves the kept members' sliding pairs short of the budget, so the torsion row acts.
         _, solver, model, state, contacts = fixture(
             0.01,
-            spin=10.0,
+            spin=1.0,
             sat=True,
             step=False,
             enable_joint_velocity_limits=False,
@@ -2926,27 +2927,29 @@ class TestColoredPropagationTorsion(unittest.TestCase):
                 np.testing.assert_allclose(output.body_qd.numpy(), expected, rtol=0.0, atol=1.0e-6)
 
     def test_inert_spares_leave_the_result_unchanged(self):
-        """Step bitwise as without spares when no group forms, so every spare stays inert.
-
-        The row loop solves both builds: spares lengthen units past the straight-line kinds, which sum differently.
-        """
-        results = {}
-        for shapes in (None, ()):
-            # Frictionless pads give every group a zero coefficient, so none is emitted.
-            with colored_variant_switches("row loop"):
-                result, solver, *_ = fixture(
-                    0.01, mu=0.0, spin=10.0, sat=True, torsion_shapes=shapes, **_COLORED_TORSION
-                )
-            select_colored_variant(solver, "row loop")
-            rows = int(solver._propagation_constraint_count.numpy()[0])
-            spares = int(
-                np.count_nonzero(solver._propagation_row_type.numpy()[0, :rows] == PGS_CONSTRAINT_TYPE_TORSION)
-            )
-            results[shapes == ()] = (result["body_qd"], spares)
-            self.assertEqual(len(_propagation_torsion_rows(solver)), 0)
-        self.assertGreater(results[False][1], 0)
-        self.assertEqual(results[True][1], 0)
-        np.testing.assert_array_equal(results[False][0], results[True][0])
+        """Step bitwise as without spares when no group forms, so every spare stays inert, on each colored body."""
+        for variant in COLORED_VARIANTS:
+            with self.subTest(variant=variant):
+                results = {}
+                for shapes in (None, ()):
+                    # Frictionless pads give every group a zero coefficient, so none is emitted.
+                    with colored_variant_switches(variant):
+                        _, solver, model, state, contacts = fixture(
+                            0.01, mu=0.0, spin=10.0, sat=True, step=False, torsion_shapes=shapes, **_COLORED_TORSION
+                        )
+                        select_colored_variant(solver, variant)
+                    output = model.state()
+                    solver.step(state, output, model.control(), contacts, 0.0025)
+                    rows = int(solver._propagation_constraint_count.numpy()[0])
+                    row_type = solver._propagation_row_type.numpy()[0, :rows]
+                    results[shapes == ()] = (
+                        output.body_qd.numpy(),
+                        int(np.count_nonzero(row_type == PGS_CONSTRAINT_TYPE_TORSION)),
+                    )
+                    self.assertEqual(len(_propagation_torsion_rows(solver)), 0)
+                self.assertGreater(results[False][1], 0)
+                self.assertEqual(results[True][1], 0)
+                np.testing.assert_array_equal(results[False][0], results[True][0])
 
     def test_prescribed_spin_turns_a_resting_sphere(self):
         """Spin up a sphere resting on a spinning kinematic platform through torsion alone, with the platform folded."""

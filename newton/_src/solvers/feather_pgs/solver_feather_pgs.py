@@ -19373,6 +19373,14 @@ def _colored_prefetch_unit_body(
         angular=free_rigid_angular,
         torsion=contact_torsion,
     )
+    # A straight-line unit's rest rows follow its sliding pair (kind 1) or its lone contact row (kind 2).
+    standard_rest = _colored_unit_rest_rows(
+        f"(um[{PROPAGATION_UNIT_STD_WORD}] == 1 ? 3 : 1)",
+        shared=True,
+        end=f"xr >= um[{5 + PROPAGATION_UNIT_RING}]",
+        angular=free_rigid_angular,
+        torsion=contact_torsion,
+    )
     return f"""
             {{
                 int p_type[{P}], p_ba[{P}], p_bb[{P}], p_par[{P}];
@@ -19398,6 +19406,7 @@ def _colored_prefetch_unit_body(
                     u_ring_imp[q] = (q < u_ring_n) ? propagation_impulses.data[world_base + um[4 + q]] : 0.0f;
                 if (um[{PROPAGATION_UNIT_STD_WORD}] != 0) {{
 {standard}
+{standard_rest}
                 }} else {{
                 bool unit_done = false;
                 bool window_done = false;
@@ -19497,13 +19506,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 {rest}
             }}
             __syncwarp({gmask});"""
-    # A standard or lone unit ends at its last friction or contact row unless rest rows follow it.
-    follows = (
-        [int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING), int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)] if free_rigid_angular else []
+    # Rows after a standard unit's sliding pair or a lone contact row's spare follow the straight line.
+    reference_rest = _colored_unit_rest_rows(
+        "(standard ? 3 : 1)", shared=True, angular=free_rigid_angular, torsion=contact_torsion
     )
-    follows += [int(PGS_CONSTRAINT_TYPE_TORSION)] if contact_torsion else []
-    standard_end = " && ".join(f"row_after != {t}" for t in [friction_type, *follows])
-    lone_end = " && ".join(f"row_next != {t}" for t in [friction_type, *follows])
 
     coop_body = f"""
             int rr = 0;
@@ -19707,8 +19713,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         coop_body = f"""
             int std_la = -1, std_lb = -1;
             bool standard = false;
-            const int row_after = (start_slot + 3 < m) ? propagation_row_type.data[world_base + start_slot + 3] : -1;
-            if (start_slot + 2 < m && ({standard_end})) {{
+            if (start_slot + 2 < m && (start_slot + 3 >= m || propagation_row_type.data[world_base + start_slot + 3] != {friction_type})) {{
                 const int o = world_base + start_slot;
                 const int ba = propagation_body_a.data[o];
                 const int bb = propagation_body_b.data[o];
@@ -19722,8 +19727,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     && (std_la != std_lb || std_la < 0);
             }}
             bool lone = false;
-            const int row_next = (start_slot + 1 < m) ? propagation_row_type.data[world_base + start_slot + 1] : -1;
-            if (!standard && ({lone_end})) {{
+            if (!standard && (start_slot + 1 >= m || propagation_row_type.data[world_base + start_slot + 1] != {friction_type})) {{
                 const int o = world_base + start_slot;
                 const int ba = propagation_body_a.data[o];
                 const int bb = propagation_body_b.data[o];
@@ -19735,6 +19739,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                 const int u_la = std_la;
                 const int u_lb = std_lb;
 {_colored_standard_unit_reference(friction="standard")}
+{reference_rest}
             }} else {{
 {coop_body}
             }}"""

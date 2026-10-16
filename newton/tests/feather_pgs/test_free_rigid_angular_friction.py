@@ -1021,7 +1021,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
     """The rows on the colored propagation response, solved inside their contact's colored unit."""
 
     def test_units_carry_the_angular_rows(self):
-        """Lay out four-, five- and six-row units and send them past the straight-line kinds to the row loops."""
+        """Lay out four-, five- and six-row units that keep the straight-line kind for their contact row and sliding pair."""
         for torsional, rolling, slots in ((0.001, 0.0, 4), (0.0, 0.002, 5), (0.001, 0.002, 6)):
             seen = {}
 
@@ -1052,7 +1052,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
                 angular += [PGS_CONSTRAINT_TYPE_CONTACT_SPIN] if torsional else []
                 self.assertEqual(seen["types"][3:], angular)
                 self.assertEqual(seen["rows"], [slots])
-                self.assertEqual(seen["kinds"], [0])
+                self.assertEqual(seen["kinds"], [1])
 
     def test_every_variant_tracks_plain_and_immediate(self):
         """Track the plain and immediate twists of a rolling, spinning sphere at every step on each colored body.

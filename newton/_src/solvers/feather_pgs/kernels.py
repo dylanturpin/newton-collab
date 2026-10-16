@@ -12710,11 +12710,14 @@ def gather_propagation_unit_meta(
     unit_meta[base + 5 + PROPAGATION_UNIT_RING] = rows
     # Straight-line kinds (see _colored_standard_unit): a contact row and its friction
     # pair, all on the unit's two bodies, or a lone contact row. 0 takes the row loop.
+    # Rows after the sliding pair (or after a lone contact row's spare) keep the kind; the solve runs them next.
     standard = int(0)
     if (
         straight_line != 0
-        and rows == 3
+        and rows >= 3
         and row_type[world, slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+        and row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
         and (la != lb or la < 0)
     ):
         if row_parent[world, slot + 1] == slot and row_parent[world, slot + 2] == slot:
@@ -12723,7 +12726,7 @@ def gather_propagation_unit_meta(
                     standard = 1
     if (
         straight_line != 0
-        and rows == 1
+        and (rows == 1 or (rows == 2 and row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_TORSION))
         and row_type[world, slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and (la != lb or la < 0)
     ):
