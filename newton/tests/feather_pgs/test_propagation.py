@@ -30,6 +30,7 @@ from newton.tests.feather_pgs._fixtures import (
     _contact_rows,
     set_torsion_radius,
 )
+from newton.tests.unittest_utils import StdOutCapture
 
 DT = 1.0 / 240.0
 
@@ -2034,7 +2035,7 @@ def _world_slices(model, worlds):
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestFeatherPGSColoredDeterministic(unittest.TestCase):
-    """``deterministic=True`` on the colored response: repeatable within the mode, never equal to immediate."""
+    """``deterministic=True`` on the colored response: repeatable within the mode; bitwise agreement with immediate is not guaranteed."""
 
     STEPS = 80
 
@@ -2089,13 +2090,25 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
     def test_overflow_with_limit_rows_is_bitwise_repeatable(self):
         """Repeat bitwise while dense joint-limit, velocity-limit and propagation rows overflow their capacity."""
         model = _build_arm_heap_model("cuda:0", tight_limits=True)
-        stepper = self._assert_bitwise(
-            model,
-            enable_joint_velocity_limits=True,
-            velocity_limit_activation_fraction=0.0,
-            free_body_constraint_max=160,
-            articulation_constraint_max=24,
-        )
+        wp.synchronize()
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            stepper = self._assert_bitwise(
+                model,
+                enable_joint_velocity_limits=True,
+                velocity_limit_activation_fraction=0.0,
+                free_body_constraint_max=160,
+                articulation_constraint_max=24,
+            )
+        finally:
+            try:
+                wp.synchronize()
+            finally:
+                printed = capture.end()
+        # Each of the two rollouts warns once per overflowing row family.
+        self.assertEqual(printed.count("dense constraint-row overflow"), 2, printed)
+        self.assertEqual(printed.count("propagation constraint-row overflow"), 2, printed)
         marks = stepper.solver.constraint_row_watermarks()
         self.assertGreater(marks["propagation_overflow_world_steps"], 0, "scene must overflow its propagation rows")
 
@@ -2130,6 +2143,55 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                     a, b = graph_stepper.snapshot(), eager.snapshot()
                     for name in _STATE_FIELDS:
                         np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
+
+    def test_moving_hub_cold_capture_replays_like_eager_steps(self):
+        """Cold-capture a moving kinematic hub with both passes folding, then match an eager twin on each route."""
+        for env in ({}, {"FEATHER_PGS_COLORED_LANES": "3"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                model, tray = _heap(nx=3, ny=3, nz=1, kinematic_tray=True)
+                model.rigid_contact_max = 2048
+                tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
+                tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
+                captured, eager = (
+                    _Stepper(
+                        model,
+                        iterations=4,
+                        velocity_iterations=2,
+                        free_body_constraint_max=512,
+                        articulation_constraint_max=64,
+                    )
+                    for _ in range(2)
+                )
+                for stepper in (captured, eager):
+                    qd = stepper.state_in.joint_qd.numpy()
+                    qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
+                    stepper.state_in.joint_qd.assign(qd)
+                    newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
+                with wp.ScopedCapture() as capture:
+                    captured.step()
+                # An eager step after recording must fold afresh rather than reuse the unexecuted capture's fold.
+                captured.step()
+                eager.step()
+                for k in range(12):
+                    wp.capture_launch(capture.graph)
+                    eager.step()
+                    a, b = captured.snapshot(), eager.snapshot()
+                    for name in _STATE_FIELDS:
+                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
+                count = int(captured.solver._propagation_constraint_count.numpy()[0])
+                self.assertGreater(count, 0)
+                swept = np.concatenate(
+                    [captured.solver._color_body_a.numpy()[0, :count], captured.solver._color_body_b.numpy()[0, :count]]
+                )
+                self.assertNotIn(tray, swept)
+
+    def test_fold_buffers_exist_only_with_prescribed_bodies(self):
+        """Allocate the folded sweep rows only for a model with a kinematic free body."""
+        self.assertIsNone(_Stepper(_build_arm_heap_model("cuda:0")).solver._color_body_a)
+        model, _ = _heap(nx=2, ny=2, nz=1, kinematic_tray=True)
+        model.rigid_contact_max = 1024
+        solver = _Stepper(model, free_body_constraint_max=256, articulation_constraint_max=64).solver
+        self.assertEqual(solver._color_body_a.shape, (solver._world_count, solver._propagation_max_constraints))
 
     def test_partial_reset_keeps_synced_and_untouched_worlds_in_lockstep(self):
         """Copy world 0 into world 1, reset only those two, and keep every field bitwise in lockstep."""
