@@ -128,6 +128,8 @@ def _launch_contact_allocator(
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
         ],
         outputs=[
             outputs["world"],
@@ -146,6 +148,7 @@ def _launch_contact_allocator(
             counters["dense_first_rejected"],
             counters["mf_first_rejected"],
             counters["propagation_first_rejected"],
+            wp.zeros((1,), dtype=wp.int32, device=device),
         ],
         device=device,
     )

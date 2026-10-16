@@ -172,8 +172,16 @@ class _SleepState:
         wp.launch(
             _restart_world_body_history,
             self.model.body_count,
-            [world_mask, world, self.body_nodes, self.model.body_world, state.body_q, state.body_qd,
-             self.last_body_q, self.last_body_qd],
+            [
+                world_mask,
+                world,
+                self.body_nodes,
+                self.model.body_world,
+                state.body_q,
+                state.body_qd,
+                self.last_body_q,
+                self.last_body_qd,
+            ],
             device=device,
         )
         wp.launch(

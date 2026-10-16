@@ -64,6 +64,8 @@ def configure_contact_torsion(solver):
         if unsupported:
             raise ValueError(f"Contact torsion does not support the geometry of shapes {unsupported}")
     solver._contact_torsion_enabled = enabled
+    # Plain propagation solves the torsion rows of its propagation contacts in a post-pass of each sweep.
+    solver._propagation_torsion_rows = enabled and solver._articulated_contact_response == "propagation"
     solver._torsion_stats = {}
     if enabled:
         _validate_torsion_mode(solver)
@@ -75,16 +77,18 @@ def _validate_torsion_mode(solver):
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response != "immediate"
+        or solver._articulated_contact_response not in ("immediate", "propagation")
         or solver._friction_mode != "fixed_normal"
         or solver._row_schedule != "interleaved"
         or solver._contact_warmstart
         or solver._contact_compliance
     ):
         raise ValueError(
-            "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
+            "Contact torsion requires CUDA non-differentiable matrix_free/immediate or propagation/current/"
             "interleaved, without warmstart or compliance"
         )
+    if solver._articulated_contact_response == "propagation" and solver._velocity_iterations > 0:
+        raise ValueError("Contact torsion on articulated_contact_response='propagation' requires velocity_iterations=0")
     if solver._velocity_iterations > 0 and solver._enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
