@@ -113,6 +113,7 @@ from .kernels import (
     accumulate_contact_wrenches_from_impulses,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
+    accumulate_propagation_warmstart_body_impulses_ordered,
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     accumulate_torsion_wrenches_from_impulses,
@@ -1958,7 +1959,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 rest, sets its ``constraint_overflow`` entry and warns as in the default mode; while its contacts
                 and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
                 physics in either mode: size the row capacities to avoid them.
-                Requires ``articulated_contact_response="immediate"``. Adds a
+                Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation"``, and contacts from
+                ``CollisionPipeline(deterministic=True)``; with ``"propagation"`` the warm-start seed of each body is
+                also summed in row order. Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -2599,8 +2602,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
         self._articulated_contact_response = articulated_contact_response
         self._deterministic = bool(deterministic)
-        if self._deterministic and articulated_contact_response != "immediate":
-            raise ValueError("deterministic=True requires articulated_contact_response='immediate'")
+        if self._deterministic and articulated_contact_response not in ("immediate", "propagation"):
+            raise ValueError("deterministic=True requires articulated_contact_response='immediate' or 'propagation'")
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
@@ -14124,9 +14127,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._propagation_cache_qd_base],
                 device=self.model.device,
             )
+        # Deterministic mode sums each body's seeded impulses in row order; the default scatters them atomically.
+        if self._deterministic:
+            kernel, dim = accumulate_propagation_warmstart_body_impulses_ordered, self._world_count * 6
+        else:
+            kernel, dim = (
+                accumulate_propagation_warmstart_body_impulses,
+                self._world_count * self._propagation_max_constraints,
+            )
         wp.launch(
-            accumulate_propagation_warmstart_body_impulses,
-            dim=self._world_count * self._propagation_max_constraints,
+            kernel,
+            dim=dim,
             inputs=[
                 self._propagation_constraint_count,
                 self._propagation_body_a,
