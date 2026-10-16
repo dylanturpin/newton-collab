@@ -6,6 +6,7 @@
 import gc
 import math
 import unittest
+from typing import NamedTuple
 
 import numpy as np
 import warp as wp
@@ -18,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
 )
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_propagation_contact_kernel
 from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import set_torsion_radius
 
@@ -91,6 +93,7 @@ def _simulate(
     observe=None,
     parent_f=False,
     anchor_deg=None,
+    on_solver=None,
     **solver_kwargs,
 ):
     model, bodies = _scene(body, tilt_deg, inertia, count, anchor_deg)
@@ -104,6 +107,8 @@ def _simulate(
         model.feather_pgs.condim.fill_(condim)
     options = {"solve_mode": "matrix_free", "iterations": 32, "deterministic": True, **solver_kwargs}
     solver = SolverFeatherPGS(model, **options)
+    if on_solver is not None:
+        on_solver(solver)
     pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching=contact_matching)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
@@ -668,6 +673,39 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
                 self.assertLessEqual(seen["rolling"], 0.002 * seen["normal"] * (1.0 + 1.0e-5))
                 self.assertLessEqual(seen["spin"], 0.001 * seen["normal"] * (1.0 + 1.0e-5))
 
+    def test_rows_stay_within_the_pooled_load_after_every_sweep(self):
+        """Hold every rolling and spin impulse at zero before friction starts and within the pooled patch load after."""
+        sweeps = _sweep_box()
+        self.assertTrue(any(sweep.offset < sweep.friction_start for sweep in sweeps))
+        _assert_cold_before_friction_start(self, sweeps)
+        _assert_within_the_pooled_load(self, sweeps)
+        # A four-anchor patch saturates far above any one anchor's load, so the pooled bound is the one in force.
+        self.assertGreater(_own_load_ratio(sweeps), 2.0)
+
+    def test_sweep_checks_catch_an_unguarded_or_unpooled_kernel(self):
+        """Trip the sweep checks with the rows-off kernel, which neither holds nor bounds them, and an unpooled load."""
+
+        def unguarded(solver):
+            solver._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
+                solver._propagation_max_constraints,
+                str(solver.model.device.arch),
+                worlds_per_block=solver._propagation_gs_worlds_per_block,
+            )
+
+        with self.assertRaisesRegex(AssertionError, "before friction start"):
+            _assert_cold_before_friction_start(self, _sweep_box(on_solver=unguarded))
+
+        def unpooled(solver):
+            # Cut each normal row's patch ring before the sweep, after the recorder has read the true ring.
+            row_type = solver._propagation_row_type.numpy()
+            row_parent = solver._propagation_row_parent.numpy()
+            row_parent[row_type == PGS_CONSTRAINT_TYPE_CONTACT] = -1
+            solver._propagation_row_parent.assign(row_parent)
+
+        sweeps = _sweep_box(before_sweep=unpooled)
+        _assert_within_the_pooled_load(self, sweeps)
+        self.assertLessEqual(_own_load_ratio(sweeps), 1.0 + 1.0e-5)
+
     def test_rows_never_add_energy(self):
         """End a contact step with no more kinetic energy than the rows-off step, for an anisotropic inertia."""
         inertia = _ANISOTROPIC * 4.0e-5
@@ -802,6 +840,104 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
         eager, _, _ = _simulate("sphere", 0.3, **kwargs)
         captured, _, _ = _simulate("sphere", 0.3, graph=True, **kwargs)
         np.testing.assert_array_equal(eager, captured)
+
+
+class _Sweep(NamedTuple):
+    offset: int
+    friction_start: int
+    before: np.ndarray
+    after: np.ndarray
+    row_type: np.ndarray
+    row_parent: np.ndarray
+    row_mu: np.ndarray
+
+
+def _sweep_box(on_solver=None, before_sweep=None):
+    """Record world 0's plain propagation rows around every sweep of a spinning box on a persistent patch."""
+    sweeps = []
+
+    def record(solver):
+        if on_solver is not None:
+            on_solver(solver)
+        sweep_once = solver._propagation_pgs_solve_one_iteration
+
+        def sweep(**kwargs):
+            count = int(solver._propagation_constraint_count.numpy()[0])
+            rows = [array.numpy()[0, :count].copy() for array in _row_arrays(solver, "propagation")]
+            if before_sweep is not None:
+                before_sweep(solver)
+            sweep_once(**kwargs)
+            after = solver._propagation_impulses.numpy()[0, :count].copy()
+            sweeps.append(
+                _Sweep(kwargs["iteration_offset"], kwargs["friction_start_iteration"], rows[3], after, *rows[:3])
+            )
+
+        solver._propagation_pgs_solve_one_iteration = sweep
+
+    _simulate(
+        "box",
+        0.0,
+        steps=3,
+        angular=(0.0, 0.0, 6.0),
+        free_rigid_rolling_friction=0.002,
+        free_rigid_torsional_friction=0.001,
+        friction_anchor_beta=0.2,
+        contact_friction_position_iterations=8,
+        on_solver=record,
+        **_PROPAGATION,
+    )
+    return sweeps
+
+
+def _angular_blocks(sweep):
+    """Yield each rolling pair's and spin row's first row and width."""
+    for row in np.flatnonzero(sweep.row_type == PGS_CONSTRAINT_TYPE_CONTACT_SPIN):
+        yield int(row), 1
+    rolling = sweep.row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+    for row in np.flatnonzero(rolling & ~np.roll(rolling, 1)):
+        yield int(row), 2
+
+
+def _projection_load(sweep, row):
+    """Return the pooled patch normal load the serial sweep projects ``row`` with.
+
+    Patch normals before ``row`` hold this sweep's values and those after it the previous sweep's.
+    """
+    normal = int(sweep.row_parent[row])
+    load, patch_row = 0.0, normal
+    while True:
+        load += float(sweep.after[patch_row] if patch_row < row else sweep.before[patch_row])
+        patch_row = int(sweep.row_parent[patch_row])
+        if patch_row < 0 or patch_row == normal:
+            return load
+
+
+def _assert_cold_before_friction_start(test, sweeps):
+    for sweep in sweeps:
+        if sweep.offset < sweep.friction_start:
+            for row, width in _angular_blocks(sweep):
+                test.assertTrue(np.all(sweep.after[row : row + width] == 0.0), f"row {row} moved before friction start")
+
+
+def _assert_within_the_pooled_load(test, sweeps):
+    for sweep in sweeps:
+        for row, width in _angular_blocks(sweep):
+            impulse = float(np.linalg.norm(sweep.after[row : row + width]))
+            bound = float(sweep.row_mu[row]) * _projection_load(sweep, row)
+            test.assertLessEqual(impulse, bound * (1.0 + 1.0e-5) + 1.0e-12, f"row {row} exceeds the pooled load")
+
+
+def _own_load_ratio(sweeps):
+    """Return the largest angular impulse over its own anchor's normal-load bound."""
+    ratio = 0.0
+    for sweep in sweeps:
+        for row, width in _angular_blocks(sweep):
+            normal = int(sweep.row_parent[row])
+            load = float(sweep.after[normal] if normal < row else sweep.before[normal])
+            impulse = float(np.linalg.norm(sweep.after[row : row + width]))
+            if load > 0.0:
+                ratio = max(ratio, impulse / (float(sweep.row_mu[row]) * load))
+    return ratio
 
 
 def _padded_body_scene(pad_condim: int, body: str = "free"):
