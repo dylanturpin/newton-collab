@@ -8382,6 +8382,46 @@ def accumulate_propagation_warmstart_body_impulses(
             wp.atomic_add(body_impulses, bb, k, J_b[world, row, k] * impulse)
 
 
+@wp.func
+def propagation_seed_body_is_shared(
+    body: int,
+    body_world: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_to_articulation: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_has_response_dofs: wp.array[int],
+):
+    """Return whether rows of several worlds may reference ``body``: a global body without its own response."""
+    if body_world[body] >= 0:
+        return False
+    art = body_to_articulation[body]
+    responds = (
+        art >= 0
+        and articulation_response_dof_count[art] > 0
+        and body_has_response_dofs[body] != 0
+        and (body_flags[body] & BodyFlags.KINEMATIC) == 0
+    )
+    return not responds
+
+
+@wp.func
+def seed_propagation_body_component(
+    body: int,
+    k: int,
+    shared: bool,
+    qd_delta: float,
+    impulse_delta: float,
+    body_qd: wp.array2d[float],
+    body_impulses: wp.array2d[float],
+):
+    if shared:
+        wp.atomic_add(body_qd, body, k, qd_delta)
+        wp.atomic_add(body_impulses, body, k, impulse_delta)
+    else:
+        body_qd[body, k] = body_qd[body, k] + qd_delta
+        body_impulses[body, k] = body_impulses[body, k] + impulse_delta
+
+
 @wp.kernel
 def accumulate_propagation_warmstart_body_impulses_ordered(
     constraint_count: wp.array[int],
@@ -8393,13 +8433,20 @@ def accumulate_propagation_warmstart_body_impulses_ordered(
     MiJt_b: wp.array3d[float],
     impulses: wp.array2d[float],
     max_constraints: int,
+    body_world: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_to_articulation: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_has_response_dofs: wp.array[int],
     # in-out
     body_qd: wp.array2d[float],
     body_impulses: wp.array2d[float],
 ):
     """Convert seeded propagation row impulses to deferred body wrenches, summed in row order.
 
-    One thread per world and twist component walks the rows serially, as the plain sweep does.
+    One thread per world and twist component walks the rows serially, as the plain sweep does. A body only
+    one world's rows reference is written by that world's thread alone; a global prescribed body, which rows
+    of several worlds may reference, is accumulated atomically.
     """
     tid = wp.tid()
     world = tid // 6
@@ -8411,11 +8458,29 @@ def accumulate_propagation_warmstart_body_impulses_ordered(
             ba = body_a[world, row]
             bb = body_b[world, row]
             if ba >= 0:
-                body_qd[ba, k] = body_qd[ba, k] + MiJt_a[world, row, k] * impulse
-                body_impulses[ba, k] = body_impulses[ba, k] + J_a[world, row, k] * impulse
+                shared = propagation_seed_body_is_shared(
+                    ba,
+                    body_world,
+                    body_flags,
+                    body_to_articulation,
+                    articulation_response_dof_count,
+                    body_has_response_dofs,
+                )
+                seed_propagation_body_component(
+                    ba, k, shared, MiJt_a[world, row, k] * impulse, J_a[world, row, k] * impulse, body_qd, body_impulses
+                )
             if bb >= 0:
-                body_qd[bb, k] = body_qd[bb, k] + MiJt_b[world, row, k] * impulse
-                body_impulses[bb, k] = body_impulses[bb, k] + J_b[world, row, k] * impulse
+                shared = propagation_seed_body_is_shared(
+                    bb,
+                    body_world,
+                    body_flags,
+                    body_to_articulation,
+                    articulation_response_dof_count,
+                    body_has_response_dofs,
+                )
+                seed_propagation_body_component(
+                    bb, k, shared, MiJt_b[world, row, k] * impulse, J_b[world, row, k] * impulse, body_qd, body_impulses
+                )
 
 
 @wp.kernel

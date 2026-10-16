@@ -503,8 +503,6 @@ PROPAGATION_SOLVER_OPTIONS = {
     "articulation_constraint_max": 256,
     "free_body_constraint_max": 6144,
     "friction_anchor_beta": 0.2,
-    "contact_shared_anchor": True,
-    "contact_friction_shared_anchor": True,
 }
 
 
@@ -544,12 +542,19 @@ def _build_heap_arm_world(seed):
     return env
 
 
-def _build_heap_arm_scene(device, seeds):
-    """One heap-and-arm world per seed, in the given order, so world contents follow their seed, not their slot."""
+def _build_heap_arm_scene(device, seeds, global_floor=False):
+    """One heap-and-arm world per seed, in the given order, so world contents follow their seed, not their slot.
+
+    ``global_floor`` replaces the ground plane with a kinematic box outside every world, which all worlds touch.
+    """
     builder = newton.ModelBuilder()
     for seed in seeds:
         builder.add_world(_build_heap_arm_world(seed))
-    builder.add_ground_plane()
+    if global_floor:
+        floor = builder.add_link(is_kinematic=True)
+        builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+    else:
+        builder.add_ground_plane()
     return builder.finalize(device=device)
 
 
@@ -592,7 +597,8 @@ def _run_heap_arm(model, steps, *, cached, warmstart, graph=False, on_step=None)
                 on_step(index, solver, contacts)
             if index % 2:
                 poses.append(state_0.body_q.numpy())
-    per_world = np.stack(poses).reshape(len(poses), model.world_count, -1, 7)
+    in_worlds = model.body_world.numpy() >= 0
+    per_world = np.stack(poses)[:, in_worlds].reshape(len(poses), model.world_count, -1, 7)
     return per_world, _sample(state_0)
 
 
@@ -621,6 +627,7 @@ def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
     # Contacts between the arm's own links stay dense; every other contact takes the propagation route.
     test.assertEqual(seen["paths"][0] + seen["paths"][2], 0)
     test.assertGreater(seen["paths"][3], 20 * seen["paths"][1])
+    first = {}
     for cached in (True, False):
         for warmstart in (False, True):
             for graph in (False, True):
@@ -630,6 +637,10 @@ def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
                         np.testing.assert_array_equal(poses, runs[0][0])
                         test.assertEqual(sample, runs[0][1])
                     test.assertTrue(runs[0][1][1])
+                    first[cached, warmstart, graph] = runs[0]
+            with test.subTest(cached=cached, warmstart=warmstart, graph="eager vs captured"):
+                np.testing.assert_array_equal(first[cached, warmstart, True][0], first[cached, warmstart, False][0])
+                test.assertEqual(first[cached, warmstart, True][1], first[cached, warmstart, False][1])
 
 
 def test_deterministic_propagation_is_world_permutation_invariant(test, device):
@@ -657,10 +668,15 @@ def _accumulate_warmstart_in_reverse_row_order(
     MiJt_b: wp.array3d[float],
     impulses: wp.array2d[float],
     max_constraints: int,
+    body_world: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_to_articulation: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_has_response_dofs: wp.array[int],
     body_qd: wp.array2d[float],
     body_impulses: wp.array2d[float],
 ):
-    """Seed the warm start in reverse row order: one order an atomic scatter may take."""
+    """Seed the warm start in reverse row order: one order an atomic scatter may take. The scene has no shared body."""
     tid = wp.tid()
     world = tid // 6
     k = tid - world * 6
@@ -714,6 +730,46 @@ def test_deterministic_propagation_warm_start_sums_in_row_order(test, device):
     ):
         reversed_order, _ = _run_heap_arm(model, 40, cached=False, warmstart=True)
     test.assertFalse(np.array_equal(reversed_order, ordered))
+
+
+def test_deterministic_propagation_seeds_a_shared_prescribed_body_completely(test, device):
+    """Accumulate every world's seed into a kinematic body outside all worlds, and repeat bitwise."""
+    model = _build_heap_arm_scene(device, (0, 1), global_floor=True)
+    floor = model.body_count - 1
+    test.assertEqual(int(model.body_world.numpy()[floor]), -1)
+    seen = {}
+    seed = SolverFeatherPGS._apply_propagation_warmstart_velocity
+
+    def checking_seed(solver):
+        counts = solver._propagation_constraint_count.numpy()
+        bodies = [solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()]
+        jacobians = [solver._propagation_J_a.numpy(), solver._propagation_J_b.numpy()]
+        impulses = solver._propagation_impulses.numpy()
+        expected = np.zeros(6)
+        worlds = set()
+        for world, count in enumerate(counts):
+            for side in range(2):
+                rows = np.flatnonzero((bodies[side][world, :count] == floor) & (impulses[world, :count] != 0.0))
+                expected += (jacobians[side][world, rows] * impulses[world, rows, None]).sum(axis=0)
+                if rows.size:
+                    worlds.add(world)
+        before = solver._propagation_body_impulses.numpy()[floor].astype(np.float64)
+        seed(solver)
+        if len(worlds) > 1:
+            seen["worlds"] = len(worlds)
+            seeded = solver._propagation_body_impulses.numpy()[floor] - before
+            np.testing.assert_allclose(seeded, expected, rtol=1.0e-4, atol=1.0e-7)
+
+    with mock.patch.object(SolverFeatherPGS, "_apply_propagation_warmstart_velocity", checking_seed):
+        reference, _ = _run_heap_arm(model, 30, cached=False, warmstart=True)
+    test.assertEqual(seen.get("worlds"), 2)
+    for cached in (False, True):
+        with test.subTest(cached=cached):
+            # Poses of the worlds' bodies only: the floor has no joint, so its published state is not compared.
+            runs = [_run_heap_arm(model, 30, cached=cached, warmstart=True) for _ in range(2)]
+            np.testing.assert_array_equal(runs[1][0], runs[0][0])
+            if not cached:
+                np.testing.assert_array_equal(runs[0][0], reference)
 
 
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
@@ -916,6 +972,12 @@ for _device in get_test_devices():
             TestFeatherPGSDeterminism,
             "test_deterministic_propagation_warm_start_sums_in_row_order",
             test_deterministic_propagation_warm_start_sums_in_row_order,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_seeds_a_shared_prescribed_body_completely",
+            test_deterministic_propagation_seeds_a_shared_prescribed_body_completely,
             devices=[_device],
         )
 

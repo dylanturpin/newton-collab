@@ -14178,31 +14178,42 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._propagation_cache_qd_base],
                 device=self.model.device,
             )
+        rows = [
+            self._propagation_constraint_count,
+            self._propagation_body_a,
+            self._propagation_body_b,
+            self._propagation_J_a,
+            self._propagation_J_b,
+            self._propagation_MiJt_a,
+            self._propagation_MiJt_b,
+            self._propagation_impulses,
+            self._propagation_max_constraints,
+        ]
+        outputs = [self._propagation_body_qd, self._propagation_body_impulses]
         # Deterministic mode sums each body's seeded impulses in row order; the default scatters them atomically.
         if self._deterministic:
-            kernel, dim = accumulate_propagation_warmstart_body_impulses_ordered, self._world_count * 6
-        else:
-            kernel, dim = (
-                accumulate_propagation_warmstart_body_impulses,
-                self._world_count * self._propagation_max_constraints,
+            wp.launch(
+                accumulate_propagation_warmstart_body_impulses_ordered,
+                dim=self._world_count * 6,
+                inputs=[
+                    *rows,
+                    self.model.body_world,
+                    self.model.body_flags,
+                    self._body_to_articulation,
+                    self._articulation_response_dof_count,
+                    self._body_has_response_dofs,
+                ],
+                outputs=outputs,
+                device=self.model.device,
             )
-        wp.launch(
-            kernel,
-            dim=dim,
-            inputs=[
-                self._propagation_constraint_count,
-                self._propagation_body_a,
-                self._propagation_body_b,
-                self._propagation_J_a,
-                self._propagation_J_b,
-                self._propagation_MiJt_a,
-                self._propagation_MiJt_b,
-                self._propagation_impulses,
-                self._propagation_max_constraints,
-            ],
-            outputs=[self._propagation_body_qd, self._propagation_body_impulses],
-            device=self.model.device,
-        )
+        else:
+            wp.launch(
+                accumulate_propagation_warmstart_body_impulses,
+                dim=self._world_count * self._propagation_max_constraints,
+                inputs=rows,
+                outputs=outputs,
+                device=self.model.device,
+            )
         self._propagate_response()
         self._flush_propagation_free_body_response()
 
