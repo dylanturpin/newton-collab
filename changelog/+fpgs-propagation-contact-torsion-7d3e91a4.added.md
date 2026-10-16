@@ -1,1 +1,1 @@
-Add experimental contact torsion (`feather_pgs:min_torsional_patch_radius` with `contact_torsion_device=True`) to `SolverFeatherPGS` with `articulated_contact_response="propagation"`, including its torque in published parent wrenches; `"propagation_colored"` and `"propagation_fused"` still reject it.
+Add experimental contact torsion (`feather_pgs:min_torsional_patch_radius` with `contact_torsion_device=True`) to `SolverFeatherPGS` with `articulated_contact_response="propagation"`, including its torque in published parent wrenches; `"propagation_fused"` still rejects it.
