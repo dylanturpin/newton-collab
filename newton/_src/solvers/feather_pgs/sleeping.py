@@ -25,10 +25,11 @@ class _SleepState:
             or solver._mf_warmstart_enabled
             or solver._contact_compliance
             or solver._velocity_iterations
-            or solver._articulated_contact_response != "immediate"
+            or solver._articulated_contact_response not in ("immediate", "propagation_colored")
         ):
             raise ValueError(
-                "Experimental sleeping requires rigid immediate response, no compliance, warmstart or velocity passes"
+                "Experimental sleeping requires rigid immediate or propagation_colored response, no compliance, "
+                "warmstart or velocity passes"
             )
         if model.articulation_count == 0:
             raise ValueError("Experimental sleeping requires at least one articulation")

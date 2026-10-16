@@ -1968,10 +1968,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.
                 Driven articulations and articulations with mimic or loop constraints stay awake.
-                Construction raises ``ValueError`` unless ``articulated_contact_response="immediate"``
-                (so it does not compose with ``propagation_colored``), the model has at least one
-                articulation and no particles, and warmstarting, contact
-                compliance and velocity post-passes (``velocity_iterations``) are off.
+                Construction raises ``ValueError`` unless ``articulated_contact_response`` is ``"immediate"``
+                or ``"propagation_colored"``, the model has at least one articulation and no particles, and
+                warmstarting, contact compliance and velocity post-passes (``velocity_iterations``) are off.
+                With the colored response and ``sleep_skip_constraints``, sleeping islands' contacts are left out of
+                the coloring and the colored sweep; a step that overflows the propagation rows keeps that world awake.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
                 solver spends work on settled scenes rather than describing the scene.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
@@ -8502,6 +8503,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._body_to_articulation,
                 self._is_free_rigid,
                 self._articulation_root_dof_start,
+                self._dynamics_art_active,
                 self._v_out,
             ],
             outputs=[self._propagation_body_qd],
@@ -9196,6 +9198,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._body_to_articulation,
                 self._is_free_rigid,
                 self._articulation_root_dof_start,
+                self._dynamics_art_active,
             ],
             outputs=[
                 self._propagation_body_qd,
