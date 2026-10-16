@@ -13008,6 +13008,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._contact_world,
                         self._contact_slot,
                         self._contact_path,
+                        self._contact_slots_needed,
                         self._contact_art_a,
                         self._contact_art_b,
                         model.shape_body,

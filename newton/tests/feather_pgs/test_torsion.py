@@ -3,7 +3,9 @@
 
 """Contact torsion: per-shape spin friction, host and device preparation of SolverFeatherPGS."""
 
+import contextlib
 import itertools
+import sys
 import unittest
 import warnings
 from inspect import signature
@@ -27,6 +29,7 @@ from newton._src.solvers.feather_pgs.contact_torsion_device import (
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_rows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
@@ -47,6 +50,7 @@ from newton.tests.feather_pgs._fixtures import (
     fixture,
     set_torsion_radius,
 )
+from newton.tests.unittest_utils import StdOutCapture
 
 # Persistent patches select their own friction locations; shared-anchor flags only warn.
 PATCH_OPTIONS = {"friction_anchor_beta": 0.2, "contact_shared_anchor": False, "contact_friction_shared_anchor": False}
@@ -2477,20 +2481,119 @@ class TestPropagationTorsion(unittest.TestCase):
 
     def test_dropped_members_leave_the_highest_kept_host(self):
         """Host a group whose members overflowed the row cap after its last kept member, budgeting kept members only."""
-        _, solver, _model, _state, contacts = fixture(
-            0.01, spin=10.0, sat=True, articulation_constraint_max=4, free_body_constraint_max=6, **_PROPAGATION_TORSION
+        _, solver, model, state, contacts = fixture(
+            0.01,
+            spin=10.0,
+            sat=True,
+            step=False,
+            enable_joint_velocity_limits=False,
+            articulation_constraint_max=8,
+            free_body_constraint_max=2,
+            **_PROPAGATION_TORSION,
         )
+        wp.synchronize_device(model.device)
+        with _device_output() as output:
+            solver.step(state, model.state(), model.control(), contacts, 0.0025)
+            wp.synchronize_device(model.device)
+        output = output[0]
+        lines = [line for line in output.splitlines() if not (line.startswith("Module") and "load on device" in line)]
+        overflow = (
+            r"Warning: FeatherPGS propagation constraint-row overflow in world 0: requested 16 rows, limit 10; "
+            r"dropped 8 contact/friction rows\. Increase articulation_constraint_max or free_body_constraint_max\."
+        )
+        self.assertEqual(len(lines), 1, output)
+        self.assertRegex(lines[0], overflow)
         count = int(contacts.rigid_contact_count.numpy()[0])
         slots = solver._contact_slot.numpy()[:count]
         kept = [c for c in range(count) if slots[c] >= 0]
-        self.assertGreater(len(kept), 0)
-        self.assertLess(len(kept), count)
+        self.assertEqual((len(kept), count), (2, 4))
         rows = _propagation_torsion_rows(solver)
         self.assertEqual(len(rows), 1)
         ((spin, members),) = rows.items()
         self.assertEqual(sorted(members), sorted(int(slots[c]) for c in kept))
         self.assertEqual(spin, _spare_rows(solver, count)[max(kept)])
         self.assertGreater(int(solver._row_dropped_propagation.numpy()[0]), 0)
+
+    def test_rows_follow_the_recorded_reservation(self):
+        """Write no tangent rows for a contact allocated without them, whatever the builder's own gap test says."""
+        allocator = solver_feather_pgs.allocate_world_contact_slots
+        gap_index = [arg.label for arg in allocator.adj.args].index("contact_friction_gap_limit")
+        launch = wp.launch
+
+        def frictionless_allocation(kernel, *args, **kwargs):
+            # The allocator alone sees every contact past the friction gap: a threshold flip in one direction.
+            if kernel is allocator:
+                kwargs["inputs"] = list(kwargs["inputs"])
+                kwargs["inputs"][gap_index] = -float("inf")
+            return launch(kernel, *args, **kwargs)
+
+        _, solver, model, state, contacts = fixture(0.01, spin=10.0, sat=True, step=False, **_PROPAGATION_TORSION)
+        with patch.object(solver_feather_pgs.wp, "launch", frictionless_allocation):
+            solver.step(state, model.state(), model.control(), contacts, 0.0025)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertTrue(np.all(solver._contact_slots_needed.numpy()[:count] == 2))
+        rows = int(solver._propagation_constraint_count.numpy()[0])
+        row_type = solver._propagation_row_type.numpy()[0, :rows]
+        self.assertEqual(rows, 2 * count)
+        self.assertFalse(np.any(row_type == PGS_CONSTRAINT_TYPE_FRICTION))
+        np.testing.assert_array_equal(row_type[::2], PGS_CONSTRAINT_TYPE_CONTACT)
+        np.testing.assert_array_equal(row_type[1::2], PGS_CONSTRAINT_TYPE_TORSION)
+
+    def test_prescribed_spin_turns_a_resting_sphere(self):
+        """Spin up a sphere resting on a spinning kinematic platform through torsion alone, as on immediate."""
+        rates = {response: _turntable(response) for response in ("immediate", "propagation")}
+        self.assertGreater(rates["immediate"], 0.5)
+        self.assertAlmostEqual(rates["propagation"], rates["immediate"], delta=1.0e-4)
+
+    def test_mixed_families_and_contact_lifecycle(self):
+        """Solve dense, torsion-hosting and free-rigid angular rows in one step, through contact loss and recovery."""
+        model, spinner_q = _mixed_scene()
+        solver = SolverFeatherPGS(
+            model,
+            solve_mode="matrix_free",
+            iterations=32,
+            baumgarte=0.05,
+            cfm=0.0,
+            friction_anchor_beta=0.0,
+            articulation_constraint_max=64,
+            free_body_constraint_max=64,
+            free_rigid_rolling_friction=0.002,
+            **_PROPAGATION_TORSION,
+        )
+        pipeline = newton.CollisionPipeline(model, reduce_contacts=False, broad_phase="nxn", rigid_contact_max=256)
+        contacts = pipeline.contacts()
+        state, output = model.state(), model.state()
+        velocity = np.zeros(model.joint_dof_count, np.float32)
+        velocity[spinner_q + 5] = 20.0
+        state.joint_qd.assign(velocity)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+        def step(lift=None):
+            nonlocal state, output
+            if lift is not None:
+                q = state.joint_q.numpy()
+                q[spinner_q + 2] = lift
+                state.joint_q.assign(q)
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            pipeline.collide(state, contacts)
+            solver.step(state, output, model.control(), contacts, 0.0025)
+            state, output = output, state
+            solver.check_constraint_capacity()
+            return _family_census(solver, contacts)
+
+        for lift, groups in ((None, [1, 1]), (0.2, [0, 1]), (0.0, [1, 1])):
+            with self.subTest(lift=lift):
+                census = step(lift)
+                self.assertEqual(census["propagation_groups"], groups)
+                self.assertTrue(all(count > 0 for count in census["dense_torsion"]), census)
+                self.assertTrue(census["free_rigid_rolling"], census)
+                self.assertTrue(np.isfinite(state.joint_qd.numpy()).all())
+        solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
+        with self.assertRaisesRegex(RuntimeError, "load ring"):
+            step()
+        solver.reset(state)
+        census = step()
+        self.assertEqual(census["propagation_groups"], [1, 1])
 
     def test_persistent_patch_impulse_matches_immediate(self):
         """Give a patch region the same torsion row count and final impulse as immediate at 128 sweeps."""
@@ -2654,6 +2757,146 @@ def _assert_torsion_budgets(test, sweeps):
             saturated |= torsion > 0.99 * bound > 0.0
             sliding_saturated |= sliding > 0.99 * budget > 0.0
     return saturated, sliding_saturated
+
+
+@contextlib.contextmanager
+def _device_output():
+    """Capture the process's stdout file descriptor, where device printf writes, even inside another capture.
+
+    Yields a list that holds the captured text once the block exits.
+    """
+    # StdOutCapture redirects the descriptor behind sys.stdout, which an enclosing capture has replaced.
+    enclosing = sys.stdout
+    sys.stdout = sys.__stdout__
+    capture = StdOutCapture()
+    capture.begin()
+    output = []
+    try:
+        yield output
+    finally:
+        output.append(capture.end())
+        sys.stdout = enclosing
+
+
+def _turntable(response, steps=8):
+    """Return the spin rate [rad/s] of a free-D6 sphere centered on a kinematic platform spinning at 5 rad/s."""
+    b = newton.ModelBuilder()
+    platform = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+    b.add_shape_box(platform, hx=0.1, hy=0.1, hz=0.01, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0))
+    pose = wp.transform(wp.vec3(0.0, 0.0, 0.0299), wp.quat_identity())
+    sphere = b.add_link(xform=pose, mass=0.3, inertia=wp.mat33(np.eye(3, dtype=np.float32) * 3e-4))
+    axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+    b.add_articulation([b.add_joint_d6(-1, sphere, parent_xform=pose, linear_axes=axes, angular_axes=axes)])
+    b.add_shape_sphere(sphere, radius=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=0.5, restitution=0))
+    model = b.finalize(device="cuda:0")
+    flags = model.body_flags.numpy()
+    flags[platform] |= int(newton.BodyFlags.KINEMATIC)
+    model.body_flags.assign(flags)
+    set_torsion_radius(model, 0.01)
+    solver = SolverFeatherPGS(
+        model,
+        solve_mode="matrix_free",
+        articulated_contact_response=response,
+        iterations=64,
+        baumgarte=0.05,
+        cfm=0.0,
+        friction_anchor_beta=0.0,
+        articulation_constraint_max=64,
+        free_body_constraint_max=64,
+        contact_torsion_device=True,
+    )
+    pipeline = newton.CollisionPipeline(model, reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    state, output = model.state(), model.state()
+    velocity = np.zeros(model.joint_dof_count, np.float32)
+    velocity[5] = 5.0
+    state.joint_qd.assign(velocity)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, output, model.control(), contacts, 0.0025)
+        state, output = output, state
+    return float(state.joint_qd.numpy()[11])
+
+
+def _mixed_scene():
+    """Return two worlds, each with a same-articulation link pair, a spinning D6 sphere and a free sphere on the ground.
+
+    Also returns the D6 joint's first coordinate and DOF index in world 0, which coincide for D6 joints.
+    The link pair's contact stays on dense rows; the D6 sphere's hosts a propagation torsion row; the free
+    sphere's carries free-rigid rolling rows and no spare.
+    """
+    scene = newton.ModelBuilder()
+    SolverFeatherPGS.register_custom_attributes(scene)
+    for _ in range(2):
+        world = newton.ModelBuilder()
+        SolverFeatherPGS.register_custom_attributes(world)
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
+        base = world.add_link()
+        world.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        joints = [
+            world.add_joint_revolute(
+                parent=-1,
+                child=base,
+                axis=wp.vec3(0.0, 0.0, 1.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+                child_xform=wp.transform_identity(),
+            )
+        ]
+        for side in (1.0, -1.0):
+            link = world.add_link()
+            world.add_shape_box(link, hx=0.12, hy=0.03, hz=0.04, cfg=cfg)
+            joints.append(
+                world.add_joint_revolute(
+                    parent=base,
+                    child=link,
+                    axis=wp.vec3(0.0, 0.0, 1.0),
+                    parent_xform=wp.transform(wp.vec3(0.06, side * 0.028, 0.0), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+                )
+            )
+        world.add_articulation(joints)
+        pose = wp.transform(wp.vec3(0.3, 0.0, 0.0199), wp.quat_identity())
+        sphere = world.add_link(xform=pose, mass=0.3, inertia=wp.mat33(np.eye(3, dtype=np.float32) * 3e-4))
+        axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+        world.add_articulation([world.add_joint_d6(-1, sphere, parent_xform=pose, linear_axes=axes, angular_axes=axes)])
+        world.add_shape_sphere(sphere, radius=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=0.5))
+        free = world.add_body(xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0199), wp.quat_identity()))
+        world.add_shape_sphere(free, radius=0.02, cfg=cfg)
+        scene.add_world(world)
+    scene.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0))
+    model = scene.finalize(device="cuda:0")
+    set_torsion_radius(model, 0.01)
+    d6 = int(np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.D6))[0])
+    assert int(model.joint_q_start.numpy()[d6]) == int(model.joint_qd_start.numpy()[d6])
+    return model, int(model.joint_qd_start.numpy()[d6])
+
+
+def _family_census(solver, contacts):
+    """Count each world's dense torsion rows and propagation torsion groups, and check free-rigid rolling rows."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    path = solver._contact_path.numpy()[:count]
+    origin = solver._contact_mf_origin.numpy()[:count]
+    slot = solver._contact_slot.numpy()[:count]
+    needed = solver._contact_slots_needed.numpy()[:count]
+    world = solver._contact_world.numpy()[:count]
+    propagation_type = solver._propagation_row_type.numpy()
+    dense_count = solver._constraint_count.numpy()
+    dense_type = solver._row_type.numpy()
+    free = [c for c in range(count) if path[c] == 2 and origin[c] == 1 and slot[c] >= 0]
+    rolling = bool(free) and all(
+        needed[c] == 5
+        and list(propagation_type[world[c], slot[c] + 3 : slot[c] + 5]) == [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * 2
+        for c in free
+    )
+    return {
+        "propagation_groups": [len(_propagation_torsion_rows(solver, w)) for w in range(solver._world_count)],
+        "dense_torsion": [
+            int(np.count_nonzero(dense_type[w, : dense_count[w]] == PGS_CONSTRAINT_TYPE_TORSION))
+            for w in range(solver._world_count)
+        ],
+        "free_rigid_rolling": rolling,
+    }
 
 
 def _permute_contacts(contacts, order):

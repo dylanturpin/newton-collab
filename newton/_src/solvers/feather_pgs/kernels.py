@@ -7927,6 +7927,7 @@ def build_propagation_contact_rows(
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     shape_body: wp.array[int],
@@ -8031,9 +8032,9 @@ def build_propagation_contact_rows(
     friction_mu = mu * contact_friction_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = phi <= contact_friction_gap_limit
-    if friction_patches.enabled != 0:
-        will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
+    # Allocation owns the row extent; recomputing eligibility can cross a floating-point threshold and
+    # overwrite the following rows. A torsion spare makes 1 or 3 base rows 2 or 4, and angular rows only follow 3.
+    will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     com_a = wp.vec3(0.0)
