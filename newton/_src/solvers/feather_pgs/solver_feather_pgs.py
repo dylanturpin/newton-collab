@@ -10571,8 +10571,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
     def snapshot_constraint_status(self) -> None:
         """Copy the status that :meth:`check_constraint_capacity` reports on the device, without waiting.
 
-        Call outside capture after the steps to observe; ``check_constraint_capacity(snapshot=True)`` then
-        raises from this copy, waiting only for the work enqueued before this call.
+        Call outside capture, on the stream that steps the solver, after the steps to observe;
+        ``check_constraint_capacity(snapshot=True)`` then raises from this copy, waiting only for the work enqueued
+        on that stream before this call. A new snapshot replaces the previous one, so check it first.
         """
         device = self.model.device
         if device.is_cuda and device.is_capturing:
@@ -10585,7 +10586,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._status_snapshot_event = wp.get_stream(device).record_event() if device.is_cuda else None
         self._status_snapshot_taken = True
 
-    def check_constraint_capacity(self, snapshot: bool = False) -> None:
+    def check_constraint_capacity(self, *, snapshot: bool = False) -> None:
         """Raise for worlds invalidated by contact or constraint capacity exhaustion.
 
         Also raises if a step saw a joint of an articulation tree disabled in
