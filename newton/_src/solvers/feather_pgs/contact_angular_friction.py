@@ -857,11 +857,16 @@ def free_rigid_angular_friction_gs_sources() -> list[tuple[str, str]]:
     angular = f"(mf_rt == {rolling} || mf_rt == {spin})"
     return [
         (
-            "        for (int i = 0; i < mf_contact_end; i++) {",
+            "        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {",
             "        // The pooled normal load of the anchor whose sliding pair this sweep visited last.\n"
             "        int angular_load_parent = -1;\n"
             "        float angular_load = 0.0f;\n"
-            "        for (int i = 0; i < mf_contact_end; i++) {",
+            "        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {",
+        ),
+        (
+            "            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;",
+            "            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;\n"
+            f"            if ((meta.w & 0xFFFF) == {rolling} && i == (meta.w >> 16) + 3) next_i = i + 2;",
         ),
         (
             "                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);",

@@ -3501,6 +3501,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # Tree joints disabled after construction, which the solver does not simulate.
         self._disabled_tree_joint = wp.zeros(self._world_count, dtype=wp.bool, device=model.device)
         self._tree_joint_world = self._build_tree_joint_world(model)
+        # Device copies of the reported status taken by snapshot_constraint_status(), and their host copies.
+        # The host copies are pageable: freeing pinned memory during another stream's capture invalidates it.
+        self._status_snapshot = {
+            "disabled_tree_joint": wp.zeros(self._world_count, dtype=wp.bool, device=model.device),
+            "constraint_overflow": wp.zeros(self._world_count, dtype=wp.bool, device=model.device),
+            "torsion": wp.zeros(1, dtype=int, device=model.device),
+        }
+        self._status_snapshot_host = (
+            {name: wp.zeros_like(array, device="cpu") for name, array in self._status_snapshot.items()}
+            if model.device.is_cuda
+            else self._status_snapshot
+        )
+        self._status_snapshot_taken = False
+        self._status_snapshot_event = None
+        self._status_readback_stream = None
         self._joint_friction_invalid = wp.zeros(self._world_count, dtype=wp.bool, device=model.device)
         self._row_dropped_all = wp.zeros((3, max(self._world_count, 1)), dtype=wp.int32, device=model.device)
         self._row_dropped_dense = self._row_dropped_all[0]
@@ -10566,7 +10581,25 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 stacklevel=3,
             )
 
-    def check_constraint_capacity(self) -> None:
+    def snapshot_constraint_status(self) -> None:
+        """Copy the status that :meth:`check_constraint_capacity` reports on the device, without waiting.
+
+        Call outside capture, on the stream that steps the solver, after the steps to observe;
+        ``check_constraint_capacity(snapshot=True)`` then raises from this copy, waiting only for the work enqueued
+        on that stream before this call. A new snapshot replaces the previous one, so check it first.
+        """
+        device = self.model.device
+        if device.is_cuda and device.is_capturing:
+            raise RuntimeError("snapshot_constraint_status() must run outside CUDA graph capture")
+        snapshot = self._status_snapshot
+        wp.copy(snapshot["disabled_tree_joint"], self._disabled_tree_joint)
+        wp.copy(snapshot["constraint_overflow"], self.constraint_overflow)
+        if self._device_torsion is not None:
+            wp.copy(snapshot["torsion"], self._device_torsion.work.status)
+        self._status_snapshot_event = wp.get_stream(device).record_event() if device.is_cuda else None
+        self._status_snapshot_taken = True
+
+    def check_constraint_capacity(self, *, snapshot: bool = False) -> None:
         """Raise for worlds invalidated by contact or constraint capacity exhaustion.
 
         Also raises if a step saw a joint of an articulation tree disabled in
@@ -10585,21 +10618,39 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         :meth:`reset` clears the affected worlds. Increasing capacity requires
         constructing a solver and recapturing graphs before restarting the
         invalidated transition.
+
+        Args:
+            snapshot: Report the status copied by the last :meth:`snapshot_constraint_status`, as it was
+                after the work enqueued before that call, instead of reading the live status synchronously.
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
+        if snapshot:
+            if not self._status_snapshot_taken:
+                raise RuntimeError("check_constraint_capacity(snapshot=True) needs snapshot_constraint_status() first")
+            arrays = self._status_snapshot_host
+            if self._status_snapshot_event is not None:
+                # A side stream orders the readback after the snapshot only, not after later steps.
+                if self._status_readback_stream is None:
+                    self._status_readback_stream = wp.Stream(self.model.device)
+                stream = self._status_readback_stream
+                stream.wait_event(self._status_snapshot_event)
+                for name, array in self._status_snapshot.items():
+                    wp.copy(arrays[name], array, stream=stream)
+        else:
+            arrays = {"disabled_tree_joint": self._disabled_tree_joint, "constraint_overflow": self.constraint_overflow}
         if self._device_torsion is not None:
             try:
-                self._device_torsion.validate()
+                self._device_torsion.validate(int(arrays["torsion"].numpy()[0]) if snapshot else None)
             except (RuntimeError, ValueError) as error:
                 raise RuntimeError(f"FeatherPGS contact torsion rejected its input: {error}") from error
-        disabled = np.flatnonzero(self._disabled_tree_joint.numpy())
+        disabled = np.flatnonzero(arrays["disabled_tree_joint"].numpy())
         if disabled.size:
             raise RuntimeError(
                 f"FeatherPGS: Model.joint_enabled disables an articulation tree joint in solver worlds "
                 f"{disabled[:16].tolist()}; only loop-closing joints can be disabled."
             )
-        worlds = np.flatnonzero(self.constraint_overflow.numpy())
+        worlds = np.flatnonzero(arrays["constraint_overflow"].numpy())
         if worlds.size:
             raise RuntimeError(
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
@@ -26581,7 +26632,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
         }}
 
-        for (int i = 0; i < mf_contact_end; i++) {{
+        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {{
             // Consume prefetched data for constraint i
             int4 meta = pre_meta;
             float cur_Ja = pre_Ja;
@@ -26589,10 +26640,14 @@ def _get_pgs_solve_mf_gs_kernel(
             float cur_MiJta = pre_MiJta;
             float cur_MiJtb = pre_MiJtb;
 
-            // Prefetch constraint i+1 (loads issued now, complete during compute)
-            if (i + 1 < mf_contact_end) {{
-                int next_mf6 = mf6_base + (i + 1) * 6;
-                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+            // The first row of a sliding pair also solves the second, so the sweep steps over it.
+            next_i = i + 1;
+            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;
+
+            // Prefetch the next visited constraint (loads issued now, complete during compute)
+            if (next_i < mf_contact_end) {{
+                int next_mf6 = mf6_base + next_i * 6;
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + next_i * 4]);
                 if (lane < 6) {{
                     pre_Ja = mf_J_a.data[next_mf6 + lane];
                     pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
@@ -26615,6 +26670,7 @@ def _get_pgs_solve_mf_gs_kernel(
             if (row_phase == 0 && mf_rt == 4) continue;
             if (mf_rt == 2 && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
+                if (next_i == i + 2) s_lam_mf[i + 1] = 0.0f;
                 __syncwarp();
                 continue;
             }}
