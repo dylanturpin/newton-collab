@@ -115,6 +115,7 @@ from .kernels import (
     accumulate_contact_watermark,
     accumulate_contact_wrenches_from_impulses,
     accumulate_group_diag_worlds,
+    accumulate_propagation_torsion_wrenches_from_impulses,
     accumulate_propagation_warmstart_body_impulses,
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
@@ -147,6 +148,7 @@ from .kernels import (
     classify_local_solve_worlds,
     clear_grouped_jacobian_active_rows,
     clear_local_solve_diag,
+    clear_propagation_torsion_spares,
     clear_sparse_diagonal_response_prefix,
     collect_propagation_units,
     compact_local_pair_candidates,
@@ -2014,6 +2016,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 a single contact-dense world may be slower than host preparation;
                 CUDA graphs do not remove that device-side work. Benchmark the
                 intended per-world contact distribution before enabling.
+                With ``articulated_contact_response="propagation"`` the rows of contacts the
+                immediate response would solve as articulated rows are propagation rows: each such
+                contact reserves one extra row, the group's row takes the spare of its last member
+                and every sweep solves it after the other rows. That response requires
+                ``contact_torsion_device=True`` and ``velocity_iterations=0``.
             enable_torsional_rolling_friction: Experimental opt-in per-contact torsional and rolling
                 friction from :attr:`~newton.Model.shape_material_mu_torsional` and
                 :attr:`~newton.Model.shape_material_mu_rolling` [m]. The pair coefficient is the mean of
@@ -3325,6 +3332,18 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._torsion_row_radius = wp.zeros(
             self._row_parent.shape if self._contact_torsion_enabled else (1, 1), dtype=wp.float32, device=model.device
         )
+        propagation_torsion_shape = (
+            (self._world_count, self._propagation_max_constraints) if self._propagation_torsion_rows else (1, 1)
+        )
+        self._propagation_torsion_row_radius = wp.zeros(
+            propagation_torsion_shape, dtype=wp.float32, device=model.device
+        )
+        # Per-world lists the plain sweep walks in contact order: torsion rows from the world's head, each
+        # torsion row's members from its first member, both linked through propagation_torsion_next.
+        self._propagation_torsion_head = wp.full(propagation_torsion_shape[0], -1, dtype=wp.int32, device=model.device)
+        self._propagation_torsion_first = wp.full(propagation_torsion_shape, -1, dtype=wp.int32, device=model.device)
+        self._propagation_torsion_next = wp.full(propagation_torsion_shape, -1, dtype=wp.int32, device=model.device)
+        self._contact_torsion_radius_dummy = wp.zeros(1, dtype=wp.float32, device=model.device)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
@@ -3567,6 +3586,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             enable_device_torsion(self)
             # Rollback snapshots are sized from the model, so a first step can be captured.
             self._device_torsion.allocate_snapshots(model)
+        elif self._propagation_torsion_rows:
+            raise ValueError(
+                "Contact torsion on articulated_contact_response='propagation' requires contact_torsion_device=True"
+            )
 
         self._enable_sleeping = bool(enable_sleeping)
         self._sleep_linear_threshold = float(sleep_linear_threshold)
@@ -6541,6 +6564,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         # velocity-limit tail); snapshotted from mf_slot_counter each step.
         self._mf_contact_rows_end = wp.zeros((self._world_count,), dtype=wp.int32, device=device)
         self._contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        # 1 when both sides of a contact are free-rigid or static, before free/free routing picks its row family.
+        self._contact_mf_origin = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
 
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
         # joint-position-limit buffers so the two flags can be used separately.
@@ -7606,6 +7631,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 device_arch,
                 worlds_per_block=self._propagation_gs_worlds_per_block,
                 free_rigid_angular=self._free_rigid_angular_rows,
+                contact_torsion=self._propagation_torsion_rows,
             )
             fused_size = getattr(self, "_propagation_full_fused_size", None)
             if self._propagation_full_fused_iterations and fused_size is not None:
@@ -9343,6 +9369,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._propagation_row_type,
                 self._propagation_row_parent,
                 self._propagation_row_mu,
+                self._propagation_torsion_head,
+                self._propagation_torsion_first,
+                self._propagation_torsion_next,
+                self._propagation_torsion_row_radius,
                 1,
                 omega,
                 int(regularize and self._regularization_enabled),
@@ -9724,6 +9754,23 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
                         model.shape_body,
+                        inv_dt,
+                    ],
+                    outputs=[contact_wrench],
+                    device=model.device,
+                )
+            if self._propagation_torsion_rows:
+                wp.launch(
+                    accumulate_propagation_torsion_wrenches_from_impulses,
+                    dim=self._propagation_row_type.shape,
+                    inputs=[
+                        self._propagation_constraint_count,
+                        self._propagation_row_type,
+                        self._propagation_body_a,
+                        self._propagation_body_b,
+                        self._propagation_J_a,
+                        self._propagation_J_b,
+                        self._propagation_impulses,
                         inv_dt,
                     ],
                     outputs=[contact_wrench],
@@ -12522,6 +12569,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._free_rigid_mu_torsional,
                     self._free_rigid_mu_rolling,
                     int(self._deterministic),
+                    self._contact_torsion_shape_radius
+                    if self._propagation_torsion_rows
+                    else self._contact_torsion_radius_dummy,
+                    int(self._propagation_torsion_rows),
                 ],
                 outputs=[
                     self._contact_world,
@@ -12540,6 +12591,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     self._dense_first_rejected_slot,
                     mf_first_rejected_slot,
                     propagation_first_rejected_slot,
+                    self._contact_mf_origin,
                 ],
                 device=model.device,
             )
@@ -12990,6 +13042,35 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 )
                 if self._free_rigid_angular_rows:
                     launch_propagation_free_rigid_angular_friction_rows(self, contacts, contact_build_threads)
+                if self._propagation_torsion_rows:
+                    wp.launch(
+                        clear_propagation_torsion_spares,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self._contact_world,
+                            self._contact_slot,
+                            self._contact_path,
+                            self._contact_slots_needed,
+                            self._contact_mf_origin,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            self._contact_torsion_shape_radius,
+                        ],
+                        outputs=[
+                            self._propagation_body_a,
+                            self._propagation_body_b,
+                            self._propagation_J_a,
+                            self._propagation_J_b,
+                            self._propagation_row_type,
+                            self._propagation_row_parent,
+                            self._propagation_row_mu,
+                            self._propagation_phi,
+                            self._propagation_row_restitution,
+                            self._propagation_torsion_row_radius,
+                        ],
+                        device=model.device,
+                    )
 
             if propagation_active:
                 wp.launch(
@@ -20083,7 +20164,11 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 
 
 def _get_pgs_solve_propagation_contact_kernel(
-    propagation_max_constraints: int, device_arch: str, worlds_per_block: int = 1, free_rigid_angular: bool = False
+    propagation_max_constraints: int,
+    device_arch: str,
+    worlds_per_block: int = 1,
+    free_rigid_angular: bool = False,
+    contact_torsion: bool = False,
 ) -> "wp.Kernel":
     """Build a one-warp propagation contact GS kernel for fixed-size body rows.
 
@@ -20094,6 +20179,8 @@ def _get_pgs_solve_propagation_contact_kernel(
     number of concurrently resident serial GS chains.
     ``free_rigid_angular`` solves the rolling pair (a disk) and spin row (a box) that follow a free-rigid
     contact's sliding pair, bounded by their coefficient times the pooled normal load.
+    ``contact_torsion`` solves each contact torsion row after the sweep's other rows, with its group's
+    residual sliding budget, as the immediate response's torsion sweep does.
     """
     M = propagation_max_constraints
     W = max(int(worlds_per_block), 1)
@@ -20112,6 +20199,16 @@ def _get_pgs_solve_propagation_contact_kernel(
         if free_rigid_angular
         else f"(row_type == {friction_type})"
     )
+    torsion_type = int(PGS_CONSTRAINT_TYPE_TORSION)
+    torsion_skip = (
+        f"""if (row_type == {torsion_type}) {{
+                __syncwarp();
+                continue;
+            }}"""
+        if contact_torsion
+        else ""
+    )
+    torsion_sweep = _propagation_torsion_sweep_source(friction_type) if contact_torsion else ""
     spin_projection = (
         f"""}} else if (row_type == {spin_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
@@ -20188,6 +20285,7 @@ def _get_pgs_solve_propagation_contact_kernel(
                 }}
             }}
 
+            {torsion_skip}
             if ({is_bounded} && global_iter < friction_start_iteration) {{
                 if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
@@ -20297,12 +20395,17 @@ def _get_pgs_solve_propagation_contact_kernel(
             }}
             __syncwarp();
         }}
+{torsion_sweep}
     }}
 
 #endif
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if contact_torsion:
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + _PROPAGATION_APPLY_ROW_CUDA, 1
+        )
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_native(
@@ -20321,6 +20424,10 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
+        propagation_torsion_head: wp.array[int],
+        propagation_torsion_first: wp.array2d[int],
+        propagation_torsion_next: wp.array2d[int],
+        propagation_torsion_row_radius: wp.array2d[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20346,6 +20453,10 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
+        propagation_torsion_head: wp.array[int],
+        propagation_torsion_first: wp.array2d[int],
+        propagation_torsion_next: wp.array2d[int],
+        propagation_torsion_row_radius: wp.array2d[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20372,6 +20483,10 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_row_type,
             propagation_row_parent,
             propagation_row_mu,
+            propagation_torsion_head,
+            propagation_torsion_first,
+            propagation_torsion_next,
+            propagation_torsion_row_radius,
             iterations,
             omega,
             regularize,
@@ -20382,10 +20497,112 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}{'_free_rigid_angular' if free_rigid_angular else ''}"
+    name = (
+        f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}"
+        f"{'_free_rigid_angular' if free_rigid_angular else ''}{'_torsion' if contact_torsion else ''}"
+    )
     pgs_solve_propagation_template.__name__ = name
     pgs_solve_propagation_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
+
+
+def _propagation_torsion_sweep_source(friction_type: int) -> str:
+    """Return the plain propagation sweep's contact torsion post-pass, a body-space port of ``torque_sweep_source``.
+
+    Torsion rows and their members are walked in the contact order of the per-world lists that device
+    torsion preparation links, so the result does not depend on how propagation slots were reserved.
+    """
+    pair = f"""n + 2 < m &&
+                    propagation_row_type.data[world_base + n + 1] == {friction_type} &&
+                    propagation_row_parent.data[world_base + n + 1] == n &&
+                    propagation_row_type.data[world_base + n + 2] == {friction_type} &&
+                    propagation_row_parent.data[world_base + n + 2] == n"""
+    return f"""
+        for (int spin = propagation_torsion_head.data[world]; spin >= 0 && spin < m;
+             spin = propagation_torsion_next.data[world_base + spin]) {{
+            const int spin_off = world_base + spin;
+            const float radius = propagation_torsion_row_radius.data[spin_off];
+            // The torsion row carries its group's undivided coefficient.
+            const float mu = fmaxf(propagation_row_mu.data[spin_off], 0.0f);
+            float normal_load = 0.0f;
+            float sliding_used = 0.0f;
+            for (int n = propagation_torsion_first.data[spin_off]; n >= 0; n = propagation_torsion_next.data[world_base + n]) {{
+                normal_load += fmaxf(propagation_impulses.data[world_base + n], 0.0f);
+                // Only a normal followed by its own tangent pair consumes sliding budget.
+                if ({pair}) {{
+                    const float a = propagation_impulses.data[world_base + n + 1];
+                    const float b = propagation_impulses.data[world_base + n + 2];
+                    sliding_used += sqrtf(a * a + b * b);
+                }}
+            }}
+            const float normal_budget = mu * normal_load;
+            // Later normal rows can lower the group's load after its tangent pairs were solved: project
+            // the pairs onto the final load and apply their velocity response.
+            if (sliding_used > normal_budget) {{
+                const float scale = normal_budget / sliding_used;
+                sliding_used = 0.0f;
+                for (int n = propagation_torsion_first.data[spin_off]; n >= 0; n = propagation_torsion_next.data[world_base + n]) {{
+                    if (!({pair})) continue;
+                    for (int t = 1; t <= 2; ++t) {{
+                        const int row_off = world_base + n + t;
+                        const float old_tangent = propagation_impulses.data[row_off];
+                        const float delta = old_tangent * scale - old_tangent;
+                        // Every lane has read the tangent impulse before lane 0 rescales it.
+                        __syncwarp();
+                        if (delta != 0.0f) {{
+                            if (lane == 0) propagation_impulses.data[row_off] = old_tangent * scale;
+                            _propagation_apply_row(row_off, delta);
+                        }}
+                        __syncwarp();
+                    }}
+                    const float a = propagation_impulses.data[world_base + n + 1];
+                    const float b = propagation_impulses.data[world_base + n + 2];
+                    sliding_used += sqrtf(a * a + b * b);
+                }}
+            }}
+            float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
+            if (global_iter < friction_start_iteration) bound = 0.0f;
+            const int spin_ba = propagation_body_a.data[spin_off];
+            const int spin_bb = propagation_body_b.data[spin_off];
+            float spin_dot = 0.0f;
+            if (lane < 6 && spin_ba >= 0) {{
+                spin_dot = propagation_J_a.data[spin_off * 6 + lane] * propagation_body_qd.data[spin_ba * 6 + lane];
+            }} else if (lane >= 6 && lane < 12 && spin_bb >= 0) {{
+                spin_dot = propagation_J_b.data[spin_off * 6 + lane - 6] * propagation_body_qd.data[spin_bb * 6 + lane - 6];
+            }}
+            for (int offset = 16; offset > 0; offset >>= 1) {{
+                spin_dot += __shfl_down_sync(0xffffffff, spin_dot, offset);
+            }}
+            const float residual = __shfl_sync(0xffffffff, spin_dot, 0) + propagation_rhs.data[spin_off];
+            const float old_spin = propagation_impulses.data[spin_off];
+            const float spin_eff_inv = propagation_eff_mass_inv.data[spin_off];
+            const float trial = spin_eff_inv > 0.0f ? old_spin - omega * residual * spin_eff_inv : 0.0f;
+            const float next_spin = fminf(fmaxf(trial, -bound), bound);
+            const float spin_delta = next_spin - old_spin;
+            // Every lane has read the torsion impulse before lane 0 overwrites it.
+            __syncwarp();
+            if (spin_delta != 0.0f) {{
+                if (lane == 0) propagation_impulses.data[spin_off] = next_spin;
+                _propagation_apply_row(spin_off, spin_delta);
+            }}
+            __syncwarp();
+        }}
+"""
+
+
+_PROPAGATION_APPLY_ROW_CUDA = """
+#define _propagation_apply_row(row_off, delta) do { \\
+    const int _ba = propagation_body_a.data[row_off]; \\
+    const int _bb = propagation_body_b.data[row_off]; \\
+    if (lane < 6 && _ba >= 0) { \\
+        propagation_body_qd.data[_ba * 6 + lane] += propagation_MiJt_a.data[(row_off) * 6 + lane] * (delta); \\
+        propagation_body_impulses.data[_ba * 6 + lane] += propagation_J_a.data[(row_off) * 6 + lane] * (delta); \\
+    } else if (lane >= 6 && lane < 12 && _bb >= 0) { \\
+        propagation_body_qd.data[_bb * 6 + lane - 6] += propagation_MiJt_b.data[(row_off) * 6 + lane - 6] * (delta); \\
+        propagation_body_impulses.data[_bb * 6 + lane - 6] += propagation_J_b.data[(row_off) * 6 + lane - 6] * (delta); \\
+    } \\
+} while (0)
+"""
 
 
 # Fused PhysX-style joint velocity clamp (fuse_joint_velocity_limits) for the
