@@ -726,12 +726,22 @@ def test_deterministic_propagation_warm_start_sums_in_row_order(test, device):
     test.assertFalse(np.array_equal(reversed_order, ordered))
 
 
-def test_deterministic_propagation_rejects_a_body_outside_the_worlds(test, device):
-    """Reject a shaped body outside every world, which rows of several worlds could reference; accept it otherwise."""
-    model = _build_heap_arm_scene(device, (0, 1), global_floor=True)
-    with test.assertRaisesRegex(ValueError, "every body with shapes to belong to a world"):
-        SolverFeatherPGS(model, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
-    SolverFeatherPGS(model, **PROPAGATION_SOLVER_OPTIONS)
+def test_deterministic_propagation_rejects_bodies_shared_by_worlds(test, device):
+    """Reject a shaped body whose contacts can reach several worlds; accept it without the flag or on one world."""
+    shared = {"outside every world": _build_heap_arm_scene(device, (0, 1), global_floor=True)}
+    # A world-local floor whose shape is added outside every world collides with both worlds.
+    builder = newton.ModelBuilder()
+    first = _build_heap_arm_world(0)
+    floor = first.add_link(is_kinematic=True)
+    builder.add_world(first)
+    builder.add_world(_build_heap_arm_world(1))
+    builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+    shared["global shape on a world body"] = builder.finalize(device=device)
+    for name, model in shared.items():
+        with test.subTest(name):
+            with test.assertRaisesRegex(ValueError, "each shaped body and its shapes to share one world"):
+                SolverFeatherPGS(model, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
+            SolverFeatherPGS(model, **PROPAGATION_SOLVER_OPTIONS)
     single = _build_heap_arm_scene(device, (0,), global_floor=True)
     SolverFeatherPGS(single, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
 
@@ -940,8 +950,8 @@ for _device in get_test_devices():
         )
         add_function_test(
             TestFeatherPGSDeterminism,
-            "test_deterministic_propagation_rejects_a_body_outside_the_worlds",
-            test_deterministic_propagation_rejects_a_body_outside_the_worlds,
+            "test_deterministic_propagation_rejects_bodies_shared_by_worlds",
+            test_deterministic_propagation_rejects_bodies_shared_by_worlds,
             devices=[_device],
         )
 

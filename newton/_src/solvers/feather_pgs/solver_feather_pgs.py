@@ -1960,9 +1960,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
                 physics in either mode: size the row capacities to avoid them.
                 Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation"``, and contacts from
-                ``CollisionPipeline(deterministic=True)``. With ``"propagation"`` on several worlds, every body with
-                shapes must belong to a world (global static geometry has no body), and the warm-start seed of each
-                body is also summed in row order. Adds a
+                ``CollisionPipeline(deterministic=True)``. With ``"propagation"`` on several worlds, each body with
+                shapes and all of its shapes must belong to one world (global static geometry has no body), so only
+                that world's rows reference the body; the warm-start seed of each body is also summed in row order.
+                Adds a
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
@@ -2606,11 +2607,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if self._deterministic and articulated_contact_response not in ("immediate", "propagation"):
             raise ValueError("deterministic=True requires articulated_contact_response='immediate' or 'propagation'")
         if self._deterministic and articulated_contact_response == "propagation" and model.world_count > 1:
-            # Rows of several worlds may reference a body outside every world, so per-world ordering cannot cover it.
+            # A body collides with the worlds of its shapes; rows of several worlds referencing one body defeat
+            # per-world ordering, so each shaped body and all of its shapes must share one world.
             shape_body = model.shape_body.numpy()
-            if np.any(model.body_world.numpy()[shape_body[shape_body >= 0]] < 0):
+            attached = shape_body >= 0
+            owner = model.body_world.numpy()[shape_body[attached]]
+            if np.any((owner < 0) | (model.shape_world.numpy()[attached] != owner)):
                 raise ValueError(
-                    "deterministic=True with 'propagation' requires every body with shapes to belong to a world"
+                    "deterministic=True with 'propagation' requires each shaped body and its shapes to share one world"
                 )
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
