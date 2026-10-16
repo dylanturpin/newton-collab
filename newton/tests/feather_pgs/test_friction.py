@@ -32,7 +32,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     pgs_solve_loop,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import _patch_fixture, fixture, run_fixture, set_torsion_radius
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
@@ -1761,7 +1761,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_point1.assign(points)
         # The x force and z torque correspond to an off-centre tangential load.
         s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
-        observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+        observables = solver.observables({newton.solvers.SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
         solver.step(s1, s0, model.control(), contacts, dt, observables=observables)
         self.assertGreater(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 0)
         count = int(solver._mf_constraint_count.numpy()[0])
@@ -2062,7 +2062,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         with wp.ScopedDevice(device):
             model, solver, contacts, step = _ground_box(device)
-            observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+            observables = solver.observables({newton.solvers.SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
             for _ in range(100):
                 step(observables)
             count = int(contacts.rigid_contact_count.numpy()[0])
@@ -3064,7 +3064,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
     def test_contact_force_reports_the_sliding_pair(self):
         """CONTACT_F reports the normal and sliding force; the angular couples stay out of it."""
         scene = ball(speed=1.0, rolling=False)
-        observables = scene.solver.observables({SolverObservableFlags.CONTACT_F})
+        observables = scene.solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=scene.contacts)
         scene.step(observables)
         # The sliding pair carries the angular row type, so the readers must accept it.
         row_type = scene.solver._row_type.numpy()[0, 1:6]
@@ -3089,7 +3089,7 @@ class TestFeatherPGSRollingFriction(unittest.TestCase):
             with self.subTest(enable=enable):
                 scene = ball(enable=enable, mu_torsional=0.02, speed=0.0, rolling=False)
                 scene.control.joint_f.assign(applied)
-                observables = scene.solver.observables({SolverObservableFlags.BODY_PARENT_F})
+                observables = scene.solver.observables({SolverBase.ObservableKind.BODY_PARENT_F})
                 for _ in range(5):
                     state_in = scene.state
                     scene.step(observables)

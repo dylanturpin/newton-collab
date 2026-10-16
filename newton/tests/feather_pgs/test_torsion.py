@@ -38,7 +38,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _use_mfgs_pair_cache,
     _use_mfgs_torsion_links,
 )
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import (
     _build_four_bar,
     _loop_anchor_gap,
@@ -1856,7 +1856,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                 result, solver, model, initial, contacts = fixture(
                     0.01, spin=100.0, center_only=True, dt=dt, velocity_iterations=4, **PATCH_OPTIONS
                 )
-                observables = solver.observables({SolverObservableFlags.CONTACT_F})
+                observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
                 for _ in range(4):
                     output = model.state()
                     solver.step(initial, output, model.control(), contacts, dt, observables=observables)

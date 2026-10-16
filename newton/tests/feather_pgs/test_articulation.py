@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     populate_connect_J_for_size,
 )
 from newton._src.solvers.featherstone.kernels import eval_fk_with_velocity_conversion
-from newton.solvers import SolverFeatherPGS, SolverFeatherstone, SolverMuJoCo, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS, SolverFeatherstone, SolverMuJoCo
 from newton.tests.feather_pgs._fixtures import _build_four_bar, _loop_anchor_gap, _sphere_on_ground, set_torsion_radius
 from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_cuda_test_devices, get_test_devices
 from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
@@ -1176,7 +1176,13 @@ def _build_mimic_layout(joint_type):
         joints.append(joint)
         parent = child
     builder.add_articulation(joints)
-    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.1, -0.5))
+    if joint_type in (newton.JointType.BALL, newton.JointType.FREE, newton.JointType.DISTANCE):
+        # Bypass the authoring guard to exercise defensive solver handling of
+        # unsupported metadata supplied directly by callers.
+        builder.joint_mimic_joint[joints[2]] = joints[1]
+        builder.joint_mimic_coeffs[joints[2]] = (0.1, -0.5)
+    else:
+        builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.1, -0.5))
     return builder, joints[1], joints[2]
 
 
@@ -3584,7 +3590,7 @@ def _gravity_tree(gravity, *, floating=False):
 
 
 DT_parent_wrench = 1.0 / 120.0
-FLAGS = {SolverObservableFlags.BODY_PARENT_F}
+FLAGS = {SolverBase.ObservableKind.BODY_PARENT_F}
 
 
 def _parent_wrench_scene(device):
@@ -4413,13 +4419,13 @@ def test_parent_wrench_of_a_contact_stop_with_armature(test, device, solve_mode=
             model = _sphere_on_ground(device, armature, dense=False)
             solver = SolverFeatherPGS(model, solve_mode=solve_mode, cfm=0.0)
             pipeline = newton.CollisionPipeline(model)
-            observables = solver.observables(FLAGS | {SolverObservableFlags.CONTACT_F})
+            contacts = pipeline.contacts()
+            observables = solver.observables(FLAGS | {SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
             state_in, state_out = model.state(), model.state()
             qd = state_in.joint_qd.numpy()
             qd[2] = -1.0
             state_in.joint_qd.assign(qd)
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            contacts = pipeline.contacts()
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, ARMATURE_DT, observables=observables)
             count = int(contacts.rigid_contact_count.numpy()[0])

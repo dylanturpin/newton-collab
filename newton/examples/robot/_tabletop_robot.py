@@ -47,6 +47,7 @@ def make_arm(b, assets, device, robot="franka", root=(-0.42, 0, 0), gripper=True
             xform=wp.transform(wp.vec3(*root), wp.quat_identity()),
             floating=False,
             enable_self_collisions=False,
+            joint_damping_mode="drive",
         )
         b.joint_q[:9] = [0, -0.25, 0, -2.35, 0, 2.10, 0.7854, 0.04, 0.04]
         ee = next(i for i, label in enumerate(b.body_label) if label.endswith("/fr3_hand"))
@@ -87,6 +88,7 @@ def make_arm(b, assets, device, robot="franka", root=(-0.42, 0, 0), gripper=True
                 xform=wp.transform(position, mount),
                 floating=False,
                 enable_self_collisions=False,
+                joint_damping_mode="drive",
             )
             ee = next(i for i, label in enumerate(b.body_label) if label.endswith("/fr3_hand"))
             fingers = [first, first + 1]
@@ -98,6 +100,7 @@ def make_arm(b, assets, device, robot="franka", root=(-0.42, 0, 0), gripper=True
                 xform=wp.transform(position, mount),
                 floating=False,
                 enable_self_collisions=False,
+                joint_damping_mode="drive",
             )
             ee = b.body_count - 1
             if instrument:

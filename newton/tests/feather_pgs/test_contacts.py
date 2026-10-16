@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import (
     _build_sparse_contact_friction_model,
     _sphere_on_ground,
@@ -725,7 +725,7 @@ def test_resting_box_reports_weight_as_linear_force(test, device, solve_mode="ma
     solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=32, articulated_contact_response=response)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     for _ in range(120):
@@ -796,7 +796,7 @@ def _impact(model, solver, joint_qd):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     solver.step(state_in, state_out, model.control(), contacts, 0.01, observables=observables)
     count = int(contacts.rigid_contact_count.numpy()[0])
     return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)
@@ -1114,10 +1114,10 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, tors
         set_torsion_radius(model, torsion_radius)
     options.setdefault("solve_mode", "matrix_free")
     solver = SolverFeatherPGS(model, iterations=32, **options)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     test.assertEqual(observables.contact_f.shape[0], model.rigid_contact_max + model.soft_contact_max)
     observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
-    contacts = pipeline.contacts()
     states = [model.state(), model.state()]
     control = model.control()
     for _ in range(steps):
@@ -1144,9 +1144,9 @@ def test_unrequested_contact_f_is_left_untouched(test, device):
     """Write nothing when the observable is allocated but not selected for the step."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(model, solve_mode="matrix_free" if wp.get_device(device).is_cuda else "split")
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
-    observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     state_in, state_out = model.state(), model.state()
     pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, model.control(), contacts, DT, observables=observables.select(set()))
@@ -1159,8 +1159,8 @@ def test_contact_f_in_a_captured_graph(test, device):
     """Write the observable from the replayed step's impulses in a captured graph."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=32)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     states = [model.state(), model.state()]
     control = model.control()
 
@@ -1194,8 +1194,8 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
         sleep_skip_constraints=skip_constraints,
         friction_anchor_beta=0.0,
     )
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     states = [model.state(), model.state()]
     control = model.control()
     for step in range(150):
@@ -1255,8 +1255,8 @@ def test_contact_f_of_compliant_hydroelastic_rows(test, device):
             iterations=64,
             free_body_constraint_max=2048,
         )
-        observables = solver.observables({SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
+        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
         states = [model.state(), model.state()]
         newton.eval_fk(model, model.joint_q, model.joint_qd, states[0])
         for _ in range(5):
@@ -1281,9 +1281,9 @@ def test_overflowing_contact_count_stays_in_the_rigid_rows(test, device, capture
     solver = SolverFeatherPGS(model, solve_mode=solve_mode, warn_constraint_overflow=False)
     rigid_capacity, soft_capacity = 4, 2
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_capacity, soft_contact_max=soft_capacity)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
-    test.assertEqual(observables.contact_f.shape[0], rigid_capacity + soft_capacity)
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    test.assertEqual(observables.contact_f.shape[0], rigid_capacity + soft_capacity)
     state_in, state_out, control = model.state(), model.state(), model.control()
     overflow_count = wp.array([rigid_capacity + soft_capacity + 3], dtype=wp.int32, device=device)
 

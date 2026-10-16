@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
 )
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import set_torsion_radius
 
 _DT = 1.0 / 480.0
@@ -131,7 +131,7 @@ def _simulate(
     obj = bodies[0]
     start = state_0.body_q.numpy()[obj][:3].copy()
 
-    observables = solver.observables({SolverObservableFlags.BODY_PARENT_F}) if parent_f else None
+    observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F}) if parent_f else None
 
     def step(state_in, state_out):
         state_in.clear_forces()
