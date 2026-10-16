@@ -179,6 +179,22 @@ def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
     return scene.finalize(device=device)
 
 
+def _build_shared_floor_model(device) -> tuple[newton.Model, int]:
+    """N_WORLDS fixed-base chains pressed into one jointless kinematic floor outside every world."""
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        world = newton.ModelBuilder()
+        world.default_shape_cfg.density = 1000.0
+        world.default_shape_cfg.mu = 0.7
+        _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
+        scene.add_world(world)
+    floor = scene.add_link(is_kinematic=True)
+    scene.add_shape_box(
+        floor, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity())
+    )
+    return scene.finalize(device=device), floor
+
+
 def _make_solver(
     model: newton.Model, response: str, *, cached: bool, cache_max_bodies: int = 8, **solver_kwargs
 ) -> SolverFeatherPGS:
@@ -862,6 +878,78 @@ def _rollout(model, solver, joint_qd, steps):
 
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "the propagation sweep requires CUDA")
+class TestPropagationSharedBody(unittest.TestCase):
+    def setUp(self):
+        self.model, self.floor = _build_shared_floor_model(wp.get_cuda_device())
+        self.solver = _make_solver(self.model, "propagation", cached=False)
+        pipeline = newton.CollisionPipeline(self.model)
+        contacts = pipeline.contacts()
+        state_in, state_out = self.model.state(), self.model.state()
+        pipeline.collide(state_in, contacts)
+        self.solver.step(state_in, state_out, self.model.control(), contacts, DT)
+
+    def test_shared_body_keeps_no_sweep_scratch(self):
+        """A body without response DOFs that rows of several worlds share gets no propagation scratch."""
+        solver, floor = self.solver, self.floor
+        counts = solver._propagation_constraint_count.numpy()
+        body_a, body_b = solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()
+        worlds = [w for w, n in enumerate(counts) if np.any(body_a[w, :n] == floor) or np.any(body_b[w, :n] == floor)]
+        self.assertEqual(worlds, list(range(N_WORLDS)))
+        self.assertEqual(int(solver._body_has_response_dofs.numpy()[floor]), 0)
+        np.testing.assert_array_equal(solver._propagation_body_impulses.numpy()[floor], np.zeros(6))
+        np.testing.assert_array_equal(solver._propagation_body_qd.numpy()[floor], np.zeros(6))
+
+    def test_skipping_the_shared_body_leaves_the_sweep_unchanged(self):
+        """Sweep one snapshot with and without the response gate: only the shared body's scratch differs."""
+        solver, floor = self.solver, self.floor
+        wpb = solver._propagation_gs_worlds_per_block
+
+        def sweep(body_has_response_dofs):
+            impulses = wp.clone(solver._propagation_impulses)
+            body_qd = wp.clone(solver._propagation_body_qd)
+            body_impulses = wp.clone(solver._propagation_body_impulses)
+            wp.launch_tiled(
+                solver._pgs_solve_propagation_kernel,
+                dim=[(solver._world_count + wpb - 1) // wpb],
+                inputs=[
+                    solver._world_count,
+                    solver._propagation_constraint_count,
+                    solver._propagation_body_a,
+                    solver._propagation_body_b,
+                    solver._propagation_MiJt_a,
+                    solver._propagation_MiJt_b,
+                    solver._propagation_J_a,
+                    solver._propagation_J_b,
+                    solver._propagation_eff_mass_inv,
+                    solver._propagation_rhs,
+                    solver._propagation_row_w,
+                    solver._propagation_row_type,
+                    solver._propagation_row_parent,
+                    solver._propagation_row_mu,
+                    body_has_response_dofs,
+                    4,
+                    1.0,
+                    0,
+                    0,
+                    0,
+                ],
+                outputs=[impulses, body_qd, body_impulses],
+                block_dim=32 * wpb,
+                device=self.model.device,
+            )
+            return impulses.numpy(), body_qd.numpy(), body_impulses.numpy()
+
+        gated = sweep(solver._body_has_response_dofs)
+        ungated = sweep(wp.ones_like(solver._body_has_response_dofs))
+        others = np.arange(self.model.body_count) != floor
+        np.testing.assert_array_equal(gated[0], ungated[0])
+        np.testing.assert_array_equal(gated[1], ungated[1])
+        np.testing.assert_array_equal(gated[2][others], ungated[2][others])
+        np.testing.assert_array_equal(gated[2][floor], np.zeros(6))
+        self.assertTrue(np.any(ungated[2][floor] != 0.0))
+
+
 class TestPropagationCoupledContacts(unittest.TestCase):
     def test_shared_dof_feet_reach_rest(self):
         """Three feet on one prismatic DOF stop at the plane for every sweep count."""

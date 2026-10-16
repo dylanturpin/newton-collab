@@ -9344,6 +9344,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 self._propagation_row_type,
                 self._propagation_row_parent,
                 self._propagation_row_mu,
+                self._body_has_response_dofs,
                 1,
                 omega,
                 int(regularize and self._regularization_enabled),
@@ -20185,15 +20186,16 @@ def _get_pgs_solve_propagation_contact_kernel(
             float active_J = 0.0f;
             float active_MiJt = 0.0f;
             float partial = 0.0f;
+            // A body without response DOFs keeps no scratch; several worlds may share it.
             if (lane < 6 && ba >= 0) {{
-                active_body = ba;
+                active_body = body_has_response_dofs.data[ba] != 0 ? ba : -1;
                 active_k = lane;
                 active_J = my_J;
                 active_MiJt = my_MiJt;
                 partial = active_J * propagation_body_qd.data[ba * 6 + lane];
             }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
                 const int k = lane - 6;
-                active_body = bb;
+                active_body = body_has_response_dofs.data[bb] != 0 ? bb : -1;
                 active_k = k;
                 active_J = my_J;
                 active_MiJt = my_MiJt;
@@ -20258,10 +20260,10 @@ def _get_pgs_solve_propagation_contact_kernel(
                 const int sib_off = world_base + sib;
                 const int sib_ba = propagation_body_a.data[sib_off];
                 const int sib_bb = propagation_body_b.data[sib_off];
-                if (lane < 6 && sib_ba >= 0) {{
+                if (lane < 6 && sib_ba >= 0 && body_has_response_dofs.data[sib_ba] != 0) {{
                     propagation_body_qd.data[sib_ba * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
                     propagation_body_impulses.data[sib_ba * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
-                }} else if (lane >= 6 && lane < 12 && sib_bb >= 0) {{
+                }} else if (lane >= 6 && lane < 12 && sib_bb >= 0 && body_has_response_dofs.data[sib_bb] != 0) {{
                     const int k = lane - 6;
                     propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
                     propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
@@ -20299,6 +20301,7 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
+        body_has_response_dofs: wp.array[int],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20324,6 +20327,7 @@ def _get_pgs_solve_propagation_contact_kernel(
         propagation_row_type: wp.array2d[int],
         propagation_row_parent: wp.array2d[int],
         propagation_row_mu: wp.array2d[float],
+        body_has_response_dofs: wp.array[int],
         iterations: int,
         omega: float,
         regularize: int,
@@ -20350,6 +20354,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_row_type,
             propagation_row_parent,
             propagation_row_mu,
+            body_has_response_dofs,
             iterations,
             omega,
             regularize,
