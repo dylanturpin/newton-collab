@@ -36,6 +36,7 @@ from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
     find_free_joint_q_start,
     poisson_axial_mode,
+    sample_frame_inertia,
     set_camera_from_bounds,
 )
 from newton.examples.basic._reduced_elastic_contact import apply_kinematic_targets
@@ -97,7 +98,7 @@ class Example:
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         builder.add_ground_plane()
 
-        inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01)
+        inertia = sample_frame_inertia(clamp_points, sample_mass)
         shape_cfg = newton.ModelBuilder.ShapeConfig()
         shape_cfg.density = 0.0
         shape_cfg.has_shape_collision = False
@@ -128,7 +129,7 @@ class Example:
             beam = builder.add_body_elastic(
                 xform=wp.transform(wp.vec3(0.0, 0.0, self.base_height + z), wp.quat_identity()),
                 com=wp.vec3(half, 0.0, 0.0),
-                mass=0.2,
+                mass=self.beam_mass,
                 inertia=inertia,
                 mode_q=[0.0],
                 modal_basis=basis,

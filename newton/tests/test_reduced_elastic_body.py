@@ -83,6 +83,11 @@ class _ElasticMeshColorProbe(newton.viewer.ViewerNull):
             self.mesh_hidden[name] = hidden
 
 
+def _compliant_alm_stiffness(material_k: float, rho: float) -> float:
+    """Return the stiffness one compliant-ALM sweep realizes for a row: ``K*rho/(K+rho)``."""
+    return material_k * rho / (material_k + rho)
+
+
 def _identity_inertia():
     return wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
@@ -2488,8 +2493,9 @@ def test_elastic_centrifugal_modal_force(test, device):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
+    # The frame carries the sample mass, so the reduced frame/modal mass is positive definite.
     beam = builder.add_body_elastic(
-        xform=wp.transform_identity(), mass=0.2, inertia=_identity_inertia(), modal_basis=basis
+        xform=wp.transform_identity(), mass=1.0, inertia=_identity_inertia(), modal_basis=basis
     )
     builder.add_joint_fixed(
         parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
@@ -2926,7 +2932,7 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
         mode_q=[mode_q],
         modal_basis=basis,
     )
-    builder.add_joint_fixed(parent=-1, child=body)
+    joint = builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
 
@@ -2935,13 +2941,10 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=1,
-        rigid_joint_linear_k_start=joint_k,
-        rigid_joint_angular_k_start=joint_k,
         rigid_joint_linear_ke=joint_k,
         rigid_joint_angular_ke=joint_k,
         rigid_joint_linear_kd=0.0,
         rigid_joint_angular_kd=0.0,
-        rigid_joint_adaptive_stiffness=False,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
@@ -2949,9 +2952,14 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
     matrix = np.triu(matrix_upper) + np.triu(matrix_upper, 1).T
     grad = solver.elastic_body_block_grad.numpy()[0]
     delta = solver.elastic_body_block_delta.numpy()[0]
-    expected_frame_diagonal = 3.0 / (dt * dt) + joint_k
-    expected_cross = 1.0 / (dt * dt) + joint_k
-    expected_modal_diagonal = 1.0 / (dt * dt) + joint_k
+    # The linear row's rho is its frame support 3/dt^2, above the 9K floor.
+    linear_row = int(solver.joint_constraint_start.numpy()[joint])
+    linear_rho = 3.0 / (dt * dt)
+    np.testing.assert_allclose(solver.joint_rho.numpy()[linear_row], linear_rho, rtol=1.0e-6)
+    row_k = _compliant_alm_stiffness(joint_k, linear_rho)
+    expected_frame_diagonal = 3.0 / (dt * dt) + row_k
+    expected_cross = 1.0 / (dt * dt) + row_k
+    expected_modal_diagonal = 1.0 / (dt * dt) + row_k
 
     test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     np.testing.assert_allclose(matrix[0, 0], expected_frame_diagonal, rtol=1.0e-6)
@@ -3235,13 +3243,10 @@ def test_vbd_craig_bampton_coupled_solve_iteration_invariant(test, device):
         solver = newton.solvers.SolverVBD(
             model,
             iterations=iterations,
-            rigid_joint_linear_k_start=1.0e6,
-            rigid_joint_angular_k_start=1.0e6,
             rigid_joint_linear_ke=1.0e6,
             rigid_joint_angular_ke=1.0e6,
             rigid_joint_linear_kd=0.0,
             rigid_joint_angular_kd=0.0,
-            rigid_joint_adaptive_stiffness=False,
         )
 
         owner_joint = int(model.elastic_joint.numpy()[0])
@@ -3253,9 +3258,12 @@ def test_vbd_craig_bampton_coupled_solve_iteration_invariant(test, device):
             trajectory.append(state_0.joint_q.numpy()[q_start : q_start + basis.mode_count].copy())
         return np.asarray(trajectory)
 
-    one_iteration = run(1)
+    # Each sweep also advances the joint multipliers, so compare iteration counts past their convergence.
     eight_iterations = run(8)
-    relative_difference = np.linalg.norm(one_iteration - eight_iterations) / np.linalg.norm(eight_iterations)
+    thirty_two_iterations = run(32)
+    relative_difference = np.linalg.norm(eight_iterations - thirty_two_iterations) / np.linalg.norm(
+        thirty_two_iterations
+    )
     test.assertLess(relative_difference, 5.0e-5)
 
 
@@ -3296,10 +3304,8 @@ def test_vbd_elastic_modal_joint_damping_projection(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=1,
-        rigid_joint_linear_k_start=joint_k,
         rigid_joint_linear_ke=joint_k,
         rigid_joint_linear_kd=joint_kd,
-        rigid_joint_adaptive_stiffness=False,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
@@ -3307,8 +3313,10 @@ def test_vbd_elastic_modal_joint_damping_projection(test, device):
     q_integrated = dt * mode_qd
     modal_inertia = mode_mass / (dt * dt)
     joint_damping_h = joint_kd / dt
-    h = modal_inertia + joint_k + joint_damping_h
-    grad = joint_k * q_integrated + joint_kd * mode_qd
+    # A kinematic frame gives the row no rigid support, so rho is the 9K floor.
+    row_k = _compliant_alm_stiffness(joint_k, 9.0 * joint_k)
+    h = modal_inertia + row_k + joint_damping_h
+    grad = row_k * q_integrated + joint_kd * mode_qd
     q_expected = q_integrated - grad / h
 
     np.testing.assert_allclose(state_1.joint_q.numpy()[q_start + 7], q_expected, rtol=1.0e-6, atol=1.0e-7)
@@ -3345,17 +3353,15 @@ def test_vbd_elastic_angular_constraint_without_linear_stiffness(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=1,
-        rigid_joint_linear_k_start=0.0,
         rigid_joint_linear_ke=0.0,
-        rigid_joint_angular_k_start=angular_k,
         rigid_joint_angular_ke=angular_k,
-        rigid_joint_adaptive_stiffness=False,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
     q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
     modal_inertia = mode_mass / (dt * dt)
-    expected = mode_q - angular_k * mode_q / (modal_inertia + angular_k)
+    row_k = _compliant_alm_stiffness(angular_k, 9.0 * angular_k)
+    expected = mode_q - row_k * mode_q / (modal_inertia + row_k)
     np.testing.assert_allclose(state_1.joint_q.numpy()[q_start], expected, rtol=1.0e-6, atol=1.0e-7)
 
 
@@ -3443,18 +3449,16 @@ def test_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=1,
-        rigid_joint_linear_k_start=1.0,
         rigid_joint_linear_ke=1.0,
-        rigid_joint_angular_k_start=angular_k,
         rigid_joint_angular_ke=angular_k,
-        rigid_joint_adaptive_stiffness=False,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
     theta = psi.T @ mode_q
     projector = np.diag([0.0, 1.0, 1.0])
-    expected_grad = angular_k * psi @ projector @ theta
-    expected_hessian = np.diag(mode_mass / (dt * dt)) + angular_k * psi @ projector @ psi.T
+    row_k = _compliant_alm_stiffness(angular_k, 9.0 * angular_k)
+    expected_grad = row_k * psi @ projector @ theta
+    expected_hessian = np.diag(mode_mass / (dt * dt)) + row_k * psi @ projector @ psi.T
     actual_grad = solver.elastic_body_block_grad.numpy()[0, 6:8]
     actual_hessian = solver.elastic_body_block_matrix.numpy()[0, 6:8, 6:8]
     np.testing.assert_allclose(actual_grad, expected_grad, rtol=5.0e-4, atol=2.0e-2)
@@ -3503,24 +3507,64 @@ def test_vbd_revolute_drive_and_limit_project_into_elastic_modes(test, device):
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
-            rigid_joint_linear_k_start=1.0,
             rigid_joint_linear_ke=1.0,
-            rigid_joint_angular_k_start=100.0,
             rigid_joint_angular_ke=100.0,
-            rigid_joint_adaptive_stiffness=False,
         )
         solver.step(state_0, state_1, model.control(), None, dt)
         q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
         return float(state_1.joint_q.numpy()[q_start])
 
+    # The frame is kinematic, so the axis support comes from the mode alone.
     modal_inertia = mode_mass / (dt * dt)
+    drive_k_eff = _compliant_alm_stiffness(drive_k, max(modal_inertia, 9.0 * drive_k))
     drive_result = solve_mode(mode_q=0.0, target_pos=0.25, target_ke=drive_k, limit_upper=1.0)
-    drive_expected = drive_k * 0.25 / (modal_inertia + drive_k)
+    drive_expected = drive_k_eff * 0.25 / (modal_inertia + drive_k_eff)
     np.testing.assert_allclose(drive_result, drive_expected, rtol=1.0e-6, atol=1.0e-7)
 
+    limit_k_eff = _compliant_alm_stiffness(drive_k, modal_inertia)
     limit_result = solve_mode(mode_q=0.25, target_pos=0.0, target_ke=0.0, limit_upper=0.1)
-    limit_expected = 0.25 - drive_k * (0.25 - 0.1) / (modal_inertia + drive_k)
+    limit_expected = 0.25 - limit_k_eff * (0.25 - 0.1) / (modal_inertia + limit_k_eff)
     np.testing.assert_allclose(limit_result, limit_expected, rtol=1.0e-6, atol=1.0e-7)
+
+
+def test_vbd_drive_support_includes_elastic_modal_mobility(test, device):
+    """A drive on a kinematic-frame elastic endpoint gets its support from the mode and moves it."""
+    dt = 0.01
+    mode_mass = 2.0
+    target = 0.25
+
+    for joint_kind in ("revolute", "prismatic"):
+        if joint_kind == "revolute":
+            sample_phi, sample_psi = [[[0.0, 0.0, 0.0]]], [[[1.0, 0.0, 0.0]]]
+        else:
+            sample_phi, sample_psi = [[[1.0, 0.0, 0.0]]], [[[0.0, 0.0, 0.0]]]
+        basis = newton.ModalBasis(
+            sample_points=[[0.0, 0.0, 0.0]],
+            sample_phi=sample_phi,
+            sample_psi=sample_psi,
+            mode_mass=[mode_mass],
+            mode_stiffness=[0.0],
+            mode_damping=[0.0],
+        )
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_body_elastic(
+            mass=1.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis, is_kinematic=True
+        )
+        add_joint = builder.add_joint_revolute if joint_kind == "revolute" else builder.add_joint_prismatic
+        joint = add_joint(parent=-1, child=body, axis=(1.0, 0.0, 0.0), target_pos=target, target_ke=200.0)
+        builder.color()
+        model = builder.finalize(device=device)
+
+        state_0 = model.state()
+        state_1 = model.state()
+        solver = newton.solvers.SolverVBD(model, iterations=4)
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        dof = int(model.joint_qd_start.numpy()[joint])
+        support = float(solver.joint_drive_limit_support.numpy()[dof])
+        np.testing.assert_allclose(support, mode_mass / (dt * dt), rtol=1.0e-5, err_msg=joint_kind)
+        q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
+        test.assertGreater(float(state_1.joint_q.numpy()[q_start]), 0.0, msg=joint_kind)
 
 
 def test_fourbar_elastic_coupler_geometry(test, device):
@@ -4423,6 +4467,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_revolute_drive_and_limit_project_into_elastic_modes",
         test_vbd_revolute_drive_and_limit_project_into_elastic_modes,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_drive_support_includes_elastic_modal_mobility",
+        test_vbd_drive_support_includes_elastic_modal_mobility,
         devices=[device],
     )
     add_function_test(
