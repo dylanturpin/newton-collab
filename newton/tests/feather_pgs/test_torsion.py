@@ -3076,6 +3076,35 @@ class TestColoredPropagationTorsion(unittest.TestCase):
         np.testing.assert_array_equal(output.joint_q.numpy(), state.joint_q.numpy())
         self.assertTrue(np.all(solver._propagation_constraint_count.numpy() == 0))
 
+    def test_rows_keep_a_shared_static_body_out(self):
+        """Give torsion rows against a jointless kinematic floor shared by every world no floor side, on each body."""
+        model, floor = test_propagation._build_shared_floor_model(wp.get_cuda_device())
+        set_torsion_radius(model, 0.01)
+        for variant in ("packed", "row loop", "block", "block global"):
+            with self.subTest(variant=variant), colored_variant_switches(variant):
+                solver = SolverFeatherPGS(
+                    model,
+                    solve_mode="matrix_free",
+                    friction_anchor_beta=0.0,
+                    free_body_constraint_max=512,
+                    articulation_constraint_max=128,
+                    **_COLORED_TORSION,
+                )
+                select_colored_variant(solver, variant)
+                pipeline = newton.CollisionPipeline(model, deterministic=True)
+                contacts = pipeline.contacts()
+                state_in, state_out = model.state(), model.state()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+                for world in range(solver._world_count):
+                    self.assertTrue(_propagation_torsion_rows(solver, world))
+                rows = solver._propagation_constraint_count.numpy()
+                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+                    for world, n in enumerate(rows):
+                        self.assertNotIn(floor, side[world, :n])
+                np.testing.assert_array_equal(solver._propagation_body_impulses.numpy()[floor], np.zeros(6))
+                np.testing.assert_array_equal(solver._propagation_body_qd.numpy()[floor], np.zeros(6))
+
     def test_unsupported_combinations_raise(self):
         """Keep colored torsion rejected without device preparation, with velocity iterations and with warm start."""
         colored = {"articulated_contact_response": "propagation_colored"}
