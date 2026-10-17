@@ -3619,6 +3619,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
         self._contact_torsion_device = bool(contact_torsion_device)
         self._device_torsion = None
+        if self._has_elastic and self._contact_torsion_enabled:
+            raise NotImplementedError("Reduced elastic links do not support contact torsion rows.")
         if self._contact_torsion_enabled and self._contact_torsion_device:
             from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
 
@@ -12822,6 +12824,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling, self._free_rigid_route_body)
                     if self._free_rigid_angular_rows
                     else None,
+                    contact_points=(self._rigid_contact_point0(contacts), self._rigid_contact_point1(contacts)),
                 )
 
             wp.launch(

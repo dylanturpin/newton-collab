@@ -1349,8 +1349,11 @@ class _FrictionPatchState:
         frozen_bodies=None,
         shape_material_mu=None,
         angular_mu=None,
+        contact_points=None,
     ):
         """Build this step's friction patches.
+
+        ``contact_points`` replaces the contacts' body-local ``(point0, point1)``, e.g. with deformed elastic points.
 
         ``angular_mu`` is (torsional, rolling, route) when free-rigid angular rows are enabled: the gated per-shape
         coefficient arrays [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
@@ -1363,8 +1366,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
-                contacts.rigid_contact_point0,
-                contacts.rigid_contact_point1,
+                *(contact_points or (contacts.rigid_contact_point0, contacts.rigid_contact_point1)),
                 contacts.rigid_contact_normal,
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
