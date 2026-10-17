@@ -4914,16 +4914,25 @@ def _joint_axis_linear_support(
     body_com: wp.array[wp.vec3],
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
+    parent_elastic_mobility: float,
+    child_elastic_mobility: float,
     inv_dt_sq: float,
 ):
-    """Return the scalar inverse-Delassus support of a translational axis."""
+    """Return the scalar inverse-Delassus support of a translational axis.
+
+    A nonnegative ``*_elastic_mobility`` replaces that side's rigid mobility.
+    """
     w = 0.0
-    if parent >= 0 and body_inv_mass[parent] > 0.0:
+    if parent_elastic_mobility >= 0.0:
+        w = parent_elastic_mobility
+    elif parent >= 0 and body_inv_mass[parent] > 0.0:
         axis_local = wp.quat_rotate_inv(wp.transform_get_rotation(parent_pose), axis_world)
         lever_local = wp.transform_get_translation(parent_anchor) - body_com[parent]
         moment_local = wp.cross(lever_local, axis_local)
         w = body_inv_mass[parent] + wp.dot(moment_local, body_inv_inertia[parent] * moment_local)
-    if child >= 0 and body_inv_mass[child] > 0.0:
+    if child_elastic_mobility >= 0.0:
+        w = w + child_elastic_mobility
+    elif child >= 0 and body_inv_mass[child] > 0.0:
         axis_local = wp.quat_rotate_inv(wp.transform_get_rotation(child_pose), axis_world)
         lever_local = wp.transform_get_translation(child_anchor) - body_com[child]
         moment_local = wp.cross(lever_local, axis_local)
@@ -4942,19 +4951,126 @@ def _joint_axis_angular_support(
     angular_gradient_world: wp.vec3,
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
+    parent_elastic_mobility: float,
+    child_elastic_mobility: float,
     inv_dt_sq: float,
 ):
-    """Return the scalar inverse-Delassus support of an angular axis."""
+    """Return the scalar inverse-Delassus support of an angular axis.
+
+    A nonnegative ``*_elastic_mobility`` replaces that side's rigid mobility.
+    """
     w = 0.0
-    if parent >= 0 and body_inv_mass[parent] > 0.0:
+    if parent_elastic_mobility >= 0.0:
+        w = parent_elastic_mobility
+    elif parent >= 0 and body_inv_mass[parent] > 0.0:
         gradient_local = wp.quat_rotate_inv(wp.transform_get_rotation(parent_pose), angular_gradient_world)
         w = wp.dot(gradient_local, body_inv_inertia[parent] * gradient_local)
-    if child >= 0 and body_inv_mass[child] > 0.0:
+    if child_elastic_mobility >= 0.0:
+        w = w + child_elastic_mobility
+    elif child >= 0 and body_inv_mass[child] > 0.0:
         gradient_local = wp.quat_rotate_inv(wp.transform_get_rotation(child_pose), angular_gradient_world)
         w = w + wp.dot(gradient_local, body_inv_inertia[child] * gradient_local)
     if w > 0.0:
         return inv_dt_sq / w
     return 0.0
+
+
+@wp.func
+def _elastic_joint_endpoint_mobility(
+    joint: int,
+    body: int,
+    is_parent_side: bool,
+    body_pose: wp.transform,
+    anchor_local: wp.transform,
+    direction_world: wp.vec3,
+    is_angular: bool,
+    body_com: wp.array[wp.vec3],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    joint_parent_elastic_endpoint: wp.array[wp.int32],
+    joint_child_elastic_endpoint: wp.array[wp.int32],
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_max_mode_count: int,
+):
+    """Return ``J M_r^-1 J^T`` of one elastic joint endpoint, or -1 for a rigid endpoint."""
+    if body < 0:
+        return -1.0
+    elastic_index = body_elastic_index[body]
+    if elastic_index < 0:
+        return -1.0
+    endpoint = joint_child_elastic_endpoint[joint]
+    if is_parent_side:
+        endpoint = joint_parent_elastic_endpoint[joint]
+    if endpoint < 0:
+        return -1.0
+
+    direction_local = wp.quat_rotate_inv(wp.transform_get_rotation(body_pose), direction_world)
+    lever_local = wp.transform_get_translation(anchor_local) - body_com[body]
+    moment_local = wp.cross(lever_local, direction_local)
+    mode_count = elastic_mode_count[elastic_index]
+    width = elastic_max_mode_count + 6
+    mobility = float(0.0)
+    for row in range(width):
+        jacobian_row = _elastic_joint_endpoint_jacobian_component(
+            row,
+            endpoint,
+            mode_count,
+            direction_local,
+            moment_local,
+            is_angular,
+            elastic_endpoint_phi,
+            elastic_endpoint_psi,
+            elastic_max_mode_count,
+        )
+        if jacobian_row != 0.0:
+            projected = float(0.0)
+            for column in range(width):
+                projected = projected + elastic_reduced_inv_mass[
+                    elastic_index, row, column
+                ] * _elastic_joint_endpoint_jacobian_component(
+                    column,
+                    endpoint,
+                    mode_count,
+                    direction_local,
+                    moment_local,
+                    is_angular,
+                    elastic_endpoint_phi,
+                    elastic_endpoint_psi,
+                    elastic_max_mode_count,
+                )
+            mobility = mobility + jacobian_row * projected
+    return mobility
+
+
+@wp.func
+def _elastic_joint_endpoint_jacobian_component(
+    coordinate: int,
+    endpoint: int,
+    mode_count: int,
+    direction_local: wp.vec3,
+    moment_local: wp.vec3,
+    is_angular: bool,
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+):
+    """Return one coordinate of a joint axis Jacobian over an elastic body block."""
+    if coordinate < 3:
+        if is_angular:
+            return 0.0
+        return direction_local[coordinate]
+    if coordinate < 6:
+        if is_angular:
+            return direction_local[coordinate - 3]
+        return moment_local[coordinate - 3]
+    mode = coordinate - 6
+    if mode >= mode_count:
+        return 0.0
+    if is_angular:
+        return wp.dot(elastic_endpoint_psi[endpoint * elastic_max_mode_count + mode], direction_local)
+    return wp.dot(elastic_endpoint_phi[endpoint * elastic_max_mode_count + mode], direction_local)
 
 
 @wp.kernel
@@ -5026,6 +5142,7 @@ def step_joint_C0_lambda_rho(
     joint_child_elastic_endpoint: wp.array[wp.int32],
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_reduced_inv_mass: wp.array3d[float],
     elastic_max_mode_count: int,
     joint_constraint_start: wp.array[wp.int32],
     joint_constraint_dim: wp.array[wp.int32],
@@ -5220,6 +5337,42 @@ def step_joint_C0_lambda_rho(
                     joint_limit_ke,
                 ):
                     axis_world = wp.normalize(wp.quat_rotate(q_wp, joint_axis[dof]))
+                    parent_elastic_mobility = _elastic_joint_endpoint_mobility(
+                        j,
+                        parent,
+                        True,
+                        parent_pose,
+                        parent_joint_xform,
+                        axis_world,
+                        False,
+                        body_com,
+                        body_elastic_index,
+                        elastic_mode_count,
+                        joint_parent_elastic_endpoint,
+                        joint_child_elastic_endpoint,
+                        elastic_endpoint_phi,
+                        elastic_endpoint_psi,
+                        elastic_reduced_inv_mass,
+                        elastic_max_mode_count,
+                    )
+                    child_elastic_mobility = _elastic_joint_endpoint_mobility(
+                        j,
+                        child,
+                        False,
+                        child_pose,
+                        child_joint_xform,
+                        axis_world,
+                        False,
+                        body_com,
+                        body_elastic_index,
+                        elastic_mode_count,
+                        joint_parent_elastic_endpoint,
+                        joint_child_elastic_endpoint,
+                        elastic_endpoint_phi,
+                        elastic_endpoint_psi,
+                        elastic_reduced_inv_mass,
+                        elastic_max_mode_count,
+                    )
                     joint_drive_limit_support[dof] = _joint_axis_linear_support(
                         parent,
                         child,
@@ -5231,6 +5384,8 @@ def step_joint_C0_lambda_rho(
                         body_com,
                         body_inv_mass,
                         body_inv_inertia,
+                        parent_elastic_mobility,
+                        child_elastic_mobility,
                         inv_dt_sq,
                     )
 
@@ -5253,6 +5408,42 @@ def step_joint_C0_lambda_rho(
                         joint_limit_ke,
                     ):
                         gradient_world = angular_jacobian_world * wp.normalize(joint_axis[dof])
+                        parent_elastic_mobility = _elastic_joint_endpoint_mobility(
+                            j,
+                            parent,
+                            True,
+                            parent_pose,
+                            parent_joint_xform,
+                            gradient_world,
+                            True,
+                            body_com,
+                            body_elastic_index,
+                            elastic_mode_count,
+                            joint_parent_elastic_endpoint,
+                            joint_child_elastic_endpoint,
+                            elastic_endpoint_phi,
+                            elastic_endpoint_psi,
+                            elastic_reduced_inv_mass,
+                            elastic_max_mode_count,
+                        )
+                        child_elastic_mobility = _elastic_joint_endpoint_mobility(
+                            j,
+                            child,
+                            False,
+                            child_pose,
+                            child_joint_xform,
+                            gradient_world,
+                            True,
+                            body_com,
+                            body_elastic_index,
+                            elastic_mode_count,
+                            joint_parent_elastic_endpoint,
+                            joint_child_elastic_endpoint,
+                            elastic_endpoint_phi,
+                            elastic_endpoint_psi,
+                            elastic_reduced_inv_mass,
+                            elastic_max_mode_count,
+                        )
                         joint_drive_limit_support[dof] = _joint_axis_angular_support(
                             parent,
                             child,
@@ -5261,6 +5452,8 @@ def step_joint_C0_lambda_rho(
                             gradient_world,
                             body_inv_mass,
                             body_inv_inertia,
+                            parent_elastic_mobility,
+                            child_elastic_mobility,
                             inv_dt_sq,
                         )
 

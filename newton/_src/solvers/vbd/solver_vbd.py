@@ -4248,6 +4248,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.joint_child_elastic_endpoint,
                         model.elastic_endpoint_phi,
                         model.elastic_endpoint_psi,
+                        self.elastic_reduced_inv_mass,
                         model.elastic_max_mode_count,
                         self.joint_constraint_start,
                         self.joint_constraint_dim,
