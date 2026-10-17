@@ -517,6 +517,15 @@ add_basic_example_test(
     allow_output_regexes=[(_KAMINO_NON_FLOATING_ROOT_WARNING_RE, "stderr")],
 )
 
+for motion, frames in (("stir", 570), ("insert", 270)):
+    add_basic_example_test(
+        name="basic.example_basic_reduced_elastic_cup_straw",
+        devices=test_devices,
+        use_viewer=True,
+        test_options={"num-frames": frames, "motion": motion},
+        test_suffix=motion,
+    )
+
 add_basic_example_test(
     name="basic.example_recording",
     devices=test_devices,
@@ -1028,6 +1037,13 @@ add_example_test(
     test_options={"usd_required": True, "num-frames": 100, "world-count": 2, "solver": "kamino"},
     use_viewer=True,
     test_suffix="kamino",
+)
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_robot_ur10_elastic_panel",
+    devices=cuda_test_devices,
+    test_options={"usd_required": True, "num-frames": 120, "carhoods_dir": "/tmp/newton_missing_carhoods"},
+    use_viewer=True,
 )
 add_example_test(
     TestRobotExamples,

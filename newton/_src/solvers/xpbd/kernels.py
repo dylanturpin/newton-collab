@@ -1048,7 +1048,7 @@ def apply_joint_forces(
     t_total = wp.vec3()
     f_total = wp.vec3()
 
-    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD:
+    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD or type == JointType.ELASTIC:
         f_total = wp.vec3(joint_f[qd_start + 0], joint_f[qd_start + 1], joint_f[qd_start + 2])
         t_total = wp.vec3(joint_f[qd_start + 3], joint_f[qd_start + 4], joint_f[qd_start + 5])
         # The input wrench is world-frame and referenced at the child's COM.
