@@ -330,9 +330,13 @@ repository examples spend tuning effort, not a shared solver API.
        which solve them as body-space rows and propagate their impulses through each
        articulation tree. In ``"propagation"`` and ``"propagation_colored"`` every
        contact row, free bodies included, shares one family of ``free_body_constraint_max +
-       articulation_constraint_max`` rows per world; ``"propagation_colored"`` sweeps them in
+       articulation_constraint_max`` rows per world, or of ``propagation_constraint_max`` rows
+       when that is set, which lets ``free_body_constraint_max`` shrink to the rows that stay
+       matrix-free (the velocity-limit rows); ``"propagation_colored"`` sweeps them in
        parallel batches of contacts that share no responding body, which pays off on
-       scenes with many contacts per world. ``propagation_cached_response`` replaces the
+       scenes with many contacts per world. A scene whose bodies are all free can also set
+       ``articulation_constraint_max=1``: none of its rows can land on the dense family, and
+       that capacity still sizes per-body Jacobian blocks and per-world dense matrices. ``propagation_cached_response`` replaces the
        per-iteration tree walk with cached per-body responses (on by default); which is
        faster depends on the model. The propagation responses reject contact torsion,
        contact compliance, sleeping and loop-closing joints, and fall back from bilateral
