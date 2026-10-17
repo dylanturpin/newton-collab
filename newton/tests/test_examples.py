@@ -526,6 +526,14 @@ for motion, frames in (("stir", 570), ("insert", 270)):
         test_suffix=motion,
     )
 
+for example, frames in (("gripper", 180), ("fingers", 240), ("whip", 210), ("cushion", 270), ("bin", 240)):
+    add_basic_example_test(
+        name=f"basic.example_basic_steel_elastic_{example}",
+        devices=cuda_test_devices,
+        use_viewer=True,
+        test_options={"num-frames": frames},
+    )
+
 add_basic_example_test(
     name="basic.example_recording",
     devices=test_devices,
