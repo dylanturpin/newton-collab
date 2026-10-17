@@ -2882,9 +2882,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._fk_id_cache = None
         # Per-entity dynamics activity; sleeping clears the entries of islands that sleep through a step.
         self._dynamics_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
-        self._parent_wrench_scratch: tuple[wp.array, ...] | None = None
         self._parent_wrench_request: tuple[wp.array, Contacts | None, wp.array | None] | None = None
-        self._parent_wrench_prescale: wp.array | None = None
         self._parent_wrench_preelim_warned = False
         self._dynamics_art_mask = wp.ones(model.articulation_count, dtype=wp.bool, device=model.device)
         self._dynamics_joint_active = wp.ones(model.joint_count, dtype=wp.int32, device=model.device)
@@ -6279,6 +6277,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._debug_stage3_qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self._debug_stage3_joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self._debug_stage3_v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self._parent_wrench_prescale = wp.empty_like(model.joint_qd) if self._enable_joint_velocity_limits else None
         else:
             self._mass_update_mask = None
             self._v_hat = None
@@ -6289,6 +6288,18 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._debug_stage3_qd_work = None
             self._debug_stage3_joint_qdd = None
             self._debug_stage3_v_hat = None
+            self._parent_wrench_prescale = None
+        # BODY_PARENT_F scratch: a buffer first allocated during graph capture is unmapped until the graph runs.
+        self._parent_wrench_scratch = None
+        if model.articulation_count:
+            self._parent_wrench_scratch = (
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
+                wp.full(
+                    (self._world_count, max(self._articulation_constraint_max, 1)), -1, dtype=int, device=model.device
+                ),
+            )
 
         self._diagonal_inverse_mass = (
             wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
@@ -9756,15 +9767,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if not model.articulation_count:
             body_parent_f.zero_()
             return
-        if self._parent_wrench_scratch is None:
-            self._parent_wrench_scratch = (
-                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
-                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
-                wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device),
-                wp.full(
-                    (self._world_count, max(self._articulation_constraint_max, 1)), -1, dtype=int, device=model.device
-                ),
-            )
         contact_wrench, body_a_s, body_ft_s, dense_slot_contact = self._parent_wrench_scratch
         contact_wrench.zero_()
         inv_dt = 1.0 / dt
@@ -10034,8 +10036,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 prescale = None
                 if stage3_qd is not state_in.joint_qd:
                     # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.
-                    if self._parent_wrench_prescale is None:
-                        self._parent_wrench_prescale = wp.empty_like(stage3_qd)
                     wp.launch(
                         subtract_arrays,
                         dim=model.joint_dof_count,
