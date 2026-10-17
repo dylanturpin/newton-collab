@@ -184,6 +184,22 @@ def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
     return scene.finalize(device=device)
 
 
+def _build_shared_floor_model(device) -> tuple[newton.Model, int]:
+    """N_WORLDS fixed-base chains pressed into one jointless kinematic floor outside every world."""
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        world = newton.ModelBuilder()
+        world.default_shape_cfg.density = 1000.0
+        world.default_shape_cfg.mu = 0.7
+        _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
+        scene.add_world(world)
+    floor = scene.add_link(is_kinematic=True)
+    scene.add_shape_box(
+        floor, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity())
+    )
+    return scene.finalize(device=device), floor
+
+
 def _make_solver(
     model: newton.Model, response: str, *, cached: bool, cache_max_bodies: int = 8, **solver_kwargs
 ) -> SolverFeatherPGS:
@@ -867,6 +883,37 @@ def _rollout(model, solver, joint_qd, steps):
 
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
+class TestPropagationSharedBody(unittest.TestCase):
+    def test_shared_body_without_response_is_static_to_the_rows(self):
+        """Rows of every world touch a shared jointless floor as static geometry and leave its scratch untouched."""
+        model, floor = _build_shared_floor_model(wp.get_cuda_device())
+        floor_shapes = np.flatnonzero(model.shape_body.numpy() == floor)
+        for response in ("propagation", "propagation_fused", "propagation_colored"):
+            with self.subTest(response=response):
+                solver = _make_solver(model, response, cached=False)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state_in, state_out = model.state(), model.state()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, model.control(), contacts, DT)
+
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                on_floor = np.isin(contacts.rigid_contact_shape0.numpy()[:count], floor_shapes) | np.isin(
+                    contacts.rigid_contact_shape1.numpy()[:count], floor_shapes
+                )
+                propagation = solver._contact_path.numpy()[:count] == 2
+                floor_worlds = solver._contact_world.numpy()[:count][on_floor & propagation]
+                self.assertEqual(sorted(set(floor_worlds.tolist())), list(range(N_WORLDS)))
+                rows = solver._propagation_constraint_count.numpy()
+                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+                    for world, n in enumerate(rows):
+                        self.assertNotIn(floor, side[world, :n])
+                np.testing.assert_array_equal(solver._propagation_body_impulses.numpy()[floor], np.zeros(6))
+                np.testing.assert_array_equal(solver._propagation_body_qd.numpy()[floor], np.zeros(6))
+                self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
+
+
 class TestPropagationCoupledContacts(unittest.TestCase):
     def test_shared_dof_feet_reach_rest(self):
         """Three feet on one prismatic DOF stop at the plane for every sweep count."""

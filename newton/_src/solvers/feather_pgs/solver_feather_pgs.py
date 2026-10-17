@@ -174,6 +174,7 @@ from .kernels import (
     compute_world_contact_bias,
     compute_world_contact_velocity_bias,
     copy_free_rigid_propagation_body_response,
+    copy_unarticulated_body_state,
     count_propagation_coupled_bodies,
     crba_fill_par_dof,
     delassus_par_row_col,
@@ -4501,6 +4502,11 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._setup_size_grouping(model)
         self._setup_world_mapping(model)
         self._build_body_maps(model)
+        if self._body_to_articulation is None:
+            unarticulated = np.arange(model.body_count, dtype=np.int32)
+        else:
+            unarticulated = np.flatnonzero(self._body_to_articulation.numpy() < 0).astype(np.int32)
+        self._unarticulated_bodies = wp.array(unarticulated, dtype=wp.int32, device=model.device)
         self._classify_free_rigid_bodies(model)
         self._compact_contact_jacobian = bool(
             model.device.is_cuda
@@ -9961,6 +9967,14 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 collide_done_event = None
             self._sleeping.begin(state_in, control, contacts)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
+        if self._unarticulated_bodies.size:
+            wp.launch(
+                copy_unarticulated_body_state,
+                dim=self._unarticulated_bodies.size,
+                inputs=[self._unarticulated_bodies, state_in.body_q, state_in.body_qd],
+                outputs=[state_out.body_q, state_out.body_qd],
+                device=model.device,
+            )
 
         if collide_done_event is not None and state_in.particle_count > 0:
             wp.get_stream(self.model.device).wait_event(collide_done_event)
@@ -13066,6 +13080,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         self._contact_slots_needed,
                         self._contact_art_a,
                         self._contact_art_b,
+                        self._articulation_response_dof_count,
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
