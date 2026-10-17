@@ -1304,9 +1304,8 @@ class ViewerBase(ABC):
 
         body_q = state.body_q.numpy()
         joint_q = state.joint_q.numpy()
-        joint_q_start = self.model.joint_q_start.numpy()
+        elastic_mode_q_start = self.model.elastic_mode_q_start.numpy()
         body_elastic_index = self.model.body_elastic_index.numpy()
-        elastic_joint = self.model.elastic_joint.numpy()
         elastic_mode_count = self.model.elastic_mode_count.numpy()
         shape_body = self.model.shape_body.numpy()
         shape_flags = self.model.shape_flags.numpy()
@@ -1354,7 +1353,7 @@ class ViewerBase(ABC):
             if visible:
                 elastic_index = int(body_elastic_index[body])
                 mode_count = int(elastic_mode_count[elastic_index])
-                q_start = int(joint_q_start[int(elastic_joint[elastic_index])]) + 7
+                q_start = int(elastic_mode_q_start[elastic_index])
                 for local_idx in range(count):
                     vertex_index = start + local_idx
                     for mode in range(mode_count):
@@ -1433,9 +1432,8 @@ class ViewerBase(ABC):
         body_q = state.body_q.numpy()
         joint_q = state.joint_q.numpy()
         elastic_body = self.model.elastic_body.numpy()
-        elastic_joint = self.model.elastic_joint.numpy()
         elastic_mode_count = self.model.elastic_mode_count.numpy()
-        joint_q_start = self.model.joint_q_start.numpy()
+        elastic_mode_q_start = self.model.elastic_mode_q_start.numpy()
         body_world = self.model.body_world.numpy()
         point_start = self.model.elastic_render_point_start.numpy()
         point_count = self.model.elastic_render_point_count.numpy()
@@ -1463,7 +1461,7 @@ class ViewerBase(ABC):
                 continue
 
             mode_count = int(elastic_mode_count[elastic_index])
-            q_start = int(joint_q_start[int(elastic_joint[elastic_index])]) + 7
+            q_start = int(elastic_mode_q_start[elastic_index])
             start = int(point_start[elastic_index])
             count = int(point_count[elastic_index])
             if count < 2:

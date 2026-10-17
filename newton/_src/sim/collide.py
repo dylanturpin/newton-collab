@@ -430,22 +430,7 @@ def write_elastic_contact(
     if index >= writer_data.contact_max:
         return
 
-    elastic_index = writer_data.body_elastic_index[elastic_body]
-    owner_joint = writer_data.elastic_joint[elastic_index]
-    owner_q_start = writer_data.joint_q_start[owner_joint]
-    X_we = wp.transform(
-        wp.vec3(
-            writer_data.joint_q[owner_q_start + 0],
-            writer_data.joint_q[owner_q_start + 1],
-            writer_data.joint_q[owner_q_start + 2],
-        ),
-        wp.quat(
-            writer_data.joint_q[owner_q_start + 3],
-            writer_data.joint_q[owner_q_start + 4],
-            writer_data.joint_q[owner_q_start + 5],
-            writer_data.joint_q[owner_q_start + 6],
-        ),
-    )
+    X_we = writer_data.body_q[elastic_body]
     X_wr = writer_data.body_q[rigid_body] if rigid_body >= 0 else wp.transform_identity()
     X_rw = wp.transform_inverse(X_wr)
 
@@ -3784,9 +3769,8 @@ class CollisionPipeline:
                 inputs=[
                     state.body_q,
                     state.joint_q,
-                    model.joint_q_start,
                     model.body_elastic_index,
-                    model.elastic_joint,
+                    model.elastic_mode_q_start,
                     model.elastic_mode_count,
                     model.elastic_max_mode_count,
                     model.elastic_shape_vertex_local,

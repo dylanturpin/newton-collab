@@ -77,6 +77,13 @@ from .contact_torsion import (
 )
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
+from .elastic_links import (
+    elastic_contact_jacobian,
+    elastic_contact_points,
+    elastic_link_bias,
+    elastic_link_mass,
+    elastic_link_tau,
+)
 from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     CONTACT_GENERATION_NONE,
@@ -2683,6 +2690,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         if solve_mode not in ("split", "matrix_free"):
             raise ValueError(f"solve_mode must be 'split' or 'matrix_free', got {solve_mode!r}")
         self._solve_mode = solve_mode
+        self._has_elastic = bool(getattr(model, "elastic_body_count", 0))
+        if self._has_elastic:
+            _validate_elastic_model(
+                model,
+                solve_mode=solve_mode,
+                articulated_contact_response=articulated_contact_response,
+                update_mass_matrix_interval=update_mass_matrix_interval,
+                enable_sleeping=enable_sleeping,
+                enable_bilateral_preelimination=enable_bilateral_preelimination,
+                enable_torsional_rolling_friction=enable_torsional_rolling_friction,
+            )
         if self._enable_joint_velocity_limits and self._solve_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires solve_mode='matrix_free'")
         if model.requires_grad:
@@ -2871,6 +2889,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and model.joint_count
             and not model.requires_grad
             and not enable_joint_velocity_limits
+            and not self._has_elastic
         )
         # Split's dense/MF execution exposed a cross-replay lifetime conflict
         # when stage 7 published next-step dynamics over active solve scratch.
@@ -2958,6 +2977,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             or self._enable_torsional_rolling_friction
             or self._free_rigid_angular_rows
             or contact_compliance
+            or self._has_elastic
             else self._select_sparse_diagonal_response_pair()
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
@@ -3259,6 +3279,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             and not model.requires_grad
             and self._drive_mode == "augmented"
             and self._articulation_max_dofs > 0
+            and not self._has_elastic
         )
         self._composite_articulations = (
             wp.array(composite_articulations, dtype=wp.int32, device=model.device)
@@ -3369,7 +3390,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self._contact_warmstart
         response_pair = (
             None
-            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None
+            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None or self._has_elastic
             else self._select_paired_response()
         )
         self._paired_response_primary_size = response_pair[0] if response_pair is not None else None
@@ -4502,6 +4523,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._setup_size_grouping(model)
         self._setup_world_mapping(model)
         self._build_body_maps(model)
+        self._setup_elastic_links(model)
         if self._body_to_articulation is None:
             unarticulated = np.arange(model.body_count, dtype=np.int32)
         else:
@@ -5413,11 +5435,205 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             self._M_size = 0
             self._articulation_max_dofs = 0
 
+    # ── Reduced elastic links ─────────────────────────────────────────
+
+    def _setup_elastic_links(self, model: Model) -> None:
+        """Index each elastic body's modal DOFs inside its articulation's response block."""
+        if not self._has_elastic:
+            return
+        device = model.device
+        elastic_body = model.elastic_body.numpy()
+        elastic_joint = model.elastic_joint.numpy()
+        mode_count = model.elastic_mode_count.numpy()
+        mode_qd0 = model.elastic_mode_qd_start.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+        body_art = self._body_to_articulation.numpy()
+        art_group_idx = self._art_group_idx.numpy()
+        response_dof_count = self._model_plan.response_dof_count
+
+        elastic_art = body_art[elastic_body].astype(np.int32)
+        frame_dofs = (mode_qd0 - joint_qd_start[elastic_joint]).astype(np.int32)
+        self._elastic_art = wp.array(elastic_art, dtype=wp.int32, device=device)
+        self._elastic_frame_dofs = wp.array(frame_dofs, dtype=wp.int32, device=device)
+        self._elastic_mode_bias = wp.zeros(max(1, int(mode_count.sum())), dtype=float, device=device)
+        self._elastic_by_size = {}
+        for size in self._size_groups:
+            members = [e for e, art in enumerate(elastic_art) if art >= 0 and response_dof_count[art] == size]
+            if members:
+                self._elastic_by_size[size] = (
+                    wp.array(members, dtype=wp.int32, device=device),
+                    wp.array(art_group_idx[elastic_art[members]], dtype=wp.int32, device=device),
+                )
+        self._elastic_point0 = None
+        self._elastic_point1 = None
+
+    def _rigid_contact_point0(self, contacts: Contacts) -> wp.array:
+        return self._elastic_point0 if self._has_elastic else contacts.rigid_contact_point0
+
+    def _rigid_contact_point1(self, contacts: Contacts) -> wp.array:
+        return self._elastic_point1 if self._has_elastic else contacts.rigid_contact_point1
+
+    def _launch_elastic_bias(self, state_in: State, state_aug: State, joint_qd: wp.array) -> None:
+        model = self.model
+        self._elastic_body_q = state_in.body_q
+        wp.launch(
+            elastic_link_bias,
+            dim=model.elastic_body_count,
+            inputs=[
+                model.elastic_body,
+                self._elastic_art,
+                model.elastic_mode_q_start,
+                model.elastic_mode_qd_start,
+                model.elastic_mode_start,
+                model.elastic_mode_count,
+                model.elastic_max_mode_count,
+                model.elastic_mode_coupling_linear,
+                model.elastic_mode_coupling_angular,
+                model.elastic_mode_coupling_centrifugal,
+                model.elastic_mode_coupling_coriolis,
+                self._articulation_origin,
+                self._dynamics_art_active,
+                model.body_disable_gravity,
+                model.body_world,
+                model.gravity,
+                joint_qd,
+                state_in.body_q,
+                state_aug._body_v_s,
+                state_aug._body_a_s,
+            ],
+            outputs=[state_aug._body_f_s, self._elastic_mode_bias],
+            device=model.device,
+        )
+
+    def _launch_elastic_tau(self, state_in: State, state_aug: State, joint_qd: wp.array, dt: float) -> None:
+        model = self.model
+        self._elastic_dt = dt
+        wp.launch(
+            elastic_link_tau,
+            dim=model.elastic_body_count,
+            inputs=[
+                self._elastic_art,
+                model.elastic_mode_q_start,
+                model.elastic_mode_qd_start,
+                model.elastic_mode_start,
+                model.elastic_mode_count,
+                model.elastic_mode_stiffness,
+                model.elastic_mode_damping,
+                self._elastic_mode_bias,
+                self._dynamics_art_active,
+                state_in.joint_q,
+                joint_qd,
+                float(dt),
+            ],
+            outputs=[state_aug._joint_tau],
+            device=model.device,
+        )
+
+    def _launch_elastic_mass(self, state_aug: State) -> None:
+        model = self.model
+        for size, (members, groups) in self._elastic_by_size.items():
+            wp.launch(
+                elastic_link_mass,
+                dim=members.shape[0],
+                inputs=[
+                    members,
+                    groups,
+                    model.elastic_body,
+                    model.elastic_joint,
+                    self._elastic_art,
+                    self._elastic_frame_dofs,
+                    model.elastic_mode_qd_start,
+                    model.elastic_mode_start,
+                    model.elastic_mode_count,
+                    model.elastic_mode_mass,
+                    model.elastic_mode_stiffness,
+                    model.elastic_mode_damping,
+                    model.elastic_mode_coupling_linear,
+                    model.elastic_mode_coupling_angular,
+                    self._articulation_dof_start,
+                    self._articulation_origin,
+                    self._mass_update_mask,
+                    model.joint_ancestor,
+                    model.joint_qd_start,
+                    state_aug._joint_S_s,
+                    self._elastic_body_q,
+                    float(self._elastic_dt),
+                    size,
+                ],
+                outputs=[self._H_by_size[size]],
+                device=model.device,
+            )
+
+    def _launch_elastic_contact_points(self, state_in: State, contacts: Contacts) -> None:
+        model = self.model
+        capacity = contacts.rigid_contact_point0.shape[0]
+        if self._elastic_point0 is None or self._elastic_point0.shape[0] != capacity:
+            self._elastic_point0 = wp.zeros(capacity, dtype=wp.vec3, device=model.device)
+            self._elastic_point1 = wp.zeros(capacity, dtype=wp.vec3, device=model.device)
+        wp.launch(
+            elastic_contact_points,
+            dim=capacity,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_elastic_sample0,
+                contacts.rigid_contact_elastic_sample1,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                model.shape_body,
+                model.body_elastic_index,
+                model.elastic_mode_q_start,
+                model.elastic_mode_count,
+                model.elastic_max_mode_count,
+                model.elastic_shape_vertex_phi,
+                state_in.joint_q,
+            ],
+            outputs=[self._elastic_point0, self._elastic_point1],
+            device=model.device,
+        )
+
+    def _launch_elastic_contact_jacobian(self, state_in: State, contacts: Contacts) -> None:
+        model = self.model
+        for size in self._size_groups:
+            wp.launch(
+                elastic_contact_jacobian,
+                dim=contacts.rigid_contact_point0.shape[0],
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_elastic_sample0,
+                    contacts.rigid_contact_elastic_sample1,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    self._contact_world,
+                    self._contact_slot,
+                    self._contact_art_a,
+                    self._contact_art_b,
+                    self._contact_path,
+                    size,
+                    self._articulation_response_dof_count,
+                    self._art_group_idx,
+                    self._articulation_dof_start,
+                    model.shape_body,
+                    model.body_elastic_index,
+                    model.elastic_mode_qd_start,
+                    model.elastic_mode_count,
+                    model.elastic_max_mode_count,
+                    model.elastic_shape_vertex_phi,
+                    state_in.body_q,
+                    self._row_type,
+                ],
+                outputs=[self._J_by_size[size]],
+                device=model.device,
+            )
+
     def _compute_root_free_metadata(self, model):
         if model.joint_count:
             joint_type = model.joint_type.numpy()
             joint_parent = model.joint_parent.numpy()
-            root_mask = ((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (joint_parent < 0)
+            free_like = (joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE) | _elastic_free_frame(model)
+            root_mask = free_like & (joint_parent < 0)
             free_root_joint_indices = np.flatnonzero(root_mask).astype(np.int32, copy=False)
             self._free_root_joint_count = int(free_root_joint_indices.size)
             self._free_root_joint_indices = (
@@ -5438,6 +5654,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         articulation_start = model.articulation_start.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
 
+        elastic_free = _elastic_free_frame(model)
         root_is_free = np.zeros(model.articulation_count, dtype=np.int32)
         root_dof_start = np.zeros(model.articulation_count, dtype=np.int32)
 
@@ -5446,7 +5663,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             root_dof_start[art] = int(joint_qd_start[root_joint])
             jt = int(joint_type[root_joint])
             jp = int(joint_parent[root_joint])
-            if jp == -1 and (jt == int(JointType.FREE) or jt == int(JointType.DISTANCE)):
+            if jp == -1 and (jt == int(JointType.FREE) or jt == int(JointType.DISTANCE) or elastic_free[root_joint]):
                 root_is_free[art] = 1
 
         self._articulation_root_is_free = wp.array(root_is_free, dtype=wp.int32, device=model.device)
@@ -6366,6 +6583,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         self._augmented_drive_q_index_by_dof = None
         self._augmented_drive_target_index_by_dof = None
+        if self._has_elastic:
+            # The elastic mass pass writes H between CRBA and the factor, which fused CRBA-Cholesky skips.
+            return
         if not self._async_augmented_drives or self._has_loop_joints or not model.joint_dof_count:
             return
 
@@ -9775,8 +9995,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 inputs=[
                     contacts.rigid_contact_count,
                     min(contacts.rigid_contact_max, self._max_contacts_alloc),
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
+                    self._rigid_contact_point0(contacts),
+                    self._rigid_contact_point1(contacts),
                     contacts.rigid_contact_normal,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -10012,11 +10232,15 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
+            if self._has_elastic:
+                self._launch_elastic_bias(state_in, state_aug, stage3_qd)
 
             if model.articulation_count:
                 inverse_dynamics_ready = self._stage1_complete_joint_tau(
                     state_in, state_aug, control, dt, drive_rows_ready
                 )
+                if self._has_elastic:
+                    self._launch_elastic_tau(state_in, state_aug, stage3_qd, dt)
             else:
                 inverse_dynamics_ready = None
             # With sleeping, wrenches go to solver-owned history first, so frozen bodies never read a caller buffer.
@@ -11678,6 +11902,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     device=model.device,
                 )
 
+        if self._has_elastic:
+            self._launch_elastic_mass(state_aug)
         self._mass_update_requested.zero_()
 
         self._force_mass_update = False
@@ -11980,6 +12206,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self._has_elastic and contacts is not None:
+            self._launch_elastic_contact_points(state_in, contacts)
         if self._contact_compliance:
             _contact_compliance.start_step(self, contacts, dt)
             _contact_compliance.begin_rows(self)
@@ -12599,8 +12827,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     contact_build_threads,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
+                    self._rigid_contact_point0(contacts),
+                    self._rigid_contact_point1(contacts),
                     contacts.rigid_contact_normal,
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
@@ -12688,8 +12916,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     inputs=[
                         contacts.rigid_contact_count,
                         contact_build_threads,
-                        contacts.rigid_contact_point0,
-                        contacts.rigid_contact_point1,
+                        self._rigid_contact_point0(contacts),
+                        self._rigid_contact_point1(contacts),
                         contacts.rigid_contact_normal,
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
@@ -12743,8 +12971,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                             inputs=[
                                 contacts.rigid_contact_count,
                                 sparse_contact_workers,
-                                contacts.rigid_contact_point0,
-                                contacts.rigid_contact_point1,
+                                self._rigid_contact_point0(contacts),
+                                self._rigid_contact_point1(contacts),
                                 contacts.rigid_contact_normal,
                                 contacts.rigid_contact_shape0,
                                 contacts.rigid_contact_shape1,
@@ -12796,8 +13024,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_jacobian_workers,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
+                            self._rigid_contact_point0(contacts),
+                            self._rigid_contact_point1(contacts),
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
@@ -12831,8 +13059,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_jacobian_workers,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
+                            self._rigid_contact_point0(contacts),
+                            self._rigid_contact_point1(contacts),
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
@@ -12888,8 +13116,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_build_threads,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
+                            self._rigid_contact_point0(contacts),
+                            self._rigid_contact_point1(contacts),
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
@@ -12940,6 +13168,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                         device=model.device,
                     )
 
+            if self._has_elastic and contacts is not None:
+                self._launch_elastic_contact_jacobian(state_in, contacts)
+
             if self._enable_torsional_rolling_friction:
                 launch_angular_friction_rows(self, state_in, state_aug, contacts, contact_build_threads)
 
@@ -12951,8 +13182,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     inputs=[
                         contacts.rigid_contact_count,
                         contact_build_threads,
-                        contacts.rigid_contact_point0,
-                        contacts.rigid_contact_point1,
+                        self._rigid_contact_point0(contacts),
+                        self._rigid_contact_point1(contacts),
                         contacts.rigid_contact_normal,
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
@@ -13067,8 +13298,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     dim=builder_dim,
                     inputs=[
                         contacts.rigid_contact_count,
-                        contacts.rigid_contact_point0,
-                        contacts.rigid_contact_point1,
+                        self._rigid_contact_point0(contacts),
+                        self._rigid_contact_point1(contacts),
                         contacts.rigid_contact_normal,
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
@@ -14668,6 +14899,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     model.joint_qd_start,
                     self._kinematic_joint_mask,
                     model.joint_dof_dim,
+                    model.joint_axis,
                     model.body_com,
                     model.joint_X_c,
                     state_in.joint_q,
@@ -14719,6 +14951,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     model.joint_qd_start,
                     self._kinematic_joint_mask,
                     model.joint_dof_dim,
+                    model.joint_axis,
                     model.body_com,
                     model.joint_X_c,
                     state_in.joint_q,
@@ -27577,3 +27810,44 @@ def _get_pgs_solve_mf_gs_kernel(
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+
+def _elastic_free_frame(model: Model) -> np.ndarray:
+    """Per-joint mask of ELASTIC joints whose rigid frame uses the FREE layout."""
+    joint_type = model.joint_type.numpy()
+    coord_count = np.diff(model.joint_q_start.numpy())
+    dof_count = np.diff(model.joint_qd_start.numpy())
+    return (joint_type == int(JointType.ELASTIC)) & (coord_count == dof_count + 1)
+
+
+def _validate_elastic_model(
+    model: Model,
+    *,
+    solve_mode: str,
+    articulated_contact_response: str,
+    update_mass_matrix_interval: int,
+    enable_sleeping: bool,
+    enable_bilateral_preelimination: bool,
+    enable_torsional_rolling_friction: bool,
+) -> None:
+    """Reject solver options and topologies the reduced elastic coupling does not cover."""
+    if solve_mode != "split" or articulated_contact_response != "immediate":
+        raise NotImplementedError("Reduced elastic links require solve_mode='split' with the immediate response.")
+    if update_mass_matrix_interval != 1:
+        raise NotImplementedError("Reduced elastic links require update_mass_matrix_interval=1.")
+    if enable_sleeping or enable_bilateral_preelimination or enable_torsional_rolling_friction:
+        raise NotImplementedError("Reduced elastic links do not support sleeping, pre-elimination or rolling friction.")
+    joint_articulation = model.joint_articulation.numpy()
+    joint_parent = model.joint_parent.numpy()
+    joint_child = model.joint_child.numpy()
+    body_elastic_index = model.body_elastic_index.numpy()
+    elastic_joint = model.elastic_joint.numpy()
+    for e, joint in enumerate(elastic_joint):
+        if joint_articulation[joint] < 0:
+            raise ValueError(f"Elastic body {model.elastic_body.numpy()[e]} needs its ELASTIC joint as tree joint.")
+    for joint in range(model.joint_count):
+        parent, child = int(joint_parent[joint]), int(joint_child[joint])
+        if parent >= 0 and body_elastic_index[parent] >= 0:
+            raise NotImplementedError(f"Joint {joint} attaches a body to elastic body {parent}.")
+        if child >= 0 and body_elastic_index[child] >= 0 and joint != elastic_joint[body_elastic_index[child]]:
+            raise NotImplementedError(f"Joint {joint} closes a loop on elastic body {child}.")

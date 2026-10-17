@@ -736,6 +736,8 @@ class ModelBuilder:
                 "elastic_body",
                 "elastic_joint",
                 "elastic_mode_start",
+                "elastic_mode_q_start",
+                "elastic_mode_qd_start",
                 "elastic_mode_count",
                 "elastic_mode_mass",
                 "elastic_mode_stiffness",
@@ -3566,6 +3568,13 @@ class ModelBuilder:
         warnings.warn(_JOINT_TWIST_LIMIT_DEPRECATION_MSG, DeprecationWarning, stacklevel=3)
         self._deprecated_joint_twist_upper = value
 
+    def _elastic_free_frame_mask(self) -> np.ndarray:
+        """Per-joint mask of ELASTIC joints whose frame uses the FREE ``[pos, quat]`` layout."""
+        q_start = np.asarray([*self.joint_q_start, self.joint_coord_count], dtype=np.int64)
+        qd_start = np.asarray([*self.joint_qd_start, self.joint_dof_count], dtype=np.int64)
+        joint_types = np.asarray(self.joint_type, dtype=np.int32)
+        return (joint_types == int(JointType.ELASTIC)) & (np.diff(q_start) == np.diff(qd_start) + 1)
+
     def _project_target_q_to_dof(self) -> list[float] | np.ndarray:
         """Drop the quat-w padding slot for FREE/BALL/DISTANCE/ROD/ELASTIC joints to turn
         the coord-sized :attr:`joint_target_q` buffer into a DOF-shaped one.
@@ -3583,7 +3592,7 @@ class ModelBuilder:
                 | (joint_types == int(JointType.FREE))
                 | (joint_types == int(JointType.DISTANCE))
                 | (joint_types == int(JointType.ROD))
-                | (joint_types == int(JointType.ELASTIC))
+                | ((joint_types == int(JointType.ELASTIC)) & self._elastic_free_frame_mask())
             )
             padding_indices = np.asarray(self.joint_q_start, dtype=np.int64)[padding_mask]
             padding_indices += np.where(ball_mask[padding_mask], 3, 6)
@@ -3598,7 +3607,7 @@ class ModelBuilder:
                 result.extend(self.joint_target_q[q_start : q_start + 3])
             elif jtype == JointType.FREE or jtype == JointType.DISTANCE or jtype == JointType.ROD:
                 result.extend(self.joint_target_q[q_start : q_start + 6])
-            elif jtype == JointType.ELASTIC:
+            elif jtype == JointType.ELASTIC and self._elastic_free_frame_mask()[j]:
                 # Drop the frame quaternion's w placeholder; modal targets follow the frame twist.
                 mode_count = self.joint_dof_dim[j][1] - 3
                 result.extend(self.joint_target_q[q_start : q_start + 6])
@@ -5965,14 +5974,20 @@ class ModelBuilder:
         mode_qd: Sequence[float] | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
+        linear_axes: Sequence[AxisType] | None = None,
+        angular_axes: Sequence[AxisType] | None = None,
     ) -> int:
         """Add a reduced elastic state-owner joint.
 
-        The joint stores a free floating frame followed by reduced elastic modal
+        By default the joint stores a free floating frame followed by reduced elastic modal
         coordinates. Its coordinate layout is ``[pos, quat, modes...]`` and its
         velocity layout is ``[linear, angular, mode_dot...]``. The joint is a state
         owner and contributes no bilateral constraints by itself; physical
         connectivity should be added with ordinary joints.
+
+        Passing ``linear_axes`` and/or ``angular_axes`` gives the frame those passive D6 axes
+        relative to ``parent`` instead (none for a frame fixed to the parent), with layout
+        ``[axis coordinates..., modes...]``. Articulated solvers use this joint as the link's tree joint.
 
         Args:
             child: Child body index owned by this reduced elastic joint.
@@ -5985,10 +6000,15 @@ class ModelBuilder:
             mode_qd: Initial modal velocities.
             enabled: Whether the owner joint is enabled.
             custom_attributes: Custom joint attributes.
+            linear_axes: Frame translation axes relative to the parent anchor.
+            angular_axes: Frame rotation axes relative to the parent anchor.
 
         Returns:
             The index of the added joint.
         """
+        free_frame = linear_axes is None and angular_axes is None
+        frame_linear = [axis_to_vec3(axis) for axis in (linear_axes or [])]
+        frame_angular = [axis_to_vec3(axis) for axis in (angular_axes or [])]
         if mode_count < 0:
             raise ValueError(f"mode_count must be non-negative, got {mode_count}")
 
@@ -6036,7 +6056,10 @@ class ModelBuilder:
         self.joint_X_p.append(parent_xform)
         self.joint_X_c.append(child_xform)
         self.joint_label.append(label or f"elastic_joint_{joint_id}")
-        self.joint_dof_dim.append((3, 3 + mode_count))
+        if free_frame:
+            self.joint_dof_dim.append((3, 3 + mode_count))
+        else:
+            self.joint_dof_dim.append((len(frame_linear), len(frame_angular) + mode_count))
         self.joint_enabled.append(enabled)
         self.joint_collision_filter_parent.append(False)
         self.joint_world.append(self.current_world)
@@ -6050,24 +6073,21 @@ class ModelBuilder:
         self.joint_qd_start.append(self.joint_dof_count)
         self.joint_cts_start.append(self.joint_constraint_count)
 
-        parent_body_xform = wp.transform_identity() if parent == -1 else self.body_q[parent]
-        parent_anchor_world = parent_body_xform * parent_xform
-        frame_q = wp.transform_inverse(parent_anchor_world) * self.body_q[child] * child_xform
-        self.joint_q.extend(list(frame_q))
+        if free_frame:
+            parent_body_xform = wp.transform_identity() if parent == -1 else self.body_q[parent]
+            parent_anchor_world = parent_body_xform * parent_xform
+            frame_q = list(wp.transform_inverse(parent_anchor_world) * self.body_q[child] * child_xform)
+            frame_axes = [Axis.X, Axis.Y, Axis.Z, Axis.X, Axis.Y, Axis.Z]
+        else:
+            frame_axes = frame_linear + frame_angular
+            frame_q = [0.0] * len(frame_axes)
+        self.joint_q.extend(frame_q)
         self.joint_q.extend(mode_q_values)
-        self.joint_qd.extend([0.0] * 6)
+        self.joint_qd.extend([0.0] * len(frame_axes))
         self.joint_qd.extend(mode_qd_values)
 
-        dof_count = 6 + mode_count
-        axes = [
-            Axis.X,
-            Axis.Y,
-            Axis.Z,
-            Axis.X,
-            Axis.Y,
-            Axis.Z,
-            *([wp.vec3(0.0)] * mode_count),
-        ]
+        dof_count = len(frame_axes) + mode_count
+        axes = [*frame_axes, *([wp.vec3(0.0)] * mode_count)]
         for axis in axes:
             self.joint_axis.append(axis_to_vec3(axis))
             self.joint_target_mode.append(int(JointTargetMode.NONE))
@@ -6086,15 +6106,16 @@ class ModelBuilder:
             self.joint_limit_lower.append(-MAXVAL)
             self.joint_limit_upper.append(MAXVAL)
 
-        self.joint_target_q.extend([0.0] * (7 + mode_count))
-        # identity frame-orientation target, matching FREE joints in either target layout
-        self.joint_target_q[-(1 + mode_count)] = 1.0
+        self.joint_target_q.extend([0.0] * (len(frame_q) + mode_count))
+        if free_frame:
+            # identity frame-orientation target, matching FREE joints in either target layout
+            self.joint_target_q[-(1 + mode_count)] = 1.0
 
         self.joint_f.extend([0.0] * dof_count)
         self.joint_act.extend([0.0] * dof_count)
 
         self.joint_dof_count += dof_count
-        self.joint_coord_count += 7 + mode_count
+        self.joint_coord_count += len(frame_q) + mode_count
 
         if custom_attributes:
             self._process_custom_attributes(
@@ -6124,6 +6145,11 @@ class ModelBuilder:
         lock_inertia: bool = False,
         is_kinematic: bool = False,
         custom_attributes: dict[str, Any] | None = None,
+        parent: int = -1,
+        parent_xform: Transform | None = None,
+        child_xform: Transform | None = None,
+        linear_axes: Sequence[AxisType] | None = None,
+        angular_axes: Sequence[AxisType] | None = None,
     ) -> int:
         """Add a reduced elastic link with a floating frame and modal DoFs.
 
@@ -6152,6 +6178,11 @@ class ModelBuilder:
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
+            parent: Parent body of the owner joint, or -1 for world.
+            parent_xform: Owner joint anchor in the parent body frame.
+            child_xform: Owner joint anchor in the elastic body frame.
+            linear_axes: Passive frame translation axes; see :meth:`add_joint_elastic`.
+            angular_axes: Passive frame rotation axes; see :meth:`add_joint_elastic`.
 
         Returns:
             The body index.
@@ -6206,6 +6237,11 @@ class ModelBuilder:
             label=f"{label}_elastic_joint" if label else None,
             mode_q=mode_q,
             mode_qd=mode_qd,
+            parent=parent,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+            linear_axes=linear_axes,
+            angular_axes=angular_axes,
         )
 
         elastic_id = len(self.elastic_body)
@@ -16448,6 +16484,16 @@ class ModelBuilder:
             m.elastic_basis = wp.array(self.elastic_basis, dtype=wp.int32)
             m.elastic_mode_start = wp.array(self.elastic_mode_start, dtype=wp.int32)
             m.elastic_mode_count = wp.array(self.elastic_mode_count, dtype=wp.int32)
+            q_end = [*self.joint_q_start[1:], self.joint_coord_count]
+            qd_end = [*self.joint_qd_start[1:], self.joint_dof_count]
+            m.elastic_mode_q_start = wp.array(
+                [q_end[j] - n for j, n in zip(self.elastic_joint, self.elastic_mode_count, strict=True)],
+                dtype=wp.int32,
+            )
+            m.elastic_mode_qd_start = wp.array(
+                [qd_end[j] - n for j, n in zip(self.elastic_joint, self.elastic_mode_count, strict=True)],
+                dtype=wp.int32,
+            )
             m.elastic_mode_mass = wp.array(self.elastic_mode_mass, dtype=wp.float32, requires_grad=requires_grad)
             m.elastic_mode_stiffness = wp.array(
                 self.elastic_mode_stiffness, dtype=wp.float32, requires_grad=requires_grad

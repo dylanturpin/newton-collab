@@ -1305,9 +1305,8 @@ def create_soft_contacts(
 def create_elastic_shape_contacts(
     body_q: wp.array[wp.transform],
     joint_q: wp.array[float],
-    joint_q_start: wp.array[wp.int32],
     body_elastic_index: wp.array[wp.int32],
-    elastic_joint: wp.array[wp.int32],
+    elastic_mode_q_start: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
     elastic_max_mode_count: int,
     elastic_shape_vertex_local: wp.array[wp.vec3],
@@ -1393,20 +1392,9 @@ def create_elastic_shape_contacts(
     if elastic_index < 0:
         return
 
-    owner_joint = elastic_joint[elastic_index]
-    owner_q_start = joint_q_start[owner_joint]
-    mode_q_start = owner_q_start + 7
+    mode_q_start = elastic_mode_q_start[elastic_index]
     mode_count = elastic_mode_count[elastic_index]
-
-    X_we = wp.transform(
-        wp.vec3(joint_q[owner_q_start + 0], joint_q[owner_q_start + 1], joint_q[owner_q_start + 2]),
-        wp.quat(
-            joint_q[owner_q_start + 3],
-            joint_q[owner_q_start + 4],
-            joint_q[owner_q_start + 5],
-            joint_q[owner_q_start + 6],
-        ),
-    )
+    X_we = body_q[elastic_body]
 
     elastic_point_local_rest = elastic_shape_vertex_local[vertex_index]
     elastic_point_local = elastic_point_local_rest

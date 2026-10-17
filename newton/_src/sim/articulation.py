@@ -247,6 +247,33 @@ def eval_angular_coordinates(
 
 
 @wp.func
+def elastic_frame_layout(
+    joint_type: int,
+    joint_axis: wp.array[wp.vec3],
+    axis_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+):
+    """Return ``(frame_type, lin, ang, mode_count)`` of a joint; non-ELASTIC joints pass through.
+
+    An ELASTIC joint's frame axes are its leading non-zero ``joint_axis`` entries: six mean a FREE
+    frame, fewer a D6 frame; the remaining zero axes are modal coordinates.
+    """
+    if joint_type != JointType.ELASTIC:
+        return joint_type, lin_axis_count, ang_axis_count, 0
+    total = lin_axis_count + ang_axis_count
+    frame = int(0)
+    while frame < total:
+        if wp.length_sq(joint_axis[axis_start + frame]) == 0.0:
+            break
+        frame += 1
+    modes = total - frame
+    if frame == 6:
+        return int(JointType.FREE), 3, 3, modes
+    return int(JointType.D6), lin_axis_count, frame - lin_axis_count, modes
+
+
+@wp.func
 def eval_joint_motion(
     type: int,
     q_start: int,
@@ -437,11 +464,12 @@ def eval_single_articulation_fk(
 
         q_start = joint_q_start[i]
         qd_start = joint_qd_start[i]
-        lin_axis_count = joint_dof_dim[i, 0]
-        ang_axis_count = joint_dof_dim[i, 1]
+        frame_type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+            type, joint_axis, qd_start, joint_dof_dim[i, 0], joint_dof_dim[i, 1]
+        )
 
         X_j, v_j = eval_joint_motion(
-            type,
+            frame_type,
             q_start,
             qd_start,
             lin_axis_count,
@@ -455,7 +483,7 @@ def eval_single_articulation_fk(
         if parent >= 0:
             X_wp = body_q[parent]
         X_wc, v_wc = eval_joint_child_state(
-            type,
+            frame_type,
             parent,
             child,
             X_wp,

@@ -1421,6 +1421,10 @@ class Model:
         """Start index of each reduced elastic body's modal data, shape [elastic_body_count], int."""
         self.elastic_mode_count: wp.array[wp.int32] | None = None
         """Number of elastic modes for each reduced elastic body, shape [elastic_body_count], int."""
+        self.elastic_mode_q_start: wp.array[wp.int32] | None = None
+        """Index into :attr:`~newton.State.joint_q` of each reduced elastic body's first modal coordinate, shape [elastic_body_count], int."""
+        self.elastic_mode_qd_start: wp.array[wp.int32] | None = None
+        """Index into :attr:`~newton.State.joint_qd` of each reduced elastic body's first modal velocity, shape [elastic_body_count], int."""
         self.elastic_mode_mass: wp.array[wp.float32] | None = None
         """Reduced elastic modal masses [kg], shape [sum(elastic_mode_count)], float."""
         self.elastic_mode_stiffness: wp.array[wp.float32] | None = None
