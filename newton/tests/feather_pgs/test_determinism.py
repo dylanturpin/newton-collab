@@ -17,9 +17,12 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
     crba_fill_par_dof,
 )
 from newton.solvers import SolverBase, SolverFeatherPGS
+from newton.tests.feather_pgs import test_propagation
+from newton.tests.feather_pgs._fixtures import set_torsion_radius
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
 # Free root, then two ball joints: every joint has several DOFs.
@@ -822,6 +825,39 @@ def test_deterministic_propagation_accepts_bodies_shared_by_worlds(test, device)
                 np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
 
 
+def test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows(test, device):
+    """Repeat contact torsion on a kinematic floor shared by every world bitwise, with no row naming the floor."""
+    model, floor = test_propagation._build_shared_floor_model(device)
+    set_torsion_radius(model, 0.01)
+    runs = []
+    for _ in range(2):
+        solver = SolverFeatherPGS(
+            model,
+            deterministic=True,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation",
+            contact_torsion_device=True,
+            friction_anchor_beta=0.0,
+            free_body_constraint_max=512,
+            articulation_constraint_max=128,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(20):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            counts = solver._propagation_constraint_count.numpy()
+            row_type = solver._propagation_row_type.numpy()
+            for world, count in enumerate(counts):
+                test.assertGreater(int(np.sum(row_type[world, :count] == PGS_CONSTRAINT_TYPE_TORSION)), 0)
+                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+                    test.assertNotIn(floor, side[world, :count])
+        runs.append(_sample(state_0))
+    test.assertEqual(runs[1], runs[0])
+
+
 def test_deterministic_propagation_drops_cross_world_responding_contacts(test, device):
     """Drop contacts joining responding bodies of different worlds, flag both worlds, and keep rows per world."""
     cases = {}
@@ -1080,6 +1116,12 @@ for _device in get_test_devices():
             TestFeatherPGSDeterminism,
             "test_deterministic_propagation_accepts_bodies_shared_by_worlds",
             test_deterministic_propagation_accepts_bodies_shared_by_worlds,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows",
+            test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows,
             devices=[_device],
         )
         add_function_test(
