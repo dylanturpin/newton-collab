@@ -82,7 +82,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
 
     def test_contact_compresses_pad_to_static_solution(self):
         mass, stiffness, g = 0.4, 2000.0, 9.81
-        model, pad = _pad_on_ground(mass, stiffness, g)
+        model, _pad = _pad_on_ground(mass, stiffness, g)
         state_0, state_1 = model.state(), model.state()
         contacts = model.contacts()
         solver = SolverFeatherPGS(model)
@@ -106,7 +106,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertEqual(digests[0], digests[1])
 
     def test_rejects_bodies_attached_to_an_elastic_link(self):
-        model, _state, info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
+        model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
         with self.assertRaises(NotImplementedError):
             SolverFeatherPGS(model)
 
@@ -151,7 +151,9 @@ def _beam_basis():
         sample_points=points, sample_phi=phi, sample_mass=sample_mass, mode_stiffness=[80.0, 120.0]
     )
     d = points.astype(np.float64)
-    inertia = np.einsum("s,sij->ij", sample_mass, (d * d).sum(1)[:, None, None] * np.eye(3) - d[:, :, None] * d[:, None, :])
+    inertia = np.einsum(
+        "s,sij->ij", sample_mass, (d * d).sum(1)[:, None, None] * np.eye(3) - d[:, :, None] * d[:, None, :]
+    )
     return basis, points, phi, sample_mass, inertia
 
 
@@ -160,7 +162,9 @@ def _hub_beam(steel, omega, eta, gravity=(0.0, 0.0, 0.0), tip_body=False):
     basis, points, phi, sample_mass, inertia = _beam_basis()
     builder = newton.ModelBuilder(gravity=gravity)
     hub_inertia = np.eye(3) * 0.02
-    hub = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(hub_inertia))
+    hub = builder.add_link(
+        xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(hub_inertia)
+    )
     beam_args = {
         "xform": wp.transform((HUB_OFFSET + 0.5 * BEAM_LENGTH, 0.0, 1.0), wp.quat_identity()),
         "mass": float(sample_mass.sum()),
@@ -184,7 +188,9 @@ def _hub_beam(steel, omega, eta, gravity=(0.0, 0.0, 0.0), tip_body=False):
     if tip_body:
         tip = builder.add_link(xform=wp.transform((HUB_OFFSET + BEAM_LENGTH, 0.0, 1.0), wp.quat_identity()), mass=0.1)
         joints.append(
-            builder.add_joint_fixed(beam, tip, parent_xform=wp.transform((0.5 * BEAM_LENGTH, 0.0, 0.0), wp.quat_identity()))
+            builder.add_joint_fixed(
+                beam, tip, parent_xform=wp.transform((0.5 * BEAM_LENGTH, 0.0, 0.0), wp.quat_identity())
+            )
         )
     builder.add_articulation(joints)
     if not steel:
@@ -308,7 +314,11 @@ def _cloud_momentum(model, state, info):
     origin_velocity = body_qd[beam][:3] - np.cross(omega, rotation @ model.body_com.numpy()[beam])
     local = info["points"] + np.einsum("smc,m->sc", info["phi"], eta)
     x = body_q[beam][:3] + local @ rotation.T
-    v = origin_velocity + np.cross(omega, local @ rotation.T) + np.einsum("smc,m->sc", info["phi"], eta_dot) @ rotation.T
+    v = (
+        origin_velocity
+        + np.cross(omega, local @ rotation.T)
+        + np.einsum("smc,m->sc", info["phi"], eta_dot) @ rotation.T
+    )
     mass = info["sample_mass"][:, None]
     return linear + np.sum(mass * v, axis=0), angular + np.sum(mass * np.cross(x, v), axis=0)
 

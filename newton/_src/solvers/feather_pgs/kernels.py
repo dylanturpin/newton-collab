@@ -960,7 +960,6 @@ def _jcalc_integrate_rigid(
         return
 
 
-
 @wp.func
 def frame_dof_count(frame_type: int, lin_axis_count: int, ang_axis_count: int):
     """Velocity DOFs of a joint frame (excluding elastic modes)."""
@@ -1022,8 +1021,21 @@ def jcalc_tau(
 ):
     if type != JointType.ELASTIC:
         _jcalc_tau_rigid(
-            type, joint_S_s, joint_f, joint_q, joint_qd, joint_spring_stiffness, joint_spring_ref, joint_damping,
-            coord_start, dof_start, lin_axis_count, ang_axis_count, body_f_s, add_existing_tau, tau,
+            type,
+            joint_S_s,
+            joint_f,
+            joint_q,
+            joint_qd,
+            joint_spring_stiffness,
+            joint_spring_ref,
+            joint_damping,
+            coord_start,
+            dof_start,
+            lin_axis_count,
+            ang_axis_count,
+            body_f_s,
+            add_existing_tau,
+            tau,
         )
         return
     # Elastic frames are passive: no spring/damping on the frame axes, modal forces come from joint_f.
@@ -1061,8 +1073,22 @@ def jcalc_integrate(
 ):
     frame_type, lin, ang, mode_count = elastic_frame_layout(type, joint_axis, dof_start, lin_axis_count, ang_axis_count)
     _jcalc_integrate_rigid(
-        frame_type, child, body_com, X_cj, joint_q, joint_qd, joint_qdd, coord_start, dof_start,
-        lin, ang, dt, angular_damping, parent, joint_q_new, joint_qd_new,
+        frame_type,
+        child,
+        body_com,
+        X_cj,
+        joint_q,
+        joint_qd,
+        joint_qdd,
+        coord_start,
+        dof_start,
+        lin,
+        ang,
+        dt,
+        angular_damping,
+        parent,
+        joint_q_new,
+        joint_qd_new,
     )
     mode_dof = dof_start + frame_dof_count(frame_type, lin, ang)
     mode_coord = coord_start + frame_coord_count(frame_type, lin, ang)

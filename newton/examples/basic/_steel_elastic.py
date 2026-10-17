@@ -22,7 +22,9 @@ class SolidMesh:
     def __init__(self, nodes: np.ndarray, tets: np.ndarray, young: float, poisson: float, density: float):
         self.nodes = np.asarray(nodes, dtype=np.float64)
         self.tets = np.asarray(tets, dtype=np.int64)
-        self.mass_matrix, self.stiffness_matrix, self.node_mass = _assemble(self.nodes, self.tets, young, poisson, density)
+        self.mass_matrix, self.stiffness_matrix, self.node_mass = _assemble(
+            self.nodes, self.tets, young, poisson, density
+        )
         self.surface_vertices, self.surface_indices, self.surface_nodes = _boundary(self.nodes, self.tets)
 
     @property
@@ -186,9 +188,8 @@ def _boundary(nodes, tets):
     tris = []
     for face, opposite in faces.values():
         a, b, c = nodes[list(face)]
-        if np.dot(np.cross(b - a, c - a), nodes[opposite] - a) > 0.0:
-            face = (face[0], face[2], face[1])
-        tris.append(face)
+        inward = np.dot(np.cross(b - a, c - a), nodes[opposite] - a) > 0.0
+        tris.append((face[0], face[2], face[1]) if inward else face)
     tris = np.asarray(tris)
     used = np.unique(tris)
     remap = -np.ones(len(nodes), dtype=np.int64)

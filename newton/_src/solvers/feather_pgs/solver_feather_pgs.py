@@ -75,8 +75,6 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
-from .friction import FRICTION_PAIR_CUDA
-from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .elastic_links import (
     elastic_contact_jacobian,
     elastic_contact_points,
@@ -84,6 +82,8 @@ from .elastic_links import (
     elastic_link_mass,
     elastic_link_tau,
 )
+from .friction import FRICTION_PAIR_CUDA
+from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     CONTACT_GENERATION_NONE,

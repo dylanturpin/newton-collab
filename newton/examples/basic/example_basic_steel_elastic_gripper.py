@@ -43,21 +43,43 @@ class Example:
         builder.add_ground_plane(cfg=contact)
 
         # Carriage lifted by a prismatic joint; two pads on prismatic joints along x.
-        carriage = builder.add_link(xform=wp.transform((0.0, 0.0, radius), wp.quat_identity()), mass=1.0,
-                                    inertia=wp.mat33(np.eye(3) * 1.0e-3), label="carriage")
+        carriage = builder.add_link(
+            xform=wp.transform((0.0, 0.0, radius), wp.quat_identity()),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3) * 1.0e-3),
+            label="carriage",
+        )
+        visual = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False, has_particle_collision=False)
+        builder.add_shape_box(
+            carriage,
+            xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()),
+            hx=self.open_x + 0.02,
+            hy=0.012,
+            hz=0.008,
+            cfg=visual,
+        )
         drive = {"target_ke": 2.0e4, "target_kd": 4.0e2}
         j_lift = builder.add_joint_prismatic(
-            -1, carriage, axis=(0.0, 0.0, 1.0), parent_xform=wp.transform((0.0, 0.0, radius), wp.quat_identity()),
-            target_pos=0.0, **drive,
+            -1,
+            carriage,
+            axis=(0.0, 0.0, 1.0),
+            parent_xform=wp.transform((0.0, 0.0, radius), wp.quat_identity()),
+            target_pos=0.0,
+            **drive,
         )
         self.pads = []
         joints = [j_lift]
         for side in (-1.0, 1.0):
-            pad = builder.add_link(xform=wp.transform((side * self.open_x, 0.0, radius), wp.quat_identity()),
-                                   mass=0.2, inertia=wp.mat33(np.eye(3) * 1.0e-4), label=f"pad_{int(side)}")
+            pad = builder.add_link(
+                xform=wp.transform((side * self.open_x, 0.0, radius), wp.quat_identity()),
+                mass=0.2,
+                inertia=wp.mat33(np.eye(3) * 1.0e-4),
+                label=f"pad_{int(side)}",
+            )
             builder.add_shape_box(pad, hx=pad_half[0], hy=pad_half[1], hz=pad_half[2], cfg=contact)
-            j_pad = builder.add_joint_prismatic(carriage, pad, axis=(side, 0.0, 0.0), target_pos=self.open_x,
-                                                limit_lower=0.0, limit_upper=0.2, **drive)
+            j_pad = builder.add_joint_prismatic(
+                carriage, pad, axis=(side, 0.0, 0.0), target_pos=self.open_x, limit_lower=0.0, limit_upper=0.2, **drive
+            )
             builder.joint_q[builder.joint_q_start[j_pad]] = self.open_x
             joints.append(j_pad)
             self.pads.append(pad)
@@ -67,10 +89,18 @@ class Example:
         ball_xform = wp.transform((0.0, 0.0, radius + 0.001), wp.quat_identity())
         if self.rigid:
             self.ball = builder.add_body(xform=ball_xform, label="ball")
-            builder.add_shape_sphere(self.ball, radius=radius, cfg=newton.ModelBuilder.ShapeConfig(mu=1.0, gap=0.002, density=300.0))
+            builder.add_shape_sphere(
+                self.ball, radius=radius, cfg=newton.ModelBuilder.ShapeConfig(mu=1.0, gap=0.002, density=300.0)
+            )
         else:
-            solid = box_solid((radius,) * 3, (6, 6, 6), young=2.0e4, poisson=0.35, density=300.0,
-                              warp_nodes=cube_to_ball(radius, radius))
+            solid = box_solid(
+                (radius,) * 3,
+                (6, 6, 6),
+                young=2.0e4,
+                poisson=0.35,
+                density=300.0,
+                warp_nodes=cube_to_ball(radius, radius),
+            )
             basis = solid.modal_basis(mode_count=12, discard_mode_count=6, damping_ratio=0.05, label="ball")
             self.ball = builder.add_body_elastic(xform=ball_xform, label="ball", **elastic_link_kwargs(solid, basis))
             solid.add_render_mesh(builder, self.ball, contact)
@@ -90,7 +120,7 @@ class Example:
         self.max_mode = 0.0
         self.max_ball_z = 0.0
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(wp.vec3(0.0, -0.42, 0.14), -12.0, 90.0)
+        self.viewer.set_camera(wp.vec3(0.0, -0.36, 0.2), -14.0, 90.0)
 
     def _schedule(self, t):
         close = min(max((t - 0.2) / 0.6, 0.0), 1.0)

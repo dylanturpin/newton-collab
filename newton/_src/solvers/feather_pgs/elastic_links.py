@@ -11,7 +11,6 @@ integrals, add the modal stiffness implicitly, and extend contact rows with the 
 
 import warp as wp
 
-from ...sim.articulation import elastic_frame_layout
 from .friction_patches import contact_tangent_basis
 
 PGS_CONSTRAINT_TYPE_FRICTION = 2
@@ -220,12 +219,28 @@ def elastic_contact_points(
     if c >= wp.min(contact_count[0], contact_point0.shape[0]):
         return
     point0_out[c] = _deformed_point(
-        contact_point0[c], contact_sample0[c], contact_shape0[c], shape_body, body_elastic_index,
-        elastic_mode_q0, elastic_mode_count, max_modes, vertex_phi, joint_q,
+        contact_point0[c],
+        contact_sample0[c],
+        contact_shape0[c],
+        shape_body,
+        body_elastic_index,
+        elastic_mode_q0,
+        elastic_mode_count,
+        max_modes,
+        vertex_phi,
+        joint_q,
     )
     point1_out[c] = _deformed_point(
-        contact_point1[c], contact_sample1[c], contact_shape1[c], shape_body, body_elastic_index,
-        elastic_mode_q0, elastic_mode_count, max_modes, vertex_phi, joint_q,
+        contact_point1[c],
+        contact_sample1[c],
+        contact_shape1[c],
+        shape_body,
+        body_elastic_index,
+        elastic_mode_q0,
+        elastic_mode_count,
+        max_modes,
+        vertex_phi,
+        joint_q,
     )
 
 
