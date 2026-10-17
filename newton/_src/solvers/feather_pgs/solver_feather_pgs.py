@@ -927,6 +927,8 @@ class _FeatherPGSKinematicsCache:
 _DENSE_META_ROW_TYPE_BITS = 4
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
+# The tiled-row PGS kernel stages M (M + 1) / 2 Delassus floats in 48 KiB of static shared memory.
+_ELASTIC_DENSE_ROW_CAPACITY_MAX = 128
 
 
 def _unprojected_equality_constraints(model: Model) -> np.ndarray:
@@ -1918,7 +1920,7 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         relaxation: float = 1.0,
         contact_regularization: float = 0.0,
         velocity_drive_mode: Literal["active", "freeze"] = "freeze",
-        articulation_constraint_max: int = 32,
+        articulation_constraint_max: int | None = None,
         contact_warmstart: bool = False,
         solve_mode: str = "split",
         articulated_contact_response: Literal[
@@ -2308,7 +2310,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 Defaults to ``"freeze"``.
             articulation_constraint_max (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
-                free_body_constraint_max. Defaults to 32.
+                free_body_constraint_max. Defaults to 32; with reduced elastic shapes, to three rows per
+                elastic contact vertex of the largest world plus 32, at most 128.
             contact_warmstart (bool, optional): Re-use dense, matrix-free, and propagation contact
                 impulses from the previous frame. Contact and friction rows always carry by
                 contact identity through the collision pipeline's ``rigid_contact_match_index``,
@@ -2609,6 +2612,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._enable_restitution = bool(enable_restitution)
         self.restitution_velocity_threshold = restitution_velocity_threshold
         self.velocity_drive_mode = velocity_drive_mode
+        if articulation_constraint_max is None:
+            articulation_constraint_max = _default_dense_row_capacity(model)
         self._requested_dense_max_constraints = int(articulation_constraint_max)
         self.warn_constraint_overflow = warn_constraint_overflow
         if articulated_contact_response not in (
@@ -27851,3 +27856,13 @@ def _validate_elastic_model(
             raise NotImplementedError(f"Joint {joint} attaches a body to elastic body {parent}.")
         if child >= 0 and body_elastic_index[child] >= 0 and joint != elastic_joint[body_elastic_index[child]]:
             raise NotImplementedError(f"Joint {joint} closes a loop on elastic body {child}.")
+
+
+def _default_dense_row_capacity(model: Model) -> int:
+    """Dense rows per world: 32, plus three per elastic contact vertex of the largest world (at most 128)."""
+    if not getattr(model, "elastic_shape_vertex_total_count", 0):
+        return 32
+    shape_world = model.shape_world.numpy()[model.elastic_shape_shape.numpy()]
+    counts = model.elastic_shape_vertex_count.numpy()
+    per_world = np.bincount(np.maximum(shape_world, 0), weights=counts)
+    return int(min(32 + 3 * int(per_world.max()), _ELASTIC_DENSE_ROW_CAPACITY_MAX))

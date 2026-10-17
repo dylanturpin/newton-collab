@@ -142,6 +142,7 @@ class Example:
 
     def step(self):
         self.simulate()
+        self.solver.check_constraint_capacity()
         self.max_ball_z = max(self.max_ball_z, float(self.state_0.body_q.numpy()[self.ball][2]))
         if not self.rigid:
             q0 = int(self.model.elastic_mode_q_start.numpy()[0])

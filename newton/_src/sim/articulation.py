@@ -868,8 +868,12 @@ def eval_articulation_ik(
     w_c = wp.spatial_bottom(v_wc)
     v_c = com_twist_to_point_velocity(v_wc, X_wc, body_com[child], wp.transform_get_translation(X_wcj))
 
-    # joint properties
-    type = joint_type[joint_idx]
+    # joint properties; an ELASTIC joint's frame part reconstructs like FREE or D6, its modes are left as they are
+    q_start = joint_q_start[joint_idx]
+    qd_start = joint_qd_start[joint_idx]
+    type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+        joint_type[joint_idx], joint_axis, qd_start, joint_dof_dim[joint_idx, 0], joint_dof_dim[joint_idx, 1]
+    )
 
     # compute position and orientation differences between anchor frames
     x_p = wp.transform_get_translation(X_wpj)
@@ -881,11 +885,6 @@ def eval_articulation_ik(
     x_err = x_c - x_p
     v_err = v_c - v_p
     w_err = w_c - w_p
-
-    q_start = joint_q_start[joint_idx]
-    qd_start = joint_qd_start[joint_idx]
-    lin_axis_count = joint_dof_dim[joint_idx, 0]
-    ang_axis_count = joint_dof_dim[joint_idx, 1]
 
     if type == JointType.PRISMATIC:
         axis = joint_axis[qd_start]
@@ -1277,11 +1276,12 @@ def eval_articulation_jacobian(
 
         q_start = joint_q_start[j]
         qd_start = joint_qd_start[j]
-        lin_axis_count = joint_dof_dim[j, 0]
-        ang_axis_count = joint_dof_dim[j, 1]
+        frame_type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+            type, joint_axis, qd_start, joint_dof_dim[j, 0], joint_dof_dim[j, 1]
+        )
 
         jcalc_motion_subspace(
-            type,
+            frame_type,
             joint_axis,
             joint_q,
             lin_axis_count,

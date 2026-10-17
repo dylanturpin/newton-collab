@@ -90,6 +90,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
             model.collide(state_0, contacts)
             solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
+        solver.check_constraint_capacity()
         eta = float(state_0.joint_q.numpy()[int(model.elastic_mode_q_start.numpy()[0])])
         self.assertAlmostEqual(eta, -mass * g / stiffness, delta=0.01 * mass * g / stiffness)
 
@@ -104,6 +105,19 @@ class TestFeatherPGSElastic(unittest.TestCase):
                 digest.update(s.joint_qd.numpy().tobytes())
             digests.append(digest.hexdigest())
         self.assertEqual(digests[0], digests[1])
+
+    def test_inverse_kinematics_keeps_modal_coordinates(self):
+        for model, state, _info in (_hub_beam(steel=True, omega=1.5, eta=(0.01, -0.02)), _free_beam()):
+            q, qd = wp.clone(state.joint_q), wp.clone(state.joint_qd)
+            newton.eval_ik(model, state, q, qd)
+            np.testing.assert_allclose(q.numpy(), state.joint_q.numpy(), atol=1.0e-6)
+            np.testing.assert_allclose(qd.numpy(), state.joint_qd.numpy(), atol=1.0e-5)
+
+    def test_elastic_shapes_size_dense_row_capacity(self):
+        model, _pad = _pad_on_ground(0.4, 2000.0, 9.81)
+        solver = SolverFeatherPGS(model)
+        expected = min(32 + 3 * int(model.elastic_shape_vertex_count.numpy().sum()), 128)
+        self.assertEqual(solver.articulation_constraint_max, expected)
 
     def test_rejects_bodies_attached_to_an_elastic_link(self):
         model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
@@ -271,7 +285,8 @@ def _pad_on_ground(mass, stiffness, g):
     )
     inertia = np.diag([mass * (hy**2 + hz**2) / 3, mass * (hx**2 + hz**2) / 3, mass * (hx**2 + hy**2) / 3])
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
-    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.5, gap=0.002)
+    # Frictionless: friction would resist the mode's Poisson spread of the bottom face.
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0, gap=0.002)
     builder.add_ground_plane(cfg=cfg)
     pad = builder.add_body_elastic(
         xform=wp.transform((0.0, 0.0, hz + 0.001), wp.quat_identity()),
