@@ -3047,6 +3047,7 @@ def _body_body_contact_damping_ignores_penalty_ramp(test, device):
         point0_world = wp.empty(4, dtype=wp.vec3, device=device)
         point1_world = wp.empty(4, dtype=wp.vec3, device=device)
         force_on_body1 = wp.empty(4, dtype=wp.vec3, device=device)
+        no_elastic_sample = wp.full(4, -1, dtype=wp.int32, device=device)
 
         wp.launch(
             compute_rigid_contact_forces,
@@ -3064,10 +3065,21 @@ def _body_body_contact_damping_ignores_penalty_ramp(test, device):
                 normal,
                 margin0,
                 margin1,
+                no_elastic_sample,
+                no_elastic_sample,
                 shape_body,
                 body_q,
                 body_q_prev,
                 body_com,
+                wp.full(body_q.shape[0], -1, dtype=wp.int32, device=device),
+                wp.zeros(0, dtype=wp.int32, device=device),
+                wp.zeros(0, dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=float, device=device),
+                wp.zeros(1, dtype=float, device=device),
+                wp.zeros(0, dtype=wp.int32, device=device),
+                wp.zeros(0, dtype=wp.vec3, device=device),
+                wp.zeros(0, dtype=wp.vec3, device=device),
+                0,
                 penalty_k,
                 contact_normal_rho,
                 material_ke,
