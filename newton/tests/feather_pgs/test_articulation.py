@@ -4713,7 +4713,7 @@ def test_open_closure_parent_wrench_carries_no_couple(test, device):
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
     control = model.control()
-    observables = solver.observables({SolverObservableFlags.BODY_PARENT_F})
+    observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F})
     for _ in range(300):
         solver.step(state_0, state_1, control, None, dt, observables=observables)
         state_0, state_1 = state_1, state_0
