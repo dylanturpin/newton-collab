@@ -575,17 +575,14 @@ def _apply_rows(
         propagation_parent[world, row] = work.slot[lead]
         propagation_mu[world, row] = work.coefficient[rep]
         propagation_row_radius[world, row] = work.radius[rep]
-        # The lead's normal row names its responding bodies; a side with no response is static to every row.
-        body_a = propagation_body_a[world, work.slot[lead]]
-        body_b = propagation_body_b[world, work.slot[lead]]
-        propagation_body_a[world, row] = body_a
-        propagation_body_b[world, row] = body_b
+        propagation_body_a[world, row] = work.body_a[lead]
+        propagation_body_b[world, row] = work.body_b[lead]
         for k in range(3):
             propagation_J_a[world, row, 3 + k] = 0.0
             propagation_J_b[world, row, 3 + k] = 0.0
-            if body_a >= 0:
+            if work.body_a[lead] >= 0:
                 propagation_J_a[world, row, 3 + k] = normal[k]
-            if body_b >= 0:
+            if work.body_b[lead] >= 0:
                 propagation_J_b[world, row, 3 + k] = -normal[k]
         return
     membership[world, work.slot[c]] = row
