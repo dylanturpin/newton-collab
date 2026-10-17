@@ -736,8 +736,6 @@ class ModelBuilder:
                 "elastic_body",
                 "elastic_joint",
                 "elastic_mode_start",
-                "elastic_mode_q_start",
-                "elastic_mode_qd_start",
                 "elastic_mode_count",
                 "elastic_mode_mass",
                 "elastic_mode_stiffness",

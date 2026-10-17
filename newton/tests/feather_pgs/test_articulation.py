@@ -2231,6 +2231,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
                 model.joint_qd_start,
                 wp.zeros(model.joint_count, dtype=wp.int32, device=device),
                 model.joint_dof_dim,
+                model.joint_axis,
                 model.body_com,
                 model.joint_X_c,
                 state.joint_q,
