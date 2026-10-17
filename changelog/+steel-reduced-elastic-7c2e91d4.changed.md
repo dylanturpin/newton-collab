@@ -1,0 +1,1 @@
+Default `SolverFeatherPGS(articulation_constraint_max=...)` to `None`, which resolves to 32 dense rows per world, or for models with reduced elastic shapes to 32 plus three per elastic contact vertex of the largest world, at most 128. Pass an integer to keep a fixed capacity.

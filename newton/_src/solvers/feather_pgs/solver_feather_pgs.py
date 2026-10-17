@@ -5471,8 +5471,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     wp.array(members, dtype=wp.int32, device=device),
                     wp.array(art_group_idx[elastic_art[members]], dtype=wp.int32, device=device),
                 )
-        self._elastic_point0 = None
-        self._elastic_point1 = None
 
     def _rigid_contact_point0(self, contacts: Contacts) -> wp.array:
         return self._elastic_point0 if self._has_elastic else contacts.rigid_contact_point0
@@ -5573,13 +5571,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
 
     def _launch_elastic_contact_points(self, state_in: State, contacts: Contacts) -> None:
         model = self.model
-        capacity = contacts.rigid_contact_point0.shape[0]
-        if self._elastic_point0 is None or self._elastic_point0.shape[0] != capacity:
-            self._elastic_point0 = wp.zeros(capacity, dtype=wp.vec3, device=model.device)
-            self._elastic_point1 = wp.zeros(capacity, dtype=wp.vec3, device=model.device)
         wp.launch(
             elastic_contact_points,
-            dim=capacity,
+            dim=min(contacts.rigid_contact_max, self._max_contacts_alloc),
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_point0,
@@ -5613,8 +5607,8 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     contacts.rigid_contact_elastic_sample1,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
-                    self._contact_world,
                     self._contact_slot,
+                    self._contact_slots_needed,
                     self._contact_art_a,
                     self._contact_art_b,
                     self._contact_path,
@@ -5629,7 +5623,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                     model.elastic_max_mode_count,
                     model.elastic_shape_vertex_phi,
                     state_in.body_q,
-                    self._row_type,
                 ],
                 outputs=[self._J_by_size[size]],
                 device=model.device,
@@ -6803,6 +6796,9 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         )
         self._contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        # Deformed body-local contact points, used in place of the contacts' points when elastic links exist.
+        self._elastic_point0 = wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self._has_elastic else None
+        self._elastic_point1 = wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self._has_elastic else None
         self._slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._dense_first_rejected_slot = wp.full(
             (self._world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device

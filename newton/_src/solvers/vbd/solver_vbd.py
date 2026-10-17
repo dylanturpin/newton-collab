@@ -1077,6 +1077,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "SolverVBD (integrate_with_external_rigid_solver=False) or remove the elastic "
                 "bodies from the model."
             )
+        if elastic_body_count > 0:
+            joints = model.elastic_joint.numpy()
+            free_frame = (
+                np.diff(model.joint_q_start.numpy())[joints] == np.diff(model.joint_qd_start.numpy())[joints] + 1
+            ) & (model.joint_parent.numpy()[joints] < 0)
+            if not np.all(free_frame):
+                raise NotImplementedError("SolverVBD supports only world-parented FREE-frame elastic joints.")
         self.elastic_body_block_width = int(model.elastic_max_mode_count) + 6
         if elastic_body_count > 0:
             self._validate_elastic_body_block_width(self.elastic_body_block_width)

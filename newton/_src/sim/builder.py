@@ -5984,8 +5984,9 @@ class ModelBuilder:
         connectivity should be added with ordinary joints.
 
         Passing ``linear_axes`` and/or ``angular_axes`` gives the frame those passive D6 axes
-        relative to ``parent`` instead (none for a frame fixed to the parent), with layout
-        ``[axis coordinates..., modes...]``. Articulated solvers use this joint as the link's tree joint.
+        relative to ``parent`` instead (none for a frame fixed to the parent; at most five), with layout
+        ``[axis coordinates..., modes...]``. Articulated solvers use this joint as the link's tree joint;
+        SolverVBD supports only the FREE frame.
 
         Args:
             child: Child body index owned by this reduced elastic joint.
@@ -6007,6 +6008,12 @@ class ModelBuilder:
         free_frame = linear_axes is None and angular_axes is None
         frame_linear = [axis_to_vec3(axis) for axis in (linear_axes or [])]
         frame_angular = [axis_to_vec3(axis) for axis in (angular_axes or [])]
+        if len(frame_linear) > 3 or len(frame_angular) > 3 or len(frame_linear) + len(frame_angular) == 6:
+            raise ValueError(
+                "An elastic D6 frame takes at most 5 axes, at most 3 of a kind; omit both for a FREE frame."
+            )
+        if any(wp.length_sq(axis) == 0.0 for axis in frame_linear + frame_angular):
+            raise ValueError("Elastic frame axes must be non-zero.")
         if mode_count < 0:
             raise ValueError(f"mode_count must be non-negative, got {mode_count}")
 

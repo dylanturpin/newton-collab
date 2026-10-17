@@ -13,8 +13,6 @@ import warp as wp
 
 from .friction_patches import contact_tangent_basis
 
-PGS_CONSTRAINT_TYPE_FRICTION = 2
-
 
 @wp.func
 def _mode_coupling_wrench(R: wp.mat33, lever: wp.vec3, S: wp.vec3, G: wp.vec3):
@@ -252,8 +250,8 @@ def elastic_contact_jacobian(
     contact_sample1: wp.array[wp.int32],
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
-    contact_world: wp.array[int],
     contact_slot: wp.array[int],
+    contact_slots_needed: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
@@ -268,7 +266,6 @@ def elastic_contact_jacobian(
     max_modes: int,
     vertex_phi: wp.array[wp.vec3],
     body_q: wp.array[wp.transform],
-    world_row_type: wp.array2d[int],
     # in/out
     J_group: wp.array3d[float],
 ):
@@ -276,15 +273,8 @@ def elastic_contact_jacobian(
     c = wp.tid()
     if c >= wp.min(contact_count[0], contact_normal.shape[0]):
         return
-    if contact_path[c] != 0:
+    if contact_path[c] != 0 or contact_slot[c] < 0:
         return
-    slot = contact_slot[c]
-    if slot < 0:
-        return
-    normal = -contact_normal[c]
-    t0, t1 = contact_tangent_basis(normal)
-    world = contact_world[c]
-    has_friction = world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
     for side in range(2):
         sample = contact_sample0[c]
         shape = contact_shape0[c]
@@ -303,6 +293,11 @@ def elastic_contact_jacobian(
         e = body_elastic_index[body]
         if e < 0:
             continue
+        slot = contact_slot[c]
+        normal = -contact_normal[c]
+        t0, t1 = contact_tangent_basis(normal)
+        # A contact owns its tangent rows exactly when it reserved them (patch non-anchors and gap contacts do not).
+        has_friction = contact_slots_needed[c] >= 3
         R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
         g = art_group_idx[art]
         qd0 = elastic_mode_qd0[e]

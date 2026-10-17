@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.elastic_links import elastic_contact_jacobian
 from newton.examples.basic._reduced_elastic import beam_render_sample_points, box_surface_mesh, cantilever_tip_mode
 from newton.solvers import SolverFeatherPGS, SolverVBD
 
@@ -142,6 +143,86 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertGreater(peak, 0.05)
         self.assertLess(error, 1.0e-5 * peak)
 
+    def test_eager_step_before_first_replay_matches_eager_twin(self):
+        """Step eagerly between capturing an elastic contact step and its first replay, and match an eager twin."""
+        runs = []
+        for _ in range(2):
+            model, _pad = _pad_on_ground(0.4, 2000.0, 9.81)
+            runs.append((model, SolverFeatherPGS(model), model.contacts(), [model.state(), model.state()]))
+
+        def step(run):
+            model, solver, contacts, states = run
+            for i in (0, 1):
+                model.collide(states[i], contacts)
+                solver.step(states[i], states[1 - i], model.control(), contacts, 1.0 / 240.0)
+
+        with wp.ScopedCapture() as capture:
+            step(runs[0])
+        step(runs[0])
+        step(runs[1])
+        wp.synchronize()
+        for _ in range(3):
+            wp.capture_launch(capture.graph)
+            step(runs[1])
+        captured, eager = (run[3][0].joint_q.numpy() for run in runs)
+        self.assertTrue(np.all(np.isfinite(captured)))
+        np.testing.assert_allclose(captured, eager, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_contact_jacobian_respects_normal_only_last_slot(self):
+        """A normal-only contact in the last dense row gets its modal column and no tangent rows."""
+        model, _pad = _pad_on_ground(0.4, 2000.0, 9.81)
+        device = model.device
+        dofs = 7
+        J = wp.zeros((1, 2, dofs), dtype=float, device=device)
+        normal = wp.array([[0.0, 0.0, -1.0]], dtype=wp.vec3, device=device)
+        bottom_sample = int(np.argmin(model.elastic_shape_vertex_local.numpy()[:, 2]))
+        one = lambda value: wp.array([value], dtype=wp.int32, device=device)  # noqa: E731
+        wp.launch(
+            elastic_contact_jacobian,
+            dim=1,
+            inputs=[
+                one(1),
+                normal,
+                one(-1),
+                one(bottom_sample),
+                one(0),
+                one(1),
+                one(1),
+                one(1),
+                one(-1),
+                one(0),
+                one(0),
+                dofs,
+                wp.array([dofs], dtype=wp.int32, device=device),
+                one(0),
+                one(0),
+                wp.array([-1, 0], dtype=wp.int32, device=device),
+                model.body_elastic_index,
+                model.elastic_mode_qd_start,
+                model.elastic_mode_count,
+                model.elastic_max_mode_count,
+                model.elastic_shape_vertex_phi,
+                model.body_q,
+            ],
+            outputs=[J],
+            device=device,
+        )
+        rows = J.numpy()[0]
+        # Side 1 carries sign -1; n = +z and phi_z = -1 at the bottom face.
+        self.assertAlmostEqual(float(rows[1, 6]), 1.0, places=5)
+        np.testing.assert_array_equal(rows[0], 0.0)
+        np.testing.assert_array_equal(rows[1, :6], 0.0)
+
+    def test_rejects_unsupported_elastic_frames(self):
+        builder = newton.ModelBuilder()
+        body = builder.add_link(mass=1.0)
+        axes = [newton.Axis.X, newton.Axis.Y, newton.Axis.Z]
+        with self.assertRaises(ValueError):
+            builder.add_joint_elastic(body, 1, linear_axes=axes, angular_axes=axes)
+        model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0))
+        with self.assertRaises(NotImplementedError):
+            SolverVBD(model)
+
     def test_rejects_bodies_attached_to_an_elastic_link(self):
         model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
         with self.assertRaises(NotImplementedError):
@@ -230,8 +311,7 @@ def _hub_beam(steel, omega, eta, gravity=(0.0, 0.0, 0.0), tip_body=False):
             )
         )
     builder.add_articulation(joints)
-    if not steel:
-        builder.color()
+    builder.color()
     model = builder.finalize()
     state = model.state()
     qd = state.joint_qd.numpy()
