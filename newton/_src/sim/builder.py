@@ -14598,6 +14598,10 @@ class ModelBuilder:
             scale = np.array(self.shape_scale[shape_index], dtype=np.float32)
             if self.shape_type[shape_index] == GeoType.BOX:
                 half_extents = np.abs(scale)
+            elif self.shape_type[shape_index] == GeoType.MESH and self.shape_source[shape_index] is not None:
+                points = np.asarray(self.shape_source[shape_index].vertices, dtype=np.float32) * scale
+                center = center + 0.5 * (points.max(axis=0) + points.min(axis=0))
+                half_extents = 0.5 * (points.max(axis=0) - points.min(axis=0))
             else:
                 radius = float(np.max(np.abs(scale))) if scale.size > 0 else 0.5
                 half_extents = np.array([radius, radius, radius], dtype=np.float32)

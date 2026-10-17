@@ -152,6 +152,10 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        # Show the deformed meshes without the elastic centerline diagnostics.
+        self.viewer.log_lines("/model/elastic_bodies/centerlines", None, None, None)
+        self.viewer.log_points("/model/elastic_bodies/samples", None)
+        self.viewer.log_points("/model/elastic_bodies/endpoints", None)
         self.viewer.end_frame()
 
     def test_final(self):

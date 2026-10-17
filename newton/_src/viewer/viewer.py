@@ -1305,6 +1305,7 @@ class ViewerBase(ABC):
         body_q = state.body_q.numpy()
         joint_q = state.joint_q.numpy()
         elastic_mode_q_start = self.model.elastic_mode_q_start.numpy()
+        shape_colors = None if self.model.shape_color is None else self.model.shape_color.numpy()
         body_elastic_index = self.model.body_elastic_index.numpy()
         elastic_mode_count = self.model.elastic_mode_count.numpy()
         shape_body = self.model.shape_body.numpy()
@@ -1373,6 +1374,8 @@ class ViewerBase(ABC):
                 else:
                     color_values = np.zeros_like(displacement)
                 colors_wp = wp.array(self._matlab_jet(color_values), dtype=wp.vec3, device=self.device)
+            elif shape_colors is not None:
+                colors_wp = wp.array(np.tile(shape_colors[shape], (count, 1)), dtype=wp.vec3, device=self.device)
 
             world_vertices = np.empty_like(local_vertices, dtype=np.float32)
             world_offset = np.zeros(3, dtype=float)
