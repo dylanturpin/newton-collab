@@ -120,7 +120,8 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.pipeline.contacts()
         # Kernel shared memory caps the dense rows per world at 128, about 40 contacts on the mat.
         self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16, articulation_constraint_max=128)
 
@@ -133,7 +134,7 @@ class Example:
 
     def simulate(self):
         for _ in range(self.sim_substeps):
-            self.model.collide(self.state_0, self.contacts)
+            self.pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt

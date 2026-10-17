@@ -21,6 +21,7 @@ HUB_OFFSET = 0.05
 @unittest.skipUnless(wp.is_cuda_available(), "SolverFeatherPGS elastic coupling tests run on CUDA")
 class TestFeatherPGSElastic(unittest.TestCase):
     def test_modal_oscillator_matches_implicit_euler(self):
+        """A frame-fixed single mode follows the closed-form implicit-Euler recursion."""
         m, k, c, q0, dt = 0.5, 200.0, 0.3, 0.02, 1.0 / 240.0
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         body = builder.add_link_elastic(
@@ -56,6 +57,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertGreater(measured, 1.5 * info["uncoupled_frequency"])
 
     def test_coupled_hub_frequency_matches_vbd(self):
+        """Steel and SolverVBD agree on the coupled hub/beam frequency at a small step."""
         dt = 1.0 / 3840.0
         frequencies = []
         for steel in (True, False):
@@ -65,6 +67,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertAlmostEqual(frequencies[0], frequencies[1], delta=0.03 * frequencies[0])
 
     def test_spinning_hub_conserves_axial_angular_momentum(self):
+        """The sample-cloud angular momentum about a free hub axis is conserved while the beam vibrates."""
         dt = 1.0 / 240.0
         model, state, info = _hub_beam(steel=True, omega=3.0, eta=(0.0, 0.02))
         momentum = [_cloud_momentum(model, s, info)[1][2] for s in _run(model, SolverFeatherPGS(model), 240, dt, state)]
@@ -72,6 +75,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertLess(np.max(np.abs(np.asarray(momentum) - initial)), 2.0e-3 * abs(initial))
 
     def test_free_body_linear_momentum_converges_with_dt(self):
+        """A free elastic body conserves linear momentum to first order in the step."""
         errors = []
         for dt in (1.0 / 240.0, 1.0 / 960.0):
             model, state, info = _free_beam()
@@ -82,13 +86,15 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertLess(errors[1], 0.4 * errors[0])
 
     def test_contact_compresses_pad_to_static_solution(self):
+        """A frictionless pad resting on the ground compresses its mode to -m g / K."""
         mass, stiffness, g = 0.4, 2000.0, 9.81
         model, _pad = _pad_on_ground(mass, stiffness, g)
         state_0, state_1 = model.state(), model.state()
-        contacts = model.contacts()
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
         solver = SolverFeatherPGS(model)
         for _ in range(480):
-            model.collide(state_0, contacts)
+            pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
         solver.check_constraint_capacity()
@@ -96,6 +102,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertAlmostEqual(eta, -mass * g / stiffness, delta=0.01 * mass * g / stiffness)
 
     def test_repeat_runs_are_bitwise_identical(self):
+        """Deterministic repeat runs of an elastic articulation are bitwise identical."""
         digests = []
         for _ in range(2):
             model, state, _info = _hub_beam(steel=True, omega=2.0, eta=(0.02, 0.01), gravity=(0.0, 0.0, -9.81))
@@ -108,6 +115,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         self.assertEqual(digests[0], digests[1])
 
     def test_inverse_kinematics_keeps_modal_coordinates(self):
+        """eval_ik reconstructs elastic frames and leaves modal coordinates unchanged."""
         for model, state, _info in (_hub_beam(steel=True, omega=1.5, eta=(0.01, -0.02)), _free_beam()):
             q, qd = wp.clone(state.joint_q), wp.clone(state.joint_qd)
             newton.eval_ik(model, state, q, qd)
@@ -115,6 +123,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
             np.testing.assert_allclose(qd.numpy(), state.joint_qd.numpy(), atol=1.0e-5)
 
     def test_elastic_shapes_size_dense_row_capacity(self):
+        """Elastic shapes size the default dense row capacity from their contact vertices."""
         model, _pad = _pad_on_ground(0.4, 2000.0, 9.81)
         solver = SolverFeatherPGS(model)
         expected = min(32 + 3 * int(model.elastic_shape_vertex_count.numpy().sum()), 128)
@@ -148,12 +157,13 @@ class TestFeatherPGSElastic(unittest.TestCase):
         runs = []
         for _ in range(2):
             model, _pad = _pad_on_ground(0.4, 2000.0, 9.81)
-            runs.append((model, SolverFeatherPGS(model), model.contacts(), [model.state(), model.state()]))
+            pipeline = newton.CollisionPipeline(model)
+            runs.append((model, SolverFeatherPGS(model), pipeline, pipeline.contacts(), [model.state(), model.state()]))
 
         def step(run):
-            model, solver, contacts, states = run
+            model, solver, pipeline, contacts, states = run
             for i in (0, 1):
-                model.collide(states[i], contacts)
+                pipeline.collide(states[i], contacts)
                 solver.step(states[i], states[1 - i], model.control(), contacts, 1.0 / 240.0)
 
         with wp.ScopedCapture() as capture:
@@ -164,7 +174,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         for _ in range(3):
             wp.capture_launch(capture.graph)
             step(runs[1])
-        captured, eager = (run[3][0].joint_q.numpy() for run in runs)
+        captured, eager = (run[4][0].joint_q.numpy() for run in runs)
         self.assertTrue(np.all(np.isfinite(captured)))
         np.testing.assert_allclose(captured, eager, rtol=1.0e-5, atol=1.0e-6)
 
@@ -214,6 +224,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         np.testing.assert_array_equal(rows[1, :6], 0.0)
 
     def test_rejects_unsupported_elastic_frames(self):
+        """Six explicit frame axes and SolverVBD with a non-FREE elastic frame are rejected."""
         builder = newton.ModelBuilder()
         body = builder.add_link(mass=1.0)
         axes = [newton.Axis.X, newton.Axis.Y, newton.Axis.Z]
@@ -224,6 +235,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
             SolverVBD(model)
 
     def test_rejects_bodies_attached_to_an_elastic_link(self):
+        """A body jointed to an elastic link is rejected until mid-chain links are supported."""
         model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
         with self.assertRaises(NotImplementedError):
             SolverFeatherPGS(model)
@@ -304,7 +316,11 @@ def _hub_beam(steel, omega, eta, gravity=(0.0, 0.0, 0.0), tip_body=False):
         j_rev = builder.add_joint_revolute(-1, hub, **revolute)
         joints = [j_rev, builder.add_joint_fixed(hub, beam, parent_xform=clamp_parent, child_xform=clamp_child)]
     if tip_body:
-        tip = builder.add_link(xform=wp.transform((HUB_OFFSET + BEAM_LENGTH, 0.0, 1.0), wp.quat_identity()), mass=0.1)
+        tip = builder.add_link(
+            xform=wp.transform((HUB_OFFSET + BEAM_LENGTH, 0.0, 1.0), wp.quat_identity()),
+            mass=0.1,
+            inertia=wp.mat33(np.eye(3) * 1.0e-4),
+        )
         joints.append(
             builder.add_joint_fixed(
                 beam, tip, parent_xform=wp.transform((0.5 * BEAM_LENGTH, 0.0, 0.0), wp.quat_identity())

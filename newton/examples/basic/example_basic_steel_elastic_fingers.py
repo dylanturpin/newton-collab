@@ -160,7 +160,8 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.pipeline.contacts()
         self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16)
 
         q_start = self.model.joint_q_start.numpy()
@@ -190,7 +191,7 @@ class Example:
             for i in self._slider_index:
                 self._targets[i] = slider
             self.control.joint_target_q.assign(self._targets)
-            self.model.collide(self.state_0, self.contacts)
+            self.pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
