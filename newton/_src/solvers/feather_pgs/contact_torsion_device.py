@@ -5,6 +5,8 @@
 The host implementation remains the oracle during qualification. This module
 changes preparation only; the coupled PGS budget and final-load projection are
 shared with the host path. Enable explicitly with ``enable_device_torsion``.
+Under plain propagation it also builds the groups of dense-origin propagation
+contacts, which the host oracle does not cover.
 """
 
 from typing import Any
@@ -14,6 +16,11 @@ import warp as wp
 
 from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+
+# Row families a torsion group can live in: dense rows appended per world, or propagation rows hosted in a
+# reserved spare after the group's highest-index member.
+_DENSE = 0
+_PROPAGATION = 1
 
 # Match the retained host oracle's rounding at angular cancellation and
 # touching/grouping thresholds. This option affects only this preparation module.
@@ -38,6 +45,20 @@ def _host_transform_point(pose: wp.transform, point: wp.vec3):
     v = wp.vec3(q[0], q[1], q[2])
     cross = 2.0 * wp.cross(v, point)
     return point + q[3] * cross + wp.cross(v, cross) + wp.transform_get_translation(pose)
+
+
+@wp.func
+def _family_row(family: int, dense: wp.array2d[int], propagation: wp.array2d[int], world: int, row: int):
+    if family == _PROPAGATION:
+        return propagation[world, row]
+    return dense[world, row]
+
+
+@wp.func
+def _family_mu(family: int, dense: wp.array2d[float], propagation: wp.array2d[float], world: int, row: int):
+    if family == _PROPAGATION:
+        return propagation[world, row]
+    return dense[world, row]
 
 
 @wp.struct
@@ -71,6 +92,9 @@ class _Workspace:
     patch_keys: wp.array[wp.int64]
     patch_indices: wp.array[int]
     rejected: wp.array[int]
+    family: wp.array[int]
+    spare: wp.array[int]
+    propagation_row_contact: wp.array2d[int]
 
 
 @wp.kernel(enable_backward=False)
@@ -99,6 +123,11 @@ def _gather(
     row_type: wp.array2d[int],
     parents: wp.array2d[int],
     row_count: wp.array[int],
+    mf_origin: wp.array[int],
+    propagation_family: int,
+    propagation_row_type: wp.array2d[int],
+    propagation_parents: wp.array2d[int],
+    propagation_row_count: wp.array[int],
     patch_mode: int,
     owner: wp.array[int],
     work: _Workspace,
@@ -113,6 +142,7 @@ def _gather(
     work.spin_row[c] = -1
     work.lead[c] = -1
     work.coefficient[c] = 0.0
+    work.spare[c] = -1
     if c == 0 and (count[0] > input_capacity or count[0] < 0):
         wp.atomic_or(work.status, 0, 1)
     if c >= wp.min(count[0], input_capacity):
@@ -121,9 +151,18 @@ def _gather(
         wp.atomic_or(work.status, 0, 2)
     world = worlds[c]
     slot = slots[c]
-    if paths[c] != 0 or slot < 0 or world < 0 or world >= world_count:
+    if slot < 0 or world < 0 or world >= world_count:
         return
-    work.keys[c] = wp.int64(world) * wp.int64(capacity + 1) + wp.int64(c)
+    # Dense-origin propagation contacts are the ones the immediate response solves as dense rows.
+    family = int(-1)
+    if paths[c] == 0:
+        family = _DENSE
+    elif paths[c] == 2 and propagation_family != 0 and mf_origin[c] == 0:
+        family = _PROPAGATION
+    if family < 0:
+        return
+    work.keys[c] = (wp.int64(family) * wp.int64(world_count) + wp.int64(world)) * wp.int64(capacity + 1) + wp.int64(c)
+    work.family[c] = family
     work.world[c] = world
     work.slot[c] = slot
     work.owner[c] = -1
@@ -138,16 +177,29 @@ def _gather(
         return
     if supported[a] == 0 or supported[b] == 0:
         return
-    anchor = int(slots_needed[c] == 3)
-    if slot >= row_count[world] or slot >= row_type.shape[1]:
+    rows = slots_needed[c]
+    row_end = row_count[world]
+    row_capacity = row_type.shape[1]
+    if family == _PROPAGATION:
+        # The last reserved row is the torsion spare.
+        rows -= 1
+        row_end = propagation_row_count[world]
+        row_capacity = propagation_row_type.shape[1]
+    anchor = int(rows == 3)
+    if slot >= row_end or slot >= row_capacity:
         return
-    if row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT or (anchor == 0 and patch_mode == 0):
+    if _family_row(family, row_type, propagation_row_type, world, slot) != PGS_CONSTRAINT_TYPE_CONTACT or (
+        anchor == 0 and patch_mode == 0
+    ):
         return
     if anchor != 0:
-        if slot + 2 >= row_count[world] or slot + 2 >= row_type.shape[1]:
+        if slot + 2 >= row_end or slot + 2 >= row_capacity:
             return
         for k in range(1, 3):
-            if row_type[world, slot + k] != PGS_CONSTRAINT_TYPE_FRICTION or parents[world, slot + k] != slot:
+            if (
+                _family_row(family, row_type, propagation_row_type, world, slot + k) != PGS_CONSTRAINT_TYPE_FRICTION
+                or _family_row(family, parents, propagation_parents, world, slot + k) != slot
+            ):
                 return
     normal = -normals[c]
     ba = shape_body[a]
@@ -174,7 +226,11 @@ def _gather(
     work.gap[c] = gap
     work.anchor[c] = anchor
     # Valid row allocation gives a unique contact per normal slot.
-    work.row_contact[world, slot] = c
+    if family == _DENSE:
+        work.row_contact[world, slot] = c
+    else:
+        work.propagation_row_contact[world, slot] = c
+        work.spare[c] = slot + slots_needed[c] - 1
 
 
 @wp.kernel(enable_backward=False)
@@ -197,8 +253,17 @@ def _patch_keys(work: _Workspace):
 
 
 @wp.kernel(enable_backward=False)
-def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[float], work: _Workspace):
-    """Summarize one patch from its head; eligible members precede rejection witnesses."""
+def _group_patches(
+    capacity: int,
+    mu: wp.array2d[float],
+    propagation_mu: wp.array2d[float],
+    shape_radius: wp.array[float],
+    work: _Workspace,
+):
+    """Summarize one patch from its head; eligible members precede rejection witnesses.
+
+    Eligible members are chained through ``next_member`` in contact order, ending at ``tail``.
+    """
     i = wp.tid()
     key = work.patch_keys[i]
     if key == wp.int64(9223372036854775807):
@@ -214,12 +279,17 @@ def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[
     first_anchor = int(-1)
     touching = int(-1)
     radius = float(0.0)
+    previous = int(-1)
     j = i
     while j < capacity and (work.patch_keys[j] >> wp.int64(1)) == patch:
         c = work.patch_indices[j]
         if work.eligible[c] == 1:
             work.group[c] = rep
             work.first_pair[c] = rep
+            if previous >= 0:
+                work.next_member[previous] = c
+            previous = c
+            work.tail[rep] = c
             radius = wp.max(radius, wp.max(shape_radius[work.shape_a[c]], shape_radius[work.shape_b[c]]))
             if work.anchor[c] != 0:
                 anchor_count += 1
@@ -233,7 +303,8 @@ def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[
     work.rejected[rep] = rejected
     if rejected != 0 or first_anchor < 0 or touching < 0:
         return
-    coefficient = mu[work.world[rep], work.slot[first_anchor] + 1] * float(anchor_count)
+    coefficient = _family_mu(work.family[rep], mu, propagation_mu, work.world[rep], work.slot[first_anchor] + 1)
+    coefficient *= float(anchor_count)
     if coefficient <= 0.0:
         return
     work.coefficient[rep] = coefficient
@@ -242,16 +313,19 @@ def _group_patches(capacity: int, mu: wp.array2d[float], shape_radius: wp.array[
 
 
 @wp.kernel(enable_backward=False)
-def _check_patch_membership(row_capacity: int, parents: wp.array2d[int], work: _Workspace):
+def _check_patch_membership(parents: wp.array2d[int], propagation_parents: wp.array2d[int], work: _Workspace):
     c = wp.tid()
     rep = work.group[c]
     if rep < 0 or work.rejected[rep] != 0:
         return
     world = work.world[c]
-    parent = parents[world, work.slot[c]]
+    family = work.family[c]
+    parent = _family_row(family, parents, propagation_parents, world, work.slot[c])
     member = int(-1)
-    if parent >= 0 and parent < row_capacity:
+    if family == _DENSE and parent >= 0 and parent < parents.shape[1]:
         member = work.row_contact[world, parent]
+    if family == _PROPAGATION and parent >= 0 and parent < propagation_parents.shape[1]:
+        member = work.propagation_row_contact[world, parent]
     if member < 0:
         wp.atomic_or(work.status, 0, 16)
     elif work.group[member] != rep:
@@ -261,23 +335,36 @@ def _check_patch_membership(row_capacity: int, parents: wp.array2d[int], work: _
 @wp.kernel(enable_backward=False)
 def _emit_patches(
     contact_capacity: int,
+    world_count: int,
     row_capacity: int,
     row_count: wp.array[int],
     row_dropped: wp.array[int],
     work: _Workspace,
+    torsion_head: wp.array[int],
+    torsion_first: wp.array2d[int],
+    torsion_next: wp.array2d[int],
 ):
-    world = wp.tid()
-    if row_dropped[world] != 0:
+    segment = wp.tid()
+    family = segment // world_count
+    world = segment - family * world_count
+    if family == _DENSE and row_dropped[world] != 0:
         wp.atomic_or(work.status, 0, 4)
     stride = wp.int64(contact_capacity + 1)
-    start = _lower_bound(work.keys, wp.int64(world) * stride, contact_capacity)
-    end = _lower_bound(work.keys, wp.int64(world + 1) * stride, contact_capacity)
-    row = row_count[world]
+    start = _lower_bound(work.keys, wp.int64(segment) * stride, contact_capacity)
+    end = _lower_bound(work.keys, wp.int64(segment + 1) * stride, contact_capacity)
+    row = int(0)
+    if family == _DENSE:
+        row = row_count[world]
+    spin = int(-1)
     for i in range(start, end):
         rep = work.indices[i]
         if work.lead[rep] >= 0:
-            row = _append_group(work, rep, world, row, row_capacity)
-    work.planned_count[world] = row
+            if family == _DENSE:
+                row = _append_group(work, rep, world, row, row_capacity)
+            else:
+                spin = _link_propagation_group(work, rep, world, spin, torsion_head, torsion_first, torsion_next)
+    if family == _DENSE:
+        work.planned_count[world] = row
 
 
 @wp.func
@@ -303,24 +390,64 @@ def _append_group(work: _Workspace, representative: int, world: int, row: int, c
     return row + 1
 
 
+@wp.func
+def _link_propagation_group(
+    work: _Workspace,
+    representative: int,
+    world: int,
+    previous_spin: int,
+    torsion_head: wp.array[int],
+    torsion_first: wp.array2d[int],
+    torsion_next: wp.array2d[int],
+):
+    """Host a propagation group in its last member's spare and append it and its members to the world's lists."""
+    spin = work.spare[work.tail[representative]]
+    work.spin_row[representative] = spin
+    if previous_spin < 0:
+        torsion_head[world] = spin
+    else:
+        torsion_next[world, previous_spin] = spin
+    torsion_next[world, spin] = -1
+    previous_slot = int(-1)
+    member = representative
+    while member >= 0:
+        slot = work.slot[member]
+        if previous_slot < 0:
+            torsion_first[world, spin] = slot
+        else:
+            torsion_next[world, previous_slot] = slot
+        previous_slot = slot
+        member = work.next_member[member]
+    torsion_next[world, previous_slot] = -1
+    return spin
+
+
 @wp.kernel(enable_backward=False)
 def _group_world(
     contact_capacity: int,
+    world_count: int,
     row_capacity: int,
     row_count: wp.array[int],
     row_dropped: wp.array[int],
     mu: wp.array2d[float],
+    propagation_mu: wp.array2d[float],
     shape_radius: wp.array[float],
     work: _Workspace,
+    torsion_head: wp.array[int],
+    torsion_first: wp.array2d[int],
+    torsion_next: wp.array2d[int],
 ):
-    world = wp.tid()
-    if row_dropped[world] != 0:
-        wp.atomic_or(work.status, 0, 4)
-    work.planned_count[world] = row_count[world]
+    segment = wp.tid()
+    family = segment // world_count
+    world = segment - family * world_count
+    if family == _DENSE:
+        if row_dropped[world] != 0:
+            wp.atomic_or(work.status, 0, 4)
+        work.planned_count[world] = row_count[world]
     stride = wp.int64(contact_capacity + 1)
-    start = _lower_bound(work.keys, wp.int64(world) * stride, contact_capacity)
-    end = _lower_bound(work.keys, wp.int64(world + 1) * stride, contact_capacity)
-    # Sorting by (world, original contact index) reproduces the host's ordered
+    start = _lower_bound(work.keys, wp.int64(segment) * stride, contact_capacity)
+    end = _lower_bound(work.keys, wp.int64(segment + 1) * stride, contact_capacity)
+    # Sorting by (family, world, original contact index) reproduces the host's ordered
     # greedy clustering without any scan over another world's witnesses.
     for i in range(start, end):
         c = work.indices[i]
@@ -373,14 +500,17 @@ def _group_world(
                 touching = c
         if first_anchor < 0 or touching < 0:
             continue
-        coefficient = mu[world, work.slot[first_anchor] + 1]
+        coefficient = _family_mu(family, mu, propagation_mu, world, work.slot[first_anchor] + 1)
         if coefficient <= 0.0:
             continue
         work.coefficient[rep] = coefficient
         work.radius[rep] = radius
         work.lead[rep] = touching
 
-    row = row_count[world]
+    row = int(0)
+    if family == _DENSE:
+        row = row_count[world]
+    spin = int(-1)
     for i in range(start, end):
         rep = work.indices[i]
         if work.group[rep] == rep and work.first_pair[rep] == rep:
@@ -389,8 +519,14 @@ def _group_world(
             for j in range(i, end):
                 cluster = work.indices[j]
                 if work.lead[cluster] >= 0 and work.first_pair[cluster] == rep:
-                    row = _append_group(work, cluster, world, row, row_capacity)
-    work.planned_count[world] = row
+                    if family == _DENSE:
+                        row = _append_group(work, cluster, world, row, row_capacity)
+                    else:
+                        spin = _link_propagation_group(
+                            work, cluster, world, spin, torsion_head, torsion_first, torsion_next
+                        )
+    if family == _DENSE:
+        work.planned_count[world] = row
 
 
 @wp.kernel(enable_backward=False)
@@ -410,6 +546,14 @@ def _apply_rows(
     restitution: wp.array2d[float],
     membership: wp.array2d[int],
     row_radius: wp.array2d[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_parent: wp.array2d[int],
+    propagation_mu: wp.array2d[float],
+    propagation_row_radius: wp.array2d[float],
 ):
     c = wp.tid()
     if work.status[0] != 0:
@@ -421,6 +565,26 @@ def _apply_rows(
     if row < 0:
         return
     world = work.world[c]
+    if work.family[c] == _PROPAGATION:
+        if c != rep:
+            return
+        # A body-space spin row about the lead normal; the reserved spare already carries no phi or restitution.
+        lead = work.lead[rep]
+        normal = work.normal[lead]
+        propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
+        propagation_parent[world, row] = work.slot[lead]
+        propagation_mu[world, row] = work.coefficient[rep]
+        propagation_row_radius[world, row] = work.radius[rep]
+        propagation_body_a[world, row] = work.body_a[lead]
+        propagation_body_b[world, row] = work.body_b[lead]
+        for k in range(3):
+            propagation_J_a[world, row, 3 + k] = 0.0
+            propagation_J_b[world, row, 3 + k] = 0.0
+            if work.body_a[lead] >= 0:
+                propagation_J_a[world, row, 3 + k] = normal[k]
+            if work.body_b[lead] >= 0:
+                propagation_J_b[world, row, 3 + k] = -normal[k]
+        return
     membership[world, work.slot[c]] = row
     if c != rep:
         return
@@ -449,7 +613,14 @@ def _apply_rows(
 
 
 @wp.kernel(enable_backward=False)
-def _apply_counts(work: _Workspace, count: wp.array[int], slots: wp.array[int], mf_count: wp.array[int]):
+def _apply_counts(
+    work: _Workspace,
+    count: wp.array[int],
+    slots: wp.array[int],
+    mf_count: wp.array[int],
+    propagation_count: wp.array[int],
+    torsion_head: wp.array[int],
+):
     world = wp.tid()
     if work.status[0] == 0:
         count[world] = work.planned_count[world]
@@ -461,6 +632,10 @@ def _apply_counts(work: _Workspace, count: wp.array[int], slots: wp.array[int], 
         slots[world] = 0
         if world < mf_count.shape[0]:
             mf_count[world] = 0
+        if world < propagation_count.shape[0]:
+            propagation_count[world] = 0
+        if world < torsion_head.shape[0]:
+            torsion_head[world] = -1
 
 
 @wp.kernel(enable_backward=False)
@@ -539,6 +714,8 @@ class DeviceTorsionPreparation:
             "first_pair",
             "lead",
             "spin_row",
+            "family",
+            "spare",
         ):
             setattr(w, name, wp.empty(self.capacity, dtype=int, device=device))
         for name in ("gap", "coefficient", "radius"):
@@ -548,6 +725,10 @@ class DeviceTorsionPreparation:
         shape = (solver._world_count, solver._articulation_constraint_max)
         w.row_contact = wp.full(shape, -1, dtype=int, device=device)
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
+        # Propagation torsion groups exist only when plain propagation hosts them in reserved spares.
+        self.propagation = bool(solver._propagation_torsion_rows)
+        propagation_shape = (solver._world_count, solver._propagation_max_constraints) if self.propagation else (1, 1)
+        w.propagation_row_contact = wp.full(propagation_shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver._world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
         w.patch_keys = wp.empty(2 * self.capacity, dtype=wp.int64, device=device)
@@ -560,6 +741,9 @@ class DeviceTorsionPreparation:
         self._dummy_stiffness = wp.zeros(1, dtype=float, device=device)
         self._dummy_owner = wp.full(1, -1, dtype=int, device=device)
         self._dummy_mf_count = wp.zeros(solver._world_count, dtype=int, device=device)
+        self._dummy_rows_int = wp.full((1, 1), -1, dtype=int, device=device)
+        self._dummy_rows_float = wp.zeros((1, 1), dtype=float, device=device)
+        self._dummy_rows_vector = wp.zeros((1, 1, 6), dtype=float, device=device)
         self._saved_state = None
         self._saved_names = ()
 
@@ -610,9 +794,10 @@ class DeviceTorsionPreparation:
                     device=self.solver.model.device,
                 )
 
-    def validate(self):
-        """Synchronously raise latched errors; they stay latched until :meth:`clear_status`."""
-        status = int(self.work.status.numpy()[0])
+    def validate(self, status: int | None = None):
+        """Raise latched errors, read synchronously unless ``status`` gives them; they stay latched until :meth:`clear_status`."""
+        if status is None:
+            status = int(self.work.status.numpy()[0])
         if status & 1:
             raise RuntimeError("Contact input overflow before contact torsion")
         if status & 2:
@@ -628,6 +813,23 @@ class DeviceTorsionPreparation:
         """Clear the latched errors on the device; a recurring cause latches again on the next step."""
         self.work.status.zero_()
 
+    @property
+    def families(self):
+        """Number of row families whose torsion groups this preparation builds."""
+        return 2 if self.propagation else 1
+
+    def _propagation_rows(self, *names):
+        """Return the solver's named propagation row arrays, or same-dtype placeholders without propagation torsion."""
+        if self.propagation:
+            return [getattr(self.solver, name) for name in names]
+        placeholders = {"_propagation_J_a": self._dummy_rows_vector, "_propagation_J_b": self._dummy_rows_vector}
+        placeholders["_propagation_row_mu"] = placeholders["_propagation_torsion_row_radius"] = self._dummy_rows_float
+        return [placeholders.get(name, self._dummy_rows_int) for name in names]
+
+    def _torsion_lists(self):
+        s = self.solver
+        return [s._propagation_torsion_head, s._propagation_torsion_first, s._propagation_torsion_next]
+
     def prepare(self, state, augmented_state, contacts):
         """Build rows entirely on device, followed by optional scalar error readback."""
         s = self.solver
@@ -636,6 +838,9 @@ class DeviceTorsionPreparation:
         w.row_contact.fill_(-1)
         w.spin_source.fill_(-1)
         s._contact_torsion_group.fill_(-1)
+        if self.propagation:
+            w.propagation_row_contact.fill_(-1)
+            s._propagation_torsion_head.fill_(-1)
         if contacts is None:
             w.spin_row.fill_(-1)
             if not self.deferred_errors:
@@ -673,6 +878,10 @@ class DeviceTorsionPreparation:
                 s._row_type,
                 s._row_parent,
                 s._constraint_count,
+                s._contact_mf_origin,
+                int(self.propagation),
+                *self._propagation_rows("_propagation_row_type", "_propagation_row_parent"),
+                s._propagation_constraint_count if self.propagation else self._dummy_mf_count,
                 int(patches),
                 s._friction_patches.current.owner if patches else self._dummy_owner,
                 w,
@@ -687,34 +896,51 @@ class DeviceTorsionPreparation:
             wp.launch(
                 _group_patches,
                 dim=self.capacity,
-                inputs=[self.capacity, s._row_mu, s._contact_torsion_shape_radius, w],
+                inputs=[
+                    self.capacity,
+                    s._row_mu,
+                    *self._propagation_rows("_propagation_row_mu"),
+                    s._contact_torsion_shape_radius,
+                    w,
+                ],
                 device=device,
             )
             wp.launch(
                 _check_patch_membership,
                 dim=self.capacity,
-                inputs=[s._articulation_constraint_max, s._row_parent, w],
+                inputs=[s._row_parent, *self._propagation_rows("_propagation_row_parent"), w],
                 device=device,
             )
             wp.launch(
                 _emit_patches,
-                dim=s._world_count,
-                inputs=[self.capacity, s._articulation_constraint_max, s._constraint_count, s._row_dropped_dense, w],
+                dim=self.families * s._world_count,
+                inputs=[
+                    self.capacity,
+                    s._world_count,
+                    s._articulation_constraint_max,
+                    s._constraint_count,
+                    s._row_dropped_dense,
+                    w,
+                    *self._torsion_lists(),
+                ],
                 device=device,
             )
         else:
             wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
             wp.launch(
                 _group_world,
-                dim=s._world_count,
+                dim=self.families * s._world_count,
                 inputs=[
                     self.capacity,
+                    s._world_count,
                     s._articulation_constraint_max,
                     s._constraint_count,
                     s._row_dropped_dense,
                     s._row_mu,
+                    *self._propagation_rows("_propagation_row_mu"),
                     s._contact_torsion_shape_radius,
                     w,
+                    *self._torsion_lists(),
                 ],
                 device=device,
             )
@@ -739,6 +965,16 @@ class DeviceTorsionPreparation:
                 s._row_restitution,
                 s._contact_torsion_group,
                 s._torsion_row_radius,
+                *self._propagation_rows(
+                    "_propagation_body_a",
+                    "_propagation_body_b",
+                    "_propagation_J_a",
+                    "_propagation_J_b",
+                    "_propagation_row_type",
+                    "_propagation_row_parent",
+                    "_propagation_row_mu",
+                    "_propagation_torsion_row_radius",
+                ),
             ],
             device=device,
         )
@@ -764,7 +1000,14 @@ class DeviceTorsionPreparation:
         wp.launch(
             _apply_counts,
             dim=s._world_count,
-            inputs=[w, s._constraint_count, s._slot_counter, getattr(s, "_mf_constraint_count", self._dummy_mf_count)],
+            inputs=[
+                w,
+                s._constraint_count,
+                s._slot_counter,
+                getattr(s, "_mf_constraint_count", self._dummy_mf_count),
+                s._propagation_constraint_count if self.propagation else self._dummy_mf_count,
+                s._propagation_torsion_head,
+            ],
             device=device,
         )
 

@@ -281,6 +281,7 @@ def create_compute_gjk_mpr_contacts(
     support_func: Any = None,
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
+    face_clip: bool = False,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -291,6 +292,7 @@ def create_compute_gjk_mpr_contacts(
         support_func: Support mapping function (defaults to support_map)
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
+        face_clip: Whether box/plane versus convex-mesh manifolds clip the hull's contact patch.
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
@@ -373,6 +375,7 @@ def create_compute_gjk_mpr_contacts(
                     post_process_contact,
                     use_precomputed_center,
                     penetration_refiner,
+                    face_clip=face_clip,
                 )
             )(
                 shape_a_data,
@@ -647,7 +650,9 @@ def check_infinite_plane_bsphere_overlap(
     return center_dist <= other_radius
 
 
-def create_find_contacts(writer_func: Any, support_func: Any = None, post_process_contact: Any = None):
+def create_find_contacts(
+    writer_func: Any, support_func: Any = None, post_process_contact: Any = None, face_clip: bool = False
+):
     """
     Factory function to create a find_contacts function with a specific writer function.
 
@@ -659,6 +664,7 @@ def create_find_contacts(writer_func: Any, support_func: Any = None, post_proces
         writer_func: Function to write contact data (signature: (ContactData, writer_data) -> None)
         support_func: Support mapping function (defaults to support_map)
         post_process_contact: Post-processing function (defaults to post_process_axial_on_discrete_contact)
+        face_clip: Whether box/plane versus convex-mesh manifolds clip the hull's contact patch.
 
     Returns:
         A find_contacts function with the writer function baked in
@@ -741,6 +747,7 @@ def create_find_contacts(writer_func: Any, support_func: Any = None, post_proces
                 post_process_contact=post_process_contact,
                 support_func=support_func,
                 use_precomputed_center=True,
+                face_clip=face_clip,
             )
         )(
             shape_data_a,
@@ -963,6 +970,17 @@ def transform_normal_with_scale(
 
 
 @wp.func
+def convex_mesh_interior_point(mesh_id: wp.uint64, scale: wp.vec3) -> wp.vec3:
+    """Return the scaled vertex mean, which always lies inside the convex hull."""
+    hull = wp.mesh_get(mesh_id)
+    num_verts = hull.points.shape[0]
+    center = wp.vec3(0.0, 0.0, 0.0)
+    for i in range(num_verts):
+        center += hull.points[i]
+    return wp.cw_mul(center, scale) / float(wp.max(num_verts, 1))
+
+
+@wp.func
 def _compute_mesh_vs_convex_query_aabb(
     mesh_shape: int,
     non_mesh_shape: int,
@@ -972,6 +990,7 @@ def _compute_mesh_vs_convex_query_aabb(
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
     contact_threshold: float,
+    non_mesh_center: wp.vec3,
 ) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     """Compute unscaled mesh-BVH bounds for a convex shape."""
     X_mesh_sw = wp.transform_inverse(X_mesh_ws)
@@ -1006,7 +1025,9 @@ def _compute_mesh_vs_convex_query_aabb(
         contact_threshold / wp.max(wp.abs(mesh_scale[1]), 1.0e-12),
         contact_threshold / wp.max(wp.abs(mesh_scale[2]), 1.0e-12),
     )
-    center_in_bvh = wp.cw_mul(pos_in_mesh, inv_scale)
+    # Cull against an interior point. A hull's origin and AABB center can
+    # both lie outside it, which discards triangles touching the hull.
+    center_in_bvh = wp.cw_mul(wp.transform_point(X_mesh_shape, non_mesh_center), inv_scale)
     return aabb_lower_bvh - margin_vec, aabb_upper_bvh + margin_vec, center_in_bvh
 
 
@@ -1042,6 +1063,7 @@ def mesh_vs_convex_midphase(
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
     contact_threshold: float,
+    non_mesh_center: wp.vec3,
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
 ):
@@ -1063,6 +1085,7 @@ def mesh_vs_convex_midphase(
         shape_data: Array of shape data (vec4: scale.xyz, margin.w)
         shape_source_ptr: Array of mesh/SDF source pointers
         contact_threshold: Contact candidate distance [m], including margin and gap
+        non_mesh_center: Interior point of the convex shape in its scaled local frame [m]
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
         triangle_pairs_count: Counter for triangle pairs
     """
@@ -1081,6 +1104,7 @@ def mesh_vs_convex_midphase(
                 shape_data,
                 shape_source_ptr,
                 contact_threshold,
+                non_mesh_center,
             )
         bounds = wp.mat33(
             aabb_lower[0],
@@ -1109,6 +1133,7 @@ def mesh_vs_convex_midphase(
             shape_data,
             shape_source_ptr,
             contact_threshold,
+            non_mesh_center,
         )
 
     if wp.static(ENABLE_TILE_BVH_QUERY):

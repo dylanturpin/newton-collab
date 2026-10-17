@@ -42,6 +42,11 @@ import warp as wp
 
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
+    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
+    build_mf_angular_friction_rows,
+    build_propagation_angular_friction_rows,
+    gate_free_rigid_angular_coefficients,
     populate_world_angular_friction_rows,
 )
 
@@ -58,6 +63,209 @@ def configure_torsional_rolling_friction(solver, enabled: bool, cone: str, creep
     solver._enable_torsional_rolling_friction = bool(enabled)
     solver._torsional_rolling_friction_cone = cone
     solver._torsional_rolling_friction_creep_speed = creep_speed
+
+
+def configure_free_rigid_angular_friction(solver, model, torsional: float | None, rolling: float | None) -> None:
+    """Decide from the shapes' ``feather_pgs:condim`` and the overrides whether free-rigid contacts get angular rows."""
+    for name, value in (("free_rigid_torsional_friction", torsional), ("free_rigid_rolling_friction", rolling)):
+        if value is not None and (not np.isfinite(float(value)) or float(value) < 0.0):
+            raise ValueError(f"{name} must be finite and non-negative [m], or None")
+    solver._free_rigid_torsional_friction = None if torsional is None else float(torsional)
+    solver._free_rigid_rolling_friction = None if rolling is None else float(rolling)
+    condim = _shape_condim(model)
+    if condim is not None and np.any((condim < 1) | (condim > 6)):
+        raise ValueError("feather_pgs:condim must be between 1 and 6")
+    overridden = torsional is not None or rolling is not None
+    solver._free_rigid_angular_rows = bool(overridden or (condim is not None and np.any(condim >= 4)))
+
+
+def refresh_free_rigid_angular_friction(solver) -> None:
+    """Write each shape's free-rigid torsional and rolling coefficients [m] on the device, zero where condim excludes them.
+
+    Capturable; outside capture it also rejects a condim above 3 on a solver constructed without angular rows.
+    """
+    model = solver.model
+    attribute = _condim_attribute(model)
+    if not solver._free_rigid_angular_rows:
+        if attribute is not None and model.shape_count and not model.device.is_capturing:
+            if np.any(attribute.numpy() >= 4):
+                raise ValueError(
+                    "feather_pgs:condim above 3 needs a solver constructed with it; construct a new solver"
+                )
+        return
+    if not model.shape_count:
+        return
+    torsional, rolling = solver._free_rigid_torsional_friction, solver._free_rigid_rolling_friction
+    wp.launch(
+        gate_free_rigid_angular_coefficients,
+        dim=model.shape_count,
+        inputs=[
+            attribute if attribute is not None else solver._free_rigid_condim_dummy,
+            int(attribute is not None),
+            solver._shape_mu_torsional,
+            solver._shape_mu_rolling,
+            -1.0 if torsional is None else torsional,
+            -1.0 if rolling is None else rolling,
+        ],
+        outputs=[solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling],
+        device=model.device,
+    )
+
+
+def free_rigid_reduction_material_key(solver):
+    """Return the body-pair reduction key provider for the solver's free-rigid angular coefficients, or ``None``.
+
+    The key is each shape's gated (torsional, rolling) coefficient [m], zero on bodies off the free-rigid route.
+    """
+    if solver._free_rigid_route_body is None or not solver.model.shape_count:
+        return None
+    if not np.any(solver._free_rigid_route_body.numpy()):
+        return None
+    shape_count = solver.model.shape_count
+    shape_body = solver.model.shape_body
+    torsional, rolling, route = (
+        solver._free_rigid_mu_torsional,
+        solver._free_rigid_mu_rolling,
+        solver._free_rigid_route_body,
+    )
+
+    def key():
+        # Captures device arrays only: a reference to the model or solver would keep them alive.
+        coefficients = np.stack((torsional.numpy()[:shape_count], rolling.numpy()[:shape_count]), axis=1)
+        body = shape_body.numpy()
+        coefficients[(body >= 0) & (route.numpy()[np.maximum(body, 0)] == 0)] = 0.0
+        return coefficients
+
+    return key
+
+
+def _condim_attribute(model):
+    namespace = getattr(model, "feather_pgs", None)
+    return getattr(namespace, "condim", None)
+
+
+def _shape_condim(model) -> np.ndarray | None:
+    namespace = getattr(model, "feather_pgs", None)
+    attribute = getattr(namespace, "condim", None)
+    return None if attribute is None or not model.shape_count else attribute.numpy()
+
+
+def free_rigid_route_bodies(solver) -> wp.array | None:
+    """Mark the bodies whose contacts can take the matrix-free free-rigid route; ``None`` without angular rows.
+
+    A contact takes that route when each side is a free rigid body or has no response DOFs, as the allocator decides.
+    """
+    if not solver._free_rigid_angular_rows:
+        return None
+    model = solver.model
+    count = max(model.body_count, 1)
+    route = np.zeros(count, dtype=np.int32)
+    if model.body_count and solver._has_free_rigid_bodies:
+        body_art = solver._body_to_articulation.numpy()[: model.body_count]
+        response = solver._articulation_response_dof_count.numpy()
+        free = solver._is_free_rigid.numpy()
+        safe = np.maximum(body_art, 0)
+        route[: model.body_count] = (body_art < 0) | (response[safe] == 0) | (free[safe] != 0)
+    return wp.array(route, dtype=wp.int32, device=model.device)
+
+
+def validate_free_rigid_angular_friction_mode(solver) -> None:
+    """Reject solver options whose matrix-free solves do not visit the free-rigid angular rows."""
+    if not solver._free_rigid_angular_rows:
+        return
+    model = solver.model
+    if (
+        not model.device.is_cuda
+        or model.requires_grad
+        or solver._solve_mode != "matrix_free"
+        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
+        or solver._row_schedule != "interleaved"
+        or solver._friction_mode != "fixed_normal"
+        or solver._contact_compliance
+        or solver._sparse_mass_matrix_size is not None
+        or (solver._has_free_rigid_bodies and solver._pgs_solve_mf_gs_kernel is None)
+    ):
+        raise ValueError(
+            "Free-rigid angular friction (feather_pgs:condim above 3) requires CUDA non-differentiable matrix_free "
+            "solving with articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
+            "row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
+            "and no contact compliance"
+        )
+
+
+def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
+    """Write the rolling and spin rows that follow each matrix-free contact's sliding pair."""
+    wp.launch(
+        build_mf_angular_friction_rows,
+        dim=threads,
+        inputs=[
+            contacts.rigid_contact_count,
+            threads,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver._contact_world,
+            solver._contact_slot,
+            solver._contact_path,
+            solver._contact_slots_needed,
+            solver._contact_art_a,
+            solver._contact_art_b,
+            solver._articulation_response_dof_count,
+            solver.model.shape_body,
+            state_aug._body_v_s,
+            solver._prescribed_articulation,
+            int(solver._has_prescribed_response),
+            solver._free_rigid_mu_torsional,
+            solver._free_rigid_mu_rolling,
+        ],
+        outputs=[
+            solver._mf_body_a,
+            solver._mf_body_b,
+            solver._mf_J_a,
+            solver._mf_J_b,
+            solver._mf_row_type,
+            solver._mf_row_parent,
+            solver._mf_row_mu,
+            solver._mf_phi,
+            solver._mf_target_velocity,
+            solver._mf_row_restitution,
+        ],
+        device=solver.model.device,
+    )
+
+
+def launch_propagation_free_rigid_angular_friction_rows(solver, contacts, threads: int) -> None:
+    """Write the rolling and spin rows that follow each free-rigid propagation contact's sliding pair."""
+    wp.launch(
+        build_propagation_angular_friction_rows,
+        dim=threads,
+        inputs=[
+            contacts.rigid_contact_count,
+            threads,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver._contact_world,
+            solver._contact_slot,
+            solver._contact_path,
+            solver._contact_slots_needed,
+            solver._contact_mf_origin,
+            solver._free_rigid_mu_torsional,
+            solver._free_rigid_mu_rolling,
+        ],
+        outputs=[
+            solver._propagation_body_a,
+            solver._propagation_body_b,
+            solver._propagation_J_a,
+            solver._propagation_J_b,
+            solver._propagation_row_type,
+            solver._propagation_row_parent,
+            solver._propagation_row_mu,
+            solver._propagation_phi,
+            solver._propagation_row_restitution,
+        ],
+        device=solver.model.device,
+    )
 
 
 def validate_torsional_rolling_friction_mode(solver) -> None:
@@ -87,8 +295,12 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
 
 
 def validate_torsional_rolling_friction_coefficients(solver) -> None:
-    """Reject positive coefficients that could reach the matrix-free free-rigid contact route."""
-    if not solver._enable_torsional_rolling_friction or not solver._has_free_rigid_bodies:
+    """Reject positive coefficients that could reach the matrix-free free-rigid contact route without its rows."""
+    if (
+        not solver._enable_torsional_rolling_friction
+        or not solver._has_free_rigid_bodies
+        or solver._free_rigid_angular_rows
+    ):
         return
     model = solver.model
     if not model.shape_count:
@@ -634,3 +846,119 @@ __CONSTRAINED__
         }
     };
 """
+
+
+def free_rigid_angular_friction_gs_sources() -> list[tuple[str, str]]:
+    """Return ``(anchor, replacement)`` edits that teach the fused matrix-free GS sweep the free-rigid angular rows.
+
+    The rolling pair is solved as one disk block at its first row, as the sliding pair is; the spin row is a box.
+    Both take their radius from the coefficient times the pooled normal load at each visit.
+    """
+    rolling = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    angular = f"(mf_rt == {rolling} || mf_rt == {spin})"
+    return [
+        (
+            "        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {",
+            "        // The pooled normal load of the anchor whose sliding pair this sweep visited last.\n"
+            "        int angular_load_parent = -1;\n"
+            "        float angular_load = 0.0f;\n"
+            "        for (int i = 0, next_i = 0; i < mf_contact_end; i = next_i) {",
+        ),
+        (
+            "            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;",
+            "            if ((meta.w & 0xFFFF) == 2 && i == (meta.w >> 16) + 1) next_i = i + 2;\n"
+            f"            if ((meta.w & 0xFFFF) == {rolling} && i == (meta.w >> 16) + 3) next_i = i + 2;",
+        ),
+        (
+            "                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);",
+            "                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);\n"
+            "                angular_load_parent = parent;\n"
+            "                angular_load = lambda_n;",
+        ),
+        (
+            "            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;",
+            f"            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2 && !{angular}) continue;",
+        ),
+        (
+            "            if (mf_rt == 2 && global_iter < friction_start_iteration) {",
+            f"            if ((mf_rt == 2 || {angular}) && global_iter < friction_start_iteration) {{",
+        ),
+        (
+            "            if (mf_rt == 2 && i != (packed_tp >> 16) + 1) continue;",
+            "            if (mf_rt == 2 && i != (packed_tp >> 16) + 1) continue;\n"
+            f"            // The rolling pair is solved at its first row, three after the normal.\n"
+            f"            if (mf_rt == {rolling} && i != (packed_tp >> 16) + 3) continue;",
+        ),
+        (
+            "            // J · v using prefetched J values",
+            _ANGULAR_PRECHECK.replace("__ANGULAR__", angular).replace("__ROLLING_TYPE__", str(rolling)),
+        ),
+        (
+            "            } else if (mf_rt == 2) {",
+            _ANGULAR_PROJECTION.replace("__SPIN__", str(spin)).replace("__ROLLING__", str(rolling)),
+        ),
+    ]
+
+
+_ANGULAR_PRECHECK = """            float angular_radius = 0.0f;
+            if (__ANGULAR__) {
+                int parent = packed_tp >> 16;
+                // The contact's own sliding pair, visited just before in this sweep, pooled the same normals.
+                float lambda_n = angular_load;
+                if (parent != angular_load_parent) {
+                    lambda_n = s_lam_mf[parent];
+                    for (int patch_row = (mf_meta.data[off_meta + parent * 4 + 3] >> 16); patch_row >= 0 && patch_row != parent; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                        lambda_n += s_lam_mf[patch_row];
+                }
+                angular_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
+                // A zero bound with no carried impulse cannot change velocity.
+                if (angular_radius == 0.0f && s_lam_mf[i] == 0.0f && (mf_rt != __ROLLING_TYPE__ || s_lam_mf[i + 1] == 0.0f))
+                    continue;
+            }
+
+            // J · v using prefetched J values"""
+
+_ANGULAR_PROJECTION = """            } else if (mf_rt == __SPIN__) {
+                new_impulse = fminf(fmaxf(new_impulse, -angular_radius), angular_radius);
+            } else if (mf_rt == __ROLLING__) {
+                int sib = i + 1;
+                int sib_mf6 = mf6_base + sib * 6;
+                float2 pair = make_float2(0.0f, 0.0f);
+                if (angular_radius > 0.0f) {
+                    float sibling_residual = 0.0f;
+                    float cross = 0.0f;
+                    if (lane < 6 && dof_a >= 0) {
+                        sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
+                        cross = cur_Ja * mf_MiJt_a.data[sib_mf6 + lane];
+                    }
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                        sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                        cross = cur_Jb * mf_MiJt_b.data[sib_mf6 + lane - 6];
+                    }
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                        cross += __shfl_down_sync(MASK, cross, offset);
+                    }
+                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
+                        + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
+                    float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
+                    cross = __shfl_sync(MASK, cross, 0);
+                    pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross,
+                        inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f, residual, sibling_residual, old_impulse,
+                        s_lam_mf[sib], angular_radius, omega);
+                }
+                float a = pair.x;
+                float b = pair.y;
+                float mag = sqrtf(a * a + b * b);
+                float scale = mag > angular_radius ? angular_radius / mag : 1.0f;
+                new_impulse = a * scale;
+                float sib_delta = b * scale - s_lam_mf[sib];
+                __syncwarp();
+                s_lam_mf[sib] = b * scale;
+                if (sib_delta != 0.0f) iteration_changed = 1;
+                if (lane < 6 && dof_a >= 0)
+                    s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                if (lane >= 6 && lane < 12 && dof_b >= 0)
+                    s_v[dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
+            } else if (mf_rt == 2) {"""

@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
-from newton.solvers import SolverFeatherPGS, SolverObservableFlags
+from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import (
     _build_sparse_contact_friction_model,
     _sphere_on_ground,
@@ -125,6 +125,10 @@ def _launch_contact_allocator(
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
             0,
         ],
         outputs=[
@@ -144,6 +148,7 @@ def _launch_contact_allocator(
             counters["dense_first_rejected"],
             counters["mf_first_rejected"],
             counters["propagation_first_rejected"],
+            wp.zeros((1,), dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -723,7 +728,7 @@ def test_resting_box_reports_weight_as_linear_force(test, device, solve_mode="ma
     solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=32, articulated_contact_response=response)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     for _ in range(120):
@@ -794,7 +799,7 @@ def _impact(model, solver, joint_qd):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     solver.step(state_in, state_out, model.control(), contacts, 0.01, observables=observables)
     count = int(contacts.rigid_contact_count.numpy()[0])
     return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)
@@ -869,6 +874,150 @@ def test_free_body_impact_shares_armature_momentum(test, device, solve_mode="mat
     test.assertAlmostEqual(float(10.0 * qd[0] + qd[6]), 10.0, delta=1.0e-3)
 
 
+ANCHOR_ROTATIONS = (
+    wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 1.0, 0.2)), 0.25 * np.pi),
+    wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi),
+)
+
+
+def _anchored_sphere(device, anchor_rotation, gravity=None, inertia=(0.004, 0.004, 0.004), max_speed=None):
+    """An offset-COM sphere on the ground whose FREE joint has the given parent-anchor rotation."""
+    builder = newton.ModelBuilder() if gravity is None else newton.ModelBuilder(gravity=gravity)
+    SolverFeatherPGS.register_custom_attributes(builder)
+    pose = wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity())
+    limits = {}
+    if max_speed is not None:
+        limits = {
+            "feather_pgs:rigid_body_max_linear_velocity": max_speed[0],
+            "feather_pgs:rigid_body_max_angular_velocity": max_speed[1],
+        }
+    body = builder.add_link(
+        xform=pose,
+        mass=1.0,
+        com=wp.vec3(0.03, -0.02, 0.01),
+        inertia=wp.mat33(np.diag(inertia)),
+        custom_attributes=limits,
+    )
+    builder.add_articulation([builder.add_joint_free(body, parent_xform=wp.transform_identity())])
+    builder.add_shape_sphere(body, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.5))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    model = builder.finalize(device=device)
+    _set_free_anchor(model, anchor_rotation, (0.0,) * 6)
+    return model
+
+
+def _set_free_anchor(model, anchor_rotation, world_twist):
+    """Move the FREE joint's parent anchor, keeping the body's world pose and giving it ``world_twist``."""
+    pose = wp.transform(*model.body_q.numpy()[0])
+    anchor = wp.transform(wp.vec3(0.2, -0.1, 0.3), anchor_rotation)
+    joint_X_p = model.joint_X_p.numpy()
+    joint_X_p[0] = [*anchor.p, *anchor.q]
+    model.joint_X_p.assign(joint_X_p)
+    local = wp.transform_inverse(anchor) * pose
+    joint_q = model.joint_q.numpy()
+    joint_q[:7] = [*local.p, *local.q]
+    model.joint_q.assign(joint_q)
+    # FREE joint velocities are expressed in the parent anchor frame.
+    to_anchor = np.array(wp.quat_to_matrix(anchor_rotation)).reshape(3, 3).T
+    joint_qd = model.joint_qd.numpy()
+    joint_qd[:3] = to_anchor @ np.asarray(world_twist[:3])
+    joint_qd[3:6] = to_anchor @ np.asarray(world_twist[3:])
+    model.joint_qd.assign(joint_qd)
+
+
+def _run_anchored_sphere(model, solver, steps, dt):
+    """Step from the model's joint state and return the body's world twist."""
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, dt)
+        state_0, state_1 = state_1, state_0
+    return state_0.body_qd.numpy()[0]
+
+
+def _anchored_sphere_cases():
+    """An oblique frictional impact, and the body rolling off its offset COM under gravity."""
+    return {
+        "impact": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 1, 0.01, None),
+        "gravity": ((0.0,) * 6, None, 60, DT, None),
+        # Box velocity limits act on world axes.
+        "velocity_limits": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 3, 0.01, (0.35, 0.3)),
+    }
+
+
+def test_rotated_anchor_free_body_matches_world_aligned(test, device, solve_mode="matrix_free", response="immediate"):
+    """Give a FREE body the same world motion whatever the rotation of its parent anchor."""
+    for inertia in ((0.004, 0.004, 0.004), (0.003, 0.004, 0.006)):
+        for case, (world_twist, gravity, steps, dt, max_speed) in _anchored_sphere_cases().items():
+            twists = []
+            for rotation in (wp.quat_identity(), *ANCHOR_ROTATIONS):
+                model = _anchored_sphere(device, rotation, gravity, inertia, max_speed)
+                _set_free_anchor(model, rotation, world_twist)
+                solver = SolverFeatherPGS(
+                    model,
+                    solve_mode=solve_mode,
+                    cfm=0.0,
+                    iterations=64,
+                    articulated_contact_response=response,
+                    velocity_limit_activation_fraction=0.5,
+                )
+                twists.append(_run_anchored_sphere(model, solver, steps, dt))
+            for rotation, twist in zip(ANCHOR_ROTATIONS, twists[1:], strict=True):
+                with test.subTest(inertia=inertia, case=case, rotation=tuple(rotation)):
+                    np.testing.assert_allclose(twist, twists[0], rtol=0.0, atol=2.0e-4)
+
+
+def test_free_anchor_rotated_after_construction(test, device, solve_mode="matrix_free", response="immediate"):
+    """Follow a FREE body's parent anchor rotated after construction, eagerly and in a replayed graph."""
+    world_twist, gravity, steps, dt, _ = _anchored_sphere_cases()["gravity"]
+    inertia = (0.003, 0.004, 0.006)
+    rotation = ANCHOR_ROTATIONS[0]
+    # The world-aligned anchor gives the expected world motion.
+    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    expected = _run_anchored_sphere(model, solver, steps, dt)
+
+    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    _run_anchored_sphere(model, solver, 1, dt)
+    _set_free_anchor(model, rotation, world_twist)
+    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    np.testing.assert_allclose(_run_anchored_sphere(model, solver, steps, dt), expected, rtol=0.0, atol=2.0e-4)
+
+    if not wp.get_device(device).is_cuda:
+        return
+    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
+    solver = SolverFeatherPGS(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+
+    def step_pair():
+        for _ in range(2):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, dt)
+            state_0.assign(state_1)
+
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    step_pair()
+    with wp.ScopedCapture(device) as capture:
+        step_pair()
+    _set_free_anchor(model, rotation, world_twist)
+    state_0.joint_q.assign(model.joint_q)
+    state_0.joint_qd.assign(model.joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    with wp.ScopedCapture(device) as notify:
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    wp.capture_launch(notify.graph)
+    for _ in range(steps // 2):
+        wp.capture_launch(capture.graph)
+    np.testing.assert_allclose(state_0.body_qd.numpy()[0], expected, rtol=0.0, atol=2.0e-4)
+
+
 class TestFeatherPGSContactForce(unittest.TestCase):
     pass
 
@@ -882,6 +1031,8 @@ for _name in (
     "test_friction_slides_at_the_coulomb_bound",
     "test_free_body_contact_response_includes_armature",
     "test_free_body_impact_shares_armature_momentum",
+    "test_rotated_anchor_free_body_matches_world_aligned",
+    "test_free_anchor_rotated_after_construction",
 ):
     add_function_test(TestFeatherPGSContactForce, _name, globals()[_name], devices=devices)
     add_function_test(
@@ -891,6 +1042,16 @@ for _name in (
     add_function_test(
         TestFeatherPGSContactForce, f"{_name}_propagation", globals()[_name], devices=devices, response="propagation"
     )
+
+
+# Colored propagation builds the same body-space rows as propagation in a different order.
+add_function_test(
+    TestFeatherPGSContactForce,
+    "test_rotated_anchor_free_body_matches_world_aligned_propagation_colored",
+    test_rotated_anchor_free_body_matches_world_aligned,
+    devices=devices,
+    response="propagation_colored",
+)
 
 
 # The fused response only differs from the immediate one with an articulated (dense-path) body.
@@ -956,10 +1117,10 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, tors
         set_torsion_radius(model, torsion_radius)
     options.setdefault("solve_mode", "matrix_free")
     solver = SolverFeatherPGS(model, iterations=32, **options)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
+    contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     test.assertEqual(observables.contact_f.shape[0], model.rigid_contact_max + model.soft_contact_max)
     observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
-    contacts = pipeline.contacts()
     states = [model.state(), model.state()]
     control = model.control()
     for _ in range(steps):
@@ -986,9 +1147,9 @@ def test_unrequested_contact_f_is_left_untouched(test, device):
     """Write nothing when the observable is allocated but not selected for the step."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(model, solve_mode="matrix_free" if wp.get_device(device).is_cuda else "split")
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
-    observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     state_in, state_out = model.state(), model.state()
     pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, model.control(), contacts, DT, observables=observables.select(set()))
@@ -1001,8 +1162,8 @@ def test_contact_f_in_a_captured_graph(test, device):
     """Write the observable from the replayed step's impulses in a captured graph."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverFeatherPGS(model, solve_mode="matrix_free", iterations=32)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     states = [model.state(), model.state()]
     control = model.control()
 
@@ -1036,8 +1197,8 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
         sleep_skip_constraints=skip_constraints,
         friction_anchor_beta=0.0,
     )
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     states = [model.state(), model.state()]
     control = model.control()
     for step in range(150):
@@ -1097,8 +1258,8 @@ def test_contact_f_of_compliant_hydroelastic_rows(test, device):
             iterations=64,
             free_body_constraint_max=2048,
         )
-        observables = solver.observables({SolverObservableFlags.CONTACT_F})
         contacts = pipeline.contacts()
+        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
         states = [model.state(), model.state()]
         newton.eval_fk(model, model.joint_q, model.joint_qd, states[0])
         for _ in range(5):
@@ -1123,9 +1284,9 @@ def test_overflowing_contact_count_stays_in_the_rigid_rows(test, device, capture
     solver = SolverFeatherPGS(model, solve_mode=solve_mode, warn_constraint_overflow=False)
     rigid_capacity, soft_capacity = 4, 2
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_capacity, soft_contact_max=soft_capacity)
-    observables = solver.observables({SolverObservableFlags.CONTACT_F})
-    test.assertEqual(observables.contact_f.shape[0], rigid_capacity + soft_capacity)
     contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    test.assertEqual(observables.contact_f.shape[0], rigid_capacity + soft_capacity)
     state_in, state_out, control = model.state(), model.state(), model.control()
     overflow_count = wp.array([rigid_capacity + soft_capacity + 3], dtype=wp.int32, device=device)
 
@@ -3495,6 +3656,64 @@ def _run_mixed_response(
         )
         state_in, state_out = state_out, state_in
     return solver, samples
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "graph capture requires CUDA")
+class TestFeatherPGSJointlessKinematicBody(unittest.TestCase):
+    PRESCRIBED_QD = (0.3, -0.2, 0.0, 0.0, 0.0, 0.5)
+
+    def _published(self, response, capture):
+        """Step a free box on a jointless kinematic floor and return the floor's state in both buffers."""
+        builder = newton.ModelBuilder()
+        floor = builder.add_link(is_kinematic=True)
+        builder.add_shape_box(floor, hx=0.5, hy=0.5, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.021)))
+        builder.add_shape_box(box, hx=0.02, hy=0.02, hz=0.02)
+        model = builder.finalize(device=wp.get_cuda_device())
+        # Freed device memory holds NaN, so any unwritten scratch the solver publishes reads as NaN.
+        nan_fill = wp.full(1 << 22, float("nan"), dtype=wp.float32, device=model.device)
+        del nan_fill
+        solver = SolverFeatherPGS(model, solve_mode="matrix_free", articulated_contact_response=response)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states = (model.state(), model.state())
+        body_q, body_qd = states[0].body_q.numpy(), states[0].body_qd.numpy()
+        body_q[floor, 0] += 0.1
+        body_qd[floor] = self.PRESCRIBED_QD
+        states[0].body_q.assign(body_q)
+        states[0].body_qd.assign(body_qd)
+        stale_q, stale_qd = states[1].body_q.numpy(), states[1].body_qd.numpy()
+        stale_q[floor] = np.nan
+        stale_qd[floor] = np.nan
+        states[1].body_q.assign(stale_q)
+        states[1].body_qd.assign(stale_qd)
+        control = model.control()
+
+        def two_steps():
+            for state_in, state_out in (states, states[::-1]):
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, DEFAULT_DT)
+
+        if capture:
+            with wp.ScopedCapture(model.device) as scope:
+                two_steps()
+            for _ in range(2):
+                wp.capture_launch(scope.graph)
+        else:
+            for _ in range(2):
+                two_steps()
+        self.assertTrue(np.isfinite(states[0].body_q.numpy()[box]).all())
+        return body_q[floor], [(s.body_q.numpy()[floor], s.body_qd.numpy()[floor]) for s in states]
+
+    def test_jointless_kinematic_body_publishes_its_prescribed_state(self):
+        """Pass a jointless kinematic body's input pose and velocity through every step, eager and captured."""
+        for response in ("immediate", "propagation"):
+            for capture in (False, True):
+                with self.subTest(response=response, capture=capture):
+                    prescribed_q, published = self._published(response, capture)
+                    for body_q, body_qd in published:
+                        np.testing.assert_array_equal(body_q, prescribed_q)
+                        np.testing.assert_array_equal(body_qd, np.array(self.PRESCRIBED_QD, dtype=np.float32))
 
 
 class TestFeatherPGSPairedResponse(unittest.TestCase):

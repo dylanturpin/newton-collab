@@ -32,6 +32,7 @@ from ..geometry.contact_reduction_body_pairs import (
     BodyPairContactReducer,
     build_reduction_group_pair_bound,
     build_reduction_groups,
+    reduction_material_key_version,
 )
 from ..geometry.contact_reduction_global import CONTACT_ID_BITS
 from ..geometry.contact_sort import ContactSorter
@@ -367,14 +368,11 @@ def compute_shape_aabbs(
     contact_generation: wp.array[wp.int32],
     broad_phase_pair_count: wp.array[wp.int32],
     num_contact_counters: int,
-    # Per-shape nonzero when its texture SDF is queried at unit scale; empty when no shape is.
-    shape_unit_scale_sdf: wp.array[wp.int32],
     # outputs
     aabb_lower: wp.array[wp.vec3],
     aabb_upper: wp.array[wp.vec3],
     geom_data: wp.array[wp.vec4],
     geom_xform: wp.array[wp.transform],
-    unit_scale_sdf_rescaled: wp.array[wp.int32],
 ):
     """Compute AABBs, narrow-phase geometry data, and zero collision counters.
 
@@ -416,14 +414,6 @@ def compute_shape_aabbs(
 
     # Check if this is an infinite plane or a shape with a pre-computed local AABB
     scale = shape_scale[shape_id]
-    if shape_unit_scale_sdf.shape[0] > 0:
-        if shape_unit_scale_sdf[shape_id] != 0 and (scale[0] != 1.0 or scale[1] != 1.0 or scale[2] != 1.0):
-            if wp.atomic_max(unit_scale_sdf_rescaled, 0, 1) == 0:
-                wp.printf(
-                    "Warning: shape_scale of shape %d changed, but its texture SDF is queried at unit scale. "
-                    "Construct CollisionPipeline with dynamic_shape_scale=True, which is slower.\n",
-                    shape_id,
-                )
     is_infinite_plane = (geo_type == GeoType.PLANE) and (scale[0] == 0.0 and scale[1] == 0.0)
     has_local_aabb = geo_type == GeoType.MESH or geo_type == GeoType.HFIELD or geo_type == GeoType.CONVEX_MESH
 
@@ -1802,6 +1792,7 @@ class CollisionPipeline:
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
         box_box_sat: bool = False,
+        convex_face_clip: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1902,6 +1893,15 @@ class CollisionPipeline:
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
+            convex_face_clip: Build box/plane versus convex-mesh manifolds by
+                clipping the hull's incident face against the box or plane
+                reference face, keeping up to 4 points; pairs the face does not
+                explain fall back to perturbed support mapping. This gives rounded
+                hulls a multi-point support patch where the default manifold
+                often keeps a single support vertex. Selected at construction and
+                fixed for the pipeline's lifetime. Experimental: the option and
+                its contacts may change without a deprecation period. Cannot be
+                combined with a prebuilt ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1982,8 +1982,9 @@ class CollisionPipeline:
                 :attr:`Model.shape_scale <newton.Model.shape_scale>` on every call, which is slower.
                 Enable this when such a shape's scale changes after construction. When ``False`` and
                 every such shape has unit scale at construction, these queries are compiled for unit
-                scale; rescaling one of these shapes afterwards makes the device print a warning once
-                and a later :meth:`collide` call outside graph capture raise :class:`RuntimeError`.
+                scale; routing a rescaled shape through mesh-SDF collision makes the device print a
+                warning once and a later :meth:`collide` call outside graph capture raise
+                :class:`RuntimeError`. Mesh-plane and mesh-convex contacts are unaffected.
                 Ignored when ``narrow_phase`` is provided. Defaults to ``False``.
 
         .. experimental::
@@ -2113,6 +2114,11 @@ class CollisionPipeline:
                 raise ValueError(
                     "box_box_sat cannot be used when narrow_phase is provided; "
                     "construct the NarrowPhase with box_box_sat=True instead"
+                )
+            if convex_face_clip:
+                raise ValueError(
+                    "convex_face_clip cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with convex_face_clip=True instead"
                 )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
@@ -2418,6 +2424,7 @@ class CollisionPipeline:
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 box_box_sat=box_box_sat,
+                convex_face_clip=convex_face_clip,
                 convex_support_acceleration=model._convex_support_lut.shape[0] > 1,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
@@ -2465,6 +2472,8 @@ class CollisionPipeline:
         self._unit_scale_sdf_rescaled = wp.zeros(min(len(shape_unit_scale_sdf), 1), dtype=wp.int32, device=device)
         self._unit_scale_sdf_rescaled_host = None
         if unit_scale_sdf_shapes is not None:
+            self.narrow_phase._shape_unit_scale_sdf = self._shape_unit_scale_sdf
+            self.narrow_phase._unit_scale_sdf_rescaled = self._unit_scale_sdf_rescaled
             self._unit_scale_sdf_rescaled_host = make_pinned_release_capture_safe(
                 wp.zeros(1, dtype=wp.int32, device="cpu", pinned=wp.get_device(device).is_cuda)
             )
@@ -2619,6 +2628,7 @@ class CollisionPipeline:
             # build_reduction_groups). Group ids must pack exactly into the
             # reduction key: aliasing two groups could evict a patch's deepest
             # contact.
+            self._reduction_material_key_version = reduction_material_key_version(model)
             shape_group, group_count = build_reduction_groups(model)
             if group_count > MAX_GROUP_ID + 1:
                 # ids are 0-based: MAX_GROUP_ID is the largest representable id
@@ -2702,7 +2712,10 @@ class CollisionPipeline:
         synchronous ``O(shape_count)`` host rebuild intended for infrequent
         material changes, not per-frame use.  Call it outside CUDA graph capture.
         Raises if the new class count exceeds the group-id budget.  No-op when
-        reduction is disabled.
+        reduction is disabled.  A solver that adds a per-shape material key
+        (``add_reduction_material_key``) after this pipeline grouped its
+        shapes triggers this rebuild at the next :meth:`collide` outside
+        capture.
         """
         if self._body_pair_reducer is None:
             return
@@ -2711,12 +2724,14 @@ class CollisionPipeline:
                 "refresh_body_pair_reduction_groups() mutates reducer topology; "
                 "call it when no CUDA graph capture is active on this device"
             )
+        version = reduction_material_key_version(self.model)
         shape_group, group_count = build_reduction_groups(self.model)
         if group_count > MAX_GROUP_ID + 1:
             raise ValueError(
                 f"body-pair contact reduction supports at most {MAX_GROUP_ID + 1} reduction groups, got {group_count}"
             )
         self._body_pair_reducer.shape_group.assign(shape_group)
+        self._reduction_material_key_version = version
         # Winners recorded under the old classes are not comparable to the new
         # grouping; severing history is the conservative continuation.
         self._body_pair_reducer.reset_history()
@@ -3266,6 +3281,11 @@ class CollisionPipeline:
                     "for an unreduced-only solver configuration is live; destroy every reference to that "
                     "solver graph first"
                 )
+            if reduction_material_key_version(self.model) != self._reduction_material_key_version:
+                # A solver added a material key since this pipeline grouped its shapes.
+                if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
+                    raise RuntimeError("A solver changed body-pair reduction groups; collide once outside capture.")
+                self.refresh_body_pair_reduction_groups()
             device = self._body_pair_reducer.device
             graph = contacts._current_warp_capture_graph()
             current_stream_is_capturing = graph is not None
@@ -3364,20 +3384,16 @@ class CollisionPipeline:
                 contacts.contact_generation,
                 self.broad_phase_pair_count,
                 contacts.contact_counters.shape[0],
-                self._shape_unit_scale_sdf,
             ],
             outputs=[
                 self.narrow_phase.shape_aabb_lower,
                 self.narrow_phase.shape_aabb_upper,
                 self.geom_data,
                 self.geom_transform,
-                self._unit_scale_sdf_rescaled,
             ],
             device=self.device,
             record_tape=False,
         )
-        if check_unit_scale_sdf:
-            wp.copy(self._unit_scale_sdf_rescaled_host, self._unit_scale_sdf_rescaled)
 
         if speculative_active:
             wp.launch(
@@ -3532,6 +3548,8 @@ class CollisionPipeline:
             shape_transform=self.geom_transform,
             shape_source=model.shape_source_ptr,
             shape_mesh_properties=model._shape_mesh_properties,
+            mesh_boundary_flags=model._mesh_boundary_flags,
+            shape_mesh_boundary_start=model._shape_mesh_boundary_start,
             shape_sdf_index=model._shape_sdf_index,
             texture_sdf_data=model._texture_sdf_data,
             shape_gap=search_gap,
@@ -3540,6 +3558,7 @@ class CollisionPipeline:
             shape_collision_aabb_lower=model.shape_collision_aabb_lower,
             shape_collision_aabb_upper=model.shape_collision_aabb_upper,
             shape_voxel_resolution=self.narrow_phase.shape_voxel_resolution,
+            shape_interior_point=model._shape_interior_point,
             shape_heightfield_index=model.shape_heightfield_index,
             heightfield_data=model.heightfield_data,
             heightfield_elevations=model.heightfield_elevations,
@@ -3549,6 +3568,8 @@ class CollisionPipeline:
             device=self.device,
             **narrow_phase_extension_kwargs,
         )
+        if check_unit_scale_sdf:
+            wp.copy(self._unit_scale_sdf_rescaled_host, self._unit_scale_sdf_rescaled)
 
         # The reducer's counters are reused by the next pass, so latch losses on this contact stream.
         reducer = self.narrow_phase.global_contact_reducer

@@ -64,6 +64,8 @@ def configure_contact_torsion(solver):
         if unsupported:
             raise ValueError(f"Contact torsion does not support the geometry of shapes {unsupported}")
     solver._contact_torsion_enabled = enabled
+    # Plain propagation solves the torsion rows of its propagation contacts in a post-pass of each sweep.
+    solver._propagation_torsion_rows = enabled and solver._articulated_contact_response == "propagation"
     solver._torsion_stats = {}
     if enabled:
         _validate_torsion_mode(solver)
@@ -75,16 +77,18 @@ def _validate_torsion_mode(solver):
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response != "immediate"
+        or solver._articulated_contact_response not in ("immediate", "propagation")
         or solver._friction_mode != "fixed_normal"
         or solver._row_schedule != "interleaved"
         or solver._contact_warmstart
         or solver._contact_compliance
     ):
         raise ValueError(
-            "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
+            "Contact torsion requires CUDA non-differentiable matrix_free/immediate or propagation/current/"
             "interleaved, without warmstart or compliance"
         )
+    if solver._articulated_contact_response == "propagation" and solver._velocity_iterations > 0:
+        raise ValueError("Contact torsion on articulated_contact_response='propagation' requires velocity_iterations=0")
     if solver._velocity_iterations > 0 and solver._enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
@@ -517,6 +521,17 @@ def torque_sweep_source(dofs, *, linked):
                         world_torsion_group.data[off_dense + n] != spin"""
     first_skip = f"if ({non_member}) continue;" if non_member else ""
     rescale_skip = f"{non_member} ||" if non_member else ""
+    lanes = [f"lane + {k * 32}" if k else "lane" for k in range((dofs + 31) // 32)]
+    # The spin row's own loads do not depend on the member walk, so they are issued before it.
+    row_loads = "\n".join(
+        f"""                float spin_J_{k} = {d} < {dofs} ? J_world.data[jy_world_base + spin * {dofs} + {d}] : 0.0f;
+                float spin_Y_{k} = {d} < {dofs} ? Y_world.data[jy_world_base + spin * {dofs} + {d}] : 0.0f;"""
+        for k, d in enumerate(lanes)
+    )
+    row_dot = "\n".join(f"                if ({d} < {dofs}) dot += spin_J_{k} * s_v[{d}];" for k, d in enumerate(lanes))
+    row_update = "\n".join(
+        f"                    if ({d} < {dofs}) s_v[{d}] += spin_Y_{k} * delta;" for k, d in enumerate(lanes)
+    )
     return f"""
         if (row_phase == 0) {{
             {torsion_rows}
@@ -524,6 +539,10 @@ def torque_sweep_source(dofs, *, linked):
                 // The torsion row carries its group's undivided coefficient. Persistent
                 // patches divide the anchor tangent rows' coefficient by the anchor count.
                 float mu = fmaxf(world_row_mu.data[off_dense + spin], 0.0f);
+{row_loads}
+                const float spin_rhs = rhs_bias.data[off_dense + spin];
+                const float spin_diagonal = world_diag.data[off_dense + spin];
+                const int spin_group = world_torsion_group.data[off_dense + spin];
                 float normal_load = 0.0f;
                 float sliding_used = 0.0f;
                 {members}
@@ -579,19 +598,18 @@ def torque_sweep_source(dofs, *, linked):
                     }}
                 }}
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
-                if (world_torsion_group.data[off_dense + spin] == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
+                if (spin_group == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
                 if (global_iter < friction_start_iteration) bound = 0.0f;
                 float dot = 0.0f;
-                for (int d = lane; d < {dofs}; d += 32)
-                    dot += J_world.data[jy_world_base + spin * {dofs} + d] * s_v[d];
+{row_dot}
                 dot += __shfl_down_sync(MASK, dot, 16);
                 dot += __shfl_down_sync(MASK, dot, 8);
                 dot += __shfl_down_sync(MASK, dot, 4);
                 dot += __shfl_down_sync(MASK, dot, 2);
                 dot += __shfl_down_sync(MASK, dot, 1);
-                float residual = __shfl_sync(MASK, dot, 0) + rhs_bias.data[off_dense + spin];
+                float residual = __shfl_sync(MASK, dot, 0) + spin_rhs;
                 float old = s_lam_dense[spin];
-                float diagonal = world_diag.data[off_dense + spin];
+                float diagonal = spin_diagonal;
                 float trial = diagonal > 0.0f ? old - omega * residual / diagonal : 0.0f;
                 float next = fminf(fmaxf(trial, -bound), bound);
                 float delta = next - old;
@@ -600,8 +618,7 @@ def torque_sweep_source(dofs, *, linked):
                 if (delta != 0.0f) {{
                     iteration_changed = 1;
                     if (lane == 0) s_lam_dense[spin] = next;
-                    for (int d = lane; d < {dofs}; d += 32)
-                        s_v[d] += Y_world.data[jy_world_base + spin * {dofs} + d] * delta;
+{row_update}
                 }}
                 __syncwarp();
             }}

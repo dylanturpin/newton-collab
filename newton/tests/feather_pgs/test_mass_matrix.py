@@ -2097,7 +2097,7 @@ def _armature_impact(model, solver, joint_qd):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
-    observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({newton.solvers.SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
     solver.step(state_in, state_out, model.control(), contacts, 0.01, observables=observables)
     count = int(contacts.rigid_contact_count.numpy()[0])
     return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)

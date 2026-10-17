@@ -67,6 +67,51 @@ class TestSleeping(unittest.TestCase):
         np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
         self.assertGreater(states[0].body_qd.numpy()[0, 2], 0)
 
+    def test_masked_reset_restarts_only_selected_history(self):
+        """Restart the selected world's sleeping history and keep the other world's history bitwise."""
+        box = newton.ModelBuilder()
+        body = box.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+        box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(box, 2)
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            enable_sleeping=True,
+            sleep_quiet_time=0.05,
+            iterations=16,
+            friction_anchor_beta=0,
+            solve_mode="split",
+        )
+        sleeping = solver._sleeping
+        state = model.state()
+        for name in _HISTORY:
+            values = getattr(sleeping, name).numpy()
+            getattr(sleeping, name).assign(np.full_like(values, 7.0))
+        sleeping.asleep_steps.assign(np.array([11, 11], dtype=np.int32))
+        sleeping.quiet_age.assign(np.array([3.0, 3.0], dtype=np.float32))
+        sleeping.art_awake.assign(np.array([0, 0], dtype=np.int32))
+        sleeping.valid.fill_(1)
+        previous_root = sleeping.previous_root.numpy().copy()
+        solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
+        sources = {
+            "last_q": state.joint_q,
+            "last_qd": state.joint_qd,
+            "last_body_q": state.body_q,
+            "last_body_qd": state.body_qd,
+        }
+        for name in _HISTORY:
+            history = getattr(sleeping, name).numpy()
+            half = history.shape[0] // 2
+            np.testing.assert_array_equal(history[:half], sources[name].numpy()[:half], err_msg=name)
+            np.testing.assert_array_equal(history[half:], np.full_like(history[half:], 7.0), err_msg=name)
+        np.testing.assert_array_equal(sleeping.asleep_steps.numpy(), [0, 11])
+        np.testing.assert_array_equal(sleeping.quiet_age.numpy(), [0.0, 3.0])
+        np.testing.assert_array_equal(sleeping.art_awake.numpy(), [1, 0])
+        np.testing.assert_array_equal(sleeping.valid.numpy(), [1])
+        np.testing.assert_array_equal(sleeping.previous_root.numpy(), previous_root)
+
     def test_free_flight_cannot_sleep(self):
         """Keep unsupported free bodies awake at zero speed."""
         model, pipeline, solver, states, control = _scene(ground=False)
@@ -85,6 +130,12 @@ class TestSleeping(unittest.TestCase):
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, enable_sleeping=True, friction_anchor_beta=0, **kwargs)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        empty = builder.finalize(device=model.device)
+        newton.solvers.SolverFeatherPGS(empty, friction_anchor_beta=0)
+        with self.assertRaisesRegex(ValueError, "at least one articulation"):
+            newton.solvers.SolverFeatherPGS(empty, enable_sleeping=True, friction_anchor_beta=0)
 
     def test_default_and_explicit_disabled_match(self):
         """Preserve the existing trajectory with sleeping explicitly disabled."""
@@ -478,6 +529,85 @@ class TestSleepingProductionProfile(unittest.TestCase):
         _advance_sleeping_production(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver._sleeping.art_awake.numpy(), [1, 0])
 
+    def test_masked_reset_restarts_state_change_history(self):
+        """Continue bitwise like a world whose live state it was given, after a masked reset of both."""
+        model, pipeline, solver, states = _two_world_boxes(self)
+        q = model.joint_q.numpy()
+        q[model.joint_q_start.numpy()[1] + 2] = 0.3
+        model.joint_q.assign(q)
+        for state in states:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        control = model.control()
+        _advance_sleeping_production(pipeline, solver, states, control, 400)
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+        for state in states:
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                values = getattr(state, name).numpy()
+                half = values.shape[0] // 2
+                values[half:] = values[:half]
+                getattr(state, name).assign(values)
+        solver.reset(states[0], world_mask=wp.array([True, True], dtype=wp.bool, device=model.device))
+        contacts = pipeline.contacts()
+        force = np.zeros((model.body_count, 6), dtype=np.float32)
+        force[:, 2] = 30.0
+        for step in range(150):
+            states[0].clear_forces()
+            if step == 60:
+                states[0].body_f.assign(force)
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, 0.005)
+            states.reverse()
+        body_q = states[0].body_q.numpy()
+        np.testing.assert_array_equal(body_q[0], body_q[1])
+
+    def test_masked_reset_between_graph_replays_restarts_only_selected_history(self):
+        """Restart the selected world's sleeping history at a masked reset between graph replays, matching eager."""
+        runs = []
+        for captured in (True, False):
+            model, pipeline, solver, states = _two_world_boxes(self)
+            control = model.control()
+            contacts = pipeline.contacts()
+            step = _ping_pong_graphs(model, pipeline, solver, states, control, contacts, captured)
+            for i in range(400):
+                step(i)
+            sleeping = solver._sleeping
+            np.testing.assert_array_equal(sleeping.body_awake.numpy(), [0, 0])
+            trace = []
+            reset_step = 400
+            for phase in range(2):
+                if reset_step % 2 != phase:
+                    step(reset_step)
+                    reset_step += 1
+                current = states[reset_step % 2]
+                body_q = current.body_q.numpy()
+                body_q[0, 2] += 0.02
+                current.body_q.assign(body_q)
+                joint_q = current.joint_q.numpy()
+                joint_q[2] += 0.02
+                current.joint_q.assign(joint_q)
+                before = {n: getattr(sleeping, n).numpy().copy() for n in _HISTORY}
+                before_steps = sleeping.asleep_steps.numpy().copy()
+                solver.reset(current, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
+                after = {n: getattr(sleeping, n).numpy() for n in _HISTORY}
+                state_rows = {
+                    "last_q": current.joint_q,
+                    "last_qd": current.joint_qd,
+                    "last_body_q": current.body_q,
+                    "last_body_qd": current.body_qd,
+                }
+                for name in _HISTORY:
+                    half = after[name].shape[0] // 2
+                    np.testing.assert_array_equal(after[name][:half], state_rows[name].numpy()[:half], err_msg=name)
+                    np.testing.assert_array_equal(after[name][half:], before[name][half:], err_msg=name)
+                np.testing.assert_array_equal(sleeping.asleep_steps.numpy(), [0, before_steps[1]])
+                np.testing.assert_array_equal(sleeping.quiet_age.numpy()[0], 0.0)
+                for i in range(reset_step, reset_step + 40):
+                    step(i)
+                    trace.append(states[(i + 1) % 2].body_q.numpy().copy())
+                reset_step += 40
+            runs.append(np.stack(trace))
+        np.testing.assert_array_equal(runs[0], runs[1])
+
     def test_property_notification_wakes_only_changed_islands(self):
         """Wake the island whose mass changed, and nothing for a notification without a change."""
         model, pipeline, solver, states = _two_world_boxes(self)
@@ -737,6 +867,30 @@ def _articulations(test, tiles=False):
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
     solver = _solver(test, model)
     return model, pipeline, solver, [model.state(), model.state()], model.control()
+
+
+_HISTORY = ("last_q", "last_qd", "last_body_q", "last_body_qd")
+
+
+def _ping_pong_graphs(model, pipeline, solver, states, control, contacts, captured):
+    """Return ``step(i)``, advancing states[i % 2] into states[(i + 1) % 2] eagerly or by replaying one of two graphs."""
+
+    def eager(i):
+        src, dst = states[i % 2], states[(i + 1) % 2]
+        src.clear_forces()
+        pipeline.collide(src, contacts)
+        solver.step(src, dst, control, contacts, 0.005)
+
+    for i in range(2):
+        eager(i)
+    if not captured:
+        return lambda i: eager(i + 2)
+    graphs = []
+    for i in range(2):
+        with wp.ScopedCapture(device=model.device) as capture:
+            eager(i)
+        graphs.append(capture.graph)
+    return lambda i: wp.capture_launch(graphs[i % 2])
 
 
 def _two_world_boxes(test):
