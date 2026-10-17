@@ -4988,9 +4988,6 @@ def _allocate_world_contact_slot(
     articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
     body_has_response_dofs: wp.array[int],
-    body_world: wp.array[int],
-    isolate_prescribed_bodies: int,
-    cross_world_warning: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5092,23 +5089,6 @@ def _allocate_world_contact_slot(
             world = -2
         if not b_can_respond and b_has_dofs and art_to_world[art_b] != world:
             world = -2
-        # A prescribed body of another world would take rows of several worlds; deterministic propagation drops them.
-        if isolate_prescribed_bodies != 0:
-            foreign = -1
-            if not a_can_respond and body_a >= 0 and body_world[body_a] != world:
-                foreign = body_a
-            if not b_can_respond and body_b >= 0 and body_world[body_b] != world:
-                foreign = body_b
-            if foreign >= 0:
-                if wp.atomic_exch(cross_world_warning, 0, 1) == 0:
-                    wp.printf(
-                        "Error: FeatherPGS deterministic propagation dropped contacts between body %d of world %d and "
-                        "world %d; contact pairs must stay within one world. check_constraint_capacity() raises.\n",
-                        foreign,
-                        body_world[foreign],
-                        world,
-                    )
-                world = -2
     if world == -2:
         if art_a >= 0:
             wp.atomic_add(dense_dropped_contact_rows, art_to_world[art_a], 3)
@@ -5303,9 +5283,6 @@ def allocate_world_contact_slots(
     articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
     body_has_response_dofs: wp.array[int],
-    body_world: wp.array[int],
-    isolate_prescribed_bodies: int,
-    cross_world_warning: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -5388,9 +5365,6 @@ def allocate_world_contact_slots(
             articulation_response_dof_count,
             body_flags,
             body_has_response_dofs,
-            body_world,
-            isolate_prescribed_bodies,
-            cross_world_warning,
             is_free_rigid,
             has_free_rigid,
             propagation_articulated_contacts,
@@ -8631,7 +8605,8 @@ def accumulate_propagation_warmstart_body_impulses_ordered(
 ):
     """Convert seeded propagation row impulses to deferred body wrenches, summed in row order.
 
-    One thread per world and twist component walks the rows serially, as the plain sweep does.
+    One thread per world and twist component walks the rows serially, as the plain sweep does. Rows reference
+    only bodies of articulations with response DOFs, and the allocator keeps those in one world: one writer per body.
     """
     tid = wp.tid()
     world = tid // 6

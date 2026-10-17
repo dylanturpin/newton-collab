@@ -606,7 +606,8 @@ def _run_heap_arm(model, steps, *, cached, warmstart, graph=False, on_step=None)
                 on_step(index, solver, contacts)
             if index % 2:
                 poses.append(state_0.body_q.numpy())
-    per_world = np.stack(poses).reshape(len(poses), model.world_count, -1, 7)
+    in_world = model.body_world.numpy() >= 0
+    per_world = np.stack(poses)[:, in_world].reshape(len(poses), model.world_count, -1, 7)
     return per_world, _sample(state_0)
 
 
@@ -735,79 +736,142 @@ def test_deterministic_propagation_warm_start_sums_in_row_order(test, device):
     test.assertFalse(np.array_equal(reversed_order, ordered))
 
 
-def test_deterministic_propagation_rejects_bodies_shared_by_worlds(test, device):
-    """Reject a shaped body whose contacts can reach several worlds; accept it without the flag or on one world."""
-    shared = {"outside every world": _build_heap_arm_scene(device, (0, 1), global_floor=True)}
-    # A world-local floor whose shape is added outside every world collides with both worlds.
+def _two_heap_arm_worlds(first_world_extra=None):
+    """Two heap-and-arm worlds; ``first_world_extra`` adds to world 0's builder and its result is returned."""
     builder = newton.ModelBuilder()
     first = _build_heap_arm_world(0)
-    floor = first.add_link(is_kinematic=True)
+    extra = first_world_extra(first) if first_world_extra is not None else None
     builder.add_world(first)
     builder.add_world(_build_heap_arm_world(1))
+    return builder, extra
+
+
+def _step_explicit(model, solver, pairs, steps=2):
+    """Step ``solver`` on a deterministic pipeline, with explicit broad-phase ``pairs`` when given."""
+    options = {}
+    if pairs is not None:
+        options = {
+            "broad_phase": "explicit",
+            "shape_pairs_filtered": wp.array(np.asarray(pairs, dtype=np.int32), dtype=wp.vec2i, device=model.device),
+        }
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky", **options)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return contacts, state_0
+
+
+def _row_worlds_by_body(solver):
+    """Map each body referenced by a propagation row to the worlds whose rows reference it."""
+    owners = {}
+    counts = solver._propagation_constraint_count.numpy()
+    for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+        for world, count in enumerate(counts):
+            for body in np.unique(side[world, :count]):
+                if body >= 0:
+                    owners.setdefault(int(body), set()).add(world)
+    return owners
+
+
+def test_deterministic_propagation_accepts_bodies_shared_by_worlds(test, device):
+    """Solve a kinematic floor shared by several worlds as static geometry, bitwise and world-permutation invariant."""
+    shared = {"outside every world": _build_heap_arm_scene(device, (0, 1), global_floor=True)}
+    builder, floor = _two_heap_arm_worlds(lambda first: first.add_link(is_kinematic=True))
     builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
     shared["global shape on a world body"] = builder.finalize(device=device)
-    for name, model in shared.items():
-        with test.subTest(name):
-            with test.assertRaisesRegex(ValueError, "each shaped body and its shapes to share one world"):
-                SolverFeatherPGS(model, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
-            SolverFeatherPGS(model, **PROPAGATION_SOLVER_OPTIONS)
-    single = _build_heap_arm_scene(device, (0,), global_floor=True)
-    SolverFeatherPGS(single, deterministic=True, **PROPAGATION_SOLVER_OPTIONS)
-
-
-def test_deterministic_propagation_drops_explicit_cross_world_pairs(test, device):
-    """Drop explicit pairs joining a world's prescribed body to another world, report them, and fail the status check."""
-    builder = newton.ModelBuilder()
-    first = _build_heap_arm_world(0)
-    floor = first.add_link(is_kinematic=True)
-    floor_shape = first.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
-    builder.add_world(first)
-    builder.add_world(_build_heap_arm_world(1))
-    model = builder.finalize(device=device)
-    pairs = np.array(
-        [[floor_shape, shape] for shape in range(model.shape_count) if shape != floor_shape], dtype=np.int32
+    builder, floor_shape = _two_heap_arm_worlds(
+        lambda first: first.add_shape_box(
+            first.add_link(is_kinematic=True), hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02))
+        )
     )
-    rows_by_world = {}
-    for deterministic in (False, True):
-        solver = SolverFeatherPGS(
-            model, deterministic=deterministic, warn_constraint_overflow=False, **PROPAGATION_SOLVER_OPTIONS
-        )
-        pipeline = newton.CollisionPipeline(
-            model,
-            deterministic=True,
-            broad_phase="explicit",
-            shape_pairs_filtered=wp.array(pairs, dtype=wp.vec2i, device=device),
-        )
-        contacts = pipeline.contacts()
-        state_0, state_1 = model.state(), model.state()
-        capture = StdOutCapture()
-        capture.begin()
-        try:
-            for _ in range(2):
-                pipeline.collide(state_0, contacts)
-                solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
-            wp.synchronize_device(device)
-        finally:
-            output = capture.end()
-        messages = output.count("FeatherPGS deterministic propagation dropped contacts")
-        test.assertEqual(messages, int(deterministic), output)
-        if deterministic:
-            with test.assertRaisesRegex(RuntimeError, "between a body and another world"):
-                solver.check_constraint_capacity()
-        else:
+    model = builder.finalize(device=device)
+    pairs = [[floor_shape, shape] for shape in range(model.shape_count) if shape != floor_shape]
+    shared["explicit pairs with a world body"] = (model, pairs)
+    for name, entry in shared.items():
+        model, pairs = entry if isinstance(entry, tuple) else (entry, None)
+        with test.subTest(name):
+            solver = SolverFeatherPGS(model, deterministic=True, contact_warmstart=True, **PROPAGATION_SOLVER_OPTIONS)
+            contacts, _ = _step_explicit(model, solver, pairs)
+            kinematic = np.flatnonzero((model.body_flags.numpy() & int(newton.BodyFlags.KINEMATIC)) != 0)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            shape_body = model.shape_body.numpy()
+            on_floor = np.isin(shape_body[contacts.rigid_contact_shape0.numpy()[:count]], kinematic) | np.isin(
+                shape_body[contacts.rigid_contact_shape1.numpy()[:count]], kinematic
+            )
+            routed = solver._contact_path.numpy()[:count] == 2
+            test.assertEqual(sorted(set(solver._contact_world.numpy()[:count][on_floor & routed].tolist())), [0, 1])
+            owners = _row_worlds_by_body(solver)
+            test.assertFalse(set(kinematic.tolist()) & set(owners))
+            test.assertEqual(max(len(worlds) for worlds in owners.values()), 1)
+            test.assertFalse(solver.constraint_overflow.numpy().any())
             solver.check_constraint_capacity()
-        counts = solver._propagation_constraint_count.numpy()
-        sides = [solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()]
-        rows_by_world[deterministic] = [
-            int(sum(np.count_nonzero(side[world, :count] == floor) for side in sides))
-            for world, count in enumerate(counts)
-        ]
-        overflow = solver.constraint_overflow.numpy()
-    # Without the flag the pairs reach both worlds' rows; with it only the floor's own world keeps them.
-    test.assertGreater(min(rows_by_world[False]), 0)
-    test.assertGreater(rows_by_world[True][0], 0)
-    test.assertEqual(rows_by_world[True][1], 0)
-    test.assertTrue(overflow[1])
+    order = (2, 0, 1)
+    in_order = _build_heap_arm_scene(device, (0, 1, 2), global_floor=True)
+    permuted = _build_heap_arm_scene(device, order, global_floor=True)
+    for cached in (True, False):
+        with test.subTest(cached=cached):
+            reference, reference_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
+            repeated, repeated_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
+            np.testing.assert_array_equal(repeated, reference)
+            test.assertEqual(repeated_sample, reference_sample)
+            moved, _ = _run_heap_arm(permuted, 40, cached=cached, warmstart=True)
+            for slot, seed in enumerate(order):
+                np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
+
+
+def test_deterministic_propagation_drops_cross_world_responding_contacts(test, device):
+    """Drop contacts joining responding bodies of different worlds, flag both worlds, and keep rows per world."""
+    cases = {}
+    # A global shape on world 0's first heap body overlaps world 1's heap.
+    builder, _ = _two_heap_arm_worlds()
+    builder.add_shape_box(3, hx=0.15, hy=0.15, hz=0.03)
+    builder.add_ground_plane()
+    cases["global shape on a dynamic body"] = (builder.finalize(device=device), None)
+    builder, _ = _two_heap_arm_worlds()
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    shape_world = model.shape_world.numpy()
+    world_0, world_1 = np.flatnonzero(shape_world == 0), np.flatnonzero(shape_world == 1)
+    # The worlds share one layout, so same-index shapes overlap exactly.
+    cases["explicit pairs between dynamic bodies"] = (model, np.stack([world_0, world_1], axis=1))
+    # On the propagation responses a kinematic free body keeps its response DOFs.
+    builder = newton.ModelBuilder()
+    for seed in (0, 1):
+        world = _build_heap_arm_world(seed)
+        floor = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)), is_kinematic=True)
+        world.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02)
+        builder.add_world(world)
+    model = builder.finalize(device=device)
+    floor_shape = int(np.flatnonzero(model.shape_world.numpy() == 0)[-1])
+    world_1 = np.flatnonzero(model.shape_world.numpy() == 1)[:-1]
+    cases["explicit pairs with a kinematic free body"] = (model, [[floor_shape, shape] for shape in world_1])
+    for name, (model, pairs) in cases.items():
+        with test.subTest(name):
+            solver = SolverFeatherPGS(
+                model,
+                deterministic=True,
+                contact_warmstart=True,
+                warn_constraint_overflow=False,
+                **PROPAGATION_SOLVER_OPTIONS,
+            )
+            contacts, state = _step_explicit(model, solver, pairs)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            body_world = model.body_world.numpy()
+            shape_body = model.shape_body.numpy()
+            body_0 = shape_body[contacts.rigid_contact_shape0.numpy()[:count]]
+            body_1 = shape_body[contacts.rigid_contact_shape1.numpy()[:count]]
+            crossing = (body_0 >= 0) & (body_1 >= 0) & (body_world[body_0] != body_world[body_1])
+            test.assertGreater(int(crossing.sum()), 0)
+            test.assertTrue(np.all(solver._contact_slot.numpy()[:count][crossing] == -1))
+            owners = _row_worlds_by_body(solver)
+            test.assertTrue(all(worlds == {int(body_world[body])} for body, worlds in owners.items()))
+            test.assertTrue(solver.constraint_overflow.numpy().all())
+            with test.assertRaisesRegex(RuntimeError, "between a global articulation and another world"):
+                solver.check_constraint_capacity()
+            test.assertTrue(np.isfinite(state.body_q.numpy()).all())
 
 
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
@@ -1014,14 +1078,14 @@ for _device in get_test_devices():
         )
         add_function_test(
             TestFeatherPGSDeterminism,
-            "test_deterministic_propagation_rejects_bodies_shared_by_worlds",
-            test_deterministic_propagation_rejects_bodies_shared_by_worlds,
+            "test_deterministic_propagation_accepts_bodies_shared_by_worlds",
+            test_deterministic_propagation_accepts_bodies_shared_by_worlds,
             devices=[_device],
         )
         add_function_test(
             TestFeatherPGSDeterminism,
-            "test_deterministic_propagation_drops_explicit_cross_world_pairs",
-            test_deterministic_propagation_drops_explicit_cross_world_pairs,
+            "test_deterministic_propagation_drops_cross_world_responding_contacts",
+            test_deterministic_propagation_drops_cross_world_responding_contacts,
             devices=[_device],
             check_output=False,
         )
