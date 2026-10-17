@@ -1792,8 +1792,8 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
     # A massless, stiffness-free mode has no inertia scale for compliant ALM's contact rows; this
-    # one-shot penalty check needs the legacy path. Compliant ALM warns on such bodies instead.
-    with test.assertWarnsRegex(UserWarning, "zero-mass mode"):
+    # one-shot penalty check needs the legacy path. Compliant ALM rejects such bodies.
+    with test.assertRaisesRegex(ValueError, "zero-mass mode"):
         newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=128)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -1827,6 +1827,7 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
 
 def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
     model, _body = _build_elastic_ground_contact_model(device, z=0.2)
+    model.elastic_mode_mass.fill_(1.0)
     solver = newton.solvers.SolverVBD(model, elastic_body_relaxation=0.37)
 
     contact_max, _contact_count, relaxation = solver._elastic_solve_inputs(None)
@@ -1837,6 +1838,15 @@ def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
     for invalid in (-0.1, 1.1, np.nan, np.inf):
         with test.assertRaisesRegex(ValueError, "elastic_body_relaxation"):
             newton.solvers.SolverVBD(model, elastic_body_relaxation=invalid)
+
+
+def test_vbd_compliant_alm_rejects_colliding_zero_mass_mode(test, device):
+    """Compliant ALM rejects a colliding zero-mass mode and accepts the same body with modal mass."""
+    model, _body = _build_elastic_ground_contact_model(device, z=0.05)
+    with test.assertRaisesRegex(ValueError, "zero-mass mode"):
+        newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=128)
+    model.elastic_mode_mass.fill_(1.0)
+    newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=128)
 
 
 def test_vbd_elastic_compliant_contact_solves_modal_penetration(test, device):
@@ -4372,6 +4382,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_body_relaxation_is_general_and_validated",
         test_vbd_elastic_body_relaxation_is_general_and_validated,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_compliant_alm_rejects_colliding_zero_mass_mode",
+        test_vbd_compliant_alm_rejects_colliding_zero_mass_mode,
         devices=[device],
     )
     add_function_test(

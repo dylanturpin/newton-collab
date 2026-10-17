@@ -1085,7 +1085,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if not np.all(free_frame):
                 raise NotImplementedError("SolverVBD supports only world-parented FREE-frame elastic joints.")
             if rigid_compliant_alm:
-                _warn_massless_colliding_modes(model)
+                _reject_massless_colliding_modes(model)
         self.elastic_body_block_width = int(model.elastic_max_mode_count) + 6
         if elastic_body_count > 0:
             self._validate_elastic_body_block_width(self.elastic_body_block_width)
@@ -5903,14 +5903,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.trimesh_collision_detector.rebuild(state.particle_q)
 
 
-def _warn_massless_colliding_modes(model) -> None:
-    """Warn when a colliding elastic body has a zero-mass mode, whose contact rows compliant ALM retires."""
+def _reject_massless_colliding_modes(model) -> None:
+    """Reject a colliding elastic body with a zero-mass mode, along which compliant ALM contact rows apply no force."""
     mode_mass = model.elastic_mode_mass.numpy()
     starts, counts = model.elastic_mode_start.numpy(), model.elastic_mode_count.numpy()
     colliding = model.shape_body.numpy()[(model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0]
     for e, body in enumerate(model.elastic_body.numpy()):
         if body in colliding and np.any(mode_mass[starts[e] : starts[e] + counts[e]] == 0.0):
-            warnings.warn(
-                f"Elastic body {body} has a zero-mass mode; compliant ALM contact rows apply no force along it.",
-                stacklevel=3,
-            )
+            raise ValueError(f"Colliding elastic body {body} has a zero-mass mode; compliant ALM needs modal mass.")
