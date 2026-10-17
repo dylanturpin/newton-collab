@@ -173,6 +173,20 @@ def cantilever_tip_mode(points: np.ndarray, length: float) -> np.ndarray:
     return out
 
 
+def sample_frame_inertia(points: np.ndarray, masses: np.ndarray) -> wp.mat33:
+    """Return the inertia of point samples about their center of mass.
+
+    A frame with the sample mass and this inertia keeps the reduced frame/modal mass positive definite.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    masses = np.asarray(masses, dtype=np.float64)
+    offsets = points - np.sum(masses[:, None] * points, axis=0) / np.sum(masses)
+    inertia = np.zeros((3, 3))
+    for mass, offset in zip(masses, offsets, strict=True):
+        inertia += mass * (np.dot(offset, offset) * np.eye(3) - np.outer(offset, offset))
+    return wp.mat33(*inertia.astype(np.float32).flatten())
+
+
 def quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotate a vector by a quaternion in xyzw order."""
     qv = np.asarray(q[:3], dtype=float)

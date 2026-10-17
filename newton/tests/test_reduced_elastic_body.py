@@ -2488,8 +2488,9 @@ def test_elastic_centrifugal_modal_force(test, device):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
+    # The frame carries the sample mass, so the reduced frame/modal mass is positive definite.
     beam = builder.add_body_elastic(
-        xform=wp.transform_identity(), mass=0.2, inertia=_identity_inertia(), modal_basis=basis
+        xform=wp.transform_identity(), mass=1.0, inertia=_identity_inertia(), modal_basis=basis
     )
     builder.add_joint_fixed(
         parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
