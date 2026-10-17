@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
+import sys
+import tempfile
+import types
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -30,6 +34,7 @@ from newton.tests.feather_pgs._fixtures import (
     _contact_rows,
     set_torsion_radius,
 )
+from newton.tests.unittest_utils import LIBC
 
 DT = 1.0 / 240.0
 
@@ -177,6 +182,22 @@ def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
         scene.add_world(world)
     scene.add_ground_plane()
     return scene.finalize(device=device)
+
+
+def _build_shared_floor_model(device) -> tuple[newton.Model, int]:
+    """N_WORLDS fixed-base chains pressed into one jointless kinematic floor outside every world."""
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        world = newton.ModelBuilder()
+        world.default_shape_cfg.density = 1000.0
+        world.default_shape_cfg.mu = 0.7
+        _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
+        scene.add_world(world)
+    floor = scene.add_link(is_kinematic=True)
+    scene.add_shape_box(
+        floor, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity())
+    )
+    return scene.finalize(device=device), floor
 
 
 def _make_solver(
@@ -862,6 +883,37 @@ def _rollout(model, solver, joint_qd, steps):
 
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
+class TestPropagationSharedBody(unittest.TestCase):
+    def test_shared_body_without_response_is_static_to_the_rows(self):
+        """Rows of every world touch a shared jointless floor as static geometry and leave its scratch untouched."""
+        model, floor = _build_shared_floor_model(wp.get_cuda_device())
+        floor_shapes = np.flatnonzero(model.shape_body.numpy() == floor)
+        for response in ("propagation", "propagation_fused", "propagation_colored"):
+            with self.subTest(response=response):
+                solver = _make_solver(model, response, cached=False)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state_in, state_out = model.state(), model.state()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, model.control(), contacts, DT)
+
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                on_floor = np.isin(contacts.rigid_contact_shape0.numpy()[:count], floor_shapes) | np.isin(
+                    contacts.rigid_contact_shape1.numpy()[:count], floor_shapes
+                )
+                propagation = solver._contact_path.numpy()[:count] == 2
+                floor_worlds = solver._contact_world.numpy()[:count][on_floor & propagation]
+                self.assertEqual(sorted(set(floor_worlds.tolist())), list(range(N_WORLDS)))
+                rows = solver._propagation_constraint_count.numpy()
+                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+                    for world, n in enumerate(rows):
+                        self.assertNotIn(floor, side[world, :n])
+                np.testing.assert_array_equal(solver._propagation_body_impulses.numpy()[floor], np.zeros(6))
+                np.testing.assert_array_equal(solver._propagation_body_qd.numpy()[floor], np.zeros(6))
+                self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
+
+
 class TestPropagationCoupledContacts(unittest.TestCase):
     def test_shared_dof_feet_reach_rest(self):
         """Three feet on one prismatic DOF stop at the plane for every sweep count."""
@@ -1928,6 +1980,429 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         self.assertEqual(int(solver._propagation_max_constraints), 32768 + 2048)
 
 
+def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False):
+    """A fixed-base six-link arm drooping onto a box heap; spheres on links 0, 3 and 5 touch the boxes."""
+    world.default_shape_cfg.density = 1000.0
+    world.default_shape_cfg.mu = 0.7
+    no_collision = world.default_shape_cfg.copy()
+    no_collision.has_shape_collision = False
+    no_collision.collision_group = 0
+    limits = {"limit_lower": -0.15, "limit_upper": 0.15} if tight_limits else {}
+    prev, joints = -1, []
+    for i in range(6):
+        link = world.add_link()
+        world.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=no_collision)
+        if i in (0, 3, 5):
+            world.add_shape_sphere(link, radius=0.08)
+        parent_xform = wp.transform(
+            wp.vec3(0.0, 0.0, 0.32) if prev == -1 else wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()
+        )
+        joints.append(
+            world.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=parent_xform,
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+                **limits,
+            )
+        )
+        prev = link
+    world.add_articulation(joints)
+    nx, ny, nz = heap
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                body = world.add_body(
+                    xform=wp.transform(
+                        wp.vec3(0.15 + 0.216 * ix, 0.083 * (iy - (ny - 1) / 2), 0.041 + 0.082 * iz),
+                        wp.quat_rpy(0.0, 0.0, 0.05 * (ix + iy + iz)),
+                    )
+                )
+                world.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
+
+
+def _build_arm_heap_model(device: str, worlds: int = N_WORLDS, **world_kwargs) -> newton.Model:
+    scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    scene.rigid_gap = 0.005
+    for _ in range(worlds):
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        world.rigid_gap = 0.005
+        _add_arm_on_heap(world, **world_kwargs)
+        scene.add_world(world)
+    scene.add_ground_plane()
+    model = scene.finalize(device=device)
+    model.rigid_contact_max = 4096 * worlds
+    return model
+
+
+_STATE_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
+
+
+def _colored_deterministic_solver(model, **kwargs):
+    args = {
+        "solve_mode": "matrix_free",
+        "articulated_contact_response": "propagation_colored",
+        "deterministic": True,
+        "iterations": 16,
+        "contact_regularization": 0.01,
+        "free_body_constraint_max": 1024,
+        "articulation_constraint_max": 128,
+        "enable_joint_limits": True,
+        "row_watermark": True,
+    }
+    args.update(kwargs)
+    return SolverFeatherPGS(model, **args)
+
+
+class _Stepper:
+    """One solver, one deterministic pipeline and a state pair advanced in place, so steps can be captured."""
+
+    def __init__(self, model, **solver_kwargs):
+        self.model = model
+        self.solver = _colored_deterministic_solver(model, **solver_kwargs)
+        self.pipeline = newton.CollisionPipeline(model, rigid_contact_max=model.rigid_contact_max, deterministic=True)
+        self.contacts = self.pipeline.contacts()
+        self.state_in, self.state_out = model.state(), model.state()
+        self.control = model.control()
+
+    def step(self):
+        self.state_in.clear_forces()
+        self.pipeline.collide(self.state_in, self.contacts)
+        self.solver.step(self.state_in, self.state_out, self.control, self.contacts, DT)
+        for name in _STATE_FIELDS:
+            wp.copy(getattr(self.state_in, name), getattr(self.state_out, name))
+
+    def snapshot(self):
+        return {name: getattr(self.state_in, name).numpy().copy() for name in _STATE_FIELDS}
+
+
+def _world_slices(model, worlds):
+    """Per-field index slices of each world's rows, for replicated worlds."""
+    counts = {"body_q": model.body_count, "body_qd": model.body_count}
+    counts.update(joint_q=model.joint_coord_count, joint_qd=model.joint_dof_count)
+    return {name: [slice(w * n // worlds, (w + 1) * n // worlds) for w in range(worlds)] for name, n in counts.items()}
+
+
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+class TestFeatherPGSColoredDeterministic(unittest.TestCase):
+    """``deterministic=True`` on the colored response: repeatable within the mode; bitwise agreement with immediate is not guaranteed."""
+
+    STEPS = 80
+
+    def _rollout(self, model, steps, capture_at=None, **solver_kwargs):
+        stepper = _Stepper(model, **solver_kwargs)
+        graph = None
+        history = []
+        for k in range(steps):
+            if k == capture_at:
+                with wp.ScopedCapture() as capture:
+                    stepper.step()
+                graph = capture.graph
+            elif graph is not None:
+                wp.capture_launch(graph)
+            else:
+                stepper.step()
+            history.append(stepper.snapshot())
+        return history, stepper
+
+    def _assert_bitwise(self, model, steps=STEPS, capture_at=None, **solver_kwargs):
+        first, stepper = self._rollout(model, steps, capture_at=capture_at, **solver_kwargs)
+        second, _ = self._rollout(model, steps, capture_at=capture_at, **solver_kwargs)
+        slices = _world_slices(model, N_WORLDS)
+        for k, (a, b) in enumerate(zip(first, second, strict=True)):
+            for name in _STATE_FIELDS:
+                np.testing.assert_array_equal(a[name], b[name], err_msg=f"run-to-run {name} at step {k}")
+                for world in range(1, N_WORLDS):
+                    np.testing.assert_array_equal(
+                        a[name][slices[name][world]], a[name][slices[name][0]], err_msg=f"world {world} {name} step {k}"
+                    )
+        return stepper
+
+    def test_gate_admits_colored_without_warm_start(self):
+        """Accept deterministic colored; reject fused, and colored with contact warm start."""
+        model = _build_arm_heap_model("cuda:0", worlds=1)
+        _colored_deterministic_solver(model)
+        with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
+            _colored_deterministic_solver(model, articulated_contact_response="propagation_fused")
+        with self.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
+            _colored_deterministic_solver(model, contact_warmstart=True)
+
+    def test_arm_on_heap_is_bitwise_repeatable(self):
+        """Repeat an arm pressing into a heap bitwise across runs and identical worlds."""
+        stepper = self._assert_bitwise(_build_arm_heap_model("cuda:0"))
+        self.assertGreaterEqual(int(stepper.solver._propagation_body_count.numpy().max()), 2)
+
+    def test_arm_on_heap_is_bitwise_repeatable_uncached(self):
+        """Repeat the arm-on-heap rollout bitwise with the cached response off."""
+        self._assert_bitwise(_build_arm_heap_model("cuda:0"), propagation_cached_response=False)
+
+    def test_overflow_with_limit_rows_is_bitwise_repeatable(self):
+        """Repeat bitwise while dense joint-limit, velocity-limit and propagation rows overflow their capacity."""
+        model = _build_arm_heap_model("cuda:0", tight_limits=True)
+        with _capture_device_stdout() as printed:
+            stepper = self._assert_bitwise(
+                model,
+                enable_joint_velocity_limits=True,
+                velocity_limit_activation_fraction=0.0,
+                free_body_constraint_max=160,
+                articulation_constraint_max=24,
+            )
+        # Each of the two rollouts warns once per overflowing row family.
+        self.assertEqual(printed.text.count("dense constraint-row overflow"), 2, printed.text)
+        self.assertEqual(printed.text.count("propagation constraint-row overflow"), 2, printed.text)
+        marks = stepper.solver.constraint_row_watermarks()
+        self.assertGreater(marks["propagation_overflow_world_steps"], 0, "scene must overflow its propagation rows")
+
+    def test_mixed_rows_are_bitwise_repeatable(self):
+        """Repeat bitwise with joint-limit and velocity-limit rows active alongside colored contact rows."""
+        stepper = self._assert_bitwise(
+            _build_arm_heap_model("cuda:0", tight_limits=True),
+            enable_joint_velocity_limits=True,
+            velocity_limit_activation_fraction=0.0,
+        )
+        marks = stepper.solver.constraint_row_watermarks()
+        self.assertGreater(marks["articulation_high_water"], 0, "scene must keep dense limit rows")
+        self.assertEqual(marks["propagation_overflow_world_steps"], 0)
+
+    def test_captured_rollout_is_bitwise_repeatable(self):
+        """Repeat bitwise when most steps replay a captured graph."""
+        self._assert_bitwise(_build_arm_heap_model("cuda:0"), capture_at=2)
+
+    def test_cold_capture_replays_like_eager_steps(self):
+        """Capture the first step of a fresh solver, then match an eager twin over repeated replays."""
+        model = _build_arm_heap_model("cuda:0")
+        for env in ({}, {"FEATHER_PGS_COLORED_PREFETCH": "0"}, {"FEATHER_PGS_COLORED_STAGED": "1"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                graph_stepper = _Stepper(model)
+                eager = _Stepper(model)
+                # Capture records the first step without running it; each replay then pairs with one eager step.
+                with wp.ScopedCapture() as capture:
+                    graph_stepper.step()
+                for k in range(60):
+                    wp.capture_launch(capture.graph)
+                    eager.step()
+                    a, b = graph_stepper.snapshot(), eager.snapshot()
+                    for name in _STATE_FIELDS:
+                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
+
+    def test_moving_hub_cold_capture_replays_like_eager_steps(self):
+        """Cold-capture a moving kinematic hub with both passes folding, then match an eager twin on each route."""
+        for env in ({}, {"FEATHER_PGS_COLORED_LANES": "3"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                model, tray = _heap(nx=3, ny=3, nz=1, kinematic_tray=True)
+                model.rigid_contact_max = 2048
+                tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
+                tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
+                captured, eager = (
+                    _Stepper(
+                        model,
+                        iterations=4,
+                        velocity_iterations=2,
+                        free_body_constraint_max=512,
+                        articulation_constraint_max=64,
+                    )
+                    for _ in range(2)
+                )
+                for stepper in (captured, eager):
+                    qd = stepper.state_in.joint_qd.numpy()
+                    qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
+                    stepper.state_in.joint_qd.assign(qd)
+                    newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
+                with wp.ScopedCapture() as capture:
+                    captured.step()
+                # An eager step after recording must fold afresh rather than reuse the unexecuted capture's fold.
+                captured.step()
+                eager.step()
+                for k in range(12):
+                    wp.capture_launch(capture.graph)
+                    eager.step()
+                    a, b = captured.snapshot(), eager.snapshot()
+                    for name in _STATE_FIELDS:
+                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
+                count = int(captured.solver._propagation_constraint_count.numpy()[0])
+                self.assertGreater(count, 0)
+                swept = np.concatenate(
+                    [captured.solver._color_body_a.numpy()[0, :count], captured.solver._color_body_b.numpy()[0, :count]]
+                )
+                self.assertNotIn(tray, swept)
+
+    def test_fold_buffers_exist_only_with_prescribed_bodies(self):
+        """Allocate the folded sweep rows only for a model with a kinematic free body."""
+        self.assertIsNone(_Stepper(_build_arm_heap_model("cuda:0")).solver._color_body_a)
+        model, _ = _heap(nx=2, ny=2, nz=1, kinematic_tray=True)
+        model.rigid_contact_max = 1024
+        solver = _Stepper(model, free_body_constraint_max=256, articulation_constraint_max=64).solver
+        self.assertEqual(solver._color_body_a.shape, (solver._world_count, solver._propagation_max_constraints))
+
+    def test_partial_reset_keeps_synced_and_untouched_worlds_in_lockstep(self):
+        """Copy world 0 into world 1, reset only those two, and keep every field bitwise in lockstep."""
+        model = _build_arm_heap_model("cuda:0")
+        slices = _world_slices(model, N_WORLDS)
+        synced, reference = _Stepper(model), _Stepper(model)
+        for stepper in (synced, reference):
+            q = stepper.state_in.joint_q.numpy()
+            q[slices["joint_q"][1]] += 0.05
+            stepper.state_in.joint_q.assign(q)
+            newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
+        for _ in range(30):
+            synced.step()
+            reference.step()
+        for name in _STATE_FIELDS:
+            for state in (synced.state_in, synced.state_out):
+                values = getattr(state, name).numpy()
+                values[slices[name][1]] = values[slices[name][0]]
+                getattr(state, name).assign(values)
+        mask = np.zeros(N_WORLDS, dtype=bool)
+        mask[:2] = True
+        synced.solver.reset(synced.state_in, world_mask=wp.array(mask, dtype=wp.bool, device=model.device))
+        synced.pipeline.reset_contact_matching(wp.array(np.append(mask, False), dtype=wp.bool, device=model.device))
+        for k in range(60):
+            synced.step()
+            reference.step()
+            a, b = synced.snapshot(), reference.snapshot()
+            for name in _STATE_FIELDS:
+                np.testing.assert_array_equal(a[name][slices[name][1]], a[name][slices[name][0]], err_msg=f"{name} {k}")
+                for world in (2, 3):
+                    np.testing.assert_array_equal(
+                        a[name][slices[name][world]], b[name][slices[name][world]], err_msg=f"world {world} {name} {k}"
+                    )
+
+    def test_unit_gather_order_does_not_change_the_rollout(self):
+        """Gather each world's units serially in reverse contact order and keep the rollout bitwise."""
+        model = _build_arm_heap_model("cuda:0")
+        reference, _ = self._rollout(model, 40)
+        module = inspect.getmodule(SolverFeatherPGS)
+        launch = wp.launch
+
+        def adverse_launch(kernel, dim, *args, **kwargs):
+            if kernel is module.collect_propagation_units:
+                kernel, dim = _collect_propagation_units_reversed, model.world_count
+            return launch(kernel, dim, *args, **kwargs)
+
+        with patch.object(module.wp, "launch", adverse_launch):
+            adverse, _ = self._rollout(model, 40)
+        for k, (a, b) in enumerate(zip(reference, adverse, strict=True)):
+            for name in _STATE_FIELDS:
+                np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} step {k}")
+
+    def test_moving_kinematic_hub_is_never_written(self):
+        """Keep the sweep off a moving kinematic tray shared by many units of one color; it still drives the heap, repeatably."""
+        model, tray = _heap(nx=5, ny=5, nz=2, kinematic_tray=True)
+        model.rigid_contact_max = 8192
+        tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
+        tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
+        for velocity_iterations in (0, 2):
+            with self.subTest(velocity_iterations=velocity_iterations):
+                self._check_kinematic_hub(model, tray, tray_dof, velocity_iterations)
+
+    def _check_kinematic_hub(self, model, tray, tray_dof, velocity_iterations):
+        def rollout(response):
+            solver = SolverFeatherPGS(
+                model,
+                solve_mode="matrix_free",
+                articulated_contact_response=response,
+                deterministic=True,
+                velocity_iterations=velocity_iterations,
+                iterations=16,
+                free_body_constraint_max=8192,
+                articulation_constraint_max=64,
+            )
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192, deterministic=True)
+            contacts = pipeline.contacts()
+            state_in, state_out = model.state(), model.state()
+            qd = state_in.joint_qd.numpy()
+            qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
+            state_in.joint_qd.assign(qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            control = model.control()
+            for _ in range(40):
+                state_in.clear_forces()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+                state_in, state_out = state_out, state_in
+            return solver, contacts, state_in.body_qd.numpy().copy(), state_in.body_q.numpy().copy()
+
+        solver, contacts, body_qd, body_q = rollout("propagation_colored")
+        _, _, repeat_qd, repeat_q = rollout("propagation_colored")
+        np.testing.assert_array_equal(body_qd, repeat_qd)
+        np.testing.assert_array_equal(body_q, repeat_q)
+        immediate_qd = rollout("immediate")[2]
+        shape_body = model.shape_body.numpy()
+        shape0 = contacts.rigid_contact_shape0.numpy()
+        shape1 = contacts.rigid_contact_shape1.numpy()
+
+        def touches_tray(contact):
+            return any(s >= 0 and shape_body[s] == tray for s in (shape0[contact], shape1[contact]))
+
+        entries = PROPAGATION_COLOR_TAIL + 2
+        offsets = solver._color_world_offsets.numpy()[:entries]
+        sorted_contacts = solver._color_unit_sorted.numpy()
+        per_color = [
+            sum(touches_tray(c) for c in sorted_contacts[offsets[i] : offsets[i + 1]]) for i in range(entries - 1)
+        ]
+        self.assertGreaterEqual(max(per_color), 8, "the tray must be shared by many units of one color")
+        m = int(solver._propagation_constraint_count.numpy()[0])
+        rows = np.concatenate([solver._propagation_body_a.numpy()[0, :m], solver._propagation_body_b.numpy()[0, :m]])
+        swept = np.concatenate([solver._color_body_a.numpy()[0, :m], solver._color_body_b.numpy()[0, :m]])
+        self.assertIn(tray, rows)
+        self.assertNotIn(tray, swept, "the colored sweep still addresses the kinematic tray")
+        # The tray's prescribed motion still reaches the boxes resting on it.
+        bottom = [b for b in range(model.body_count) if b != tray and body_q[b, 2] < 0.065]
+        self.assertGreater(len(bottom), 10)
+        colored_vx = float(np.mean(body_qd[bottom, 0]))
+        immediate_vx = float(np.mean(immediate_qd[bottom, 0]))
+        self.assertGreater(colored_vx, 0.05)
+        # Without a velocity pass this fixture is sensitive to tiny start perturbations; gate parity where it is not.
+        if velocity_iterations > 0:
+            # Empirical bound from perturbed calibration runs on two GPU architectures, not a derived guarantee.
+            self.assertLess(abs(colored_vx - immediate_vx), 0.02)
+
+
+@wp.kernel
+def _collect_propagation_units_reversed(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_world: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    propagation_max_constraints: int,
+    world_unit_cursor: wp.array[int],
+    unit_contact: wp.array[int],
+    unit_body_a: wp.array[int],
+    unit_body_b: wp.array[int],
+    unit_len: wp.array[int],
+):
+    """Gather like ``collect_propagation_units``, one thread per world walking contacts backwards."""
+    world = wp.tid()
+    for r in range(contact_count[0]):
+        c = contact_count[0] - 1 - r
+        if contact_path[c] != 2 or contact_world[c] != world:
+            continue
+        idx = world_unit_cursor[world]
+        world_unit_cursor[world] = idx + 1
+        if idx >= propagation_max_constraints:
+            continue
+        base = world * propagation_max_constraints
+        body_a = int(-1)
+        body_b = int(-1)
+        if contact_shape0[c] >= 0:
+            body_a = shape_body[contact_shape0[c]]
+            if body_a >= 0 and body_prescribed[body_a] != 0:
+                body_a = -1
+        if contact_shape1[c] >= 0:
+            body_b = shape_body[contact_shape1[c]]
+            if body_b >= 0 and body_prescribed[body_b] != 0:
+                body_b = -1
+        unit_contact[base + idx] = c
+        unit_body_a[base + idx] = body_a
+        unit_body_b[base + idx] = body_b
+        unit_len[base + idx] = contact_slots_needed[c]
+
+
 RADIUS = 0.05
 
 
@@ -2987,6 +3462,32 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                 np.testing.assert_allclose(
                     getattr(state, name).numpy(), getattr(reference, name).numpy(), rtol=3e-6, atol=3e-6, err_msg=name
                 )
+
+
+@contextlib.contextmanager
+def _capture_device_stdout():
+    """Capture what reaches file descriptor 1, where device printf writes, also inside an enclosing capture."""
+    wp.synchronize()
+    sys.stdout.flush()
+    if LIBC is not None:
+        LIBC.fflush(None)
+    captured = types.SimpleNamespace(text="")
+    saved_fd = os.dup(1)
+    with tempfile.TemporaryFile() as sink:
+        os.dup2(sink.fileno(), 1)
+        try:
+            yield captured
+        finally:
+            try:
+                wp.synchronize()
+                sys.stdout.flush()
+                if LIBC is not None:
+                    LIBC.fflush(None)
+            finally:
+                os.dup2(saved_fd, 1)
+                os.close(saved_fd)
+            sink.seek(0)
+            captured.text = sink.read().decode("utf-8", errors="replace")
 
 
 if __name__ == "__main__":

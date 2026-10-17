@@ -45,6 +45,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     build_mf_angular_friction_rows,
+    build_propagation_angular_friction_rows,
     gate_free_rigid_angular_coefficients,
     populate_world_angular_friction_rows,
 )
@@ -177,18 +178,18 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         not model.device.is_cuda
         or model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response != "immediate"
+        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._contact_compliance
-        or solver._route_free_free_contacts
         or solver._sparse_mass_matrix_size is not None
         or (solver._has_free_rigid_bodies and solver._pgs_solve_mf_gs_kernel is None)
     ):
         raise ValueError(
-            "Free-rigid angular friction (feather_pgs:condim above 3) requires CUDA non-differentiable matrix_free/immediate/interleaved "
-            "solving with friction_mode='fixed_normal', the fused matrix-free GS kernel, and no contact compliance "
-            "or free-free propagation routing"
+            "Free-rigid angular friction (feather_pgs:condim above 3) requires CUDA non-differentiable matrix_free "
+            "solving with articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
+            "row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
+            "and no contact compliance"
         )
 
 
@@ -228,6 +229,40 @@ def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads
             solver._mf_phi,
             solver._mf_target_velocity,
             solver._mf_row_restitution,
+        ],
+        device=solver.model.device,
+    )
+
+
+def launch_propagation_free_rigid_angular_friction_rows(solver, contacts, threads: int) -> None:
+    """Write the rolling and spin rows that follow each free-rigid propagation contact's sliding pair."""
+    wp.launch(
+        build_propagation_angular_friction_rows,
+        dim=threads,
+        inputs=[
+            contacts.rigid_contact_count,
+            threads,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver._contact_world,
+            solver._contact_slot,
+            solver._contact_path,
+            solver._contact_slots_needed,
+            solver._contact_mf_origin,
+            solver._free_rigid_mu_torsional,
+            solver._free_rigid_mu_rolling,
+        ],
+        outputs=[
+            solver._propagation_body_a,
+            solver._propagation_body_b,
+            solver._propagation_J_a,
+            solver._propagation_J_b,
+            solver._propagation_row_type,
+            solver._propagation_row_parent,
+            solver._propagation_row_mu,
+            solver._propagation_phi,
+            solver._propagation_row_restitution,
         ],
         device=solver.model.device,
     )

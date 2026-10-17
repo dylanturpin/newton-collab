@@ -487,11 +487,20 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                 np.testing.assert_array_equal(paths[0], paths[1], err_msg="same contacts dropped differently")
 
 
-def test_deterministic_requires_immediate_or_plain_propagation(test, device):
+def test_deterministic_rejects_fused_and_warm_started_colored(test, device):
     model = _build_contact_scene(device, worlds=1, boxes=1, ants=1)
-    for response in ("propagation_fused", "propagation_colored"):
-        with test.subTest(response), test.assertRaisesRegex(ValueError, "deterministic=True requires"):
-            SolverFeatherPGS(model, deterministic=True, solve_mode="matrix_free", articulated_contact_response=response)
+    with test.assertRaisesRegex(ValueError, "deterministic=True requires"):
+        SolverFeatherPGS(
+            model, deterministic=True, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
+        )
+    with test.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
+        SolverFeatherPGS(
+            model,
+            deterministic=True,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            contact_warmstart=True,
+        )
 
 
 # A fixed-base three-link arm pressed into a 5x5x2 heap of boxes and spheres: every link and every heap body has
@@ -953,8 +962,8 @@ for _device in get_test_devices():
     )
     add_function_test(
         TestFeatherPGSDeterminism,
-        "test_deterministic_requires_immediate_or_plain_propagation",
-        test_deterministic_requires_immediate_or_plain_propagation,
+        "test_deterministic_rejects_fused_and_warm_started_colored",
+        test_deterministic_rejects_fused_and_warm_started_colored,
         devices=[_device],
     )
 
