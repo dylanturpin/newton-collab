@@ -5,7 +5,7 @@ import functools
 
 import warp as wp
 
-from .articulation import eval_joint_child_state, eval_joint_motion
+from .articulation import elastic_frame_layout, eval_joint_child_state, eval_joint_motion
 
 TILE_BLOCK_DIM = 32
 # The kernel stages one wp.transform (28 B) per joint of a level in two
@@ -91,10 +91,11 @@ def create_eval_articulation_fk_tile(level_capacity: int, write_all: bool):
                     X_cj = joint_X_c[joint]
                     q_start = joint_q_start[joint]
                     qd_start = joint_qd_start[joint]
-                    lin_axis_count = joint_dof_dim[joint, 0]
-                    ang_axis_count = joint_dof_dim[joint, 1]
+                    frame_type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+                        type, joint_axis, qd_start, joint_dof_dim[joint, 0], joint_dof_dim[joint, 1]
+                    )
                     X_j, v_j = eval_joint_motion(
-                        type,
+                        frame_type,
                         q_start,
                         qd_start,
                         lin_axis_count,
@@ -110,7 +111,7 @@ def create_eval_articulation_fk_tile(level_capacity: int, write_all: bool):
                     elif parent >= 0:
                         X_wp = body_q[parent]
                     X_wc, v_wc = eval_joint_child_state(
-                        type,
+                        frame_type,
                         parent,
                         child,
                         X_wp,

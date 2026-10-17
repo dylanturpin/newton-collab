@@ -1887,6 +1887,7 @@ void main() {
         metallic: float | None = None,
         dynamic: bool = False,
         opacity: float | None = None,
+        colors: wp.array[wp.vec3] | None = None,
     ) -> None:
         """Log a mesh for rendering.
 
@@ -1908,6 +1909,7 @@ void main() {
                 is metal.
             dynamic: Whether mesh topology may change between frames.
             opacity: Optional display opacity in [0, 1].
+            colors: Optional per-vertex colors, applied when the mesh prim is authored.
         """
         name = self._qualify(name)
 
@@ -1926,6 +1928,7 @@ void main() {
                 roughness=roughness,
                 metallic=metallic,
                 dynamic=dynamic,
+                colors=colors,
             )
             self._mesh_prim_paths[name] = self._get_path(name)
             if self._phase == self._PHASE_RENDER:
