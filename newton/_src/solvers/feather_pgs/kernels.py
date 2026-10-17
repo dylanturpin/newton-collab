@@ -2301,8 +2301,10 @@ def accumulate_connect_wrenches_from_impulses(
 ):
     """Add each loop closure's solved point-coincidence force to its parent and child bodies.
 
-    The rows are ``e_k . (v(p_A) - v(p_B))`` scaled by the row builder's stored inverse norm, so the impulse maps
-    back to a force along ``e_k`` at each anchor.
+    The rows are built at the shared anchor ``p_M``, the midpoint of the two anchors (see
+    ``populate_connect_J_for_size``), scaled by the row builder's stored inverse norm, so the impulse maps back to
+    an equal and opposite force along ``e_k`` applied to both bodies at ``p_M``: the readout carries no couple across
+    an open closure, exactly like the solve.
     """
     k = wp.tid()
     base_slot = connect_slot[k]
@@ -2317,6 +2319,8 @@ def accumulate_connect_wrenches_from_impulses(
     if body_p >= 0:
         p_a = wp.transform_point(body_q[body_p], anchor_p)
     p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
+    # Same shared anchor as the Jacobian: the solved impulse pair acts at one world point.
+    p_m = p_a - 0.5 * (p_a - p_b)
     for axis_index in range(3):
         slot = base_slot + axis_index
         if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
@@ -2327,8 +2331,8 @@ def accumulate_connect_wrenches_from_impulses(
         axis = wp.vec3(0.0)
         axis[axis_index] = 1.0
         force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
-        _add_point_force(body_p, force, p_a, body_to_articulation, articulation_origin, body_contact_wrench)
-        _add_point_force(body_c, -force, p_b, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_p, force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(body_c, -force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
 
 
 @wp.kernel
@@ -4420,7 +4424,7 @@ def populate_connect_J_for_size(
     Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
     (small) closure table and, for closures belonging to its articulation, writes three
     rows: for world axis ``e_k``, ``phi = (p_A - p_B) . e_k`` and
-    ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
+    ``J = e_k . (Jpoint(parent, p_M) - Jpoint(child, p_M))`` with ``p_M`` the anchor midpoint, via the contact ancestor
     walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
     diagonal makes the sweep skip it. The anchors are the translations of the closure
     joint's ``joint_X_p`` / ``joint_X_c``, read every step.
@@ -4450,22 +4454,29 @@ def populate_connect_J_for_size(
         joint = connect_joint[k]
         anchor_p = wp.transform_get_translation(joint_X_p[joint])
         p_a = anchor_p
-        v_a = wp.vec3(0.0, 0.0, 0.0)
         if body_p >= 0:
             p_a = wp.transform_point(body_q[body_p], anchor_p)
-            if prescribed:
-                # Prescribed parent: the anchor velocity comes from the body twist
-                # (v_com_world, omega_world) rather than from tree DOFs.
-                twist = body_qd[body_p]
-                v_com = wp.spatial_top(twist)
-                omega = wp.spatial_bottom(twist)
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = v_com + wp.cross(omega, p_a - x_com)
         p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
         origin = articulation_origin[art]
-        rel_a = p_a - origin
-        rel_b = p_b - origin
         delta = p_a - p_b
+        # Shared anchor: both ancestor walks take their lever arm from the midpoint of
+        # the two anchors, so the impulse pair acts at one world point and applies no
+        # net wrench to the articulation however far the closure has drifted (the
+        # per-body form is a couple C x lambda that spins a floating base). Identical
+        # to the per-body Jacobian once the closure is satisfied.
+        p_m = p_a - 0.5 * delta
+        rel_a = p_m - origin
+        rel_b = rel_a
+        v_a = wp.vec3(0.0, 0.0, 0.0)
+        if prescribed and body_p >= 0:
+            # Prescribed parent: the row target is the parent's velocity at the shared
+            # anchor, from the body twist (v_com_world, omega_world) rather than tree DOFs,
+            # so target and child Jacobian refer to the same point.
+            twist = body_qd[body_p]
+            v_com = wp.spatial_top(twist)
+            omega = wp.spatial_bottom(twist)
+            x_com = wp.transform_point(body_q[body_p], body_com[body_p])
+            v_a = v_com + wp.cross(omega, p_m - x_com)
 
         for axis in range(3):
             slot = base_slot + axis
@@ -4477,7 +4488,8 @@ def populate_connect_J_for_size(
             e[axis] = 1.0
             target = float(0.0)
 
-            # J = e . (Jpoint(parent, p_a) - Jpoint(child, p_b)): ancestor walks with
+            # J = e . (Jpoint(parent, p_m) - Jpoint(child, p_m)) with p_m the anchors'
+            # midpoint, so the impulse pair acts at one world point: ancestor walks with
             # opposite signs; shared ancestors partially cancel automatically.
             if prescribed:
                 target = -wp.dot(e, v_a)
