@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -16,6 +19,7 @@ from newton._src.solvers.feather_pgs._testing import kernel_overrides
 from newton._src.solvers.feather_pgs.friction_patches import (
     _FrictionPatchState,
 )
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_propagation_colored_block_kernel
 from newton.solvers import SolverBase, SolverFeatherPGS
 
 
@@ -698,3 +702,61 @@ def fixture(
     )
     result["count"] = solver._constraint_count.numpy()
     return result, solver, model, a, contacts
+
+
+_COLORED_SWITCHES = (
+    "FEATHER_PGS_COLORED_PREFETCH",
+    "FEATHER_PGS_COLORED_STAGED",
+    "FEATHER_PGS_COLORED_PACKED",
+    "FEATHER_PGS_COLORED_STRAIGHT_LINE",
+    "FEATHER_PGS_COLORED_LANES",
+)
+# Each colored solve body, selected by its kernel switches, with a tag of the kernel it must build.
+COLORED_VARIANTS = {
+    "packed": ({"FEATHER_PGS_COLORED_PACKED": "1"}, "_pf1_st0_pk1"),
+    "prefetch": ({"FEATHER_PGS_COLORED_PACKED": "0"}, "_pf1_st0_pk0"),
+    "staged": ({"FEATHER_PGS_COLORED_STAGED": "1"}, "_pf1_st1"),
+    "reference": ({"FEATHER_PGS_COLORED_PREFETCH": "0"}, "_pf0_st0_pk0_sl1"),
+    "row loop": ({"FEATHER_PGS_COLORED_PREFETCH": "0", "FEATHER_PGS_COLORED_STRAIGHT_LINE": "0"}, "_sl0"),
+    "two lanes": ({"FEATHER_PGS_COLORED_LANES": "2"}, "_r2_"),
+    "four lanes": ({"FEATHER_PGS_COLORED_LANES": "4"}, "_r4_"),
+    "block": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_sb"),
+    "block global": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_gb"),
+}
+
+
+@contextlib.contextmanager
+def colored_variant_switches(name):
+    """Set only colored variant ``name``'s kernel switches while solvers are built."""
+    env, _ = COLORED_VARIANTS[name]
+    with mock.patch.dict(os.environ, env):
+        for key in _COLORED_SWITCHES:
+            if key not in env:
+                os.environ.pop(key, None)
+        yield
+
+
+def select_colored_variant(solver, name):
+    """Give ``solver`` colored variant ``name``'s solve kernel and check that it built that kernel.
+
+    Build the solver inside :func:`colored_variant_switches`. Raises ``SkipTest`` where staging is unsupported.
+    """
+    if name == "block global":
+        # Bodies past the staging cap keep the twists in global memory; the body list is unused then.
+        solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
+            solver._propagation_max_constraints,
+            solver._color_world_offsets.shape[0] // solver._world_count,
+            solver._propagation_colored_block_dim,
+            385,
+            str(solver.model.device.arch),
+            free_rigid_angular=solver._free_rigid_angular_rows,
+            contact_torsion=solver._propagation_torsion_rows,
+        )
+    warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
+    kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
+    if name == "staged" and warp_kernel is not None and "_pf1_st1" not in kernel.key:
+        raise unittest.SkipTest("shared-memory staging needs cp.async")
+    tag = COLORED_VARIANTS[name][1]
+    assert tag in kernel.key, f"{name} built {kernel.key}"
+    assert ("_fra" in kernel.key) == bool(solver._free_rigid_angular_rows), kernel.key
+    assert ("_tor" in kernel.key) == bool(solver._propagation_torsion_rows), kernel.key
