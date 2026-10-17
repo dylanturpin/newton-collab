@@ -21,11 +21,11 @@ from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
+    elastic_frame_layout,
     eval_single_articulation_fk,
 )
 from ...sim.contacts import GENERATION_SENTINEL
 from ..featherstone.kernels import jcalc_motion
-from .elastic_links import elastic_frame_layout
 from .friction import friction_pair_candidate
 from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
