@@ -3527,6 +3527,46 @@ def test_vbd_revolute_drive_and_limit_project_into_elastic_modes(test, device):
     np.testing.assert_allclose(limit_result, limit_expected, rtol=1.0e-6, atol=1.0e-7)
 
 
+def test_vbd_drive_support_includes_elastic_modal_mobility(test, device):
+    """A drive on a kinematic-frame elastic endpoint gets its support from the mode and moves it."""
+    dt = 0.01
+    mode_mass = 2.0
+    target = 0.25
+
+    for joint_kind in ("revolute", "prismatic"):
+        if joint_kind == "revolute":
+            sample_phi, sample_psi = [[[0.0, 0.0, 0.0]]], [[[1.0, 0.0, 0.0]]]
+        else:
+            sample_phi, sample_psi = [[[1.0, 0.0, 0.0]]], [[[0.0, 0.0, 0.0]]]
+        basis = newton.ModalBasis(
+            sample_points=[[0.0, 0.0, 0.0]],
+            sample_phi=sample_phi,
+            sample_psi=sample_psi,
+            mode_mass=[mode_mass],
+            mode_stiffness=[0.0],
+            mode_damping=[0.0],
+        )
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_body_elastic(
+            mass=1.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis, is_kinematic=True
+        )
+        add_joint = builder.add_joint_revolute if joint_kind == "revolute" else builder.add_joint_prismatic
+        joint = add_joint(parent=-1, child=body, axis=(1.0, 0.0, 0.0), target_pos=target, target_ke=200.0)
+        builder.color()
+        model = builder.finalize(device=device)
+
+        state_0 = model.state()
+        state_1 = model.state()
+        solver = newton.solvers.SolverVBD(model, iterations=4)
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        dof = int(model.joint_qd_start.numpy()[joint])
+        support = float(solver.joint_drive_limit_support.numpy()[dof])
+        np.testing.assert_allclose(support, mode_mass / (dt * dt), rtol=1.0e-5, err_msg=joint_kind)
+        q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
+        test.assertGreater(float(state_1.joint_q.numpy()[q_start]), 0.0, msg=joint_kind)
+
+
 def test_fourbar_elastic_coupler_geometry(test, device):
     a, b_rest, c, d = 0.2, 0.5, 0.4, 0.5
     eta = 0.06
@@ -4427,6 +4467,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_revolute_drive_and_limit_project_into_elastic_modes",
         test_vbd_revolute_drive_and_limit_project_into_elastic_modes,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_drive_support_includes_elastic_modal_mobility",
+        test_vbd_drive_support_includes_elastic_modal_mobility,
         devices=[device],
     )
     add_function_test(
