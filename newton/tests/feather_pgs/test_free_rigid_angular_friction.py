@@ -5,21 +5,30 @@
 
 import gc
 import math
+import os
 import unittest
 from typing import NamedTuple
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton._src.geometry.contact_reduction_body_pairs import build_reduction_groups
+from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PROPAGATION_UNIT_META,
+    PROPAGATION_UNIT_RING,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_propagation_contact_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _get_pgs_solve_propagation_colored_block_kernel,
+    _get_pgs_solve_propagation_colored_warp_kernel,
+    _get_pgs_solve_propagation_contact_kernel,
+)
 from newton.solvers import SolverBase, SolverFeatherPGS
 from newton.tests.feather_pgs._fixtures import set_torsion_radius
 
@@ -286,15 +295,16 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                         np.testing.assert_allclose(twist, reference, atol=2.0e-4)
                         self.assertAlmostEqual(rotated_travel, travel, delta=1.0e-4)
 
-    def test_rows_reject_colored_and_fused_propagation_responses(self):
-        """Reject the angular rows on the propagation responses whose solves do not visit them."""
+    def test_rows_reject_the_fused_propagation_response(self):
+        """Reject the angular rows on the fused propagation response, whose solve does not visit them."""
         model, _ = _scene("sphere", anchor_deg=45.0)
-        for options in (
-            {"articulated_contact_response": "propagation_colored"},
-            {"articulated_contact_response": "propagation_fused"},
-        ):
-            with self.subTest(**options), self.assertRaises(ValueError):
-                SolverFeatherPGS(model, solve_mode="matrix_free", free_rigid_rolling_friction=1.0e-3, **options)
+        with self.assertRaises(ValueError):
+            SolverFeatherPGS(
+                model,
+                solve_mode="matrix_free",
+                free_rigid_rolling_friction=1.0e-3,
+                articulated_contact_response="propagation_fused",
+            )
 
     def test_patch_angular_rows_do_not_depend_on_contact_order(self):
         """Keep each material's angular rows when two shapes of one body with different angular coefficients rest
@@ -902,6 +912,385 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
         np.testing.assert_array_equal(eager, captured)
 
 
+_COLORED = {"articulated_contact_response": "propagation_colored"}
+_COLORED_SWITCHES = (
+    "FEATHER_PGS_COLORED_PREFETCH",
+    "FEATHER_PGS_COLORED_STAGED",
+    "FEATHER_PGS_COLORED_PACKED",
+    "FEATHER_PGS_COLORED_STRAIGHT_LINE",
+    "FEATHER_PGS_COLORED_LANES",
+)
+# Each colored solve body, selected by its kernel switches, with a tag of the kernel it must build.
+_COLORED_VARIANTS = {
+    "packed": ({"FEATHER_PGS_COLORED_PACKED": "1"}, "_pf1_st0_pk1"),
+    "prefetch": ({"FEATHER_PGS_COLORED_PACKED": "0"}, "_pf1_st0_pk0"),
+    "staged": ({"FEATHER_PGS_COLORED_STAGED": "1"}, "_pf1_st1"),
+    "reference": ({"FEATHER_PGS_COLORED_PREFETCH": "0"}, "_pf0_st0_pk0_sl1"),
+    "row loop": ({"FEATHER_PGS_COLORED_PREFETCH": "0", "FEATHER_PGS_COLORED_STRAIGHT_LINE": "0"}, "_sl0"),
+    "two lanes": ({"FEATHER_PGS_COLORED_LANES": "2"}, "_r2_"),
+    "four lanes": ({"FEATHER_PGS_COLORED_LANES": "4"}, "_r4_"),
+    "block": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_sb"),
+    "block global": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_gb"),
+}
+
+
+def _colored_variant(name, on_solver=None):
+    """Return the environment and solver hook that build colored variant ``name`` and check its kernel."""
+    env, tag = _COLORED_VARIANTS[name]
+
+    def hook(solver):
+        if name == "block global":
+            # Bodies past the staging cap keep the twists in global memory; the body list is unused then.
+            solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
+                solver._propagation_max_constraints,
+                solver._color_world_offsets.shape[0] // solver._world_count,
+                solver._propagation_colored_block_dim,
+                385,
+                str(solver.model.device.arch),
+                free_rigid_angular=solver._free_rigid_angular_rows,
+            )
+        warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
+        kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
+        if name == "staged" and warp_kernel is not None and "_pf1_st1" not in kernel.key:
+            raise unittest.SkipTest("shared-memory staging needs cp.async")
+        assert tag in kernel.key, f"{name} built {kernel.key}"
+        assert "_fra" in kernel.key or not solver._free_rigid_angular_rows, kernel.key
+        if on_solver is not None:
+            on_solver(solver)
+
+    return env, hook
+
+
+def _simulate_colored(variant, *args, on_solver=None, **kwargs):
+    """Run :func:`_simulate` on the colored response with only ``variant``'s kernel switches set."""
+    env, hook = _colored_variant(variant, on_solver)
+    with mock.patch.dict(os.environ, env):
+        for key in _COLORED_SWITCHES:
+            if key not in env:
+                os.environ.pop(key, None)
+        return _simulate(*args, on_solver=hook, **_COLORED, **kwargs)
+
+
+def _trajectory(*args, simulate=_simulate, **kwargs):
+    """Return the body's poses and twists after every step."""
+    poses, twists = [], []
+    simulate(*args, on_step=lambda pose, twist: (poses.append(pose), twists.append(twist)), **kwargs)
+    return np.array(poses), np.array(twists)
+
+
+def _pile(spins):
+    """Return one world per entry of ``spins`` of three touching boxes, spinning at those rates, on a kinematic table."""
+    scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    SolverFeatherPGS.register_custom_attributes(scene)
+    for _ in spins:
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        SolverFeatherPGS.register_custom_attributes(world)
+        table = world.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
+        world.add_shape_box(table, hx=0.5, hy=0.5, hz=0.05)
+        for index in range(3):
+            pose = wp.transform((0.0601 * index, 0.0, _RADIUS + 1.0e-4), wp.quat_identity())
+            box = world.add_body(xform=pose, mass=_MASS)
+            world.add_shape_box(box, hx=_RADIUS, hy=_RADIUS, hz=_RADIUS)
+        scene.add_world(world)
+    model = scene.finalize()
+    qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    starts = model.joint_qd_start.numpy()
+    joints_per_world = model.joint_count // len(spins)
+    for joint in range(model.joint_count):
+        world, index = divmod(joint, joints_per_world)
+        if index > 0:
+            qd[starts[joint] : starts[joint] + 6] = (0.0, 0.1 * index, 0.0, 0.0, 0.0, spins[world] * index)
+    return model, qd
+
+
+def _pile_rollout(spins, steps, graph_at=None, **solver_kwargs):
+    """Step a pile from :func:`_pile` with every angular row on, optionally replaying a captured step from ``graph_at``."""
+    model, qd = _pile(spins)
+    options = {
+        "solve_mode": "matrix_free",
+        "iterations": 16,
+        "deterministic": True,
+        "free_rigid_rolling_friction": 0.002,
+        "free_rigid_torsional_friction": 0.001,
+        "friction_anchor_beta": 0.2,
+        **solver_kwargs,
+    }
+    solver = SolverFeatherPGS(model, **options)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    state_in.joint_qd.assign(qd)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    control = model.control()
+
+    def step():
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, _DT)
+        wp.copy(state_in.body_q, state_out.body_q)
+        wp.copy(state_in.body_qd, state_out.body_qd)
+        wp.copy(state_in.joint_q, state_out.joint_q)
+        wp.copy(state_in.joint_qd, state_out.joint_qd)
+
+    history, graph = [], None
+    for k in range(steps):
+        if k == graph_at:
+            with wp.ScopedCapture(device=model.device) as capture:
+                step()
+            graph = capture.graph
+        if graph is not None:
+            wp.capture_launch(graph)
+        else:
+            step()
+        history.append(state_in.body_qd.numpy().copy())
+    return np.array(history), solver
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "FeatherPGS matrix-free requires CUDA")
+class TestFreeRigidAngularFrictionColored(unittest.TestCase):
+    """The rows on the colored propagation response, solved inside their contact's colored unit."""
+
+    def test_units_carry_the_angular_rows(self):
+        """Lay out four-, five- and six-row units and send them past the straight-line kinds to the row loops."""
+        for torsional, rolling, slots in ((0.001, 0.0, 4), (0.0, 0.002, 5), (0.001, 0.002, 6)):
+            seen = {}
+
+            def observe(solver, contacts, observables, seen=seen, slots=slots):
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                seen["path"] = solver._contact_path.numpy()[:count].tolist()
+                seen["unit_len"] = solver._color_unit_len.numpy()[:count].tolist()
+                slot = int(solver._contact_slot.numpy()[0])
+                seen["types"] = solver._propagation_row_type.numpy()[0, slot : slot + slots].tolist()
+                units = int(solver._color_world_offsets.numpy()[-1])
+                meta = solver._color_unit_meta.numpy().reshape(-1, PROPAGATION_UNIT_META)[:units]
+                seen["rows"] = meta[:, 5 + PROPAGATION_UNIT_RING].tolist()
+                seen["kinds"] = meta[:, 6 + PROPAGATION_UNIT_RING].tolist()
+
+            with self.subTest(torsional=torsional, rolling=rolling):
+                _simulate_colored(
+                    "packed",
+                    "sphere",
+                    0.0,
+                    steps=2,
+                    free_rigid_torsional_friction=torsional,
+                    free_rigid_rolling_friction=rolling,
+                    observe=observe,
+                )
+                self.assertEqual(seen["path"], [2])
+                self.assertEqual(seen["unit_len"], [slots])
+                angular = [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * (2 if rolling else 0)
+                angular += [PGS_CONSTRAINT_TYPE_CONTACT_SPIN] if torsional else []
+                self.assertEqual(seen["types"][3:], angular)
+                self.assertEqual(seen["rows"], [slots])
+                self.assertEqual(seen["kinds"], [0])
+
+    def test_every_variant_tracks_plain_and_immediate(self):
+        """Track the plain and immediate twists of a rolling, spinning sphere at every step on each colored body.
+
+        Four-, five- and six-row units; the bounds are plain's empirical gap to immediate on this fixture.
+        """
+        rows = {"spin": (0.001, 0.0), "rolling": (0.0, 0.002), "both": (0.001, 0.002)}
+        motion = {"steps": 60, "linear": (0.0, -0.3, 0.0), "angular": (10.0, 0.0, 6.0)}
+        _, twist_off = _trajectory("sphere", 0.0, **motion)
+        for label, (torsional, rolling) in rows.items():
+            kwargs = {**motion, "free_rigid_torsional_friction": torsional, "free_rigid_rolling_friction": rolling}
+            references = {
+                "immediate": _trajectory("sphere", 0.0, **kwargs),
+                "plain": _trajectory("sphere", 0.0, **kwargs, **_PROPAGATION),
+            }
+            effect = float(np.abs(references["immediate"][1][-1] - twist_off[-1]).max())
+            for variant in _COLORED_VARIANTS:
+                with self.subTest(rows=label, variant=variant):
+                    pose, twist = _trajectory(
+                        "sphere", 0.0, simulate=lambda *a, v=variant, **k: _simulate_colored(v, *a, **k), **kwargs
+                    )
+                    for name, (pose_ref, twist_ref) in references.items():
+                        np.testing.assert_allclose(twist, twist_ref, rtol=0.0, atol=5.0e-5, err_msg=name)
+                        np.testing.assert_allclose(pose[:, :3], pose_ref[:, :3], rtol=0.0, atol=1.0e-6, err_msg=name)
+                    gap = float(np.abs(twist[-1] - references["immediate"][1][-1]).max())
+                    colored_effect = float(np.abs(twist[-1] - twist_off[-1]).max())
+                    self.assertGreaterEqual(colored_effect, 0.5 * effect)
+                    self.assertGreaterEqual(colored_effect, 10.0 * gap)
+
+    def test_spin_is_relative_to_a_turning_support(self):
+        """Spin a resting sphere up to a kinematic turntable's rate, as plain does, with the turntable's side folded."""
+        options = {"free_rigid_torsional_friction": 5.0e-4, "free_rigid_rolling_friction": 0.0}
+        kwargs = {"steps": 120, "support_angular": (0.0, 0.0, 2.0), **options}
+        _, plain = _trajectory("sphere", 0.0, **kwargs, **_PROPAGATION)
+        self.assertGreater(float(plain[-1][5]), 1.0)
+        for variant in ("packed", "reference", "two lanes", "block", "block global"):
+            with self.subTest(variant=variant):
+
+                def folded(solver, test=self):
+                    test.assertTrue(solver._has_prescribed_bodies)
+
+                _, twist = _trajectory(
+                    "sphere",
+                    0.0,
+                    simulate=lambda *a, v=variant, **k: _simulate_colored(v, *a, on_solver=folded, **k),
+                    **kwargs,
+                )
+                np.testing.assert_allclose(twist, plain, rtol=0.0, atol=5.0e-5)
+
+    def test_rows_stay_within_the_pooled_load_after_every_sweep(self):
+        """Hold the rows at zero before friction starts and within the pooled patch load after, on each colored body."""
+        for variant in _COLORED_VARIANTS:
+            with self.subTest(variant=variant):
+                env, hook = _colored_variant(variant)
+                with mock.patch.dict(os.environ, env):
+                    for key in _COLORED_SWITCHES:
+                        if key not in env:
+                            os.environ.pop(key, None)
+                    sweeps = _sweep_box(on_solver=hook, response={**_COLORED, "deterministic": True})
+                self.assertTrue(any(sweep.offset < sweep.friction_start for sweep in sweeps))
+                _assert_cold_before_friction_start(self, sweeps)
+                _assert_within_the_pooled_load(self, sweeps)
+                self.assertGreater(_own_load_ratio(sweeps), 2.0)
+
+    def test_bodies_built_without_the_rows_leave_them_unsolved(self):
+        """Leave every angular impulse at zero with colored bodies built without the rows, which end units early."""
+        for variant in ("packed", "block"):
+            with self.subTest(variant=variant):
+
+                def rows_off(solver):
+                    arch = str(solver.model.device.arch)
+                    entries = solver._color_world_offsets.shape[0] // solver._world_count
+                    warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
+                    if warp_kernel is None:
+                        solver._pgs_solve_propagation_colored_block_kernel = (
+                            _get_pgs_solve_propagation_colored_block_kernel(
+                                solver._propagation_max_constraints,
+                                entries,
+                                solver._propagation_colored_block_dim,
+                                int(solver._max_propagation_bodies),
+                                arch,
+                            )
+                        )
+                        return
+                    solver._pgs_solve_propagation_colored_warp_kernel = _get_pgs_solve_propagation_colored_warp_kernel(
+                        solver._propagation_max_constraints,
+                        entries,
+                        int(solver._max_propagation_bodies),
+                        1,
+                        solver._propagation_colored_worlds_per_block,
+                        arch,
+                        prefetch=True,
+                        packed="_pk1" in warp_kernel.key,
+                    )
+
+                moved = {}
+                for name, on_solver in (("rows", None), ("rows off", rows_off)):
+                    env, hook = _colored_variant(variant, on_solver=on_solver)
+                    with mock.patch.dict(os.environ, env):
+                        for key in _COLORED_SWITCHES:
+                            if key not in env:
+                                os.environ.pop(key, None)
+                        sweeps = _sweep_box(on_solver=hook, response={**_COLORED, "deterministic": True})
+                    blocks = [
+                        sweep.after[row : row + width] for sweep in sweeps for row, width in _angular_blocks(sweep)
+                    ]
+                    self.assertTrue(blocks)
+                    moved[name] = any(np.any(block != 0.0) for block in blocks)
+                self.assertEqual(moved, {"rows": True, "rows off": False})
+
+    def test_rows_start_cold_under_warm_start(self):
+        """Carry the normal and sliding impulses but start the angular rows at zero, as the other responses do."""
+        model, _ = _scene("sphere")
+        solver = SolverFeatherPGS(
+            model,
+            solve_mode="matrix_free",
+            iterations=32,
+            contact_warmstart=True,
+            free_rigid_rolling_friction=0.002,
+            free_rigid_torsional_friction=0.001,
+            **_COLORED,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky")
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        qd = states[0].joint_qd.numpy()
+        qd[3:6] = (10.0, 0.0, 6.0)
+        states[0].joint_qd.assign(qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        for steps in (20, 1):
+            if steps == 1:
+                # A solve-free step leaves exactly the gathered warm start in the impulses.
+                solver._iterations = 0
+            for _ in range(steps):
+                states[0].clear_forces()
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, _DT)
+                states.reverse()
+            slot = int(solver._contact_slot.numpy()[0])
+            impulses = solver._propagation_impulses.numpy()[0, slot : slot + 6].copy()
+            if steps == 20:
+                self.assertEqual(int(solver._contact_path.numpy()[0]), 2)
+                solved = impulses
+        self.assertTrue(np.all(solved[[0, 3, 4, 5]] != 0.0))
+        self.assertGreater(impulses[0], 0.0)
+        np.testing.assert_array_equal(impulses[3:6], 0.0)
+
+    def test_deterministic_runs_repeat_bitwise_and_ignore_world_order(self):
+        """Repeat a three-world pile bitwise, and give each world the same twists when the worlds are permuted."""
+        spins = (4.0, 1.0, 7.0)
+        first, solver = _pile_rollout(spins, 40, **_COLORED)
+        # Box-box contacts give each world more units than bodies touching the table.
+        self.assertGreater(int(solver._color_world_unit_cursor.numpy()[0]), 12)
+        second, _ = _pile_rollout(spins, 40, **_COLORED)
+        np.testing.assert_array_equal(first, second)
+        order = (2, 0, 1)
+        permuted, _ = _pile_rollout(tuple(spins[w] for w in order), 40, **_COLORED)
+        bodies = first.shape[1] // len(spins)
+        for slot, world in enumerate(order):
+            np.testing.assert_array_equal(
+                permuted[:, slot * bodies : (slot + 1) * bodies], first[:, world * bodies : (world + 1) * bodies]
+            )
+        # The rows act on this pile: switching them off changes the twists.
+        off, _ = _pile_rollout(
+            spins, 40, **_COLORED, free_rigid_rolling_friction=0.0, free_rigid_torsional_friction=0.0
+        )
+        self.assertGreater(float(np.abs(off - first).max()), 1.0e-2)
+
+    def test_serial_tail_solves_the_rows(self):
+        """Solve the rows of units that overflow a two-color cap in the serial tail, as with the full cap.
+
+        The row-loop bodies sweep the tail in the same order and arithmetic, so they match bitwise. The straight-line
+        bodies sum in a different order in the tail; they are compared over one step, as the straight-line check in
+        test_propagation does, since a pile amplifies that rounding over later steps.
+        """
+        for variant, steps in (("row loop", 20), ("block", 20), ("packed", 1), ("reference", 1)):
+            with self.subTest(variant=variant):
+                env, _ = _COLORED_VARIANTS[variant]
+                with mock.patch.dict(os.environ, env):
+                    for key in _COLORED_SWITCHES:
+                        if key not in env:
+                            os.environ.pop(key, None)
+                    uncapped, _ = _pile_rollout((4.0, 1.0), steps, **_COLORED)
+                    with mock.patch.object(solver_feather_pgs, "PROPAGATION_COLOR_TAIL", 2):
+                        capped, solver = _pile_rollout((4.0, 1.0), steps, **_COLORED)
+                        entries = solver._color_world_offsets.shape[0] // solver._world_count
+                        offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, entries)
+                self.assertTrue(np.all(offsets[:, -1] - offsets[:, -2] > 0), "no unit reached the serial tail")
+                if steps > 1:
+                    np.testing.assert_array_equal(capped, uncapped)
+                else:
+                    np.testing.assert_allclose(capped, uncapped, rtol=1e-4, atol=1e-6)
+
+    def test_captured_steps_match_eager_steps(self):
+        """Replay captured colored steps bit for bit against eager steps, on each colored body."""
+        for variant in ("packed", "staged", "reference", "two lanes", "block"):
+            with self.subTest(variant=variant):
+                env, _ = _COLORED_VARIANTS[variant]
+                with mock.patch.dict(os.environ, env):
+                    for key in _COLORED_SWITCHES:
+                        if key not in env:
+                            os.environ.pop(key, None)
+                    eager, _ = _pile_rollout((4.0, 1.0), 30, **_COLORED)
+                    captured, _ = _pile_rollout((4.0, 1.0), 30, graph_at=3, **_COLORED)
+                np.testing.assert_array_equal(captured, eager)
+
+
 class _Sweep(NamedTuple):
     offset: int
     friction_start: int
@@ -912,8 +1301,11 @@ class _Sweep(NamedTuple):
     row_mu: np.ndarray
 
 
-def _sweep_box(on_solver=None, before_sweep=None):
-    """Record world 0's plain propagation rows around every sweep of a spinning box on a persistent patch."""
+def _sweep_box(on_solver=None, before_sweep=None, response=None):
+    """Record world 0's propagation rows around every sweep of a spinning box on a persistent patch.
+
+    ``response`` holds the solver's response options, plain propagation by default.
+    """
     sweeps = []
 
     def record(solver):
@@ -944,7 +1336,7 @@ def _sweep_box(on_solver=None, before_sweep=None):
         friction_anchor_beta=0.2,
         contact_friction_position_iterations=8,
         on_solver=record,
-        **_PROPAGATION,
+        **(_PROPAGATION if response is None else response),
     )
     return sweeps
 
