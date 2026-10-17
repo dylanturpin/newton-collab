@@ -1790,15 +1790,22 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
     model.collide(state_0, contacts)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
-    solver = newton.solvers.SolverVBD(
-        model,
-        iterations=1,
-        rigid_contact_k_start=1000.0,
-        rigid_avbd_contact_alpha=0.0,
-        rigid_body_contact_buffer_size=128,
-        elastic_body_relaxation=1.0,
-        elastic_solver_metrics=True,
-    )
+    # A massless, stiffness-free mode has no inertia scale for compliant ALM's contact rows; this
+    # one-shot penalty check needs the legacy path. Compliant ALM warns on such bodies instead.
+    with test.assertWarnsRegex(UserWarning, "zero-mass mode"):
+        newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=128)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            rigid_compliant_alm=False,
+            rigid_contact_k_start=1000.0,
+            rigid_avbd_contact_alpha=0.0,
+            rigid_body_contact_buffer_size=128,
+            elastic_body_relaxation=1.0,
+            elastic_solver_metrics=True,
+        )
     solver.step(state_0, state_1, control, contacts, 0.01)
 
     owner_joint = int(model.elastic_joint.numpy()[0])

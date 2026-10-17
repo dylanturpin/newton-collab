@@ -62,7 +62,7 @@ class TestFeatherPGSElastic(unittest.TestCase):
         frequencies = []
         for steel in (True, False):
             model, state, _info = _hub_beam(steel=steel, omega=0.0, eta=(0.0, 0.02))
-            solver = SolverFeatherPGS(model) if steel else SolverVBD(model, iterations=32, rigid_compliant_alm=False)
+            solver = SolverFeatherPGS(model) if steel else SolverVBD(model, iterations=32)
             frequencies.append(_frequency(_mode_history(model, _run(model, solver, 1536, dt, state), 1), dt))
         self.assertAlmostEqual(frequencies[0], frequencies[1], delta=0.03 * frequencies[0])
 

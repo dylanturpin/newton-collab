@@ -95,6 +95,7 @@ class Example:
 
         shape_cfg = newton.ModelBuilder.ShapeConfig()
         shape_cfg.density = 0.0
+        shape_cfg.has_shape_collision = False
         builder.add_shape_box(self.beam, hx=0.5 * self.length, hy=self.hy, hz=self.hz, cfg=shape_cfg)
         self.fixed_joint = builder.add_joint_fixed(
             parent=-1,
