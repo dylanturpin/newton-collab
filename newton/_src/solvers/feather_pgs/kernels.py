@@ -8589,6 +8589,43 @@ def accumulate_propagation_warmstart_body_impulses(
 
 
 @wp.kernel
+def accumulate_propagation_warmstart_body_impulses_ordered(
+    constraint_count: wp.array[int],
+    body_a: wp.array2d[int],
+    body_b: wp.array2d[int],
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    MiJt_a: wp.array3d[float],
+    MiJt_b: wp.array3d[float],
+    impulses: wp.array2d[float],
+    max_constraints: int,
+    # in-out
+    body_qd: wp.array2d[float],
+    body_impulses: wp.array2d[float],
+):
+    """Convert seeded propagation row impulses to deferred body wrenches, summed in row order.
+
+    One thread per world and twist component walks the rows serially, as the plain sweep does. Rows reference
+    only bodies of articulations with response DOFs, and the allocator keeps those in one world: one writer per body.
+    """
+    tid = wp.tid()
+    world = tid // 6
+    k = tid - world * 6
+    count = wp.min(constraint_count[world], max_constraints)
+    for row in range(count):
+        impulse = impulses[world, row]
+        if impulse != 0.0:
+            ba = body_a[world, row]
+            bb = body_b[world, row]
+            if ba >= 0:
+                body_qd[ba, k] = body_qd[ba, k] + MiJt_a[world, row, k] * impulse
+                body_impulses[ba, k] = body_impulses[ba, k] + J_a[world, row, k] * impulse
+            if bb >= 0:
+                body_qd[bb, k] = body_qd[bb, k] + MiJt_b[world, row, k] * impulse
+                body_impulses[bb, k] = body_impulses[bb, k] + J_b[world, row, k] * impulse
+
+
+@wp.kernel
 def allocate_rigid_velocity_limit_slots(
     free_rigid_body_indices: wp.array[int],
     body_to_articulation: wp.array[int],

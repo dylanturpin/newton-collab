@@ -2119,13 +2119,12 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                     )
         return stepper
 
-    def test_gate_admits_colored_only(self):
-        """Accept deterministic colored; reject plain and fused, and colored with contact warm start."""
+    def test_gate_admits_colored_without_warm_start(self):
+        """Accept deterministic colored; reject fused, and colored with contact warm start."""
         model = _build_arm_heap_model("cuda:0", worlds=1)
         _colored_deterministic_solver(model)
-        for response in ("propagation", "propagation_fused"):
-            with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
-                _colored_deterministic_solver(model, articulated_contact_response=response)
+        with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
+            _colored_deterministic_solver(model, articulated_contact_response="propagation_fused")
         with self.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
             _colored_deterministic_solver(model, contact_warmstart=True)
 
