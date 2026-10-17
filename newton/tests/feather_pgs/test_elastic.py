@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.examples.basic._reduced_elastic import box_surface_mesh
+from newton.examples.basic._reduced_elastic import beam_render_sample_points, box_surface_mesh, cantilever_tip_mode
 from newton.solvers import SolverFeatherPGS, SolverVBD
 
 BEAM_LENGTH = 0.6
@@ -118,6 +118,29 @@ class TestFeatherPGSElastic(unittest.TestCase):
         solver = SolverFeatherPGS(model)
         expected = min(32 + 3 * int(model.elastic_shape_vertex_count.numpy().sum()), 128)
         self.assertEqual(solver.articulation_constraint_max, expected)
+
+    def test_frame_origin_invariance_under_driven_base_rotation(self):
+        """Clamp-origin and mid-span-origin frames of the same beam on a rocking base respond identically."""
+        model, base_joint, targets = _rocking_base_beams()
+        control = model.control()
+        state_0, state_1 = model.state(), model.state()
+        solver = SolverFeatherPGS(model)
+        q_index = int(model.joint_q_start.numpy()[base_joint])
+        qd_index = int(model.joint_qd_start.numpy()[base_joint])
+        mode = model.elastic_mode_q_start.numpy()
+        target_q, target_qd = control.joint_target_q.numpy(), control.joint_target_qd.numpy()
+        dt, peak, error = 1.0 / 240.0, 0.0, 0.0
+        for i in range(240):
+            target_q[q_index], target_qd[qd_index] = targets((i + 1) * dt)
+            control.joint_target_q.assign(target_q)
+            control.joint_target_qd.assign(target_qd)
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+            q = state_0.joint_q.numpy()
+            peak = max(peak, abs(float(q[mode[0]])))
+            error = max(error, abs(float(q[mode[0]] - q[mode[1]])))
+        self.assertGreater(peak, 0.05)
+        self.assertLess(error, 1.0e-5 * peak)
 
     def test_rejects_bodies_attached_to_an_elastic_link(self):
         model, _state, _info = _hub_beam(steel=True, omega=0.0, eta=(0.0, 0.0), tip_body=True)
@@ -238,6 +261,56 @@ def _hub_beam(steel, omega, eta, gravity=(0.0, 0.0, 0.0), tip_body=False):
         "uncoupled_frequency": np.sqrt(120.0 / modal_mass) / (2 * np.pi),
     }
     return model, state, info
+
+
+def _rocking_base_beams():
+    """#4111's base-rotation scene: one beam framed at its clamp, one at mid-span, on a driven revolute base."""
+    length, amplitude, frequency = 0.8, 0.25, 1.5
+    centered = beam_render_sample_points(length, 0.04, 0.03, extra_points=((-0.5 * length, 0, 0), (0.5 * length, 0, 0)))
+    phi = cantilever_tip_mode(centered, length).reshape((-1, 1, 3))
+    sample_mass = np.full(centered.shape[0], 1.0 / centered.shape[0], dtype=np.float32)
+    modal_mass = float(np.sum(sample_mass * np.sum(phi[:, 0] ** 2, axis=1)))
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = builder.add_link(
+        xform=wp.transform((0.0, 0.0, 0.8), wp.quat_identity()), mass=50.0, inertia=wp.mat33(np.eye(3) * 5.0)
+    )
+    base_joint = builder.add_joint_revolute(
+        -1,
+        base,
+        axis=(0.0, 1.0, 0.0),
+        parent_xform=wp.transform((0.0, 0.0, 0.8), wp.quat_identity()),
+        target_ke=1.0e6,
+        target_kd=2.0e4,
+    )
+    joints = [base_joint]
+    for origin_x, y in ((0.0, -0.22), (0.5 * length, 0.22)):
+        basis = newton.ModalBasis(
+            sample_points=centered + np.array([0.5 * length - origin_x, 0.0, 0.0], dtype=np.float32),
+            sample_phi=phi,
+            sample_mass=sample_mass,
+            mode_stiffness=[60.0],
+            mode_damping=[0.3 * np.sqrt(60.0 * modal_mass)],
+        )
+        beam = builder.add_link_elastic(
+            xform=wp.transform((origin_x, y, 0.8), wp.quat_identity()),
+            com=wp.vec3(0.5 * length - origin_x, 0.0, 0.0),
+            mass=0.2,
+            inertia=wp.mat33(np.eye(3) * 0.01),
+            modal_basis=basis,
+            parent=base,
+            parent_xform=wp.transform((0.0, y, 0.0), wp.quat_identity()),
+            child_xform=wp.transform((-origin_x, 0.0, 0.0), wp.quat_identity()),
+            linear_axes=[],
+            angular_axes=[],
+        )
+        joints.append(builder.body_elastic_joint[beam])
+    builder.add_articulation(joints)
+
+    def targets(t):
+        w = 2.0 * np.pi * frequency
+        return amplitude * np.sin(w * t), amplitude * w * np.cos(w * t)
+
+    return builder.finalize(), base_joint, targets
 
 
 def _free_beam():
