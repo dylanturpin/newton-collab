@@ -11,6 +11,7 @@ import warp as wp
 import newton
 from newton._src.sim.modal import _estimate_sample_psi
 from newton._src.solvers.vbd.reduced_elastic_kernels import create_solve_elastic_body_tiled
+from newton._src.solvers.vbd.rigid_vbd_kernels import _elastic_joint_endpoint_mobility
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
     beam_torsion_linear_modal_properties,
@@ -3212,7 +3213,9 @@ def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
     np.testing.assert_array_equal(solver.elastic_implicit_mass_coupling.numpy(), [False, True])
 
 
-def test_vbd_craig_bampton_coupled_solve_iteration_invariant(test, device):
+def test_vbd_craig_bampton_coupled_solve_converges_with_iterations(test, device):
+    """The compliant-ALM coupled Craig-Bampton solve agrees at 8 and 32 sweeps (one sweep is unconverged by design)."""
+
     def run(iterations: int) -> np.ndarray:
         interface_positions, mass, stiffness, damping, sample_points, recovery, _ = _build_craig_bampton_test_data()
         generator = newton.ModalGeneratorCraigBampton(
@@ -3532,6 +3535,76 @@ def test_vbd_revolute_drive_and_limit_project_into_elastic_modes(test, device):
     limit_result = solve_mode(mode_q=0.25, target_pos=0.0, target_ke=0.0, limit_upper=0.1)
     limit_expected = 0.25 - limit_k_eff * (0.25 - 0.1) / (modal_inertia + limit_k_eff)
     np.testing.assert_allclose(limit_result, limit_expected, rtol=1.0e-6, atol=1.0e-7)
+
+
+@wp.kernel
+def _angular_endpoint_mobility_probe(
+    side_is_parent: wp.array[wp.bool],
+    com: wp.array[wp.vec3],
+    index: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    endpoint: wp.array[wp.int32],
+    phi: wp.array[wp.vec3],
+    psi: wp.array[wp.vec3],
+    inv_mass: wp.array3d[float],
+    elastic_joint: wp.array[wp.int32],
+    joint_q: wp.array[float],
+    joint_q_start: wp.array[wp.int32],
+    out: wp.array[float],
+):
+    i = wp.tid()
+    out[i] = _elastic_joint_endpoint_mobility(
+        0,
+        0,
+        side_is_parent[i],
+        wp.transform_identity(),
+        wp.transform_identity(),
+        wp.vec3(0.0, 0.0, 1.0),
+        True,
+        com,
+        index,
+        count,
+        endpoint,
+        endpoint,
+        phi,
+        psi,
+        inv_mass,
+        2,
+        elastic_joint,
+        joint_q,
+        joint_q_start,
+    )
+
+
+def test_vbd_angular_endpoint_mobility_uses_deformed_rotation(test, device):
+    """Angular drive support at a deformed endpoint uses the left Jacobian of exp(sum psi q), on both sides."""
+    inv_mass = np.zeros((1, 8, 8), dtype=np.float32)
+    inv_mass[0, 6, 6] = inv_mass[0, 7, 7] = 1.0
+    joint_q = np.zeros(9, dtype=np.float32)
+    joint_q[7] = 0.5 * np.pi
+    out = wp.zeros(2, dtype=float, device=device)
+    ints = lambda values: wp.array(values, dtype=wp.int32, device=device)  # noqa: E731
+    wp.launch(
+        _angular_endpoint_mobility_probe,
+        dim=2,
+        inputs=[
+            wp.array([True, False], dtype=wp.bool, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            ints([0]),
+            ints([2]),
+            ints([0]),
+            wp.zeros(2, dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array(inv_mass, dtype=float, device=device),
+            ints([0]),
+            wp.array(joint_q, dtype=float, device=device),
+            ints([0]),
+        ],
+        outputs=[out],
+        device=device,
+    )
+    # At theta = (pi/2, 0, 0) the y mode's angular column picks up z = (1 - cos theta) / theta = 2 / pi.
+    np.testing.assert_allclose(out.numpy(), [(2.0 / np.pi) ** 2] * 2, rtol=1.0e-5)
 
 
 def test_vbd_drive_support_includes_elastic_modal_mobility(test, device):
@@ -4442,8 +4515,8 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
-        "test_vbd_craig_bampton_coupled_solve_iteration_invariant",
-        test_vbd_craig_bampton_coupled_solve_iteration_invariant,
+        "test_vbd_craig_bampton_coupled_solve_converges_with_iterations",
+        test_vbd_craig_bampton_coupled_solve_converges_with_iterations,
         devices=[device],
     )
     add_function_test(
@@ -4480,6 +4553,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_drive_support_includes_elastic_modal_mobility",
         test_vbd_drive_support_includes_elastic_modal_mobility,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_angular_endpoint_mobility_uses_deformed_rotation",
+        test_vbd_angular_endpoint_mobility_uses_deformed_rotation,
         devices=[device],
     )
     add_function_test(

@@ -11,6 +11,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _SMALL_LENGTH_EPS,
     RigidForceElementAdjacencyInfo,
     _load_solve_weight,
+    _so3_left_jacobian,
     contact_surface_separation,
     evaluate_contact_point_world,
     evaluate_joint_force_hessian,
@@ -36,21 +37,6 @@ def copy_elastic_body_transforms_back(
     body = body_ids[wp.tid()]
     if body_elastic_index[body] >= 0:
         body_q_out[body] = body_q_in[body]
-
-
-@wp.func
-def _so3_left_jacobian(theta: wp.vec3) -> wp.mat33:
-    """Map a rotation-vector increment to a left-trivialized angular increment."""
-    theta_sq = wp.dot(theta, theta)
-    theta_skew = wp.skew(theta)
-    theta_skew_sq = theta_skew * theta_skew
-    if theta_sq < _SMALL_ANGLE_EPS * _SMALL_ANGLE_EPS:
-        return wp.identity(3, float) + 0.5 * theta_skew + (1.0 / 6.0) * theta_skew_sq
-
-    angle = wp.sqrt(theta_sq)
-    a = (1.0 - wp.cos(angle)) / theta_sq
-    b = (angle - wp.sin(angle)) / (theta_sq * angle)
-    return wp.identity(3, float) + a * theta_skew + b * theta_skew_sq
 
 
 @wp.func

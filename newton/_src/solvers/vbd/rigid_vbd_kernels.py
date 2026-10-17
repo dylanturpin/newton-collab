@@ -4976,6 +4976,21 @@ def _joint_axis_angular_support(
 
 
 @wp.func
+def _so3_left_jacobian(theta: wp.vec3) -> wp.mat33:
+    """Map a rotation-vector increment to a left-trivialized angular increment."""
+    theta_sq = wp.dot(theta, theta)
+    theta_skew = wp.skew(theta)
+    theta_skew_sq = theta_skew * theta_skew
+    if theta_sq < _SMALL_ANGLE_EPS * _SMALL_ANGLE_EPS:
+        return wp.identity(3, float) + 0.5 * theta_skew + (1.0 / 6.0) * theta_skew_sq
+
+    angle = wp.sqrt(theta_sq)
+    a = (1.0 - wp.cos(angle)) / theta_sq
+    b = (angle - wp.sin(angle)) / (theta_sq * angle)
+    return wp.identity(3, float) + a * theta_skew + b * theta_skew_sq
+
+
+@wp.func
 def _elastic_joint_endpoint_mobility(
     joint: int,
     body: int,
@@ -4993,8 +5008,14 @@ def _elastic_joint_endpoint_mobility(
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_reduced_inv_mass: wp.array3d[float],
     elastic_max_mode_count: int,
+    elastic_joint: wp.array[wp.int32],
+    joint_q: wp.array[float],
+    joint_q_start: wp.array[wp.int32],
 ):
-    """Return ``J M_r^-1 J^T`` of one elastic joint endpoint, or -1 for a rigid endpoint."""
+    """Return ``J M_r^-1 J^T`` of one elastic joint endpoint, or -1 for a rigid endpoint.
+
+    Angular modal columns use the left Jacobian of the endpoint rotation ``exp(sum psi_i q_i)``.
+    """
     if body < 0:
         return -1.0
     elastic_index = body_elastic_index[body]
@@ -5010,6 +5031,13 @@ def _elastic_joint_endpoint_mobility(
     lever_local = wp.transform_get_translation(anchor_local) - body_com[body]
     moment_local = wp.cross(lever_local, direction_local)
     mode_count = elastic_mode_count[elastic_index]
+    q_start = joint_q_start[elastic_joint[elastic_index]] + 7
+    theta_local = wp.vec3(0.0)
+    for mode in range(mode_count):
+        theta_local = (
+            theta_local + elastic_endpoint_psi[endpoint * elastic_max_mode_count + mode] * joint_q[q_start + mode]
+        )
+    rotation_jacobian = _so3_left_jacobian(theta_local)
     width = elastic_max_mode_count + 6
     mobility = float(0.0)
     for row in range(width):
@@ -5023,6 +5051,7 @@ def _elastic_joint_endpoint_mobility(
             elastic_endpoint_phi,
             elastic_endpoint_psi,
             elastic_max_mode_count,
+            rotation_jacobian,
         )
         if jacobian_row != 0.0:
             projected = float(0.0)
@@ -5039,6 +5068,7 @@ def _elastic_joint_endpoint_mobility(
                     elastic_endpoint_phi,
                     elastic_endpoint_psi,
                     elastic_max_mode_count,
+                    rotation_jacobian,
                 )
             mobility = mobility + jacobian_row * projected
     return mobility
@@ -5055,6 +5085,7 @@ def _elastic_joint_endpoint_jacobian_component(
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_max_mode_count: int,
+    rotation_jacobian: wp.mat33,
 ):
     """Return one coordinate of a joint axis Jacobian over an elastic body block."""
     if coordinate < 3:
@@ -5069,7 +5100,9 @@ def _elastic_joint_endpoint_jacobian_component(
     if mode >= mode_count:
         return 0.0
     if is_angular:
-        return wp.dot(elastic_endpoint_psi[endpoint * elastic_max_mode_count + mode], direction_local)
+        return wp.dot(
+            rotation_jacobian * elastic_endpoint_psi[endpoint * elastic_max_mode_count + mode], direction_local
+        )
     return wp.dot(elastic_endpoint_phi[endpoint * elastic_max_mode_count + mode], direction_local)
 
 
@@ -5354,6 +5387,9 @@ def step_joint_C0_lambda_rho(
                         elastic_endpoint_psi,
                         elastic_reduced_inv_mass,
                         elastic_max_mode_count,
+                        elastic_joint,
+                        joint_q,
+                        joint_q_start,
                     )
                     child_elastic_mobility = _elastic_joint_endpoint_mobility(
                         j,
@@ -5372,6 +5408,9 @@ def step_joint_C0_lambda_rho(
                         elastic_endpoint_psi,
                         elastic_reduced_inv_mass,
                         elastic_max_mode_count,
+                        elastic_joint,
+                        joint_q,
+                        joint_q_start,
                     )
                     joint_drive_limit_support[dof] = _joint_axis_linear_support(
                         parent,
@@ -5425,6 +5464,9 @@ def step_joint_C0_lambda_rho(
                             elastic_endpoint_psi,
                             elastic_reduced_inv_mass,
                             elastic_max_mode_count,
+                            elastic_joint,
+                            joint_q,
+                            joint_q_start,
                         )
                         child_elastic_mobility = _elastic_joint_endpoint_mobility(
                             j,
@@ -5443,6 +5485,9 @@ def step_joint_C0_lambda_rho(
                             elastic_endpoint_psi,
                             elastic_reduced_inv_mass,
                             elastic_max_mode_count,
+                            elastic_joint,
+                            joint_q,
+                            joint_q_start,
                         )
                         joint_drive_limit_support[dof] = _joint_axis_angular_support(
                             parent,

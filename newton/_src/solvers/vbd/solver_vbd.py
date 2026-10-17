@@ -5911,5 +5911,6 @@ def _warn_massless_colliding_modes(model) -> None:
     for e, body in enumerate(model.elastic_body.numpy()):
         if body in colliding and np.any(mode_mass[starts[e] : starts[e] + counts[e]] == 0.0):
             warnings.warn(
-                f"Elastic body {body} has a zero-mass mode; compliant ALM applies no contact force to it.", stacklevel=3
+                f"Elastic body {body} has a zero-mass mode; compliant ALM contact rows apply no force along it.",
+                stacklevel=3,
             )
