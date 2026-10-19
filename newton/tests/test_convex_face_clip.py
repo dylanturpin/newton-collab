@@ -366,7 +366,7 @@ def test_rounded_hull_settles(test, device):
         model = builder.finalize(device=device)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, convex_face_clip=True)
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverFeatherPGS(model, iterations=32, contact_regularization=0.01)
+        solver = newton.solvers.SolverSteel(model, iterations=32, contact_regularization=0.01)
         state_0, state_1, control = model.state(), model.state(), model.control()
         speeds = []
         for _ in range(480):

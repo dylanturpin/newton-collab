@@ -1,1 +1,0 @@
-Add experimental default-off FeatherPGS `contact_compliance` to consume native per-contact stiffness, damping, and friction quadrature weights with an implicit unilateral normal law, explicit unsupported-mode guards, and dense/articulated plus matrix-free contact tests.

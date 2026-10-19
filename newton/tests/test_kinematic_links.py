@@ -479,7 +479,7 @@ def test_kinematic_free_base_prescribed_motion(
         )
         solver = solver_fn(model)
         if (
-            isinstance(solver, newton.solvers.SolverFeatherPGS)
+            isinstance(solver, newton.solvers.SolverSteel)
             and solver._solve_mode == "matrix_free"
             and solver._articulated_contact_response == "immediate"
         ):
@@ -794,7 +794,7 @@ def test_kinematic_runtime_toggle(
     builder.color()
     model = builder.finalize(device=device)
     solver = solver_fn(model)
-    if isinstance(solver, newton.solvers.SolverFeatherPGS):
+    if isinstance(solver, newton.solvers.SolverSteel):
         solver._update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
@@ -888,17 +888,13 @@ def _undamped(solver):
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "feather_pgs_split": lambda model: _undamped(newton.solvers.SolverFeatherPGS(model, solve_mode="split")),
-    "feather_pgs_matrix_free": lambda model: _undamped(
-        newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free")
+    "steel_split": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="split")),
+    "steel_matrix_free": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="matrix_free")),
+    "steel_propagation": lambda model: _undamped(
+        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation")
     ),
-    "feather_pgs_propagation": lambda model: _undamped(
-        newton.solvers.SolverFeatherPGS(model, solve_mode="matrix_free", articulated_contact_response="propagation")
-    ),
-    "feather_pgs_propagation_fused": lambda model: _undamped(
-        newton.solvers.SolverFeatherPGS(
-            model, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
-        )
+    "steel_propagation_fused": lambda model: _undamped(
+        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_fused")
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
@@ -912,12 +908,12 @@ for device in devices:
             continue
         if device.is_cpu and solver_name in (
             "mujoco_warp",
-            "feather_pgs_matrix_free",
-            "feather_pgs_propagation",
-            "feather_pgs_propagation_fused",
+            "steel_matrix_free",
+            "steel_propagation",
+            "steel_propagation_fused",
         ):
             continue
-        if device.is_cpu and solver_name == "feather_pgs_matrix_free":
+        if device.is_cpu and solver_name == "steel_matrix_free":
             continue
 
         add_function_test(
@@ -926,20 +922,20 @@ for device in devices:
             test_kinematic_free_base_prescribed_motion,
             devices=[device],
             solver_fn=solver_fn,
-            check_reversed_order=solver_name == "feather_pgs_matrix_free",
+            check_reversed_order=solver_name == "steel_matrix_free",
         )
-        if solver_name == "feather_pgs_matrix_free":
-            # FeatherPGS elides prescribed free bodies only with the matrix-free immediate response.
+        if solver_name == "steel_matrix_free":
+            # Steel elides prescribed free bodies only with the matrix-free immediate response.
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_feather_pgs_matrix_free",
+                "test_kinematic_prescribed_response_lifetime_steel_matrix_free",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_free_base_drives_dense_articulation_feather_pgs_matrix_free",
+                "test_kinematic_free_base_drives_dense_articulation_steel_matrix_free",
                 test_kinematic_free_base_drives_dense_articulation,
                 devices=[device],
                 solver_fn=solver_fn,

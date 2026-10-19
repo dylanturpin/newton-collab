@@ -1,1 +1,0 @@
-Fix FeatherPGS `articulated_contact_response="propagation_colored"` CUDA graphs captured before a free body became kinematic: after `notify_model_changed(ModelFlags.BODY_PROPERTIES)`, replaying such a graph no longer lets several rows of one color write the newly kinematic body.

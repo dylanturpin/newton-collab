@@ -380,7 +380,7 @@ MuJoCo provides GPU effective-mass hooks from MuJoCo Warp data so proxy virtual
 inertia and ADMM endpoint weights can use articulated mass estimates rather than
 raw body mass.
 
-:class:`~newton.solvers.SolverFeatherPGS` can own rigid bodies and articulations
+:class:`~newton.solvers.SolverSteel` can own rigid bodies and articulations
 as a proxy source or an ADMM entry; it must not own particles. It consumes
 coupling forces through ``state.body_f`` and reports articulated effective mass
 as the inverse of the axis mean of the endpoint mobility ``J H^-1 J^T``, with
@@ -391,14 +391,14 @@ kinematics after coupler writes and restores persistent friction-patch history
 before the next solve after an iteration restart, so repeated solves of one step
 start from the same history; a reset cancels that restore, so worlds a masked
 reset does not select keep their history. A reset that selects global entities
-also clears world 0, where FeatherPGS solves global articulations. Sleeping,
+also clears world 0, where Steel solves global articulations. Sleeping,
 warm starting, contact compliance, contact torsion, owning particles, and
 acting as a proxy destination raise :class:`NotImplementedError` in coupled
-use. Proxy-contact friction between FeatherPGS bodies and deformables is solved
-by the destination solver, not by FeatherPGS patch or torsional friction. Size
+use. Proxy-contact friction between Steel bodies and deformables is solved
+by the destination solver, not by Steel patch or torsional friction. Size
 ``model.rigid_contact_max`` to the contact buffer passed to the coupled step
-before constructing the solver, because FeatherPGS allocates its contact scratch
-from the model. FeatherPGS does not integrate the cross-solver joints that ADMM
+before constructing the solver, because Steel allocates its contact scratch
+from the model. Steel does not integrate the cross-solver joints that ADMM
 joint proxies keep in its view, so route those proxies to the other entry with
 ``joint_proximal_destination_entries``.
 
@@ -418,7 +418,7 @@ The coupled-solver framework is useful today, but it is still experimental:
 - Particle-particle ADMM contacts use a private stream, not a public contact API.
 - Effective-mass weighting falls back to simple model mass/inertia where no
   custom hook is available.
-- FeatherPGS effective masses are fixed at the configuration in
+- Steel effective masses are fixed at the configuration in
   ``model.joint_q`` and are refreshed only on ``BODY_INERTIAL_PROPERTIES``
   notifications, outside graph capture.
 - USD ownership, automatic coupled-solver construction, and high-level tuning

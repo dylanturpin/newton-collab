@@ -1,1 +1,0 @@
-Preserve FeatherPGS contact-compliance and torsional-friction opt-ins when patch friction is the default: an omitted patch gain selects their supported point-friction law with a warning, while explicit incompatible patch gains are rejected.

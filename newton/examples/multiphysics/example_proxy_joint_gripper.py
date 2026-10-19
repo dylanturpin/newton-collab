@@ -4,13 +4,13 @@
 ###########################################################################
 # Example Proxy Joint Gripper
 #
-# A MuJoCo- or FeatherPGS-driven palm and two prismatic cube fingers grip a
+# A MuJoCo- or Steel-driven palm and two prismatic cube fingers grip a
 # VBD soft grid. The VBD entry receives the gripper bodies as body proxies and
 # keeps the fixed/prismatic joints enabled as proxy joints whose targets track
 # the rigid source joint configuration.
 #
 # Command: python -m newton.examples proxy_joint_gripper
-#          python -m newton.examples proxy_joint_gripper --rigid-solver featherpgs
+#          python -m newton.examples proxy_joint_gripper --rigid-solver steel
 #
 ###########################################################################
 
@@ -24,7 +24,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 
 
 @wp.kernel
@@ -106,14 +106,14 @@ class Example:
             "rigid_joint_angular_ke": 5.0e5 if self.scenario == "harsh" else 2.0e6,
         }
 
-        if args.rigid_solver == "featherpgs":
-            rigid_name = "fpgs"
+        if args.rigid_solver == "steel":
+            rigid_name = "steel"
 
             def rigid_factory(v):
-                return SolverFeatherPGS(
+                return SolverSteel(
                     v,
                     solve_mode="matrix_free",
-                    iterations=int(args.fpgs_iterations),
+                    iterations=int(args.steel_iterations),
                     enable_joint_limits=True,
                 )
 
@@ -377,12 +377,12 @@ class Example:
         parser.add_argument(
             "--rigid-solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Rigid solver that drives the gripper.",
         )
         parser.add_argument("--mujoco-iterations", type=int, default=20, help="MuJoCo solver iterations.")
-        parser.add_argument("--fpgs-iterations", type=int, default=20, help="FeatherPGS PGS iterations.")
+        parser.add_argument("--steel-iterations", type=int, default=20, help="Steel PGS iterations.")
         parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy coupling iterations per substep.")
         parser.add_argument(
             "--mass-scale",

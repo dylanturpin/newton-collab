@@ -269,9 +269,9 @@ class Example:
             )
             solver_config.dvi.max_alternating_iterations = 4
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
-        elif self.solver_type == "featherpgs":
+        elif self.solver_type == "steel":
             # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
-            self.solver = newton.solvers.SolverFeatherPGS(
+            self.solver = newton.solvers.SolverSteel(
                 self.model,
                 solve_mode="matrix_free",
                 contact_compliance=True,
@@ -386,7 +386,7 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
-        if self.solver_type == "featherpgs":
+        if self.solver_type == "steel":
             self.solver.validate_contact_compliance()
 
         self.sim_time += self.frame_dt
@@ -522,15 +522,15 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["xpbd", "mujoco", "kamino", "featherpgs"],
+            choices=["xpbd", "mujoco", "kamino", "steel"],
             default="mujoco",
-            help="Solver to use: 'xpbd', 'mujoco', 'kamino', or the experimental compliant 'featherpgs'.",
+            help="Solver to use: 'xpbd', 'mujoco', 'kamino', or the experimental compliant 'steel'.",
         )
         parser.add_argument(
             "--pgs-iterations",
             type=int,
             default=16,
-            help="FeatherPGS position iterations (only with --solver featherpgs).",
+            help="Steel position iterations (only with --solver steel).",
         )
         parser.add_argument(
             "--num-per-world",

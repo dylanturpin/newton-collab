@@ -1680,7 +1680,7 @@ class CollisionPipeline:
             body_pairs: Post-reduce materialized ordinary contacts by body-pair
                 patch.  This is intended for compound bodies made from many
                 colliders and is currently supported by
-                :class:`~newton.solvers.SolverFeatherPGS` only.  Must be used
+                :class:`~newton.solvers.SolverSteel` only.  Must be used
                 with ``mesh=True`` when mesh or heightfield collision paths
                 are present.
             body_pair_cell_size: Spatial cell edge [m] used to keep separated
@@ -1719,7 +1719,7 @@ class CollisionPipeline:
         contacts with identical packed winner keys may retain additional
         contacts.  It is an approximation with scene-dependent support error
         and possible upward torsional-friction bias; validate tipping- and
-        yaw-sensitive tasks. It supports contact matching and FeatherPGS warm
+        yaw-sensitive tasks. It supports contact matching and Steel warm
         starting with ``contact_matching="latest"``; sticky replay and active
         hydroelastic contacts remain unsupported. Call
         :meth:`CollisionPipeline.reset_contact_matching` and the solver's
@@ -1815,7 +1815,7 @@ class CollisionPipeline:
                 :class:`CollisionPipeline.ContactReductionConfig` to configure
                 the two stages explicitly.  Body-pair reduction is opt-in and
                 currently produces contacts supported only by
-                :class:`~newton.solvers.SolverFeatherPGS`.  In mesh or
+                :class:`~newton.solvers.SolverSteel`.  In mesh or
                 heightfield scenes, body-pair reduction requires the mesh
                 stage because the postpass cannot recover contacts lost while
                 materializing an over-capacity raw triangle stream.

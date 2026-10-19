@@ -1056,7 +1056,7 @@ add_example_test(
 for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack"):
     add_example_test(
         TestRobotExamples,
-        name=f"robot.example_fpgs_{tabletop_task}",
+        name=f"robot.example_steel_{tabletop_task}",
         devices=cuda_test_devices,
         test_options={"usd_required": True, "num-frames": 900},
         use_viewer=True,
@@ -1663,9 +1663,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_rigid_soft_contact",
     devices=cuda_test_devices,
-    test_options={"num-frames": 2, "solver": "coupled", "rigid-solver": "featherpgs", "vbd-iterations": 1},
+    test_options={"num-frames": 2, "solver": "coupled", "rigid-solver": "steel", "vbd-iterations": 1},
     use_viewer=True,
-    test_suffix="coupled_featherpgs",
+    test_suffix="coupled_steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1678,9 +1678,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_vbd_admm_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 30, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 30, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1693,9 +1693,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_admm_contact_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 120, "tray-solver": "featherpgs"},
+    test_options={"num-frames": 120, "tray-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1716,9 +1716,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_kamino_mujoco_admm_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 30, "world-count": 4, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 30, "world-count": 4, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1755,20 +1755,20 @@ add_example_test(
         "payload-kind": "vbd-cable",
         "payload-segments": 3,
         "vbd-iterations": 2,
-        "rigid-solver": "featherpgs",
+        "rigid-solver": "steel",
         "graph-capture": False,
     },
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
     allow_output_regexes=[(_WARP_SDF_CONSTANT_CONVERSION_WARNING_RE, "stderr")],
 )
 add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cable_ik_pick_place",
     devices=cuda_test_devices,
-    test_options={"rigid-solver": "featherpgs"},
+    test_options={"rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1781,9 +1781,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cloth_block",
     devices=cuda_test_devices,
-    test_options={"rigid-solver": "featherpgs"},
+    test_options={"rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1796,9 +1796,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_shirt_fold_stack",
     devices=cuda_test_devices,
-    test_options={"num-frames": 600, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 600, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1811,9 +1811,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_mpm_coupled_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1826,9 +1826,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_vbd_coupled_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1841,9 +1841,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_xpbd_coupled_solver",
     devices=cuda_test_devices,
-    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 2, "proxy-iterations": 1, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,
@@ -1856,9 +1856,9 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_proxy_joint_gripper",
     devices=cuda_test_devices,
-    test_options={"num-frames": 120, "rigid-solver": "featherpgs"},
+    test_options={"num-frames": 120, "rigid-solver": "steel"},
     use_viewer=True,
-    test_suffix="featherpgs",
+    test_suffix="steel",
 )
 add_example_test(
     TestMultiphysicsExamples,

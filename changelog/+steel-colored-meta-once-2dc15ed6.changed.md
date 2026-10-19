@@ -1,0 +1,1 @@
+Gather the `propagation_colored` unit records once per Steel step instead of before every sweep, and only when the prefetching unit body uses them. This removes about 0.2 ms per step at 1024 worlds. Results are unchanged.

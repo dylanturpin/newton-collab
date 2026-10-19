@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Interactive, force-driven FPGS tabletop demonstrations."""
+"""Interactive, force-driven Steel tabletop demonstrations."""
 
 import numpy as np
 import warp as wp
@@ -8,7 +8,7 @@ import warp as wp
 import newton
 import newton.examples
 import newton.utils
-from newton.solvers import SolverFeatherPGS
+from newton.solvers import SolverSteel
 
 from ._tabletop_common import box
 from ._tabletop_robot import make_arm
@@ -44,7 +44,7 @@ class TabletopDemo:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
         if not wp.get_device().is_cuda:
-            raise RuntimeError("These FPGS matrix-free examples require a CUDA device")
+            raise RuntimeError("These Steel matrix-free examples require a CUDA device")
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -118,7 +118,7 @@ class TabletopDemo:
             contact_matching="disabled",
         )
         self.contacts = self.pipeline.contacts()
-        self.solver = SolverFeatherPGS(
+        self.solver = SolverSteel(
             self.model,
             solve_mode="matrix_free",
             articulated_contact_response=args.contact_response,
@@ -150,12 +150,12 @@ class TabletopDemo:
         parser = newton.examples.create_parser()
         parser.set_defaults(num_frames=900)
         parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
-        parser.add_argument("--iterations", type=int, default=12, help="FPGS sweeps per substep")
+        parser.add_argument("--iterations", type=int, default=12, help="Steel sweeps per substep")
         parser.add_argument(
             "--contact-response",
             choices=("immediate", "propagation", "propagation_fused", "propagation_colored"),
             default="immediate",
-            help="FPGS matrix-free articulated contact response",
+            help="Steel matrix-free articulated contact response",
         )
         return parser
 
