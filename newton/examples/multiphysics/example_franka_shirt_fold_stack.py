@@ -6,14 +6,14 @@
 #
 # The T-shirt and Franka of the cloth Franka example, at meter scale and
 # with two-way coupling. A fixed-base Franka, simulated by MuJoCo or
-# FeatherPGS, folds the VBD T-shirt with scripted IK keyframes, then picks
+# Steel, folds the VBD T-shirt with scripted IK keyframes, then picks
 # two rigid blocks off a pedestal and stacks them on the folded shirt.
 # SolverCoupledProxy exposes the gripper and the blocks to VBD as proxies,
 # so the cloth both resists the fingers and carries the block stack. Cloth
 # grasps are not deterministic: task_success() reports each run's outcome.
 #
 # Command: python -m newton.examples franka_shirt_fold_stack
-#          python -m newton.examples franka_shirt_fold_stack --rigid-solver featherpgs
+#          python -m newton.examples franka_shirt_fold_stack --rigid-solver steel
 #
 ###########################################################################
 
@@ -29,7 +29,7 @@ import newton.examples
 import newton.ik as ik
 import newton.usd
 import newton.utils
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 
 FRANKA_BASE = (-0.5, -0.5, 0.0)
 FRANKA_Q = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307, 0.785, 0.032, 0.032]
@@ -146,8 +146,8 @@ class Example:
             self.model, broad_phase="explicit", soft_contact_gap=CLOTH_CONTACT_GAP
         )
         self.contacts = self.collision_pipeline.contacts()
-        if self.rigid_solver == "featherpgs":
-            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+        if self.rigid_solver == "steel":
+            # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
         self._build_solver(args)
         self._build_ik()
@@ -205,7 +205,7 @@ class Example:
             gravcomp.values = {}
         for body in self.franka_bodies:
             gravcomp.values[body] = 1.0
-            if self.rigid_solver == "featherpgs":
+            if self.rigid_solver == "steel":
                 builder.body_disable_gravity[body] = True
 
         block_cfg = newton.ModelBuilder.ShapeConfig(
@@ -312,11 +312,11 @@ class Example:
     # Solver
     # ------------------------------------------------------------------
     def _build_solver(self, args):
-        if self.rigid_solver == "featherpgs":
-            rigid_name = "fpgs"
+        if self.rigid_solver == "steel":
+            rigid_name = "steel"
 
             def rigid_solver(view):
-                return SolverFeatherPGS(
+                return SolverSteel(
                     view,
                     solve_mode="matrix_free",
                     iterations=24,
@@ -659,7 +659,7 @@ class Example:
         parser.add_argument(
             "--rigid-solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Solver that owns the Franka arm and the blocks.",
         )

@@ -1,1 +1,0 @@
-Solve the experimental contact torsion rows of `SolverFeatherPGS` with `articulated_contact_response="propagation_colored"`, inside the colored unit of each group's last contact, after the group's other rows.

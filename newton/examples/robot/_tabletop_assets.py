@@ -23,7 +23,7 @@ def _asset(name, floating, mu, restitution):
     asset.default_shape_cfg.gap = 0.00025
     asset.default_joint_cfg.armature = 1.0e-5
     # Keep every authored convex piece; the largest has 128 vertices.
-    asset.add_usd(newton.examples.get_asset(f"fpgs_tabletop/{name}.usd"), floating=floating, mesh_maxhullvert=128)
+    asset.add_usd(newton.examples.get_asset(f"steel_tabletop/{name}.usd"), floating=floating, mesh_maxhullvert=128)
     return asset
 
 

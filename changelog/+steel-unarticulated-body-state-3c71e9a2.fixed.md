@@ -1,0 +1,1 @@
+Fix `SolverSteel` publishing an uninitialized `body_qd` (often NaN) for a body outside every articulation, such as a jointless kinematic link; such bodies now pass their input `body_q` and `body_qd` through the step, as in `SolverXPBD`. With friction anchors on, the bad velocity could also change the rollout.

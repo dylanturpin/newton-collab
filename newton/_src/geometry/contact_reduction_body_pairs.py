@@ -101,7 +101,7 @@ representatives from the pre-prediction contact geometry. A spatial winner can
 therefore remain speculative after prediction while a discarded interior
 candidate becomes penetrating. Increasing XPBD iterations reduced a curved-foot
 rocking residual in one characterization scene but did not establish a
-class-wide selection invariant, so XPBD rejects reduced buffers. FeatherPGS is
+class-wide selection invariant, so XPBD rejects reduced buffers. Steel is
 the supported solver.
 
 **Known characteristic -- torsional patch friction.** During twist, friction at

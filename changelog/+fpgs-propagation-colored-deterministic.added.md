@@ -1,1 +1,0 @@
-Allow `deterministic=True` with FeatherPGS `articulated_contact_response="propagation_colored"`: repeated runs of the colored response are bitwise identical to each other; bitwise agreement with the immediate response is not guaranteed. Colored sweeps no longer write to kinematic bodies shared by several rows of one color.

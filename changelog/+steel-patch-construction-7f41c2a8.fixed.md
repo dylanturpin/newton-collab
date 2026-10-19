@@ -1,0 +1,1 @@
+Reduce Steel friction-patch construction scans with compact member and anchor indices, and reject incompatible history before transporting spring displacement. Preserve contact ordering and existing friction behavior.

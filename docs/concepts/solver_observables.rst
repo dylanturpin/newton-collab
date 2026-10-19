@@ -136,13 +136,13 @@ Standard observables
      - Incoming parent-joint wrenches on rigid bodies
      - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp or native MuJoCo CPU,
        :class:`~newton.solvers.SolverFeatherstone`,
-       :class:`~newton.solvers.SolverFeatherPGS`, and
+       :class:`~newton.solvers.SolverSteel`, and
        :class:`~newton.solvers.SolverXPBD`
    * - ``CONTACT_F`` / ``observables.contact_f``
      - Contact spatial forces aligned with the bound contacts
      - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp,
        :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverVBD`,
-       :class:`~newton.solvers.SolverKamino`, and :class:`~newton.solvers.SolverFeatherPGS`
+       :class:`~newton.solvers.SolverKamino`, and :class:`~newton.solvers.SolverSteel`
 
 :class:`~newton.solvers.SolverKamino` computes acceleration as the discrete
 step-average ``(body_qd_out - body_qd_in) / dt``. Across an impact, this includes
@@ -158,7 +158,7 @@ implicit, or implicitfast integration; discrete integration supports only
 ``QFRC_ACTUATOR``. MuJoCo Warp supports body
 observables on both CPU and GPU.
 
-:class:`~newton.solvers.SolverFeatherPGS` accounts ``BODY_PARENT_F`` from the step's solved
+:class:`~newton.solvers.SolverSteel` accounts ``BODY_PARENT_F`` from the step's solved
 motion, including its contact, friction and loop-closure impulses, so loads carried by a subtree
 reach the joints that support it; see the solver's documentation for the cases it leaves out.
 Like :class:`~newton.solvers.SolverMuJoCo`, it reconstructs the wrench from the bodies' rigid
@@ -169,7 +169,7 @@ inertia, without joint armature, so a dynamic joint's projected wrench is its ge
 :class:`~newton.solvers.SolverFeatherstone` reports the start-of-step inverse dynamics at zero
 joint acceleration instead.
 
-:class:`~newton.solvers.SolverFeatherPGS` reports only the linear part of each rigid
+:class:`~newton.solvers.SolverSteel` reports only the linear part of each rigid
 contact force; the torque part is zero. Contacts without solved rows, such as rows
 dropped for capacity or skipped for sleeping islands, report zero. A sleeping body's
 contacts therefore read as unloaded even though they still support it; use

@@ -6,7 +6,7 @@
 #
 # A fixed-base Franka FR3 arm uses Newton's GPU IK solver to pick up a
 # deformable cable and move it to a target location. The arm is simulated
-# by MuJoCo or FeatherPGS (PD position targets driven from the IK result),
+# by MuJoCo or Steel (PD position targets driven from the IK result),
 # the cable is a VBD rod, and SolverCoupledProxy couples the two: the gripper
 # bodies are exposed to VBD as virtual proxies so the cable detects them as
 # contacts.
@@ -17,7 +17,7 @@
 # Standalone: depends only on newton + warp (no IsaacLab).
 #
 # Command: python -m newton.examples franka_cable_ik_pick_place
-#          python -m newton.examples franka_cable_ik_pick_place --rigid-solver featherpgs
+#          python -m newton.examples franka_cable_ik_pick_place --rigid-solver steel
 ###########################################################################
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 
 # Initial Franka joint configuration (7 arm + 2 finger).
 FRANKA_Q = [
@@ -119,8 +119,8 @@ class Example:
             shape_pairs_filtered=self._ground_shape_pairs(),
         )
         self.contacts = self.collision_pipeline.contacts()
-        if self.rigid_solver == "featherpgs":
-            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+        if self.rigid_solver == "steel":
+            # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
         self._build_solvers(args)
         self._build_ik()
@@ -233,7 +233,7 @@ class Example:
             gravcomp.values = {}
         for body in self.franka_bodies:
             gravcomp.values[body] = 1.0
-            if self.rigid_solver == "featherpgs":
+            if self.rigid_solver == "steel":
                 builder.body_disable_gravity[body] = True
 
         # VBD cable.
@@ -298,14 +298,14 @@ class Example:
     # Solvers
     # ------------------------------------------------------------------
     def _build_solvers(self, args):
-        if self.rigid_solver == "featherpgs":
-            rigid_name = "fpgs"
+        if self.rigid_solver == "steel":
+            rigid_name = "steel"
 
             def rigid_solver(v):
-                return SolverFeatherPGS(
+                return SolverSteel(
                     v,
                     solve_mode="matrix_free",
-                    iterations=int(args.fpgs_iterations),
+                    iterations=int(args.steel_iterations),
                     enable_joint_limits=True,
                     articulation_constraint_max=64,
                 )
@@ -560,7 +560,7 @@ class Example:
         parser.add_argument(
             "--rigid-solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Solver that owns the Franka arm.",
         )
@@ -584,7 +584,7 @@ class Example:
         parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
         parser.add_argument("--mujoco-iterations", type=int, default=100, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=20, help="MuJoCo line-search iterations.")
-        parser.add_argument("--fpgs-iterations", type=int, default=24, help="FeatherPGS PGS iterations.")
+        parser.add_argument("--steel-iterations", type=int, default=24, help="Steel PGS iterations.")
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",

@@ -930,7 +930,7 @@ class ModelBuilder:
 
         :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True``
         on the solver constructor for this field to take effect.
-        :class:`~newton.solvers.SolverFeatherPGS` uses the arithmetic mean of the
+        :class:`~newton.solvers.SolverSteel` uses the arithmetic mean of the
         two shapes' coefficients, each clamped to ``[0, 1]`` (non-finite values
         count as zero), for contacts whose incident normal speed exceeds its
         ``restitution_velocity_threshold``.
@@ -5601,7 +5601,7 @@ class ModelBuilder:
                 :meth:`collapse_fixed_joints`, which always accumulates mass and inertia across merged bodies.
             is_kinematic: If True, the body is kinematic and does not respond to forces.
                 Only root bodies (bodies whose joint parent is ``-1``) may be kinematic.
-            disable_gravity: Exclude this body's gravitational wrench in FeatherPGS and Featherstone.
+            disable_gravity: Exclude this body's gravitational wrench in Steel and Featherstone.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
@@ -5693,7 +5693,7 @@ class ModelBuilder:
                 center of mass, or inertia. This does not affect merging behavior in
                 :meth:`collapse_fixed_joints`, which always accumulates mass and inertia across merged bodies.
             is_kinematic: If True, the body is kinematic and does not respond to forces.
-            disable_gravity: Exclude this body's gravitational wrench in FeatherPGS and Featherstone.
+            disable_gravity: Exclude this body's gravitational wrench in Steel and Featherstone.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:

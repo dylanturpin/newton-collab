@@ -1,1 +1,0 @@
-Speed up the fused matrix-free Gauss-Seidel sweep of `SolverFeatherPGS` by stepping over the second row of each sliding and free-rigid rolling friction pair, which the pair's first row already solves. The rows solved, their order and their arithmetic are unchanged.

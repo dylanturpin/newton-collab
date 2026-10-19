@@ -375,11 +375,11 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples cable_plectoneme</code>
     </td>
   </tr>
-  <tr><td colspan="3"><h3>FPGS Tabletop Examples (CUDA)</h3></td></tr>
+  <tr><td colspan="3"><h3>Steel Tabletop Examples (CUDA)</h3></td></tr>
   <tr>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_fpgs_bolt_sweep.py"><img width="320" src="docs/images/examples/example_fpgs_bolt_sweep.jpg" alt="Bolt sweep"></a><br><code>python -m newton.examples fpgs_bolt_sweep</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_fpgs_wrecking_ball.py"><img width="320" src="docs/images/examples/example_fpgs_wrecking_ball.jpg" alt="Wrecking ball"></a><br><code>python -m newton.examples fpgs_wrecking_ball</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_fpgs_plate_rack.py"><img width="320" src="docs/images/examples/example_fpgs_plate_rack.jpg" alt="Plate rack"></a><br><code>python -m newton.examples fpgs_plate_rack</code></td>
+    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_bolt_sweep.py"><img width="320" src="docs/images/examples/example_steel_bolt_sweep.jpg" alt="Bolt sweep"></a><br><code>python -m newton.examples steel_bolt_sweep</code></td>
+    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_wrecking_ball.py"><img width="320" src="docs/images/examples/example_steel_wrecking_ball.jpg" alt="Wrecking ball"></a><br><code>python -m newton.examples steel_wrecking_ball</code></td>
+    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_plate_rack.py"><img width="320" src="docs/images/examples/example_steel_plate_rack.jpg" alt="Plate rack"></a><br><code>python -m newton.examples steel_plate_rack</code></td>
   </tr>
   <tr>
     <td align="center" width="33%">
