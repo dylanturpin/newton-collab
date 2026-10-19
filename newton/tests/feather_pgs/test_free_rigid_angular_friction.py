@@ -5,10 +5,9 @@
 
 import gc
 import math
-import os
 import unittest
 from typing import NamedTuple
-from unittest import mock
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -30,7 +29,12 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_pgs_solve_propagation_contact_kernel,
 )
 from newton.solvers import SolverBase, SolverFeatherPGS
-from newton.tests.feather_pgs._fixtures import set_torsion_radius
+from newton.tests.feather_pgs._fixtures import (
+    COLORED_VARIANTS,
+    colored_variant_switches,
+    select_colored_variant,
+    set_torsion_radius,
+)
 
 _DT = 1.0 / 480.0
 _RADIUS = 0.03
@@ -913,62 +917,30 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
 
 
 _COLORED = {"articulated_contact_response": "propagation_colored"}
-_COLORED_SWITCHES = (
-    "FEATHER_PGS_COLORED_PREFETCH",
-    "FEATHER_PGS_COLORED_STAGED",
-    "FEATHER_PGS_COLORED_PACKED",
-    "FEATHER_PGS_COLORED_STRAIGHT_LINE",
-    "FEATHER_PGS_COLORED_LANES",
-)
-# Each colored solve body, selected by its kernel switches, with a tag of the kernel it must build.
-_COLORED_VARIANTS = {
-    "packed": ({"FEATHER_PGS_COLORED_PACKED": "1"}, "_pf1_st0_pk1"),
-    "prefetch": ({"FEATHER_PGS_COLORED_PACKED": "0"}, "_pf1_st0_pk0"),
-    "staged": ({"FEATHER_PGS_COLORED_STAGED": "1"}, "_pf1_st1"),
-    "reference": ({"FEATHER_PGS_COLORED_PREFETCH": "0"}, "_pf0_st0_pk0_sl1"),
-    "row loop": ({"FEATHER_PGS_COLORED_PREFETCH": "0", "FEATHER_PGS_COLORED_STRAIGHT_LINE": "0"}, "_sl0"),
-    "two lanes": ({"FEATHER_PGS_COLORED_LANES": "2"}, "_r2_"),
-    "four lanes": ({"FEATHER_PGS_COLORED_LANES": "4"}, "_r4_"),
-    "block": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_sb"),
-    "block global": ({"FEATHER_PGS_COLORED_LANES": "3"}, "_gb"),
-}
-
-
-def _colored_variant(name, on_solver=None):
-    """Return the environment and solver hook that build colored variant ``name`` and check its kernel."""
-    env, tag = _COLORED_VARIANTS[name]
-
-    def hook(solver):
-        if name == "block global":
-            # Bodies past the staging cap keep the twists in global memory; the body list is unused then.
-            solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
-                solver._propagation_max_constraints,
-                solver._color_world_offsets.shape[0] // solver._world_count,
-                solver._propagation_colored_block_dim,
-                385,
-                str(solver.model.device.arch),
-                free_rigid_angular=solver._free_rigid_angular_rows,
-            )
-        warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
-        kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
-        if name == "staged" and warp_kernel is not None and "_pf1_st1" not in kernel.key:
-            raise unittest.SkipTest("shared-memory staging needs cp.async")
-        assert tag in kernel.key, f"{name} built {kernel.key}"
-        assert "_fra" in kernel.key or not solver._free_rigid_angular_rows, kernel.key
-        if on_solver is not None:
-            on_solver(solver)
-
-    return env, hook
 
 
 def _simulate_colored(variant, *args, on_solver=None, **kwargs):
-    """Run :func:`_simulate` on the colored response with only ``variant``'s kernel switches set."""
-    env, hook = _colored_variant(variant, on_solver)
-    with mock.patch.dict(os.environ, env):
-        for key in _COLORED_SWITCHES:
-            if key not in env:
-                os.environ.pop(key, None)
+    """Run :func:`_simulate` on the colored response built as colored variant ``variant``."""
+
+    def hook(solver):
+        select_colored_variant(solver, variant)
+        if on_solver is not None:
+            on_solver(solver)
+
+    with colored_variant_switches(variant):
         return _simulate(*args, on_solver=hook, **_COLORED, **kwargs)
+
+
+def _sweep_colored(variant, on_solver=None):
+    """Record :func:`_sweep_box` on deterministic colored variant ``variant``."""
+
+    def hook(solver):
+        select_colored_variant(solver, variant)
+        if on_solver is not None:
+            on_solver(solver)
+
+    with colored_variant_switches(variant):
+        return _sweep_box(on_solver=hook, response={**_COLORED, "deterministic": True})
 
 
 def _trajectory(*args, simulate=_simulate, **kwargs):
@@ -1051,7 +1023,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
     """The rows on the colored propagation response, solved inside their contact's colored unit."""
 
     def test_units_carry_the_angular_rows(self):
-        """Lay out four-, five- and six-row units and send them past the straight-line kinds to the row loops."""
+        """Lay out four-, five- and six-row units that keep the straight-line kind for their contact row and sliding pair."""
         for torsional, rolling, slots in ((0.001, 0.0, 4), (0.0, 0.002, 5), (0.001, 0.002, 6)):
             seen = {}
 
@@ -1082,7 +1054,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
                 angular += [PGS_CONSTRAINT_TYPE_CONTACT_SPIN] if torsional else []
                 self.assertEqual(seen["types"][3:], angular)
                 self.assertEqual(seen["rows"], [slots])
-                self.assertEqual(seen["kinds"], [0])
+                self.assertEqual(seen["kinds"], [1])
 
     def test_every_variant_tracks_plain_and_immediate(self):
         """Track the plain and immediate twists of a rolling, spinning sphere at every step on each colored body.
@@ -1099,7 +1071,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
                 "plain": _trajectory("sphere", 0.0, **kwargs, **_PROPAGATION),
             }
             effect = float(np.abs(references["immediate"][1][-1] - twist_off[-1]).max())
-            for variant in _COLORED_VARIANTS:
+            for variant in COLORED_VARIANTS:
                 with self.subTest(rows=label, variant=variant):
                     pose, twist = _trajectory(
                         "sphere", 0.0, simulate=lambda *a, v=variant, **k: _simulate_colored(v, *a, **k), **kwargs
@@ -1122,7 +1094,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
             with self.subTest(variant=variant):
 
                 def folded(solver, test=self):
-                    test.assertTrue(solver._has_prescribed_bodies)
+                    test.assertTrue(np.any(solver._body_prescribed.numpy()))
 
                 _, twist = _trajectory(
                     "sphere",
@@ -1134,14 +1106,9 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
 
     def test_rows_stay_within_the_pooled_load_after_every_sweep(self):
         """Hold the rows at zero before friction starts and within the pooled patch load after, on each colored body."""
-        for variant in _COLORED_VARIANTS:
+        for variant in COLORED_VARIANTS:
             with self.subTest(variant=variant):
-                env, hook = _colored_variant(variant)
-                with mock.patch.dict(os.environ, env):
-                    for key in _COLORED_SWITCHES:
-                        if key not in env:
-                            os.environ.pop(key, None)
-                    sweeps = _sweep_box(on_solver=hook, response={**_COLORED, "deterministic": True})
+                sweeps = _sweep_colored(variant)
                 self.assertTrue(any(sweep.offset < sweep.friction_start for sweep in sweeps))
                 _assert_cold_before_friction_start(self, sweeps)
                 _assert_within_the_pooled_load(self, sweeps)
@@ -1180,12 +1147,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
 
                 moved = {}
                 for name, on_solver in (("rows", None), ("rows off", rows_off)):
-                    env, hook = _colored_variant(variant, on_solver=on_solver)
-                    with mock.patch.dict(os.environ, env):
-                        for key in _COLORED_SWITCHES:
-                            if key not in env:
-                                os.environ.pop(key, None)
-                        sweeps = _sweep_box(on_solver=hook, response={**_COLORED, "deterministic": True})
+                    sweeps = _sweep_colored(variant, on_solver=on_solver)
                     blocks = [
                         sweep.after[row : row + width] for sweep in sweeps for row, width in _angular_blocks(sweep)
                     ]
@@ -1261,13 +1223,9 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
         """
         for variant, steps in (("row loop", 20), ("block", 20), ("packed", 1), ("reference", 1)):
             with self.subTest(variant=variant):
-                env, _ = _COLORED_VARIANTS[variant]
-                with mock.patch.dict(os.environ, env):
-                    for key in _COLORED_SWITCHES:
-                        if key not in env:
-                            os.environ.pop(key, None)
+                with colored_variant_switches(variant):
                     uncapped, _ = _pile_rollout((4.0, 1.0), steps, **_COLORED)
-                    with mock.patch.object(solver_feather_pgs, "PROPAGATION_COLOR_TAIL", 2):
+                    with patch.object(solver_feather_pgs, "PROPAGATION_COLOR_TAIL", 2):
                         capped, solver = _pile_rollout((4.0, 1.0), steps, **_COLORED)
                         entries = solver._color_world_offsets.shape[0] // solver._world_count
                         offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, entries)
@@ -1281,11 +1239,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
         """Replay captured colored steps bit for bit against eager steps, on each colored body."""
         for variant in ("packed", "staged", "reference", "two lanes", "block"):
             with self.subTest(variant=variant):
-                env, _ = _COLORED_VARIANTS[variant]
-                with mock.patch.dict(os.environ, env):
-                    for key in _COLORED_SWITCHES:
-                        if key not in env:
-                            os.environ.pop(key, None)
+                with colored_variant_switches(variant):
                     eager, _ = _pile_rollout((4.0, 1.0), 30, **_COLORED)
                     captured, _ = _pile_rollout((4.0, 1.0), 30, graph_at=3, **_COLORED)
                 np.testing.assert_array_equal(captured, eager)
