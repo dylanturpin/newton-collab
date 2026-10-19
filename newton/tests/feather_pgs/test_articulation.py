@@ -3755,6 +3755,43 @@ def test_sleeping_parent_wrench_from_legacy_to_observable(test, device):
     np.testing.assert_array_equal(states[0].body_parent_f.numpy(), legacy)
 
 
+def test_parent_wrench_eager_step_before_first_replay(test, device):
+    """Step eagerly between capturing a BODY_PARENT_F step and its first replay, and match an eager twin."""
+    for velocity_limits in (False, True):
+        with test.subTest(enable_joint_velocity_limits=velocity_limits):
+            runs = []
+            for _ in range(2):
+                model, pipeline = _parent_wrench_scene(device)
+                solver = SolverFeatherPGS(
+                    model,
+                    solve_mode="matrix_free",
+                    friction_anchor_beta=0.0,
+                    articulation_constraint_max=128,
+                    enable_joint_velocity_limits=velocity_limits,
+                )
+                runs.append((model, pipeline, solver, solver.observables(FLAGS), [model.state(), model.state()]))
+
+            def step(run):
+                model, pipeline, solver, observables, states = run
+                contacts = pipeline.contacts()
+                control = model.control()
+                for i in (0, 1):
+                    pipeline.collide(states[i], contacts)
+                    solver.step(states[i], states[1 - i], control, contacts, DT_parent_wrench, observables=observables)
+
+            with wp.ScopedCapture(device) as capture:
+                step(runs[0])
+            step(runs[0])
+            step(runs[1])
+            wp.synchronize_device(device)
+            for _ in range(3):
+                wp.capture_launch(capture.graph)
+                step(runs[1])
+            captured, eager = (run[3].body_parent_f.numpy() for run in runs)
+            test.assertGreater(np.abs(eager).max(), 1.0)
+            np.testing.assert_allclose(captured, eager, rtol=1.0e-5, atol=1.0e-5)
+
+
 def _branched_chains(device, world_count=2):
     """Two-branch revolute trees on a fixed base plus a free box, with gravity, revolute joint forces and velocities."""
     template = newton.ModelBuilder()
@@ -4515,6 +4552,7 @@ for _name in (
     "test_sleeping_parent_wrench_is_independent_of_the_output",
     "test_parent_wrench_first_requested_after_sleep",
     "test_sleeping_parent_wrench_from_legacy_to_observable",
+    "test_parent_wrench_eager_step_before_first_replay",
 ):
     add_function_test(TestFeatherPGSParentWrench, _name, globals()[_name], devices=get_cuda_test_devices())
 add_function_test(
