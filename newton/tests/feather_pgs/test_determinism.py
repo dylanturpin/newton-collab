@@ -13,12 +13,16 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
     crba_fill_par_dof,
 )
 from newton.solvers import SolverBase, SolverFeatherPGS
+from newton.tests.feather_pgs import test_propagation
+from newton.tests.feather_pgs._fixtures import set_torsion_radius
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
 # Free root, then two ball joints: every joint has several DOFs.
@@ -486,12 +490,424 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                 np.testing.assert_array_equal(paths[0], paths[1], err_msg="same contacts dropped differently")
 
 
-def test_deterministic_requires_immediate_contact_response(test, device):
+def test_deterministic_rejects_fused_and_warm_started_colored(test, device):
     model = _build_contact_scene(device, worlds=1, boxes=1, ants=1)
     with test.assertRaisesRegex(ValueError, "deterministic=True requires"):
         SolverFeatherPGS(
-            model, deterministic=True, solve_mode="matrix_free", articulated_contact_response="propagation"
+            model, deterministic=True, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
         )
+    with test.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
+        SolverFeatherPGS(
+            model,
+            deterministic=True,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+            contact_warmstart=True,
+        )
+
+
+# A fixed-base three-link arm pressed into a 5x5x2 heap of boxes and spheres: every link and every heap body has
+# contacts, about 1.9k per world. Plain propagation carries all of them.
+PROPAGATION_SOLVER_OPTIONS = {
+    "solve_mode": "matrix_free",
+    "articulated_contact_response": "propagation",
+    "iterations": 16,
+    "articulation_constraint_max": 256,
+    "free_body_constraint_max": 6144,
+    "friction_anchor_beta": 0.2,
+}
+
+
+def _build_heap_arm_world(seed):
+    env = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+    joints, parent = [], -1
+    for link_index in range(3):
+        link = env.add_link(xform=wp.transform(wp.vec3(-0.12 + 0.1 * link_index, 0.0, 0.1025), wp.quat_identity()))
+        env.add_shape_box(link, hx=0.05, hy=0.03, hz=0.02, cfg=cfg)
+        parent_xform = wp.transform(wp.vec3(-0.17, 0.0, 0.1025) if parent < 0 else wp.vec3(0.05, 0.0, 0.0))
+        joints.append(
+            env.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=parent_xform,
+                child_xform=wp.transform(wp.vec3(-0.05, 0.0, 0.0)),
+                target_kd=0.2,
+            )
+        )
+        parent = link
+    env.add_articulation(joints)
+    rng = np.random.default_rng(seed)
+    for ix in range(5):
+        for iy in range(5):
+            for iz in range(2):
+                pose = wp.transform(
+                    wp.vec3((ix - 2) * 0.042 + 0.0008 * rng.uniform(-1.0, 1.0), (iy - 2) * 0.042, 0.021 + 0.041 * iz),
+                    wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(rng.uniform(-0.03, 0.03))),
+                )
+                body = env.add_body(xform=pose)
+                if (ix + iy + iz) % 2:
+                    env.add_shape_sphere(body, radius=0.02, cfg=cfg)
+                else:
+                    env.add_shape_box(body, hx=0.02, hy=0.02, hz=0.02, cfg=cfg)
+    return env
+
+
+def _build_heap_arm_scene(device, seeds, global_floor=False):
+    """One heap-and-arm world per seed, in the given order, so world contents follow their seed, not their slot.
+
+    ``global_floor`` replaces the ground plane with a kinematic box outside every world, which all worlds touch.
+    """
+    builder = newton.ModelBuilder()
+    for seed in seeds:
+        builder.add_world(_build_heap_arm_world(seed))
+    if global_floor:
+        floor = builder.add_link(is_kinematic=True)
+        builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+    else:
+        builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
+def _run_heap_arm(model, steps, *, cached, warmstart, graph=False, on_step=None):
+    """Return each world's body poses after every second step, and the final state hash."""
+    solver = SolverFeatherPGS(
+        model,
+        deterministic=True,
+        propagation_cached_response=cached,
+        contact_warmstart=warmstart,
+        **PROPAGATION_SOLVER_OPTIONS,
+    )
+    pipeline = newton.CollisionPipeline(
+        model, deterministic=True, contact_matching="sticky" if warmstart else "disabled"
+    )
+    contacts = pipeline.contacts()
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    torques = np.zeros(model.joint_dof_count, dtype=np.float32)
+    torques[model.joint_qd_start.numpy()[:-1][model.joint_type.numpy() == newton.JointType.REVOLUTE]] = -0.3
+    control.joint_f.assign(torques)
+
+    def step(state_in, state_out):
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+
+    poses = []
+    if graph:
+        with wp.ScopedCapture(device=model.device) as capture:
+            step(state_0, state_1)
+            step(state_1, state_0)
+        for _ in range(steps // 2):
+            wp.capture_launch(capture.graph)
+            poses.append(state_0.body_q.numpy())
+    else:
+        for index in range(steps):
+            step(state_0, state_1)
+            state_0, state_1 = state_1, state_0
+            if on_step is not None:
+                on_step(index, solver, contacts)
+            if index % 2:
+                poses.append(state_0.body_q.numpy())
+    in_world = model.body_world.numpy() >= 0
+    per_world = np.stack(poses)[:, in_world].reshape(len(poses), model.world_count, -1, 7)
+    return per_world, _sample(state_0)
+
+
+def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
+    """Repeat plain propagation bitwise, eager and captured, with and without the cached response and warm start."""
+    model = _build_heap_arm_scene(device, (0, 1, 2))
+    arm_bodies = np.arange(3)
+    seen = {}
+
+    def observe(index, solver, contacts):
+        if index != 0:
+            return
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        body_0 = model.shape_body.numpy()[contacts.rigid_contact_shape0.numpy()[:count]]
+        body_1 = model.shape_body.numpy()[contacts.rigid_contact_shape1.numpy()[:count]]
+        bodies = np.concatenate([body_0, body_1])
+        seen["contacts_per_world"] = np.bincount(
+            model.body_world.numpy()[np.where(body_0 >= 0, body_0, body_1)], minlength=3
+        )
+        seen["active_links"] = np.intersect1d(bodies, arm_bodies).size
+        seen["paths"] = np.bincount(solver._contact_path.numpy()[:count] + 1, minlength=4)
+
+    _run_heap_arm(model, 2, cached=True, warmstart=False, on_step=observe)
+    test.assertGreater(seen["contacts_per_world"].min(), 1000)
+    test.assertEqual(seen["active_links"], 3)
+    # Contacts between the arm's own links stay dense; every other contact takes the propagation route.
+    test.assertEqual(seen["paths"][0] + seen["paths"][2], 0)
+    test.assertGreater(seen["paths"][3], 20 * seen["paths"][1])
+    first = {}
+    for cached in (True, False):
+        for warmstart in (False, True):
+            for graph in (False, True):
+                with test.subTest(cached=cached, warmstart=warmstart, graph=graph):
+                    runs = [_run_heap_arm(model, 40, cached=cached, warmstart=warmstart, graph=graph) for _ in range(3)]
+                    for poses, sample in runs[1:]:
+                        np.testing.assert_array_equal(poses, runs[0][0])
+                        test.assertEqual(sample, runs[0][1])
+                    test.assertTrue(runs[0][1][1])
+                    first[cached, warmstart, graph] = runs[0]
+            with test.subTest(cached=cached, warmstart=warmstart, graph="eager vs captured"):
+                np.testing.assert_array_equal(first[cached, warmstart, True][0], first[cached, warmstart, False][0])
+                test.assertEqual(first[cached, warmstart, True][1], first[cached, warmstart, False][1])
+
+
+def test_deterministic_propagation_is_world_permutation_invariant(test, device):
+    """Give each world the same trajectory, bitwise, whichever slot it occupies."""
+    order = (2, 0, 1)
+    in_order = _build_heap_arm_scene(device, (0, 1, 2))
+    permuted = _build_heap_arm_scene(device, order)
+    for cached in (True, False):
+        for warmstart in (False, True):
+            with test.subTest(cached=cached, warmstart=warmstart):
+                reference, _ = _run_heap_arm(in_order, 40, cached=cached, warmstart=warmstart)
+                moved, _ = _run_heap_arm(permuted, 40, cached=cached, warmstart=warmstart)
+                for slot, seed in enumerate(order):
+                    np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
+
+
+@wp.kernel
+def _accumulate_warmstart_in_reverse_row_order(
+    constraint_count: wp.array[int],
+    body_a: wp.array2d[int],
+    body_b: wp.array2d[int],
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    MiJt_a: wp.array3d[float],
+    MiJt_b: wp.array3d[float],
+    impulses: wp.array2d[float],
+    max_constraints: int,
+    body_qd: wp.array2d[float],
+    body_impulses: wp.array2d[float],
+):
+    """Seed the warm start in reverse row order: one order an atomic scatter may take."""
+    tid = wp.tid()
+    world = tid // 6
+    k = tid - world * 6
+    count = wp.min(constraint_count[world], max_constraints)
+    for step in range(count):
+        row = count - 1 - step
+        impulse = impulses[world, row]
+        if impulse != 0.0:
+            ba = body_a[world, row]
+            bb = body_b[world, row]
+            if ba >= 0:
+                body_qd[ba, k] = body_qd[ba, k] + MiJt_a[world, row, k] * impulse
+                body_impulses[ba, k] = body_impulses[ba, k] + J_a[world, row, k] * impulse
+            if bb >= 0:
+                body_qd[bb, k] = body_qd[bb, k] + MiJt_b[world, row, k] * impulse
+                body_impulses[bb, k] = body_impulses[bb, k] + J_b[world, row, k] * impulse
+
+
+def test_deterministic_propagation_warm_start_sums_in_row_order(test, device):
+    """Seed warm-started impulses in row order, which a reordered sum over a shared body does not reproduce."""
+    model = _build_heap_arm_scene(device, (1,))
+    seen = {"shared": 0, "arm_links": 0}
+    seed = SolverFeatherPGS._apply_propagation_warmstart_velocity
+
+    def recording_seed(solver):
+        count = int(solver._propagation_constraint_count.numpy()[0])
+        seeded = solver._propagation_impulses.numpy()[0, :count] != 0.0
+        bodies = np.concatenate(
+            [
+                solver._propagation_body_a.numpy()[0, :count][seeded],
+                solver._propagation_body_b.numpy()[0, :count][seeded],
+            ]
+        )
+        bodies = bodies[bodies >= 0]
+        if bodies.size:
+            seen["shared"] = max(seen["shared"], int(np.bincount(bodies).max()))
+            seen["arm_links"] = max(seen["arm_links"], np.intersect1d(bodies, np.arange(3)).size)
+        seed(solver)
+
+    with mock.patch.object(SolverFeatherPGS, "_apply_propagation_warmstart_velocity", recording_seed):
+        ordered, ordered_sample = _run_heap_arm(model, 40, cached=False, warmstart=True)
+    test.assertGreater(seen["shared"], 2)
+    test.assertGreaterEqual(seen["arm_links"], 2)
+    repeated, repeated_sample = _run_heap_arm(model, 40, cached=False, warmstart=True)
+    np.testing.assert_array_equal(repeated, ordered)
+    test.assertEqual(repeated_sample, ordered_sample)
+    with mock.patch.object(
+        solver_feather_pgs,
+        "accumulate_propagation_warmstart_body_impulses_ordered",
+        _accumulate_warmstart_in_reverse_row_order,
+    ):
+        reversed_order, _ = _run_heap_arm(model, 40, cached=False, warmstart=True)
+    test.assertFalse(np.array_equal(reversed_order, ordered))
+
+
+def _two_heap_arm_worlds(first_world_extra=None):
+    """Two heap-and-arm worlds; ``first_world_extra`` adds to world 0's builder and its result is returned."""
+    builder = newton.ModelBuilder()
+    first = _build_heap_arm_world(0)
+    extra = first_world_extra(first) if first_world_extra is not None else None
+    builder.add_world(first)
+    builder.add_world(_build_heap_arm_world(1))
+    return builder, extra
+
+
+def _step_explicit(model, solver, pairs, steps=2):
+    """Step ``solver`` on a deterministic pipeline, with explicit broad-phase ``pairs`` when given."""
+    options = {}
+    if pairs is not None:
+        options = {
+            "broad_phase": "explicit",
+            "shape_pairs_filtered": wp.array(np.asarray(pairs, dtype=np.int32), dtype=wp.vec2i, device=model.device),
+        }
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky", **options)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return contacts, state_0
+
+
+def _row_worlds_by_body(solver):
+    """Map each body referenced by a propagation row to the worlds whose rows reference it."""
+    owners = {}
+    counts = solver._propagation_constraint_count.numpy()
+    for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+        for world, count in enumerate(counts):
+            for body in np.unique(side[world, :count]):
+                if body >= 0:
+                    owners.setdefault(int(body), set()).add(world)
+    return owners
+
+
+def test_deterministic_propagation_accepts_bodies_shared_by_worlds(test, device):
+    """Solve a kinematic floor shared by several worlds as static geometry, bitwise and world-permutation invariant."""
+    shared = {"outside every world": _build_heap_arm_scene(device, (0, 1), global_floor=True)}
+    builder, floor = _two_heap_arm_worlds(lambda first: first.add_link(is_kinematic=True))
+    builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
+    shared["global shape on a world body"] = builder.finalize(device=device)
+    builder, floor_shape = _two_heap_arm_worlds(
+        lambda first: first.add_shape_box(
+            first.add_link(is_kinematic=True), hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02))
+        )
+    )
+    model = builder.finalize(device=device)
+    pairs = [[floor_shape, shape] for shape in range(model.shape_count) if shape != floor_shape]
+    shared["explicit pairs with a world body"] = (model, pairs)
+    for name, entry in shared.items():
+        model, pairs = entry if isinstance(entry, tuple) else (entry, None)
+        with test.subTest(name):
+            solver = SolverFeatherPGS(model, deterministic=True, contact_warmstart=True, **PROPAGATION_SOLVER_OPTIONS)
+            contacts, _ = _step_explicit(model, solver, pairs)
+            kinematic = np.flatnonzero((model.body_flags.numpy() & int(newton.BodyFlags.KINEMATIC)) != 0)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            shape_body = model.shape_body.numpy()
+            on_floor = np.isin(shape_body[contacts.rigid_contact_shape0.numpy()[:count]], kinematic) | np.isin(
+                shape_body[contacts.rigid_contact_shape1.numpy()[:count]], kinematic
+            )
+            routed = solver._contact_path.numpy()[:count] == 2
+            test.assertEqual(sorted(set(solver._contact_world.numpy()[:count][on_floor & routed].tolist())), [0, 1])
+            owners = _row_worlds_by_body(solver)
+            test.assertFalse(set(kinematic.tolist()) & set(owners))
+            test.assertEqual(max(len(worlds) for worlds in owners.values()), 1)
+            test.assertFalse(solver.constraint_overflow.numpy().any())
+            solver.check_constraint_capacity()
+    order = (2, 0, 1)
+    in_order = _build_heap_arm_scene(device, (0, 1, 2), global_floor=True)
+    permuted = _build_heap_arm_scene(device, order, global_floor=True)
+    for cached in (True, False):
+        with test.subTest(cached=cached):
+            reference, reference_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
+            repeated, repeated_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
+            np.testing.assert_array_equal(repeated, reference)
+            test.assertEqual(repeated_sample, reference_sample)
+            moved, _ = _run_heap_arm(permuted, 40, cached=cached, warmstart=True)
+            for slot, seed in enumerate(order):
+                np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
+
+
+def test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows(test, device):
+    """Repeat contact torsion on a kinematic floor shared by every world bitwise, with no row naming the floor."""
+    model, floor = test_propagation._build_shared_floor_model(device)
+    set_torsion_radius(model, 0.01)
+    runs = []
+    for _ in range(2):
+        solver = SolverFeatherPGS(
+            model,
+            deterministic=True,
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation",
+            contact_torsion_device=True,
+            friction_anchor_beta=0.0,
+            free_body_constraint_max=512,
+            articulation_constraint_max=128,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(20):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            counts = solver._propagation_constraint_count.numpy()
+            row_type = solver._propagation_row_type.numpy()
+            for world, count in enumerate(counts):
+                test.assertGreater(int(np.sum(row_type[world, :count] == PGS_CONSTRAINT_TYPE_TORSION)), 0)
+                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
+                    test.assertNotIn(floor, side[world, :count])
+        runs.append(_sample(state_0))
+    test.assertEqual(runs[1], runs[0])
+
+
+def test_deterministic_propagation_drops_cross_world_responding_contacts(test, device):
+    """Drop contacts joining responding bodies of different worlds, flag both worlds, and keep rows per world."""
+    cases = {}
+    # A global shape on world 0's first heap body overlaps world 1's heap.
+    builder, _ = _two_heap_arm_worlds()
+    builder.add_shape_box(3, hx=0.15, hy=0.15, hz=0.03)
+    builder.add_ground_plane()
+    cases["global shape on a dynamic body"] = (builder.finalize(device=device), None)
+    builder, _ = _two_heap_arm_worlds()
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    shape_world = model.shape_world.numpy()
+    world_0, world_1 = np.flatnonzero(shape_world == 0), np.flatnonzero(shape_world == 1)
+    # The worlds share one layout, so same-index shapes overlap exactly.
+    cases["explicit pairs between dynamic bodies"] = (model, np.stack([world_0, world_1], axis=1))
+    # On the propagation responses a kinematic free body keeps its response DOFs.
+    builder = newton.ModelBuilder()
+    for seed in (0, 1):
+        world = _build_heap_arm_world(seed)
+        floor = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)), is_kinematic=True)
+        world.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02)
+        builder.add_world(world)
+    model = builder.finalize(device=device)
+    floor_shape = int(np.flatnonzero(model.shape_world.numpy() == 0)[-1])
+    world_1 = np.flatnonzero(model.shape_world.numpy() == 1)[:-1]
+    cases["explicit pairs with a kinematic free body"] = (model, [[floor_shape, shape] for shape in world_1])
+    for name, (model, pairs) in cases.items():
+        with test.subTest(name):
+            solver = SolverFeatherPGS(
+                model,
+                deterministic=True,
+                contact_warmstart=True,
+                warn_constraint_overflow=False,
+                **PROPAGATION_SOLVER_OPTIONS,
+            )
+            contacts, state = _step_explicit(model, solver, pairs)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            body_world = model.body_world.numpy()
+            shape_body = model.shape_body.numpy()
+            body_0 = shape_body[contacts.rigid_contact_shape0.numpy()[:count]]
+            body_1 = shape_body[contacts.rigid_contact_shape1.numpy()[:count]]
+            crossing = (body_0 >= 0) & (body_1 >= 0) & (body_world[body_0] != body_world[body_1])
+            test.assertGreater(int(crossing.sum()), 0)
+            test.assertTrue(np.all(solver._contact_slot.numpy()[:count][crossing] == -1))
+            owners = _row_worlds_by_body(solver)
+            test.assertTrue(all(worlds == {int(body_world[body])} for body, worlds in owners.items()))
+            test.assertTrue(solver.constraint_overflow.numpy().all())
+            with test.assertRaisesRegex(RuntimeError, "between a global articulation and another world"):
+                solver.check_constraint_capacity()
+            test.assertTrue(np.isfinite(state.body_q.numpy()).all())
 
 
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
@@ -646,8 +1062,8 @@ for _device in get_test_devices():
     )
     add_function_test(
         TestFeatherPGSDeterminism,
-        "test_deterministic_requires_immediate_contact_response",
-        test_deterministic_requires_immediate_contact_response,
+        "test_deterministic_rejects_fused_and_warm_started_colored",
+        test_deterministic_rejects_fused_and_warm_started_colored,
         devices=[_device],
     )
 
@@ -677,6 +1093,43 @@ for _device in get_test_devices():
             "test_deterministic_joint_rows_follow_articulation_order",
             test_deterministic_joint_rows_follow_articulation_order,
             devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_runs_are_bitwise_identical",
+            test_deterministic_propagation_runs_are_bitwise_identical,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_is_world_permutation_invariant",
+            test_deterministic_propagation_is_world_permutation_invariant,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_warm_start_sums_in_row_order",
+            test_deterministic_propagation_warm_start_sums_in_row_order,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_accepts_bodies_shared_by_worlds",
+            test_deterministic_propagation_accepts_bodies_shared_by_worlds,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows",
+            test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows,
+            devices=[_device],
+        )
+        add_function_test(
+            TestFeatherPGSDeterminism,
+            "test_deterministic_propagation_drops_cross_world_responding_contacts",
+            test_deterministic_propagation_drops_cross_world_responding_contacts,
+            devices=[_device],
+            check_output=False,
         )
 
 

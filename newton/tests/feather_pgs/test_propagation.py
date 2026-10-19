@@ -2119,13 +2119,12 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                     )
         return stepper
 
-    def test_gate_admits_colored_only(self):
-        """Accept deterministic colored; reject plain and fused, and colored with contact warm start."""
+    def test_gate_admits_colored_without_warm_start(self):
+        """Accept deterministic colored; reject fused, and colored with contact warm start."""
         model = _build_arm_heap_model("cuda:0", worlds=1)
         _colored_deterministic_solver(model)
-        for response in ("propagation", "propagation_fused"):
-            with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
-                _colored_deterministic_solver(model, articulated_contact_response=response)
+        with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
+            _colored_deterministic_solver(model, articulated_contact_response="propagation_fused")
         with self.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
             _colored_deterministic_solver(model, contact_warmstart=True)
 
@@ -2228,13 +2227,66 @@ class TestFeatherPGSColoredDeterministic(unittest.TestCase):
                 )
                 self.assertNotIn(tray, swept)
 
-    def test_fold_buffers_exist_only_with_prescribed_bodies(self):
-        """Allocate the folded sweep rows only for a model with a kinematic free body."""
-        self.assertIsNone(_Stepper(_build_arm_heap_model("cuda:0")).solver._color_body_a)
-        model, _ = _heap(nx=2, ny=2, nz=1, kinematic_tray=True)
-        model.rigid_contact_max = 1024
-        solver = _Stepper(model, free_body_constraint_max=256, articulation_constraint_max=64).solver
-        self.assertEqual(solver._color_body_a.shape, (solver._world_count, solver._propagation_max_constraints))
+    def test_graph_captured_before_a_body_turns_kinematic_keeps_folding(self):
+        """Replay a graph captured while every body was dynamic after one turns kinematic, and match an eager twin."""
+        for env in ({}, {"FEATHER_PGS_COLORED_LANES": "3"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                model, tray = _heap(nx=4, ny=4, nz=1, kinematic_tray=True)
+                model.rigid_contact_max = 2048
+                flags = model.body_flags.numpy()
+                flags[tray] &= ~int(newton.BodyFlags.KINEMATIC)
+                model.body_flags.assign(flags)
+                tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
+                tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
+                captured, eager = (
+                    _Stepper(
+                        model,
+                        iterations=4,
+                        velocity_iterations=2,
+                        free_body_constraint_max=512,
+                        articulation_constraint_max=64,
+                    )
+                    for _ in range(2)
+                )
+                with wp.ScopedCapture() as capture:
+                    captured.step()
+                flags[tray] |= int(newton.BodyFlags.KINEMATIC)
+                model.body_flags.assign(flags)
+                for stepper in (captured, eager):
+                    stepper.solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                    qd = stepper.state_in.joint_qd.numpy()
+                    qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
+                    stepper.state_in.joint_qd.assign(qd)
+                    newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
+                for k in range(12):
+                    wp.capture_launch(capture.graph)
+                    eager.step()
+                    a, b = captured.snapshot(), eager.snapshot()
+                    for name in _STATE_FIELDS:
+                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
+                solver = captured.solver
+                count = int(solver._propagation_constraint_count.numpy()[0])
+                rows = np.concatenate(
+                    [solver._propagation_body_a.numpy()[0, :count], solver._propagation_body_b.numpy()[0, :count]]
+                )
+                swept = np.concatenate(
+                    [solver._color_body_a.numpy()[0, :count], solver._color_body_b.numpy()[0, :count]]
+                )
+                self.assertIn(tray, rows)
+                self.assertNotIn(tray, swept, "the replayed sweep still addresses the now-kinematic tray")
+                shape_body = model.shape_body.numpy()
+                shape0 = captured.contacts.rigid_contact_shape0.numpy()
+                shape1 = captured.contacts.rigid_contact_shape1.numpy()
+                offsets = solver._color_world_offsets.numpy()[: PROPAGATION_COLOR_TAIL + 2]
+                units = solver._color_unit_sorted.numpy()
+                tray_units = [
+                    sum(
+                        any(sh >= 0 and shape_body[sh] == tray for sh in (shape0[c], shape1[c]))
+                        for c in units[offsets[i] : offsets[i + 1]]
+                    )
+                    for i in range(PROPAGATION_COLOR_TAIL + 1)
+                ]
+                self.assertGreaterEqual(max(tray_units), 8, "the tray must be shared by many units of one color")
 
     def test_partial_reset_keeps_synced_and_untouched_worlds_in_lockstep(self):
         """Copy world 0 into world 1, reset only those two, and keep every field bitwise in lockstep."""

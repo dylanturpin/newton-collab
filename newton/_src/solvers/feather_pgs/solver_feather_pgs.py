@@ -117,6 +117,7 @@ from .kernels import (
     accumulate_group_diag_worlds,
     accumulate_propagation_torsion_wrenches_from_impulses,
     accumulate_propagation_warmstart_body_impulses,
+    accumulate_propagation_warmstart_body_impulses_ordered,
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     accumulate_torsion_wrenches_from_impulses,
@@ -1967,19 +1968,21 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 rest, sets its ``constraint_overflow`` entry and warns as in the default mode; while its contacts
                 and joint rows are unchanged it drops the same contacts every step. Overflowed steps are invalid
                 physics in either mode: size the row capacities to avoid them.
-                Requires ``articulated_contact_response`` ``"immediate"`` or ``"propagation_colored"``; the colored
+                Requires ``articulated_contact_response`` ``"immediate"``, ``"propagation"`` or
+                ``"propagation_colored"``, and contacts from ``CollisionPipeline(deterministic=True)``. The colored
                 response is repeatable within itself but sweeps rows in color order, so bitwise agreement with an
-                immediate run is not guaranteed. With the colored response ``contact_warmstart`` must be False.
-                Adds a per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity
-                slot.
+                immediate run is not guaranteed; with it ``contact_warmstart`` must be False. With
+                ``"propagation"`` the warm-start seed of each body is summed in row order. Adds a
+                per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
                 sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
                 Configure at construction; rebuild captured graphs to change this option.
                 Driven articulations and articulations with mimic or loop constraints stay awake.
-                Construction raises ``ValueError`` unless ``articulated_contact_response="immediate"``
-                (so it does not compose with ``propagation_colored``), the model has at least one
-                articulation and no particles, and warmstarting, contact
-                compliance and velocity post-passes (``velocity_iterations``) are off.
+                Construction raises ``ValueError`` unless ``articulated_contact_response`` is ``"immediate"``
+                or ``"propagation_colored"``, the model has at least one articulation and no particles, and
+                warmstarting, contact compliance and velocity post-passes (``velocity_iterations``) are off.
+                With the colored response and ``sleep_skip_constraints``, sleeping islands' contacts are left out of
+                the coloring and the colored sweep; a step that overflows the propagation rows keeps that world awake.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
                 solver spends work on settled scenes rather than describing the scene.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
@@ -2617,12 +2620,19 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
         self._articulated_contact_response = articulated_contact_response
         self._deterministic = bool(deterministic)
-        if self._deterministic and articulated_contact_response not in ("immediate", "propagation_colored"):
+        if self._deterministic and articulated_contact_response not in (
+            "immediate",
+            "propagation",
+            "propagation_colored",
+        ):
             raise ValueError(
-                "deterministic=True requires articulated_contact_response 'immediate' or 'propagation_colored'"
+                "deterministic=True requires articulated_contact_response 'immediate', 'propagation' or"
+                " 'propagation_colored'"
             )
-        if self._deterministic and contact_warmstart and articulated_contact_response != "immediate":
-            raise ValueError("deterministic=True with contact_warmstart requires the 'immediate' contact response")
+        if self._deterministic and contact_warmstart and articulated_contact_response == "propagation_colored":
+            raise ValueError(
+                "deterministic=True with contact_warmstart requires the 'immediate' or 'propagation' response"
+            )
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
@@ -2899,9 +2909,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self._joint_armature_device = wp.zeros(max(model.joint_dof_count, 1), dtype=wp.float32, device=model.device)
         self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
-        self._has_prescribed_bodies = False
-        self._color_unit_meta = None
-        self._color_body_a = None
         self._update_kinematic_state()
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping, which would desynchronize it from the
@@ -3741,19 +3748,6 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             free_bodies = model.joint_child.numpy()[first_joints]
             prescribed[free_bodies] = kinematic[free_bodies]
         self._body_prescribed.assign(prescribed)
-        self._has_prescribed_bodies = bool(np.any(prescribed))
-        self._ensure_color_fold_buffers()
-
-    def _ensure_color_fold_buffers(self) -> None:
-        """Allocate the colored sweep's folded rows once colored buffers exist and some body is prescribed."""
-        if self._color_body_a is not None or self._color_unit_meta is None or not self._has_prescribed_bodies:
-            return
-        shape = (self._world_count, self._propagation_max_constraints)
-        device = self.model.device
-        # Rows with prescribed sides removed and their constant velocity term folded into the right-hand side.
-        self._color_body_a = wp.zeros(shape, dtype=wp.int32, device=device)
-        self._color_body_b = wp.zeros(shape, dtype=wp.int32, device=device)
-        self._color_rhs = wp.zeros(shape, dtype=wp.float32, device=device)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
@@ -7222,8 +7216,10 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
             )
             self._color_unit_meta_stale = True
             self._color_fold_rhs = None
-            self._color_body_a = None
-            self._ensure_color_fold_buffers()
+            # Rows with prescribed sides removed and their constant velocity term folded into the right-hand side.
+            self._color_body_a = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
+            self._color_body_b = wp.zeros((worlds, propagation_max_c), dtype=wp.int32, device=device)
+            self._color_rhs = wp.zeros((worlds, propagation_max_c), dtype=wp.float32, device=device)
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
@@ -8987,30 +8983,29 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
         regularize: bool = True,
     ) -> None:
         device = self.model.device
-        body_a, body_b = self._propagation_body_a, self._propagation_body_b
-        if self._has_prescribed_bodies:
-            # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
-            # A pass's right-hand side and the prescribed velocities are fixed within a step: fold once per pass.
-            if self._color_fold_rhs is not rhs:
-                self._color_fold_rhs = rhs
-                wp.launch(
-                    fold_prescribed_propagation_sides,
-                    dim=(self._world_count, self._propagation_max_constraints),
-                    inputs=[
-                        self._propagation_constraint_count,
-                        body_a,
-                        body_b,
-                        self._propagation_J_a,
-                        self._propagation_J_b,
-                        self._body_prescribed,
-                        self._propagation_body_qd,
-                        rhs,
-                        self._propagation_max_constraints,
-                    ],
-                    outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
-                    device=device,
-                )
-            body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
+        # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
+        # The fold reads the device prescribed mask, so a captured graph stays correct when that mask changes.
+        # A pass's right-hand side and the prescribed velocities are fixed within a step: fold once per pass.
+        if self._color_fold_rhs is not rhs:
+            self._color_fold_rhs = rhs
+            wp.launch(
+                fold_prescribed_propagation_sides,
+                dim=(self._world_count, self._propagation_max_constraints),
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_J_a,
+                    self._propagation_J_b,
+                    self._body_prescribed,
+                    self._propagation_body_qd,
+                    rhs,
+                    self._propagation_max_constraints,
+                ],
+                outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
+                device=device,
+            )
+        body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
         if self._pgs_solve_propagation_colored_warp_kernel is not None:
             # The unit records depend only on this step's colored row layout, so they are
             # gathered once per step, before its first sweep, and only for the prefetch body.
@@ -14343,9 +14338,17 @@ class SolverFeatherPGS(SolverBase, CouplingInterface):
                 outputs=[self._propagation_cache_qd_base],
                 device=self.model.device,
             )
+        # Deterministic mode sums each body's seeded impulses in row order; the default scatters them atomically.
+        if self._deterministic:
+            kernel, dim = accumulate_propagation_warmstart_body_impulses_ordered, self._world_count * 6
+        else:
+            kernel, dim = (
+                accumulate_propagation_warmstart_body_impulses,
+                self._world_count * self._propagation_max_constraints,
+            )
         wp.launch(
-            accumulate_propagation_warmstart_body_impulses,
-            dim=self._world_count * self._propagation_max_constraints,
+            kernel,
+            dim=dim,
             inputs=[
                 self._propagation_constraint_count,
                 self._propagation_body_a,
