@@ -2788,6 +2788,7 @@ class TestColoredPropagationTorsion(unittest.TestCase):
     def test_every_variant_tracks_plain_and_immediate(self):
         """Match plain's three-foot spinner on each colored body, close immediate's gap as sweeps rise, and act."""
         colored = {"deterministic": True}
+        expected, _ = _spinner("propagation", 32, 0.01, spin=4.0)
         for variant in COLORED_VARIANTS:
             with self.subTest(variant=variant), colored_variant_switches(variant):
                 actual, _ = _spinner(
@@ -2798,7 +2799,6 @@ class TestColoredPropagationTorsion(unittest.TestCase):
                     on_solver=lambda solver, v=variant: select_colored_variant(solver, v),
                     **colored,
                 )
-                expected, _ = _spinner("propagation", 32, 0.01, spin=4.0)
                 np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-6)
         x, gaps = {}, {}
         for iterations in (8, 32, 128, 512):
