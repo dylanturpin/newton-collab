@@ -2987,7 +2987,7 @@ class TestColoredPropagationTorsion(unittest.TestCase):
 
                 def check(solver, v=variant):
                     select_colored_variant(solver, v)
-                    self.assertTrue(solver._has_prescribed_bodies)
+                    self.assertTrue(np.any(solver._body_prescribed.numpy()))
 
                 self.assertAlmostEqual(_turntable("propagation_colored", on_solver=check), expected, delta=1.0e-4)
 

@@ -1094,7 +1094,7 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
             with self.subTest(variant=variant):
 
                 def folded(solver, test=self):
-                    test.assertTrue(solver._has_prescribed_bodies)
+                    test.assertTrue(np.any(solver._body_prescribed.numpy()))
 
                 _, twist = _trajectory(
                     "sphere",
