@@ -3453,7 +3453,7 @@ class TestSteelRollingFrictionPropagation(unittest.TestCase):
         radius, mu_torsional, torsion_radius = 0.1, 0.005, 0.01
         inertia = 0.4 * radius * radius
         # Fast enough to keep spinning through the fit with both couples.
-        start = {"radius": radius, "mu_rolling": 0.0, "speed": 0.0, "rolling": False, "spin": 10.0}
+        start = {"radius": radius, "mu_rolling": 0.0, "speed": 0.0, "rolling": False, "spin": 10.0, "cone": "elliptic"}
         rows = {
             "spin row": (mu_torsional, None),
             "torsion": (0.0, torsion_radius),
