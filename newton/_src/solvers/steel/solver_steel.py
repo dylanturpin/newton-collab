@@ -1226,6 +1226,11 @@ def _align_shared_memory(size: int) -> int:
     return (size + 15) // 16 * 16
 
 
+def _estimate_tiled_row_shared_memory(max_constraints: int) -> int:
+    """Estimate the shared memory of the dense split-mode Gauss-Seidel kernel [B]."""
+    return 4 * (max_constraints * (max_constraints + 1) // 2 + 6 * max_constraints)
+
+
 def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
     """Estimate the complete tiled Cholesky shared-memory footprint [B]."""
     matrix_bytes = _align_shared_memory(4 * n_dofs * n_dofs)
@@ -7273,6 +7278,18 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._pgs_solve_tiled_contact_kernel = None
         self._pgs_solve_streaming_kernel = None
         if self._articulation_constraint_max > 0 and self._solve_mode != "matrix_free":
+            tiled_row_shared_bytes = _estimate_tiled_row_shared_memory(self._articulation_constraint_max)
+            if (
+                self._pgs_kernel == "tiled_row"
+                and tiled_row_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES > _STATIC_SHARED_MEMORY_MAX_BYTES
+            ):
+                if "pgs_kernel" in self._kernel_overrides:
+                    raise ValueError(
+                        f"pgs_kernel='tiled_row' needs {tiled_row_shared_bytes} bytes of shared memory at "
+                        f"articulation_constraint_max={self._articulation_constraint_max}"
+                    )
+                # The packed Delassus triangle exceeds static shared memory; the scalar loop has no tile.
+                self._pgs_kernel = "loop"
             if self._pgs_kernel == "tiled_row":
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
                     self._articulation_constraint_max, device_arch
