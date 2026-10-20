@@ -10,6 +10,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.robot._tabletop_demo import TabletopDemo
+from newton.examples.robot.example_steel_plate_rack import Example as PlateRack
 from newton.examples.robot.example_steel_wrecking_ball import Example
 from newton.solvers import SolverSteel
 from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_selected_cuda_test_devices
@@ -95,6 +96,33 @@ add_function_test(
     test_wrecking_ball_idle,
     devices=get_selected_cuda_test_devices(),
 )
+
+
+def test_complete_demo(test, device, example_type):
+    """Finish the demonstration and validate placement or post-impact stability."""
+    with wp.ScopedDevice(device):
+        args = newton.examples.default_args(example_type.create_parser())
+        args.test = True
+        example = example_type(ViewerNull(), args)
+        for _ in range(args.num_frames):
+            example.step()
+            example.test_post_step()
+        example.test_final()
+
+
+@unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+class TestTabletopCompletion(unittest.TestCase):
+    pass
+
+
+for name, example_type in (("plate_rack", PlateRack), ("wrecking_ball", Example)):
+    add_function_test(
+        TestTabletopCompletion,
+        f"test_{name}",
+        test_complete_demo,
+        devices=get_selected_cuda_test_devices(),
+        example_type=example_type,
+    )
 
 
 if __name__ == "__main__":
