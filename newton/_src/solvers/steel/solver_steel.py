@@ -26055,6 +26055,9 @@ def _get_pgs_solve_mf_gs_kernel(
                             G_t1t2 += Jt1 * Yt2;
                             G_t2t2 += Jt2 * Yt2;
                         }
+                        // The friction rows' rhs carries a prescribed body's tangential velocity.
+                        u_t1 += s_rhs_dense[i_t1];
+                        u_t2 += s_rhs_dense[i_t2];
 
                         // __DENSE_DESAXCE_BIAS__
 
@@ -26297,6 +26300,9 @@ def _get_pgs_solve_mf_gs_kernel(
                                 u_t2 += mf_J_b.data[t2_mf6 + k] * vb;
                             }
                         }
+                        // The friction rows' rhs carries a prescribed body's tangential velocity.
+                        u_t1 += __int_as_float(mf_meta.data[off_meta + i_t1 * 4 + 2]);
+                        u_t2 += __int_as_float(mf_meta.data[off_meta + i_t2 * 4 + 2]);
 
                         // __DESAXCE_BIAS__
 
@@ -26533,6 +26539,9 @@ def _get_pgs_solve_mf_gs_kernel(
                                 u_t2 += mf_J_b.data[t2_mf6 + k] * vb;
                             }
                         }
+                        // The friction rows' rhs carries a prescribed body's tangential velocity.
+                        u_t1 += __int_as_float(mf_meta.data[off_meta + i_t1 * 4 + 2]);
+                        u_t2 += __int_as_float(mf_meta.data[off_meta + i_t2 * 4 + 2]);
 
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
                         float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
