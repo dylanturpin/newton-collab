@@ -225,3 +225,20 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
         if speed > 6.0:
             raise ValueError(f"Discontinuous IK path at {ta:.2f}-{tb:.2f}s: {speed:.2f} rad/s")
     return [(t, q[:driven]) for t, q in result]
+
+
+def rotate_vectors(quaternions, vectors):
+    """Rotate vectors by unit XYZW quaternions, allowing NumPy broadcasting."""
+    xyz = np.asarray(quaternions)[..., :3]
+    vectors = np.asarray(vectors)
+    cross = 2 * np.cross(xyz, vectors)
+    return vectors + np.asarray(quaternions)[..., 3:] * cross + np.cross(xyz, cross)
+
+
+def relative_angles(quaternions, axis):
+    """Unwrap rotation about a local axis relative to the first quaternion."""
+    q = np.asarray(quaternions)
+    a, w = -q[0, :3], q[0, 3]
+    xyz = w * q[:, :3] + q[:, 3:] * a + np.cross(a, q[:, :3])
+    real = w * q[:, 3] - q[:, :3] @ a
+    return np.unwrap(2 * np.arctan2(xyz[:, axis], real))
