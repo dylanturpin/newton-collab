@@ -180,12 +180,13 @@ def _gather(
     rows = slots_needed[c]
     row_end = row_count[world]
     row_capacity = row_type.shape[1]
+    anchor = int(rows == 3)
     if family == _PROPAGATION:
-        # The last reserved row is the torsion spare.
+        # The last reserved row is the torsion spare; the spin and rolling rows may follow the sliding pair.
         rows -= 1
         row_end = propagation_row_count[world]
         row_capacity = propagation_row_type.shape[1]
-    anchor = int(rows == 3)
+        anchor = int(rows == 3 or rows == 6)
     if slot >= row_end or slot >= row_capacity:
         return
     if _family_row(family, row_type, propagation_row_type, world, slot) != PGS_CONSTRAINT_TYPE_CONTACT or (

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-contact torsional and rolling friction from the shape material coefficients.
 
-Each dense contact that receives a sliding pair and has a positive pair coefficient
-reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``, and its
-five friction rows take the angular-friction row type so that one solve owns them. The
+Each articulated contact that receives a sliding pair and has a positive pair coefficient
+reserves three more contiguous rows: ``[normal, t1, t2, spin, roll1, roll2]``. Dense rows give
+all five friction rows the angular-friction row type so that one solve owns them; propagation
+rows keep the sliding pair's type and solve the block at the spin row, after the pair. The
 spin row resists relative rotation about the normal and the rolling pair about the
 contact tangents. With the normal impulse fixed, each Gauss-Seidel visit solves the
 five friction rows of a contact as one block: it minimizes the block's quadratic over a
@@ -46,6 +47,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     build_mf_angular_friction_rows,
     build_propagation_angular_friction_rows,
+    build_propagation_articulated_angular_friction_rows,
     gate_free_rigid_angular_coefficients,
     populate_world_angular_friction_rows,
 )
@@ -271,24 +273,25 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
     if not solver._enable_torsional_rolling_friction:
         return
     model = solver.model
+    immediate = solver._articulated_contact_response == "immediate"
     if (
         not model.device.is_cuda
         or model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response != "immediate"
+        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._friction_anchors_enabled
         or solver._contact_warmstart
         or solver._velocity_iterations != 0
         or solver._contact_compliance
-        or solver._contact_torsion_enabled
-        or solver._sleeping is not None
+        or (immediate and (solver._contact_torsion_enabled or solver._sleeping is not None))
     ):
         raise ValueError(
-            "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/immediate/interleaved "
-            "solving with friction_mode='fixed_normal', point friction (friction_anchor_beta=0), and no warm start, "
-            "velocity iterations, contact compliance, contact torsion radius, or sleeping"
+            "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/interleaved solving with "
+            "articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
+            "friction_mode='fixed_normal', point friction (friction_anchor_beta=0), and no warm start, velocity "
+            "iterations or contact compliance; on 'immediate' also no contact torsion radius or sleeping"
         )
 
 
@@ -372,6 +375,40 @@ def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads:
         )
 
 
+def launch_propagation_angular_friction_rows(solver, contacts, threads: int) -> None:
+    """Write the spin and rolling rows that follow each articulated propagation contact's sliding pair."""
+    wp.launch(
+        build_propagation_articulated_angular_friction_rows,
+        dim=threads,
+        inputs=[
+            contacts.rigid_contact_count,
+            threads,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver._contact_world,
+            solver._contact_slot,
+            solver._contact_path,
+            solver._contact_slots_needed,
+            solver._contact_mf_origin,
+            solver._shape_mu_torsional,
+            solver._shape_mu_rolling,
+        ],
+        outputs=[
+            solver._propagation_body_a,
+            solver._propagation_body_b,
+            solver._propagation_J_a,
+            solver._propagation_J_b,
+            solver._propagation_row_type,
+            solver._propagation_row_parent,
+            solver._propagation_row_mu,
+            solver._propagation_phi,
+            solver._propagation_row_restitution,
+        ],
+        device=solver.model.device,
+    )
+
+
 def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dict[str, str]:
     """Return the CUDA fragments that the fused matrix-free GS kernel splices in for ``cone`` and ``creep_speed``."""
     angular = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
@@ -396,6 +433,19 @@ def angular_friction_gs_sources(cone: str, creep_speed: float, dofs: int) -> dic
                 }}
                 delta_impulse = new_impulse - old_impulse;"""
     return {"helpers": helpers, "row_block": row_block}
+
+
+def propagation_angular_friction_source(cone: str, creep_speed: float) -> str:
+    """Return the CUDA ``PropagationAngularFrictionBlock`` that solves a propagation contact's friction rows on ``cone``.
+
+    The cone solve is the dense block's; the rows are body-space and one thread solves the block.
+    """
+    elliptic = cone == "elliptic"
+    return (
+        _PROPAGATION_BLOCK_SOURCE.replace("__PROJECT__", _ELLIPTIC_PROJECT if elliptic else _PYRAMIDAL_PROJECT)
+        .replace("__CONSTRAINED__", _ELLIPTIC_CONSTRAINED if elliptic else _PYRAMIDAL_CONSTRAINED)
+        .replace("__CREEP__", f"{float(creep_speed)!r}f")
+    )
 
 
 _ELLIPTIC_PROJECT = """
@@ -543,9 +593,9 @@ _PYRAMIDAL_CONSTRAINED = """
                     }"""
 
 
-_BLOCK_SOURCE = """
-    struct AngularFrictionBlock {
-        typedef float Row[5];
+# The cone solve shared by the dense and propagation blocks: the projection, the trust-region subproblem and its
+# proximal fallback, in coefficient-normalized impulses.
+_BLOCK_CORE = """        typedef float Row[5];
 __PROJECT__
 
         // A row takes part when it is active and has curvature; other rows keep zero impulse.
@@ -691,7 +741,14 @@ __PROJECT__
             return interior;
         }
 
-        struct Update {
+"""
+
+_BLOCK_SOURCE = (
+    """
+    struct AngularFrictionBlock {
+"""
+    + _BLOCK_CORE
+    + """        struct Update {
             float first;
             bool changed;
         };
@@ -844,6 +901,138 @@ __CONSTRAINED__
         }
     };
 """
+)
+
+_PROPAGATION_BLOCK_SOURCE = (
+    """
+    struct PropagationAngularFrictionBlock {
+"""
+    + _BLOCK_CORE
+    + """        // Relax the cone answer y by omega, line-search it from the current impulses moved into the cone, and apply
+        // every row's change to lam and to the side twists qa, qb and impulse sums ia, ib (null for a static side).
+        static __device__ __noinline__ void apply(
+            float* qa, float* ia, float* qb, float* ib, const float* Ja, const float* Jb, const float* Ma,
+            const float* Mb, float* lam, const float* mu_rows, const float* rhs_rows, float load, float omega,
+            const bool* active, float* y) {
+            const float unit[3] = {1.0f, 1.0f, 1.0f};
+            float shift[5], step[5];
+            for (int k = 0; k < 5; ++k) {
+                float mu_k = fmaxf(mu_rows[k], 0.0f);
+                step[k] = lam[k] + omega * (mu_k * y[k] - lam[k]);
+            }
+            if (omega != 1.0f) {
+                for (int k = 0; k < 5; ++k) y[k] = active[k] ? step[k] / mu_rows[k] : 0.0f;
+                project(y, unit, load);
+                for (int k = 0; k < 5; ++k) step[k] = fmaxf(mu_rows[k], 0.0f) * y[k];
+            }
+            for (int k = 0; k < 5; ++k) y[k] = active[k] ? lam[k] / mu_rows[k] : 0.0f;
+            project(y, unit, load);
+            for (int k = 0; k < 5; ++k) {
+                float base = fmaxf(mu_rows[k], 0.0f) * y[k];
+                shift[k] = base - lam[k];
+                step[k] -= base;
+            }
+            // Slope and curvature from the rows and the twists rather than the rounded 5x5 block.
+            float slope = 0.0f, curvature = 0.0f;
+            for (int side = 0; side < 2; ++side) {
+                const float* q = side == 0 ? qa : qb;
+                if (q == nullptr) continue;
+                const float* J = side == 0 ? Ja : Jb;
+                const float* M = side == 0 ? Ma : Mb;
+                for (int e = 0; e < 6; ++e) {
+                    float j_shift = 0.0f, j_step = 0.0f, m_step = 0.0f;
+                    for (int k = 0; k < 5; ++k) {
+                        j_shift += J[k * 6 + e] * shift[k];
+                        j_step += J[k * 6 + e] * step[k];
+                        m_step += M[k * 6 + e] * step[k];
+                    }
+                    slope += j_step * q[e] + j_shift * m_step;
+                    curvature += j_step * m_step;
+                }
+            }
+            for (int k = 0; k < 5; ++k) {
+                float mu_k = fmaxf(mu_rows[k], 0.0f);
+                float compliance = k >= 2 && active[k] && load > 0.0f ? __CREEP__ / (mu_k * mu_k * load) : 0.0f;
+                slope += (rhs_rows[k] + compliance * (lam[k] + shift[k])) * step[k];
+                curvature += compliance * step[k] * step[k];
+            }
+            float t = slope < 0.0f ? (curvature > -slope ? -slope / curvature : 1.0f) : 0.0f;
+            for (int k = 0; k < 5; ++k) {
+                shift[k] += t > 0.0f ? t * step[k] : 0.0f;
+                lam[k] += shift[k];
+                if (shift[k] == 0.0f) continue;
+                for (int e = 0; e < 6; ++e) {
+                    if (qa != nullptr) {
+                        qa[e] += Ma[k * 6 + e] * shift[k];
+                        ia[e] += Ja[k * 6 + e] * shift[k];
+                    }
+                    if (qb != nullptr) {
+                        qb[e] += Mb[k * 6 + e] * shift[k];
+                        ib[e] += Jb[k * 6 + e] * shift[k];
+                    }
+                }
+            }
+        }
+
+        // Minimize the quadratic of a contact's five friction rows [t1, t2, spin, roll1, roll2] over the cone at
+        // normal load ``load``, on one thread. J, M, lam, mu_rows and rhs_rows start at the contact's t1 row.
+        static __device__ void solve(
+            float* qa, float* ia, float* qb, float* ib, const float* Ja, const float* Jb, const float* Ma,
+            const float* Mb, float* lam, const float* mu_rows, const float* rhs_rows, float load, float omega) {
+                float x0[5], mu[5], gradient0[5], H[5][5], largest = 0.0f;
+                for (int k = 0; k < 5; ++k) {
+                    x0[k] = lam[k];
+                    mu[k] = fmaxf(mu_rows[k], 0.0f);
+                    float jv = 0.0f;
+                    for (int e = 0; e < 6; ++e) {
+                        if (qa != nullptr) jv += Ja[k * 6 + e] * qa[e];
+                        if (qb != nullptr) jv += Jb[k * 6 + e] * qb[e];
+                    }
+                    gradient0[k] = jv + rhs_rows[k];
+                }
+                // The block's Delassus matrix through the sides' split responses M = response * J'.
+                for (int k = 0; k < 5; ++k) {
+                    for (int l = k; l < 5; ++l) {
+                        float h = 0.0f;
+                        for (int e = 0; e < 6; ++e) {
+                            if (qa != nullptr) h += Ja[k * 6 + e] * Ma[l * 6 + e];
+                            if (qb != nullptr) h += Jb[k * 6 + e] * Mb[l * 6 + e];
+                        }
+                        H[k][l] = h;
+                        H[l][k] = h;
+                    }
+                    largest = fmaxf(largest, H[k][k]);
+                }
+                load = fmaxf(load, 0.0f);
+                bool active[5];
+                for (int k = 0; k < 5; ++k) active[k] = mu[k] > 0.0f && H[k][k] > 1.0e-12f * largest;
+                for (int k = 2; k < 5; ++k) {
+                    float compliance = active[k] && load > 0.0f ? __CREEP__ / (mu[k] * mu[k] * load) : 0.0f;
+                    H[k][k] += compliance;
+                    gradient0[k] += compliance * x0[k];
+                }
+                float y0[5], y[5], c[5];
+                for (int k = 0; k < 5; ++k) {
+                    y0[k] = active[k] ? x0[k] / mu[k] : 0.0f;
+                    gradient0[k] = active[k] ? gradient0[k] * mu[k] : 0.0f;
+                    for (int l = 0; l < 5; ++l) H[k][l] *= mu[k] * mu[l];
+                }
+                for (int k = 0; k < 5; ++k) {
+                    c[k] = gradient0[k];
+                    for (int l = 0; l < 5; ++l) c[k] -= H[k][l] * y0[l];
+                    c[k] = active[k] ? c[k] : 0.0f;
+                }
+                bool sticking = trust_region(H, c, active, load, lam, mu_rows, y) && cone_norm(y) <= load;
+                const float unit[3] = {1.0f, 1.0f, 1.0f};
+                if (!sticking) {
+__CONSTRAINED__
+                    project(y, unit, load);
+                }
+                apply(qa, ia, qb, ib, Ja, Jb, Ma, Mb, lam, mu_rows, rhs_rows, load, omega, active, y);
+        }
+    };
+"""
+)
 
 
 def free_rigid_angular_friction_gs_sources() -> list[tuple[str, str]]:
