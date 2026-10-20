@@ -2365,8 +2365,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
                 response by propagating each row's combined test impulse through the articulated
-                body factorization. Requires ``articulated_contact_response="propagation"``.
-                Defaults to False (dense routing, prior behavior).
+                body factorization. Requires ``articulated_contact_response`` ``"propagation"`` or
+                ``"propagation_colored"``. Defaults to False (dense routing, prior behavior).
             propagation_cached_response (bool, optional): Replace the per-iteration
                 propagation tree walk with cached per-body response matrices. Within one
                 solver pass the tree factorization is fixed, so deferred body impulse ->
@@ -2638,7 +2638,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
             raise ValueError(
                 "propagation_same_articulation_rows requires articulated_contact_response "
-                "'propagation' or 'propagation_fused'"
+                "'propagation' or 'propagation_colored'"
             )
         if propagation_same_articulation_rows and articulated_contact_response == "propagation_fused":
             raise NotImplementedError(
