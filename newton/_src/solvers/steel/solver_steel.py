@@ -21018,10 +21018,6 @@ def _get_pgs_solve_propagation_contact_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
-    if friction_mode != "fixed_normal":
-        snippet = snippet.replace(
-            "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
-        )
     if contact_torsion:
         snippet = snippet.replace(
             "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + _PROPAGATION_APPLY_ROW_CUDA, 1
