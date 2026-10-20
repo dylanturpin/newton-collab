@@ -285,8 +285,10 @@ repository examples spend tuning effort, not a shared solver API.
        a uniformly loaded disk of radius ``R``). ``contact_torsion_device``
        prepares these rows on the device, which CUDA graph capture requires.
        The experimental ``contact_compliance`` option solves hydroelastic
-       contacts with positive stiffness as implicit spring-dampers instead; it
-       uses point friction and does not support CUDA graph capture.
+       contacts with positive stiffness as implicit spring-dampers instead, with
+       the ``"immediate"`` or ``"propagation_colored"`` articulated contact
+       response; it uses point friction, and a captured step reports its input
+       errors through ``validate_contact_compliance()`` after replay.
        Joint drives are integrated implicitly by default, which keeps large
        drive gains stable at ordinary ``dt``; ``drive_mode="rows"`` solves
        them as PGS rows together with contacts and limits instead, and each
@@ -334,9 +336,9 @@ repository examples spend tuning effort, not a shared solver API.
        parallel batches of contacts that share no responding body, which pays off on
        scenes with many contacts per world. ``propagation_cached_response`` replaces the
        per-iteration tree walk with cached per-body responses (on by default); which is
-       faster depends on the model. The propagation responses reject contact compliance
-       and loop-closing joints, and fall back from bilateral pre-elimination to iterative
-       mimic rows with a warning. ``"propagation"`` and ``"propagation_colored"`` support
+       faster depends on the model. ``"propagation"`` and ``"propagation_fused"`` reject
+       contact compliance; the propagation responses reject loop-closing joints, and fall
+       back from bilateral pre-elimination to iterative mimic rows with a warning. ``"propagation"`` and ``"propagation_colored"`` support
        contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
        and ``deterministic=True`` (``"propagation_colored"`` without ``contact_warmstart``);
        ``"propagation_colored"`` also supports sleeping and the ``friction_mode`` values

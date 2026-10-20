@@ -751,6 +751,7 @@ def select_colored_variant(solver, name):
             str(solver.model.device.arch),
             free_rigid_angular=solver._free_rigid_angular_rows,
             contact_torsion=solver._propagation_torsion_rows,
+            contact_compliance=solver._contact_compliance,
             friction_mode=solver._friction_mode,
         )
     warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
@@ -761,5 +762,6 @@ def select_colored_variant(solver, name):
     assert tag in kernel.key, f"{name} built {kernel.key}"
     assert ("_fra" in kernel.key) == bool(solver._free_rigid_angular_rows), kernel.key
     assert ("_tor" in kernel.key) == bool(solver._propagation_torsion_rows), kernel.key
+    assert ("_cc" in kernel.key) == bool(solver._contact_compliance), kernel.key
     modes = [mode for mode in ("bisection_desaxce", "bisection", "coulomb_newton") if f"_{mode}" in kernel.key]
     assert modes[:1] == ([] if solver._friction_mode == "fixed_normal" else [solver._friction_mode]), kernel.key

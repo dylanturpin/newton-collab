@@ -41,7 +41,8 @@ _FLOAT32_RANGE = 7
 _DENSE_TYPE = 8
 _MF_TYPE = 9
 _INVALID_SEPARATION = 10
-_STATUS_CODES = 11
+_PROPAGATION_TYPE = 11
+_STATUS_CODES = 12
 # status[_STATUS_CODES] holds the smallest (contact + 1) * 16 + code; global errors use contact = -1.
 _NO_ERROR = 2147483647
 
@@ -60,6 +61,7 @@ _ERRORS = {
     _DENSE_TYPE: (RuntimeError, "Contact map no longer points to a dense normal row"),
     _MF_TYPE: (RuntimeError, "Contact map no longer points to an effective MF normal row"),
     _INVALID_SEPARATION: (ValueError, "separation must be finite"),
+    _PROPAGATION_TYPE: (RuntimeError, "Contact map no longer points to a propagation normal row"),
 }
 
 
@@ -94,9 +96,13 @@ def normal_coefficients(stiffness, damping, separation, *, dt):
 
 def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
+    if settings["articulated_contact_response"] not in ("immediate", "propagation_colored"):
+        raise ValueError(
+            "contact_compliance requires articulated_contact_response 'immediate' or 'propagation_colored'; "
+            f"got {settings['articulated_contact_response']!r}"
+        )
     required = {
         "solve_mode": "matrix_free",
-        "articulated_contact_response": "immediate",
         "row_schedule": "interleaved",
         "velocity_iterations": 0,
         "contact_warmstart": False,
@@ -145,6 +151,12 @@ class ComplianceBuffers:
         self.mf_gamma = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
         self.dense_weight = wp.zeros(solver._diag.shape, dtype=float, device=device)
         self.mf_weight = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
+        # The colored response puts every contact on propagation rows; other responses route none there.
+        propagation_shape = (
+            (1, 1) if solver._propagation_eff_mass_inv is None else solver._propagation_eff_mass_inv.shape
+        )
+        self.propagation_gamma = wp.zeros(propagation_shape, dtype=float, device=device)
+        self.propagation_weight = wp.zeros(propagation_shape, dtype=float, device=device)
         # [active, skipped] for the latest prepared step.
         self.counts = wp.zeros(2, dtype=wp.int32, device=device)
         self.status = wp.empty(_STATUS_CODES + 1, dtype=wp.int32, device=device)
@@ -161,6 +173,7 @@ def begin_rows(solver):
     buffers = solver._compliance
     buffers.dense_gamma.zero_()
     buffers.mf_gamma.zero_()
+    buffers.propagation_gamma.zero_()
     buffers.counts.zero_()
     # The allocator writes slots_needed only after intentional skip gates.
     # Clear prior-step requests so an excluded contact cannot look overflowed.
@@ -171,6 +184,23 @@ def prepare_rows(solver, contacts, dt):
     """Replace CFM and bias of compliant normal rows on the device, then weight their friction rows."""
     buffers = solver._compliance
     device = solver.model.device
+    propagation = solver._propagation_eff_mass_inv is not None
+    if propagation:
+        propagation_rows = (
+            solver._propagation_constraint_count,
+            solver._propagation_row_type,
+            solver._propagation_phi,
+            solver._propagation_eff_mass_inv,
+            solver._propagation_rhs,
+        )
+    else:
+        propagation_rows = (
+            buffers.counts,
+            solver._dummy_contact_row_type,
+            buffers.propagation_gamma,
+            buffers.propagation_weight,
+            buffers.propagation_weight,
+        )
     wp.launch(
         _check_capacity,
         dim=max(solver._world_count, 1),
@@ -181,6 +211,8 @@ def prepare_rows(solver, contacts, dt):
             solver._articulation_constraint_max,
             solver._mf_constraint_count,
             solver._free_body_constraint_max,
+            propagation_rows[0],
+            solver._propagation_max_constraints if propagation else 2147483647,
             solver._row_dropped_all,
             buffers.status,
         ],
@@ -210,6 +242,9 @@ def prepare_rows(solver, contacts, dt):
             solver._mf_phi,
             solver._mf_target_velocity if has_target else buffers.dummy_target,
             int(has_target),
+            propagation_rows[0],
+            propagation_rows[1],
+            propagation_rows[2],
             float(solver._cfm),
         ],
         outputs=[
@@ -217,10 +252,14 @@ def prepare_rows(solver, contacts, dt):
             solver._rhs,
             solver._mf_eff_mass_inv,
             solver._mf_rhs,
+            propagation_rows[3],
+            propagation_rows[4],
             buffers.dense_gamma,
             buffers.mf_gamma,
+            buffers.propagation_gamma,
             buffers.dense_weight,
             buffers.mf_weight,
+            buffers.propagation_weight,
             buffers.counts,
             buffers.status,
         ],
@@ -251,6 +290,20 @@ def prepare_rows(solver, contacts, dt):
                 buffers.mf_weight,
             ],
             outputs=[solver._mf_row_mu],
+            device=device,
+        )
+    if propagation:
+        wp.launch(
+            _weight_friction_rows,
+            dim=solver._propagation_row_mu.shape,
+            inputs=[
+                solver._propagation_constraint_count,
+                solver._propagation_row_type,
+                solver._propagation_row_parent,
+                buffers.propagation_gamma,
+                buffers.propagation_weight,
+            ],
+            outputs=[solver._propagation_row_mu],
             device=device,
         )
     if not wp.get_stream(device).is_capturing:
@@ -296,6 +349,8 @@ def _check_capacity(
     dense_capacity: int,
     mf_count: wp.array[int],
     mf_capacity: int,
+    propagation_count: wp.array[int],
+    propagation_capacity: int,
     dropped: wp.array2d[wp.int32],
     status: wp.array[wp.int32],
 ):
@@ -311,6 +366,8 @@ def _check_capacity(
     if world < dense_count.shape[0] and dense_count[world] > dense_capacity:
         lost += 1
     if world < mf_count.shape[0] and mf_count[world] > mf_capacity:
+        lost += 1
+    if world < propagation_count.shape[0] and propagation_count[world] > propagation_capacity:
         lost += 1
     if lost != 0:
         _latch(status, _ROW_OVERFLOW, -1)
@@ -349,15 +406,22 @@ def _prepare_contacts(
     mf_phi: wp.array2d[float],
     mf_target: wp.array2d[float],
     has_mf_target: int,
+    propagation_count: wp.array[int],
+    propagation_type: wp.array2d[int],
+    propagation_phi: wp.array2d[float],
     pgs_cfm: float,
     diag: wp.array2d[float],
     rhs: wp.array2d[float],
     mf_inv: wp.array2d[float],
     mf_rhs: wp.array2d[float],
+    propagation_inv: wp.array2d[float],
+    propagation_rhs: wp.array2d[float],
     dense_gamma: wp.array2d[float],
     mf_gamma: wp.array2d[float],
+    propagation_gamma: wp.array2d[float],
     dense_weight: wp.array2d[float],
     mf_weight: wp.array2d[float],
+    propagation_weight: wp.array2d[float],
     counts: wp.array[wp.int32],
     status: wp.array[wp.int32],
 ):
@@ -383,12 +447,17 @@ def _prepare_contacts(
     if path == 1:
         rows = mf_gamma.shape[1]
         world_count = mf_gamma.shape[0]
-    if (path != 0 and path != 1) or world < 0 or world >= world_count or slot < 0 or slot >= rows:
+    elif path == 2:
+        rows = propagation_gamma.shape[1]
+        world_count = propagation_gamma.shape[0]
+    if path < 0 or path > 2 or world < 0 or world >= world_count or slot < 0 or slot >= rows:
         _latch(status, _UNMAPPED, contact)
         return
     active_rows = dense_count[world]
     if path == 1:
         active_rows = mf_count[world]
+    elif path == 2:
+        active_rows = propagation_count[world]
     if slot >= active_rows:
         _latch(status, _BEYOND_ROWS, contact)
         return
@@ -404,8 +473,10 @@ def _prepare_contacts(
     phi = float(0.0)
     if path == 0:
         phi = dense_phi[world, slot]
-    else:
+    elif path == 1:
         phi = mf_phi[world, slot]
+    else:
+        phi = propagation_phi[world, slot]
     if not wp.isfinite(phi):
         _latch(status, _INVALID_SEPARATION, contact)
         return
@@ -431,6 +502,18 @@ def _prepare_contacts(
         dense_weight[world, slot] = weight
         rhs[world, slot] = bias32 - dense_target[world, slot]
         diag[world, slot] = diag[world, slot] + (gamma32 - dense_cfm[world, slot])
+    elif path == 2:
+        inv = propagation_inv[world, slot]
+        if propagation_type[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT or inv <= 0.0:
+            _latch(status, _PROPAGATION_TYPE, contact)
+            return
+        if wp.atomic_add(propagation_gamma, world, slot, gamma32) != 0.0:
+            _latch(status, _DUPLICATE, contact)
+            return
+        propagation_weight[world, slot] = weight
+        # The colored sweep folds a prescribed side's velocity into this rhs itself.
+        propagation_rhs[world, slot] = bias32
+        propagation_inv[world, slot] = 1.0 / (1.0 / inv - pgs_cfm + gamma32)
     else:
         inv = mf_inv[world, slot]
         if mf_type[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT or inv <= 0.0:
