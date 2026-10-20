@@ -3,17 +3,15 @@
 """Contact-operated remote fader driving the supplied pelican automaton."""
 
 import math
-import xml.etree.ElementTree as ET
 
 import numpy as np
 import warp as wp
 
 import newton
-import newton.examples
 
+from ._tabletop_assets import import_object
 from ._tabletop_common import box, plan_ik, relative_angles, rotate_vectors, tf
 
-ASSET = newton.examples.get_asset("steel_tabletop/pelican_bicycle")
 SCALE = 2.5
 TRAVEL = 0.24
 MAX_SPEED = math.tau
@@ -25,26 +23,6 @@ def fader_drive(fader: int, wheel: int, q: wp.array[float], velocity_targets: wp
     # This is an electrical controller reading the physical slider encoder.
     # It never sets the slider pose or prescribes a mechanism trajectory.
     velocity_targets[wheel] = 6.28318530718 * fraction
-
-
-def mechanism_xml():
-    root = ET.parse(str(ASSET) + "/pelican_contact_gears.xml").getroot()
-    root.find("compiler").set("meshdir", str(ASSET) + "/cad")
-    root.remove(root.find("actuator"))
-    geometries = {g.get("name"): g for g in root.findall(".//worldbody//geom")}
-    for bit, pair in enumerate(root.findall("contact/pair"), start=1):
-        for key in ("geom1", "geom2"):
-            geom = geometries[pair.get(key)]
-            geom.set("contype", str(1 << bit))
-            geom.set("conaffinity", str(1 << bit))
-    # A single fixed root puts both closed pedal loops in one articulation.
-    world = root.find("worldbody")
-    base = ET.Element("body", name="fixed_stand")
-    for child in list(world):
-        world.remove(child)
-        base.append(child)
-    world.append(base)
-    return ET.tostring(root, encoding="unicode")
 
 
 def populate(b, info, ee, down, fingers, device):
@@ -94,15 +72,8 @@ def populate(b, info, ee, down, fingers, device):
     box(b, (0, 0, 0), (0.035, 0.014, 0.018), teal, knob, "pelican/fader-cap")
     box(b, (0, 0, 0.0185), (0.027, 0.002, 0.0005), gold, knob, "pelican/fader-mark")
     b.add_articulation([joint], label="pelican/remote")
-    first_shape, first_dof = b.shape_count, b.joint_dof_count
-    b.add_mjcf(
-        mechanism_xml(),
-        xform=tf((0.12, 0.25, 0)),
-        scale=SCALE,
-        parse_mujoco_options=False,
-        enable_self_collisions=True,
-        ignore_inertial_definitions=False,
-    )
+    first_dof = b.joint_dof_count
+    bodies = import_object(b, "pelican_bicycle", tf((0.12, 0.25, 0)))
     for i in range(first_dof, b.joint_dof_count):
         b.joint_target_ke[i], b.joint_target_kd[i] = 0, 0
         b.joint_target_mode[i] = int(newton.JointTargetMode.NONE)
@@ -111,33 +82,6 @@ def populate(b, info, ee, down, fingers, device):
     b.joint_target_mode[wheel_v] = int(newton.JointTargetMode.VELOCITY)
     b.joint_target_kd[wheel_v] = 0.12
     b.joint_effort_limit[wheel_v] = 0.20
-    for i in range(first_shape, b.shape_count):
-        b.shape_gap[i] = 0.000025
-        if b.shape_flags[i] & int(newton.ShapeFlags.VISIBLE) and b.shape_type[i] == int(newton.GeoType.MESH):
-            source = b.shape_source[i]
-            vertices = np.asarray(source.vertices)[np.asarray(source.indices).reshape(-1, 3)]
-            normals = np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
-            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
-            b.shape_source[i] = newton.Mesh(
-                vertices.reshape(-1, 3),
-                np.arange(vertices.size // 3, dtype=np.int32),
-                normals=np.repeat(normals, 3, axis=0),
-                compute_inertia=False,
-            )
-        if b.shape_flags[i] & int(newton.ShapeFlags.COLLIDE_SHAPES):
-            b.shape_flags[i] &= ~int(newton.ShapeFlags.VISIBLE)
-            b.shape_material_mu[i] = 0.03
-    b.approximate_meshes(
-        "convex_hull",
-        keep_visual_shapes=False,
-        shape_indices=[
-            i for i in range(first_shape, b.shape_count) if b.shape_flags[i] & int(newton.ShapeFlags.COLLIDE_SHAPES)
-        ],
-    )
-    bodies = {
-        name: next(i for i, label in enumerate(b.body_label) if label.endswith("/" + name) or label == name)
-        for name in ("input", "output", "wing_left", "wing_right", "jaw", "shin_left", "shin_right")
-    }
     bodies["fader"] = knob
     info.update(
         pelican_fader_q=fader_q,

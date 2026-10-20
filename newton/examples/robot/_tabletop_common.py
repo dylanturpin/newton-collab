@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared geometry and robot initialization for the tabletop examples."""
 
-import hashlib
-import json
 import math
-from functools import cache
 from itertools import pairwise
 
 import numpy as np
@@ -24,43 +21,8 @@ def box(b, p, size, color, body=-1, label=""):
     return b.add_shape_box(body, xform=tf(p), hx=size[0], hy=size[1], hz=size[2], color=color, label=label)
 
 
-def _trajectory_key(b, ee, offset, poses, rotation, waypoint_dt):
-    digest = hashlib.sha256()
-    for values in (
-        b.joint_type,
-        b.joint_parent,
-        b.joint_child,
-        b.joint_X_p,
-        b.joint_X_c,
-        b.joint_axis,
-        b.joint_dof_dim,
-        b.joint_q,
-        b.joint_limit_lower,
-        b.joint_limit_upper,
-        [ee, *offset, *rotation, -1 if waypoint_dt is None else waypoint_dt],
-        getattr(b, "_tabletop_grip_dofs", []),
-        [getattr(b, "_tabletop_driven_dofs", 0)],
-    ):
-        array = np.asarray(values, dtype=np.float64)
-        digest.update(str(array.shape).encode())
-        digest.update(array.tobytes())
-    for pose in poses:
-        digest.update(np.asarray([pose[0], *pose[1], -1 if pose[2] is None else pose[2]], dtype=np.float64).tobytes())
-        digest.update(np.asarray(rotation if len(pose) == 3 else pose[3], dtype=np.float64).tobytes())
-    return digest.hexdigest()
-
-
-@cache
-def _trajectories():
-    with open(newton.examples.get_asset("steel_tabletop/trajectories.json")) as source:
-        return json.load(source)
-
-
 def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=None):
     """Solve a sparse waypoint path; the simulated drives track its interpolation.
-
-    Reuse a precomputed path when the robot kinematics and requested waypoints
-    match. Regenerate the shipped paths with ``scripts/generate_steel_trajectories.py``.
 
     When ``waypoint_dt`` [s] is given, each segment is subdivided into eased
     Cartesian waypoints spaced at most ``waypoint_dt`` apart in time.
@@ -70,13 +32,6 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
         for c in robot_shapes[i + 1 :]:
             b.add_shape_collision_filter_pair(a, c)
     rotation = wp.quat(1.0, 0.0, 0.0, 0.0) if desired_rotation is None else desired_rotation
-    trajectory = _trajectories().get(_trajectory_key(b, ee, offset, poses, rotation, waypoint_dt))
-    if trajectory is not None:
-        coordinates = np.asarray(trajectory["coordinates"], dtype=np.float32)
-        b.joint_q[:] = coordinates[0].tolist()
-        b.joint_target_q[:] = b.joint_q[:]
-        driven = getattr(b, "_tabletop_driven_dofs", coordinates.shape[1])
-        return [(time, values[:driven]) for time, values in zip(trajectory["times"], coordinates, strict=True)]
     model = b.finalize(device=device)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
