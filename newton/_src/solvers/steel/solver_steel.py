@@ -2905,12 +2905,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._joint_armature_device = wp.zeros(max(model.joint_dof_count, 1), dtype=wp.float32, device=model.device)
         self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
         self._update_kinematic_state()
-        # Prescribed-response elision removes fully-kinematic free bases from
-        # the compact response mapping, which would desynchronize it from the
-        # contiguous per-world windows the propagation kernels address (see
-        # _compute_world_response_dof_mapping). Restrict the elision to the
-        # immediate response path; propagation modes keep the exact
-        # large-armature kinematic fallback for such bases.
+        # Prescribed-response elision drops fully-kinematic free bases from the
+        # compact response mapping. The propagation kernels expect each
+        # articulation's full DOF range in that mapping, so elision is limited to
+        # the immediate response; propagation keeps the large-armature fallback.
         self._model_plan = _SteelModelPlan.build(
             model,
             self._kinematic_dof_mask_host,
