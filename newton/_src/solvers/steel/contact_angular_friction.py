@@ -325,7 +325,7 @@ def validate_torsional_rolling_friction_coefficients(solver) -> None:
         )
 
 
-def launch_angular_friction_rows(solver, state_in, state_aug, contacts, threads: int) -> None:
+def launch_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
     """Fill the reserved spin and rolling rows for every size group after the contact rows."""
     model = solver.model
     for index, size in enumerate(solver._size_groups):
