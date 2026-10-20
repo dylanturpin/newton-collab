@@ -1980,8 +1980,8 @@ class TestSteelColoredScheduling(unittest.TestCase):
         self.assertEqual(int(solver._propagation_max_constraints), 32768 + 2048)
 
 
-def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False):
-    """A fixed-base six-link arm drooping onto a box heap; spheres on links 0, 3 and 5 touch the boxes."""
+def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False, links=6):
+    """A fixed-base arm of ``links`` revolute links drooping onto a box heap; spheres on links 0, 3 and the last."""
     world.default_shape_cfg.density = 1000.0
     world.default_shape_cfg.mu = 0.7
     no_collision = world.default_shape_cfg.copy()
@@ -1989,10 +1989,10 @@ def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False):
     no_collision.collision_group = 0
     limits = {"limit_lower": -0.15, "limit_upper": 0.15} if tight_limits else {}
     prev, joints = -1, []
-    for i in range(6):
+    for i in range(links):
         link = world.add_link()
         world.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=no_collision)
-        if i in (0, 3, 5):
+        if i in (0, 3, links - 1):
             world.add_shape_sphere(link, radius=0.08)
         parent_xform = wp.transform(
             wp.vec3(0.0, 0.0, 0.32) if prev == -1 else wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()

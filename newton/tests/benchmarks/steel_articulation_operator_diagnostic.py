@@ -342,8 +342,8 @@ def _propagation_operator_columns(
     MiJt_b = solver._propagation_MiJt_b.numpy()[world, :row_count].astype(np.float64, copy=True)
 
     body_count = solver.model.body_count
-    world_start = int(solver._world_dof_start.numpy()[world])
     world_width = int(solver._world_dof_count.numpy()[world])
+    world_dofs = solver._world_dof_indices.numpy()[world, :world_width]
     propagated = np.zeros((row_count, len(source_rows)), dtype=np.float64)
     local_only = np.zeros_like(propagated)
     qd_propagated = np.zeros((world_width, len(source_rows)), dtype=np.float64)
@@ -369,16 +369,13 @@ def _propagation_operator_columns(
 
         qd_after = solver._propagation_body_qd.numpy().astype(np.float64, copy=True)
         propagated[:, out_col] = _propagation_target_velocities(qd_after, body_a, body_b, J_a, J_b)
-        qd_propagated[:, out_col] = solver._v_out.numpy()[world_start : world_start + world_width].astype(
-            np.float64, copy=True
-        )
+        qd_propagated[:, out_col] = solver._v_out.numpy()[world_dofs].astype(np.float64, copy=True)
 
     return propagated, local_only, qd_propagated
 
 
 def _nonfree_world_dof_mask_and_condition(solver: SolverSteel, world: int) -> tuple[np.ndarray, float | None]:
     width = int(solver._world_dof_count.numpy()[world])
-    world_start = int(solver._world_dof_start.numpy()[world])
     mask = np.zeros(width, dtype=bool)
 
     if solver._is_free_rigid is None:
@@ -387,7 +384,7 @@ def _nonfree_world_dof_mask_and_condition(solver: SolverSteel, world: int) -> tu
         art_is_free = solver._is_free_rigid.numpy().astype(np.int32, copy=False) != 0
 
     art_to_world = solver._art_to_world.numpy().astype(np.int32, copy=False)
-    art_dof_start = solver._articulation_dof_start.numpy().astype(np.int32, copy=False)
+    art_world_offset = solver._articulation_world_dof_offset.numpy().astype(np.int32, copy=False)
     # PR #13 renamed the per-articulation solve-size array (art_size ->
     # articulation_response_dof_count, sourced from the model plan); read the
     # plan's response_dof_count like the surviving solver-side consumers
@@ -400,7 +397,7 @@ def _nonfree_world_dof_mask_and_condition(solver: SolverSteel, world: int) -> tu
         if int(art_to_world[art]) != world or bool(art_is_free[art]):
             continue
 
-        local_start = int(art_dof_start[art]) - world_start
+        local_start = int(art_world_offset[art])
         local_end = local_start + int(art_size[art])
         if local_end <= 0 or local_start >= width:
             continue
