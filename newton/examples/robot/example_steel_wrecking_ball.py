@@ -20,9 +20,7 @@ class Example(TabletopDemo):
     @staticmethod
     def create_parser():
         parser = TabletopDemo.create_parser()
-        # At 12 sweeps the under-converged chain-ball contacts pump spin into the
-        # ball after the strike until it back-drives the slew brake.
-        parser.set_defaults(iterations=32)
+        parser.set_defaults(substeps=4, iterations=16, contact_response="propagation_colored")
         return parser
 
     def populate(self, builder, info, ee, down, fingers):

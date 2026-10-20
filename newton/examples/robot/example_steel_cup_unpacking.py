@@ -23,6 +23,12 @@ class Example(TabletopDemo):
 
     camera_position = (1.25, -1.65, 1.45)
 
+    @staticmethod
+    def create_parser():
+        parser = TabletopDemo.create_parser()
+        parser.set_defaults(contact_response="propagation_colored")
+        return parser
+
     def populate(self, builder, info, ee, down, fingers):
         _cup_unpacking.populate(builder, info, ee, down, fingers, wp.get_device())
 

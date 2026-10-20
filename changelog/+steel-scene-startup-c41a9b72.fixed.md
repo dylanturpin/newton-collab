@@ -1,0 +1,1 @@
+Reduce Steel tabletop example loading time by precomputing fixed robot trajectories and capturing fallback IK solves in CUDA graphs; use four substeps and 16 propagation-colored iterations for the wrecking ball example, and propagation coloring for cup unpacking.
