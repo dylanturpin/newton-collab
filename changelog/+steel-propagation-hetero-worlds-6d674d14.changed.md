@@ -1,0 +1,1 @@
+Accept models whose worlds have different DOF counts with the `"propagation"`, `"propagation_fused"` and `"propagation_colored"` contact responses of `newton.solvers.SolverSteel`. `"propagation_fused"` still needs every non-free articulation to have the same DOF count.

@@ -341,8 +341,9 @@ repository examples spend tuning effort, not a shared solver API.
        back from bilateral pre-elimination to iterative mimic rows with a warning. ``"propagation"`` and ``"propagation_colored"`` support
        contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
        and ``deterministic=True`` (``"propagation_colored"`` without ``contact_warmstart``);
-       ``"propagation_colored"`` also supports sleeping. ``"propagation_fused"`` rejects
-       contact torsion, sleeping and ``deterministic=True``.
+       ``"propagation_colored"`` also supports sleeping and the ``friction_mode`` values
+       other than ``"fixed_normal"``, which it applies to articulated contacts as well.
+       ``"propagation_fused"`` rejects contact torsion, sleeping and ``deterministic=True``.
        ``use_parallel_streams`` and ``double_buffer`` overlap the work of
        articulation-size groups and of consecutive steps without changing results;
        measure the full step before relying on them.

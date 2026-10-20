@@ -3,6 +3,8 @@
 
 """Friction patches, anchors, directions, and torsional and rolling friction of SolverSteel."""
 
+import contextlib
+import itertools
 import math
 import unittest
 import warnings
@@ -33,7 +35,15 @@ from newton._src.solvers.steel.kernels import (
 )
 from newton._src.solvers.steel.solver_steel import _get_pgs_solve_tiled_row_kernel
 from newton.solvers import SolverBase, SolverSteel
-from newton.tests.steel._fixtures import _patch_fixture, fixture, run_fixture, set_torsion_radius
+from newton.tests.steel._fixtures import (
+    COLORED_VARIANTS,
+    _patch_fixture,
+    colored_variant_switches,
+    fixture,
+    run_fixture,
+    select_colored_variant,
+    set_torsion_radius,
+)
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 
@@ -3314,6 +3324,291 @@ class TestSteelAngularFrictionBlock(unittest.TestCase):
                         )
                         # Float32 velocities carry relative energy error of about eps times the inertia ratio, 1e4.
                         np.testing.assert_array_less(gains.max(axis=1), 1.0e-4 * start)
+
+
+_COUPLED_MODES = ("bisection", "bisection_desaxce", "coulomb_newton")
+_MODE_MU = 0.5
+_MODE_DT = 1.0 / 240.0
+
+
+class _ModeScene:
+    """One box on an incline or one sliding sphere per world, stepped in place so steps can be captured."""
+
+    def __init__(
+        self,
+        response,
+        mode,
+        *,
+        scene="incline",
+        angle=0.0,
+        articulated=False,
+        worlds=1,
+        variant=None,
+        **solver_kwargs,
+    ):
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        cfg = newton.ModelBuilder.ShapeConfig(mu=_MODE_MU, gap=0.0, restitution=0.0, density=500.0)
+        tilt = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), float(angle))
+        world.add_shape_box(-1, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform((0.0, 0.0, -0.05), tilt), cfg=cfg)
+        if scene == "incline":
+            pose = wp.transform(wp.quat_rotate(tilt, wp.vec3(0.0, 0.0, 0.05)), tilt)
+        else:
+            pose = wp.transform((0.0, 0.0, 0.05), wp.quat_identity())
+        body = (world.add_link if articulated else world.add_body)(xform=pose)
+        if articulated:
+            joint = world.add_joint_d6(
+                parent=-1,
+                child=body,
+                parent_xform=pose,
+                linear_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+                angular_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+            )
+            world.add_articulation([joint])
+        if scene == "incline":
+            world.add_shape_box(body, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+        else:
+            world.add_shape_sphere(body, radius=0.05, cfg=cfg)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.replicate(world, worlds)
+        self.model = builder.finalize(device="cuda:0")
+        args = {
+            "solve_mode": "matrix_free",
+            "articulated_contact_response": response,
+            "friction_mode": mode,
+            "friction_anchor_beta": 0.0,
+            "iterations": 32,
+            "free_body_constraint_max": 64,
+            "articulation_constraint_max": 64,
+            "row_watermark": True,
+            "deterministic": True,
+        }
+        args.update(solver_kwargs)
+        with colored_variant_switches(variant) if variant else contextlib.nullcontext():
+            self.solver = SolverSteel(self.model, **args)
+            if variant:
+                select_colored_variant(self.solver, variant)
+        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=16 * worlds, deterministic=True)
+        self.contacts = self.pipeline.contacts()
+        self.state_in, self.state_out = self.model.state(), self.model.state()
+        self.control = self.model.control()
+        if scene == "sphere":
+            # Sliding along x without spin.
+            qd = self.state_in.joint_qd.numpy().reshape(worlds, 6)
+            qd[:, 0] = 2.0
+            self.state_in.joint_qd.assign(qd.reshape(-1))
+        newton.eval_fk(self.model, self.state_in.joint_q, self.state_in.joint_qd, self.state_in)
+
+    def step(self, steps=1):
+        for _ in range(steps):
+            self.state_in.clear_forces()
+            self.pipeline.collide(self.state_in, self.contacts)
+            self.solver.step(self.state_in, self.state_out, self.control, self.contacts, _MODE_DT)
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                wp.copy(getattr(self.state_in, name), getattr(self.state_out, name))
+
+    def velocity(self):
+        return self.state_in.body_qd.numpy().astype(np.float64)
+
+    def run(self, steps):
+        trace = []
+        for _ in range(steps):
+            self.step()
+            trace.append(self.velocity())
+        return np.asarray(trace)
+
+
+def _mode_trace(response, mode, steps, **kwargs):
+    return _ModeScene(response, mode, **kwargs).run(steps)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+class TestColoredFrictionModes(unittest.TestCase):
+    """``friction_mode`` other than fixed_normal with ``articulated_contact_response="propagation_colored"``."""
+
+    SLIP = math.atan(_MODE_MU)
+    TOLERANCE = 1.0e-4
+
+    def _assert_no_lost_rows(self, scene):
+        for key, value in scene.solver.constraint_row_watermarks().items():
+            if "overflow" in key or "dropped" in key:
+                self.assertEqual(value, 0, key)
+
+    def test_incline_tracks_immediate(self):
+        """A box near the slip angle follows immediate's coupled solve of each mode, which fixed_normal does not.
+
+        The mode's effect, its gap to fixed_normal on immediate, must exceed ten times the tolerance; colored
+        solving the box with fixed_normal would miss by that much.
+        """
+        for angle, iterations in itertools.product((self.SLIP - 0.05, self.SLIP + 0.05), (4, 32)):
+            fixed = _mode_trace("immediate", "fixed_normal", 20, angle=angle, iterations=iterations)
+            for mode in _COUPLED_MODES:
+                with self.subTest(angle=angle, iterations=iterations, mode=mode):
+                    immediate = _mode_trace("immediate", mode, 20, angle=angle, iterations=iterations)
+                    scene = _ModeScene("propagation_colored", mode, angle=angle, iterations=iterations)
+                    colored = scene.run(20)
+                    self._assert_no_lost_rows(scene)
+                    np.testing.assert_allclose(colored, immediate, atol=self.TOLERANCE, rtol=0.0)
+                    # Coulomb Newton and fixed_normal reach the same converged solution.
+                    if iterations == 4 or mode != "coulomb_newton":
+                        self.assertGreater(np.abs(immediate - fixed).max(), 10.0 * self.TOLERANCE)
+
+    def test_articulated_contacts_take_the_mode(self):
+        """A box on a six-DOF joint slides as the free box does, in every mode.
+
+        Colored solves every contact with the matrix-free coupled solve. Immediate's articulated contacts run
+        bisection without the de Saxce bias and fixed_normal for coulomb_newton, so it matches only in bisection.
+        The joint moves the box about 1e-5 off the free trajectory, which the de Saxce bias amplifies past the
+        tolerance after 13 steps, so the comparison stops at 12.
+        """
+        for angle, iterations in itertools.product((self.SLIP - 0.05, self.SLIP + 0.05), (4, 32)):
+            for mode in _COUPLED_MODES:
+                with self.subTest(angle=angle, iterations=iterations, mode=mode):
+                    kwargs = {"angle": angle, "iterations": iterations}
+                    free = _mode_trace("propagation_colored", mode, 12, **kwargs)
+                    articulated = _mode_trace("propagation_colored", mode, 12, articulated=True, **kwargs)
+                    np.testing.assert_allclose(articulated, free, atol=self.TOLERANCE, rtol=0.0)
+                    if mode == "bisection":
+                        immediate = _mode_trace("immediate", mode, 12, articulated=True, **kwargs)
+                        np.testing.assert_allclose(articulated, immediate, atol=self.TOLERANCE, rtol=0.0)
+
+    def test_sliding_sphere_reaches_rolling_as_on_immediate(self):
+        """A sphere launched without spin slides until it rolls at 5/7 of its speed, as on immediate."""
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                immediate = _mode_trace("immediate", mode, 120, scene="sphere")
+                colored = _mode_trace("propagation_colored", mode, 120, scene="sphere")
+                np.testing.assert_allclose(colored, immediate, atol=self.TOLERANCE, rtol=0.0)
+                speed, spin = colored[-1, 0, 0], colored[-1, 0, 4]
+                self.assertAlmostEqual(speed, 2.0 * 5.0 / 7.0, delta=0.02)
+                self.assertAlmostEqual(spin * 0.05, speed, delta=1.0e-3)
+
+    def test_kinematic_belt_drags_the_box(self):
+        """A box resting on a kinematic belt reaches the belt speed in every mode.
+
+        The colored sweep folds the belt's velocity into the rows' right-hand sides, which the coupled solve reads.
+        """
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+                cfg = newton.ModelBuilder.ShapeConfig(mu=_MODE_MU, gap=0.0, restitution=0.0, density=500.0)
+                belt = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
+                builder.add_shape_box(belt, hx=2.0, hy=2.0, hz=0.05, cfg=cfg)
+                box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+                builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+                builder.body_flags[belt] = int(newton.BodyFlags.KINEMATIC)
+                model = builder.finalize(device="cuda:0")
+                solver = SolverSteel(
+                    model,
+                    solve_mode="matrix_free",
+                    articulated_contact_response="propagation_colored",
+                    friction_mode=mode,
+                    friction_anchor_beta=0.0,
+                    iterations=32,
+                    deterministic=True,
+                )
+                pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
+                contacts = pipeline.contacts()
+                state, next_state, control = model.state(), model.state(), model.control()
+                qd = state.joint_qd.numpy()
+                qd[0] = 0.5
+                state.joint_qd.assign(qd)
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                for _ in range(120):
+                    body_qd = state.body_qd.numpy()
+                    body_qd[belt] = (0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    state.body_qd.assign(body_qd)
+                    state.clear_forces()
+                    pipeline.collide(state, contacts)
+                    solver.step(state, next_state, control, contacts, _MODE_DT)
+                    state, next_state = next_state, state
+                np.testing.assert_allclose(state.body_qd.numpy()[box], (0.5, 0.0, 0.0, 0.0, 0.0, 0.0), atol=1.0e-3)
+
+    def test_every_colored_variant_agrees(self):
+        """Every colored solve body runs the coupled solve, agreeing within float32 summation order.
+
+        The bodies call one coupled update for every mode, so one mode covers them.
+        """
+        for mode in ("bisection_desaxce",):
+            reference = None
+            for variant in COLORED_VARIANTS:
+                with self.subTest(mode=mode, variant=variant):
+                    trace = _ModeScene(
+                        "propagation_colored", mode, angle=self.SLIP + 0.05, iterations=4, worlds=2, variant=variant
+                    ).run(20)
+                    if reference is None:
+                        reference = trace
+                    # A bisection or a slip flip turns float32 summation-order differences into larger steps.
+                    np.testing.assert_allclose(trace[0], reference[0], atol=1.0e-5, rtol=0.0)
+                    np.testing.assert_allclose(trace, reference, atol=self.TOLERANCE, rtol=0.0)
+
+    def test_deterministic_repeats_bitwise(self):
+        """With deterministic=True two runs of several worlds match bitwise in every mode."""
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                runs = [
+                    _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=3, deterministic=True).run(
+                        30
+                    )
+                    for _ in range(2)
+                ]
+                np.testing.assert_array_equal(runs[0], runs[1])
+
+    def test_captured_steps_match_eager_steps(self):
+        """Replaying a captured step matches eager stepping bitwise in every mode."""
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                eager = _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
+                eager.step(2)
+                expected = eager.run(10)
+                captured = _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
+                captured.step(2)
+                with wp.ScopedCapture(device="cuda:0") as capture:
+                    captured.step()
+                trace = []
+                for _ in range(10):
+                    wp.capture_launch(capture.graph)
+                    trace.append(captured.velocity())
+                np.testing.assert_array_equal(np.asarray(trace), expected)
+
+    def test_resting_box_sleeps_as_on_immediate(self):
+        """A resting box falls asleep at the same step as on immediate in every mode."""
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                asleep = {}
+                for response in ("immediate", "propagation_colored"):
+                    scene = _ModeScene(response, mode, enable_sleeping=True, sleep_quiet_time=0.05)
+                    awake = []
+                    for _ in range(120):
+                        scene.step()
+                        awake.append(bool(scene.solver._sleeping.body_awake.numpy()[0]))
+                    asleep[response] = awake
+                self.assertFalse(asleep["immediate"][-1])
+                self.assertEqual(asleep["propagation_colored"], asleep["immediate"])
+
+    def test_unsupported_combinations_are_rejected(self):
+        """Colored keeps the immediate restrictions of the coupled modes; other propagation responses raise."""
+        model = _ModeScene("immediate", "fixed_normal").model
+        base = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                SolverSteel(model, **base, friction_mode=mode, friction_anchor_beta=0.0)
+                with self.assertRaisesRegex(ValueError, "Patch friction requires"):
+                    SolverSteel(model, **base, friction_mode=mode, friction_anchor_beta=0.2)
+                with self.assertRaisesRegex(ValueError, "angular friction"):
+                    SolverSteel(
+                        model, **base, friction_mode=mode, friction_anchor_beta=0.0, free_rigid_rolling_friction=0.01
+                    )
+                with self.assertRaisesRegex(ValueError, "contact_compliance requires"):
+                    SolverSteel(model, **base, friction_mode=mode, friction_anchor_beta=0.0, contact_compliance=True)
+                for response in ("propagation", "propagation_fused"):
+                    with self.assertRaises(NotImplementedError):
+                        SolverSteel(
+                            model,
+                            solve_mode="matrix_free",
+                            articulated_contact_response=response,
+                            friction_mode=mode,
+                            friction_anchor_beta=0.0,
+                        )
 
 
 if __name__ == "__main__":
