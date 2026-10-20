@@ -3598,6 +3598,14 @@ class TestSteelRollingFrictionPropagation(unittest.TestCase):
         for overrides in rejected:
             with self.subTest(**overrides), self.assertRaises(ValueError):
                 ball(**overrides)
+        # The colored response supports these alone, so the angular rows must be what rejects them.
+        angular_rejected = (
+            *({**_COLORED, "friction_mode": mode} for mode in ("bisection", "bisection_desaxce", "coulomb_newton")),
+            {**_COLORED, "contact_compliance": True, "enable_restitution": False},
+        )
+        for overrides in angular_rejected:
+            with self.subTest(**overrides), self.assertRaisesRegex(ValueError, "torsional/rolling friction"):
+                ball(**overrides)
 
 
 class TestSteelAngularFrictionBlock(unittest.TestCase):
