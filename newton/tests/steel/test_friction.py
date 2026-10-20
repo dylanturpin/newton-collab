@@ -3482,6 +3482,47 @@ class TestColoredFrictionModes(unittest.TestCase):
                 self.assertAlmostEqual(speed, 2.0 * 5.0 / 7.0, delta=0.02)
                 self.assertAlmostEqual(spin * 0.05, speed, delta=1.0e-3)
 
+    def test_kinematic_belt_drags_the_box(self):
+        """A box resting on a kinematic belt reaches the belt speed in every mode.
+
+        The colored sweep folds the belt's velocity into the rows' right-hand sides, which the coupled solve reads.
+        """
+        for mode in _COUPLED_MODES:
+            with self.subTest(mode=mode):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+                cfg = newton.ModelBuilder.ShapeConfig(mu=_MODE_MU, gap=0.0, restitution=0.0, density=500.0)
+                belt = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
+                builder.add_shape_box(belt, hx=2.0, hy=2.0, hz=0.05, cfg=cfg)
+                box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+                builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+                builder.body_flags[belt] = int(newton.BodyFlags.KINEMATIC)
+                model = builder.finalize(device="cuda:0")
+                solver = SolverSteel(
+                    model,
+                    solve_mode="matrix_free",
+                    articulated_contact_response="propagation_colored",
+                    friction_mode=mode,
+                    friction_anchor_beta=0.0,
+                    iterations=32,
+                    deterministic=True,
+                )
+                pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
+                contacts = pipeline.contacts()
+                state, next_state, control = model.state(), model.state(), model.control()
+                qd = state.joint_qd.numpy()
+                qd[0] = 0.5
+                state.joint_qd.assign(qd)
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                for _ in range(120):
+                    body_qd = state.body_qd.numpy()
+                    body_qd[belt] = (0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    state.body_qd.assign(body_qd)
+                    state.clear_forces()
+                    pipeline.collide(state, contacts)
+                    solver.step(state, next_state, control, contacts, _MODE_DT)
+                    state, next_state = next_state, state
+                np.testing.assert_allclose(state.body_qd.numpy()[box], (0.5, 0.0, 0.0, 0.0, 0.0, 0.0), atol=1.0e-3)
+
     def test_every_colored_variant_agrees(self):
         """Every colored solve body runs the coupled solve, agreeing within float32 summation order.
 
