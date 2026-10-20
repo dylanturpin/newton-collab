@@ -60,7 +60,9 @@ from .contact_angular_friction import (
     free_rigid_route_bodies,
     launch_angular_friction_rows,
     launch_free_rigid_angular_friction_rows,
+    launch_propagation_angular_friction_rows,
     launch_propagation_free_rigid_angular_friction_rows,
+    propagation_angular_friction_source,
     refresh_free_rigid_angular_friction,
     validate_free_rigid_angular_friction_mode,
     validate_torsional_rolling_friction_coefficients,
@@ -78,7 +80,9 @@ from .contact_torsion import (
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
+    ANGULAR_FRICTION_DENSE,
     ANGULAR_FRICTION_FREE_RIGID,
+    ANGULAR_FRICTION_PROPAGATION,
     CONTACT_GENERATION_NONE,
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -2036,14 +2040,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 :attr:`~newton.Model.shape_material_mu_rolling` [m]. The pair coefficient is the mean of
                 the two shapes, as for sliding friction; MuJoCo's ``condim`` attribute and its max pair rule
                 are ignored, so enabling this applies every positive material coefficient, including on
-                shapes a MuJoCo model treats as ``condim=3``. Each dense articulated contact with sliding
+                shapes a MuJoCo model treats as ``condim=3``. Each articulated contact with sliding
                 friction and a positive pair coefficient gets one spin row about the normal and two
                 rolling rows about the tangents. At the solved normal impulse, each Gauss-Seidel visit
                 minimizes the contact's five-row friction quadratic over the joint cone selected by
                 ``torsional_rolling_friction_cone``. False ignores both fields. Requires CUDA
-                ``matrix_free``/``immediate``/``interleaved`` solving with ``friction_mode="fixed_normal"``
-                and point friction (``friction_anchor_beta=0``), without warm start, velocity iterations,
-                debug, contact compliance, contact torsion radius, sleeping, or differentiation. Positive
+                ``matrix_free``/``interleaved`` solving with ``articulated_contact_response``
+                ``"immediate"``, ``"propagation"`` or ``"propagation_colored"``,
+                ``friction_mode="fixed_normal"`` and point friction (``friction_anchor_beta=0``), without warm
+                start, velocity iterations, contact compliance or differentiation. ``"immediate"`` also rejects
+                a contact torsion radius and sleeping. On the propagation responses a contact can carry both
+                these rows and a contact torsion row, whose budget counts sliding only, so their spin couples
+                add; there, contacts kept on dense rows get no angular rows while contact torsion is on. Positive
                 coefficients on shapes that can reach the matrix-free free-rigid route (free bodies, and
                 static or zero-DOF articulated shapes when free bodies exist) raise ``ValueError``.
                 Construction-only: it selects a specialized solve kernel. Coefficient edits, in place or by
@@ -2639,6 +2647,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         self._propagation_full_fused_iterations = articulated_contact_response == "propagation_fused"
         self._propagation_colored = articulated_contact_response == "propagation_colored"
+        # Cone and creep speed of the spin and rolling rows of articulated contacts on the propagation row family.
+        self._propagation_angular_friction = (
+            (self._torsional_rolling_friction_cone, self._torsional_rolling_friction_creep_speed)
+            if self._enable_torsional_rolling_friction
+            and articulated_contact_response in ("propagation", "propagation_colored")
+            else None
+        )
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
             raise ValueError(
                 "propagation_same_articulation_rows requires articulated_contact_response "
@@ -3295,6 +3310,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
         configure_contact_torsion(self)
+        # The dense GS kernel solves angular rows or torsion rows, not both; with torsion on a propagation response
+        # only the propagation family's contacts get angular rows.
+        self._dense_angular_friction = self._enable_torsional_rolling_friction and not (
+            self._propagation_torsion_rows and self._articulated_contact_response != "immediate"
+        )
         if self._solve_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -7483,9 +7503,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact_torsion=self._contact_torsion_enabled,
                 torsion_links=self._mfgs_torsion_links,
                 factor_coordinates=self._paired_factor_coordinates,
-                angular_friction_cone=(
-                    self._torsional_rolling_friction_cone if self._enable_torsional_rolling_friction else None
-                ),
+                angular_friction_cone=(self._torsional_rolling_friction_cone if self._dense_angular_friction else None),
                 angular_friction_creep_speed=self._torsional_rolling_friction_creep_speed,
                 contact_compliance=self._contact_compliance,
                 pair_cache=self._mfgs_pair_cache,
@@ -7524,6 +7542,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device_arch,
                 free_rigid_angular=self._free_rigid_angular_rows,
                 contact_torsion=self._propagation_torsion_rows,
+                articulated_angular=self._propagation_angular_friction,
                 contact_compliance=self._contact_compliance,
                 friction_mode=self._friction_mode,
             )
@@ -7570,6 +7589,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     straight_line=self._propagation_colored_straight_line,
                     free_rigid_angular=self._free_rigid_angular_rows,
                     contact_torsion=self._propagation_torsion_rows,
+                    articulated_angular=self._propagation_angular_friction,
                     contact_compliance=self._contact_compliance,
                     friction_mode=self._friction_mode,
                 )
@@ -7605,6 +7625,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 worlds_per_block=self._propagation_gs_worlds_per_block,
                 free_rigid_angular=self._free_rigid_angular_rows,
                 contact_torsion=self._propagation_torsion_rows,
+                articulated_angular=self._propagation_angular_friction,
             )
             fused_size = getattr(self, "_propagation_full_fused_size", None)
             if self._propagation_full_fused_iterations and fused_size is not None:
@@ -12567,7 +12588,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_max_constraints,
                     self._friction_gap,
                     self._friction_patches.view,
-                    int(self._enable_torsional_rolling_friction)
+                    (ANGULAR_FRICTION_DENSE if self._dense_angular_friction else 0)
+                    | (ANGULAR_FRICTION_PROPAGATION if self._propagation_angular_friction is not None else 0)
                     | (ANGULAR_FRICTION_FREE_RIGID if self._free_rigid_angular_rows else 0),
                     self._shape_mu_torsional,
                     self._shape_mu_rolling,
@@ -12877,7 +12899,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         device=model.device,
                     )
 
-            if self._enable_torsional_rolling_friction:
+            if self._dense_angular_friction:
                 launch_angular_friction_rows(self, state_in, state_aug, contacts, contact_build_threads)
 
             # Build MF contact rows
@@ -13050,6 +13072,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
                 if self._free_rigid_angular_rows:
                     launch_propagation_free_rigid_angular_friction_rows(self, contacts, contact_build_threads)
+                if self._propagation_angular_friction is not None:
+                    launch_propagation_angular_friction_rows(self, contacts, contact_build_threads)
                 if self._propagation_torsion_rows:
                     wp.launch(
                         clear_propagation_torsion_spares,
@@ -18647,6 +18671,14 @@ PAYLOAD_LANE_WORDS = 104
 then its 3 rhs values (kept apart from the 16-byte static chunks they would race with), padded."""
 
 
+def _articulated_angular_suffix(articulated_angular: tuple[str, float] | None) -> str:
+    """Kernel-name suffix for the articulated angular friction rows' cone and creep speed."""
+    if articulated_angular is None:
+        return ""
+    cone, creep_speed = articulated_angular
+    return f"_aaf_{cone}_{float(creep_speed)!r}".replace(".", "p").replace("-", "m")
+
+
 def _colored_staging_supported(device_arch: int, lanes: int, world_count: int, max_bodies: int) -> bool:
     """Whether the colored solve stages each color's payload in shared memory.
 
@@ -18936,12 +18968,16 @@ def _colored_coupled_row_loop(*, apply: bool, global_twists: bool = False) -> st
     return code
 
 
-def _colored_unit_rest_rows(first: str, *, shared: bool, end: str = "", angular: bool, torsion: bool) -> str:
+def _colored_unit_rest_rows(
+    first: str, *, shared: bool, end: str = "", angular: bool, torsion: bool, articulated_angular: bool = False
+) -> str:
     """CUDA solving the rows after a colored unit's contact row and sliding pair, from unit row ``first``.
 
     ``angular``: a free-rigid contact's rolling pair, solved as a disk at its first row (parent + 3), and
     its spin row, solved as a box; both bounded by their coefficient times the pooled patch load, as on the
-    plain sweep. ``torsion``: the contact torsion spare. A group's row sits in the spare of its last
+    plain sweep. ``articulated_angular``: an articulated contact's spin and rolling rows, solved at the first
+    (parent + 3) together with the sliding pair as one block on the joint cone (``PropagationAngularFrictionBlock``).
+    ``torsion``: the contact torsion spare. A group's row sits in the spare of its last
     member, whose unit has the group's highest color, so it runs after every member's rows of the sweep
     and takes the plain post-pass's residual budget; other spares are inert. ``shared`` reads the twists
     from the color loop's local slots, otherwise from the global bodies. ``end`` also ends the unit.
@@ -18950,7 +18986,12 @@ def _colored_unit_rest_rows(first: str, *, shared: bool, end: str = "", angular:
     spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
     torsion_type = int(PGS_CONSTRAINT_TYPE_TORSION)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
-    types = ([rolling_type, spin_type] if angular else []) + ([torsion_type] if torsion else [])
+    block_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
+    types = (
+        ([rolling_type, spin_type] if angular else [])
+        + ([block_type] if articulated_angular else [])
+        + ([torsion_type] if torsion else [])
+    )
     if not types:
         return ""
     if shared:
@@ -19065,6 +19106,34 @@ def _colored_unit_rest_rows(first: str, *, shared: bool, end: str = "", angular:
         if torsion
         else ""
     )
+    block_row = (
+        f"""
+                if (row_type == {block_type}) {{
+                    if (global_iter < friction_start_iteration) {{
+                        propagation_impulses.data[off] = 0.0f;
+                        continue;
+                    }}
+                    const int parent_idx = propagation_row_parent.data[off];
+                    // The block runs at its spin row, after the unit's sliding pair, and covers rows parent + 1 to + 5.
+                    if (slot != parent_idx + 3) continue;
+                    {locate("off")}
+                    if (la < 0 && lb < 0) continue;
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
+                    const int first_off = world_base + parent_idx + 1;
+                    PropagationAngularFrictionBlock::solve(
+                        la >= 0 ? &{qd("a", "0")} : nullptr, la >= 0 ? &{imp("a", "0")} : nullptr,
+                        lb >= 0 ? &{qd("b", "0")} : nullptr, lb >= 0 ? &{imp("b", "0")} : nullptr,
+                        &propagation_J_a.data[first_off * 6], &propagation_J_b.data[first_off * 6],
+                        &propagation_MiJt_a.data[first_off * 6], &propagation_MiJt_b.data[first_off * 6],
+                        &propagation_impulses.data[first_off], &propagation_row_mu.data[first_off],
+                        &propagation_rhs.data[first_off], lambda_n, omega);
+                    continue;
+                }}"""
+        if articulated_angular
+        else ""
+    )
     angular_rows = (
         f"""
                 if (global_iter < friction_start_iteration) {{
@@ -19137,6 +19206,7 @@ def _colored_unit_rest_rows(first: str, *, shared: bool, end: str = "", angular:
                 const int row_type = propagation_row_type.data[off];
                 if ({rest}) break;
 {torsion_row}
+{block_row}
 {angular_rows}
             }}
 """
@@ -19149,6 +19219,7 @@ def _colored_prefetch_unit_body(
     packed: bool = False,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    articulated_angular: bool = False,
     contact_compliance: bool = False,
     friction_mode: str = "fixed_normal",
 ) -> str:
@@ -19519,6 +19590,7 @@ def _colored_prefetch_unit_body(
         end=f"xr >= um[{5 + PROPAGATION_UNIT_RING}]",
         angular=free_rigid_angular,
         torsion=contact_torsion,
+        articulated_angular=articulated_angular,
     )
     # A straight-line unit's rest rows follow its sliding pair (kind 1) or its lone contact row (kind 2).
     standard_rest = _colored_unit_rest_rows(
@@ -19527,6 +19599,7 @@ def _colored_prefetch_unit_body(
         end=f"xr >= um[{5 + PROPAGATION_UNIT_RING}]",
         angular=free_rigid_angular,
         torsion=contact_torsion,
+        articulated_angular=articulated_angular,
     )
     return f"""
             {{
@@ -19611,6 +19684,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     straight_line: bool = True,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    articulated_angular: tuple[str, float] | None = None,
     contact_compliance: bool = False,
     friction_mode: str = "fixed_normal",
 ) -> "wp.Kernel":
@@ -19628,9 +19702,11 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     are row-uniform); only float summation order inside a row's dot differs.
     ``free_rigid_angular`` solves the rolling pair and spin row that follow a free-rigid contact's sliding
     pair inside its unit, and ``contact_torsion`` each torsion group's row inside its host unit (see
-    :func:`_colored_unit_rest_rows`). ``contact_compliance`` adds ``compliance_gamma * lambda`` to every contact
-    row's residual; the coefficient is zero on hard rows. Any ``friction_mode`` but fixed_normal solves each
-    contact row and its sliding pair together at the pair's first row (see :func:`_colored_coupled_contact`).
+    :func:`_colored_unit_rest_rows`). ``articulated_angular`` is the ``(cone, creep speed)`` of the articulated
+    contacts' spin and rolling rows, solved with their sliding pair as one block. ``contact_compliance`` adds
+    ``compliance_gamma * lambda`` to every contact row's residual; the coefficient is zero on hard rows. Any
+    ``friction_mode`` but fixed_normal solves each contact row and its sliding pair together at the pair's first
+    row (see :func:`_colored_coupled_contact`).
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -19735,7 +19811,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 """
     # The next row's dot reads entries other lanes of the group just wrote.
     row_sync = f"                __syncwarp({gmask});" if R > 1 else ""
-    rest = _colored_unit_rest_rows("rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion)
+    block = articulated_angular is not None
+    rest = _colored_unit_rest_rows(
+        "rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion, articulated_angular=block
+    )
     coop_rest = rest
     if rest and R > 1:
         # The group leader solves the rest of the unit alone, between barriers over the group.
@@ -19747,7 +19826,11 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             __syncwarp({gmask});"""
     # Rows after a standard unit's sliding pair or a lone contact row's spare follow the straight line.
     reference_rest = _colored_unit_rest_rows(
-        "(standard ? 3 : 1)", shared=True, angular=free_rigid_angular, torsion=contact_torsion
+        "(standard ? 3 : 1)",
+        shared=True,
+        angular=free_rigid_angular,
+        torsion=contact_torsion,
+        articulated_angular=block,
     )
 
     coop_body = f"""
@@ -19937,6 +20020,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             packed=packed or staged,
             free_rigid_angular=free_rigid_angular,
             contact_torsion=contact_torsion,
+            articulated_angular=block,
             contact_compliance=contact_compliance,
             friction_mode=friction_mode,
         )
@@ -20123,6 +20207,12 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if articulated_angular is not None:
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)",
+            "#if defined(__CUDA_ARCH__)\n" + propagation_angular_friction_source(*articulated_angular),
+            1,
+        )
     if friction_mode != "fixed_normal":
         snippet = snippet.replace(
             "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
@@ -20245,7 +20335,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     name = (
         f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
         f"_pk{int(bool(packed or staged))}_sl{int(bool(straight_line))}{'_fra' if free_rigid_angular else ''}"
-        f"{'_tor' if contact_torsion else ''}{'_cc' if contact_compliance else ''}"
+        f"{'_tor' if contact_torsion else ''}{_articulated_angular_suffix(articulated_angular)}"
+        f"{'_cc' if contact_compliance else ''}"
         f"{'' if friction_mode == 'fixed_normal' else '_' + friction_mode}"
     )
     pgs_solve_propagation_colored_warp_template.__name__ = name
@@ -20262,6 +20353,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     device_arch: str,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    articulated_angular: tuple[str, float] | None = None,
     contact_compliance: bool = False,
     friction_mode: str = "fixed_normal",
 ) -> "wp.Kernel":
@@ -20274,7 +20366,8 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     exact Gauss-Seidel, while units of one color share no body and write
     race-free. The tail segment (color-cap overflow) runs ordered on
     thread 0. One launch per PGS iteration regardless of color count.
-    ``free_rigid_angular`` and ``contact_torsion`` solve the rows after a unit's sliding pair inside it.
+    ``free_rigid_angular``, ``articulated_angular`` and ``contact_torsion`` solve the rows after a unit's
+    sliding pair inside it (see :func:`_get_pgs_solve_propagation_colored_warp_kernel`).
     ``contact_compliance`` adds ``compliance_gamma * lambda`` to every contact row's residual.
     Any ``friction_mode`` but fixed_normal solves each contact row and its sliding pair together.
     """
@@ -20288,8 +20381,13 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     # global-memory path (no per-step behavior switches).
     MB = max(int(max_propagation_bodies), 1)
     use_staging = MB <= 384
-    rest_global = _colored_unit_rest_rows("rr", shared=False, angular=free_rigid_angular, torsion=contact_torsion)
-    rest_staged = _colored_unit_rest_rows("rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion)
+    block = articulated_angular is not None
+    rest_global = _colored_unit_rest_rows(
+        "rr", shared=False, angular=free_rigid_angular, torsion=contact_torsion, articulated_angular=block
+    )
+    rest_staged = _colored_unit_rest_rows(
+        "rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion, articulated_angular=block
+    )
 
     rhs_term = "__ldg(&propagation_rhs.data[off])"
     if contact_compliance:
@@ -20630,6 +20728,12 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if articulated_angular is not None:
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)",
+            "#if defined(__CUDA_ARCH__)\n" + propagation_angular_friction_source(*articulated_angular),
+            1,
+        )
     if friction_mode != "fixed_normal":
         snippet = snippet.replace(
             "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
@@ -20741,6 +20845,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     name = (
         f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}_{stag}{MB}"
         f"{'_fra' if free_rigid_angular else ''}{'_tor' if contact_torsion else ''}"
+        f"{_articulated_angular_suffix(articulated_angular)}"
         f"{'_cc' if contact_compliance else ''}"
         f"{'' if friction_mode == 'fixed_normal' else '_' + friction_mode}"
     )
@@ -20755,6 +20860,7 @@ def _get_pgs_solve_propagation_contact_kernel(
     worlds_per_block: int = 1,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    articulated_angular: tuple[str, float] | None = None,
 ) -> "wp.Kernel":
     """Build a one-warp propagation contact GS kernel for fixed-size body rows.
 
@@ -20767,6 +20873,8 @@ def _get_pgs_solve_propagation_contact_kernel(
     contact's sliding pair, bounded by their coefficient times the pooled normal load.
     ``contact_torsion`` solves each contact torsion row after the sweep's other rows, with its group's
     residual sliding budget, as the immediate response's torsion sweep does.
+    ``articulated_angular`` is the ``(cone, creep speed)`` of the articulated contacts' spin and rolling rows,
+    which lane 0 solves at the spin row together with the sliding pair as one block on the joint cone.
     """
     M = propagation_max_constraints
     W = max(int(worlds_per_block), 1)
@@ -20795,6 +20903,34 @@ def _get_pgs_solve_propagation_contact_kernel(
         else ""
     )
     torsion_sweep = _propagation_torsion_sweep_source(friction_type) if contact_torsion else ""
+    block_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
+    block_rows = (
+        f"""if (row_type == {block_type}) {{
+                const int parent_idx = propagation_row_parent.data[off];
+                if (lane == 0 && global_iter < friction_start_iteration) {{
+                    propagation_impulses.data[off] = 0.0f;
+                }} else if (lane == 0 && i == parent_idx + 3 && (ba >= 0 || bb >= 0)) {{
+                    // The block covers rows parent + 1 to + 5; it runs at its spin row, after the sliding pair.
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
+                    const int first_off = world_base + parent_idx + 1;
+                    PropagationAngularFrictionBlock::solve(
+                        ba >= 0 ? &propagation_body_qd.data[ba * 6] : nullptr,
+                        ba >= 0 ? &propagation_body_impulses.data[ba * 6] : nullptr,
+                        bb >= 0 ? &propagation_body_qd.data[bb * 6] : nullptr,
+                        bb >= 0 ? &propagation_body_impulses.data[bb * 6] : nullptr,
+                        &propagation_J_a.data[first_off * 6], &propagation_J_b.data[first_off * 6],
+                        &propagation_MiJt_a.data[first_off * 6], &propagation_MiJt_b.data[first_off * 6],
+                        &propagation_impulses.data[first_off], &propagation_row_mu.data[first_off],
+                        &propagation_rhs.data[first_off], lambda_n, omega);
+                }}
+                __syncwarp();
+                continue;
+            }}"""
+        if articulated_angular is not None
+        else ""
+    )
     spin_projection = (
         f"""}} else if (row_type == {spin_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
@@ -20872,6 +21008,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             }}
 
             {torsion_skip}
+            {block_rows}
             if ({is_bounded} && global_iter < friction_start_iteration) {{
                 if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
@@ -20988,6 +21125,12 @@ def _get_pgs_solve_propagation_contact_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if articulated_angular is not None:
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)",
+            "#if defined(__CUDA_ARCH__)\n" + propagation_angular_friction_source(*articulated_angular),
+            1,
+        )
     if contact_torsion:
         snippet = snippet.replace(
             "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + _PROPAGATION_APPLY_ROW_CUDA, 1
@@ -21086,6 +21229,7 @@ def _get_pgs_solve_propagation_contact_kernel(
     name = (
         f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}"
         f"{'_free_rigid_angular' if free_rigid_angular else ''}{'_torsion' if contact_torsion else ''}"
+        f"{_articulated_angular_suffix(articulated_angular)}"
     )
     pgs_solve_propagation_template.__name__ = name
     pgs_solve_propagation_template.__qualname__ = name

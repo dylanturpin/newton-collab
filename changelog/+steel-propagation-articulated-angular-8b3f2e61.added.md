@@ -1,0 +1,1 @@
+Solve the experimental torsional and rolling friction rows of `SolverSteel` (`enable_torsional_rolling_friction`) on articulated contacts with `articulated_contact_response="propagation"` and `"propagation_colored"`, on the same joint cone as `"immediate"`, together with contact torsion, sleeping (colored) and `deterministic=True`.
