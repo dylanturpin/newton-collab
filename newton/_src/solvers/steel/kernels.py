@@ -65,9 +65,11 @@ PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION = 9
 PGS_CONSTRAINT_TYPE_CONTACT_ROLLING = 10
 PGS_CONSTRAINT_TYPE_CONTACT_SPIN = 11
 PGS_CONSTRAINT_TYPE_COUNT = 12
-# Bits of the allocator's ``angular_friction_enabled``: dense articulated rows, matrix-free free-rigid rows.
+# Bits of the allocator's ``angular_friction_enabled``: articulated rows on the dense and propagation families,
+# free-rigid rows.
 ANGULAR_FRICTION_DENSE = 1
 ANGULAR_FRICTION_FREE_RIGID = 2
+ANGULAR_FRICTION_PROPAGATION = 4
 
 # Keep launch-geometry-specific dynamics kernels out of the large general
 # kernel module. Warp compiles one whole module variant per block dimension.
@@ -1977,26 +1979,22 @@ def accumulate_contact_wrenches_from_impulses(
     if contact_path[c] == 0 and slot >= 0:
         world = contact_world[c]
         dense_slot_contact[world, slot] = c
-        # Torsional/rolling rows about the normal and both tangents follow a dense contact's sliding pair.
-        if slot + 5 < world_constraint_count[world]:
-            angular_rows = int(1)
-            for k in range(3):
-                row = slot + 3 + k
-                if (
-                    world_row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
-                    or world_row_parent[world, row] != slot
-                ):
-                    angular_rows = 0
-            if angular_rows != 0:
-                angular = wp.vec3(
-                    world_impulses[world, slot + 3], world_impulses[world, slot + 4], world_impulses[world, slot + 5]
-                )
+        angular = articulated_angular_friction_impulses(
+            world, slot, world_impulses, world_constraint_count, world_row_type, world_row_parent
+        )
     if contact_path[c] == 1 and slot >= 0:
         angular = mf_angular_friction_impulses(
             contact_world[c], slot, mf_impulses, mf_constraint_count, mf_row_type, mf_row_parent
         )
     if contact_path[c] == 2 and slot >= 0:
         angular = mf_angular_friction_impulses(
+            contact_world[c],
+            slot,
+            propagation_impulses,
+            propagation_constraint_count,
+            propagation_row_type,
+            propagation_row_parent,
+        ) + articulated_angular_friction_impulses(
             contact_world[c],
             slot,
             propagation_impulses,
@@ -3367,6 +3365,28 @@ def mf_angular_friction_impulses(
     ):
         angular[0] = mf_impulses[world, row]
     return angular
+
+
+@wp.func
+def articulated_angular_friction_impulses(
+    world: int,
+    slot: int,
+    impulses: wp.array2d[wp.float32],
+    constraint_count: wp.array[wp.int32],
+    row_type: wp.array2d[wp.int32],
+    row_parent: wp.array2d[wp.int32],
+):
+    """Return an articulated contact's spin and two rolling impulses [N·m·s] about its normal and tangents.
+
+    Reads either row family that carries articulated contacts: dense or propagation.
+    """
+    if slot + 5 >= constraint_count[world]:
+        return wp.vec3(0.0)
+    for k in range(3):
+        row = slot + 3 + k
+        if row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION or row_parent[world, row] != slot:
+            return wp.vec3(0.0)
+    return wp.vec3(impulses[world, slot + 3], impulses[world, slot + 4], impulses[world, slot + 5])
 
 
 @wp.func
@@ -5191,8 +5211,11 @@ def _allocate_world_contact_slot(
         add_friction = add_friction and friction_patches.weight[c] > 0.0
     if add_friction:
         slots_needed = 3
-        # Torsional/rolling rows follow the sliding pair of dense and, when enabled, matrix-free contacts.
-        if (angular_friction_enabled & ANGULAR_FRICTION_DENSE) != 0 and is_mf == 0 and is_propagation == 0:
+        # Torsional/rolling rows follow the sliding pair of articulated and, when enabled, free-rigid contacts.
+        articulated_bit = ANGULAR_FRICTION_DENSE
+        if is_propagation != 0:
+            articulated_bit = ANGULAR_FRICTION_PROPAGATION
+        if (angular_friction_enabled & articulated_bit) != 0 and free_rigid_pair == 0:
             torsional, rolling = contact_angular_friction_coefficients(
                 shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
             )
@@ -7889,6 +7912,74 @@ def build_propagation_angular_friction_rows(
 
 
 @wp.kernel
+def build_propagation_articulated_angular_friction_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    contact_mf_origin: wp.array[int],
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
+    # outputs
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_phi: wp.array2d[float],
+    propagation_row_restitution: wp.array2d[float],
+):
+    """Write the spin and rolling rows that follow an articulated propagation contact's sliding pair.
+
+    The rows are the dense layout's: spin about the B-to-A normal, then rolling about the two tangents, on the bodies
+    of the contact's normal row. Must run after :func:`build_propagation_contact_rows`.
+    """
+    total_contacts = wp.min(contact_count[0], contact_normal.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        slot = contact_slot[c]
+        # Six rows, or seven with a contact torsion spare; fewer is a contact without angular rows.
+        if contact_path[c] != 2 or slot < 0 or contact_slots_needed[c] < 6 or contact_mf_origin[c] != 0:
+            continue
+        world = contact_world[c]
+        torsional, rolling = contact_angular_friction_coefficients(
+            contact_shape0[c], contact_shape1[c], shape_material_mu_torsional, shape_material_mu_rolling
+        )
+        body_a = propagation_body_a[world, slot]
+        body_b = propagation_body_b[world, slot]
+        normal = -contact_normal[c]
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        for k in range(3):
+            axis = normal
+            coefficient = torsional
+            if k == 1:
+                axis = tangent0
+                coefficient = rolling
+            elif k == 2:
+                axis = tangent1
+                coefficient = rolling
+            row = slot + 3 + k
+            for i in range(3):
+                propagation_J_a[world, row, i] = 0.0
+                propagation_J_b[world, row, i] = 0.0
+                propagation_J_a[world, row, 3 + i] = axis[i]
+                propagation_J_b[world, row, 3 + i] = -axis[i]
+            propagation_body_a[world, row] = body_a
+            propagation_body_b[world, row] = body_b
+            propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
+            propagation_row_parent[world, row] = slot
+            propagation_row_mu[world, row] = coefficient
+            propagation_phi[world, row] = 0.0
+            propagation_row_restitution[world, row] = 0.0
+
+
+@wp.kernel
 def clear_propagation_torsion_spares(
     contact_count: wp.array[int],
     contact_world: wp.array[int],
@@ -8063,7 +8154,7 @@ def build_propagation_contact_rows(
 
     t0, t1 = contact_tangent_basis(normal)
     # Allocation owns the row extent; recomputing eligibility can cross a floating-point threshold and
-    # overwrite the following rows. A torsion spare makes 1 or 3 base rows 2 or 4, and angular rows only follow 3.
+    # overwrite the following rows. A torsion spare makes 1, 3 or 6 base rows 2, 4 or 7, and angular rows follow 3.
     will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
@@ -12764,11 +12855,12 @@ def gather_propagation_unit_meta(
                 walk = row_parent[world, walk]
             overflow = offset | (count << 20)
     unit_meta[base + 7 + PROPAGATION_UNIT_RING] = overflow
-    # Rows of the unit: its first row and the friction, free-rigid angular and torsion spare rows following it.
+    # Rows of the unit: its first row and the friction, angular and torsion spare rows following it.
     m = wp.min(constraint_count[world], int(row_type.shape[1]))
     rows = int(1)
     while slot + rows < m and (
         row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_FRICTION
+        or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
         or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
         or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
         or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_TORSION
