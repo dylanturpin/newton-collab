@@ -2342,8 +2342,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 body-space rows, computes body response from the articulation tree, and propagates
                 deferred body impulses through the tree once per PGS iteration.
                 ``"propagation_fused"`` uses the same response model and runs a fused full-iteration
-                kernel for supported homogeneous non-free articulation groups; unsupported cases raise
-                :class:`NotImplementedError` instead of falling back to split propagation.
+                kernel; it needs every non-free articulation to have the same DOF count, and unsupported
+                cases raise :class:`NotImplementedError` instead of falling back to split propagation.
                 ``"propagation_colored"`` uses the propagation response model but replaces the
                 serial per-world row sweep with graph-colored batches: rows are colored per step
                 so no two rows of a color share a responding body (a kinematic free rigid body
@@ -2358,9 +2358,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 scheduling changes — while ``"propagation_fused"`` keeps free/free rows
                 on the matrix-free family (its measured-best configuration).
                 Velocity-limit rows stay on the matrix-free family in all modes.
-                Passing any propagation-family value with a heterogeneous multi-world
-                model (worlds whose per-world DOF counts differ) raises ``ValueError``;
-                use ``"immediate"`` (or ``solve_mode="split"``) for such models.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -2927,7 +2924,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
         self._refresh_body_prescribed()
         self._compute_articulation_metadata(model)
-        self._validate_heterogeneous_world_support(model)
         self._warn_unsolvable_global_contacts(model)
         # Loop-closing joints are excluded from the tree (see _SteelModelPlan.build)
         # and enforced as CONNECT rows; the propagation-family kernels still iterate full
@@ -4581,64 +4577,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_crba_topology_schedules(model)
         self._setup_world_size_grouping(model)
 
-    def _detect_heterogeneous_world_dofs(self, model) -> "np.ndarray | None":
-        """Return the distinct per-world DOF counts when worlds are heterogeneous.
-
-        Mirrors the per-world DOF-span computation in
-        :meth:`_compute_world_dof_mapping`, but only considers worlds that
-        contain at least one articulation (worlds without articulations do not
-        participate in per-world DOF windows). Returns ``None`` when the model
-        is homogeneous, including the trivial cases (no joints, no
-        articulations, or at most one populated world).
-        """
-        if not model.joint_count or not model.articulation_count or self._art_to_world is None:
-            return None
-        art_to_world_np = self._art_to_world.numpy()
-        art_dof_start_np = self._articulation_dof_start.numpy()
-        art_H_rows_np = self._articulation_H_rows.numpy()
-
-        world_dof_start_np = np.full(self._world_count, np.iinfo(np.int64).max, dtype=np.int64)
-        world_dof_end_np = np.full(self._world_count, np.iinfo(np.int64).min, dtype=np.int64)
-        for art_idx in range(model.articulation_count):
-            w = art_to_world_np[art_idx]
-            ds = int(art_dof_start_np[art_idx])
-            de = ds + int(art_H_rows_np[art_idx])
-            world_dof_start_np[w] = min(world_dof_start_np[w], ds)
-            world_dof_end_np[w] = max(world_dof_end_np[w], de)
-
-        populated = world_dof_end_np != np.iinfo(np.int64).min
-        counts = np.unique(world_dof_end_np[populated] - world_dof_start_np[populated])
-        if len(counts) <= 1:
-            return None
-        return counts
-
-    def _validate_heterogeneous_world_support(self, model) -> None:
-        """Reject solver configurations known to be unsafe on heterogeneous worlds.
-
-        Heterogeneous multi-world models (worlds whose per-world DOF counts
-        differ) are only supported on the ``solve_mode="matrix_free"`` and
-        ``solve_mode="split"`` paths with the default
-        ``articulated_contact_response="immediate"``. The dense path produces
-        deterministic wrong trajectories on such models, and the
-        propagation-family contact responses still use fixed-width per-world
-        velocity windows that silently corrupt velocities across world
-        boundaries.
-        """
-        hetero_counts = self._detect_heterogeneous_world_dofs(model)
-        if hetero_counts is None:
-            return
-        counts_str = ", ".join(str(int(c)) for c in hetero_counts)
-        if self._articulated_contact_response != "immediate":
-            raise ValueError(
-                f"articulated_contact_response={self._articulated_contact_response!r} does not "
-                "support heterogeneous multi-world models "
-                f"(found per-world DOF counts [{counts_str}]): the propagation-family contact "
-                "response uses fixed-width per-world velocity windows that silently corrupt "
-                "velocities across world boundaries when worlds have differing DOF counts. "
-                "Use articulated_contact_response='immediate' with solve_mode='matrix_free', "
-                "or solve_mode='split', instead."
-            )
-
     def _select_dense_row_capacity(self, model) -> int:
         requested = int(self._requested_dense_max_constraints)
         if requested <= 0:
@@ -6142,26 +6080,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._world_dof_count = wp.array(world_dof_count, dtype=wp.int32, device=model.device)
         self._world_dof_indices = wp.array(padded_indices, dtype=wp.int32, device=model.device)
-
-        # --- Legacy contiguous per-world DOF window (propagation family) ---
-        # The propagation contact-response kernels address the global velocity
-        # array through a contiguous [world_dof_start, world_dof_start + D)
-        # window. Keep it alive alongside the compact response mapping above.
-        # In every configuration that can reach the propagation kernels
-        # (homogeneous worlds enforced by _validate_heterogeneous_world_support
-        # and prescribed-response elision disabled for propagation modes), the
-        # compact mapping coincides exactly with this physical window, i.e.
-        # world_dof_indices[w, d] == world_dof_start[w] + d for d < count.
-        art_to_world_np = self._art_to_world.numpy()
-        art_dof_start_np = self._articulation_dof_start.numpy()
-
-        world_dof_start_np = np.full(self._world_count, np.iinfo(np.int32).max, dtype=np.int32)
-        for art_idx in range(model.articulation_count):
-            w = art_to_world_np[art_idx]
-            world_dof_start_np[w] = min(world_dof_start_np[w], art_dof_start_np[art_idx])
-        # For worlds with no articulations, set start to 0
-        world_dof_start_np = np.where(world_dof_start_np == np.iinfo(np.int32).max, 0, world_dof_start_np)
-        self._world_dof_start = wp.array(world_dof_start_np, dtype=wp.int32, device=model.device)
 
     def _detect_jy_world_identity(self) -> bool:
         """Return whether host-side group and compact world J/Y layouts are identical."""
@@ -9307,7 +9225,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._world_count,
                     self._constraint_count,
                     self._dense_phase_bounds,
-                    self._world_dof_start,
+                    self._world_dof_indices,
                     dense_rhs,
                     self._diag,
                     self._row_w,
@@ -9352,6 +9270,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._body_to_articulation,
                     self._is_free_rigid,
                     self._articulation_root_dof_start,
+                    self._articulation_world_dof_offset,
                     self._world_group_art_start[int(fused_size)],
                     self._world_group_to_art[int(fused_size)],
                     self.model.articulation_start,
@@ -21097,7 +21016,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
-    const int w_dof_start = world_dof_start.data[world];
+    const int dof_map_base = world * __D__;
     const int off_dense = world * __M_D__;
     const int off_mf = world * __M_MF__;
     const int off_meta = off_mf * 4;
@@ -21139,7 +21058,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     _arr_mf_t& s_lam_mf = _sh_lam_mf[_slot];
 
     for (int d = lane; d < __D__; d += 32) {
-        s_v[d] = v_out.data[w_dof_start + d];
+        const int global_dof = world_dof_indices.data[dof_map_base + d];
+        s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }
     for (int i = lane; i < m_dense; i += 32) {
         const int off = off_dense + i;
@@ -21443,6 +21363,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                 const int world_art_end = world_group_art_start.data[world + 1];
                 for (int group_idx = world_art_begin; group_idx < world_art_end; ++group_idx) {
                     const int art = world_group_to_art.data[group_idx];
+                    const int local_base = articulation_world_dof_offset.data[art] - articulation_root_dof_start.data[art];
                     const int joint_start = articulation_start.data[art];
                     const int joint_end = articulation_start.data[art + 1];
 
@@ -21476,7 +21397,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             }
                             for (int a = 0; a < dof_count; ++a) {
                                 const int gdof = dof_start + a;
-                                const int local_dof = gdof - w_dof_start;
+                                const int local_dof = gdof + local_base;
                                 if (local_dof >= 0 && local_dof < __D__) {
                                     value += propagation_joint_S_flat.data[gdof * 6 + lane] * s_v[local_dof];
                                 }
@@ -21495,8 +21416,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     const int body = propagation_body_list.data[body_base + local_body];
                     const int art = (body >= 0) ? body_to_articulation.data[body] : -1;
                     if (body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {
-                        const int dof_start = articulation_root_dof_start.data[art];
-                        const int local_dof = dof_start - w_dof_start;
+                        const int local_dof = articulation_world_dof_offset.data[art];
                         float root_k = 0.0f;
                         if (local_dof >= 0 && local_dof + 5 < __D__) {
                             root_k = s_v[local_dof + lane];
@@ -21629,6 +21549,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 
                 for (int group_idx = world_art_begin; group_idx < world_art_end; ++group_idx) {
                     const int art = world_group_to_art.data[group_idx];
+                    const int local_base = articulation_world_dof_offset.data[art] - articulation_root_dof_start.data[art];
                     const int joint_start = articulation_start.data[art];
                     const int joint_end = articulation_start.data[art + 1];
                     int has_impulse = 0;
@@ -21784,7 +21705,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                                 }
                                 if (lane == 0) {
                                     propagation_tree_qdd.data[gdof_a] = qdd;
-                                    const int local_dof = gdof_a - w_dof_start;
+                                    const int local_dof = gdof_a + local_base;
                                     if (local_dof >= 0 && local_dof < __D__) {
                                         s_v[local_dof] += qdd;
                                     }
@@ -21813,8 +21734,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     if (body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {
                         // Plain copy back: both sides are referenced at the root body's COM.
                         const float qdk = propagation_body_qd.data[body * 6 + lane];
-                        const int dof_start = articulation_root_dof_start.data[art];
-                        const int local_dof = dof_start - w_dof_start;
+                        const int local_dof = articulation_world_dof_offset.data[art];
                         if (local_dof >= 0 && local_dof + 5 < __D__) {
                             s_v[local_dof + lane] = qdk;
                         }
@@ -21828,7 +21748,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     }
 
     for (int d = lane; d < __D__; d += 32) {
-        v_out.data[w_dof_start + d] = s_v[d];
+        const int global_dof = world_dof_indices.data[dof_map_base + d];
+        if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
     }
     for (int i = lane; i < m_dense; i += 32) {
         world_impulses.data[off_dense + i] = s_lam_dense[i];
@@ -21888,7 +21809,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_count: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
-        world_dof_start: wp.array[int],
+        world_dof_indices: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
         world_row_w: wp.array2d[float],
@@ -21931,6 +21852,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
         world_group_art_start: wp.array[int],
         world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
@@ -21963,7 +21885,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_count: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
-        world_dof_start: wp.array[int],
+        world_dof_indices: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
         world_row_w: wp.array2d[float],
@@ -22006,6 +21928,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
         world_group_art_start: wp.array[int],
         world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
@@ -22039,7 +21962,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             world_count,
             world_constraint_count,
             dense_phase_bounds,
-            world_dof_start,
+            world_dof_indices,
             rhs_bias,
             world_diag,
             world_row_w,
@@ -22082,6 +22005,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             body_to_articulation,
             is_free_rigid,
             articulation_root_dof_start,
+            articulation_world_dof_offset,
             world_group_art_start,
             world_group_to_art,
             articulation_start,
