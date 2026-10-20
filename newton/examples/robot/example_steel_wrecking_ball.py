@@ -55,7 +55,7 @@ class Example(TabletopDemo):
         def touching(a, b):
             return (a, b) in pairs or (b, a) in pairs
 
-        if all(touching(finger, self.info["crane_handle"]) for finger in self.info["crane_fingers"]):
+        if all(touching(finger, self.info["crane_grasp_body"]) for finger in self.info["crane_fingers"]):
             self.grasp_frames += 1
         self.ball_struck_building |= any(
             touching(self.info["tracked_body"], body) for body in self.info["demolition_structure"]
@@ -67,8 +67,14 @@ class Example(TabletopDemo):
 
     def test_final(self):
         """Verify that the ball stays attached and the upper floors collapse."""
+        removed = ("crane_long_jaw", "handle_support", "grasp_handle")
+        assert not any(name.endswith(removed) for name in self.model.shape_label), (
+            "Use stock fingers and the original counterweight"
+        )
         self.check_capacity()
-        assert self.grasp_frames >= 20, f"Handle was not held between both fingers: {self.grasp_frames} frames"
+        assert self.grasp_frames >= 20, (
+            f"Rear counterweight was not held between both fingers: {self.grasp_frames} frames"
+        )
         assert self.slew_max - self.slew_min > 1.0, "Crane did not rotate through the strike"
         assert self.ball_struck_building, "Ball never contacted the building"
         assert self.max_release_drift < 0.05, f"Ball back-drove the crane after release: {self.max_release_drift} rad"
