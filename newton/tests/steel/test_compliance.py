@@ -1130,6 +1130,54 @@ class TestContactComplianceColored(unittest.TestCase):
                     abs(colored["compliant"]["normal_impulse_N_s"] - colored["stock_law"]["normal_impulse_N_s"]), 1e-5
                 )
 
+    def test_rising_kinematic_support_matches_immediate(self):
+        """A compliant sphere on a kinematic platform rising at 0.1 m/s rides it as on immediate."""
+        traces = {}
+        for response in ("immediate", "propagation_colored"):
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            builder.rigid_gap = 0.005
+            platform = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
+            builder.add_shape_box(platform, hx=0.5, hy=0.5, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+            sphere = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+            cfg = newton.ModelBuilder.ShapeConfig(density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5)
+            builder.add_shape_sphere(sphere, radius=0.05, cfg=cfg)
+            builder.body_flags[platform] = int(newton.BodyFlags.KINEMATIC)
+            model = builder.finalize(device="cuda:0")
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+            model.rigid_contact_max = 32
+            contacts = pipeline.contacts()
+            for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+                setattr(contacts, name, wp.zeros(32, dtype=float, device="cuda:0"))
+            solver = SolverSteel(
+                model,
+                solve_mode="matrix_free",
+                articulated_contact_response=response,
+                contact_compliance=True,
+                friction_anchor_beta=0.0,
+                enable_restitution=False,
+                iterations=8,
+                baumgarte=0.05,
+            )
+            state, output, control = model.state(), model.state(), model.control()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            trace = []
+            for step in range(200):
+                body_q, body_qd = state.body_q.numpy(), state.body_qd.numpy()
+                body_q[platform, 2] = -0.05 + 0.1 * step * 0.005
+                body_qd[platform] = (0.0, 0.0, 0.1, 0.0, 0.0, 0.0)
+                state.body_q.assign(body_q)
+                state.body_qd.assign(body_qd)
+                state.clear_forces()
+                pipeline.collide(state, contacts)
+                _materials(contacts, 3000.0)
+                solver.step(state, output, control, contacts, 0.005)
+                state, output = output, state
+                trace.append(state.body_qd.numpy()[sphere].copy())
+            self.assertEqual(solver.compliance_contact_count, 1)
+            traces[response] = np.asarray(trace)
+        np.testing.assert_allclose(traces["propagation_colored"], traces["immediate"], atol=1e-6, rtol=0)
+        self.assertAlmostEqual(float(traces["propagation_colored"][-1, 2]), 0.1, delta=1e-4)
+
     def test_device_coefficients_match_host_law(self):
         """Prepare colored open-gap and penetrating rows exactly as the float64 host law."""
         for articulated in (True, False):
