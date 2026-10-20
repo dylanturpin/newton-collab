@@ -50,6 +50,19 @@ class Example(TabletopDemo):
     def test_final(self):
         """Validate the completed manipulation and mechanism stability."""
         self.check_capacity()
+        starts = self.model.joint_qd_start.numpy()
+        lower = self.model.joint_limit_lower.numpy()
+        upper = self.model.joint_limit_upper.numpy()
+        for name, limits in (("fork_z", (-0.002, 0.022)), ("beak_slider_z", (-0.002, 0.011))):
+            joint = next(
+                index
+                for index, label in enumerate(self.model.joint_label)
+                if label == name or label.endswith("/" + name)
+            )
+            coordinate = starts[joint]
+            np.testing.assert_allclose(
+                [lower[coordinate], upper[coordinate]], np.asarray(limits) * _pelican_bicycle.SCALE, atol=1e-7
+            )
         result = _pelican_bicycle.check(self.info, np.asarray(self.test_poses), self.fps)
         assert result["pass"], result
 

@@ -173,7 +173,7 @@ def populate(b, info, ee, down, device):
             b.joint_damping[vi] = 0.05
         elif b.joint_label[j] == "/crane/joints/crane_slew_q":
             # A dry slew brake resists back-driving but yields to the gripper.
-            b.joint_friction[vi] = 3.0
+            b.joint_friction[vi] = 3.5
             b.joint_damping[vi] = 0.006
         elif b.joint_label[j] == "/crane/joints/hook_swing_q":
             b.joint_damping[vi] = 0.006

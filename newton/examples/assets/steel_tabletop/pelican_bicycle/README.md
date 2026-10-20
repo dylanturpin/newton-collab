@@ -12,6 +12,6 @@ Only the front wheel has a finite-torque velocity motor. Its command comes
 from the measured position of the separate, physically movable remote fader.
 No wing, jaw, pedal, or fader trajectory is prescribed. Meshes use flat normals.
 
-Run `uv run -m newton.examples steel_pelican_bicycle --test --viewer null`
+Run `uv run --extra examples -m newton.examples steel_pelican_bicycle --test --viewer null`
 on CUDA to check the complete interaction, gear ratio, ankle closure, wing
 and jaw motion, and speed tracking. See `SOURCE.md` for asset provenance.

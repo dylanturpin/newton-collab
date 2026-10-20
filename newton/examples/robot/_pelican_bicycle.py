@@ -31,8 +31,6 @@ def mechanism_xml():
     root = ET.parse(str(ASSET) + "/pelican_contact_gears.xml").getroot()
     root.find("compiler").set("meshdir", str(ASSET) + "/cad")
     root.remove(root.find("actuator"))
-    for joint in root.findall(".//joint[@type='slide']"):
-        joint.set("range", " ".join(str(float(v) * SCALE) for v in joint.get("range").split()))
     geometries = {g.get("name"): g for g in root.findall(".//worldbody//geom")}
     for bit, pair in enumerate(root.findall("contact/pair"), start=1):
         for key in ("geom1", "geom2"):
