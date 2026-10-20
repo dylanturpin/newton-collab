@@ -75,7 +75,7 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
-from .friction import FRICTION_PAIR_CUDA
+from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
@@ -2420,6 +2420,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
                 ``friction_mode`` is matrix-free only — passing
                 any value other than ``"fixed_normal"`` with ``solve_mode="split"`` raises ``ValueError``.
+                With ``articulated_contact_response="immediate"`` the three modes apply to free-rigid
+                contacts; articulated contacts run ``"bisection"`` without the de Saxce bias and keep the
+                fixed-normal pair under ``"coulomb_newton"``. ``"propagation_colored"`` solves every
+                contact, articulated ones included, with the free-rigid update of the selected mode;
+                ``"propagation"`` and ``"propagation_fused"`` raise ``NotImplementedError``.
                 Defaults to ``"fixed_normal"``.
             free_body_constraint_max (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
@@ -2765,7 +2770,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     f"got solve_mode={solve_mode!r} with friction_mode={friction_mode!r}. "
                     "Select solve_mode='matrix_free' or leave friction_mode='fixed_normal'."
                 )
-            if articulated_contact_response != "immediate":
+            if articulated_contact_response not in ("immediate", "propagation_colored"):
                 raise NotImplementedError(
                     f"articulated_contact_response={articulated_contact_response!r} currently supports "
                     "friction_mode='fixed_normal' only"
@@ -7601,6 +7606,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device_arch,
                 free_rigid_angular=self._free_rigid_angular_rows,
                 contact_torsion=self._propagation_torsion_rows,
+                friction_mode=self._friction_mode,
             )
             self._pgs_solve_propagation_colored_warp_kernel = None
             mb = int(getattr(self, "_max_propagation_bodies", 0))
@@ -7645,6 +7651,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     straight_line=self._propagation_colored_straight_line,
                     free_rigid_angular=self._free_rigid_angular_rows,
                     contact_torsion=self._propagation_torsion_rows,
+                    friction_mode=self._friction_mode,
                 )
             # The coloring keeps a world's used-color masks (16 words per body) in shared
             # memory when its unit bodies span few enough indices. Size that span from the
@@ -18734,7 +18741,9 @@ PROPAGATION_UNIT_STD_WORD = 6 + PROPAGATION_UNIT_RING
 """Unit-record word holding a unit's straight-line kind (see :func:`_colored_standard_unit`)."""
 
 
-def _colored_standard_unit(acc: dict, ring: str, setup: str, friction: str = "true") -> str:
+def _colored_standard_unit(
+    acc: dict, ring: str, setup: str, friction: str = "true", friction_mode: str = "fixed_normal"
+) -> str:
     """CUDA solving one standard contact unit straight-line, on register twists.
 
     A standard unit is a contact row followed by its friction pair, all three rows on the
@@ -18746,7 +18755,8 @@ def _colored_standard_unit(acc: dict, ring: str, setup: str, friction: str = "tr
     ``acc`` maps payload fields to expressions: ``eff``, ``rhs``, ``w``, ``mu`` take a row
     index; ``Ja``, ``Jb``, ``Ma``, ``Mb`` a row and a component. ``ring`` adds the contact
     row's patch-ring members to ``lambda_n``; ``setup`` declares ``fp[5]``, the friction
-    pair's operator setup.
+    pair's operator setup. Any ``friction_mode`` but fixed_normal solves the contact row and
+    its pair again together after the contact row (see :func:`_colored_coupled_contact`).
     """
 
     def dot(r: int) -> str:
@@ -18790,6 +18800,33 @@ def _colored_standard_unit(acc: dict, ring: str, setup: str, friction: str = "tr
         if friction != "false"
         else ""
     )
+    if friction != "false" and friction_mode != "fixed_normal":
+        coupled = _colored_coupled_contact(
+            J=lambda side, r, k: acc[f"J{side}"](r, k),
+            M=lambda side, r, k: acc[f"M{side}"](r, k),
+            rhs=acc["rhs"],
+            mu=acc["mu"],
+            old=lambda r: "lambda_n" if r == 0 else acc["imp"](r),
+            qd=lambda side, k: f"q{side}[{k}]",
+            ok=lambda side: f"u_l{side} >= 0",
+        )
+        friction_block = f"""
+                    if (!({friction})) {{
+                    }} else if (global_iter < friction_start_iteration) {{
+                        imp[1] = 0.0f;
+                        imp[2] = 0.0f;
+                    }} else if ({acc["eff"](1)} > 0.0f) {{
+{coupled}
+                        const float d0 = cn - lambda_n;
+                        const float d1 = c1 - {acc["imp"](1)};
+                        const float d2 = c2 - {acc["imp"](2)};
+                        imp[0] = cn;
+                        imp[1] = c1;
+                        imp[2] = c2;
+                        {update(0, "d0")}
+                        {update(2, "d2")}
+                        {update(1, "d1")}
+                    }}"""
     return f"""
                 {{
                     float qa[6], qb[6], ia[6], ib[6];
@@ -18823,7 +18860,7 @@ def _colored_standard_unit(acc: dict, ring: str, setup: str, friction: str = "tr
 """
 
 
-def _colored_standard_unit_reference(friction: str = "true") -> str:
+def _colored_standard_unit_reference(friction: str = "true", friction_mode: str = "fixed_normal") -> str:
     """The standard-unit solve with every field loaded from global memory (reference body)."""
     o = "(world_base + start_slot + {r})"
     acc = {
@@ -18853,7 +18890,112 @@ def _colored_standard_unit_reference(friction: str = "true") -> str:
                             {cross}
                             friction_pair_setup(e1 > 0.0f ? 1.0f / e1 : 0.0f, cross, e2 > 0.0f ? 1.0f / e2 : 0.0f, fp[0], fp[1], fp[2], fp[3], fp[4]);
                         }}"""
-    return _colored_standard_unit(acc, ring, setup, friction=friction)
+    return _colored_standard_unit(acc, ring, setup, friction=friction, friction_mode=friction_mode)
+
+
+def _colored_coupled_contact(J, M, rhs, mu, old, qd, ok) -> str:
+    """CUDA solving a contact row and its sliding pair together with ``contact_block_solve`` into ``cn, c1, c2``.
+
+    Unit row 0 is the contact row, rows 1 and 2 its pair. ``J`` and ``M`` take a side (``"a"``, ``"b"``), a unit
+    row and a component; ``rhs``, ``mu`` and ``old`` (the current impulse) a unit row; ``qd`` a side and a
+    component; ``ok`` a side, true when it has a twist. The pair's rhs carries a prescribed side's velocity.
+    """
+
+    def velocity(side: str) -> str:
+        return f"""if ({ok(side)}) {{
+                            #pragma unroll
+                            for (int k = 0; k < 6; ++k) {{
+                                const float v = {qd(side, "k")};
+                                u_n += {J(side, 0, "k")} * v;
+                                u_t1 += {J(side, 1, "k")} * v;
+                                u_t2 += {J(side, 2, "k")} * v;
+                            }}
+                        }}"""
+
+    def delassus(side: str) -> str:
+        return f"""if ({ok(side)}) {{
+                            #pragma unroll
+                            for (int k = 0; k < 6; ++k) {{
+                                const float jn = {J(side, 0, "k")}, j1 = {J(side, 1, "k")}, j2 = {J(side, 2, "k")};
+                                const float m1 = {M(side, 1, "k")}, m2 = {M(side, 2, "k")};
+                                G_nn += jn * {M(side, 0, "k")};
+                                G_nt1 += jn * m1;
+                                G_nt2 += jn * m2;
+                                G_t1t1 += j1 * m1;
+                                G_t1t2 += j1 * m2;
+                                G_t2t2 += j2 * m2;
+                            }}
+                        }}"""
+
+    return f"""
+                        float cn, c1, c2;
+                        {{
+                            float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
+                            float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f, G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
+                            {velocity("a")}
+                            {velocity("b")}
+                            {delassus("a")}
+                            {delassus("b")}
+                            contact_block_solve(u_n, u_t1 + {rhs(1)}, u_t2 + {rhs(2)}, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2,
+                                G_t2t2, -{rhs(0)}, {mu(1)}, {old(0)}, {old(1)}, {old(2)}, cn, c1, c2);
+                        }}"""
+
+
+def _colored_coupled_row_loop(*, apply: bool, global_twists: bool = False) -> str:
+    """CUDA for a pair's first row in a colored row loop: the contact row and the pair, coupled.
+
+    Needs ``world_base``, ``off``, ``parent_idx`` and the row's twist slots: ``la``/``lb`` into the shared
+    ``s_qd``/``s_imp``, or with ``global_twists`` the bodies ``ba``/``bb``. Sets ``new_impulse``. With ``apply``
+    it also moves the twists by the contact row's and the second pair row's deltas; otherwise it leaves them in
+    ``par``/``par_delta`` and ``sib``/``sib_delta`` for the caller.
+    """
+    if global_twists:
+        slot, qd_array, imp_array = "b", "propagation_body_qd.data", "propagation_body_impulses.data"
+    else:
+        slot, qd_array, imp_array = "l", "s_qd", "s_imp"
+    rows = {0: "par_off", 1: "off", 2: "sib_off"}
+    coupled = _colored_coupled_contact(
+        J=lambda side, r, k: f"propagation_J_{side}.data[{rows[r]} * 6 + {k}]",
+        M=lambda side, r, k: f"propagation_MiJt_{side}.data[{rows[r]} * 6 + {k}]",
+        rhs=lambda r: f"propagation_rhs.data[{rows[r]}]",
+        mu=lambda r: f"propagation_row_mu.data[{rows[r]}]",
+        old=lambda r: f"propagation_impulses.data[{rows[r]}]",
+        qd=lambda side, k: f"{qd_array}[{slot}{side} * 6 + {k}]",
+        ok=lambda side: f"{slot}{side} >= 0",
+    )
+    declare = "const float " if apply else ""
+    code = f"""
+                        const int par_off = world_base + parent_idx;
+                        const int sib_off = world_base + parent_idx + 2;
+{coupled}
+                        {declare}par_delta = cn - propagation_impulses.data[par_off];
+                        {declare}sib_delta = c2 - propagation_impulses.data[sib_off];
+                        propagation_impulses.data[par_off] = cn;
+                        propagation_impulses.data[sib_off] = c2;
+                        new_impulse = c1;
+"""
+    if not apply:
+        return (
+            code
+            + """                        par = parent_idx;
+                        sib = parent_idx + 2;
+"""
+        )
+    for row, delta in (("par_off", "par_delta"), ("sib_off", "sib_delta")):
+        code += f"""                        if ({delta} != 0.0f) {{
+                            for (int e = 0; e < 6; ++e) {{
+                                if ({slot}a >= 0) {{
+                                    {qd_array}[{slot}a * 6 + e] += propagation_MiJt_a.data[{row} * 6 + e] * {delta};
+                                    {imp_array}[{slot}a * 6 + e] += propagation_J_a.data[{row} * 6 + e] * {delta};
+                                }}
+                                if ({slot}b >= 0) {{
+                                    {qd_array}[{slot}b * 6 + e] += propagation_MiJt_b.data[{row} * 6 + e] * {delta};
+                                    {imp_array}[{slot}b * 6 + e] += propagation_J_b.data[{row} * 6 + e] * {delta};
+                                }}
+                            }}
+                        }}
+"""
+    return code
 
 
 def _colored_unit_rest_rows(first: str, *, shared: bool, end: str = "", angular: bool, torsion: bool) -> str:
@@ -19069,6 +19211,7 @@ def _colored_prefetch_unit_body(
     packed: bool = False,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    friction_mode: str = "fixed_normal",
 ) -> str:
     """CUDA body solving one contact unit on a single lane with its rows prefetched.
 
@@ -19084,7 +19227,8 @@ def _colored_prefetch_unit_body(
     shared buffer ``s_pay`` that the color loop filled with ``cp.async`` during the
     previous color (layout: :func:`_get_colored_payload_pack_kernel`); other units load directly.
     ``free_rigid_angular`` and ``contact_torsion`` also solve the rows recorded past a unit's contact row
-    and sliding pair (see :func:`_colored_unit_rest_rows`).
+    and sliding pair (see :func:`_colored_unit_rest_rows`). Any ``friction_mode`` but fixed_normal solves each
+    contact row and its pair together at the pair's first row (see :func:`_colored_coupled_contact`).
     """
     P = 3
 
@@ -19135,6 +19279,13 @@ def _colored_prefetch_unit_body(
         )
         return f"if (la >= 0) {{ {la} }} if (lb >= 0) {{ {lb} }}"
 
+    # The coupled modes skip any row without mobility, as the matrix-free kernel does.
+    eff_skip = (
+        "if (eff_inv <= 0.0f && row_type != 2) continue;"
+        if friction_mode == "fixed_normal"
+        else "if (eff_inv <= 0.0f) continue;"
+    )
+
     def solve_row(me: dict, sib: dict, end_unit: str, sib_decl: str = "", setup: bool = False) -> str:
         # The reference body interleaves the sibling residual and the cross term per k;
         # keep that summation order.
@@ -19157,35 +19308,8 @@ def _colored_prefetch_unit_body(
                 "float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, "
                 "sb_eff > 0.0f ? 1.0f / sb_eff : 0.0f, residual, sibling_residual, old_impulse, sb_other, radius, omega);"
             )
-        jv_a = " ".join(f"jv += {me['Ja'](k)} * s_qd[la * 6 + {k}];" for k in range(6))
-        jv_b = " ".join(f"jv += {me['Jb'](k)} * s_qd[lb * 6 + {k}];" for k in range(6))
-        return f"""
-                const int row_type = {me["type"]};
-                if (rr > 0 && row_type != {friction_type}) {end_unit}
-                if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
-                    {me["store"]("0.0f")}
-                    continue;
-                }}
-                const float eff_inv = {me["eff"]};
-                if (eff_inv <= 0.0f && row_type != 2) continue;
-                const int parent_idx = {me["par"]};
-                // The pair's second row is solved together with slot parent_idx + 1.
-                if (row_type == {friction_type} && slot != parent_idx + 1) continue;
-                const int ba = {me["ba"]};
-                const int bb = {me["bb"]};
-                const int la = (ba == u_ba) ? u_la : ((ba >= 0) ? propagation_body_local_slot.data[ba] : -1);
-                const int lb = (bb == u_bb) ? u_lb : ((bb >= 0) ? propagation_body_local_slot.data[bb] : -1);
-                float jv = 0.0f;
-                if (la >= 0) {{ {jv_a} }}
-                if (lb >= 0) {{ {jv_b} }}
-                const float residual = jv + {me["rhs"]};
-                const float old_impulse = {me["imp"]};
-                const float w = regularize ? {me["w"]} : 1.0f;
-                float new_impulse = old_impulse + omega * (-residual * eff_inv * w - (1.0f - w) * old_impulse);
-                if (row_type == {contact_type}) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
-                }} else if (row_type == {friction_type}) {{
-                    float lambda_n = (parent_idx == start_slot) ? u_imp[0] : propagation_impulses.data[world_base + parent_idx];
+        if friction_mode == "fixed_normal":
+            friction_branch = f"""                    float lambda_n = (parent_idx == start_slot) ? u_imp[0] : propagation_impulses.data[world_base + parent_idx];
                     int patch_row = (parent_idx == start_slot) ? p_par[0] : propagation_row_parent.data[world_base + parent_idx];
                     // The unit's own patch ring was loaded in the prologue; sum it in ring order.
                     if (parent_idx == start_slot) {{
@@ -19213,7 +19337,61 @@ def _colored_prefetch_unit_body(
                     const float sib_delta = sib_new - sb_other;
                     {sib["store"]("sib_new")}
                     if (sib_delta != 0.0f) {{ {body_update(sib, "sib_delta")} }}
+"""
+        else:
+            par = glob("par_off")
+            unit = {0: par, 1: me, 2: sib}
+            coupled = _colored_coupled_contact(
+                J=lambda side, r, k: unit[r][f"J{side}"](k),
+                M=lambda side, r, k: unit[r][f"M{side}"](k),
+                rhs=lambda r: unit[r]["rhs"],
+                mu=lambda r: unit[r]["mu"],
+                old=lambda r: unit[r]["imp"],
+                qd=lambda side, k: f"s_qd[l{side} * 6 + {k}]",
+                ok=lambda side: f"l{side} >= 0",
+            )
+            friction_branch = f"""
+                    {sib_decl}
+                    const int par_off = world_base + parent_idx;
+{coupled}
+                    const float par_delta = cn - {par["imp"]};
+                    const float sib_delta = c2 - {sib["imp"]};
+                    {par["store"]("cn")}
+                    if (parent_idx == start_slot) u_imp[0] = cn;
+                    {sib["store"]("c2")}
+                    if (par_delta != 0.0f) {{ {body_update(par, "par_delta")} }}
+                    if (sib_delta != 0.0f) {{ {body_update(sib, "sib_delta")} }}
+                    new_impulse = c1;
+"""
+        jv_a = " ".join(f"jv += {me['Ja'](k)} * s_qd[la * 6 + {k}];" for k in range(6))
+        jv_b = " ".join(f"jv += {me['Jb'](k)} * s_qd[lb * 6 + {k}];" for k in range(6))
+        return f"""
+                const int row_type = {me["type"]};
+                if (rr > 0 && row_type != {friction_type}) {end_unit}
+                if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+                    {me["store"]("0.0f")}
+                    continue;
                 }}
+                const float eff_inv = {me["eff"]};
+                {eff_skip}
+                const int parent_idx = {me["par"]};
+                // The pair's second row is solved together with slot parent_idx + 1.
+                if (row_type == {friction_type} && slot != parent_idx + 1) continue;
+                const int ba = {me["ba"]};
+                const int bb = {me["bb"]};
+                const int la = (ba == u_ba) ? u_la : ((ba >= 0) ? propagation_body_local_slot.data[ba] : -1);
+                const int lb = (bb == u_bb) ? u_lb : ((bb >= 0) ? propagation_body_local_slot.data[bb] : -1);
+                float jv = 0.0f;
+                if (la >= 0) {{ {jv_a} }}
+                if (lb >= 0) {{ {jv_b} }}
+                const float residual = jv + {me["rhs"]};
+                const float old_impulse = {me["imp"]};
+                const float w = regularize ? {me["w"]} : 1.0f;
+                float new_impulse = old_impulse + omega * (-residual * eff_inv * w - (1.0f - w) * old_impulse);
+                if (row_type == {contact_type}) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (row_type == {friction_type}) {{
+{friction_branch}                }}
                 const float delta_impulse = new_impulse - old_impulse;
                 {me["store"]("new_impulse")}
                 if (delta_impulse != 0.0f) {{ {body_update(me, "delta_impulse")} }}
@@ -19382,7 +19560,9 @@ def _colored_prefetch_unit_body(
                         float fp[5];
                         #pragma unroll
                         for (int q = 0; q < 5; ++q) fp[q] = u_fp[q];"""
-    standard = _colored_standard_unit(acc, ring, setup, friction=f"um[{PROPAGATION_UNIT_STD_WORD}] == 1")
+    standard = _colored_standard_unit(
+        acc, ring, setup, friction=f"um[{PROPAGATION_UNIT_STD_WORD}] == 1", friction_mode=friction_mode
+    )
     # A contact row with a torsion spare and no sliding pair ends the window at the spare.
     rest = _colored_unit_rest_rows(
         "unit_rest",
@@ -19482,6 +19662,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     straight_line: bool = True,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    friction_mode: str = "fixed_normal",
 ) -> "wp.Kernel":
     """Build the warp-per-world colored solver with sub-warp unit cooperation.
 
@@ -19497,7 +19678,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     are row-uniform); only float summation order inside a row's dot differs.
     ``free_rigid_angular`` solves the rolling pair and spin row that follow a free-rigid contact's sliding
     pair inside its unit, and ``contact_torsion`` each torsion group's row inside its host unit (see
-    :func:`_colored_unit_rest_rows`).
+    :func:`_colored_unit_rest_rows`). Any ``friction_mode`` but fixed_normal solves each contact row and its
+    sliding pair together at the pair's first row (see :func:`_colored_coupled_contact`).
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -19512,6 +19694,89 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     else:
         gmask = f"((((1u << {R}) - 1u)) << (grp * {R}))"
 
+    coop_pair = """                            sib = parent_idx + 2;
+                            const int sib_off = world_base + sib;
+                            const float other = propagation_impulses.data[sib_off];
+                            float sibling_residual = propagation_rhs.data[sib_off];
+                            float cross = 0.0f;
+                            for (int k = 0; k < 6; ++k) {
+                                if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                                if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                                if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                                if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                            }
+                            const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                            float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                                residual, sibling_residual, old_impulse, other, radius, omega);
+                            new_impulse = pair.x;
+                            const float trial_sib = pair.y;
+                            const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                            const float scale = mag > radius ? radius / mag : 1.0f;
+                            new_impulse *= scale;
+                            const float sib_new = trial_sib * scale;
+                            sib_delta = sib_new - other;
+                            propagation_impulses.data[sib_off] = sib_new;
+"""
+    tail_pair = """                        int sib = parent_idx + 2;
+                        const int sib_off = world_base + sib;
+                        const float other = propagation_impulses.data[sib_off];
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {
+                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        for (int e = 0; e < 6; ++e) {
+                            if (la >= 0) {
+                                s_qd[la * 6 + e] += propagation_MiJt_a.data[sib_off * 6 + e] * sib_delta;
+                                s_imp[la * 6 + e] += propagation_J_a.data[sib_off * 6 + e] * sib_delta;
+                            }
+                            if (lb >= 0) {
+                                s_qd[lb * 6 + e] += propagation_MiJt_b.data[sib_off * 6 + e] * sib_delta;
+                                s_imp[lb * 6 + e] += propagation_J_b.data[sib_off * 6 + e] * sib_delta;
+                            }
+                        }
+"""
+    coop_parent_decl = ""
+    coop_parent = ""
+    eff_skip = "if (eff_inv <= 0.0f && row_type != 2) continue;"
+    if friction_mode != "fixed_normal":
+        # The coupled modes skip any row without mobility, as the matrix-free kernel does.
+        eff_skip = "if (eff_inv <= 0.0f) continue;"
+        coop_pair = _colored_coupled_row_loop(apply=False)
+        tail_pair = _colored_coupled_row_loop(apply=True)
+        coop_parent_decl = """                float par_delta = 0.0f;
+                int par = -1;
+"""
+        coop_parent = f"""                par_delta = __shfl_sync({gmask}, par_delta, 0, {R});
+                par = __shfl_sync({gmask}, par, 0, {R});
+                if (par >= 0 && par_delta != 0.0f) {{
+                    const int par_off = world_base + par;
+                    for (int e = gl; e < 6; e += {R}) {{
+                        if (la >= 0) {{
+                            s_qd[la * 6 + e] += __ldg(&propagation_MiJt_a.data[par_off * 6 + e]) * par_delta;
+                            s_imp[la * 6 + e] += __ldg(&propagation_J_a.data[par_off * 6 + e]) * par_delta;
+                        }}
+                        if (lb >= 0) {{
+                            s_qd[lb * 6 + e] += __ldg(&propagation_MiJt_b.data[par_off * 6 + e]) * par_delta;
+                            s_imp[lb * 6 + e] += __ldg(&propagation_J_b.data[par_off * 6 + e]) * par_delta;
+                        }}
+                    }}
+                }}
+"""
     # The next row's dot reads entries other lanes of the group just wrote.
     row_sync = f"                __syncwarp({gmask});" if R > 1 else ""
     rest = _colored_unit_rest_rows("rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion)
@@ -19542,7 +19807,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f && row_type != 2) continue;
+                {eff_skip}
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 const int la = (ba >= 0) ? __ldg(&propagation_body_local_slot.data[ba]) : -1;
@@ -19561,7 +19826,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                 float delta_impulse = 0.0f;
                 float sib_delta = 0.0f;
                 int sib = -1;
-                if (gl == 0) {{
+{coop_parent_decl}                if (gl == 0) {{
                     const float residual = partial + __ldg(&propagation_rhs.data[off]);
                     const float old_impulse = propagation_impulses.data[off];
                     const float w = regularize ? propagation_row_w.data[off] : 1.0f;
@@ -19577,29 +19842,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                         if (slot != parent_idx + 1) {{
                             new_impulse = old_impulse;
                         }} else {{
-                            sib = parent_idx + 2;
-                            const int sib_off = world_base + sib;
-                            const float other = propagation_impulses.data[sib_off];
-                            float sibling_residual = propagation_rhs.data[sib_off];
-                            float cross = 0.0f;
-                            for (int k = 0; k < 6; ++k) {{
-                                if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
-                                if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
-                                if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
-                                if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
-                            }}
-                            const float inv_sib = propagation_eff_mass_inv.data[sib_off];
-                            float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                                residual, sibling_residual, old_impulse, other, radius, omega);
-                            new_impulse = pair.x;
-                            const float trial_sib = pair.y;
-                            const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
-                            const float scale = mag > radius ? radius / mag : 1.0f;
-                            new_impulse *= scale;
-                            const float sib_new = trial_sib * scale;
-                            sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
-                        }}
+{coop_pair}                        }}
                     }}
                     delta_impulse = new_impulse - old_impulse;
                     propagation_impulses.data[off] = new_impulse;
@@ -19607,7 +19850,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                 delta_impulse = __shfl_sync({gmask}, delta_impulse, 0, {R});
                 sib_delta = __shfl_sync({gmask}, sib_delta, 0, {R});
                 sib = __shfl_sync({gmask}, sib, 0, {R});
-
+{coop_parent}
                 if (sib >= 0 && sib_delta != 0.0f) {{
                     const int sib_off = world_base + sib;
                     for (int e = gl; e < 6; e += {R}) {{
@@ -19651,7 +19894,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     continue;
                 }}
                 const float eff_inv = propagation_eff_mass_inv.data[off];
-                if (eff_inv <= 0.0f && row_type != 2) continue;
+                {eff_skip}
                 const int ba = propagation_body_a.data[off];
                 const int bb = propagation_body_b.data[off];
                 const int la = (ba >= 0) ? propagation_body_local_slot.data[ba] : -1;
@@ -19674,39 +19917,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     if (slot != parent_idx + 1) {{
                         new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 2;
-                        const int sib_off = world_base + sib;
-                        const float other = propagation_impulses.data[sib_off];
-                        float sibling_residual = propagation_rhs.data[sib_off];
-                        float cross = 0.0f;
-                        for (int k = 0; k < 6; ++k) {{
-                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
-                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
-                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
-                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
-                        }}
-                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
-                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            residual, sibling_residual, old_impulse, other, radius, omega);
-                        new_impulse = pair.x;
-                        const float trial_sib = pair.y;
-                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
-                        const float scale = mag > radius ? radius / mag : 1.0f;
-                        new_impulse *= scale;
-                        const float sib_new = trial_sib * scale;
-                        const float sib_delta = sib_new - other;
-                        propagation_impulses.data[sib_off] = sib_new;
-                        for (int e = 0; e < 6; ++e) {{
-                            if (la >= 0) {{
-                                s_qd[la * 6 + e] += propagation_MiJt_a.data[sib_off * 6 + e] * sib_delta;
-                                s_imp[la * 6 + e] += propagation_J_a.data[sib_off * 6 + e] * sib_delta;
-                            }}
-                            if (lb >= 0) {{
-                                s_qd[lb * 6 + e] += propagation_MiJt_b.data[sib_off * 6 + e] * sib_delta;
-                                s_imp[lb * 6 + e] += propagation_J_b.data[sib_off * 6 + e] * sib_delta;
-                            }}
-                        }}
-                    }}
+{tail_pair}                    }}
                 }}
                 const float delta_impulse = new_impulse - old_impulse;
                 propagation_impulses.data[off] = new_impulse;
@@ -19756,7 +19967,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             if (standard || lone) {{
                 const int u_la = std_la;
                 const int u_lb = std_lb;
-{_colored_standard_unit_reference(friction="standard")}
+{_colored_standard_unit_reference(friction="standard", friction_mode=friction_mode)}
 {reference_rest}
             }} else {{
 {coop_body}
@@ -19770,6 +19981,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             packed=packed or staged,
             free_rigid_angular=free_rigid_angular,
             contact_torsion=contact_torsion,
+            friction_mode=friction_mode,
         )
     staged = bool(staged) and _prefetch
     if staged:
@@ -19954,6 +20166,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if friction_mode != "fixed_normal":
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
+        )
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_warp_native(
@@ -20069,7 +20285,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     name = (
         f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
         f"_pk{int(bool(packed or staged))}_sl{int(bool(straight_line))}{'_fra' if free_rigid_angular else ''}"
-        f"{'_tor' if contact_torsion else ''}"
+        f"{'_tor' if contact_torsion else ''}{'' if friction_mode == 'fixed_normal' else '_' + friction_mode}"
     )
     pgs_solve_propagation_colored_warp_template.__name__ = name
     pgs_solve_propagation_colored_warp_template.__qualname__ = name
@@ -20085,6 +20301,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     device_arch: str,
     free_rigid_angular: bool = False,
     contact_torsion: bool = False,
+    friction_mode: str = "fixed_normal",
 ) -> "wp.Kernel":
     """Build the block-local colored propagation solver over contact units.
 
@@ -20096,6 +20313,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     race-free. The tail segment (color-cap overflow) runs ordered on
     thread 0. One launch per PGS iteration regardless of color count.
     ``free_rigid_angular`` and ``contact_torsion`` solve the rows after a unit's sliding pair inside it.
+    Any ``friction_mode`` but fixed_normal solves each contact row and its sliding pair together.
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -20110,6 +20328,100 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     rest_global = _colored_unit_rest_rows("rr", shared=False, angular=free_rigid_angular, torsion=contact_torsion)
     rest_staged = _colored_unit_rest_rows("rr", shared=True, angular=free_rigid_angular, torsion=contact_torsion)
 
+    global_pair = """                        int sib = parent_idx + 2;
+                        const int sib_off = world_base + sib;
+                        const float other = propagation_impulses.data[sib_off];
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {
+                            if (ba >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
+                            if (ba >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (bb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
+                            if (bb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        const int sib_ba = propagation_body_a.data[sib_off];
+                        const int sib_bb = propagation_body_b.data[sib_off];
+                        if (sib_ba >= 0) {
+                            for (int k = 0; k < 6; ++k) {
+                                propagation_body_qd.data[sib_ba * 6 + k] += propagation_MiJt_a.data[sib_off * 6 + k] * sib_delta;
+                                propagation_body_impulses.data[sib_ba * 6 + k] += propagation_J_a.data[sib_off * 6 + k] * sib_delta;
+                            }
+                        }
+                        if (sib_bb >= 0) {
+                            for (int k = 0; k < 6; ++k) {
+                                propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                                propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
+                            }
+                        }
+"""
+    staged_pair = """                        int sib = parent_idx + 2;
+                        const int sib_off = world_base + sib;
+                        const float other = propagation_impulses.data[sib_off];
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {
+                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        // sibling shares this unit's bodies: locals la/lb
+                        if (la >= 0) {
+                            const float2* M2 = (const float2*)(propagation_MiJt_a.data + (size_t)sib_off * 6);
+                            const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)sib_off * 6);
+                            #pragma unroll
+                            for (int k = 0; k < 3; ++k) {
+                                const float2 mi = __ldg(&M2[k]);
+                                const float2 jj = __ldg(&J2[k]);
+                                s_qd[la * 6 + 2 * k] += mi.x * sib_delta;
+                                s_qd[la * 6 + 2 * k + 1] += mi.y * sib_delta;
+                                s_imp[la * 6 + 2 * k] += jj.x * sib_delta;
+                                s_imp[la * 6 + 2 * k + 1] += jj.y * sib_delta;
+                            }
+                        }
+                        if (lb >= 0) {
+                            const float2* M2 = (const float2*)(propagation_MiJt_b.data + (size_t)sib_off * 6);
+                            const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)sib_off * 6);
+                            #pragma unroll
+                            for (int k = 0; k < 3; ++k) {
+                                const float2 mi = __ldg(&M2[k]);
+                                const float2 jj = __ldg(&J2[k]);
+                                s_qd[lb * 6 + 2 * k] += mi.x * sib_delta;
+                                s_qd[lb * 6 + 2 * k + 1] += mi.y * sib_delta;
+                                s_imp[lb * 6 + 2 * k] += jj.x * sib_delta;
+                                s_imp[lb * 6 + 2 * k + 1] += jj.y * sib_delta;
+                            }
+                        }
+"""
+    eff_skip = "if (eff_inv <= 0.0f && row_type != 2) continue;"
+    if friction_mode != "fixed_normal":
+        # The coupled modes skip any row without mobility, as the matrix-free kernel does.
+        eff_skip = "if (eff_inv <= 0.0f) continue;"
+        global_pair = _colored_coupled_row_loop(apply=True, global_twists=True)
+        staged_pair = _colored_coupled_row_loop(apply=True)
+
     unit_solve_body = f"""
             int rr = 0;
             for (; ; ++rr) {{
@@ -20123,7 +20435,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f && row_type != 2) continue;
+                {eff_skip}
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 float jv = 0.0f;
@@ -20162,43 +20474,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     if (slot != parent_idx + 1) {{
                         new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 2;
-                        const int sib_off = world_base + sib;
-                        const float other = propagation_impulses.data[sib_off];
-                        float sibling_residual = propagation_rhs.data[sib_off];
-                        float cross = 0.0f;
-                        for (int k = 0; k < 6; ++k) {{
-                            if (ba >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
-                            if (ba >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
-                            if (bb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
-                            if (bb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
-                        }}
-                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
-                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            residual, sibling_residual, old_impulse, other, radius, omega);
-                        new_impulse = pair.x;
-                        const float trial_sib = pair.y;
-                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
-                        const float scale = mag > radius ? radius / mag : 1.0f;
-                        new_impulse *= scale;
-                        const float sib_new = trial_sib * scale;
-                        const float sib_delta = sib_new - other;
-                        propagation_impulses.data[sib_off] = sib_new;
-                        const int sib_ba = propagation_body_a.data[sib_off];
-                        const int sib_bb = propagation_body_b.data[sib_off];
-                        if (sib_ba >= 0) {{
-                            for (int k = 0; k < 6; ++k) {{
-                                propagation_body_qd.data[sib_ba * 6 + k] += propagation_MiJt_a.data[sib_off * 6 + k] * sib_delta;
-                                propagation_body_impulses.data[sib_ba * 6 + k] += propagation_J_a.data[sib_off * 6 + k] * sib_delta;
-                            }}
-                        }}
-                        if (sib_bb >= 0) {{
-                            for (int k = 0; k < 6; ++k) {{
-                                propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                                propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
-                            }}
-                        }}
-                    }}
+{global_pair}                    }}
                 }}
                 const float delta_impulse = new_impulse - old_impulse;
                 propagation_impulses.data[off] = new_impulse;
@@ -20255,7 +20531,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f && row_type != 2) continue;
+                {eff_skip}
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 const int la = (ba >= 0) ? __ldg(&propagation_body_local_slot.data[ba]) : -1;
@@ -20292,56 +20568,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     if (slot != parent_idx + 1) {{
                         new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 2;
-                        const int sib_off = world_base + sib;
-                        const float other = propagation_impulses.data[sib_off];
-                        float sibling_residual = propagation_rhs.data[sib_off];
-                        float cross = 0.0f;
-                        for (int k = 0; k < 6; ++k) {{
-                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
-                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
-                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
-                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
-                        }}
-                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
-                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            residual, sibling_residual, old_impulse, other, radius, omega);
-                        new_impulse = pair.x;
-                        const float trial_sib = pair.y;
-                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
-                        const float scale = mag > radius ? radius / mag : 1.0f;
-                        new_impulse *= scale;
-                        const float sib_new = trial_sib * scale;
-                        const float sib_delta = sib_new - other;
-                        propagation_impulses.data[sib_off] = sib_new;
-                        // sibling shares this unit's bodies: locals la/lb
-                        if (la >= 0) {{
-                            const float2* M2 = (const float2*)(propagation_MiJt_a.data + (size_t)sib_off * 6);
-                            const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)sib_off * 6);
-                            #pragma unroll
-                            for (int k = 0; k < 3; ++k) {{
-                                const float2 mi = __ldg(&M2[k]);
-                                const float2 jj = __ldg(&J2[k]);
-                                s_qd[la * 6 + 2 * k] += mi.x * sib_delta;
-                                s_qd[la * 6 + 2 * k + 1] += mi.y * sib_delta;
-                                s_imp[la * 6 + 2 * k] += jj.x * sib_delta;
-                                s_imp[la * 6 + 2 * k + 1] += jj.y * sib_delta;
-                            }}
-                        }}
-                        if (lb >= 0) {{
-                            const float2* M2 = (const float2*)(propagation_MiJt_b.data + (size_t)sib_off * 6);
-                            const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)sib_off * 6);
-                            #pragma unroll
-                            for (int k = 0; k < 3; ++k) {{
-                                const float2 mi = __ldg(&M2[k]);
-                                const float2 jj = __ldg(&J2[k]);
-                                s_qd[lb * 6 + 2 * k] += mi.x * sib_delta;
-                                s_qd[lb * 6 + 2 * k + 1] += mi.y * sib_delta;
-                                s_imp[lb * 6 + 2 * k] += jj.x * sib_delta;
-                                s_imp[lb * 6 + 2 * k + 1] += jj.y * sib_delta;
-                            }}
-                        }}
-                    }}
+{staged_pair}                    }}
                 }}
                 const float delta_impulse = new_impulse - old_impulse;
                 propagation_impulses.data[off] = new_impulse;
@@ -20437,6 +20664,10 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if friction_mode != "fixed_normal":
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
+        )
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_block_native(
@@ -20541,6 +20772,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     name = (
         f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}_{stag}{MB}"
         f"{'_fra' if free_rigid_angular else ''}{'_tor' if contact_torsion else ''}"
+        f"{'' if friction_mode == 'fixed_normal' else '_' + friction_mode}"
     )
     pgs_solve_propagation_colored_block_template.__name__ = name
     pgs_solve_propagation_colored_block_template.__qualname__ = name
@@ -20786,6 +21018,10 @@ def _get_pgs_solve_propagation_contact_kernel(
 """
 
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    if friction_mode != "fixed_normal":
+        snippet = snippet.replace(
+            "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + coupled_contact_cuda(friction_mode), 1
+        )
     if contact_torsion:
         snippet = snippet.replace(
             "#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + _PROPAGATION_APPLY_ROW_CUDA, 1
