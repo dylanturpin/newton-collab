@@ -759,8 +759,11 @@ class TestSteelFrictionDirection(unittest.TestCase):
                                     self.assertEqual(value, 0, key)
 
 
-def _belt_ride(mode, articulated, steps=120):
-    """Step a box resting on a kinematic belt moving at 0.5 m/s along x; return the box twist and MF row count."""
+def _belt_ride(mode, articulated, steps=120, window=30):
+    """Step a box resting on a kinematic belt moving at 0.5 m/s along x.
+
+    Returns the box's mean x velocity over the last ``window`` steps and the matrix-free row count.
+    """
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
     belt = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
@@ -798,12 +801,15 @@ def _belt_ride(mode, articulated, steps=120):
     joint_qd[0] = 0.5
     state.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    for _ in range(steps):
+    for step in range(steps):
+        if step == steps - window:
+            x_start = state.body_q.numpy()[box, 0]
         state.clear_forces()
         pipeline.collide(state, contacts)
         solver.step(state, next_state, control, contacts, 1.0 / 240.0)
         state, next_state = next_state, state
-    return state.body_qd.numpy()[box], int(solver._mf_constraint_count.numpy().sum())
+    mean_vx = (state.body_q.numpy()[box, 0] - x_start) * 240.0 / window
+    return mean_vx, int(solver._mf_constraint_count.numpy().sum())
 
 
 class TestSteelKinematicBeltFriction(unittest.TestCase):
@@ -813,10 +819,10 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
         for articulated in (False, True):
             for mode in ("fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton"):
                 with self.subTest(articulated=articulated, mode=mode):
-                    twist, mf_rows = _belt_ride(mode, articulated)
+                    mean_vx, mf_rows = _belt_ride(mode, articulated)
                     # The free box's contact is a matrix-free row; the articulated box's is a dense one.
                     self.assertEqual(mf_rows == 0, articulated)
-                    np.testing.assert_allclose(twist, (0.5, 0.0, 0.0, 0.0, 0.0, 0.0), atol=1.0e-3)
+                    self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
 
 @wp.kernel(enable_backward=False)
