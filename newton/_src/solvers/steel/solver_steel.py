@@ -84,10 +84,6 @@ from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     ANGULAR_FRICTION_PROPAGATION,
     CONTACT_GENERATION_NONE,
-    FRICTION_MODE_BISECTION,
-    FRICTION_MODE_BISECTION_DESAXCE,
-    FRICTION_MODE_COULOMB_NEWTON,
-    FRICTION_MODE_CURRENT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -2790,18 +2786,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     "friction_mode='fixed_normal' only"
                 )
         self._friction_mode = friction_mode
-        # Numeric id consumed by the matrix-free PGS kernels.  Mirrors the
-        # :data:`FRICTION_MODE_*` constants in ``steel/kernels.py``
-        # so we dispatch once at construction rather than doing string
-        # comparisons per step.
-        if friction_mode == "bisection":
-            self._friction_mode_id = int(FRICTION_MODE_BISECTION)
-        elif friction_mode == "bisection_desaxce":
-            self._friction_mode_id = int(FRICTION_MODE_BISECTION_DESAXCE)
-        elif friction_mode == "coulomb_newton":
-            self._friction_mode_id = int(FRICTION_MODE_COULOMB_NEWTON)
-        else:
-            self._friction_mode_id = int(FRICTION_MODE_CURRENT)
 
         self._free_body_constraint_max = int(free_body_constraint_max)
         # Propagation rows replaced the old D-wide dense articulated rows, so their
@@ -3010,7 +2994,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=model.device,
         )
         self._dense_internal_max_rows = self._estimate_dense_internal_rows_per_world(model)
-        self._articulation_constraint_max = self._select_dense_row_capacity(model)
+        self._articulation_constraint_max = self._select_dense_row_capacity()
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
         # Build the execution plan after articulation_constraint_max has been
         # finalized by _select_dense_row_capacity so chunk selection sees the
@@ -4602,7 +4586,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_crba_topology_schedules(model)
         self._setup_world_size_grouping(model)
 
-    def _select_dense_row_capacity(self, model) -> int:
+    def _select_dense_row_capacity(self) -> int:
         requested = int(self._requested_dense_max_constraints)
         if requested <= 0:
             return requested
@@ -5311,62 +5295,19 @@ class SolverSteel(SolverBase, CouplingInterface):
         return int(np.max(per_world)) if per_world.size else 0
 
     def _compute_articulation_indices(self, model):
-        # calculate total size and offsets of Jacobian and mass matrices for entire system
         if model.joint_count:
-            self._J_size = 0
-            self._M_size = wp.int64(0)
-            self._H_size = 0
-
-            articulation_J_start = []
-            articulation_M_start = []
-            articulation_H_start = []
-
-            articulation_M_rows = []
             articulation_H_rows = []
-            articulation_J_rows = []
-            articulation_J_cols = []
-
             articulation_dof_start = []
 
-            articulation_start = model.articulation_start.numpy()
             for i in range(model.articulation_count):
-                first_joint = articulation_start[i]
-                last_joint = articulation_start[i + 1]
+                articulation_dof_start.append(int(self._model_plan.articulation_dof_start[i]))
+                articulation_H_rows.append(int(self._model_plan.articulation_dof_count[i]))
 
-                first_dof = int(self._model_plan.articulation_dof_start[i])
-                joint_count = last_joint - first_joint
-                dof_count = int(self._model_plan.articulation_dof_count[i])
-
-                articulation_J_start.append(self._J_size)
-                articulation_M_start.append(int(self._M_size))
-                articulation_H_start.append(self._H_size)
-                articulation_dof_start.append(first_dof)
-
-                articulation_M_rows.append(joint_count * 6)
-                articulation_H_rows.append(dof_count)
-                articulation_J_rows.append(joint_count * 6)
-                articulation_J_cols.append(dof_count)
-
-                self._J_size += 6 * joint_count * dof_count
-                self._M_size = wp.int64(self._M_size + wp.int64(joint_count * 36))
-                self._H_size += dof_count * dof_count
-
-            # matrix offsets for grouped gemm
-            self._articulation_J_start = wp.array(articulation_J_start, dtype=wp.int32, device=model.device)
-            self._articulation_M_start = wp.array(articulation_M_start, dtype=wp.int32, device=model.device)
-            self._articulation_H_start = wp.array(articulation_H_start, dtype=wp.int32, device=model.device)
-
-            self._articulation_M_rows = wp.array(articulation_M_rows, dtype=wp.int32, device=model.device)
             self._articulation_H_rows = wp.array(articulation_H_rows, dtype=wp.int32, device=model.device)
-            self._articulation_J_rows = wp.array(articulation_J_rows, dtype=wp.int32, device=model.device)
-            self._articulation_J_cols = wp.array(articulation_J_cols, dtype=wp.int32, device=model.device)
-
             self._articulation_dof_start = wp.array(articulation_dof_start, dtype=wp.int32, device=model.device)
 
             self._articulation_max_dofs = int(max(articulation_H_rows)) if articulation_H_rows else 0
-            self._M_size = int(self._M_size)
         else:
-            self._M_size = 0
             self._articulation_max_dofs = 0
 
     def _compute_root_free_metadata(self, model):
@@ -5507,7 +5448,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not model.articulation_count:
             self._world_count = 0
             self._art_to_world = None
-            self._max_arts_per_world = 0
             self._is_one_solve_art_per_world = False
             return
 
@@ -5520,14 +5460,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._model_plan.articulation_joint_end, dtype=wp.int32, device=model.device
         )
 
-        world_art_counts = np.bincount(articulation_world, minlength=self._world_count).astype(np.int32)
-
         response_dof_count = self._model_plan.response_dof_count
         world_response_art_counts = np.zeros(self._world_count, dtype=np.int32)
         for art, world in enumerate(articulation_world):
             world_response_art_counts[world] += int(response_dof_count[art] > 0)
         self._is_one_solve_art_per_world = bool(np.all(world_response_art_counts == 1))
-        self._max_arts_per_world = int(np.max(world_art_counts)) if len(world_art_counts) else 0
 
     def _setup_world_size_grouping(self, model):
         self._world_group_art_start = {}
@@ -12563,7 +12500,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
                     state_in.body_q,
-                    model.shape_transform,
                     model.shape_body,
                     self._body_to_articulation,
                     self._art_to_world,
@@ -12872,12 +12808,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                             state_in.body_q,
                             state_aug._body_v_s,
                             self._prescribed_articulation,
-                            model.shape_transform,
                             self._shape_mu,
                             self._shape_restitution,
                             self._friction_gap,
                             int(self._contact_friction_shared_anchor),
-                            is_free_rigid,
                             self._contact_friction_scale,
                             int(self._contact_shared_anchor),
                             self._baumgarte,
@@ -12900,7 +12834,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     )
 
             if self._dense_angular_friction:
-                launch_angular_friction_rows(self, state_in, state_aug, contacts, contact_build_threads)
+                launch_angular_friction_rows(self, state_aug, contacts, contact_build_threads)
 
             # Build MF contact rows
             if mf_active:
@@ -13043,10 +12977,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
-                        is_free_rigid,
                         self._shape_mu,
                         self._shape_restitution,
-                        self._friction_gap,
                         int(self._contact_friction_shared_anchor),
                         self._contact_friction_scale,
                         int(self._contact_shared_anchor),
@@ -26567,15 +26499,12 @@ def _get_pgs_solve_mf_gs_kernel(
     # --- MF friction-row projection -------------------------------------
     # ``friction_mode="fixed_normal"`` solves the tangent block on its friction
     # disk at fixed normal load (matches :func:`friction_step_current`).
-    # ``friction_mode="bisection"`` runs the RAISim bisection on λ_n
-    # (matches :func:`friction_step_bisection`).
+    # ``friction_mode="bisection"`` runs the RAISim bisection on λ_n.
     # ``friction_mode="bisection_desaxce"`` runs the same bisection
     # with the de Saxce max-dissipation bias (``μ · ‖c_T‖`` added to
     # the normal target velocity) — Steel Friction Modes 6/13.
     # ``friction_mode="coulomb_newton"`` runs Gilles Daviet's scalar
-    # bracketed-Newton on alpha (matches
-    # :func:`friction_step_coulomb_newton`) — Steel Friction Modes
-    # 7/13.  We inject one of these CUDA blocks into the MF phase;
+    # bracketed-Newton on alpha — Steel Friction Modes 7/13.  We inject one of these CUDA blocks into the MF phase;
     # the outer row loop handles the standard ``delta_impulse``
     # accounting for the first-friction row (and t2's delta
     # collapses to zero because ``s_lam_mf[i_t2]`` is pre-written
@@ -26824,8 +26753,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 '// (no de Saxce bias; friction_mode="bisection".)',
             )
     elif friction_mode == "coulomb_newton":
-        # Gilles Daviet's 1D Coulomb Newton (7/13).  CUDA port of
-        # :func:`friction_step_coulomb_newton`; mirrors the
+        # Gilles Daviet's 1D Coulomb Newton (7/13).  Mirrors the
         # bisection block's structure — lane 0 runs the serial
         # scalar Newton, then broadcasts (new_t1, d_n, d_t2) to
         # every lane via ``__shfl_sync`` so the v_out deltas for
