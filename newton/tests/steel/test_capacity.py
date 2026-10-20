@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Row capacities, overflow reporting, watermarks and heterogeneous-world guards of SolverSteel."""
+"""Row capacities, overflow reporting, watermarks and heterogeneous worlds of SolverSteel."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ import newton
 from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
+    PGS_CONSTRAINT_TYPE_TORSION,
     allocate_world_contact_slots,
     collect_propagation_units,
     finalize_mf_constraint_counts,
@@ -24,6 +27,8 @@ from newton._src.solvers.steel.solver_steel import (
     _get_color_propagation_prebuild_kernel,
 )
 from newton.solvers import SolverSteel
+from newton.tests.steel._fixtures import set_torsion_radius
+from newton.tests.steel.test_propagation import _add_arm_on_heap, _Stepper
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
@@ -807,102 +812,7 @@ add_function_test(
 )
 
 
-PROPAGATION_RESPONSES = ("propagation", "propagation_fused", "propagation_colored")
-
-
-def _make_chain_world(n_links: int) -> newton.ModelBuilder:
-    """A fixed-base serial chain of ``n_links`` revolute links (n_links DOFs)."""
-    builder = newton.ModelBuilder()
-    joints = []
-    prev = -1
-    for i in range(n_links):
-        link = builder.add_link()
-        builder.add_shape_box(link, hx=0.15, hy=0.03, hz=0.03)
-        if prev == -1:
-            parent_xform = wp.transform(p=wp.vec3(0.0, 0.0, 1.0), q=wp.quat_identity())
-        else:
-            parent_xform = wp.transform(p=wp.vec3(0.15, 0.0, 0.0), q=wp.quat_identity())
-        joints.append(
-            builder.add_joint_revolute(
-                parent=prev,
-                child=link,
-                axis=wp.vec3(0.0, 1.0, 0.0),
-                parent_xform=parent_xform,
-                child_xform=wp.transform(p=wp.vec3(-0.15, 0.0, 0.0), q=wp.quat_identity()),
-                label=f"chain_joint_{i}",
-            )
-        )
-        prev = link
-    builder.add_articulation(joints, label="chain")
-    return builder
-
-
-def _build_model_hetero_guard(world_link_counts: list[int], device: str) -> newton.Model:
-    """One chain world per entry in ``world_link_counts``, plus a ground plane."""
-    scene = newton.ModelBuilder()
-    for n_links in world_link_counts:
-        scene.add_world(_make_chain_world(n_links))
-    scene.add_ground_plane()
-    return scene.finalize(device=device)
-
-
-class TestSteelHeteroGuard(unittest.TestCase):
-    """Unsafe hetero-world configurations must fail at construction."""
-
-    @classmethod
-    def setUpClass(cls):
-        if wp.get_cuda_device_count() == 0:
-            raise unittest.SkipTest("SolverSteel construction tests require cuda:0")
-        cls.device = "cuda:0"
-        # Worlds alternate a 1-link pendulum and a 3-link chain: per-world DOF
-        # counts [1, 3, 1, 3] -> heterogeneous.
-        cls.hetero_model = _build_model_hetero_guard([1, 3, 1, 3], cls.device)
-        # All 3-link chains: per-world DOF counts uniform -> homogeneous.
-        cls.homogeneous_model = _build_model_hetero_guard([3, 3, 3, 3], cls.device)
-
-    def test_hetero_propagation_family_raises(self):
-        for response in PROPAGATION_RESPONSES:
-            with self.subTest(articulated_contact_response=response):
-                with self.assertRaises(ValueError) as ctx:
-                    SolverSteel(
-                        self.hetero_model,
-                        solve_mode="matrix_free",
-                        articulated_contact_response=response,
-                    )
-                message = str(ctx.exception)
-                self.assertIn(response, message)
-                self.assertIn("heterogeneous", message)
-                self.assertIn("1, 3", message)
-
-    def test_hetero_matrix_free_constructs(self):
-        solver = SolverSteel(self.hetero_model, solve_mode="matrix_free")
-        self.assertEqual(solver._solve_mode, "matrix_free")
-
-    def test_hetero_split_constructs(self):
-        solver = SolverSteel(self.hetero_model, solve_mode="split")
-        self.assertEqual(solver._solve_mode, "split")
-
-    def test_homogeneous_all_modes_construct(self):
-        for solve_mode, response in (
-            ("split", "immediate"),
-            ("matrix_free", "immediate"),
-            ("matrix_free", "propagation"),
-            ("matrix_free", "propagation_fused"),
-            ("matrix_free", "propagation_colored"),
-        ):
-            with self.subTest(solve_mode=solve_mode, articulated_contact_response=response):
-                solver = SolverSteel(
-                    self.homogeneous_model,
-                    solve_mode=solve_mode,
-                    articulated_contact_response=response,
-                )
-                self.assertEqual(solver._solve_mode, solve_mode)
-                self.assertEqual(solver._articulated_contact_response, response)
-
-
-def _make_chain_world_hetero_guard_upstream(
-    n_links: int, root_height: float = 1.0, free_box: bool = False
-) -> newton.ModelBuilder:
+def _make_chain_world(n_links: int, root_height: float = 1.0, free_box: bool = False) -> newton.ModelBuilder:
     """A fixed-base serial chain of ``n_links`` revolute links (n_links DOFs), optionally with a free box."""
     builder = newton.ModelBuilder()
     joints = []
@@ -931,15 +841,17 @@ def _make_chain_world_hetero_guard_upstream(
     return builder
 
 
-def _build_model_hetero_guard_upstream(
-    world_link_counts: list[int], device, root_height: float = 1.0, free_box=None
-) -> newton.Model:
-    """One chain world per entry in ``world_link_counts``, plus a ground plane."""
+def _build_chain_worlds(world_link_counts: list[int], device, root_height=1.0, free_box=None) -> newton.Model:
+    """One chain world per entry in ``world_link_counts``, plus a ground plane.
+
+    ``root_height`` and ``free_box`` are either one value for every world or one entry per world.
+    """
+    count = len(world_link_counts)
+    heights = root_height if isinstance(root_height, list) else [root_height] * count
+    boxes = free_box if free_box is not None else [False] * count
     scene = newton.ModelBuilder()
-    for world, n_links in enumerate(world_link_counts):
-        scene.add_world(
-            _make_chain_world_hetero_guard_upstream(n_links, root_height, free_box is not None and free_box[world])
-        )
+    for n_links, height, box in zip(world_link_counts, heights, boxes, strict=True):
+        scene.add_world(_make_chain_world(n_links, height, box))
     scene.add_ground_plane()
     return scene.finalize(device=device)
 
@@ -962,33 +874,101 @@ def _final_joint_q(model, steps=60, solve_mode="matrix_free", response="immediat
     return state_0.joint_q.numpy()
 
 
+def test_hetero_matrix_free_constructs(test, device):
+    """Construct on worlds whose DOF counts differ."""
+    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device), solve_mode="matrix_free")
+    np.testing.assert_array_equal(solver._world_dof_count.numpy(), [1, 3, 1, 3])
+
+
 def test_homogeneous_matrix_free_constructs(test, device):
     """Construct on worlds with identical DOF counts."""
-    solver = SolverSteel(_build_model_hetero_guard_upstream([3, 3, 3, 3], device), solve_mode="matrix_free")
+    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device), solve_mode="matrix_free")
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
+
+
+def test_hetero_split_constructs(test, device):
+    """Construct the split solve on worlds whose DOF counts differ."""
+    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device), solve_mode="split")
+    test.assertEqual(solver._solve_mode, "split")
+    test.assertEqual(solver._size_groups, [3, 1])
 
 
 def test_homogeneous_split_constructs(test, device):
     """Construct the split solve on worlds with identical DOF counts."""
-    solver = SolverSteel(_build_model_hetero_guard_upstream([3, 3, 3, 3], device), solve_mode="split")
+    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device), solve_mode="split")
     test.assertEqual(solver._solve_mode, "split")
     test.assertEqual(solver._size_groups, [3])
 
 
 def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="matrix_free"):
     """Simulate each world of a heterogeneous model exactly as it simulates alone."""
-    combined = _final_joint_q(_build_model_hetero_guard_upstream([1, 3], device), solve_mode=solve_mode)
-    single = _final_joint_q(_build_model_hetero_guard_upstream([1], device), solve_mode=solve_mode)
-    triple = _final_joint_q(_build_model_hetero_guard_upstream([3], device), solve_mode=solve_mode)
+    combined = _final_joint_q(_build_chain_worlds([1, 3], device), solve_mode=solve_mode)
+    single = _final_joint_q(_build_chain_worlds([1], device), solve_mode=solve_mode)
+    triple = _final_joint_q(_build_chain_worlds([3], device), solve_mode=solve_mode)
     np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-5)
 
 
-class TestSteelHeteroGuardUpstream(unittest.TestCase):
+def test_homogeneous_propagation_constructs(test, device):
+    """Construct every propagation response on worlds with identical DOF counts."""
+    model = _build_chain_worlds([3, 3, 3, 3], device)
+    for response in ("propagation", "propagation_fused", "propagation_colored"):
+        with test.subTest(response=response):
+            solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=response)
+            test.assertEqual(solver._articulated_contact_response, response)
+            np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
+
+
+def test_hetero_propagation_matches_isolated_worlds(test, device):
+    """Simulate each world of a heterogeneous model with a propagation response exactly as it simulates alone.
+
+    The chains hang low enough to hit the ground, so every world solves propagation contact rows.
+    """
+
+    def run(link_counts, free_box, response):
+        model = _build_chain_worlds(link_counts, device, 0.35, free_box)
+        return _final_joint_q(model, response=response, from_fk=True)
+
+    for response in ("propagation", "propagation_colored"):
+        combined = run([1, 3], None, response)
+        single = run([1], None, response)
+        triple = run([3], None, response)
+        # The cached response sizes its reductions by the model's body capacity, so the sums reassociate.
+        np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-4)
+
+    # The fused response needs one articulation size, but a free box still makes world DOF counts differ.
+    combined = run([3, 3], [False, True], "propagation_fused")
+    plain = run([3], [False], "propagation_fused")
+    boxed = run([3], [True], "propagation_fused")
+    np.testing.assert_allclose(combined, np.concatenate([plain, boxed]), rtol=0.0, atol=1.0e-5)
+
+
+def test_hetero_fused_keeps_the_next_world_velocities(test, device):
+    """Keep a busy 3-DOF world from writing over the next, 9-DOF world in the fused response.
+
+    The first chain lies on the ground and solves many rows; the second hangs clear above a resting box.
+    """
+
+    def run(root_height, free_box):
+        model = _build_chain_worlds([3] * len(free_box), device, root_height, free_box)
+        return _final_joint_q(model, response="propagation_fused", from_fk=True)
+
+    combined = run([0.03, 2.0], [False, True])
+    lying = run([0.03], [False])
+    hanging = run([2.0], [True])
+    np.testing.assert_allclose(combined, np.concatenate([lying, hanging]), rtol=0.0, atol=1.0e-5)
+
+
+class TestSteelHeteroWorlds(unittest.TestCase):
     pass
 
 
 add_function_test(
-    TestSteelHeteroGuardUpstream,
+    TestSteelHeteroWorlds, "test_hetero_matrix_free_constructs", test_hetero_matrix_free_constructs, devices=devices
+)
+
+
+add_function_test(
+    TestSteelHeteroWorlds,
     "test_homogeneous_matrix_free_constructs",
     test_homogeneous_matrix_free_constructs,
     devices=devices,
@@ -996,7 +976,7 @@ add_function_test(
 
 
 add_function_test(
-    TestSteelHeteroGuardUpstream,
+    TestSteelHeteroWorlds,
     "test_hetero_worlds_match_isolated_worlds",
     test_hetero_worlds_match_isolated_worlds,
     devices=devices,
@@ -1007,7 +987,12 @@ split_devices = get_test_devices()
 
 
 add_function_test(
-    TestSteelHeteroGuardUpstream,
+    TestSteelHeteroWorlds, "test_hetero_split_constructs", test_hetero_split_constructs, devices=split_devices
+)
+
+
+add_function_test(
+    TestSteelHeteroWorlds,
     "test_homogeneous_split_constructs",
     test_homogeneous_split_constructs,
     devices=split_devices,
@@ -1015,12 +1000,130 @@ add_function_test(
 
 
 add_function_test(
-    TestSteelHeteroGuardUpstream,
+    TestSteelHeteroWorlds,
     "test_hetero_worlds_match_isolated_worlds_split",
     test_hetero_worlds_match_isolated_worlds,
     devices=split_devices,
     solve_mode="split",
 )
+
+
+add_function_test(
+    TestSteelHeteroWorlds,
+    "test_homogeneous_propagation_constructs",
+    test_homogeneous_propagation_constructs,
+    devices=devices,
+)
+
+
+add_function_test(
+    TestSteelHeteroWorlds,
+    "test_hetero_propagation_matches_isolated_worlds",
+    test_hetero_propagation_matches_isolated_worlds,
+    devices=devices,
+)
+
+
+add_function_test(
+    TestSteelHeteroWorlds,
+    "test_hetero_fused_keeps_the_next_world_velocities",
+    test_hetero_fused_keeps_the_next_world_velocities,
+    devices=devices,
+)
+
+
+# Arm lengths and heaps differ per world, so DOF and body counts differ too.
+_HETERO_HEAPS = ({"links": 3, "heap": (2, 2, 1)}, {"links": 6, "heap": (4, 2, 1)})
+_HETERO_HEAP_STEPS = 90
+_HETERO_HEAP_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
+
+
+def _build_hetero_heap_model(worlds: tuple[dict, ...]) -> newton.Model:
+    scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    scene.rigid_gap = 0.005
+    for world_kwargs in worlds:
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        world.rigid_gap = 0.005
+        _add_arm_on_heap(world, **world_kwargs)
+        scene.add_world(world)
+    scene.add_ground_plane()
+    model = scene.finalize(device="cuda:0")
+    model.rigid_contact_max = 4096 * len(worlds)
+    set_torsion_radius(model, 0.01)
+    return model
+
+
+def _hetero_heap_rollout(worlds: tuple[dict, ...], capture_at: int | None = None):
+    """Roll out the heap worlds with every colored contact feature on; return the final state and solver."""
+    stepper = _Stepper(
+        _build_hetero_heap_model(worlds),
+        contact_torsion_device=True,
+        free_rigid_torsional_friction=0.01,
+        free_rigid_rolling_friction=0.01,
+        enable_sleeping=True,
+        sleep_quiet_time=0.05,
+    )
+    graph = None
+    for step in range(_HETERO_HEAP_STEPS):
+        if step == capture_at:
+            with wp.ScopedCapture() as capture:
+                stepper.step()
+            graph = capture.graph
+        if graph is not None:
+            wp.capture_launch(graph)
+        else:
+            stepper.step()
+    return stepper.snapshot(), stepper.solver
+
+
+def _split_by_world(model: newton.Model, snapshot: dict) -> list[dict]:
+    body_world = model.body_world.numpy()
+    joint_world = model.joint_world.numpy()
+    q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+    worlds = []
+    for world in range(model.world_count):
+        joints = np.flatnonzero(joint_world == world)
+        worlds.append(
+            {
+                "body_q": snapshot["body_q"][body_world == world],
+                "body_qd": snapshot["body_qd"][body_world == world],
+                "joint_q": np.concatenate([snapshot["joint_q"][q_start[j] : q_start[j + 1]] for j in joints]),
+                "joint_qd": np.concatenate([snapshot["joint_qd"][qd_start[j] : qd_start[j + 1]] for j in joints]),
+            }
+        )
+    return worlds
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+class TestSteelHeteroColored(unittest.TestCase):
+    """Deterministic colored propagation on worlds whose DOF and body counts differ."""
+
+    def test_rollouts_match_isolated_worlds_bitwise(self):
+        """Match isolated worlds, a repeat and a captured replay bitwise, with torsion, angular rows and sleeping."""
+        combined, solver = _hetero_heap_rollout(_HETERO_HEAPS)
+        repeat, _ = _hetero_heap_rollout(_HETERO_HEAPS)
+        captured, _ = _hetero_heap_rollout(_HETERO_HEAPS, capture_at=2)
+        for name in _HETERO_HEAP_FIELDS:
+            np.testing.assert_array_equal(repeat[name], combined[name], err_msg=f"repeat {name}")
+            np.testing.assert_array_equal(captured[name], combined[name], err_msg=f"captured {name}")
+        for world, (world_state, world_kwargs) in enumerate(
+            zip(_split_by_world(solver.model, combined), _HETERO_HEAPS, strict=True)
+        ):
+            isolated, _ = _hetero_heap_rollout((world_kwargs,))
+            for name in _HETERO_HEAP_FIELDS:
+                np.testing.assert_array_equal(world_state[name], isolated[name], err_msg=f"world {world} {name}")
+
+        counts = solver._world_dof_count.numpy()
+        self.assertNotEqual(counts[0], counts[1], "worlds must differ in DOF count")
+        rows = solver._propagation_constraint_count.numpy()
+        row_types = np.concatenate([solver._propagation_row_type.numpy()[w, :n] for w, n in enumerate(rows)])
+        for row_type in (
+            PGS_CONSTRAINT_TYPE_TORSION,
+            PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+            PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
+        ):
+            self.assertGreater(int(np.sum(row_types == row_type)), 0, f"row type {row_type} must be active")
+        self.assertGreater(int(np.sum(solver._sleeping.body_awake.numpy() == 0)), 0, "some bodies must sleep")
 
 
 if __name__ == "__main__":
