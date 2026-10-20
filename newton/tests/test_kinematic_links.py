@@ -893,9 +893,6 @@ solvers = {
     "steel_propagation": lambda model: _undamped(
         newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation")
     ),
-    "steel_propagation_fused": lambda model: _undamped(
-        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_fused")
-    ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
@@ -910,7 +907,6 @@ for device in devices:
             "mujoco_warp",
             "steel_matrix_free",
             "steel_propagation",
-            "steel_propagation_fused",
         ):
             continue
         if device.is_cpu and solver_name == "steel_matrix_free":

@@ -790,7 +790,7 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
             np.testing.assert_array_equal(first, second, err_msg=f"cap {cap}")
 
 
-PROPAGATION_RESPONSES = ("propagation", "propagation_fused")
+PROPAGATION_RESPONSES = ("propagation", "propagation_colored")
 
 
 REGULARIZED = {"baumgarte": 0.0, "cfm": 0.0, "contact_regularization": 3.0}
@@ -799,7 +799,6 @@ REGULARIZED = {"baumgarte": 0.0, "cfm": 0.0, "contact_regularization": 3.0}
 # (articulated_contact_response, propagation_cached_response)
 PROPAGATION_ROUTES = (
     ("propagation", False),
-    ("propagation_fused", False),
     ("propagation", True),
     ("propagation_colored", False),
 )
@@ -889,7 +888,7 @@ class TestPropagationSharedBody(unittest.TestCase):
         """Rows of every world touch a shared jointless floor as static geometry and leave its scratch untouched."""
         model, floor = _build_shared_floor_model(wp.get_cuda_device())
         floor_shapes = np.flatnonzero(model.shape_body.numpy() == floor)
-        for response in ("propagation", "propagation_fused", "propagation_colored"):
+        for response in ("propagation", "propagation_colored"):
             with self.subTest(response=response):
                 solver = _make_solver(model, response, cached=False)
                 pipeline = newton.CollisionPipeline(model)
@@ -2184,11 +2183,9 @@ class TestSteelColoredDeterministic(unittest.TestCase):
         return stepper
 
     def test_gate_admits_colored_without_warm_start(self):
-        """Accept deterministic colored; reject fused, and colored with contact warm start."""
+        """Accept deterministic colored; reject it with contact warm start."""
         model = _build_arm_heap_model("cuda:0", worlds=1)
         _colored_deterministic_solver(model)
-        with self.assertRaisesRegex(ValueError, "deterministic=True requires"):
-            _colored_deterministic_solver(model, articulated_contact_response="propagation_fused")
         with self.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
             _colored_deterministic_solver(model, contact_warmstart=True)
 

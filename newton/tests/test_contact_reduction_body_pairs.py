@@ -87,7 +87,7 @@ def _prismatic_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.
 
     Unlike a single-link free articulation, this is a non-free articulation.
     Contacts on it must therefore take the articulated propagation-row path in
-    every propagation response mode, including ``propagation_fused``.
+    every propagation response mode.
     """
     link = builder.add_link()
     for i in range(num_cyl):
@@ -1134,17 +1134,14 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             ("split", "immediate", 16, _free_jointed_foot, "free_body"),
         ]
         # Matrix-free (and its propagation response family) is CUDA-only. Use
-        # a non-free prismatic articulation for every propagation variant. A
-        # free-only scene disables propagation_fused and would let that
-        # subtest pass through the ordinary matrix-free solver.
+        # a non-free prismatic articulation for every propagation variant.
         configs += [
             ("matrix_free", "immediate", None, _free_jointed_foot, "free_body"),
             ("matrix_free", "propagation", 16, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation_fused", None, _prismatic_jointed_foot, "propagation"),
             ("matrix_free", "propagation_colored", 16, _prismatic_jointed_foot, "propagation"),
         ]
         # Dense, propagation, and propagation_colored run 16 iterations. The
-        # two ``None`` entries deliberately omit iterations and assert the
+        # ``None`` entry deliberately omits iterations and asserts the
         # production default (12), rather than testing a stale assumed default.
         # At 8 iterations the UNREDUCED redundant set does not converge (dense
         # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
@@ -1175,8 +1172,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                             solver._propagation_contacts_enabled(),
                             f"{response} test scene did not enable propagation contacts",
                         )
-                    if response == "propagation_fused":
-                        self.assertTrue(solver._propagation_full_fused_iterations)
                     return solver
 
                 self._compare(

@@ -299,17 +299,6 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                         np.testing.assert_allclose(twist, reference, atol=2.0e-4)
                         self.assertAlmostEqual(rotated_travel, travel, delta=1.0e-4)
 
-    def test_rows_reject_the_fused_propagation_response(self):
-        """Reject the angular rows on the fused propagation response, whose solve does not visit them."""
-        model, _ = _scene("sphere", anchor_deg=45.0)
-        with self.assertRaises(ValueError):
-            SolverSteel(
-                model,
-                solve_mode="matrix_free",
-                free_rigid_rolling_friction=1.0e-3,
-                articulated_contact_response="propagation_fused",
-            )
-
     def test_patch_angular_rows_do_not_depend_on_contact_order(self):
         """Keep each material's angular rows when two shapes of one body with different angular coefficients rest
         side by side, whichever shape's contacts come first."""

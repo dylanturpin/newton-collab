@@ -153,7 +153,7 @@ class TabletopDemo:
         parser.add_argument("--iterations", type=int, default=12, help="Steel sweeps per substep")
         parser.add_argument(
             "--contact-response",
-            choices=("immediate", "propagation", "propagation_fused", "propagation_colored"),
+            choices=("immediate", "propagation", "propagation_colored"),
             default="immediate",
             help="Steel matrix-free articulated contact response",
         )

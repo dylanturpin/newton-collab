@@ -81,15 +81,14 @@ def _validate_torsion_mode(solver):
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._friction_mode != "fixed_normal"
         or solver._row_schedule != "interleaved"
         or solver._contact_warmstart
         or solver._contact_compliance
     ):
         raise ValueError(
-            "Contact torsion requires CUDA non-differentiable matrix_free/immediate, propagation or colored/current/"
-            "interleaved, without warmstart or compliance"
+            "Contact torsion requires CUDA non-differentiable matrix_free/current/interleaved, without warmstart or "
+            "compliance"
         )
     if solver._articulated_contact_response != "immediate" and solver._velocity_iterations > 0:
         raise ValueError("Contact torsion on a propagation articulated_contact_response requires velocity_iterations=0")

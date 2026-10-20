@@ -1917,15 +1917,14 @@ class TestSleepingColoredPropagation(unittest.TestCase):
     STEPS = 360
 
     def test_gate_admits_colored_only(self):
-        """Construct colored propagation with sleeping; keep rejecting the plain and fused propagation responses."""
+        """Construct colored propagation with sleeping; keep rejecting plain propagation."""
         model = _build_arm_heap_model("cuda:0", worlds=1)
         for response in ("immediate", "propagation_colored"):
             SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=response, enable_sleeping=True)
-        for response in ("propagation", "propagation_fused"):
-            with self.assertRaisesRegex(ValueError, "immediate or propagation_colored"):
-                SolverSteel(
-                    model, solve_mode="matrix_free", articulated_contact_response=response, enable_sleeping=True
-                )
+        with self.assertRaisesRegex(ValueError, "immediate or propagation_colored"):
+            SolverSteel(
+                model, solve_mode="matrix_free", articulated_contact_response="propagation", enable_sleeping=True
+            )
 
     def test_separated_boxes_sleep_and_wake_at_immediate_steps(self):
         """Sleep, force-wake and resettle separated boxes at the same steps as immediate, with units only while awake."""

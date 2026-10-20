@@ -438,7 +438,6 @@ class TestContactComplianceLaw(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for key, value in (
             ("articulated_contact_response", "propagation"),
-            ("articulated_contact_response", "propagation_fused"),
             ("velocity_iterations", 1),
             ("contact_regularization", 0.01),
             ("contact_warmstart", True),
@@ -1513,15 +1512,15 @@ def _run(model, pipeline, solver, frames, dt=DT):
 def test_regularization_route_agreement(test: unittest.TestCase, device):
     """The regularized update must agree across the matrix-free execution
     routes: the fused MF-GS kernel (matrix_free/immediate), the standalone
-    MF kernel (split/immediate), and the propagation_fused full-iteration
-    kernel: same scene, same g, matching resting poses."""
+    MF kernel (split/immediate), and the colored propagation sweep: same
+    scene, same g, matching resting poses."""
     with wp.ScopedDevice(device):
         results = {}
         for label, mode, response, velit in (
             ("fused", "matrix_free", "immediate", 2),
             # velocity iterations are matrix_free-only; split runs without
             ("standalone", "split", "immediate", 0),
-            ("propagation_fused", "matrix_free", "propagation_fused", 2),
+            ("propagation_colored", "matrix_free", "propagation_colored", 2),
         ):
             model, pipeline, solver, _bodies = _stack_scene(
                 device, g=0.05, solve_mode=mode, response=response, velocity_iterations=velit
@@ -1591,7 +1590,7 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
     """The velocity-only pass solves the exact rigid law: a settled stack holds
     its height to well under a millimetre over the last second."""
     with wp.ScopedDevice(device):
-        for response in ("immediate", "propagation_fused"):
+        for response in ("immediate", "propagation_colored"):
             model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
             _, zs = _run(model, pipeline, solver, 240)
             drift = abs(zs[-1] - zs[179])

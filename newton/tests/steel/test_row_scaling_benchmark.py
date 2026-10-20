@@ -63,7 +63,7 @@ def _build_d6_articulated_free_contact_model(device: str):
     return builder.finalize(device=device)
 
 
-def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple[int, int, int], int | None]:
+def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple[int, int, int]]:
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -91,12 +91,12 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
         int(np.sum(solver._mf_constraint_count.numpy())),
         int(np.sum(propagation_count.numpy())) if propagation_count is not None else 0,
     )
-    return state_out.joint_qd.numpy().copy(), rows, getattr(solver, "_propagation_full_fused_size", None)
+    return state_out.joint_qd.numpy().copy(), rows
 
 
 class TestSteelArticulationRowScalingBench(unittest.TestCase):
-    def test_steel_propagation_fused_supports_multi_dof_contact_rows(self):
-        _require_cuda("CUDA is required for propagation_fused multi-DOF contact rows")
+    def test_steel_propagation_supports_multi_dof_contact_rows(self):
+        _require_cuda("CUDA is required for propagation multi-DOF contact rows")
 
         model = _build_d6_articulated_free_contact_model("cuda:0")
         self.assertEqual(model.joint_dof_dim.numpy().tolist(), [[3, 3], [3, 3]])
@@ -109,24 +109,16 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
         wp.synchronize()
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
-        qd_immediate, rows_immediate, fused_immediate = _step_d6_contact_case(model, contacts, "immediate")
-        qd_propagation, rows_propagation, fused_propagation = _step_d6_contact_case(model, contacts, "propagation")
-        qd_fused, rows_fused, fused_size = _step_d6_contact_case(model, contacts, "propagation_fused")
-
+        qd_immediate, rows_immediate = _step_d6_contact_case(model, contacts, "immediate")
         self.assertGreater(rows_immediate[0], 0)
         self.assertEqual(rows_immediate[2], 0)
-        self.assertIsNone(fused_immediate)
 
-        self.assertEqual(rows_propagation[0], 0)
-        self.assertGreater(rows_propagation[2], 0)
-        self.assertIsNone(fused_propagation)
-
-        self.assertEqual(rows_fused[0], 0)
-        self.assertEqual(rows_fused[2], rows_propagation[2])
-        self.assertEqual(fused_size, 6)
-
-        np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
-        np.testing.assert_allclose(qd_fused, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+        for response in ("propagation", "propagation_colored"):
+            with self.subTest(response=response):
+                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response)
+                self.assertEqual(rows_propagation[0], 0)
+                self.assertGreater(rows_propagation[2], 0)
+                np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
 
     def test_steel_propagation_mixed_size_free_body_response(self):
         _require_cuda("CUDA is required for propagation articulated/free contact rows")
@@ -200,7 +192,7 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
             self.assertTrue((out_dir / "results.csv").is_file())
             results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
         paths = {row["path"] for row in results}
-        self.assertEqual(paths, {"mf_immediate", "propagation", "propagation_fused"})
+        self.assertEqual(paths, {"mf_immediate", "propagation", "propagation_colored"})
         self.assertFalse(
             paths
             & {
@@ -219,22 +211,13 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
         self.assertTrue(free_rows)
         self.assertTrue(articulated_rows)
 
-        # Contact-row placement is intrinsic to the response mode (3f282c21):
-        # "propagation" routes free/free rows onto the propagation family (the
-        # family allocates for all-free-body scenes), while "propagation_fused"
-        # keeps free/free rows on the matrix-free family (its measured-best
-        # configuration).
+        # "propagation" routes free/free rows onto the propagation family, which allocates for all-free-body scenes.
         free_propagation = next(row for row in free_rows if row["path"] == "propagation")
         self.assertTrue(free_propagation["propagation_active"])
         self.assertGreater(free_propagation["propagation_extra_mib"], 0.0)
         self.assertEqual(free_propagation["dense_rows_total"], 0)
         self.assertEqual(free_propagation["mf_rows_total"], 0)
         self.assertGreater(free_propagation["propagation_rows_total"], 0)
-
-        free_fused = next(row for row in free_rows if row["path"] == "propagation_fused")
-        self.assertEqual(free_fused["dense_rows_total"], 0)
-        self.assertGreater(free_fused["mf_rows_total"], 0)
-        self.assertEqual(free_fused["propagation_rows_total"], 0)
 
         articulated_baseline = next(row for row in articulated_rows if row["path"] == "mf_immediate")
         articulated_propagation = next(row for row in articulated_rows if row["path"] == "propagation")

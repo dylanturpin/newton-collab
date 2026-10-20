@@ -1046,16 +1046,6 @@ add_function_test(
 )
 
 
-# The fused response only differs from the immediate one with an articulated (dense-path) body.
-add_function_test(
-    TestSteelContactForce,
-    "test_free_body_contact_response_includes_armature_propagation_fused",
-    test_free_body_contact_response_includes_armature,
-    devices=devices,
-    response="propagation_fused",
-)
-
-
 LOWER_MASS = 2.0
 
 
@@ -1383,7 +1373,6 @@ add_function_test(
 
 for _suffix, _options in (
     ("propagation", {"articulated_contact_response": "propagation"}),
-    ("propagation_fused", {"articulated_contact_response": "propagation_fused"}),
     ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
     ("point_friction", {"friction_anchor_beta": 0.0}),
     ("torsion", {"torsion_radius": 0.01}),
@@ -1722,17 +1711,15 @@ IMPACT_FRACTION = 0.4
 PATH_DENSE = 0
 
 
-RESPONSE_MODES = ("immediate", "propagation", "propagation_fused", "propagation_colored")
+RESPONSE_MODES = ("immediate", "propagation", "propagation_colored")
 
 
 EXPECTED_PATHS = {
     ("free", "immediate"): {PATH_MATRIX_FREE},
     ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation_fused"): {PATH_MATRIX_FREE},
     ("free", "propagation_colored"): {PATH_PROPAGATION},
     ("articulated", "immediate"): {PATH_DENSE},
     ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation_fused"): {PATH_PROPAGATION},
     ("articulated", "propagation_colored"): {PATH_PROPAGATION},
 }
 
@@ -2696,7 +2683,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
     inertia = _diagonal_inertia(0.02)
 
     for joint_kind in ("fixed", "revolute"):
-        for response in ("immediate", "propagation_fused", "propagation_colored"):
+        for response in ("immediate", "propagation", "propagation_colored"):
             with test.subTest(joint=joint_kind, response=response):
                 builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
                 xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
@@ -3019,19 +3006,15 @@ DROP = 0.12
 
 
 # The route each scene and response mode takes, measured rather than assumed.
-# A lone free body never reaches dense rows, and "propagation_fused" only uses
-# propagation rows once a real articulation exists -- with a free body it
-# degrades to the matrix-free path -- so a single-sphere scene cannot claim to
-# cover either. Asserting the exact set keeps the suite from silently claiming
-# coverage of a path it never reaches.
+# A lone free body never reaches dense rows, so a single-sphere scene cannot
+# claim to cover them. Asserting the exact set keeps the suite from silently
+# claiming coverage of a path it never reaches.
 EXPECTED_PATHS = {
     ("free", "immediate"): {PATH_MATRIX_FREE},
     ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation_fused"): {PATH_MATRIX_FREE},
     ("free", "propagation_colored"): {PATH_PROPAGATION},
     ("articulated", "immediate"): {PATH_DENSE},
     ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation_fused"): {PATH_PROPAGATION},
     ("articulated", "propagation_colored"): {PATH_PROPAGATION},
 }
 

@@ -1923,7 +1923,6 @@ SLIDER_CONFIGS_CUDA = [
     ("matrix_free", "immediate", 0),
     ("matrix_free", "immediate", 2),
     ("matrix_free", "propagation", 0),
-    ("matrix_free", "propagation_fused", 0),
     ("matrix_free", "propagation_colored", 0),
 ]
 
@@ -1942,7 +1941,7 @@ def _record_slider_step(
     peak_contacts[0] = wp.max(peak_contacts[0], rigid_contact_count[0])
 
 
-def _build_slider(device, articulated=False):
+def _build_slider(device):
     """A frictionless sphere resting on a frictionless ground plane."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     builder.default_shape_cfg.mu = 0.0
@@ -1953,19 +1952,7 @@ def _build_slider(device, articulated=False):
         inertia=wp.mat33(0.004, 0.0, 0.0, 0.0, 0.004, 0.0, 0.0, 0.0, 0.004),
     )
     builder.add_shape_sphere(body, radius=RADIUS)
-    joints = [builder.add_joint_free(body)]
-    if articulated:
-        # Fused propagation deliberately keeps single free bodies on the
-        # ordinary matrix-free path. A concentric fixed child makes this a
-        # floating articulation without changing the frictionless invariant.
-        child = builder.add_link(
-            xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS), wp.quat_identity()),
-            mass=0.1,
-            com=wp.vec3(0.0, 0.0, 0.0),
-            inertia=wp.mat33(0.0004, 0.0, 0.0, 0.0, 0.0004, 0.0, 0.0, 0.0, 0.0004),
-        )
-        joints.append(builder.add_joint_fixed(body, child))
-    builder.add_articulation(joints)
+    builder.add_articulation([builder.add_joint_free(body)])
     builder.add_ground_plane()
     return builder.finalize(device=device)
 
@@ -1996,11 +1983,6 @@ def _slide_heights(model, omega_y, solve_mode, response="immediate", velocity_it
     control = model.control()
     heights = wp.empty(STEPS_free_root_predictor, dtype=wp.float32, device=model.device)
     peak_contacts = wp.zeros(1, dtype=wp.int32, device=model.device)
-    if response == "propagation_fused":
-        if not solver._propagation_contacts_enabled():
-            raise AssertionError("propagation_fused test model did not activate propagation contacts")
-        if solver._pgs_solve_propagation_full_iteration_kernel is None:
-            raise AssertionError("propagation_fused test model did not construct the fused iteration kernel")
     for step in range(STEPS_free_root_predictor):
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT_free_root_predictor)
@@ -2012,8 +1994,6 @@ def _slide_heights(model, omega_y, solve_mode, response="immediate", velocity_it
             outputs=[heights, peak_contacts],
             device=model.device,
         )
-    if response == "propagation_fused" and int(solver._propagation_constraint_count.numpy().sum()) <= 0:
-        raise AssertionError("propagation_fused test did not build any propagation contact rows")
     return heights.numpy(), int(peak_contacts.numpy()[0])
 
 
@@ -2057,7 +2037,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
             configs += SLIDER_CONFIGS_CUDA
         for solve_mode, response, vel_iters in configs:
             with self.subTest(solve_mode=solve_mode, response=response, velocity_iterations=vel_iters):
-                model = _build_slider(device, articulated=response == "propagation_fused")
+                model = _build_slider(device)
                 still, contacts_still = _slide_heights(model, 0.0, solve_mode, response, vel_iters)
                 spinning, contacts_spin = _slide_heights(model, OMEGA_Y, solve_mode, response, vel_iters)
                 # the comparison is vacuous unless both runs really ride on

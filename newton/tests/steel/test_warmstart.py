@@ -483,7 +483,6 @@ class TestSteelIdentityWarmstart(unittest.TestCase):
             ("propagation", False),
             ("propagation_colored", False),
             ("propagation_colored", True),
-            ("propagation_fused", False),
         )
         for response, cached in cases:
             with self.subTest(response=response, cached=cached):

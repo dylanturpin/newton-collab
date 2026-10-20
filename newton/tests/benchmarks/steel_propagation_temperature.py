@@ -5,7 +5,7 @@
 
 Runs a small config matrix that isolates the three scaling axes (contact
 count, chain depth, articulation count) across the immediate, propagation,
-and propagation_fused response modes. For each point it reports:
+and propagation_colored response modes. For each point it reports:
 
 - per-step wall time (contacts precomputed, solver-only, restore-state loop),
 - analytic row/propagation buffer memory,
@@ -62,7 +62,7 @@ from steel_articulation_row_scaling import (
 import newton
 from newton.solvers import SolverSteel
 
-MODES = ("mf_immediate", "propagation", "propagation_fused", "propagation_colored")
+MODES = ("mf_immediate", "propagation", "propagation_colored")
 CONTACT_ROW_TYPE = 0
 
 

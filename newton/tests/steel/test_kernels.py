@@ -193,20 +193,13 @@ class TestSteelLaunchConfig(unittest.TestCase):
             articulated_contact_response="propagation",
         )
         self.assertEqual(solver._articulated_contact_response, "propagation")
-        fused = SolverSteel(
-            model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_fused",
-        )
-        self.assertEqual(fused._articulated_contact_response, "propagation_fused")
 
-        with self.assertRaisesRegex(ValueError, "articulated_contact_response"):
-            SolverSteel(model, articulated_contact_response="bad")
+        for removed in ("bad", "propagation_fused"):
+            with self.assertRaisesRegex(ValueError, f"articulated_contact_response must be .*got '{removed}'"):
+                SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=removed)
 
         with self.assertRaisesRegex(NotImplementedError, "solve_mode='matrix_free'"):
             SolverSteel(model, solve_mode="split", articulated_contact_response="propagation")
-        with self.assertRaisesRegex(NotImplementedError, "solve_mode='matrix_free'"):
-            SolverSteel(model, solve_mode="split", articulated_contact_response="propagation_fused")
 
         with self.assertRaisesRegex(NotImplementedError, "friction_mode='fixed_normal'"):
             SolverSteel(

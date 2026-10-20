@@ -2678,7 +2678,6 @@ class TestPropagationTorsion(unittest.TestCase):
     def test_unsupported_combinations_raise(self):
         """Keep torsion rejected where its rows are not solved or not validated."""
         for options, message in (
-            ({"articulated_contact_response": "propagation_fused", "contact_torsion_device": True}, "requires"),
             ({**_PROPAGATION_TORSION, "contact_warmstart": True}, "warmstart"),
             ({**_PROPAGATION_TORSION, "velocity_iterations": 1}, "velocity_iterations=0"),
             ({"articulated_contact_response": "propagation"}, "contact_torsion_device=True"),
