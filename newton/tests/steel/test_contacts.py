@@ -104,7 +104,6 @@ def _launch_contact_allocator(
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
@@ -346,7 +345,6 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     )
     body_v = wp.zeros((3,), dtype=wp.spatial_vector, device=device)
     prescribed = wp.zeros((1,), dtype=wp.int32, device=device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
     material_mu = wp.array([0.6, 0.8], dtype=wp.float32, device=device)
     material_restitution = wp.array([0.2, 0.4], dtype=wp.float32, device=device)
 
@@ -386,12 +384,10 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             body_q,
             body_v,
             prescribed,
-            shape_transform,
             material_mu,
             material_restitution,
             1.0,
             1,
-            wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,

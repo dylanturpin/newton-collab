@@ -189,6 +189,7 @@ def populate(b, info, ee, down, device):
     chain, anchors = [], []
     steel = b.default_shape_cfg.copy()
     steel.density, steel.mu, steel.gap = 7800, 0.3, 0.0002
+    # Passive bearing drag dissipates contact-induced spin after the strike.
     for k in range(count):
         body = b.add_link(xform=tf(top - [0, 0, (k + 0.5) * link_length]), label=f"wrecking_chain_{k}")
         child_anchor = np.array([0, 0, link_length / 2])
@@ -197,7 +198,7 @@ def populate(b, info, ee, down, device):
             body,
             parent_xform=tf(anchor),
             child_xform=tf(child_anchor),
-            damping=0.0,
+            damping=0.001,
             armature=1e-4,
             label=f"wrecking_chain_joint_{k}",
         )
@@ -227,7 +228,7 @@ def populate(b, info, ee, down, device):
         ball,
         parent_xform=tf(anchor),
         child_xform=tf((0, 0, radius)),
-        damping=0.0,
+        damping=0.005,
         armature=1e-5,
         label="wrecking_ball_joint",
     )
