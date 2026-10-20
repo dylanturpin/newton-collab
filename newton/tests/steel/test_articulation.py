@@ -3741,17 +3741,26 @@ def test_sleeping_parent_wrench_from_legacy_to_observable(test, device):
 
 def test_parent_wrench_eager_step_before_first_replay(test, device):
     """Step eagerly between capturing a BODY_PARENT_F step and its first replay, and match an eager twin."""
-    for velocity_limits in (False, True):
-        with test.subTest(enable_joint_velocity_limits=velocity_limits):
+    colored = {
+        "enable_joint_velocity_limits": True,
+        "articulated_contact_response": "propagation_colored",
+        "enable_sleeping": True,
+        "contact_torsion_device": True,
+        "velocity_iterations": 0,
+    }
+    for options in ({"enable_joint_velocity_limits": False}, {"enable_joint_velocity_limits": True}, colored):
+        with test.subTest(**options):
             runs = []
             for _ in range(2):
                 model, pipeline = _parent_wrench_scene(device)
+                if options.get("contact_torsion_device"):
+                    set_torsion_radius(model, 0.02)
                 solver = SolverSteel(
                     model,
                     solve_mode="matrix_free",
                     friction_anchor_beta=0.0,
                     articulation_constraint_max=128,
-                    enable_joint_velocity_limits=velocity_limits,
+                    **options,
                 )
                 runs.append((model, pipeline, solver, solver.observables(FLAGS), [model.state(), model.state()]))
 

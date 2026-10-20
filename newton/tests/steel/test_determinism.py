@@ -145,6 +145,9 @@ ROBOT_SOLVER_OPTIONS = {
 }
 
 
+COLORED_ROBOT_SOLVER_OPTIONS = {**ROBOT_SOLVER_OPTIONS, "articulated_contact_response": "propagation_colored"}
+
+
 # Torsional and rolling rows ride on the robot options; their capacity fits, so no world overflows.
 ANGULAR_FRICTION_SOLVER_OPTIONS = {
     **ROBOT_SOLVER_OPTIONS,
@@ -361,6 +364,7 @@ def test_deterministic_runs_are_bitwise_identical(test, device):
         configurations += [
             ("matrix_free", robot_model, ROBOT_SOLVER_OPTIONS, False),
             ("matrix_free_graph", robot_model, ROBOT_SOLVER_OPTIONS, True),
+            ("colored_graph", robot_model, COLORED_ROBOT_SOLVER_OPTIONS, True),
             ("angular_friction", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, False),
             ("angular_friction_graph", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, True),
         ]
