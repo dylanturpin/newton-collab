@@ -26031,7 +26031,8 @@ def _get_pgs_solve_mf_gs_kernel(
                     // Every lane has read the old impulses before lane 0 overwrites them.
                     __syncwarp();
                     if (lane == 0) {
-                        float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
+                        // The friction rows' rhs carries a prescribed body's tangential velocity.
+                        float u_n = 0.0f, u_t1 = s_rhs_dense[i_t1], u_t2 = s_rhs_dense[i_t2];
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
                         float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
 
@@ -26055,9 +26056,6 @@ def _get_pgs_solve_mf_gs_kernel(
                             G_t1t2 += Jt1 * Yt2;
                             G_t2t2 += Jt2 * Yt2;
                         }
-                        // The friction rows' rhs carries a prescribed body's tangential velocity.
-                        u_t1 += s_rhs_dense[i_t1];
-                        u_t2 += s_rhs_dense[i_t2];
 
                         // __DENSE_DESAXCE_BIAS__
 
