@@ -34,7 +34,8 @@ def populate(b, info, ee, fingers, device, variant):
         b.add_shape_capsule(
             -1, xform=tf((source[0] + x, source[1], 0.065)), radius=0.003, half_height=0.057, color=(0.40, 0.46, 0.50)
         )
-    grasp = np.array([0.0095, 0, 0.085])
+    # Grip the upper rim so the open fingertips clear the rack during retreat.
+    grasp = np.array([0.0095, 0, 0.10])
     pickup, target = source + grasp, roots[3] + grasp
     down = wp.quat_rpy(0.0, 0.0, math.pi / 2) * wp.quat(1, 0, 0, 0)
     for finger in fingers:
@@ -89,6 +90,6 @@ def populate(b, info, ee, fingers, device, variant):
         plate_slot_half_width=pitch / 2 - 0.003,
         plate_resting_bodies=resting,
         plate_goal_rotation=list(plate_rotation),
-        plate_grasp_local=[0, 0.085, 0.0095],
+        plate_grasp_local=[0, 0.10, 0.0095],
         task="Lift a loose dinner plate by its rim and seat it in a proc-gen wire rack with two contact-supported plates",
     )
