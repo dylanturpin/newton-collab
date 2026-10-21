@@ -206,7 +206,8 @@ def test_rejects_unsupported_configs(test, device):
     observables = solver.observables({newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F})
     with test.assertRaisesRegex(NotImplementedError, "observables"):
         solver.step(state, model.state(requires_grad=True), None, None, _DT, observables=observables)
-    model.request_state_attributes("body_parent_f")
+    with test.assertWarns(DeprecationWarning):
+        model.request_state_attributes("body_parent_f")
     with test.assertRaisesRegex(NotImplementedError, "body_parent_f"):
         solver.step(state, model.state(requires_grad=True), None, None, _DT)
 
@@ -1461,6 +1462,90 @@ def test_smooth_contact_bounce_gradient_converges_across_eps(test, device):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=1.0e-2 * max(1.0, abs(fd)))
 
 
+def test_runtime_disabled_tree_joint_is_reported(test, device):
+    """A tree joint disabled after construction fails the status check, eagerly and in a replayed graph."""
+    model = _build_chain(device)
+    solver = SolverSteel(model, differentiable=True)
+    state, output = model.state(requires_grad=True), model.state(requires_grad=True)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    capture = None
+    if wp.get_device(device).is_cuda:
+        solver.step(state, output, None, None, _DT)
+        with wp.ScopedCapture(device) as capture:
+            solver.step(state, output, None, None, _DT)
+    enabled = model.joint_enabled.numpy()
+
+    def step():
+        if capture is None:
+            solver.step(state, output, None, None, _DT)
+        else:
+            wp.capture_launch(capture.graph)
+
+    step()
+    solver.check_constraint_capacity()
+    enabled[1] = False
+    model.joint_enabled.assign(enabled)
+    step()
+    with test.assertRaisesRegex(RuntimeError, "disables an articulation tree joint"):
+        solver.check_constraint_capacity()
+
+
+def test_unarticulated_body_contact_matches_default(test, device):
+    """A raised body outside every articulation supports the slider: its pose reaches the contact rows."""
+
+    def build(requires_grad):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
+        inertia = wp.mat33(np.eye(3) * 0.01)
+        link_x = builder.add_link(mass=1.0, inertia=inertia)
+        link_y = builder.add_link(mass=0.5, inertia=inertia)
+        link_z = builder.add_link(mass=0.3, xform=wp.transform(wp.vec3(0.0, 0.0, 0.598), wp.quat_identity()))
+        builder.add_shape_sphere(link_z, radius=0.1, cfg=cfg)
+        builder.add_articulation(
+            [
+                builder.add_joint_prismatic(-1, link_x, axis=(1.0, 0.0, 0.0)),
+                builder.add_joint_prismatic(link_x, link_y, axis=(0.0, 1.0, 0.0)),
+                builder.add_joint_prismatic(
+                    link_y,
+                    link_z,
+                    axis=(0.0, 0.0, 1.0),
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.598), wp.quat_identity()),
+                ),
+            ]
+        )
+        support = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_box(support, hx=1.0, hy=1.0, hz=0.25, cfg=cfg)
+        return builder.finalize(device=device, requires_grad=requires_grad), support
+
+    options = {**_CONTACT_OPTIONS, "contact_friction_gap_max": None, "iterations": 8}
+    qd0 = np.array([0.3, -0.2, -0.5], np.float32)
+    results = {}
+    for differentiable in (False, True):
+        model, support = build(differentiable)
+        solver = SolverSteel(model, differentiable=differentiable, **options)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+        contacts = pipeline.contacts()
+        states = [model.state(requires_grad=True) for _ in range(9)]
+        states[0].joint_qd.assign(qd0)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        for k in range(8):
+            pipeline.collide(states[k], contacts)
+            test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+            solver.step(states[k], states[k + 1], None, contacts, _DT)
+        results[differentiable] = states[-1]
+        np.testing.assert_array_equal(states[-1].body_q.numpy()[support], states[0].body_q.numpy()[support])
+    # The sphere rests on the support, half a metre above the ground plane it never reaches.
+    test.assertGreater(float(results[True].joint_q.numpy()[2]), -0.05)
+    for attribute in ("joint_q", "joint_qd"):
+        expected = getattr(results[False], attribute).numpy()
+        actual = getattr(results[True], attribute).numpy()
+        with test.subTest(attribute=attribute):
+            if wp.get_device(device).is_cpu:
+                np.testing.assert_array_equal(actual, expected)
+            else:
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -1516,6 +1601,8 @@ for _device in get_test_devices():
         test_smooth_contact_damped_zero_gap_gradient_matches_finite_difference,
         test_smooth_contact_bounce_gradient_converges_across_eps,
         test_taped_kernels_keep_adjoints,
+        test_runtime_disabled_tree_joint_is_reported,
+        test_unarticulated_body_contact_matches_default,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:

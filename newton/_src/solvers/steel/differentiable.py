@@ -36,6 +36,7 @@ from .kernels import (
     compute_velocity_predictor,
     compute_world_contact_bias,
     contact_restitution_fires,
+    copy_unarticulated_body_state,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     integrate_generalized_joints,
@@ -265,13 +266,45 @@ class DifferentiableStep:
             raise NotImplementedError("differentiable=True does not publish solver observables or State.body_parent_f")
         if control is None:
             control = model.control(clone_variables=False)
+        # Deferred: the solver module imports this one.
+        from .solver_steel import _flag_disabled_tree_joints  # noqa: PLC0415
+
+        # Bodies outside every articulation keep their prescribed, stop-gradient state.
+        unarticulated = solver._unarticulated_bodies
+        if unarticulated.size:
+            wp.launch(
+                copy_unarticulated_body_state,
+                dim=unarticulated.size,
+                inputs=[unarticulated, state_in.body_q, state_in.body_qd],
+                outputs=[state_out.body_q, state_out.body_qd],
+                device=device,
+                record_tape=False,
+            )
         if not model.joint_count:
             solver._step += 1
             return state_out
         b = self.buffers(state_out)
         # The wrench recursion accumulates into body_ft_s; buffers are reused when a state is stepped into again.
         b.body_ft_s.zero_()
-
+        if unarticulated.size:
+            # Contact rows read every pose from b.body_q, which FK writes for articulated bodies only.
+            wp.launch(
+                copy_unarticulated_body_state,
+                dim=unarticulated.size,
+                inputs=[unarticulated, state_in.body_q, state_in.body_qd],
+                outputs=[b.body_q, state_out.body_qd],
+                device=device,
+                record_tape=False,
+            )
+        if solver._tree_joint_world is not None:
+            wp.launch(
+                _flag_disabled_tree_joints,
+                dim=model.joint_count,
+                inputs=[model.joint_enabled, solver._tree_joint_world],
+                outputs=[solver._disabled_tree_joint],
+                device=device,
+                record_tape=False,
+            )
         wp.launch(
             _eval_fk_id_uncached,
             dim=model.articulation_count,
