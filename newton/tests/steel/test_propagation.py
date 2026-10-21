@@ -853,6 +853,64 @@ def _three_foot_slider_model(device):
     return builder.finalize(device=device)
 
 
+def _linkage_gripper_model(device):
+    """Two pads on passive mimic linkages of one soft, effort-limited driver, under a stiff lift, around a box."""
+    builder = newton.ModelBuilder()
+    lift = builder.add_link(mass=5.0, inertia=wp.mat33(np.eye(3) * 0.05))
+    joints = [
+        builder.add_joint_prismatic(
+            -1,
+            lift,
+            axis=(0.0, 0.0, 1.0),
+            parent_xform=wp.transform((0.0, 0.0, 0.175), wp.quat_identity()),
+            target_ke=5.0e4,
+            target_kd=500.0,
+        )
+    ]
+    palm = builder.add_link(mass=0.7, inertia=wp.mat33(np.eye(3) * 1.0e-3))
+    joints.append(builder.add_joint_revolute(lift, palm, axis=(0.0, 0.0, 1.0), target_ke=5.0e4, target_kd=50.0))
+    pad_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=5.0, gap=0.005)
+    knuckles, fingers = {}, {}
+    for side in (-1.0, 1.0):
+        driven = side < 0.0
+        knuckle = builder.add_link(mass=0.013, inertia=wp.mat33(np.eye(3) * 2.0e-6))
+        knuckles[side] = builder.add_joint_revolute(
+            palm,
+            knuckle,
+            axis=(0.0, side, 0.0),
+            parent_xform=wp.transform((side * 0.0532, 0.0, -0.03), wp.quat_identity()),
+            target_ke=100.0 if driven else 0.0,
+            target_kd=10.0 if driven else 0.0,
+            effort_limit=10.0 if driven else 1.0e6,
+            limit_lower=-0.1,
+            limit_upper=0.9,
+        )
+        pad = builder.add_link(mass=0.04, inertia=wp.mat33(np.eye(3) * 1.0e-5))
+        builder.add_shape_box(
+            pad, xform=wp.transform((0.0, 0.0, -0.03), wp.quat_identity()), hx=0.006, hy=0.012, hz=0.03, cfg=pad_cfg
+        )
+        fingers[side] = builder.add_joint_revolute(
+            knuckle,
+            pad,
+            axis=(0.0, side, 0.0),
+            parent_xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()),
+            limit_lower=-0.9,
+            limit_upper=0.1,
+        )
+        joints += [knuckles[side], fingers[side]]
+    builder.add_articulation(joints)
+    # The left knuckle drives the right knuckle and both pad joints.
+    builder.set_joint_mimic(knuckles[1.0], knuckles[-1.0], coeffs=(0.0, 1.0))
+    for finger in fingers.values():
+        builder.set_joint_mimic(finger, knuckles[-1.0], coeffs=(0.0, -1.0))
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.0305), wp.quat_identity()))
+    builder.add_shape_box(
+        box, hx=0.03, hy=0.024, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / 1.728e-4, mu=0.5, gap=0.005)
+    )
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    return builder.finalize(device=device), palm, box
+
+
 def _solver(model, response, iterations, cached=False, **kwargs):
     return SolverSteel(
         model,
@@ -913,6 +971,7 @@ class TestPropagationSharedBody(unittest.TestCase):
                 self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
 class TestPropagationCoupledContacts(unittest.TestCase):
     def test_shared_dof_feet_reach_rest(self):
         """Three feet on one prismatic DOF stop at the plane for every sweep count."""
@@ -923,6 +982,22 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                     solver = _solver(model, response, iterations, baumgarte=0.0, cfm=0.0)
                     (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
                     self.assertLess(abs(float(qd[0])), 1.0e-3)
+
+    def test_shared_dof_feet_split_their_whole_response(self):
+        """Feet whose only mobility is one shared DOF split all of it, on the warp and the serial response kernels."""
+        model = _three_foot_slider_model("cuda:0")
+        feet = [1, 2, 3]
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
+                solver = _solver(model, "propagation_colored", 1, baumgarte=0.0, cfm=0.0)
+                if serial:
+                    _force_serial_fallback(solver)
+                list(_rollout(model, solver, np.array([-1.0], dtype=np.float32), 1))
+                exact = solver._propagation_body_response.numpy()[feet]
+                split = solver._propagation_body_response_split.numpy()[feet]
+                self.assertGreater(float(np.abs(exact).max()), 0.0)
+                np.testing.assert_allclose(split, 3.0 * exact, rtol=1.0e-5, atol=1.0e-7)
 
     def test_regularized_feet_reach_immediate_equilibrium(self):
         """Splitting leaves the regularized contact fixed point of three coupled feet unchanged."""
@@ -959,7 +1034,48 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                 for _ in range(3):
                     wp.capture_launch(capture.graph)
                 np.testing.assert_allclose(output.joint_qd.numpy(), expected, atol=1.0e-6)
-                self.assertEqual(int(solver._propagation_coupling_group_body_count.numpy().max()), 3)
+                self.assertEqual(int(solver._propagation_joint_split.numpy().max()), 3)
+
+    def test_linkage_gripper_holds_lifted_box(self):
+        """Pads whose mobility is their own passive linkage keep their unsplit step and hold a box through a lift."""
+        model, palm, box = _linkage_gripper_model("cuda:0")
+        for response in PROPAGATION_RESPONSES:
+            with self.subTest(response=response):
+                solver = SolverSteel(
+                    model,
+                    solve_mode="matrix_free",
+                    articulated_contact_response=response,
+                    iterations=64,
+                    friction_anchor_beta=0.0,
+                    contact_friction_gap_max=0.001,
+                    enable_sleeping=False,
+                )
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state, output, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+                with wp.ScopedCapture(device=model.device) as capture:
+                    pipeline.collide(state, contacts)
+                    for source, target in ((state, output), (output, state)) * 2:
+                        source.clear_forces()
+                        solver.step(source, target, control, contacts, 1.0 / 800.0)
+                joint_target = model.joint_target_q.numpy()
+                grasped = None
+                for tick in range(260):
+                    # Close the driver, then lift by 0.2 m along a smoothstep.
+                    joint_target[2] = 0.8 if tick >= 40 else 0.0
+                    lift = min(max(tick - 120, 0) / 100.0, 1.0)
+                    joint_target[0] = 0.2 * lift * lift * (3.0 - 2.0 * lift)
+                    control.joint_target_q.assign(joint_target)
+                    wp.capture_launch(capture.graph)
+                    if tick == 119:
+                        grasped = self._box_below_palm(state, palm, box)
+                self.assertLess(abs(grasped - self._box_below_palm(state, palm, box)), 0.01)
+
+    @staticmethod
+    def _box_below_palm(state, palm, box):
+        body_q = state.body_q.numpy()
+        return float(body_q[palm, 2] - body_q[box, 2])
 
     def test_floating_quadruped_with_joint_velocities_stays_bounded(self):
         """Four feet coupled through a light free root keep their roll rate physical."""

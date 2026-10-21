@@ -176,7 +176,7 @@ from .kernels import (
     compute_world_contact_velocity_bias,
     copy_free_rigid_propagation_body_response,
     copy_unarticulated_body_state,
-    count_propagation_coupled_bodies,
+    count_propagation_joint_split,
     crba_fill_par_dof,
     delassus_par_row_col,
     diag_from_JY_par_art,
@@ -5706,7 +5706,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._body_response_dof_mask = None
             self._body_single_response_dof = None
             self._body_single_response_dof_host = None
-            self._body_coupling_group_host = None
             return
 
         joint_child = model.joint_child.numpy()
@@ -5738,8 +5737,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
         body_response_dof_mask = np.zeros(model.body_count, dtype=np.uint32)
         body_single_response_dof = np.full(model.body_count, -1, dtype=np.int32)
-        # Only bodies sharing their topmost moving ancestor joint can have a cross response.
-        body_coupling_group = np.arange(model.body_count, dtype=np.int32)
         for body, joint in enumerate(body_to_joint):
             articulation = body_to_articulation[body]
             if joint < 0 or articulation < 0:
@@ -5762,7 +5759,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 overlap_end = min(joint_dof_end, response_end)
                 if overlap_start < overlap_end:
                     body_has_response_dofs[body] = 1
-                    body_coupling_group[body] = joint_child[ancestor_joint]
                     for global_dof in range(overlap_start, overlap_end):
                         response_dofs.append(global_dof)
                         local_dof = global_dof - response_start
@@ -5779,7 +5775,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._body_response_dof_mask = wp.array(body_response_dof_mask, dtype=wp.uint32, device=device)
         self._body_single_response_dof = wp.array(body_single_response_dof, dtype=wp.int32, device=device)
         self._body_single_response_dof_host = body_single_response_dof
-        self._body_coupling_group_host = body_coupling_group
 
     def _init_deterministic_rows(self, model):
         """Build the per-world element lists that order row reservations in deterministic mode."""
@@ -6834,14 +6829,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_row_restitution = None
             self._propagation_restitution_target = None
             self._propagation_body_response = None
+            self._propagation_body_response_split = None
             self._propagation_body_qd = None
             self._propagation_body_impulses = None
             self._propagation_body_com_rel = None
             self._propagation_body_seen = None
             self._propagation_body_local_slot = None
-            self._propagation_body_coupling_group = None
             self._propagation_body_split_seen = None
-            self._propagation_coupling_group_body_count = None
+            self._propagation_joint_split = None
             self._propagation_joint_S_flat = None
             self._propagation_tree_Ia = None
             self._propagation_tree_U = None
@@ -6966,6 +6961,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_response = wp.zeros(
             (body_count, 6, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        self._propagation_body_response_split = wp.zeros(
+            (body_count, 6, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
         self._propagation_body_qd = wp.zeros(
             (body_count, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -6975,12 +6973,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_com_rel = wp.zeros((body_count, 3), dtype=wp.float32, device=device)
         self._propagation_body_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
         self._propagation_body_local_slot = wp.zeros((body_count,), dtype=wp.int32, device=device)
-        coupling_group = self._body_coupling_group_host
-        if coupling_group is None:
-            coupling_group = np.arange(body_count, dtype=np.int32)
-        self._propagation_body_coupling_group = wp.array(coupling_group, dtype=wp.int32, device=device)
         self._propagation_body_split_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
-        self._propagation_coupling_group_body_count = wp.zeros((body_count,), dtype=wp.int32, device=device)
+        self._propagation_joint_split = wp.zeros((max(model.joint_count, 1),), dtype=wp.int32, device=device)
+        art_start = model.articulation_start.numpy()
+        self._propagation_split_max_depth = int(np.diff(art_start).max()) if art_start.size > 1 else 1
 
         # ── Cached-response buffers (propagation_cached_response) ───────────
         # R: per (world, active-body slot) full joint-space response matrix
@@ -8437,6 +8433,25 @@ class SolverSteel(SolverBase, CouplingInterface):
                     outputs=[self._propagation_joint_S_flat],
                     device=self.model.device,
                 )
+        with self._sync_timed("prop_setup_joint_split"):
+            # The rows are built, so the split response can weight each joint by the row-bearing bodies it carries.
+            self._propagation_body_split_seen.zero_()
+            self._propagation_joint_split.zero_()
+            wp.launch(
+                count_propagation_joint_split,
+                dim=self._world_count * self._propagation_max_constraints,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_max_constraints,
+                    self._body_to_joint,
+                    self.model.joint_parent,
+                    self._propagation_split_max_depth,
+                ],
+                outputs=[self._propagation_body_split_seen, self._propagation_joint_split],
+                device=self.model.device,
+            )
 
         for size in self._size_groups:
             n_arts = self._n_arts_by_size[size]
@@ -8522,11 +8537,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_body_com_rel,
                             self._propagation_tree_U,
                             self._propagation_tree_D_inv,
+                            self._propagation_joint_split,
                         ],
                         outputs=[
                             self._propagation_tree_Ia,
                             self._propagation_tree_body_delta,
                             self._propagation_body_response,
+                            self._propagation_body_response_split,
                         ],
                         block_dim=32,
                         device=self.model.device,
@@ -8553,6 +8570,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_body_com_rel,
                             self._propagation_tree_U,
                             self._propagation_tree_D_inv,
+                            self._propagation_joint_split,
                         ],
                         outputs=[
                             self._propagation_tree_pA,
@@ -8560,6 +8578,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_tree_qdd,
                             self._propagation_tree_body_delta,
                             self._propagation_body_response,
+                            self._propagation_body_response_split,
                         ],
                         device=self.model.device,
                     )
@@ -8618,7 +8637,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._body_to_articulation,
                         self._mf_body_Hinv,
                     ],
-                    outputs=[self._propagation_body_response],
+                    outputs=[self._propagation_body_response, self._propagation_body_response_split],
                     device=self.model.device,
                 )
         with self._sync_timed("prop_setup_refresh_free_qd"):
@@ -8630,21 +8649,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         # rewrites all active rows each step, so stale entries past the count
         # are never read.
         with self._sync_timed("prop_setup_effective_mass_rhs"):
-            self._propagation_body_split_seen.zero_()
-            self._propagation_coupling_group_body_count.zero_()
-            wp.launch(
-                count_propagation_coupled_bodies,
-                dim=self._world_count * self._propagation_max_constraints,
-                inputs=[
-                    self._propagation_constraint_count,
-                    self._propagation_body_a,
-                    self._propagation_body_b,
-                    self._propagation_max_constraints,
-                    self._propagation_body_coupling_group,
-                ],
-                outputs=[self._propagation_body_split_seen, self._propagation_coupling_group_body_count],
-                device=self.model.device,
-            )
             wp.launch(
                 compute_propagation_effective_mass_and_rhs,
                 dim=self._world_count * self._propagation_max_constraints,
@@ -8655,8 +8659,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_J_a,
                     self._propagation_J_b,
                     self._propagation_body_response,
-                    self._propagation_body_coupling_group,
-                    self._propagation_coupling_group_body_count,
+                    self._propagation_body_response_split,
                     self._propagation_phi,
                     self._propagation_row_type,
                     self._propagation_row_restitution,
@@ -21457,7 +21460,9 @@ def _get_propagation_tree_body_response_revolute_kernel(
 
     Writes the per-link 6x6 COM response for EVERY link of the articulation
     (overwriting ``propagation_tree_Ia`` in joint order so each link can reuse
-    its parent's already-computed response).
+    its parent's already-computed response), and the split response that weights
+    each joint's term by ``propagation_joint_split`` (each link reuses its parent's
+    split response the same way).
 
     ``has_free_root`` compiles a special case for articulations whose FIRST
     joint is a multi-DOF world-rooted joint (dof_count <= 6): the root link's
@@ -21537,97 +21542,45 @@ def _get_propagation_tree_body_response_revolute_kernel(
                 p5 -= propagation_tree_U.data[gdof * 6 + 5] * scale;
             }
 
-            float parent_delta0 = 0.0f;
-            float parent_delta1 = 0.0f;
-            float parent_delta2 = 0.0f;
-            float parent_delta3 = 0.0f;
-            float parent_delta4 = 0.0f;
-            float parent_delta5 = 0.0f;
+            const float pp[6] = {p0, p1, p2, p3 + ey * p2 - ez * p1, p4 + ez * p0 - ex * p2, p5 + ex * p1 - ey * p0};
+            float parent_delta[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float parent_split[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             if (parent >= 0) {
-                const float pp0 = p0;
-                const float pp1 = p1;
-                const float pp2 = p2;
-                const float pp3 = p3 + ey * p2 - ez * p1;
-                const float pp4 = p4 + ez * p0 - ex * p2;
-                const float pp5 = p5 + ex * p1 - ey * p0;
-
-                parent_delta0 = propagation_tree_Ia.data[parent * 36 + 0 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 0 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 0 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 0 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 0 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 0 * 6 + 5] * pp5;
-                parent_delta1 = propagation_tree_Ia.data[parent * 36 + 1 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 1 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 1 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 1 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 1 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 1 * 6 + 5] * pp5;
-                parent_delta2 = propagation_tree_Ia.data[parent * 36 + 2 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 2 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 2 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 2 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 2 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 2 * 6 + 5] * pp5;
-                parent_delta3 = propagation_tree_Ia.data[parent * 36 + 3 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 3 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 3 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 3 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 3 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 3 * 6 + 5] * pp5;
-                parent_delta4 = propagation_tree_Ia.data[parent * 36 + 4 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 4 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 4 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 4 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 4 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 4 * 6 + 5] * pp5;
-                parent_delta5 = propagation_tree_Ia.data[parent * 36 + 5 * 6 + 0] * pp0
-                    + propagation_tree_Ia.data[parent * 36 + 5 * 6 + 1] * pp1
-                    + propagation_tree_Ia.data[parent * 36 + 5 * 6 + 2] * pp2
-                    + propagation_tree_Ia.data[parent * 36 + 5 * 6 + 3] * pp3
-                    + propagation_tree_Ia.data[parent * 36 + 5 * 6 + 4] * pp4
-                    + propagation_tree_Ia.data[parent * 36 + 5 * 6 + 5] * pp5;
-
-                const float wx = parent_delta3;
-                const float wy = parent_delta4;
-                const float wz = parent_delta5;
-                parent_delta0 += wy * ez - wz * ey;
-                parent_delta1 += wz * ex - wx * ez;
-                parent_delta2 += wx * ey - wy * ex;
+                for (int r = 0; r < 6; ++r) {
+                    float exact = 0.0f;
+                    float split = 0.0f;
+                    for (int c = 0; c < 6; ++c) {
+                        exact += propagation_tree_Ia.data[parent * 36 + r * 6 + c] * pp[c];
+                        split += propagation_body_response_split.data[parent * 36 + r * 6 + c] * pp[c];
+                    }
+                    parent_delta[r] = exact;
+                    parent_split[r] = split;
+                }
+                parent_delta[0] += parent_delta[4] * ez - parent_delta[5] * ey;
+                parent_delta[1] += parent_delta[5] * ex - parent_delta[3] * ez;
+                parent_delta[2] += parent_delta[3] * ey - parent_delta[4] * ex;
+                parent_split[0] += parent_split[4] * ez - parent_split[5] * ey;
+                parent_split[1] += parent_split[5] * ex - parent_split[3] * ez;
+                parent_split[2] += parent_split[3] * ey - parent_split[4] * ex;
             }
 
-            float parent_dot = 0.0f;
-            float qdd = 0.0f;
+            float value = parent_delta[row];
+            float split_value = parent_split[row];
             if (has_dof) {
-                parent_dot = propagation_tree_U.data[gdof * 6 + 0] * parent_delta0
-                    + propagation_tree_U.data[gdof * 6 + 1] * parent_delta1
-                    + propagation_tree_U.data[gdof * 6 + 2] * parent_delta2
-                    + propagation_tree_U.data[gdof * 6 + 3] * parent_delta3
-                    + propagation_tree_U.data[gdof * 6 + 4] * parent_delta4
-                    + propagation_tree_U.data[gdof * 6 + 5] * parent_delta5;
-                qdd = inv_d * (s_dot_f - parent_dot);
-            }
-
-            float value = 0.0f;
-            if (row == 0) {
-                value = parent_delta0;
-            } else if (row == 1) {
-                value = parent_delta1;
-            } else if (row == 2) {
-                value = parent_delta2;
-            } else if (row == 3) {
-                value = parent_delta3;
-            } else if (row == 4) {
-                value = parent_delta4;
-            } else {
-                value = parent_delta5;
-            }
-            if (has_dof) {
-                value += propagation_joint_S_flat.data[gdof * 6 + row] * qdd;
+                float parent_dot = 0.0f;
+                float split_dot = 0.0f;
+                for (int r = 0; r < 6; ++r) {
+                    parent_dot += propagation_tree_U.data[gdof * 6 + r] * parent_delta[r];
+                    split_dot += propagation_tree_U.data[gdof * 6 + r] * parent_split[r];
+                }
+                const float weight = (float)max(propagation_joint_split.data[joint], 1);
+                value += propagation_joint_S_flat.data[gdof * 6 + row] * (inv_d * (s_dot_f - parent_dot));
+                split_value += propagation_joint_S_flat.data[gdof * 6 + row] * (inv_d * (weight * s_dot_f - split_dot));
             }
 
             propagation_tree_Ia.data[child * 36 + elem] = value;
             propagation_body_response.data[child * 36 + elem] = value;
+            propagation_body_response_split.data[child * 36 + elem] = split_value;
         }
         __syncwarp(mask);
     }
@@ -21641,6 +21594,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
             const int root_dof_start = joint_qd_start.data[joint];
             const int root_dc = joint_qd_start.data[joint + 1] - root_dof_start;
             const int root_child = joint_child.data[joint];
+            const float root_weight = (float)max(propagation_joint_split.data[joint], 1);
             for (int elem = lane; elem < 36; elem += 32) {
                 const int row = elem / 6;
                 const int col = elem - row * 6;
@@ -21655,6 +21609,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
                 }
                 propagation_tree_Ia.data[root_child * 36 + elem] = value;
                 propagation_body_response.data[root_child * 36 + elem] = value;
+                propagation_body_response_split.data[root_child * 36 + elem] = root_weight * value;
             }
             __syncwarp(mask);
             continue;
@@ -21676,9 +21631,11 @@ def _get_propagation_tree_body_response_revolute_kernel(
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
         propagation_tree_D_inv: wp.array3d[float],
+        propagation_joint_split: wp.array[int],
         propagation_tree_Ia: wp.array3d[float],
         propagation_tree_body_delta: wp.array2d[float],
         propagation_body_response: wp.array3d[float],
+        propagation_body_response_split: wp.array3d[float],
     ): ...
 
     def propagation_tree_body_response_revolute_template(  # pragma: no cover - compiled by wp.kernel
@@ -21691,9 +21648,11 @@ def _get_propagation_tree_body_response_revolute_kernel(
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
         propagation_tree_D_inv: wp.array3d[float],
+        propagation_joint_split: wp.array[int],
         propagation_tree_Ia: wp.array3d[float],
         propagation_tree_body_delta: wp.array2d[float],
         propagation_body_response: wp.array3d[float],
+        propagation_body_response_split: wp.array3d[float],
     ):
         group_idx, _lane = wp.tid()
         propagation_tree_body_response_revolute_native(
@@ -21707,9 +21666,11 @@ def _get_propagation_tree_body_response_revolute_kernel(
             propagation_body_com_rel,
             propagation_tree_U,
             propagation_tree_D_inv,
+            propagation_joint_split,
             propagation_tree_Ia,
             propagation_tree_body_delta,
             propagation_body_response,
+            propagation_body_response_split,
         )
 
     name = f"propagation_tree_body_response_revolute_{size}"

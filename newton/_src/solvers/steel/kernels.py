@@ -9095,13 +9095,15 @@ def copy_free_rigid_propagation_body_response(
     mf_body_Hinv: wp.array[wp.spatial_matrix],
     # outputs
     propagation_body_response: wp.array3d[float],
+    propagation_body_response_split: wp.array3d[float],
 ):
     """Seed propagation's 6D body response for free rigid bodies.
 
     Propagation rows use ``propagation_body_response`` for both contact sides.
     Non-free articulated links are filled by the tree-response setup. Free rigid
     bodies do not run that tree solve, so copy the same inverse spatial inertia
-    used by the existing free/free MF path.
+    used by the existing free/free MF path. A free rigid body shares no joint, so
+    its split response is the same matrix.
     """
     body = wp.tid()
     art = body_to_articulation[body]
@@ -9114,6 +9116,7 @@ def copy_free_rigid_propagation_body_response(
     for r in range(6):
         for c in range(6):
             propagation_body_response[body, r, c] = Hinv[r, c]
+            propagation_body_response_split[body, r, c] = Hinv[r, c]
 
 
 @wp.kernel
@@ -9353,37 +9356,39 @@ def compute_mf_rhs_bias(
 
 
 @wp.kernel
-def count_propagation_coupled_bodies(
+def count_propagation_joint_split(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
     propagation_max_constraints: int,
-    propagation_body_coupling_group: wp.array[int],
+    body_to_joint: wp.array[int],
+    joint_parent: wp.array[int],
+    max_depth: int,
     # outputs
     propagation_body_split_seen: wp.array[int],
-    propagation_coupling_group_body_count: wp.array[int],
+    propagation_joint_split: wp.array[int],
 ):
-    """Count the distinct row-bearing bodies in each coupling group."""
+    """Count, per joint, the distinct row-bearing bodies whose root path contains it."""
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
     if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
         return
-    ba = propagation_body_a[world, i]
-    if ba >= 0 and wp.atomic_add(propagation_body_split_seen, ba, 1) == 0:
-        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[ba], 1)
-    bb = propagation_body_b[world, i]
-    if bb >= 0 and wp.atomic_add(propagation_body_split_seen, bb, 1) == 0:
-        wp.atomic_add(propagation_coupling_group_body_count, propagation_body_coupling_group[bb], 1)
-
-
-@wp.func
-def propagation_body_split(
-    body: int,
-    propagation_body_coupling_group: wp.array[int],
-    propagation_coupling_group_body_count: wp.array[int],
-) -> float:
-    return float(wp.max(propagation_coupling_group_body_count[propagation_body_coupling_group[body]], 1))
+    for side in range(2):
+        body = propagation_body_a[world, i]
+        if side == 1:
+            body = propagation_body_b[world, i]
+        if body < 0 or wp.atomic_add(propagation_body_split_seen, body, 1) != 0:
+            continue
+        joint = body_to_joint[body]
+        for _depth in range(max_depth):
+            if joint < 0:
+                break
+            wp.atomic_add(propagation_joint_split, joint, 1)
+            parent = joint_parent[joint]
+            joint = -1
+            if parent >= 0:
+                joint = body_to_joint[parent]
 
 
 @wp.kernel
@@ -9394,8 +9399,7 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     propagation_body_response: wp.array3d[float],
-    propagation_body_coupling_group: wp.array[int],
-    propagation_coupling_group_body_count: wp.array[int],
+    propagation_body_response_split: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_restitution: wp.array2d[float],
@@ -9429,27 +9433,27 @@ def compute_propagation_effective_mass_and_rhs(
     d = pgs_cfm
     d_unsplit = pgs_cfm
 
-    # Mass splitting: a sweep sees only each body's own response, so a body shares its coupling
-    # group's mobility with the group's other row-bearing bodies to damp the Jacobi update.
+    # Mass splitting: a sweep sees only each body's own response, so the step uses the split
+    # response, which scales each joint's share of the mobility by the row-bearing bodies sharing it.
     if ba >= 0:
-        split_a = propagation_body_split(ba, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
+            exact = float(0.0)
             value = float(0.0)
             for c in range(6):
-                value += propagation_body_response[ba, r, c] * propagation_J_a[world, i, c]
-            d_unsplit += propagation_J_a[world, i, r] * value
-            value *= split_a
+                exact += propagation_body_response[ba, r, c] * propagation_J_a[world, i, c]
+                value += propagation_body_response_split[ba, r, c] * propagation_J_a[world, i, c]
+            d_unsplit += propagation_J_a[world, i, r] * exact
             propagation_MiJt_a[world, i, r] = value
             d += propagation_J_a[world, i, r] * value
 
     if bb >= 0:
-        split_b = propagation_body_split(bb, propagation_body_coupling_group, propagation_coupling_group_body_count)
         for r in range(6):
+            exact = float(0.0)
             value = float(0.0)
             for c in range(6):
-                value += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
-            d_unsplit += propagation_J_b[world, i, r] * value
-            value *= split_b
+                exact += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
+                value += propagation_body_response_split[bb, r, c] * propagation_J_b[world, i, c]
+            d_unsplit += propagation_J_b[world, i, r] * exact
             propagation_MiJt_b[world, i, r] = value
             d += propagation_J_b[world, i, r] * value
 
@@ -10233,6 +10237,7 @@ def compute_propagation_tree_body_response_for_size(
     propagation_body_com_rel: wp.array2d[float],
     propagation_tree_U: wp.array2d[float],
     propagation_tree_D_inv: wp.array3d[float],
+    propagation_joint_split: wp.array[int],
     # scratch
     propagation_tree_pA: wp.array2d[float],
     propagation_tree_u: wp.array[float],
@@ -10240,8 +10245,12 @@ def compute_propagation_tree_body_response_for_size(
     propagation_tree_body_delta: wp.array2d[float],
     # outputs
     propagation_body_response: wp.array3d[float],
+    propagation_body_response_split: wp.array3d[float],
 ):
-    """Compute exact 6x6 COM response for active propagation bodies by tree solves."""
+    """Compute exact and split 6x6 COM responses for active propagation bodies by tree solves.
+
+    The split response weights each path joint's term by its ``propagation_joint_split`` count.
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
@@ -10375,62 +10384,74 @@ def compute_propagation_tree_body_response_for_size(
                     for r in range(6):
                         propagation_tree_pA[parent, r] = propagation_tree_pA[parent, r] + propagated_parent[r]
 
-            # Forward sweep, root -> target along the path (parents first):
-            # level i visits the (path_len-1-i)-th ancestor of target_body.
-            for level in range(path_len):
-                joint = body_to_joint[target_body]
-                steps = path_len - 1 - level
-                for _s in range(steps):
-                    joint = body_to_joint[joint_parent[joint]]
-                child = joint_child[joint]
-                parent = joint_parent[joint]
-                dof_start = joint_qd_start[joint]
-                dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
-                parent_delta_child = wp.spatial_vector()
-                if parent >= 0:
-                    parent_delta_parent = wp.spatial_vector(
-                        propagation_tree_body_delta[parent, 0],
-                        propagation_tree_body_delta[parent, 1],
-                        propagation_tree_body_delta[parent, 2],
-                        propagation_tree_body_delta[parent, 3],
-                        propagation_tree_body_delta[parent, 4],
-                        propagation_tree_body_delta[parent, 5],
-                    )
-                    child_rel = wp.vec3(
-                        propagation_body_com_rel[child, 0],
-                        propagation_body_com_rel[child, 1],
-                        propagation_body_com_rel[child, 2],
-                    )
-                    parent_rel = wp.vec3(
-                        propagation_body_com_rel[parent, 0],
-                        propagation_body_com_rel[parent, 1],
-                        propagation_body_com_rel[parent, 2],
-                    )
-                    parent_delta_child = translate_twist_between_parallel_frames(
-                        parent_delta_parent, child_rel - parent_rel
-                    )
+            # The forward sweep runs once per response: exact (weight 1), then split.
+            for split_pass in range(2):
+                # Forward sweep, root -> target along the path (parents first):
+                # level i visits the (path_len-1-i)-th ancestor of target_body.
+                for level in range(path_len):
+                    joint = body_to_joint[target_body]
+                    steps = path_len - 1 - level
+                    for _s in range(steps):
+                        joint = body_to_joint[joint_parent[joint]]
+                    weight = float(1.0)
+                    if split_pass == 1:
+                        weight = float(wp.max(propagation_joint_split[joint], 1))
+                    child = joint_child[joint]
+                    parent = joint_parent[joint]
+                    dof_start = joint_qd_start[joint]
+                    dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+                    parent_delta_child = wp.spatial_vector()
+                    if parent >= 0:
+                        parent_delta_parent = wp.spatial_vector(
+                            propagation_tree_body_delta[parent, 0],
+                            propagation_tree_body_delta[parent, 1],
+                            propagation_tree_body_delta[parent, 2],
+                            propagation_tree_body_delta[parent, 3],
+                            propagation_tree_body_delta[parent, 4],
+                            propagation_tree_body_delta[parent, 5],
+                        )
+                        child_rel = wp.vec3(
+                            propagation_body_com_rel[child, 0],
+                            propagation_body_com_rel[child, 1],
+                            propagation_body_com_rel[child, 2],
+                        )
+                        parent_rel = wp.vec3(
+                            propagation_body_com_rel[parent, 0],
+                            propagation_body_com_rel[parent, 1],
+                            propagation_body_com_rel[parent, 2],
+                        )
+                        parent_delta_child = translate_twist_between_parallel_frames(
+                            parent_delta_parent, child_rel - parent_rel
+                        )
 
-                for a in range(dof_count):
-                    gdof_a = dof_start + a
-                    qdd = float(0.0)
-                    for b in range(dof_count):
-                        gdof_b = dof_start + b
-                        parent_term = float(0.0)
-                        if parent >= 0:
-                            for r in range(6):
-                                parent_term += propagation_tree_U[gdof_b, r] * parent_delta_child[r]
-                        qdd += propagation_tree_D_inv[joint, a, b] * (propagation_tree_u[gdof_b] - parent_term)
-                    propagation_tree_qdd[gdof_a] = qdd
+                    for a in range(dof_count):
+                        gdof_a = dof_start + a
+                        qdd = float(0.0)
+                        for b in range(dof_count):
+                            gdof_b = dof_start + b
+                            parent_term = float(0.0)
+                            if parent >= 0:
+                                for r in range(6):
+                                    parent_term += propagation_tree_U[gdof_b, r] * parent_delta_child[r]
+                            qdd += propagation_tree_D_inv[joint, a, b] * (
+                                weight * propagation_tree_u[gdof_b] - parent_term
+                            )
+                        propagation_tree_qdd[gdof_a] = qdd
+
+                    for r in range(6):
+                        value = parent_delta_child[r]
+                        for a in range(dof_count):
+                            gdof = dof_start + a
+                            value += propagation_joint_S_flat[gdof, r] * propagation_tree_qdd[gdof]
+                        propagation_tree_body_delta[child, r] = value
 
                 for r in range(6):
-                    value = parent_delta_child[r]
-                    for a in range(dof_count):
-                        gdof = dof_start + a
-                        value += propagation_joint_S_flat[gdof, r] * propagation_tree_qdd[gdof]
-                    propagation_tree_body_delta[child, r] = value
-
-            for r in range(6):
-                propagation_body_response[target_body, r, basis] = propagation_tree_body_delta[target_body, r]
+                    if split_pass == 0:
+                        propagation_body_response[target_body, r, basis] = propagation_tree_body_delta[target_body, r]
+                    else:
+                        propagation_body_response_split[target_body, r, basis] = propagation_tree_body_delta[
+                            target_body, r
+                        ]
 
 
 @wp.kernel
