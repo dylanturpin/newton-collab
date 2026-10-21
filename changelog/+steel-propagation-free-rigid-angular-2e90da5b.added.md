@@ -1,1 +1,1 @@
-Add experimental free-rigid rolling and spin friction rows (`free_rigid_rolling_friction`, `free_rigid_torsional_friction`, `steel:condim`) to `SolverSteel` with `articulated_contact_response="propagation"`, including their torque in published parent wrenches; `"propagation_fused"` still rejects them.
+Add experimental free-rigid rolling and spin friction rows (`free_rigid_rolling_friction`, `free_rigid_torsional_friction`, `steel:condim`) to `SolverSteel` with `articulated_contact_response="propagation"`, including their torque in published parent wrenches.
