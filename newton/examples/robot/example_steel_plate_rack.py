@@ -26,7 +26,10 @@ class Example(TabletopDemo):
         body = self.info["tracked_body"]
         pose = self.state_0.body_q.numpy()[body]
         assert self.peak_height > 0.25, f"Plate was not lifted: {self.peak_height}"
-        assert abs(pose[0] - self.info["plate_slot_x"]) < 0.04, f"Wrong rack slot: {pose}"
+        center = wp.transform_point(wp.transform(*pose), wp.vec3(*self.info["plate_center_local"]))
+        assert abs(center[0] - self.info["plate_slot_x"]) < self.info["plate_slot_half_width"], (
+            f"Plate missed rack slot: center={center}, slot={self.info['plate_slot_x']}"
+        )
         assert abs(pose[1] - self.info["rack_origin"][1]) < 0.04, f"Plate missed rack: {pose}"
         assert 0.07 < pose[2] < 0.16, f"Plate is unsupported: {pose}"
         normal = np.asarray(wp.quat_rotate(wp.quat(*pose[3:]), wp.vec3(0, 0, 1)))

@@ -49,16 +49,23 @@ def import_object(b, name, pose, *, free_root=False, finish_color=None):
     return {label.rsplit("/", 1)[-1]: body_start + i for i, label in enumerate(asset.body_label)}
 
 
-def collision_bounds(b, name, orientation):
-    """Bound a single-body asset's collision geometry after rotating it by ``orientation``."""
-    asset = _scene_asset(b, name, True)
-    rotation = wp.transform(wp.vec3(), orientation)
+@cache
+def _collision_vertices(asset):
     points = []
     for shape, source in enumerate(asset.shape_source):
         if not asset.shape_flags[shape] & newton.ShapeFlags.COLLIDE_SHAPES:
             continue
-        local = rotation * asset.shape_transform[shape]
-        for vertex in np.asarray(source.vertices) * np.asarray(asset.shape_scale[shape]):
-            points.append(np.asarray(wp.transform_point(local, wp.vec3(*vertex))))
-    points = np.asarray(points)
+        local = asset.shape_transform[shape]
+        vertices = np.asarray(source.vertices) * np.asarray(asset.shape_scale[shape])
+        rotation = np.asarray(wp.quat_to_matrix(wp.transform_get_rotation(local))).reshape(3, 3)
+        translation = np.asarray(wp.transform_get_translation(local))
+        points.append(vertices @ rotation.T + translation)
+    return np.concatenate(points)
+
+
+def collision_bounds(b, name, orientation):
+    """Bound a single-body asset's collision geometry after rotating it by ``orientation``."""
+    asset = _scene_asset(b, name, True)
+    rotation = np.asarray(wp.quat_to_matrix(orientation)).reshape(3, 3)
+    points = _collision_vertices(asset) @ rotation.T
     return points.min(axis=0), points.max(axis=0)

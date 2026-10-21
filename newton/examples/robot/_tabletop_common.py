@@ -31,10 +31,10 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
     for i, a in enumerate(robot_shapes):
         for c in robot_shapes[i + 1 :]:
             b.add_shape_collision_filter_pair(a, c)
+    rotation = wp.quat(1.0, 0.0, 0.0, 0.0) if desired_rotation is None else desired_rotation
     model = b.finalize(device=device)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    rotation = wp.quat(1.0, 0.0, 0.0, 0.0) if desired_rotation is None else desired_rotation
     if waypoint_dt is not None:
         dense = [poses[0]]
         for a, c in pairwise(poses):
@@ -79,10 +79,23 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
     fallback = None
     local_fallback = None
     candidate_solver = None
+    candidates = None
     candidate_positions = None
     candidate_rotations = None
     seed_rng = np.random.default_rng(147)
     driven = getattr(b, "_tabletop_driven_dofs", 9 if any(pose[2] is not None for pose in poses) else 6)
+    solve_graphs = {}
+
+    def solve(solver, coordinates, iterations):
+        if not model.device.is_cuda:
+            solver.step(coordinates, coordinates, iterations=iterations)
+            return
+        key = (solver, coordinates.ptr, iterations)
+        if key not in solve_graphs:
+            with wp.ScopedCapture(device=model.device) as capture:
+                solver.step(coordinates, coordinates, iterations=iterations)
+            solve_graphs[key] = capture.graph
+        wp.capture_launch(solve_graphs[key])
 
     def path_jump(values, previous, t):
         if not result:
@@ -107,7 +120,7 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
             rot.set_target_rotation(0, wp.vec4(*target_rotation))
             pos.set_target_position(0, wp.vec3(*xyz))
             previous = q.numpy()[0].copy()
-            solver.step(q, q, iterations=96)
+            solve(solver, q, 96)
             target = q.numpy()[0].copy()
             newton.eval_fk(model, q.flatten(), model.joint_qd, state)
             actual = wp.transform(*state.body_q.numpy()[ee])
@@ -143,7 +156,7 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
                             jacobian_mode=ik.IKJacobianType.ANALYTIC,
                         )
                     recovery = fallback
-                recovery.step(q, q, iterations=192)
+                solve(recovery, q, 192)
                 target = q.numpy()[0].copy()
                 newton.eval_fk(model, q.flatten(), model.joint_qd, state)
                 actual = wp.transform(*state.body_q.numpy()[ee])
@@ -174,8 +187,10 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
                         previous + seed_rng.normal(0, 0.2, size=(16, len(previous))), lower.numpy(), upper.numpy()
                     )
                     seeds[0] = previous
-                    candidates = wp.array(seeds, device=device)
-                    candidate_solver.step(candidates, candidates, iterations=192)
+                    if candidates is None:
+                        candidates = wp.empty(seeds.shape, dtype=float, device=device)
+                    candidates.assign(seeds)
+                    solve(candidate_solver, candidates, 192)
                     feasible = []
                     for candidate in candidates.numpy():
                         for joint, joint_type in enumerate(b.joint_type):
@@ -225,3 +240,20 @@ def plan_ik(b, ee, offset, poses, device, desired_rotation=None, waypoint_dt=Non
         if speed > 6.0:
             raise ValueError(f"Discontinuous IK path at {ta:.2f}-{tb:.2f}s: {speed:.2f} rad/s")
     return [(t, q[:driven]) for t, q in result]
+
+
+def rotate_vectors(quaternions, vectors):
+    """Rotate vectors by unit XYZW quaternions, allowing NumPy broadcasting."""
+    xyz = np.asarray(quaternions)[..., :3]
+    vectors = np.asarray(vectors)
+    cross = 2 * np.cross(xyz, vectors)
+    return vectors + np.asarray(quaternions)[..., 3:] * cross + np.cross(xyz, cross)
+
+
+def relative_angles(quaternions, axis):
+    """Unwrap rotation about a local axis relative to the first quaternion."""
+    q = np.asarray(quaternions)
+    a, w = -q[0, :3], q[0, 3]
+    xyz = w * q[:, :3] + q[:, 3:] * a + np.cross(a, q[:, :3])
+    real = w * q[:, 3] - q[:, :3] @ a
+    return np.unwrap(2 * np.arctan2(xyz[:, axis], real))

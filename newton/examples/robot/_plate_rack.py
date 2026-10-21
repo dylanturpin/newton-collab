@@ -86,6 +86,8 @@ def populate(b, info, ee, fingers, device, variant):
         plate_rack=True,
         rack_origin=rack_origin.tolist(),
         plate_slot_x=float(roots[3][0] + thickness_center),
+        plate_center_local=[0, 0, thickness_center],
+        plate_slot_half_width=pitch / 2 - 0.003,
         plate_resting_bodies=resting,
         plate_goal_rotation=list(plate_rotation),
         plate_grasp_local=[0, 0.10, 0.0095],
