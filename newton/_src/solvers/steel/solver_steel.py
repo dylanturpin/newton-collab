@@ -2012,15 +2012,20 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``contact_torsion_device`` selects the experimental device-resident torsion preparation.
                 False retains the host reference implementation. True preserves the
                 grouping and friction law while using preallocated GPU buffers.
-                It supports CUDA graph capture of :meth:`step`. Invalid torsion input
-                (for example rows beyond the capacity or hydroelastic contacts) makes
-                an eager step raise before it applies torsion rows. In a captured step the
-                error is deferred: the failing step restores its output motion arrays
-                (``joint_q``, ``joint_qd``, ``body_q``, ``body_qd``, ``body_qdd``) to the input
-                values, while other outputs, observables and solver history still advance,
+                It supports CUDA graph capture of :meth:`step`. Torsion rows count against
+                ``articulation_constraint_max`` after the world's dense contact and joint rows.
+                In both preparations a world whose torsion groups do not all fit keeps the
+                rows that fit, and a world that dropped dense rows gets no torsion rows; both
+                set the world's ``constraint_overflow`` entry and warn as a row overflow does,
+                and other worlds step unaffected. Invalid torsion input (contact-buffer
+                overflow, hydroelastic contacts, or a friction-patch load ring that does not
+                match its group) makes an eager step raise before it applies torsion rows. In a
+                captured step that error is deferred: the failing step restores its output motion
+                arrays (``joint_q``, ``joint_qd``, ``body_q``, ``body_qd``, ``body_qdd``) to the
+                input values, while other outputs, observables and solver history still advance,
                 and :meth:`check_constraint_capacity` raises after the replays.
                 Check before using replay results, discard failed output, fix the cause and
-                :meth:`reset`. The error is solver-wide: any reset clears it, and a cause
+                :meth:`reset`. The input error is solver-wide: any reset clears it, and a cause
                 that persists latches it again on the next step. No effect when the torsion radius is
                 zero. The host reference cannot be captured.
                 Grouping currently runs serially within each world with worst-case
@@ -2335,10 +2340,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact impulses carried from the previous frame. This option is appended to
                 the constructor to preserve its established positional layout. Defaults to 1.0.
             warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense,
-                matrix-free, or propagation row family exceeds its configured per-world capacity. The warning
-                reports the world, requested rows, row limit, and dropped contact/friction rows without a host
-                synchronization, so it remains compatible with CUDA graph capture. With ``deterministic=True``
-                it adds which contacts deterministic mode drops. Defaults to True.
+                matrix-free, or propagation row family, or the contact torsion rows, exceeds its configured
+                per-world capacity. The warning reports the world, requested rows, row limit, and dropped rows
+                without a host synchronization, so it remains compatible with CUDA graph capture. With
+                ``deterministic=True`` it adds which contacts deterministic mode drops. Defaults to True.
             solve_mode (str, optional): PGS mode. "split" solves articulated contact rows through the dense
                 Delassus system and free rigid body contacts through a matrix-free PGS path; it is the
                 only mode available on CPU. "matrix_free" is CUDA-only; CPU construction raises
@@ -3934,7 +3939,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         the carried friction anchors, and overflow status, is cleared. Mass
         factors for selected worlds refresh on the next step after a teleport;
         other worlds retain their normal refresh cadence. Any reset, whatever its mask, also clears the
-        solver-wide contact torsion error; it clears the disabled-tree-joint status of the selected worlds. A full reset (``world_mask=None``)
+        solver-wide contact torsion input error; it clears the disabled-tree-joint status of the selected worlds. A full reset (``world_mask=None``)
         also restarts the host-side step cadence for subsequent :meth:`step` calls. CUDA graphs
         captured before the reset keep their captured cadence and buffer schedule.
 
@@ -3961,7 +3966,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._compliance is not None:
             self._compliance.counts.zero_()
         if self._device_torsion is not None:
-            # The torsion status is solver-wide; a cause that persists latches again on the next step.
+            # The torsion input status is solver-wide; a cause that persists latches again on the next step.
             self._device_torsion.clear_status()
         world_mask = self._solver_world_mask(world_mask)
         if self._sleeping is not None:
@@ -10411,7 +10416,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         passes after the reset does not validate the earlier output. With
         ``contact_torsion_device``, also raises if contact torsion rejected its input since
         the last :meth:`reset`; a failing captured step restored its output motion arrays to the
-        input, while a failing eager step raised from :meth:`step`.
+        input, while a failing eager step raised from :meth:`step`. Torsion rows dropped for
+        capacity are reported as a capacity loss of their worlds.
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident :attr:`constraint_overflow` boolean array is always
