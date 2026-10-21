@@ -363,11 +363,14 @@ class TestContactTorsion(unittest.TestCase):
             np.testing.assert_allclose(velocity, velocities[0], atol=2e-5)
         baseline, *_ = fixture(0.0, center_only=True)
         for device_preparation in (False, True):
-            with self.subTest(device_preparation=device_preparation), warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
+            with self.subTest(device_preparation=device_preparation):
                 limit = int(baseline["count"][0])
                 result, solver, *_ = fixture(
-                    0.01, center_only=True, row_limit=limit, contact_torsion_device=device_preparation
+                    0.01,
+                    center_only=True,
+                    row_limit=limit,
+                    contact_torsion_device=device_preparation,
+                    warn_constraint_overflow=False,
                 )
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True])
                 self.assertEqual(int(result["count"][0]), limit)
@@ -1694,7 +1697,7 @@ def _pad_worlds(pairs_per_world):
     return model, state
 
 
-def _pad_rollout(pairs_per_world, capacity, *, preparation="device", steps=3, reset_mask=None):
+def _pad_rollout(pairs_per_world, capacity, *, preparation="device", steps=3, reset_mask=None, warn=False):
     """Step the pad worlds deterministically and return per-world joint_qd, the overflow flags and the solver."""
     model, a = _pad_worlds(pairs_per_world)
     solver = SolverSteel(
@@ -1709,6 +1712,7 @@ def _pad_rollout(pairs_per_world, capacity, *, preparation="device", steps=3, re
         free_body_constraint_max=16,
         deterministic=True,
         contact_torsion_device=preparation != "host",
+        warn_constraint_overflow=warn,
     )
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=256, deterministic=True)
     contacts = pipeline.contacts()
@@ -1754,8 +1758,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
     def test_overflowing_world_is_flagged_and_others_are_unchanged(self):
         capacity = self.capacity()
         for preparation in ("host", "device", "graph"):
-            with self.subTest(preparation=preparation), warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
+            with self.subTest(preparation=preparation):
                 reference, reference_overflow, _ = _pad_rollout([1, 1, 1], capacity, preparation=preparation)
                 actual, overflow, solver = _pad_rollout([1, 1, 2], capacity, preparation=preparation)
                 np.testing.assert_array_equal(reference_overflow, [False, False, False])
@@ -1783,7 +1786,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
         capture = StdOutCapture()
         capture.begin()
         try:
-            _pad_rollout([1, 1, 2], capacity)
+            _pad_rollout([1, 1, 2], capacity, warn=True)
         finally:
             wp.synchronize()
             output = capture.end()
@@ -1794,7 +1797,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
         capacity = self.capacity()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            _pad_rollout([1, 1, 2], capacity, preparation="host", steps=1)
+            _pad_rollout([1, 1, 2], capacity, preparation="host", steps=1, warn=True)
         self.assertTrue(any("torsion row overflow" in str(w.message) for w in caught))
 
 
