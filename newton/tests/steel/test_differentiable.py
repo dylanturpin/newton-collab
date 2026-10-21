@@ -69,10 +69,30 @@ def _build_floating_chain(device, requires_grad=True):
     return builder.finalize(device=device, requires_grad=requires_grad)
 
 
-def _build_free_body(device, requires_grad=True):
+def _build_free_body(device, requires_grad=True, anchor=None):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     body = builder.add_link(mass=2.0, inertia=wp.mat33(np.diag([0.08, 0.12, 0.16])))
-    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    parent_xform = None if anchor is None else wp.transform(wp.vec3(0.1, -0.2, 0.3), anchor)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body, parent_xform=parent_xform)])
+    return builder.finalize(device=device, requires_grad=requires_grad)
+
+
+def _build_ball_chain(device, requires_grad=True):
+    """A damped ball joint carrying a hinged link: exercises the ball joint's passive damping."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    upper = builder.add_link(mass=1.2, inertia=wp.mat33(np.diag([0.03, 0.02, 0.025])), com=wp.vec3(0.0, 0.0, -0.25))
+    lower = builder.add_link(mass=0.6, inertia=wp.mat33(np.diag([0.01, 0.015, 0.012])), com=wp.vec3(0.2, 0.0, 0.0))
+    joints = [
+        builder.add_joint_ball(-1, upper, armature=0.01, damping=0.4),
+        builder.add_joint_revolute(
+            upper,
+            lower,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.5), wp.quat_identity()),
+            axis=(0.0, 1.0, 0.0),
+            armature=0.01,
+        ),
+    ]
+    builder.add_articulation(joints)
     return builder.finalize(device=device, requires_grad=requires_grad)
 
 
@@ -80,6 +100,11 @@ _MODELS = {
     "chain_drives": lambda device, requires_grad=True: _build_chain(device, drives=True, requires_grad=requires_grad),
     "floating_chain": _build_floating_chain,
     "free_body": _build_free_body,
+    # A rotated FREE anchor: the gyroscopic update runs in the anchor frame of the joint velocity.
+    "free_body_anchor": lambda device, requires_grad=True: _build_free_body(
+        device, requires_grad, wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 0.5)), 0.7)
+    ),
+    "ball_chain": _build_ball_chain,
 }
 
 
@@ -252,6 +277,8 @@ def test_gradient_matches_finite_difference(test, device):
             if key == "joint_q":
                 for joint in np.flatnonzero(joint_type == newton.JointType.FREE):
                     direction[q_start[joint] + 3 : q_start[joint] + 7] = 0.0
+                for joint in np.flatnonzero(joint_type == newton.JointType.BALL):
+                    direction[q_start[joint] : q_start[joint] + 4] = 0.0
             direction /= np.linalg.norm(direction)
             plus = dict(inputs, **{key: inputs[key] + eps * direction})
             minus = dict(inputs, **{key: inputs[key] - eps * direction})
