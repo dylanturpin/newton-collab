@@ -178,7 +178,6 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         not model.device.is_cuda
         or model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._contact_compliance
@@ -187,8 +186,7 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
     ):
         raise ValueError(
             "Free-rigid angular friction (steel:condim above 3) requires CUDA non-differentiable matrix_free "
-            "solving with articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
-            "row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
+            "solving with row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
             "and no contact compliance"
         )
 
@@ -278,7 +276,6 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
         not model.device.is_cuda
         or model.requires_grad
         or solver._solve_mode != "matrix_free"
-        or solver._articulated_contact_response not in ("immediate", "propagation", "propagation_colored")
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._friction_anchors_enabled
@@ -289,7 +286,6 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
     ):
         raise ValueError(
             "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/interleaved solving with "
-            "articulated_contact_response 'immediate', 'propagation' or 'propagation_colored', "
             "friction_mode='fixed_normal', point friction (friction_anchor_beta=0), and no warm start, velocity "
             "iterations or contact compliance; on 'immediate' also no contact torsion radius or sleeping"
         )

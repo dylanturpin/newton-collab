@@ -665,7 +665,7 @@ class TestSteelFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_articulated_sliding_direction(self):
         """Preserve sliding direction through dense and every articulated propagation route."""
-        for response in ("immediate", "propagation", "propagation_fused", "propagation_colored"):
+        for response in ("immediate", "propagation", "propagation_colored"):
             with self.subTest(response=response):
                 velocity, direction, _ = _slide("cuda:0", "matrix_free", 0.2, False, np.pi / 4, response)
                 np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
@@ -673,7 +673,7 @@ class TestSteelFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_locked_tangent_preserves_other_friction_direction(self):
         """Retain friction along a slider when its first tangent has zero response."""
-        for response in ("immediate", "propagation", "propagation_fused", "propagation_colored"):
+        for response in ("immediate", "propagation", "propagation_colored"):
             for beta in (0.0, 0.2):
                 with self.subTest(response=response, beta=beta):
                     velocity, direction, watermarks = _slide(
@@ -2071,8 +2071,8 @@ class TestSteelFrictionPatches(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_propagation_variants_preserve_a_warmstarted_patch(self):
-        """Retain a sticking articulated grasp across cached, fused, and colored propagation."""
-        for response in ("propagation", "propagation_fused", "propagation_colored"):
+        """Retain a sticking articulated grasp across cached and colored propagation."""
+        for response in ("propagation", "propagation_colored"):
             with self.subTest(response=response), self.assertWarnsRegex(UserWarning, "Patch friction selects"):
                 drift, solver, state = _run_squeeze(
                     5.0,
@@ -3342,7 +3342,6 @@ class TestSteelRollingFriction(unittest.TestCase):
     def test_unsupported_routes_are_rejected(self):
         rejected = (
             {"solve_mode": "split"},
-            {"articulated_contact_response": "propagation_fused"},
             {"friction_anchor_beta": 0.2},
             {"contact_warmstart": True},
             {"velocity_iterations": 2},
@@ -3718,7 +3717,6 @@ class TestSteelRollingFrictionPropagation(unittest.TestCase):
 
     def test_unsupported_options_are_rejected(self):
         rejected = (
-            {"articulated_contact_response": "propagation_fused"},
             {**_COLORED, "friction_anchor_beta": 0.2},
             {**_COLORED, "contact_warmstart": True},
             {**_COLORED, "velocity_iterations": 2},
@@ -4089,15 +4087,14 @@ class TestColoredFrictionModes(unittest.TestCase):
                     )
                 with self.assertRaisesRegex(ValueError, "contact_compliance requires"):
                     SolverSteel(model, **base, friction_mode=mode, friction_anchor_beta=0.0, contact_compliance=True)
-                for response in ("propagation", "propagation_fused"):
-                    with self.assertRaises(NotImplementedError):
-                        SolverSteel(
-                            model,
-                            solve_mode="matrix_free",
-                            articulated_contact_response=response,
-                            friction_mode=mode,
-                            friction_anchor_beta=0.0,
-                        )
+                with self.assertRaises(NotImplementedError):
+                    SolverSteel(
+                        model,
+                        solve_mode="matrix_free",
+                        articulated_contact_response="propagation",
+                        friction_mode=mode,
+                        friction_anchor_beta=0.0,
+                    )
 
 
 if __name__ == "__main__":

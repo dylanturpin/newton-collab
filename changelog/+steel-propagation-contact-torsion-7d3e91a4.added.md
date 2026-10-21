@@ -1,1 +1,1 @@
-Add experimental contact torsion (`steel:min_torsional_patch_radius` with `contact_torsion_device=True`) to `SolverSteel` with `articulated_contact_response="propagation"`, including its torque in published parent wrenches; `"propagation_fused"` still rejects it.
+Add experimental contact torsion (`steel:min_torsional_patch_radius` with `contact_torsion_device=True`) to `SolverSteel` with `articulated_contact_response="propagation"`, including its torque in published parent wrenches.

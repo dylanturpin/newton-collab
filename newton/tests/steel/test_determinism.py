@@ -492,12 +492,8 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                 np.testing.assert_array_equal(paths[0], paths[1], err_msg="same contacts dropped differently")
 
 
-def test_deterministic_rejects_fused_and_warm_started_colored(test, device):
+def test_deterministic_rejects_warm_started_colored(test, device):
     model = _build_contact_scene(device, worlds=1, boxes=1, ants=1)
-    with test.assertRaisesRegex(ValueError, "deterministic=True requires"):
-        SolverSteel(
-            model, deterministic=True, solve_mode="matrix_free", articulated_contact_response="propagation_fused"
-        )
     with test.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
         SolverSteel(
             model,
@@ -1064,8 +1060,8 @@ for _device in get_test_devices():
     )
     add_function_test(
         TestSteelDeterminism,
-        "test_deterministic_rejects_fused_and_warm_started_colored",
-        test_deterministic_rejects_fused_and_warm_started_colored,
+        "test_deterministic_rejects_warm_started_colored",
+        test_deterministic_rejects_warm_started_colored,
         devices=[_device],
     )
 

@@ -939,7 +939,7 @@ def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="matrix_fr
 def test_homogeneous_propagation_constructs(test, device):
     """Construct every propagation response on worlds with identical DOF counts."""
     model = _build_chain_worlds([3, 3, 3, 3], device)
-    for response in ("propagation", "propagation_fused", "propagation_colored"):
+    for response in ("propagation", "propagation_colored"):
         with test.subTest(response=response):
             solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=response)
             test.assertEqual(solver._articulated_contact_response, response)
@@ -957,33 +957,35 @@ def test_hetero_propagation_matches_isolated_worlds(test, device):
         return _final_joint_q(model, response=response, from_fk=True)
 
     for response in ("propagation", "propagation_colored"):
-        combined = run([1, 3], None, response)
-        single = run([1], None, response)
-        triple = run([3], None, response)
-        # The cached response sizes its reductions by the model's body capacity, so the sums reassociate.
-        np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-4)
+        with test.subTest(response=response):
+            combined = run([1, 3], None, response)
+            single = run([1], None, response)
+            triple = run([3], None, response)
+            # The cached response sizes its reductions by the model's body capacity, so the sums reassociate.
+            np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-4)
+            # One articulation size, with a free box that still makes the world DOF counts differ.
+            combined = run([3, 3], [False, True], response)
+            plain = run([3], [False], response)
+            boxed = run([3], [True], response)
+            np.testing.assert_allclose(combined, np.concatenate([plain, boxed]), rtol=0.0, atol=1.0e-4)
 
-    # The fused response needs one articulation size, but a free box still makes world DOF counts differ.
-    combined = run([3, 3], [False, True], "propagation_fused")
-    plain = run([3], [False], "propagation_fused")
-    boxed = run([3], [True], "propagation_fused")
-    np.testing.assert_allclose(combined, np.concatenate([plain, boxed]), rtol=0.0, atol=1.0e-5)
 
-
-def test_hetero_fused_keeps_the_next_world_velocities(test, device):
-    """Keep a busy 3-DOF world from writing over the next, 9-DOF world in the fused response.
+def test_hetero_propagation_keeps_the_next_world_velocities(test, device):
+    """Keep a busy 3-DOF world from writing over the next, 9-DOF world in the propagation responses.
 
     The first chain lies on the ground and solves many rows; the second hangs clear above a resting box.
     """
 
-    def run(root_height, free_box):
+    def run(root_height, free_box, response):
         model = _build_chain_worlds([3] * len(free_box), device, root_height, free_box)
-        return _final_joint_q(model, response="propagation_fused", from_fk=True)
+        return _final_joint_q(model, response=response, from_fk=True)
 
-    combined = run([0.03, 2.0], [False, True])
-    lying = run([0.03], [False])
-    hanging = run([2.0], [True])
-    np.testing.assert_allclose(combined, np.concatenate([lying, hanging]), rtol=0.0, atol=1.0e-5)
+    for response in ("propagation", "propagation_colored"):
+        with test.subTest(response=response):
+            combined = run([0.03, 2.0], [False, True], response)
+            lying = run([0.03], [False], response)
+            hanging = run([2.0], [True], response)
+            np.testing.assert_allclose(combined, np.concatenate([lying, hanging]), rtol=0.0, atol=1.0e-4)
 
 
 class TestSteelHeteroWorlds(unittest.TestCase):
@@ -1054,8 +1056,8 @@ add_function_test(
 
 add_function_test(
     TestSteelHeteroWorlds,
-    "test_hetero_fused_keeps_the_next_world_velocities",
-    test_hetero_fused_keeps_the_next_world_velocities,
+    "test_hetero_propagation_keeps_the_next_world_velocities",
+    test_hetero_propagation_keeps_the_next_world_velocities,
     devices=devices,
 )
 

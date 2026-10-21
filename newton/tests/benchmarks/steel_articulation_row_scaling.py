@@ -53,7 +53,7 @@ def scalar_hinv_jt():
         yield
 
 
-PROPAGATION_PATHS = ("propagation", "propagation_fused", "propagation_colored")
+PROPAGATION_PATHS = ("propagation", "propagation_colored")
 
 
 @dataclass(frozen=True)
@@ -994,7 +994,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("This report uses real `SolverSteel.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
     lines.append("- `propagation`: fixed-size articulated contact rows plus tree response/propagation.")
-    lines.append("- `propagation_fused`: same response model with the fused propagation kernel where supported.")
+    lines.append("- `propagation_colored`: same response model with graph-colored contact batches.")
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
@@ -1125,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("mf_immediate", *PROPAGATION_PATHS),
         default=None,
-        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation_fused.",
+        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation_colored.",
     )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument(
@@ -1174,7 +1174,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation_fused")
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation_colored")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:
