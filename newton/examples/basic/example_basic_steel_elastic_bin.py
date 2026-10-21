@@ -119,7 +119,7 @@ class Example:
         self.control = self.model.control()
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
-        # Kernel shared memory caps the dense rows per world at 128.
+        # 128 dense rows per world keep the tiled-row PGS kernel within its shared-memory budget.
         self.solver = newton.solvers.SolverSteel(self.model, iterations=16, articulation_constraint_max=128)
 
         self._paddle_index = int(self.model.joint_q_start.numpy()[self.j_paddle])

@@ -928,7 +928,7 @@ class _SteelKinematicsCache:
 _DENSE_META_ROW_TYPE_BITS = 4
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
-# The tiled-row PGS kernel stages M (M + 1) / 2 Delassus floats in 48 KiB of static shared memory.
+# Keeps the default capacity within the tiled-row PGS kernel's static shared-memory budget.
 _ELASTIC_DENSE_ROW_CAPACITY_MAX = 128
 
 
