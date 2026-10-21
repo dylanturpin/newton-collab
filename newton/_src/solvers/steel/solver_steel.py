@@ -1518,10 +1518,11 @@ class SolverSteel(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
-    Loop-closing BALL and REVOLUTE joints (joints outside the articulation tree whose child
+    Loop-closing BALL, REVOLUTE and FIXED joints (joints outside the articulation tree whose child
     belongs to an articulation) are enforced as bilateral rows: three that pin the joint's
     anchors together, plus, for a REVOLUTE closure, two that keep the child's hinge axis
-    aligned with the parent's. A loop closure carries no joint coordinate, so limits and
+    aligned with the parent's, or, for a FIXED (weld) closure, three that hold the two anchor
+    frames' relative rotation at zero. A loop closure carries no joint coordinate, so limits and
     drive gains on a loop REVOLUTE joint are ignored (with a warning). The rows read
     :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_X_p` /
     :attr:`~newton.Model.joint_X_c` and, for REVOLUTE closures,
@@ -3047,7 +3048,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._init_joint_friction_load(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
-                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
+                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, FIXED, or imported weld equalities) are "
                 f"only supported with articulated_contact_response='immediate' "
                 f"(got {self._articulated_contact_response!r})."
             )
@@ -4942,12 +4943,12 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing BALL and REVOLUTE joints are excluded from FK/ID by
+        Loop-closing BALL, REVOLUTE and FIXED joints are excluded from FK/ID by
         :meth:`_SteelModelPlan.build` and enforced here as bilateral rows: three
         pinning the joint's parent/child anchors together, plus, for a REVOLUTE closure,
-        two aligning the child's hinge axis with the parent's. Their stored owner comes
-        from the child body's tree articulation, independent of joint ordering. FIXED
-        (weld) loop joints warn and are ignored for now. All buffers are allocated once
+        two aligning the child's hinge axis with the parent's, or, for a FIXED (weld) closure, three
+        holding the two anchor frames' relative rotation at zero. Their stored owner comes
+        from the child body's tree articulation, independent of joint ordering. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
         :attr:`~newton.Model.joint_enabled`, the translations of its
         :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` and, for a REVOLUTE closure, its
@@ -4994,10 +4995,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                         "joint coordinate, so they are ignored (only the hinge itself is enforced).",
                         stacklevel=2,
                     )
+            elif int(joint_type[j]) == int(JointType.FIXED):
+                rows = 6
             else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect and REVOLUTE closures are enforced); ignored.",
+                    f"{int(joint_type[j])} (only BALL/connect, REVOLUTE and FIXED closures are enforced); ignored.",
                     stacklevel=2,
                 )
                 continue
@@ -5038,7 +5041,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
         self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
-        self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 6), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
