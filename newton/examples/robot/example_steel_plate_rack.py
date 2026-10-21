@@ -29,6 +29,9 @@ class Example(TabletopDemo):
         assert abs(pose[0] - self.info["plate_slot_x"]) < 0.04, f"Wrong rack slot: {pose}"
         assert abs(pose[1] - self.info["rack_origin"][1]) < 0.04, f"Plate missed rack: {pose}"
         assert 0.07 < pose[2] < 0.16, f"Plate is unsupported: {pose}"
+        normal = np.asarray(wp.quat_rotate(wp.quat(*pose[3:]), wp.vec3(0, 0, 1)))
+        goal_normal = np.asarray(wp.quat_rotate(wp.quat(*self.info["plate_goal_rotation"]), wp.vec3(0, 0, 1)))
+        assert abs(np.dot(normal, goal_normal)) > np.cos(np.deg2rad(15)), f"Plate is not upright: {pose}"
         speed = np.linalg.norm(self.state_0.body_qd.numpy()[body])
         assert speed < 0.25, f"Plate did not settle: {speed}"
 

@@ -202,6 +202,37 @@ class TestSteelSafety(unittest.TestCase):
                 expected[1, 0] = 0.5
                 np.testing.assert_array_equal(solver._impulses.numpy(), expected)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "requires the native tiled CUDA solver")
+    def test_dense_capacity_beyond_static_shared_memory_builds(self):
+        """Solve a dense capacity whose packed Delassus triangle exceeds static shared memory."""
+        device = wp.get_cuda_device()
+        capacity = 256
+        model = _driven_model(worlds=2, device=device)
+        solver = SolverSteel(model, solve_mode="split", articulation_constraint_max=capacity)
+        self.assertEqual(solver._pgs_kernel, "loop")
+        self.assertIsNone(solver._pgs_solve_tiled_row_kernel)
+        state, output = model.state(), model.state()
+        solver.step(state, output, model.control(), None, 0.01)
+        self.assertTrue(np.isfinite(output.body_qd.numpy()).all())
+
+        solver._constraint_count.assign(np.array([capacity, 1], dtype=np.int32))
+        solver._impulses.zero_()
+        solver._diag.fill_(2.0)
+        solver._C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (2, 1, 1)))
+        solver._rhs.fill_(-1.0)
+        solver._row_type.zero_()
+        solver._row_parent.zero_()
+        solver._row_mu.zero_()
+        solver._dispatch_dense_pgs_solve(iterations=1, friction_start_iteration=0)
+        expected = np.zeros((2, capacity), dtype=np.float32)
+        expected[0] = 0.5
+        expected[1, 0] = 0.5
+        np.testing.assert_array_equal(solver._impulses.numpy(), expected)
+
+        with self.assertRaisesRegex(ValueError, "shared memory"):
+            with kernel_overrides({"pgs_kernel": "tiled_row"}):
+                SolverSteel(model, solve_mode="split", articulation_constraint_max=capacity)
+
     def test_partial_reset_refreshes_only_selected_mass_factors(self):
         """Preserve factor reuse in worlds outside a partial episode reset."""
         devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
