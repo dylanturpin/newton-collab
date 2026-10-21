@@ -11,6 +11,7 @@ stores every intermediate in buffers owned by the output state, so a
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -20,10 +21,12 @@ import warp as wp
 from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import JointType
+from .contact_torsion import _contact_groups, _group_budget
 from .friction_patches import contact_tangent_basis
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
     _compute_body_net_wrench,
     _gyro_skew,
     _is_identity_rotation,
@@ -81,7 +84,6 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["enable_sleeping"], "enable_sleeping=False"),
         (options["contact_warmstart"], "contact_warmstart=False"),
         (beta is not None and beta > 0.0, "friction_anchor_beta=0"),
-        (options["contact_torsion_device"], "contact_torsion_device=False"),
         (options["enable_torsional_rolling_friction"], "enable_torsional_rolling_friction=False"),
         (
             options["free_rigid_torsional_friction"] is not None or options["free_rigid_rolling_friction"] is not None,
@@ -116,7 +118,6 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
         ),
         (bool(np.any(solver._kinematic_dof_mask_host)), "no kinematic bodies"),
         (not np.array_equal(plan.response_dof_count, plan.articulation_dof_count), "every articulation DOF dynamic"),
-        (solver._contact_torsion_enabled, "no contact torsion (steel:min_torsional_patch_radius)"),
         (solver._free_rigid_angular_rows, "no free-rigid torsional or rolling friction (steel:condim)"),
         # The dense sweep reproduces the loop and tiled_row updates; CPU and matrix_free resolve to loop.
         (
@@ -782,6 +783,10 @@ class DifferentiableStep:
                 outputs=[c.J[size]],
                 device=device,
             )
+        if solver._contact_torsion_enabled:
+            self._append_torsion_rows(b, c, contacts)
+        for size in solver._size_groups:
+            n_arts = solver._n_arts_by_size[size]
             wp.launch(
                 _hinv_jt_dense,
                 dim=n_arts * max_rows,
@@ -903,7 +908,10 @@ class DifferentiableStep:
         # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
         c.impulses[0].zero_()
         friction_start = solver._contact_friction_start_iteration(solver._iterations)
+        torsion = solver._contact_torsion_enabled
         for k in range(solver._iterations):
+            # With torsion, the contact sweep writes torsion_input[k] and the torsion rows follow it in the same sweep.
+            sweep_out = c.torsion_input[k] if torsion else c.impulses[k + 1]
             wp.launch(
                 _dense_pgs_sweep,
                 dim=solver._world_count,
@@ -921,9 +929,37 @@ class DifferentiableStep:
                     c.smooth_impulse,
                     c.impulses[k],
                 ],
-                outputs=[c.residuals[k], c.impulses[k + 1]],
+                outputs=[c.residuals[k], sweep_out],
                 device=device,
             )
+            if torsion:
+                wp.launch(
+                    _dense_torsion_sweep,
+                    dim=solver._world_count,
+                    inputs=[
+                        c.row_count,
+                        c.row_type,
+                        c.row_parent,
+                        c.torsion_group,
+                        c.torsion_radius,
+                        c.row_mu,
+                        c.diag,
+                        c.C,
+                        rhs,
+                        solver._relaxation,
+                        int(k < friction_start),
+                        c.torsion_input[k],
+                    ],
+                    outputs=[
+                        c.torsion_load[k],
+                        c.torsion_sliding[k],
+                        c.torsion_scale[k],
+                        c.torsion_scaled_sliding[k],
+                        c.torsion_residuals[k],
+                        c.impulses[k + 1],
+                    ],
+                    device=device,
+                )
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
@@ -944,6 +980,120 @@ class DifferentiableStep:
                 device=device,
             )
         return c.v_out
+
+    def _append_torsion_rows(self, b: _StepBuffers, c: _ContactBuffers, contacts: Contacts) -> None:
+        """Append one spin row per touching contact group, as the default host torsion preparation does.
+
+        The groups, rows and radii are frozen topology, built on the host off the tape; the spin rows' Jacobian
+        follows the step's motion subspaces on the tape.
+        """
+        solver = self.solver
+        device = solver.model.device
+        if wp.get_stream(device).is_capturing:
+            raise RuntimeError("differentiable=True contact torsion groups contacts on the host; step eagerly")
+        view = _TorsionGroupingView(solver, c)
+        c.torsion_group.fill_(-1)
+        groups = _contact_groups(view, b, contacts)
+        if not groups:
+            return
+        count = c.row_count.numpy()
+        requested = count.copy()
+        membership = np.full(c.torsion_group.shape, -1, dtype=np.int32)
+        row_mu = c.row_mu.numpy()
+        shape_radius = solver._contact_torsion_shape_radius.numpy()
+        entries = []
+        for group in groups:
+            world = group[0].world
+            budget = _group_budget(view, group, row_mu)
+            if budget is None:
+                continue
+            coefficient, _anchors, touching = budget
+            lead = touching[0]
+            requested[world] += 1
+            row = int(count[world])
+            # Groups past the capacity get no row; their world is flagged below.
+            if row >= solver._articulation_constraint_max:
+                continue
+            count[world] += 1
+            radius = float(max(max(shape_radius[w.shape_a], shape_radius[w.shape_b]) for w in group))
+            for witness in group:
+                membership[world, witness.slot] = row
+            entries.append((world, row, lead.slot, lead.body_a, lead.body_b, coefficient, radius, lead.normal))
+        overflowed = np.flatnonzero(requested > count)
+        if overflowed.size:
+            overflow = solver.constraint_overflow.numpy()
+            overflow[overflowed] = True
+            solver.constraint_overflow.assign(overflow)
+            if solver._warn_constraint_overflow:
+                warnings.warn(
+                    "Steel contact torsion row overflow: groups beyond articulation_constraint_max get no row and "
+                    "flag their worlds in constraint_overflow. Increase articulation_constraint_max.",
+                    RuntimeWarning,
+                    stacklevel=4,
+                )
+        if not entries:
+            return
+        rows = wp.array(np.array([e[:5] for e in entries], dtype=np.int32), dtype=wp.int32, device=device)
+        coefficients = wp.array(np.array([e[5:7] for e in entries], dtype=np.float32), dtype=wp.float32, device=device)
+        normals = wp.array(np.array([e[7] for e in entries], dtype=np.float32), dtype=wp.vec3, device=device)
+        c.torsion_group.assign(membership)
+        c.row_count.assign(count)
+        c.slot_counter.assign(count)
+        wp.launch(
+            _write_torsion_rows,
+            dim=len(entries),
+            inputs=[rows, coefficients, solver._cfm],
+            outputs=[
+                c.row_type,
+                c.row_parent,
+                c.row_mu,
+                c.row_beta,
+                c.row_cfm,
+                c.phi,
+                c.target_velocity,
+                c.row_restitution,
+                c.row_max_depenetration,
+                c.torsion_radius,
+            ],
+            device=device,
+            record_tape=False,
+        )
+        for size in solver._size_groups:
+            wp.launch(
+                _torsion_jacobian,
+                dim=(len(entries), size),
+                inputs=[
+                    rows,
+                    normals,
+                    size,
+                    solver._body_to_articulation,
+                    solver._articulation_response_dof_count,
+                    solver._art_group_idx,
+                    solver._articulation_dof_start,
+                    self.body_dof_chain,
+                    b.joint_S_s,
+                ],
+                outputs=[c.J[size]],
+                device=device,
+            )
+
+
+class _TorsionGroupingView:
+    """The solver attributes the default torsion grouping reads, backed by one differentiable step's rows."""
+
+    def __init__(self, solver: SolverSteel, c: _ContactBuffers):
+        self.model = solver.model
+        self._contact_torsion_shape_radius = solver._contact_torsion_shape_radius
+        self._friction_anchors_enabled = False
+        self._friction_patches = solver._friction_patches
+        self._row_dropped_dense = solver._row_dropped_dense
+        self._contact_path = c.path
+        self._contact_slot = c.slot
+        self._contact_world = c.world
+        self._contact_slots_needed = c.slots_needed
+        self._row_type = c.row_type
+        self._row_parent = c.row_parent
+        self._constraint_count = c.row_count
 
 
 class _StepBuffers:
@@ -1035,6 +1185,17 @@ class _ContactBuffers:
         self.diag = zeros((worlds, rows))
         self.C = zeros((worlds, rows, rows))
         self.impulses = [zeros((worlds, rows)) for _ in range(solver._iterations + 1)]
+        # Contact torsion: the spin rows of each sweep read the contact rows' impulses after their own sweep.
+        torsion_iterations = solver._iterations if solver._contact_torsion_enabled else 0
+        torsion_shape = (worlds, rows) if solver._contact_torsion_enabled else (1, 1)
+        self.torsion_group = wp.full(torsion_shape, -1, dtype=wp.int32, device=device)
+        self.torsion_radius = zeros(torsion_shape, wp.float32, False)
+        self.torsion_input = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
+        self.torsion_load = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
+        self.torsion_sliding = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
+        self.torsion_scale = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
+        self.torsion_scaled_sliding = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
+        self.torsion_residuals = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
         self.residuals = [zeros((worlds, rows)) for _ in range(solver._iterations)]
         self.v_out = zeros(solver.model.joint_dof_count)
         self.J, self.Y, self.Y_tmp = {}, {}, {}
@@ -2087,7 +2248,10 @@ def _dense_pgs_sweep(
     m = row_count[world]
     for i in range(m):
         kind = row_type[world, i]
-        if kind == PGS_CONSTRAINT_TYPE_FRICTION and skip_friction != 0:
+        if kind == PGS_CONSTRAINT_TYPE_TORSION:
+            # The torsion sweep solves spin rows after every contact row, as the matrix-free kernel does.
+            impulses_out[world, i] = impulses_in[world, i]
+        elif kind == PGS_CONSTRAINT_TYPE_FRICTION and skip_friction != 0:
             impulses_out[world, i] = 0.0
         elif kind != PGS_CONSTRAINT_TYPE_FRICTION or i == row_parent[world, i] + 1:
             w = rhs[world, i]
@@ -2357,3 +2521,186 @@ def _adj_friction_pair(
             wp.adjoint[old] += wp.mat22(a, c, c, d) * p
             wp.adjoint[residual] -= p
             wp.adjoint[radius] += q * radius
+
+
+@wp.kernel
+def _write_torsion_rows(
+    rows: wp.array2d[int],
+    coefficients: wp.array2d[float],
+    cfm: float,
+    # outputs
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_cfm: wp.array2d[float],
+    row_phi: wp.array2d[float],
+    row_target_velocity: wp.array2d[float],
+    row_restitution: wp.array2d[float],
+    row_max_depenetration: wp.array2d[float],
+    torsion_radius: wp.array2d[float],
+):
+    """Row metadata of prepare_torsion_rows: no bias, no target, the group's coefficient and radius."""
+    e = wp.tid()
+    world = rows[e, 0]
+    row = rows[e, 1]
+    row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
+    row_parent[world, row] = rows[e, 2]
+    row_mu[world, row] = coefficients[e, 0]
+    row_beta[world, row] = 0.0
+    row_cfm[world, row] = cfm
+    row_phi[world, row] = 0.0
+    row_target_velocity[world, row] = 0.0
+    row_restitution[world, row] = 0.0
+    row_max_depenetration[world, row] = 0.0
+    torsion_radius[world, row] = coefficients[e, 1]
+
+
+@wp.kernel
+def _torsion_jacobian(
+    rows: wp.array2d[int],
+    normals: wp.array[wp.vec3],
+    target_size: int,
+    body_to_articulation: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    art_group_idx: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    body_dof_chain: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    # outputs
+    J_group: wp.array3d[float],
+):
+    """Spin-row Jacobian of prepare_torsion_rows: the lead normal's angular projection of each chain DOF."""
+    e, dof = wp.tid()
+    row = rows[e, 1]
+    body_a = rows[e, 3]
+    body_b = rows[e, 4]
+    normal = normals[e]
+    art_a = int(-1)
+    art_b = int(-1)
+    if body_a >= 0:
+        art_a = body_to_articulation[body_a]
+    if body_b >= 0:
+        art_b = body_to_articulation[body_b]
+    a_matches = art_a >= 0 and articulation_response_dof_count[art_a] == target_size
+    b_matches = art_b >= 0 and articulation_response_dof_count[art_b] == target_size
+    if a_matches:
+        value = float(0.0)
+        if body_dof_chain[body_a, dof] != 0:
+            S = joint_S_s[articulation_dof_start[art_a] + dof]
+            value += wp.dot(normal, wp.vec3(S[3], S[4], S[5]))
+        if b_matches and art_b == art_a and body_dof_chain[body_b, dof] != 0:
+            S = joint_S_s[articulation_dof_start[art_b] + dof]
+            value -= wp.dot(normal, wp.vec3(S[3], S[4], S[5]))
+        J_group[art_group_idx[art_a], row, dof] = value
+    if b_matches and art_b != art_a:
+        value = float(0.0)
+        if body_dof_chain[body_b, dof] != 0:
+            S = joint_S_s[articulation_dof_start[art_b] + dof]
+            value -= wp.dot(normal, wp.vec3(S[3], S[4], S[5]))
+        J_group[art_group_idx[art_b], row, dof] = value
+
+
+@wp.func
+def _has_tangent_pair(row_type: wp.array2d[int], row_parent: wp.array2d[int], world: int, n: int, m: int):
+    """Whether normal row n is followed by its own sliding pair."""
+    return (
+        n + 2 < m
+        and row_type[world, n + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+        and row_parent[world, n + 1] == n
+        and row_type[world, n + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+        and row_parent[world, n + 2] == n
+    )
+
+
+@wp.kernel
+def _dense_torsion_sweep(
+    row_count: wp.array[int],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    torsion_group: wp.array2d[int],
+    torsion_radius: wp.array2d[float],
+    row_mu: wp.array2d[float],
+    diag: wp.array2d[float],
+    C: wp.array3d[float],
+    rhs: wp.array2d[float],
+    omega: float,
+    skip_friction: int,
+    impulses_in: wp.array2d[float],
+    # outputs
+    load: wp.array2d[float],
+    sliding: wp.array2d[float],
+    scale: wp.array2d[float],
+    scaled_sliding: wp.array2d[float],
+    residuals: wp.array2d[float],
+    impulses_out: wp.array2d[float],
+):
+    """torque_sweep_source's spin rows, after the contact rows of the same sweep.
+
+    Each spin row shares its group's Coulomb budget with the members' sliding pairs, rescales those pairs when
+    they exceed it, and projects its impulse onto what is left. Loop sums are stored and read back, as in
+    _dense_pgs_sweep, and every output element is written once.
+    """
+    world = wp.tid()
+    m = row_count[world]
+    for i in range(m):
+        kind = row_type[world, i]
+        member_pair = int(0)
+        if kind == PGS_CONSTRAINT_TYPE_FRICTION:
+            parent = row_parent[world, i]
+            if torsion_group[world, parent] >= 0 and _has_tangent_pair(row_type, row_parent, world, parent, m):
+                member_pair = 1
+        if kind != PGS_CONSTRAINT_TYPE_TORSION and member_pair == 0:
+            impulses_out[world, i] = impulses_in[world, i]
+    for spin in range(m):
+        if row_type[world, spin] == PGS_CONSTRAINT_TYPE_TORSION:
+            load_sum = float(0.0)
+            sliding_sum = float(0.0)
+            for n in range(m):
+                if row_type[world, n] == PGS_CONSTRAINT_TYPE_CONTACT and torsion_group[world, n] == spin:
+                    load_sum += wp.max(impulses_in[world, n], 0.0)
+                    if _has_tangent_pair(row_type, row_parent, world, n, m):
+                        a = impulses_in[world, n + 1]
+                        b = impulses_in[world, n + 2]
+                        sliding_sum += _guarded_sqrt(a * a + b * b)
+            load[world, spin] = load_sum
+            sliding[world, spin] = sliding_sum
+            budget = wp.max(row_mu[world, spin], 0.0) * load[world, spin]
+            factor = float(1.0)
+            if sliding[world, spin] > budget:
+                factor = budget / sliding[world, spin]
+            scale[world, spin] = factor
+            rescaled_sum = float(0.0)
+            for n2 in range(m):
+                if row_type[world, n2] == PGS_CONSTRAINT_TYPE_CONTACT and torsion_group[world, n2] == spin:
+                    if _has_tangent_pair(row_type, row_parent, world, n2, m):
+                        t1 = impulses_in[world, n2 + 1] * scale[world, spin]
+                        t2 = impulses_in[world, n2 + 2] * scale[world, spin]
+                        impulses_out[world, n2 + 1] = t1
+                        impulses_out[world, n2 + 2] = t2
+                        rescaled_sum += _guarded_sqrt(t1 * t1 + t2 * t2)
+            scaled_sliding[world, spin] = rescaled_sum
+            used = sliding[world, spin]
+            if sliding[world, spin] > budget:
+                used = scaled_sliding[world, spin]
+            bound = torsion_radius[world, spin] * wp.max(budget - used, 0.0)
+            if skip_friction != 0:
+                bound = 0.0
+            w = rhs[world, spin]
+            for j in range(m):
+                impulse = impulses_in[world, j]
+                kind_j = row_type[world, j]
+                if kind_j == PGS_CONSTRAINT_TYPE_TORSION and j < spin:
+                    impulse = impulses_out[world, j]
+                elif kind_j == PGS_CONSTRAINT_TYPE_FRICTION:
+                    parent_j = row_parent[world, j]
+                    group = torsion_group[world, parent_j]
+                    if group >= 0 and group <= spin and _has_tangent_pair(row_type, row_parent, world, parent_j, m):
+                        impulse = impulses_in[world, j] * scale[world, group]
+                w += C[world, spin, j] * impulse
+            residuals[world, spin] = w
+            residual = residuals[world, spin]
+            trial = float(0.0)
+            if diag[world, spin] > 0.0:
+                trial = impulses_in[world, spin] - omega * residual / diag[world, spin]
+            impulses_out[world, spin] = wp.clamp(trial, -bound, bound)

@@ -15,8 +15,13 @@ from newton._src.solvers.steel.differentiable import (
     _smooth_contact_impulse,
     _taped_compute_world_contact_bias,
 )
-from newton._src.solvers.steel.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
+)
 from newton.solvers import SolverSteel, steel
+from newton.tests.steel._fixtures import set_torsion_radius
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 _DT = 1.0 / 120.0
@@ -179,7 +184,6 @@ def test_rejects_unsupported_configs(test, device):
         {"enable_sleeping": True},
         {"contact_warmstart": True},
         {"friction_anchor_beta": 0.2},
-        {"contact_torsion_device": True},
         {"enable_torsional_rolling_friction": True},
         {"free_rigid_torsional_friction": 0.01},
         {"articulated_contact_response": "propagation"},
@@ -1588,6 +1592,140 @@ def test_matrix_free_contacts_match_default(test, device):
                 )
 
 
+def _build_torsion_scene(device, shape, *, requires_grad=True, radius=0.05):
+    """A sphere (one contact) or box (four) floating base carrying a hinged arm, with contact torsion."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
+    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.099), wp.quat_identity()))
+    if shape == "sphere":
+        builder.add_shape_sphere(base, radius=0.1, cfg=cfg)
+    else:
+        builder.add_shape_box(base, hx=0.2, hy=0.15, hz=0.1, cfg=cfg)
+    arm = builder.add_link(
+        mass=0.2, inertia=wp.mat33(np.eye(3) * 1.0e-3), xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity())
+    )
+    joints = [
+        builder.add_joint_free(parent=-1, child=base),
+        builder.add_joint_revolute(
+            base,
+            arm,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.2), wp.quat_identity()),
+            axis=(1.0, 0.0, 0.0),
+            armature=0.01,
+        ),
+    ]
+    builder.add_articulation(joints)
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=requires_grad)
+    set_torsion_radius(model, radius)
+    return model
+
+
+_TORSION_OPTIONS = {"friction_anchor_beta": 0.0, "solve_mode": "matrix_free", "iterations": 8}
+
+
+def _torsion_inputs(model, spin):
+    return {
+        "joint_q": model.joint_q.numpy().copy(),
+        "joint_qd": np.array([0.2, 0.1, 0.0, 0.0, 0.0, spin, 0.5], np.float32),
+        "joint_f": np.zeros(model.joint_dof_count, np.float32),
+    }
+
+
+def test_contact_torsion_matches_default(test, device):
+    """Spin rows of sliding (saturated) and sticking contact groups follow the default matrix-free solve."""
+    # The device preparation builds the host's groups; the differentiable step groups on the host for both.
+    cases = (
+        ("sphere", 20.0, 4, False),
+        ("sphere", 3.0, 10, False),
+        ("box", 20.0, 4, False),
+        ("sphere", 20.0, 4, True),
+    )
+    for shape, spin, steps, device_preparation in cases:
+        options = {**_TORSION_OPTIONS, "contact_torsion_device": device_preparation}
+        inputs = _torsion_inputs(_build_torsion_scene(device, shape), spin)
+        reference_model = _build_torsion_scene(device, shape, requires_grad=False)
+        reference, _ = _contact_scene_rollout(reference_model, options, inputs, steps, differentiable=False)
+        result, _ = _contact_scene_rollout(
+            _build_torsion_scene(device, shape), options, inputs, steps, differentiable=True
+        )
+        untwisted, _ = _contact_scene_rollout(
+            _build_torsion_scene(device, shape, requires_grad=False, radius=0.0),
+            options,
+            inputs,
+            steps,
+            differentiable=False,
+        )
+        with test.subTest(shape=shape, spin=spin, contact_torsion_device=device_preparation):
+            rows = result._steel_differentiable_buffers.contacts
+            spin_rows = rows.row_type.numpy()[0, : int(rows.row_count.numpy()[0])] == PGS_CONSTRAINT_TYPE_TORSION
+            test.assertEqual(int(np.count_nonzero(spin_rows)), 1)
+            if shape == "sphere":
+                # One witness has no spin resistance without its spin row; the sliding box corners use the whole
+                # shared budget, which leaves the spin row a zero bound.
+                test.assertGreater(abs(float(untwisted.joint_qd.numpy()[5] - reference.joint_qd.numpy()[5])), 0.5)
+            for attribute in ("joint_q", "joint_qd"):
+                np.testing.assert_allclose(
+                    getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=1.0e-6, atol=1.0e-5
+                )
+
+
+def test_contact_torsion_gradient_matches_finite_difference(test, device):
+    """Tape against central differences for spin rows at their bound and inside it."""
+    for shape, spin in (("sphere", 20.0), ("sphere", 0.3), ("box", 0.3)):
+        model = _build_torsion_scene(device, shape)
+        solver = SolverSteel(model, differentiable=True, **_TORSION_OPTIONS)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        rng = np.random.default_rng(3)
+        wq = wp.array(rng.normal(size=model.joint_coord_count).astype(np.float32), device=device)
+        wqd = wp.array(rng.normal(size=model.joint_dof_count).astype(np.float32), device=device)
+        qd0 = _torsion_inputs(model, spin)["joint_qd"]
+
+        def loss_of(qd, tape=None, model=model, solver=solver, pipeline=pipeline, wq=wq, wqd=wqd):
+            states = [model.state(requires_grad=True) for _ in range(5)]
+            states[0].joint_qd.assign(qd)
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            counts = []
+            for k in range(4):
+                contacts = pipeline.contacts()
+                pipeline.collide(states[k], contacts)
+                counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+                if tape is not None:
+                    tape.__enter__()
+                solver.step(states[k], states[k + 1], None, contacts, _DT)
+                if tape is not None:
+                    tape.__exit__(None, None, None)
+            loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+            if tape is not None:
+                tape.__enter__()
+            wp.launch(
+                _weighted_loss,
+                dim=max(model.joint_coord_count, model.joint_dof_count),
+                inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+                outputs=[loss],
+                device=device,
+            )
+            if tape is not None:
+                tape.__exit__(None, None, None)
+            return float(loss.numpy()[0]), states, counts
+
+        tape = wp.Tape()
+        _, states, counts = loss_of(qd0, tape)
+        tape.backward(grads={tape.launches[-1][4][0]: wp.ones(1, dtype=float, device=device)})
+        gradient = states[0].joint_qd.grad.numpy().astype(np.float64)
+        eps = 3.0e-3
+        for trial in range(3):
+            direction = rng.normal(size=model.joint_dof_count)
+            direction /= np.linalg.norm(direction)
+            plus = loss_of((qd0 + eps * direction).astype(np.float32))
+            minus = loss_of((qd0 - eps * direction).astype(np.float32))
+            fd = (plus[0] - minus[0]) / (2.0 * eps)
+            with test.subTest(shape=shape, spin=spin, trial=trial):
+                test.assertEqual(plus[2], counts)
+                test.assertEqual(minus[2], counts)
+                test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -1649,7 +1787,12 @@ for _device in get_test_devices():
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
         # solve_mode="matrix_free" and its features run on CUDA only.
-        for _test in (test_collide_done_event, test_matrix_free_contacts_match_default):
+        for _test in (
+            test_collide_done_event,
+            test_matrix_free_contacts_match_default,
+            test_contact_torsion_matches_default,
+            test_contact_torsion_gradient_matches_finite_difference,
+        ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 
 

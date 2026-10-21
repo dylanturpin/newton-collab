@@ -80,7 +80,7 @@ def _validate_torsion_mode(solver):
     """Reject unsupported construction and runtime mode combinations."""
     if (
         not solver.model.device.is_cuda
-        or solver.model.requires_grad
+        or (solver.model.requires_grad and not solver._differentiable)
         or solver._solve_mode != "matrix_free"
         or solver._friction_mode != "fixed_normal"
         or solver._row_schedule != "interleaved"

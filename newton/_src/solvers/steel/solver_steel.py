@@ -2584,6 +2584,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
         self._compliance = None
         super().__init__(model)
+        self._differentiable = bool(differentiable)
         _validate_equality_constraints(model)
         _validate_tree_joints_enabled(model)
 
