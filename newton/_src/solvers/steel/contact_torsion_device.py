@@ -5,6 +5,9 @@
 The host implementation remains the oracle during qualification. This module
 changes preparation only; the coupled PGS budget and final-load projection are
 shared with the host path. Enable explicitly with ``enable_device_torsion``.
+A world whose dense rows were dropped gets no torsion rows, and a world whose
+torsion rows exceed the dense capacity keeps the rows that fit; both are flagged
+in the solver's per-world ``constraint_overflow``.
 Under plain propagation it also builds the groups of dense-origin propagation
 contacts, which the host oracle does not cover.
 """
@@ -89,6 +92,7 @@ class _Workspace:
     spin_source: wp.array2d[int]
     planned_count: wp.array[int]
     status: wp.array[int]
+    overflow_warned: wp.array[int]
     patch_keys: wp.array[wp.int64]
     patch_indices: wp.array[int]
     rejected: wp.array[int]
@@ -123,6 +127,7 @@ def _gather(
     row_type: wp.array2d[int],
     parents: wp.array2d[int],
     row_count: wp.array[int],
+    row_dropped: wp.array[int],
     mf_origin: wp.array[int],
     propagation_family: int,
     propagation_row_type: wp.array2d[int],
@@ -152,6 +157,9 @@ def _gather(
     world = worlds[c]
     slot = slots[c]
     if slot < 0 or world < 0 or world >= world_count:
+        return
+    # A world that lost dense rows is already invalid; its surviving rows cannot prove complete groups.
+    if row_dropped[world] != 0:
         return
     # Dense-origin propagation contacts are the ones the immediate response solves as dense rows.
     family = int(-1)
@@ -339,17 +347,16 @@ def _emit_patches(
     world_count: int,
     row_capacity: int,
     row_count: wp.array[int],
-    row_dropped: wp.array[int],
     work: _Workspace,
     torsion_head: wp.array[int],
     torsion_first: wp.array2d[int],
     torsion_next: wp.array2d[int],
+    overflow: wp.array[wp.bool],
+    warn: int,
 ):
     segment = wp.tid()
     family = segment // world_count
     world = segment - family * world_count
-    if family == _DENSE and row_dropped[world] != 0:
-        wp.atomic_or(work.status, 0, 4)
     stride = wp.int64(contact_capacity + 1)
     start = _lower_bound(work.keys, wp.int64(segment) * stride, contact_capacity)
     end = _lower_bound(work.keys, wp.int64(segment + 1) * stride, contact_capacity)
@@ -357,15 +364,17 @@ def _emit_patches(
     if family == _DENSE:
         row = row_count[world]
     spin = int(-1)
+    requested = int(0)
     for i in range(start, end):
         rep = work.indices[i]
         if work.lead[rep] >= 0:
             if family == _DENSE:
+                requested += 1
                 row = _append_group(work, rep, world, row, row_capacity)
             else:
                 spin = _link_propagation_group(work, rep, world, spin, torsion_head, torsion_first, torsion_next)
     if family == _DENSE:
-        work.planned_count[world] = row
+        _finish_dense_rows(work, world, row_count[world], requested, row, row_capacity, overflow, warn)
 
 
 @wp.func
@@ -383,12 +392,39 @@ def _lower_bound(keys: wp.array[wp.int64], target: wp.int64, size: int):
 
 @wp.func
 def _append_group(work: _Workspace, representative: int, world: int, row: int, capacity: int):
+    """Give the group the world's next dense row; a group past the capacity keeps ``spin_row`` -1."""
     if row >= capacity:
-        wp.atomic_or(work.status, 0, 8)
         return row
     work.spin_row[representative] = row
     work.spin_source[world, row] = representative
     return row + 1
+
+
+@wp.func
+def _finish_dense_rows(
+    work: _Workspace,
+    world: int,
+    first_row: int,
+    requested: int,
+    row: int,
+    capacity: int,
+    overflow: wp.array[wp.bool],
+    warn: int,
+):
+    """Publish the world's planned count and flag the world when torsion groups found no row."""
+    work.planned_count[world] = row
+    dropped = first_row + requested - row
+    if dropped > 0:
+        overflow[world] = True
+        if warn != 0 and wp.atomic_exch(work.overflow_warned, 0, 1) == 0:
+            wp.printf(
+                "Warning: Steel contact torsion row overflow in world %d: requested %d rows, limit %d; "
+                "dropped %d torsion rows. Increase articulation_constraint_max.\n",
+                world,
+                first_row + requested,
+                capacity,
+                dropped,
+            )
 
 
 @wp.func
@@ -429,7 +465,6 @@ def _group_world(
     world_count: int,
     row_capacity: int,
     row_count: wp.array[int],
-    row_dropped: wp.array[int],
     mu: wp.array2d[float],
     propagation_mu: wp.array2d[float],
     shape_radius: wp.array[float],
@@ -437,14 +472,12 @@ def _group_world(
     torsion_head: wp.array[int],
     torsion_first: wp.array2d[int],
     torsion_next: wp.array2d[int],
+    overflow: wp.array[wp.bool],
+    warn: int,
 ):
     segment = wp.tid()
     family = segment // world_count
     world = segment - family * world_count
-    if family == _DENSE:
-        if row_dropped[world] != 0:
-            wp.atomic_or(work.status, 0, 4)
-        work.planned_count[world] = row_count[world]
     stride = wp.int64(contact_capacity + 1)
     start = _lower_bound(work.keys, wp.int64(segment) * stride, contact_capacity)
     end = _lower_bound(work.keys, wp.int64(segment + 1) * stride, contact_capacity)
@@ -512,6 +545,7 @@ def _group_world(
     if family == _DENSE:
         row = row_count[world]
     spin = int(-1)
+    requested = int(0)
     for i in range(start, end):
         rep = work.indices[i]
         if work.group[rep] == rep and work.first_pair[rep] == rep:
@@ -521,13 +555,14 @@ def _group_world(
                 cluster = work.indices[j]
                 if work.lead[cluster] >= 0 and work.first_pair[cluster] == rep:
                     if family == _DENSE:
+                        requested += 1
                         row = _append_group(work, cluster, world, row, row_capacity)
                     else:
                         spin = _link_propagation_group(
                             work, cluster, world, spin, torsion_head, torsion_first, torsion_next
                         )
     if family == _DENSE:
-        work.planned_count[world] = row
+        _finish_dense_rows(work, world, row_count[world], requested, row, row_capacity, overflow, warn)
 
 
 @wp.kernel(enable_backward=False)
@@ -735,6 +770,7 @@ class DeviceTorsionPreparation:
         w.propagation_row_contact = wp.full(propagation_shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver._world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
+        w.overflow_warned = wp.zeros(1, dtype=int, device=device)
         w.patch_keys = wp.empty(2 * self.capacity, dtype=wp.int64, device=device)
         w.patch_indices = wp.empty(2 * self.capacity, dtype=int, device=device)
         w.rejected = wp.empty(self.capacity, dtype=int, device=device)
@@ -799,17 +835,16 @@ class DeviceTorsionPreparation:
                 )
 
     def validate(self, status: int | None = None):
-        """Raise latched errors, read synchronously unless ``status`` gives them; they stay latched until :meth:`clear_status`."""
+        """Raise latched input errors, read synchronously unless ``status`` gives them.
+
+        They stay latched until :meth:`clear_status`. Row capacity losses are per-world ``constraint_overflow``.
+        """
         if status is None:
             status = int(self.work.status.numpy()[0])
         if status & 1:
             raise RuntimeError("Contact input overflow before contact torsion")
         if status & 2:
             raise ValueError("Contact torsion does not support hydroelastic contacts")
-        if status & 4:
-            raise RuntimeError("Dense contact row overflow before contact torsion; refusing dropped rows")
-        if status & 8:
-            raise RuntimeError("Experimental torsion row capacity exceeded; refusing dropped work")
         if status & 16:
             raise RuntimeError("Persistent friction patch load ring does not match its contact torsion group")
 
@@ -882,6 +917,7 @@ class DeviceTorsionPreparation:
                 s._row_type,
                 s._row_parent,
                 s._constraint_count,
+                s._row_dropped_dense,
                 s._contact_mf_origin,
                 int(self.propagation),
                 *self._propagation_rows("_propagation_row_type", "_propagation_row_parent"),
@@ -923,9 +959,10 @@ class DeviceTorsionPreparation:
                     s._world_count,
                     s._articulation_constraint_max,
                     s._constraint_count,
-                    s._row_dropped_dense,
                     w,
                     *self._torsion_lists(),
+                    s.constraint_overflow,
+                    int(s._warn_constraint_overflow),
                 ],
                 device=device,
             )
@@ -939,12 +976,13 @@ class DeviceTorsionPreparation:
                     s._world_count,
                     s._articulation_constraint_max,
                     s._constraint_count,
-                    s._row_dropped_dense,
                     s._row_mu,
                     *self._propagation_rows("_propagation_row_mu"),
                     s._contact_torsion_shape_radius,
                     w,
                     *self._torsion_lists(),
+                    s.constraint_overflow,
+                    int(s._warn_constraint_overflow),
                 ],
                 device=device,
             )
@@ -1020,7 +1058,8 @@ def enable_device_torsion(solver, *, deferred_errors=False):
     """Prepare the solver's torsion rows on the device.
 
     With ``deferred_errors``, invalid input latches an error and rolls back the published dynamic
-    state of the failing step instead of raising during preparation.
+    state of the failing step instead of raising during preparation. Row capacity losses only flag
+    the affected worlds in ``constraint_overflow``.
     """
     if not solver._contact_torsion_enabled:
         raise ValueError("Give a shape a positive steel:min_torsional_patch_radius before device preparation")

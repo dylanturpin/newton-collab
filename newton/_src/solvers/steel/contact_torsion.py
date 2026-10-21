@@ -14,6 +14,7 @@ state is rebuilt per step; there is no anchor or elastic orientation memory.
 Host grouping precludes graphs and throughput use.
 """
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -140,6 +141,7 @@ def _contact_groups(solver, state, contacts):
     and contact plane. Persistent patches already define the friction unit, so
     each patch region becomes one group holding every dense normal of its load
     ring, touching or not, and a region with any inadmissible member is skipped.
+    Worlds that dropped dense rows get no groups.
     """
     count = int(contacts.rigid_contact_count.numpy()[0])
     if count > contacts.rigid_contact_max:
@@ -166,6 +168,7 @@ def _contact_groups(solver, state, contacts):
     row_types = solver._row_type.numpy()
     parents = solver._row_parent.numpy()
     row_counts = solver._constraint_count.numpy()
+    dense_dropped = solver._row_dropped_dense.numpy()
     patches = bool(solver._friction_anchors_enabled)
     owners = solver._friction_patches.current.owner.numpy()[:count] if patches else None
     groups = {}
@@ -176,6 +179,9 @@ def _contact_groups(solver, state, contacts):
     for c in range(count):
         world, slot = int(worlds[c]), int(slots[c])
         if paths[c] != 0 or slot < 0:
+            continue
+        # A world that lost dense rows is already invalid; its surviving rows cannot prove complete groups.
+        if 0 <= world < len(dense_dropped) and dense_dropped[world] != 0:
             continue
         region = (world, int(owners[c])) if patches else None
         a, b = int(shape_a[c]), int(shape_b[c])
@@ -364,10 +370,6 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
-    # The allocator rolls counters back on failure; count <= capacity cannot
-    # prove that every contact was retained. Tracking is mandatory for torsion.
-    if np.any(solver._row_dropped_dense.numpy()):
-        raise RuntimeError("Dense contact row overflow before contact torsion; refusing dropped rows")
     groups = _contact_groups(solver, state, contacts)
     if not groups:
         return
@@ -399,6 +401,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     body_velocities = augmented_state._body_v_s.numpy()
     shape_radius = solver._contact_torsion_shape_radius.numpy()
     row_radius = solver._torsion_row_radius.numpy()
+    requested_rows = count.copy()
     for group in groups:
         world = group[0].world
         budget = _group_budget(solver, group, fields["row_mu"])
@@ -406,9 +409,11 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             continue
         coefficient, anchors, touching = budget
         lead = touching[0]
+        requested_rows[world] += 1
         row = int(count[world])
+        # Groups past the capacity get no row; their world is flagged below.
         if row >= solver._articulation_constraint_max:
-            raise RuntimeError("Experimental torsion row capacity exceeded; refusing dropped work")
+            continue
         count[world] += 1
         for field in fields.values():
             field[world, row] = 0
@@ -454,6 +459,19 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             }
         )
     solver._torsion_stats["rows"] = len(solver._torsion_stats["groups"])
+    overflowed = np.flatnonzero(requested_rows > count)
+    if overflowed.size:
+        overflow = solver.constraint_overflow.numpy()
+        overflow[overflowed] = True
+        solver.constraint_overflow.assign(overflow)
+        if solver._warn_constraint_overflow:
+            # A constant message lets the default warning filter report it once.
+            warnings.warn(
+                "Steel contact torsion row overflow: groups beyond articulation_constraint_max get no row and "
+                "flag their worlds in constraint_overflow. Increase articulation_constraint_max.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if not solver._torsion_stats["rows"]:
         return
     for name, values in fields.items():
