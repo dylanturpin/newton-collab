@@ -1062,6 +1062,17 @@ for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack", "pelican_bicy
         use_viewer=True,
     )
 
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_steel_padlock",
+    devices=cuda_test_devices,
+    use_viewer=True,
+    variants=[
+        {"test_options": {"num-frames": 216}, "test_suffix": "matched"},
+        {"test_options": {"num-frames": 216, "key": "wrong", "cutaway": False}, "test_suffix": "wrong"},
+    ],
+)
+
 
 class TestRobotPolicyExamples(unittest.TestCase):
     pass
