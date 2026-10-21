@@ -1,1 +1,1 @@
-Correct the Steel plate-rack example's wrist alignment so the plate seats inside the rack, and tighten its placement check to reject plates left beside the rack.
+Tighten the Steel plate-rack example's placement check to measure the transformed plate center against the actual slot opening and reject plates left beside the rack.

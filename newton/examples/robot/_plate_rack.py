@@ -64,8 +64,8 @@ def populate(b, info, ee, fingers, device, variant):
         (15, pickup + np.array([0, 0, lift_height]), 0.04),
     ]
     # The pads seat against the dish's inclined rim. Correct the measured
-    # grasp pitch with a 0.34 rad wrist rotation before approaching the slots.
-    seated_rotation = wp.quat_rpy(0.0, 0.34, 0.0) * down
+    # 11-degree grasp pitch with the robot wrist before approaching the slots.
+    seated_rotation = wp.quat_rpy(0.0, 0.19, 0.0) * down
     poses = [(*pose, seated_rotation) if pose[0] >= 4.3 else pose for pose in poses]
     # IK only sees the robot; add all dish bodies after its self filters.
     info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1034), poses, device, desired_rotation=down, waypoint_dt=0.12)
