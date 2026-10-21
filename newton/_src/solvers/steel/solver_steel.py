@@ -26343,7 +26343,9 @@ def _get_pgs_solve_mf_gs_kernel(
                         // __DENSE_DESAXCE_BIAS__
 
                         if (G_nn >= 1.0e-20f) {
-                            float u_n_at_zero = u_n + G_nn * (0.0f - old_lambda_n);
+                            // At zero load the cone also zeroes the sliding pair.
+                            float u_n_at_zero = u_n - G_nn * old_lambda_n
+                                - G_nt1 * old_lambda_t1 - G_nt2 * old_lambda_t2;
                             if (u_n_at_zero >= target_vel_n) {
                                 new_lambda_n = 0.0f;
                                 new_lambda_t1 = 0.0f;
@@ -26354,6 +26356,7 @@ def _get_pgs_solve_mf_gs_kernel(
                                     old_lambda_n * 2.0f,
                                     (target_vel_n - u_n) / G_nn + old_lambda_n);
                                 hi = fmaxf(hi, 1.0f);
+                                float f_lo = u_n_at_zero - target_vel_n, f_hi = -1.0f;
 
                                 for (int _bi = 0; _bi < 20; _bi++) {
                                     float mid = 0.5f * (lo + hi);
@@ -26383,11 +26386,11 @@ def _get_pgs_solve_mf_gs_kernel(
                                     float u_n_trial = u_n + G_nn * d_n
                                         + G_nt1 * d_t1_actual
                                         + G_nt2 * d_t2_actual;
-                                    if (u_n_trial < target_vel_n) lo = mid;
-                                    else hi = mid;
+                                    if (u_n_trial < target_vel_n) { lo = mid; f_lo = u_n_trial - target_vel_n; }
+                                    else { hi = mid; f_hi = u_n_trial - target_vel_n; }
                                 }
-
-                                new_lambda_n = 0.5f * (lo + hi);
+                                // Interpolate the root in the final bracket, whose width scales with the initial one.
+                                new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : 0.5f * (lo + hi);
                                 float d_n_final = new_lambda_n - old_lambda_n;
                                 float ut1_f = u_t1 + G_nt1 * d_n_final;
                                 float ut2_f = u_t2 + G_nt2 * d_n_final;
@@ -26621,7 +26624,9 @@ def _get_pgs_solve_mf_gs_kernel(
 
                         if (G_nn >= 1.0e-20f) {
                             // Check separating contact (λ_n = 0 solves it)
-                            float u_n_at_zero = u_n + G_nn * (0.0f - old_lambda_n);
+                            // At zero load the cone also zeroes the sliding pair.
+                            float u_n_at_zero = u_n - G_nn * old_lambda_n
+                                - G_nt1 * old_lambda_t1 - G_nt2 * old_lambda_t2;
                             if (u_n_at_zero >= target_vel_n) {
                                 new_lambda_n = 0.0f;
                                 new_lambda_t1 = 0.0f;
@@ -26632,6 +26637,7 @@ def _get_pgs_solve_mf_gs_kernel(
                                     old_lambda_n * 2.0f,
                                     (target_vel_n - u_n) / G_nn + old_lambda_n);
                                 hi = fmaxf(hi, 1.0f);
+                                float f_lo = u_n_at_zero - target_vel_n, f_hi = -1.0f;
 
                                 for (int _bi = 0; _bi < 20; _bi++) {
                                     float mid = 0.5f * (lo + hi);
@@ -26661,10 +26667,11 @@ def _get_pgs_solve_mf_gs_kernel(
                                     float u_n_trial = u_n + G_nn * d_n
                                         + G_nt1 * d_t1_actual
                                         + G_nt2 * d_t2_actual;
-                                    if (u_n_trial < target_vel_n) lo = mid;
-                                    else hi = mid;
+                                    if (u_n_trial < target_vel_n) { lo = mid; f_lo = u_n_trial - target_vel_n; }
+                                    else { hi = mid; f_hi = u_n_trial - target_vel_n; }
                                 }
-                                new_lambda_n = 0.5f * (lo + hi);
+                                // Interpolate the root in the final bracket, whose width scales with the initial one.
+                                new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : 0.5f * (lo + hi);
 
                                 float d_n_final = new_lambda_n - old_lambda_n;
                                 float ut1_f = u_t1 + G_nt1 * d_n_final;
