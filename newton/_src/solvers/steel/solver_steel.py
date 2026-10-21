@@ -7288,7 +7288,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         f"pgs_kernel='tiled_row' needs {tiled_row_shared_bytes} bytes of shared memory at "
                         f"articulation_constraint_max={self._articulation_constraint_max}"
                     )
-                # The packed Delassus triangle exceeds static shared memory; the scalar loop has no tile.
+                # The triangle plus Warp's reserve exceed the static shared budget; the loop kernel has no tile.
                 self._pgs_kernel = "loop"
             if self._pgs_kernel == "tiled_row":
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
