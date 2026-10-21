@@ -72,6 +72,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.world_count = args.world_count
         self.viewer = viewer
+        self.viewer.picking_enabled = False
 
         sdf_max_resolution = 64
         sdf_narrow_band_range = (-0.01, 0.01)
@@ -101,6 +102,7 @@ class Example:
             xform=wp.transform((-0.5, -0.5, 0.05), wp.quat_identity()),
             enable_self_collisions=False,
             parse_visuals_as_colliders=True,
+            joint_damping_mode="passive",
         )
 
         def find_body(name):
@@ -308,17 +310,17 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
 
-        if self.solver_type == "featherpgs":
+        if self.solver_type == "steel":
             # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
-            self.solver = newton.solvers.SolverFeatherPGS(
+            self.solver = newton.solvers.SolverSteel(
                 self.model,
-                pgs_mode="matrix_free",
+                solve_mode="matrix_free",
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 enable_restitution=False,
-                pgs_iterations=args.pgs_iterations,
-                dense_max_constraints=1536,
-                mf_max_constraints=1024,
+                iterations=args.pgs_iterations,
+                articulation_constraint_max=1536,
+                free_body_constraint_max=1024,
             )
         else:
             # Create MuJoCo solver with Newton contacts
@@ -340,11 +342,11 @@ class Example:
             )
 
         self.viewer.set_model(self.model)
-        self.viewer.picking_enabled = False  # Disable interactive picking for this example
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_camera(wp.vec3(0.5, 0.0, 0.5), -15, -140)
             self.viewer.set_world_offsets(wp.vec3(1.0, 1.0, 0.0))
             self.viewer.show_hydro_contact_surface = self.show_isosurface
+        if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self.render_ui, position="side")
 
         # Initialize state for IK setup
@@ -405,8 +407,8 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if self.solver_type == "featherpgs":
-            # A captured first FeatherPGS step diverges on this scene; warm up eagerly, then restore the state.
+        if self.solver_type == "steel":
+            # A captured first Steel step diverges on this scene; warm up eagerly, then restore the state.
             initial = self.model.state()
             initial.assign(self.state_0)
             self.simulate()
@@ -414,8 +416,6 @@ class Example:
             self.state_1.assign(initial)
             self.solver.reset(self.state_0)
         with wp.ScopedCapture() as capture:
-            if self.solver_type == "featherpgs":
-                self.solver.seed_double_buffer_events()
             self.simulate()
         self.graph = capture.graph
 
@@ -435,7 +435,7 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
-        if self.solver_type == "featherpgs":
+        if self.solver_type == "steel":
             self.solver.validate_contact_compliance()
 
         self.sim_time += self.frame_dt
@@ -614,15 +614,15 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
-            help="Solver to use: 'mujoco' or the experimental compliant 'featherpgs'.",
+            help="Solver to use: 'mujoco' or the experimental compliant 'steel'.",
         )
         parser.add_argument(
             "--pgs-iterations",
             type=int,
             default=16,
-            help="FeatherPGS position iterations (only with --solver featherpgs).",
+            help="Steel position iterations (only with --solver steel).",
         )
         return parser
 

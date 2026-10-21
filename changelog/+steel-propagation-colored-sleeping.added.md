@@ -1,0 +1,1 @@
+Allow experimental `enable_sleeping=True` with Steel `articulated_contact_response="propagation_colored"`. With `sleep_skip_constraints`, sleeping islands' contacts are left out of the coloring and the colored sweep; a world whose propagation rows overflow stays awake, as with the other row families.

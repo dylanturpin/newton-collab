@@ -5,30 +5,31 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import feather_pgs, style3d
-    from .feather_pgs.solver_feather_pgs import SolverFeatherPGS
+    from . import mujoco, steel, style3d
     from .featherstone import SolverFeatherstone
     from .implicit_mpm import SolverImplicitMPM
     from .kamino import SolverKamino
-    from .mujoco import SolverMuJoCo
+    from .mujoco.solver_mujoco import SolverMuJoCo
     from .semi_implicit import SolverSemiImplicit
     from .solver import SolverBase
+    from .steel.solver_steel import SolverSteel
     from .style3d.solver_style3d import SolverStyle3D
     from .vbd import SolverVBD
     from .xpbd import SolverXPBD
 
 __all__ = [
     "SolverBase",
-    "SolverFeatherPGS",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverKamino",
     "SolverMuJoCo",
     "SolverSemiImplicit",
+    "SolverSteel",
     "SolverStyle3D",
     "SolverVBD",
     "SolverXPBD",
-    "feather_pgs",
+    "mujoco",
+    "steel",
     "style3d",
 ]
 
@@ -38,16 +39,17 @@ __all__ = [
 # not pay the import cost of every solver backend.
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "SolverBase": (".solver", "SolverBase"),
-    "SolverFeatherPGS": (".feather_pgs.solver_feather_pgs", "SolverFeatherPGS"),
     "SolverFeatherstone": (".featherstone", "SolverFeatherstone"),
     "SolverImplicitMPM": (".implicit_mpm", "SolverImplicitMPM"),
     "SolverKamino": (".kamino", "SolverKamino"),
-    "SolverMuJoCo": (".mujoco", "SolverMuJoCo"),
+    "SolverMuJoCo": (".mujoco.solver_mujoco", "SolverMuJoCo"),
     "SolverSemiImplicit": (".semi_implicit", "SolverSemiImplicit"),
+    "SolverSteel": (".steel.solver_steel", "SolverSteel"),
     "SolverStyle3D": (".style3d.solver_style3d", "SolverStyle3D"),
     "SolverVBD": (".vbd", "SolverVBD"),
     "SolverXPBD": (".xpbd", "SolverXPBD"),
-    "feather_pgs": (".feather_pgs", None),
+    "mujoco": (".mujoco", None),
+    "steel": (".steel", None),
     "style3d": (".style3d", None),
 }
 

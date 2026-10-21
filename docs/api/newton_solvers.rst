@@ -21,13 +21,15 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :hidden:
 
    newton_solvers_experimental
-   newton_solvers_feather_pgs
+   newton_solvers_mujoco
+   newton_solvers_steel
    newton_solvers_style3d
 
 .. rubric:: Submodules
 
 - :doc:`newton.solvers.experimental <newton_solvers_experimental>`
-- :doc:`newton.solvers.feather_pgs <newton_solvers_feather_pgs>`
+- :doc:`newton.solvers.mujoco <newton_solvers_mujoco>`
+- :doc:`newton.solvers.steel <newton_solvers_steel>`
 - :doc:`newton.solvers.style3d <newton_solvers_style3d>`
 
 .. rubric:: Classes
@@ -37,12 +39,12 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :nosignatures:
 
    SolverBase
-   SolverFeatherPGS
    SolverFeatherstone
    SolverImplicitMPM
    SolverKamino
    SolverMuJoCo
    SolverSemiImplicit
+   SolverSteel
    SolverStyle3D
    SolverVBD
    SolverXPBD

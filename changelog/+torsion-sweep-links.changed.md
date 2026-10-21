@@ -1,0 +1,1 @@
+Speed up the experimental Steel contact torsion solve in worlds with many dense rows. Each sweep now visits only a torsion group's member contacts instead of scanning every dense row for every torsion row; results are bitwise unchanged. Dense-row capacities whose member lists would not fit in the solve kernel's static shared memory keep the full scan.

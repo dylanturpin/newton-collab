@@ -161,6 +161,32 @@ class TestKinematicLinks(unittest.TestCase):
             "Dynamic body should move on the first step after a kinematic toggle.",
         )
 
+    def test_featherstone_refreshes_joint_inertia_separately_from_forces(self):
+        """Refresh a cached mass matrix for armature changes but retain it for force edits."""
+        builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_revolute(-1, body, armature=0.1)
+        builder.add_articulation([joint])
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverFeatherstone(model, update_mass_matrix_interval=100)
+        state_in, state_out = model.state(), model.state()
+        control = model.control()
+        control.joint_f.fill_(1.0)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver.step(state_in, state_out, control, None, 0.01)
+        initial_velocity = state_out.joint_qd.numpy().copy()
+        model.joint_damping.fill_(0.2)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+        self.assertFalse(solver._mass_matrix_dirty)
+        model.joint_armature.fill_(2.0)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES)
+        solver.step(state_in, state_out, control, None, 0.01)
+        reference = newton.solvers.SolverFeatherstone(model)
+        reference_out = model.state()
+        reference.step(state_in, reference_out, control, None, 0.01)
+        np.testing.assert_allclose(state_out.joint_qd.numpy(), reference_out.joint_qd.numpy())
+        self.assertLess(float(state_out.joint_qd.numpy()[0]), float(initial_velocity[0]))
+
     def test_immovable_contact_pair_filtering(self):
         """Filter static-static pairs while making other immovable pairs configurable."""
         for shape_a, shape_b in [
@@ -452,23 +478,27 @@ def test_kinematic_free_base_prescribed_motion(
             device, kinematic_first=kinematic_first
         )
         solver = solver_fn(model)
-        if isinstance(solver, newton.solvers.SolverFeatherPGS) and solver.pgs_mode == "matrix_free":
-            body_to_articulation = solver.body_to_articulation.numpy()
+        if (
+            isinstance(solver, newton.solvers.SolverSteel)
+            and solver._solve_mode == "matrix_free"
+            and solver._articulated_contact_response == "immediate"
+        ):
+            body_to_articulation = solver._body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
-            physical_dof_count = solver.articulation_H_rows.numpy()
-            response_dof_count = solver.articulation_response_dof_count.numpy()
+            physical_dof_count = solver._articulation_H_rows.numpy()
+            response_dof_count = solver._articulation_response_dof_count.numpy()
             test.assertEqual(int(physical_dof_count[kinematic_articulation]), 6)
             test.assertEqual(int(physical_dof_count[probe_articulation]), 6)
             test.assertEqual(int(response_dof_count[kinematic_articulation]), 0)
             test.assertEqual(int(response_dof_count[probe_articulation]), 6)
-            test.assertEqual(solver.max_world_dofs, 6)
+            test.assertEqual(solver._max_world_dofs, 6)
             test.assertEqual(solver._free_rigid_body_count, 1)
-            test.assertEqual(int(solver.free_rigid_body_indices.numpy()[0]), probe_body)
-            world = int(solver.art_to_world.numpy()[probe_articulation])
-            probe_start = int(solver.articulation_dof_start.numpy()[probe_articulation])
+            test.assertEqual(int(solver._free_rigid_body_indices.numpy()[0]), probe_body)
+            world = int(solver._art_to_world.numpy()[probe_articulation])
+            probe_start = int(solver._articulation_dof_start.numpy()[probe_articulation])
             np.testing.assert_array_equal(
-                solver.world_dof_indices.numpy()[world], np.arange(probe_start, probe_start + 6)
+                solver._world_dof_indices.numpy()[world], np.arange(probe_start, probe_start + 6)
             )
         collision_pipeline, contacts = _create_contacts(model, solver)
         state_0, state_1 = model.state(), model.state()
@@ -583,7 +613,7 @@ def test_kinematic_free_base_drives_dense_articulation(
         state_0, state_1 = state_1, state_0
         max_probe_velocity = max(max_probe_velocity, float(state_0.joint_qd.numpy()[probe_qd_start]))
 
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[0]), 0)
+    test.assertEqual(int(solver._articulation_response_dof_count.numpy()[0]), 0)
     test.assertGreater(max_probe_velocity, 3.0e-2)
 
 
@@ -764,8 +794,8 @@ def test_kinematic_runtime_toggle(
     builder.color()
     model = builder.finalize(device=device)
     solver = solver_fn(model)
-    if isinstance(solver, newton.solvers.SolverFeatherPGS):
-        solver.update_mass_matrix_interval = 100
+    if isinstance(solver, newton.solvers.SolverSteel):
+        solver._update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
     state_0, state_1 = model.state(), model.state()
@@ -828,18 +858,19 @@ def test_kinematic_prescribed_response_lifetime(
     device,
     solver_fn,
 ):
+    """Drop a newly kinematic free body from the response and reject a kinematic body turning dynamic."""
     model, kinematic_body, probe_body, _kinematic_joint = _build_free_root_scene(device)
     solver = solver_fn(model)
-    body_to_articulation = solver.body_to_articulation.numpy()
+    body_to_articulation = solver._body_to_articulation.numpy()
     kinematic_articulation = int(body_to_articulation[kinematic_body])
     probe_articulation = int(body_to_articulation[probe_body])
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[kinematic_articulation]), 0)
+    test.assertEqual(int(solver._articulation_response_dof_count.numpy()[kinematic_articulation]), 0)
 
     flags = model.body_flags.numpy()
     flags[probe_body] = int(BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
     solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[probe_articulation]), 6)
+    test.assertEqual(int(solver._articulation_response_dof_count.numpy()[probe_articulation]), 6)
 
     flags = model.body_flags.numpy()
     flags[kinematic_body] = int(BodyFlags.DYNAMIC)
@@ -848,12 +879,19 @@ def test_kinematic_prescribed_response_lifetime(
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 
+def _undamped(solver):
+    """Turn off the default angular damping of the free roots."""
+    solver._rigid_body_angular_damping.zero_()
+    return solver
+
+
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split"),
-    "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, pgs_mode="matrix_free"
+    "steel_split": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="split")),
+    "steel_matrix_free": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="matrix_free")),
+    "steel_propagation": lambda model: _undamped(
+        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation")
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
@@ -865,9 +903,13 @@ for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name == "mujoco_warp":
+        if device.is_cpu and solver_name in (
+            "mujoco_warp",
+            "steel_matrix_free",
+            "steel_propagation",
+        ):
             continue
-        if device.is_cpu and solver_name == "feather_pgs_matrix_free":
+        if device.is_cpu and solver_name == "steel_matrix_free":
             continue
 
         add_function_test(
@@ -876,19 +918,20 @@ for device in devices:
             test_kinematic_free_base_prescribed_motion,
             devices=[device],
             solver_fn=solver_fn,
-            check_reversed_order=solver_name == "feather_pgs_matrix_free",
+            check_reversed_order=solver_name == "steel_matrix_free",
         )
-        if solver_name == "feather_pgs_matrix_free":
+        if solver_name == "steel_matrix_free":
+            # Steel elides prescribed free bodies only with the matrix-free immediate response.
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_feather_pgs_matrix_free",
+                "test_kinematic_prescribed_response_lifetime_steel_matrix_free",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_free_base_drives_dense_articulation_feather_pgs_matrix_free",
+                "test_kinematic_free_base_drives_dense_articulation_steel_matrix_free",
                 test_kinematic_free_base_drives_dense_articulation,
                 devices=[device],
                 solver_fn=solver_fn,

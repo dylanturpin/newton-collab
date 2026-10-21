@@ -28,6 +28,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import warp as wp
 
+from ..core.capture_release import CaptureSafeTexture3D, release_deferred
 from ..core.types import Axis
 from .kernels import sdf_box, sdf_capsule, sdf_cone, sdf_cylinder, sdf_ellipsoid, sdf_sphere
 from .sdf_mc import MC_EDGE_CLAMP_MAX, MC_EDGE_CLAMP_MIN, MC_EDGE_VAL_DIFF_EPS
@@ -341,7 +342,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
         ) -> float:
             return get_distance_to_mesh(mesh, point, max_dist, winding_threshold)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def check_subgrid_occupied_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -370,7 +371,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
         else:
             subgrid_required[tid] = 0
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def accumulate_subgrid_linearity_error_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -450,7 +451,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
 
         wp.atomic_max(linearity_errors, subgrid_idx, wp.abs(sdf_value - coarse_val))
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def build_coarse_sdf_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -484,7 +485,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
 
         background_sdf[tid] = query_sdf(mesh, shape_type, shape_scale, pos, 10000.0, winding_threshold)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def populate_subgrid_texture_float32_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -551,7 +552,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
         )
         subgrid_texture[tex_idx] = sdf_val
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def populate_subgrid_texture_uint16_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -621,7 +622,7 @@ def _create_source_kernels(source_kind: int, sign_mode: int):
         v_normalized = wp.clamp((sdf_val - sdf_min) * sdf_range_inv, 0.0, 1.0)
         subgrid_texture[tex_idx] = wp.uint16(v_normalized * 65535.0)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def populate_subgrid_texture_uint8_kernel(
         mesh: wp.uint64,
         shape_type: wp.int32,
@@ -2453,7 +2454,8 @@ def create_sparse_sdf_textures(
     # the stored values exactly, preserving the software interpolation path.
     coarse_data = _pack_sdf_x_pairs(sparse_data["coarse_sdf"]) if paired_samples else sparse_data["coarse_sdf"]
     subgrid_data = _pack_sdf_x_pairs(sparse_data["subgrid_data"]) if paired_samples else sparse_data["subgrid_data"]
-    coarse_tex = wp.Texture3D(
+    release_deferred()
+    coarse_tex = CaptureSafeTexture3D(
         coarse_data,
         filter_mode=wp.TextureFilterMode.LINEAR,
         address_mode=wp.TextureAddressMode.CLAMP,
@@ -2461,7 +2463,7 @@ def create_sparse_sdf_textures(
         device=device,
     )
 
-    subgrid_tex = wp.Texture3D(
+    subgrid_tex = CaptureSafeTexture3D(
         subgrid_data,
         filter_mode=wp.TextureFilterMode.LINEAR,
         address_mode=wp.TextureAddressMode.CLAMP,

@@ -1,0 +1,1 @@
+Fix a CUDA illegal memory access in `SolverSteel` when a step that publishes `BODY_PARENT_F` is first run inside a CUDA graph capture and the solver is then stepped eagerly before the graph is launched.
