@@ -558,7 +558,6 @@ class DifferentiableStep:
         """Raise for contact configurations the differentiable step does not reproduce yet."""
         solver = self.solver
         checks = (
-            (solver._solve_mode != "split", 'solve_mode="split" with contacts'),
             (self.has_mixed_free_worlds, "no world mixing free rigid bodies and articulations"),
             (
                 solver._differentiable_patch_friction_default,

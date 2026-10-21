@@ -490,8 +490,6 @@ def test_contact_rejects_unsupported_configs(test, device):
         {**_CONTACT_OPTIONS, "contact_friction_gap_max": None, "contact_friction_shared_anchor": True},
         {**_CONTACT_OPTIONS, "contact_regularization": 0.1},
     ]
-    if wp.get_device(device).is_cuda:
-        unsupported.append({**_CONTACT_OPTIONS, "solve_mode": "matrix_free"})
     for options in unsupported:
         solver = SolverSteel(model, differentiable=True, **options)
         with test.subTest(**options), test.assertRaisesRegex(NotImplementedError, "contacts require"):
@@ -1546,6 +1544,50 @@ def test_unarticulated_body_contact_matches_default(test, device):
                 np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
 
 
+def _contact_scene_rollout(model, options, inputs, steps, *, differentiable, dt=_DT):
+    """Step a contact scene from ``inputs``, colliding every step; return the final state."""
+    solver = SolverSteel(model, differentiable=differentiable, **options)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    states[0].joint_q.assign(inputs["joint_q"])
+    states[0].joint_qd.assign(inputs["joint_qd"])
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control = model.control()
+    control.joint_f.assign(inputs["joint_f"])
+    for k in range(steps):
+        pipeline.collide(states[k], contacts)
+        solver.step(states[k], states[k + 1], control, contacts, dt)
+    return states[-1], solver
+
+
+_MATRIX_FREE_SCENES = {
+    "box_chain": _build_box_chain_on_plane,
+    "slider": lambda device, requires_grad=True: _build_slider_on_plane(device, requires_grad=requires_grad),
+    "free_box": lambda device, requires_grad=True: _build_free_shape(device, "box", requires_grad=requires_grad),
+}
+
+
+def test_matrix_free_contacts_match_default(test, device):
+    """With solve_mode="matrix_free" the dense sweep follows the fused matrix-free Gauss-Seidel solve."""
+    options = {"friction_anchor_beta": 0.0, "solve_mode": "matrix_free", "iterations": 8}
+    for name, build in _MATRIX_FREE_SCENES.items():
+        model = build(device, requires_grad=False)
+        rng = np.random.default_rng(0)
+        inputs = {
+            "joint_q": model.joint_q.numpy().copy(),
+            "joint_qd": (0.3 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+            "joint_f": (0.5 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+        }
+        reference, _ = _contact_scene_rollout(model, options, inputs, 20, differentiable=False)
+        result, _ = _contact_scene_rollout(build(device), options, inputs, 20, differentiable=True)
+        for attribute in ("joint_q", "joint_qd"):
+            with test.subTest(scene=name, attribute=attribute):
+                np.testing.assert_allclose(
+                    getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=0.0, atol=1.0e-5
+                )
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -1606,9 +1648,9 @@ for _device in get_test_devices():
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
-        add_function_test(
-            TestSteelDifferentiable, "test_collide_done_event", test_collide_done_event, devices=[_device]
-        )
+        # solve_mode="matrix_free" and its features run on CUDA only.
+        for _test in (test_collide_done_event, test_matrix_free_contacts_match_default):
+            add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 
 
 if __name__ == "__main__":
