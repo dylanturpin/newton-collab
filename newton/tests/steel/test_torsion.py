@@ -1756,6 +1756,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
         return int(counts[2]) - 1
 
     def test_overflowing_world_is_flagged_and_others_are_unchanged(self):
+        """Flag only the overflowing world and leave the other worlds bitwise unchanged."""
         capacity = self.capacity()
         for preparation in ("host", "device", "graph"):
             with self.subTest(preparation=preparation):
@@ -1774,6 +1775,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
                     solver.check_constraint_capacity()
 
     def test_reset_clears_only_the_selected_world(self):
+        """Keep the flag through another world's reset and clear it with its own."""
         capacity = self.capacity()
         _, overflow, solver = _pad_rollout([1, 1, 2], capacity, reset_mask=[False, True, False])
         np.testing.assert_array_equal(overflow, [False, False, True])
@@ -1782,6 +1784,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
         solver.check_constraint_capacity()
 
     def test_device_warning_reports_the_world_once(self):
+        """Print the device overflow warning once, naming the world."""
         capacity = self.capacity()
         capture = StdOutCapture()
         capture.begin()
@@ -1794,6 +1797,7 @@ class TestTorsionRowOverflowIsPerWorld(unittest.TestCase):
         self.assertIn("in world 2", output)
 
     def test_host_warning(self):
+        """Warn from the host preparation when torsion rows overflow."""
         capacity = self.capacity()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
