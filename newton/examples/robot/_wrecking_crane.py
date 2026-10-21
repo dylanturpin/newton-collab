@@ -107,7 +107,6 @@ def populate(b, info, ee, down, device):
     base = np.array([0.18, 0.25, 0])
     for body, label in enumerate(b.body_label):
         if label.endswith(("/fr3_leftfinger", "/fr3_rightfinger")):
-            box(b, (0, 0, 0.085), (0.006, 0.006, 0.055), (0.31, 0.36, 0.40), body, "crane_long_jaw")
             for shape, owner in enumerate(b.shape_body):
                 if owner == body:
                     b.shape_material_mu[shape] = 1.3
@@ -119,15 +118,15 @@ def populate(b, info, ee, down, device):
             vi = b.joint_qd_start[j]
             b.joint_target_ke[vi], b.joint_target_kd[vi] = 4000, 40
             b.joint_effort_limit[vi] = 40
-    # A side-mounted vertical grip gives the fingers broad opposing faces.
-    # Its circular path drives only the passive slew through contact.
-    lever = np.array([0.14, 0.0, 0.24])
+    # Stock fingers pinch the existing rear counterweight across its 52 mm
+    # depth. The tracked base stays fixed; contact turns the upper body.
+    lever = np.array([0.040, 0.116, 0.151])
 
     def control_point(slew):
         return base + np.asarray(wp.quat_rotate(wp.quat_rpy(0.0, 0.0, float(slew)), wp.vec3(*lever)))
 
     first = control_point(0)
-    poses = [(0, first + np.array([0, 0, 0.17]), 0.04), (1, first, 0.04), (1.8, first, 0.004)]
+    poses = [(0, first + np.array([0, 0, 0.17]), 0.04), (1, first, 0.04), (1.8, first, 0.018)]
     phases = [
         (3.2, -0.4),
         (4.0, -0.4),
@@ -145,7 +144,7 @@ def populate(b, info, ee, down, device):
                 (
                     previous_time + (time - previous_time) * u,
                     control_point(angle),
-                    0.004,
+                    0.018,
                     wp.quat_rpy(0.0, 0.0, angle) * down,
                 )
             )
@@ -160,12 +159,12 @@ def populate(b, info, ee, down, device):
             (15, last + np.array([0, 0, 0.18]), 0.035, turned),
         ]
     )
-    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1434), poses, device, desired_rotation=down)
+    info["waypoints"] = plan_ik(b, ee, (0, 0, 0.1034), poses, device, desired_rotation=down)
     info["dense_waypoints"] = True
     info["integral_drive_count"] = 6
     joint_start = b.joint_count
     # The imported crane joints stay unarticulated; one articulation below also
-    # spans the handle, chain and ball.
+    # spans the rotating body, chain and ball.
     mapping = import_object(b, "crane", tf(base))
     for j in range(joint_start, b.joint_count):
         vi = b.joint_qd_start[j]
@@ -174,14 +173,10 @@ def populate(b, info, ee, down, device):
             b.joint_damping[vi] = 0.05
         elif b.joint_label[j] == "/crane/joints/crane_slew_q":
             # A dry slew brake resists back-driving but yields to the gripper.
-            b.joint_friction[vi] = 3.0
+            b.joint_friction[vi] = 3.5
             b.joint_damping[vi] = 0.006
         elif b.joint_label[j] == "/crane/joints/hook_swing_q":
             b.joint_damping[vi] = 0.006
-    handle = b.add_link(xform=tf(base), label="crane_grasp_handle")
-    b.add_joint_fixed(mapping["crane_slew"], handle, label="crane_handle_mount")
-    box(b, (0.07, 0, 0.12), (0.07, 0.015, 0.015), (0.96, 0.61, 0.065), handle, "handle_support")
-    box(b, (0.14, 0, 0.21), (0.015, 0.018, 0.09), (0.96, 0.61, 0.065), handle, "grasp_handle")
     hook_local = np.array([0, -0.338, 0.416])
     top = base + hook_local
     count, link_length, radius = 5, 0.025, 0.049
@@ -189,6 +184,7 @@ def populate(b, info, ee, down, device):
     chain, anchors = [], []
     steel = b.default_shape_cfg.copy()
     steel.density, steel.mu, steel.gap = 7800, 0.3, 0.0002
+    # Passive bearing drag dissipates contact-induced spin after the strike.
     for k in range(count):
         body = b.add_link(xform=tf(top - [0, 0, (k + 0.5) * link_length]), label=f"wrecking_chain_{k}")
         child_anchor = np.array([0, 0, link_length / 2])
@@ -197,7 +193,7 @@ def populate(b, info, ee, down, device):
             body,
             parent_xform=tf(anchor),
             child_xform=tf(child_anchor),
-            damping=0.0,
+            damping=0.001,
             armature=1e-4,
             label=f"wrecking_chain_joint_{k}",
         )
@@ -227,7 +223,7 @@ def populate(b, info, ee, down, device):
         ball,
         parent_xform=tf(anchor),
         child_xform=tf((0, 0, radius)),
-        damping=0.0,
+        damping=0.005,
         armature=1e-5,
         label="wrecking_ball_joint",
     )
@@ -245,7 +241,7 @@ def populate(b, info, ee, down, device):
         demolition_half_sizes=sizes,
         demolition_upper_floors=floors,
         demolition_furniture=furniture,
-        crane_handle=handle,
+        crane_grasp_body=mapping["crane_slew"],
         crane_fingers=[
             i for i, label in enumerate(b.body_label) if label.endswith(("/fr3_leftfinger", "/fr3_rightfinger"))
         ],

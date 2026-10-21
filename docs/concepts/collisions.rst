@@ -1252,7 +1252,7 @@ changed at runtime, call
 :meth:`~CollisionPipeline.refresh_body_pair_reduction_groups` so contacts with
 different material laws stop competing in a stale equivalence class.
 
-Body-pair reduction is supported by :class:`~newton.solvers.SolverFeatherPGS`,
+Body-pair reduction is supported by :class:`~newton.solvers.SolverSteel`,
 including warm starting with ``contact_matching="latest"``. Sorting precedes
 reduction, and matching saves the retained stream, so cached impulses refer to
 the contacts actually solved. With matching enabled,
@@ -2230,7 +2230,7 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
-   :class:`~newton.solvers.SolverFeatherPGS` applies restitution in ``dense``,
+   :class:`~newton.solvers.SolverSteel` applies restitution in ``dense``,
    ``split``, and ``matrix_free`` modes. Its ordinary normal row averages the
    two shape coefficients, freezes incident relative normal velocity, and uses
    the rebound target only when a sufficiently fast contact is predicted to
@@ -2241,7 +2241,7 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
    so in-place zero-to-positive material updates work under an already-captured
    graph.
 
-   FeatherPGS applies the qualifying rebound velocity over the whole discrete
+   Steel applies the qualifying rebound velocity over the whole discrete
    step, like conventional PGS. This makes post-impact velocity accurate but
    leaves a first-order, impact-phase-dependent position offset because no
    time-of-impact substep is introduced. Use a smaller timestep when impact

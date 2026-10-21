@@ -1,1 +1,0 @@
-Add the `franka_shirt_fold_stack` multiphysics example, in which a MuJoCo or FeatherPGS Franka folds a VBD T-shirt with scripted pinch grasps and stacks two rigid blocks on the folded shirt through proxy coupling.

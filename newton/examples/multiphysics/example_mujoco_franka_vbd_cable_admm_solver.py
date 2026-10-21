@@ -5,7 +5,7 @@
 # Example MuJoCo Franka + Rigid Chain ADMM Pick-and-Place
 #
 # A fixed-base Franka arm tracks a pick-and-place IK sequence through MuJoCo
-# (or, with --rigid-solver featherpgs, FeatherPGS) position targets while a
+# (or, with --rigid-solver steel, Steel) position targets while a
 # short rigid payload chain is simulated by XPBD by
 # default. The original VBD cable payload is kept as an alternate mode for A/B
 # testing. SolverCoupledADMM detects rigid-rigid contacts between the robot and
@@ -13,7 +13,7 @@
 # replicated across many worlds to exercise ADMM contact scaling.
 #
 # Command: python -m newton.examples mujoco_franka_vbd_cable_admm_solver
-#          python -m newton.examples mujoco_franka_vbd_cable_admm_solver --rigid-solver featherpgs
+#          python -m newton.examples mujoco_franka_vbd_cable_admm_solver --rigid-solver steel
 #
 ###########################################################################
 
@@ -29,7 +29,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD, SolverXPBD
 
 PAYLOAD_CENTER = wp.vec3(0.5, 0.0, 0.256)
 PAYLOAD_LENGTH = 0.42
@@ -208,13 +208,13 @@ class Example:
         self.capture()
 
     def _make_rigid_solver(self, args):
-        if self.rigid_solver == "featherpgs":
-            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+        if self.rigid_solver == "steel":
+            # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
-            return "fpgs", lambda v: SolverFeatherPGS(
+            return "steel", lambda v: SolverSteel(
                 v,
                 solve_mode="matrix_free",
-                iterations=int(args.fpgs_iterations),
+                iterations=int(args.steel_iterations),
                 enable_joint_limits=True,
                 articulation_constraint_max=64,
             )
@@ -276,7 +276,7 @@ class Example:
             gravcomp.values = {}
         for body in franka_bodies:
             gravcomp.values[body] = 1.0
-            if self.rigid_solver == "featherpgs":
+            if self.rigid_solver == "steel":
                 builder.body_disable_gravity[body] = True
 
         payload_shape_start = builder.shape_count
@@ -626,7 +626,7 @@ class Example:
         parser.set_defaults(world_count=8)
         parser.add_argument(
             "--rigid-solver",
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Solver that owns the Franka arm.",
         )
@@ -683,7 +683,7 @@ class Example:
         parser.add_argument("--vbd-iterations", type=int, default=8, help="VBD iterations per coupled substep.")
         parser.add_argument("--mujoco-iterations", type=int, default=12, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=25, help="MuJoCo line-search iterations.")
-        parser.add_argument("--fpgs-iterations", type=int, default=24, help="FeatherPGS PGS iterations.")
+        parser.add_argument("--steel-iterations", type=int, default=24, help="Steel PGS iterations.")
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",

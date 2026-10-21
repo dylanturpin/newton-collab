@@ -6,7 +6,7 @@
 #
 # A rigid paddle on a driven prismatic joint sweeps two soft rubber balls
 # across a bin floor and squashes them against the far wall, simulated with
-# SolverFeatherPGS. Each ball is a free reduced elastic body; they travel
+# SolverSteel. Each ball is a free reduced elastic body; they travel
 # in separate lanes and never touch each other.
 #
 # Command: python -m newton.examples basic_steel_elastic_bin
@@ -120,7 +120,7 @@ class Example:
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
         # Kernel shared memory caps the dense rows per world at 128.
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16, articulation_constraint_max=128)
+        self.solver = newton.solvers.SolverSteel(self.model, iterations=16, articulation_constraint_max=128)
 
         self._paddle_index = int(self.model.joint_q_start.numpy()[self.j_paddle])
         self._targets = self.control.joint_target_q.numpy()

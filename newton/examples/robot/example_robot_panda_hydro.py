@@ -310,9 +310,9 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
 
-        if self.solver_type == "featherpgs":
+        if self.solver_type == "steel":
             # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
-            self.solver = newton.solvers.SolverFeatherPGS(
+            self.solver = newton.solvers.SolverSteel(
                 self.model,
                 solve_mode="matrix_free",
                 contact_compliance=True,
@@ -407,8 +407,8 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if self.solver_type == "featherpgs":
-            # A captured first FeatherPGS step diverges on this scene; warm up eagerly, then restore the state.
+        if self.solver_type == "steel":
+            # A captured first Steel step diverges on this scene; warm up eagerly, then restore the state.
             initial = self.model.state()
             initial.assign(self.state_0)
             self.simulate()
@@ -435,7 +435,7 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
-        if self.solver_type == "featherpgs":
+        if self.solver_type == "steel":
             self.solver.validate_contact_compliance()
 
         self.sim_time += self.frame_dt
@@ -614,15 +614,15 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
-            help="Solver to use: 'mujoco' or the experimental compliant 'featherpgs'.",
+            help="Solver to use: 'mujoco' or the experimental compliant 'steel'.",
         )
         parser.add_argument(
             "--pgs-iterations",
             type=int,
             default=16,
-            help="FeatherPGS position iterations (only with --solver featherpgs).",
+            help="Steel position iterations (only with --solver steel).",
         )
         return parser
 

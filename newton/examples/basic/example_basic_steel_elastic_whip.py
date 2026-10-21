@@ -5,7 +5,7 @@
 # Example Basic Steel Elastic Whip
 #
 # A position-driven two-link arm swings a long soft whip with
-# SolverFeatherPGS. The whip is a reduced elastic FEM beam clamped to the
+# SolverSteel. The whip is a reduced elastic FEM beam clamped to the
 # forearm: it lags the swing, whips through when the arm stops, and knocks
 # a block off a post.
 #
@@ -184,7 +184,7 @@ class Example:
         self.control = self.model.control()
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16)
+        self.solver = newton.solvers.SolverSteel(self.model, iterations=16)
 
         q_start = self.model.joint_q_start.numpy()
         self._arm_index = [int(q_start[j_shoulder]), int(q_start[j_elbow])]

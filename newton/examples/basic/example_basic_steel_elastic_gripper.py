@@ -5,7 +5,7 @@
 # Example Basic Steel Elastic Gripper
 #
 # A position-driven parallel gripper squeezes a soft rubber ball and lifts
-# it off the ground with SolverFeatherPGS. The ball is a free reduced
+# it off the ground with SolverSteel. The ball is a free reduced
 # elastic body whose free-free FEM modes deform at the pad contacts.
 #
 # Command: python -m newton.examples basic_steel_elastic_gripper
@@ -111,7 +111,7 @@ class Example:
         self.control = self.model.control()
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16)
+        self.solver = newton.solvers.SolverSteel(self.model, iterations=16)
 
         target_start = self.model.joint_q_start.numpy()
         self._lift_index = int(target_start[self.j_lift])

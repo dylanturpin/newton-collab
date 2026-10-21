@@ -5,7 +5,7 @@
 # Example Basic Steel Elastic Fingers
 #
 # A parallel gripper with soft rubber fingers grips a rigid box and lifts
-# it with SolverFeatherPGS. Each finger is a reduced elastic FEM beam
+# it with SolverSteel. Each finger is a reduced elastic FEM beam
 # clamped to a driven prismatic slider and bends where it presses the box.
 #
 # Command: python -m newton.examples basic_steel_elastic_fingers
@@ -162,7 +162,7 @@ class Example:
         self.control = self.model.control()
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16)
+        self.solver = newton.solvers.SolverSteel(self.model, iterations=16)
 
         q_start = self.model.joint_q_start.numpy()
         self._lift_index = int(q_start[self.j_lift])

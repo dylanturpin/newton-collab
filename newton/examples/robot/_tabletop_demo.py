@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Interactive, force-driven FPGS tabletop demonstrations."""
+"""Interactive, force-driven Steel tabletop demonstrations."""
 
 import numpy as np
 import warp as wp
@@ -8,7 +8,7 @@ import warp as wp
 import newton
 import newton.examples
 import newton.utils
-from newton.solvers import SolverFeatherPGS
+from newton.solvers import SolverSteel
 
 from ._tabletop_common import box
 from ._tabletop_robot import make_arm
@@ -37,14 +37,16 @@ def command_path(
 
 
 class TabletopDemo:
-    """Share simulation plumbing without coupling the three scene builders."""
+    """Share simulation plumbing without coupling the scene builders."""
 
     task = ""
+    robot_root = None
+    camera_position = (1.65, -2.1, 1.6)
 
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
         if not wp.get_device().is_cuda:
-            raise RuntimeError("These FPGS matrix-free examples require a CUDA device")
+            raise RuntimeError("These Steel matrix-free examples require a CUDA device")
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -80,7 +82,7 @@ class TabletopDemo:
             assets,
             wp.get_device(),
             robot=robot,
-            root=(-0.30, 0, 0) if robot == "franka" else (-0.42, 0, 0),
+            root=self.robot_root or ((-0.30, 0, 0) if robot == "franka" else (-0.42, 0, 0)),
             gripper=self.task != "sweep",
         )
         self.populate(b, self.info, ee, down, fingers)
@@ -118,7 +120,7 @@ class TabletopDemo:
             contact_matching="disabled",
         )
         self.contacts = self.pipeline.contacts()
-        self.solver = SolverFeatherPGS(
+        self.solver = SolverSteel(
             self.model,
             solve_mode="matrix_free",
             articulated_contact_response=args.contact_response,
@@ -134,7 +136,7 @@ class TabletopDemo:
             use_parallel_streams=False,
         )
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(1.65, -2.1, 1.6), pitch=-28, yaw=128)
+        self.viewer.set_camera(pos=wp.vec3(*self.camera_position), pitch=-28, yaw=128)
         self.graph = None
         self.peak_height = float(self.initial.body_q.numpy()[self.info["tracked_body"], 2])
         if self.model.device.is_cuda:
@@ -150,12 +152,12 @@ class TabletopDemo:
         parser = newton.examples.create_parser()
         parser.set_defaults(num_frames=900)
         parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
-        parser.add_argument("--iterations", type=int, default=12, help="FPGS sweeps per substep")
+        parser.add_argument("--iterations", type=int, default=12, help="Steel sweeps per substep")
         parser.add_argument(
             "--contact-response",
-            choices=("immediate", "propagation", "propagation_fused", "propagation_colored"),
+            choices=("immediate", "propagation", "propagation_colored"),
             default="immediate",
-            help="FPGS matrix-free articulated contact response",
+            help="Steel matrix-free articulated contact response",
         )
         return parser
 
@@ -164,13 +166,18 @@ class TabletopDemo:
         self.state_0.assign(self.initial)
         self.state_1.assign(self.initial)
         self.control.joint_target_q.assign(self.model.joint_target_q)
+        self.control.joint_target_qd.assign(self.model.joint_target_qd)
         self.integral.zero_()
         self.solver.reset(self.state_0)
         self.sim_time = self.phase = 0.0
         self.peak_height = float(self.initial.body_q.numpy()[self.info["tracked_body"], 2])
 
+    def update_control(self):
+        """Update feedback-controlled mechanism drives before each substep."""
+
     def simulate(self):
         for _ in range(self.sim_substeps):
+            self.update_control()
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.pipeline.collide(self.state_0, self.contacts)
@@ -211,7 +218,7 @@ class TabletopDemo:
         self.viewer.end_frame()
 
     def gui(self, imgui):
-        imgui.text("Drag bodies to apply forces. Targets drive only the robot.")
+        imgui.text("Drag bodies to apply forces. The path controls the robot arm.")
         _, self.autoplay = imgui.checkbox("Run demonstration", self.autoplay)
         changed, phase = imgui.slider_float("Robot path [s]", self.phase, 0.0, 15.0)
         if changed:

@@ -1064,7 +1064,7 @@ class Model:
         self.body_mass: wp.array[wp.float32] | None = None
         """Rigid body mass [kg], shape [body_count], float."""
         self.body_disable_gravity: wp.array[wp.bool] | None = None
-        """Per-body gravity exclusion, shape [body_count], bool; supported by FeatherPGS and Featherstone.
+        """Per-body gravity exclusion, shape [body_count], bool; supported by Steel and Featherstone.
 
         After editing, notify the solver with :attr:`ModelFlags.BODY_PROPERTIES`.
         """

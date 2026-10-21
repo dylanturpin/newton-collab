@@ -5,7 +5,7 @@
 # Example Basic Steel Elastic Cushion
 #
 # Rigid blocks and spheres of mixed mass drop into a bin and pile up on a
-# soft rubber mat stretched across it, simulated with SolverFeatherPGS. The
+# soft rubber mat stretched across it, simulated with SolverSteel. The
 # mat is a reduced elastic body clamped to the world along its rim, so its
 # fixed-base FEM modes dish under each impact and sag under the pile.
 #
@@ -123,7 +123,7 @@ class Example:
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
         # Kernel shared memory caps the dense rows per world at 128, about 40 contacts on the mat.
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, iterations=16, articulation_constraint_max=128)
+        self.solver = newton.solvers.SolverSteel(self.model, iterations=16, articulation_constraint_max=128)
 
         self.drop_mass = float(self.model.body_mass.numpy()[self.drops].sum())
         self.max_deflection = 0.0

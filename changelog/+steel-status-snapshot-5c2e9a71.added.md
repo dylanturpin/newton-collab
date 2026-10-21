@@ -1,0 +1,1 @@
+Add `SolverSteel.snapshot_constraint_status()` and `check_constraint_capacity(snapshot=True)` to report the capacity, disabled-tree-joint and contact torsion status of earlier steps without waiting for the steps queued after them.

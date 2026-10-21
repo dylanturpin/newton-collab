@@ -1,1 +1,0 @@
-Fix `SolverFeatherPGS` articulation-local contact owners counting the response diagonal twice for articulations with a diagonal mass matrix (for example a single slider or hinge) in scenes with free rigid bodies, which halved the effective PGS step and changed trajectories at low iteration counts.

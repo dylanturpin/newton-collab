@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Linear tetrahedral FE helpers for building reduced elastic links in the FeatherPGS examples."""
+"""Linear tetrahedral FE helpers for building reduced elastic links in the Steel examples."""
 
 from __future__ import annotations
 
