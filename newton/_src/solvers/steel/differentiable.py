@@ -33,6 +33,7 @@ from .kernels import (
     allocate_world_contact_slots,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
+    assign_world_contact_slots,
     compute_composite_inertia,
     compute_link_transform,
     compute_link_velocity,
@@ -40,13 +41,17 @@ from .kernels import (
     compute_world_contact_bias,
     contact_restitution_fires,
     copy_unarticulated_body_state,
+    fill_contact_world_sort_keys,
+    finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
+    find_contact_world_segments,
     integrate_generalized_joints,
     mixed_contact_restitution,
     prescribed_relative_contact_target,
     remove_free_root_transport_from_qdd,
     rhs_accum_world_par_art,
+    rhs_accum_world_par_row,
     update_qdd_from_velocity,
 )
 
@@ -72,6 +77,7 @@ _taped_integrate_generalized_joints = _taped(integrate_generalized_joints)
 _taped_finalize_world_diag_cfm = _taped(finalize_world_diag_cfm)
 _taped_compute_world_contact_bias = _taped(compute_world_contact_bias)
 _taped_rhs_accum_world_par_art = _taped(rhs_accum_world_par_art)
+_taped_rhs_accum_world_par_row = _taped(rhs_accum_world_par_row)
 _taped_apply_impulses_world_par_dof = _taped(apply_impulses_world_par_dof)
 
 
@@ -99,7 +105,6 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["friction_mode"] != "fixed_normal", 'friction_mode="fixed_normal"'),
         (options["velocity_iterations"] != 0, "velocity_iterations=0"),
         (options["parallel_tree"], "parallel_tree=False"),
-        (options["deterministic"], "deterministic=False"),
     )
     for unsupported, requirement in checks:
         if unsupported:
@@ -559,7 +564,10 @@ class DifferentiableStep:
         """Raise for contact configurations the differentiable step does not reproduce yet."""
         solver = self.solver
         checks = (
-            (self.has_mixed_free_worlds, "no world mixing free rigid bodies and articulations"),
+            (
+                self.has_mixed_free_worlds and solver._solve_mode == "split",
+                'solve_mode="matrix_free" for worlds mixing free rigid bodies and articulations',
+            ),
             (
                 solver._differentiable_patch_friction_default,
                 "an explicit friction_anchor_beta=0 (the default friction law is patch friction)",
@@ -610,6 +618,12 @@ class DifferentiableStep:
         )
         solver._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
         dummy = solver._dummy_mf_slot_counter
+        # Free-body contacts reserve matrix-free slots first and take dense rows after the articulated ones,
+        # the order in which the matrix-free kernel sweeps the two families.
+        free_rows = int(solver._has_free_rigid_bodies)
+        c.mf_slot_counter.zero_()
+        c.mf_first_rejected.fill_(_ROW_SLOT_UNBOUNDED)
+        deterministic = int(solver._deterministic)
         wp.launch(
             allocate_world_contact_slots,
             dim=threads,
@@ -631,7 +645,7 @@ class DifferentiableStep:
                 model.body_flags,
                 solver._body_has_response_dofs,
                 solver._dummy_is_free_rigid if solver._is_free_rigid is None else solver._is_free_rigid,
-                0,
+                free_rows,
                 0,
                 0,
                 0,
@@ -646,7 +660,7 @@ class DifferentiableStep:
                 solver._shape_mu_rolling,
                 solver._free_rigid_mu_torsional,
                 solver._free_rigid_mu_rolling,
-                0,
+                deterministic,
                 solver._contact_torsion_radius_dummy,
                 0,
             ],
@@ -657,7 +671,7 @@ class DifferentiableStep:
                 c.art_b,
                 c.slot_counter,
                 c.path,
-                dummy,
+                c.mf_slot_counter,
                 dummy,
                 c.dense_world_flag,
                 c.slots_needed,
@@ -665,13 +679,15 @@ class DifferentiableStep:
                 solver._row_dropped_mf,
                 solver._row_dropped_propagation,
                 solver._dense_first_rejected_slot,
-                dummy,
+                c.mf_first_rejected,
                 dummy,
                 c.mf_origin,
             ],
             device=device,
             record_tape=False,
         )
+        if deterministic:
+            self._assign_slots_by_world(c, contacts)
         wp.launch(
             finalize_world_constraint_counts,
             dim=solver._world_count,
@@ -680,12 +696,38 @@ class DifferentiableStep:
             device=device,
             record_tape=False,
         )
+        if free_rows:
+            wp.launch(
+                finalize_mf_constraint_counts,
+                dim=solver._world_count,
+                inputs=[c.mf_slot_counter, solver._free_body_constraint_max, c.mf_first_rejected],
+                outputs=[c.mf_row_count],
+                device=device,
+                record_tape=False,
+            )
+            c.appended_first_rejected.fill_(_ROW_SLOT_UNBOUNDED)
+            wp.launch(
+                _append_free_body_rows,
+                dim=c.capacity,
+                inputs=[c.count, c.world, c.row_count, max_rows, c.slots_needed],
+                outputs=[c.path, c.slot, solver._row_dropped_dense, c.appended_first_rejected],
+                device=device,
+                record_tape=False,
+            )
+            wp.launch(
+                _finalize_appended_rows,
+                dim=solver._world_count,
+                inputs=[c.mf_row_count, c.appended_first_rejected, max_rows],
+                outputs=[c.row_count],
+                device=device,
+                record_tape=False,
+            )
         wp.launch(
             _finalize_constraint_status,
             dim=solver._world_count,
             inputs=[
                 c.slot_counter,
-                dummy,
+                c.mf_slot_counter,
                 dummy,
                 solver._row_dropped_all,
                 c.count,
@@ -805,6 +847,17 @@ class DifferentiableStep:
             )
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
+            if solver._deterministic:
+                # A world's articulations add in a fixed order, so repeated steps are bitwise identical.
+                world_group_start, world_groups = solver._world_groups_by_size[size]
+                wp.launch(
+                    _delassus_dense_ordered,
+                    dim=(solver._world_count, max_rows, max_rows),
+                    inputs=[c.J[size], c.Y[size], world_group_start, world_groups, c.row_count, size],
+                    outputs=[c.C, c.diag],
+                    device=device,
+                )
+                continue
             wp.launch(
                 _delassus_dense,
                 dim=n_arts * max_rows * max_rows,
@@ -847,6 +900,26 @@ class DifferentiableStep:
             device=device,
         )
         for size in solver._size_groups:
+            if solver._deterministic:
+                world_group_start, world_groups = solver._world_groups_by_size[size]
+                wp.launch(
+                    _taped_rhs_accum_world_par_row,
+                    dim=solver._world_count * max_rows,
+                    inputs=[
+                        c.row_count,
+                        world_group_start,
+                        world_groups,
+                        solver._group_to_art[size],
+                        solver._articulation_dof_start,
+                        v_hat,
+                        c.J[size],
+                        size,
+                        max_rows,
+                    ],
+                    outputs=[c.rhs],
+                    device=device,
+                )
+                continue
             wp.launch(
                 _taped_rhs_accum_world_par_art,
                 dim=solver._n_arts_by_size[size],
@@ -980,6 +1053,61 @@ class DifferentiableStep:
                 device=device,
             )
         return c.v_out
+
+    def _assign_slots_by_world(self, c: _ContactBuffers, contacts: Contacts) -> None:
+        """_assign_contact_slots_by_world on this step's routes: rows reserved in contact order."""
+        solver = self.solver
+        device = solver.model.device
+        count = contacts.rigid_contact_max
+        wp.launch(
+            fill_contact_world_sort_keys,
+            dim=count,
+            inputs=[c.count, c.path, c.world, solver._world_count],
+            outputs=[solver._contact_sort_keys, solver._contact_sort_values],
+            device=device,
+            record_tape=False,
+        )
+        wp.utils.radix_sort_pairs(
+            solver._contact_sort_keys, solver._contact_sort_values, count, end_bit=solver._contact_sort_end_bit
+        )
+        solver._world_contact_segments.zero_()
+        wp.launch(
+            find_contact_world_segments,
+            dim=count,
+            inputs=[solver._contact_sort_keys, count, solver._world_count],
+            outputs=[solver._world_contact_segments[0], solver._world_contact_segments[1]],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            assign_world_contact_slots,
+            dim=solver._world_count,
+            inputs=[
+                solver._world_contact_segments[0],
+                solver._world_contact_segments[1],
+                solver._contact_sort_values,
+                c.slots_needed,
+                solver._articulation_constraint_max,
+                solver._free_body_constraint_max,
+                solver._propagation_max_constraints,
+            ],
+            outputs=[
+                c.path,
+                c.slot_counter,
+                c.mf_slot_counter,
+                c.propagation_slot_counter,
+                c.slot,
+                c.dense_world_flag,
+                solver._row_dropped_dense,
+                solver._row_dropped_mf,
+                solver._row_dropped_propagation,
+                solver._dense_first_rejected_slot,
+                c.mf_first_rejected,
+                c.propagation_first_rejected,
+            ],
+            device=device,
+            record_tape=False,
+        )
 
     def _append_torsion_rows(self, b: _StepBuffers, c: _ContactBuffers, contacts: Contacts) -> None:
         """Append one spin row per touching contact group, as the default host torsion preparation does.
@@ -1167,6 +1295,12 @@ class _ContactBuffers:
         for name in ("world", "slot", "art_a", "art_b", "path", "slots_needed", "mf_origin"):
             setattr(self, name, zeros(capacity, wp.int32, False))
         self.slot_counter = zeros(worlds, wp.int32, False)
+        self.mf_slot_counter = zeros(worlds, wp.int32, False)
+        self.mf_first_rejected = zeros(worlds, wp.int32, False)
+        self.mf_row_count = zeros(worlds, wp.int32, False)
+        self.appended_first_rejected = zeros(worlds, wp.int32, False)
+        self.propagation_slot_counter = zeros(worlds, wp.int32, False)
+        self.propagation_first_rejected = zeros(worlds, wp.int32, False)
         self.dense_world_flag = zeros(worlds, wp.int32, False)
         self.row_count = zeros(worlds, wp.int32, False)
         self.row_type = zeros((worlds, rows), wp.int32, False)
@@ -1784,7 +1918,7 @@ def _dense_contact_rows(
     c = wp.tid()
     if c < wp.min(contact_count[0], point0.shape[0]):
         slot = contact_slot[c]
-        if contact_path[c] == 0 and slot >= 0:
+        if contact_path[c] >= 0 and contact_path[c] <= 1 and slot >= 0:
             world = contact_world[c]
             normal = -contact_normal[c]
             body_a = int(-1)
@@ -1930,7 +2064,7 @@ def _dense_contact_jacobian(
     c, dof = wp.tid()
     if c < wp.min(contact_count[0], point0.shape[0]):
         slot = contact_slot[c]
-        if contact_path[c] == 0 and slot >= 0:
+        if contact_path[c] >= 0 and contact_path[c] <= 1 and slot >= 0:
             normal = -contact_normal[c]
             body_a = int(-1)
             body_b = int(-1)
@@ -2219,6 +2353,33 @@ def _delassus_dense(
     wp.atomic_add(world_C, world, i, j, val)
     if i == j:
         wp.atomic_add(world_diag, world, i, val)
+
+
+@wp.kernel
+def _delassus_dense_ordered(
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    world_group_start: wp.array[int],
+    world_groups: wp.array[int],
+    row_count: wp.array[int],
+    n_dofs: int,
+    # outputs
+    world_C: wp.array3d[float],
+    world_diag: wp.array2d[float],
+):
+    """_delassus_dense with each world's articulations of one size summed in their listed order."""
+    world, i, j = wp.tid()
+    m = row_count[world]
+    if i >= m or j >= m:
+        return
+    val = float(0.0)
+    for g in range(world_group_start[world], world_group_start[world + 1]):
+        group = world_groups[g]
+        for k in range(n_dofs):
+            val += J_group[group, i, k] * Y_group[group, j, k]
+    world_C[world, i, j] = world_C[world, i, j] + val
+    if i == j:
+        world_diag[world, i] = world_diag[world, i] + val
 
 
 @wp.kernel
@@ -2704,3 +2865,50 @@ def _dense_torsion_sweep(
             if diag[world, spin] > 0.0:
                 trial = impulses_in[world, spin] - omega * residual / diag[world, spin]
             impulses_out[world, spin] = wp.clamp(trial, -bound, bound)
+
+
+@wp.kernel
+def _append_free_body_rows(
+    contact_count: wp.array[int],
+    contact_world: wp.array[int],
+    dense_row_count: wp.array[int],
+    max_rows: int,
+    slots_needed: wp.array[int],
+    # in/out
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    # outputs
+    dense_dropped_rows: wp.array[int],
+    first_rejected: wp.array[int],
+):
+    """Move matrix-free contact rows behind their world's articulated rows; rows past the capacity are dropped."""
+    c = wp.tid()
+    if c >= contact_count[0] or contact_path[c] != 1:
+        return
+    world = contact_world[c]
+    slot = contact_slot[c]
+    if slot < 0:
+        return
+    slot += dense_row_count[world]
+    if slot + slots_needed[c] > max_rows:
+        wp.atomic_min(first_rejected, world, slot)
+        wp.atomic_add(dense_dropped_rows, world, slots_needed[c])
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+    # The rows keep path 1, so the torsion grouping still sees free-body contacts as matrix-free.
+    contact_slot[c] = slot
+
+
+@wp.kernel
+def _finalize_appended_rows(
+    mf_row_count: wp.array[int],
+    first_rejected: wp.array[int],
+    max_rows: int,
+    # in/out
+    row_count: wp.array[int],
+):
+    """The world's row count after its free-body rows, truncated at the first dropped one."""
+    world = wp.tid()
+    count = wp.min(row_count[world] + mf_row_count[world], first_rejected[world])
+    row_count[world] = wp.min(count, max_rows)

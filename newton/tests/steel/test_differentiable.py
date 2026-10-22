@@ -196,7 +196,6 @@ def test_rejects_unsupported_configs(test, device):
         {"drive_mode": "rows"},
         {"friction_mode": "bisection"},
         {"velocity_iterations": 2},
-        {"deterministic": True},
     ):
         with test.subTest(**kwargs), test.assertRaisesRegex(ValueError, "differentiable=True requires"):
             SolverSteel(model, differentiable=True, **kwargs)
@@ -1726,6 +1725,149 @@ def test_contact_torsion_gradient_matches_finite_difference(test, device):
                 test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def _build_arm_on_box_stack(device, *, requires_grad=True):
+    """A two-link arm pressing a stack of two free boxes on the ground, all in one world."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
+    builder.add_ground_plane(cfg=cfg)
+    lower = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0995), wp.quat_identity()))
+    builder.add_shape_box(lower, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    upper = builder.add_body(xform=wp.transform(wp.vec3(0.02, 0.01, 0.2985), wp.quat_identity()))
+    builder.add_shape_box(upper, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    inertia = wp.mat33(np.eye(3) * 0.01)
+    link0 = builder.add_link(mass=1.0, inertia=inertia, xform=wp.transform(wp.vec3(-0.3, 0.0, 0.6), wp.quat_identity()))
+    link1 = builder.add_link(mass=0.5, inertia=inertia, xform=wp.transform(wp.vec3(0.0, 0.0, 0.6), wp.quat_identity()))
+    builder.add_shape_capsule(link1, radius=0.03, half_height=0.12, cfg=cfg)
+    joints = [
+        builder.add_joint_revolute(
+            -1,
+            link0,
+            parent_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.6), wp.quat_identity()),
+            axis=(0.0, 1.0, 0.0),
+            armature=0.01,
+        ),
+        builder.add_joint_revolute(
+            link0,
+            link1,
+            parent_xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+            axis=(0.0, 1.0, 0.0),
+            armature=0.01,
+        ),
+    ]
+    builder.add_articulation(joints)
+    return builder.finalize(device=device, requires_grad=requires_grad)
+
+
+# Every contact row takes an articulated slot in the differentiable step, free-body rows included.
+_ARM_ON_BOX_OPTIONS = {
+    "friction_anchor_beta": 0.0,
+    "solve_mode": "matrix_free",
+    "iterations": 16,
+    "articulation_constraint_max": 64,
+}
+
+
+def _arm_on_box_inputs(model):
+    joint_f = np.zeros(model.joint_dof_count, np.float32)
+    joint_f[-2:] = (3.0, 2.0)
+    return {
+        "joint_q": model.joint_q.numpy().copy(),
+        "joint_qd": np.zeros(model.joint_dof_count, np.float32),
+        "joint_f": joint_f,
+    }
+
+
+def test_mixed_world_contacts_match_default(test, device):
+    """A world with articulated and free-body contacts follows the matrix-free solve, which sweeps them in turn."""
+    for deterministic in (False, True):
+        options = {**_ARM_ON_BOX_OPTIONS, "deterministic": deterministic}
+        inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
+        reference, solver = _contact_scene_rollout(
+            _build_arm_on_box_stack(device, requires_grad=False), options, inputs, 20, differentiable=False
+        )
+        test.assertGreater(int(solver._constraint_count.numpy()[0]), 0)
+        test.assertGreater(int(solver._mf_constraint_count.numpy()[0]), 0)
+        result, solver = _contact_scene_rollout(
+            _build_arm_on_box_stack(device), options, inputs, 20, differentiable=True
+        )
+        solver.check_constraint_capacity()
+        with test.subTest(deterministic=deterministic):
+            for attribute in ("joint_q", "joint_qd"):
+                np.testing.assert_allclose(
+                    getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=1.0e-5, atol=2.0e-5
+                )
+
+
+def test_deterministic_rollouts_repeat(test, device):
+    """deterministic=True reserves rows in contact order and sums articulations in order: repeats are bitwise."""
+    options = {**_ARM_ON_BOX_OPTIONS, "deterministic": True}
+    inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
+    results = [
+        _contact_scene_rollout(_build_arm_on_box_stack(device), options, inputs, 20, differentiable=True)[0]
+        for _ in range(3)
+    ]
+    for result in results[1:]:
+        np.testing.assert_array_equal(result.joint_qd.numpy(), results[0].joint_qd.numpy())
+        np.testing.assert_array_equal(result.body_q.numpy(), results[0].body_q.numpy())
+
+
+def test_mixed_world_gradient_matches_finite_difference(test, device):
+    """Tape against central differences through the arm's contact with a free box stack."""
+    model = _build_arm_on_box_stack(device)
+    solver = SolverSteel(model, differentiable=True, **_ARM_ON_BOX_OPTIONS)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    rng = np.random.default_rng(5)
+    wq = wp.array(rng.normal(size=model.joint_coord_count).astype(np.float32), device=device)
+    wqd = wp.array(rng.normal(size=model.joint_dof_count).astype(np.float32), device=device)
+    inputs = _arm_on_box_inputs(model)
+    steps = 4
+
+    def loss_of(joint_f, tape=None):
+        states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        control.joint_f.assign(joint_f)
+        counts = []
+        for k in range(steps):
+            contacts = pipeline.contacts()
+            pipeline.collide(states[k], contacts)
+            counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+            if tape is not None:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], control, contacts, _DT)
+            if tape is not None:
+                tape.__exit__(None, None, None)
+        loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        if tape is not None:
+            tape.__enter__()
+        wp.launch(
+            _weighted_loss,
+            dim=max(model.joint_coord_count, model.joint_dof_count),
+            inputs=[states[-1].joint_q, wq, states[-1].joint_qd, wqd],
+            outputs=[loss],
+            device=device,
+        )
+        if tape is not None:
+            tape.__exit__(None, None, None)
+        return loss, control, counts
+
+    tape = wp.Tape()
+    loss, control, counts = loss_of(inputs["joint_f"], tape)
+    tape.backward(loss)
+    gradient = control.joint_f.grad.numpy().astype(np.float64)
+    eps = 1.0e-2
+    for trial in range(3):
+        direction = rng.normal(size=model.joint_dof_count)
+        direction /= np.linalg.norm(direction)
+        plus = loss_of((inputs["joint_f"] + eps * direction).astype(np.float32))
+        minus = loss_of((inputs["joint_f"] - eps * direction).astype(np.float32))
+        fd = (float(plus[0].numpy()[0]) - float(minus[0].numpy()[0])) / (2.0 * eps)
+        with test.subTest(trial=trial):
+            test.assertEqual(plus[2], counts)
+            test.assertEqual(minus[2], counts)
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -1792,6 +1934,9 @@ for _device in get_test_devices():
             test_matrix_free_contacts_match_default,
             test_contact_torsion_matches_default,
             test_contact_torsion_gradient_matches_finite_difference,
+            test_mixed_world_contacts_match_default,
+            test_deterministic_rollouts_repeat,
+            test_mixed_world_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 
