@@ -116,7 +116,7 @@ class Example:
         builder.add_ground_plane()
 
         inertia = wp.mat33(0.012, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.012)
-        self.input_rocker = builder.add_body(
+        self.input_rocker = builder.add_link(
             xform=wp.transform(
                 wp.vec3(*(self.input_pivot + 0.5 * self.input_length * input_axis)),
                 _quat_from_angle_z(self.input_theta0),
@@ -125,13 +125,13 @@ class Example:
             inertia=inertia,
             label="input_rocker",
         )
-        self.bellcrank = builder.add_body(
+        self.bellcrank = builder.add_link(
             xform=wp.transform(wp.vec3(*self.bell_pivot), wp.quat_identity()),
             mass=1.2,
             inertia=inertia,
             label="rigid_bellcrank",
         )
-        self.output_rocker = builder.add_body(
+        self.output_rocker = builder.add_link(
             xform=wp.transform(
                 wp.vec3(*(self.output_pivot + 0.5 * self.output_length * output_axis)),
                 _quat_from_angle_z(self.output_theta0),
@@ -249,6 +249,9 @@ class Example:
             child_xform=wp.transform(wp.vec3(-0.5 * self.output_length, 0.0, 0.0), wp.quat_identity()),
             label="ground_to_output_rocker",
         )
+        # Each ground joint is its rigid body's tree joint.
+        for joint in (self.j_input_ground, self.j_bell_ground, self.j_output_ground):
+            builder.add_articulation([joint])
         builder.color()
 
         self.model = builder.finalize()

@@ -218,7 +218,7 @@ class Example:
             modal_basis=arm_basis,
             label="flexible_dipper_arm",
         )
-        self.barrel = builder.add_body(
+        self.barrel = builder.add_link(
             xform=wp.transform(wp.vec3(*self.lower_pivot), self.cylinder_quat),
             mass=0.55,
             inertia=actuator_inertia,
@@ -315,6 +315,8 @@ class Example:
             child_xform=wp.transform(wp.vec3(0.0, 0.0, self.weight_offset), wp.quat_identity()),
             label="dipper_tip_to_weight",
         )
+        # The ground joint is the rigid body's tree joint.
+        builder.add_articulation([self.j_cylinder_base])
         builder.color()
 
         self.model = builder.finalize()

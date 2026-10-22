@@ -227,7 +227,7 @@ class Example:
         builder.add_ground_plane()
 
         inertia = wp.mat33(0.012, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.012)
-        self.left_rocker = builder.add_body(
+        self.left_rocker = builder.add_link(
             xform=wp.transform(
                 wp.vec3(*(left_ground + 0.5 * self.left_length * left_axis)), _quat_from_xz_angle(self.theta0)
             ),
@@ -245,7 +245,7 @@ class Example:
             modal_basis=coupler_basis,
             label="elastic_watt_coupler",
         )
-        self.right_rocker = builder.add_body(
+        self.right_rocker = builder.add_link(
             xform=wp.transform(
                 wp.vec3(*(right_ground + 0.5 * self.right_length * right_axis)), _quat_from_xz_angle(theta4)
             ),
@@ -253,7 +253,7 @@ class Example:
             inertia=inertia,
             label="right_rocker",
         )
-        self.follower = builder.add_body(
+        self.follower = builder.add_link(
             xform=wp.transform(wp.vec3(*follower_center), wp.quat_identity()),
             mass=0.5,
             inertia=inertia,
@@ -322,6 +322,9 @@ class Example:
             child_xform=wp.transform_identity(),
             label="vertical_follower_rail",
         )
+        # Each ground joint is its rigid body's tree joint.
+        for joint in (self.j_left_ground, self.j_right_ground, self.j_follower_rail):
+            builder.add_articulation([joint])
         builder.color()
 
         self.model = builder.finalize()

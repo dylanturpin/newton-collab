@@ -115,7 +115,7 @@ class Example:
         builder.add_ground_plane()
 
         inertia = wp.mat33(0.015, 0.0, 0.0, 0.0, 0.015, 0.0, 0.0, 0.0, 0.015)
-        self.crank = builder.add_body(
+        self.crank = builder.add_link(
             xform=wp.transform(
                 wp.vec3(*(np.array([0.0, 0.0, self.z]) + 0.5 * self.crank_length * crank_axis)),
                 _quat_from_angle_z(self.theta0),
@@ -132,7 +132,7 @@ class Example:
             modal_basis=rod_basis,
             label="elastic_connecting_rod",
         )
-        self.slider = builder.add_body(
+        self.slider = builder.add_link(
             xform=wp.transform(wp.vec3(*slider_pin), wp.quat_identity()),
             mass=1.2,
             inertia=inertia,
@@ -182,6 +182,9 @@ class Example:
             child_xform=wp.transform_identity(),
             label="slider_rail",
         )
+        # Each ground joint is its rigid body's tree joint.
+        for joint in (self.j_crank_ground, self.j_slider_ground):
+            builder.add_articulation([joint])
         builder.color()
 
         self.model = builder.finalize()

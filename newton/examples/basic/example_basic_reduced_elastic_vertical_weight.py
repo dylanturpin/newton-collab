@@ -110,7 +110,7 @@ class Example:
         builder.add_ground_plane()
 
         inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01)
-        self.top_fixture = builder.add_body(
+        self.top_fixture = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, self.top_z + 0.045), wp.quat_identity()),
             mass=1.0,
             inertia=inertia,
@@ -160,6 +160,8 @@ class Example:
             child_xform=wp.transform_identity(),
             label="vertical_bar_to_weight",
         )
+        # The ground joint is the rigid body's tree joint.
+        builder.add_articulation([self.j_fixture])
         builder.color()
 
         self.model = builder.finalize()
