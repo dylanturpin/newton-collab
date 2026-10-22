@@ -2642,6 +2642,35 @@ def test_kinematic_velocity_gradient_matches_finite_difference(test, device):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def test_deterministic_gradients_repeat(test, device):
+    """With deterministic=True, repeated rollouts from the same state give bitwise-identical gradients."""
+    model = _build_gripper(device)
+    gradients = []
+    for _ in range(3):
+        solver = SolverSteel(model, differentiable=True, **_PRODUCTION_PROFILE)
+        pipeline = _production_pipeline(model)
+        states = [model.state(requires_grad=True) for _ in range(21)]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        _gripper_targets(control, 0.0)
+        tape = wp.Tape()
+        for k in range(20):
+            contacts = pipeline.contacts()
+            pipeline.collide(states[k], contacts)
+            with tape:
+                solver.step(states[k], states[k + 1], control, contacts, 1.0 / 240.0)
+        tape.backward(grads={states[-1].joint_qd: wp.ones(model.joint_dof_count, dtype=float, device=device)})
+        gradients.append(
+            np.concatenate(
+                [states[0].joint_q.grad.numpy(), states[0].joint_qd.grad.numpy(), control.joint_target_q.grad.numpy()]
+            )
+        )
+    test.assertTrue(np.all(np.isfinite(gradients[0])))
+    test.assertGreater(float(np.abs(gradients[0]).max()), 0.0)
+    for repeat in gradients[1:]:
+        np.testing.assert_array_equal(repeat, gradients[0])
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2725,6 +2754,7 @@ for _device in get_test_devices():
             test_production_profile_gradient_matches_finite_difference,
             test_rigid_velocity_limits_match_default,
             test_rigid_velocity_limits_gradient_matches_finite_difference,
+            test_deterministic_gradients_repeat,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

@@ -178,6 +178,7 @@ class DifferentiableStep:
     def __init__(self, solver: SolverSteel, smooth_contact: SmoothContactLaw | None = None):
         self.solver = solver
         self.smooth_contact = smooth_contact
+        self._ordered_kernels = _ordered_kernel_set(solver) if solver._deterministic else {}
         model = solver.model
         device = model.device
         joint_parent = model.joint_parent.numpy()
@@ -250,6 +251,10 @@ class DifferentiableStep:
         worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
+
+    def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
+        """The copy of ``kernel`` whose atomics, its adjoint's included, reduce in a fixed order under deterministic=True."""
+        return self._ordered_kernels.get(kernel, kernel)
 
     def buffers(self, state_out: State) -> _StepBuffers:
         buffers = getattr(state_out, "_steel_differentiable_buffers", None)
@@ -395,7 +400,7 @@ class DifferentiableStep:
             device=device,
         )
         wp.launch(
-            _project_joint_tau,
+            self._ordered(_project_joint_tau),
             dim=model.joint_dof_count,
             inputs=[
                 self.dof_joint,
@@ -454,7 +459,7 @@ class DifferentiableStep:
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
-                _crba_dense,
+                self._ordered(_crba_dense),
                 dim=(n_arts, size, size),
                 inputs=[
                     solver._group_to_art[size],
@@ -797,7 +802,7 @@ class DifferentiableStep:
 
         if solver._enable_joint_limits:
             wp.launch(
-                _joint_limit_gap,
+                self._ordered(_joint_limit_gap),
                 dim=(solver._world_count, max_rows),
                 inputs=[
                     c.row_count,
@@ -813,7 +818,7 @@ class DifferentiableStep:
             )
         # Rows: geometry recomputed from this step's FK poses; the contact normal is stop-gradient.
         wp.launch(
-            _dense_contact_rows,
+            self._ordered(_dense_contact_rows),
             dim=c.capacity,
             inputs=[
                 c.count,
@@ -873,7 +878,7 @@ class DifferentiableStep:
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
-                _dense_contact_jacobian,
+                self._ordered(_dense_contact_jacobian),
                 dim=(c.capacity, size),
                 inputs=[
                     c.count,
@@ -919,7 +924,7 @@ class DifferentiableStep:
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
-                _hinv_jt_dense,
+                self._ordered(_hinv_jt_dense),
                 dim=n_arts * max_rows,
                 inputs=[
                     b.L[size],
@@ -940,7 +945,7 @@ class DifferentiableStep:
                 # A world's articulations add in a fixed order, so repeated steps are bitwise identical.
                 world_group_start, world_groups = solver._world_groups_by_size[size]
                 wp.launch(
-                    _delassus_dense_ordered,
+                    self._ordered(_delassus_dense_ordered),
                     dim=(solver._world_count, max_rows, max_rows),
                     inputs=[c.J[size], c.Y[size], world_group_start, world_groups, c.row_count, size],
                     outputs=[c.C, c.diag],
@@ -948,7 +953,7 @@ class DifferentiableStep:
                 )
                 continue
             wp.launch(
-                _delassus_dense,
+                self._ordered(_delassus_dense),
                 dim=n_arts * max_rows * max_rows,
                 inputs=[
                     c.J[size],
@@ -992,7 +997,7 @@ class DifferentiableStep:
             if solver._deterministic:
                 world_group_start, world_groups = solver._world_groups_by_size[size]
                 wp.launch(
-                    _taped_rhs_accum_world_par_row,
+                    self._ordered(_taped_rhs_accum_world_par_row),
                     dim=solver._world_count * max_rows,
                     inputs=[
                         c.row_count,
@@ -1010,7 +1015,7 @@ class DifferentiableStep:
                 )
                 continue
             wp.launch(
-                _taped_rhs_accum_world_par_art,
+                self._ordered(_taped_rhs_accum_world_par_art),
                 dim=solver._n_arts_by_size[size],
                 inputs=[
                     c.row_count,
@@ -1143,7 +1148,7 @@ class DifferentiableStep:
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
-                _taped_apply_impulses_world_par_dof,
+                self._ordered(_taped_apply_impulses_world_par_dof),
                 dim=n_arts * size,
                 inputs=[
                     solver._group_to_art[size],
@@ -1616,7 +1621,7 @@ class DifferentiableStep:
         )
         for size in solver._size_groups:
             wp.launch(
-                _torsion_jacobian,
+                self._ordered(_torsion_jacobian),
                 dim=(len(entries), size),
                 inputs=[
                     rows,
@@ -3851,3 +3856,49 @@ def _clamp_row_count(max_rows: int, row_count: wp.array[int]):
     """Rows reserved past the capacity were not written; the count stops at the capacity."""
     world = wp.tid()
     row_count[world] = wp.min(row_count[world], max_rows)
+
+
+_ORDERED_KERNELS: dict[tuple[str, int], wp.Kernel] = {}
+
+
+def _ordered_kernel_set(solver: SolverSteel) -> dict[wp.Kernel, wp.Kernel]:
+    """Deterministic copies of the kernels whose threads share read elements, so their adjoints scatter atomically.
+
+    Warp's deterministic mode records every atomic and reduces the records in a fixed order. Each copy's record
+    bound covers its per-thread loop: rows for the impulse application, a world's DOFs for the right-hand side and
+    the Delassus matrix. The serial per-world sweeps and the per-articulation kernels need none.
+    """
+    plan = solver._model_plan
+    max_size = max(solver._size_groups, default=1)
+    world_dofs = np.bincount(np.maximum(plan.articulation_world, 0), weights=plan.response_dof_count, minlength=1).max()
+    rows = solver._articulation_constraint_max
+    bounds = {
+        _project_joint_tau: 0,
+        _crba_dense: 0,
+        _dense_contact_rows: 0,
+        _dense_contact_jacobian: 0,
+        _torsion_jacobian: 0,
+        _hinv_jt_dense: max_size * max_size,
+        _delassus_dense: max_size,
+        _delassus_dense_ordered: int(world_dofs),
+        _joint_limit_gap: 0,
+        _taped_rhs_accum_world_par_row: int(world_dofs),
+        _taped_rhs_accum_world_par_art: rows * max_size,
+        _taped_apply_impulses_world_par_dof: rows,
+    }
+    kernels = {}
+    for kernel, records in bounds.items():
+        key = (kernel.key, records)
+        if key not in _ORDERED_KERNELS:
+            _ORDERED_KERNELS[key] = wp.kernel(
+                kernel.func,
+                enable_backward=True,
+                module="unique",
+                module_options={
+                    "deterministic": wp.DeterministicMode.RUN_TO_RUN,
+                    "deterministic_max_records": records,
+                    "max_unroll": 32,
+                },
+            )
+        kernels[kernel] = _ORDERED_KERNELS[key]
+    return kernels
