@@ -39,6 +39,8 @@ from .kernels import (
     _compute_body_net_wrench,
     _gyro_skew,
     _is_identity_rotation,
+    accumulate_contact_wrenches_from_impulses,
+    accumulate_torsion_wrenches_from_impulses,
     allocate_joint_velocity_limit_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
@@ -46,12 +48,14 @@ from .kernels import (
     apply_impulses_world_par_dof,
     assign_world_contact_slots,
     compute_composite_inertia,
+    compute_contact_spatial_force_from_impulses,
     compute_link_transform,
     compute_link_velocity,
     compute_velocity_predictor,
     compute_world_contact_bias,
     contact_restitution_fires,
     copy_unarticulated_body_state,
+    eval_post_solve_parent_wrenches,
     fill_contact_world_sort_keys,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
@@ -68,7 +72,9 @@ from .kernels import (
     rhs_accum_world_par_art,
     rhs_accum_world_par_row,
     scan_world_row_requests,
+    subtract_arrays,
     update_qdd_from_velocity,
+    zero_unattached_parent_wrenches,
 )
 
 if TYPE_CHECKING:
@@ -95,6 +101,12 @@ _taped_compute_world_contact_bias = _taped(compute_world_contact_bias)
 _taped_rhs_accum_world_par_art = _taped(rhs_accum_world_par_art)
 _taped_rhs_accum_world_par_row = _taped(rhs_accum_world_par_row)
 _taped_apply_impulses_world_par_dof = _taped(apply_impulses_world_par_dof)
+_taped_compute_contact_spatial_force_from_impulses = _taped(compute_contact_spatial_force_from_impulses)
+_taped_accumulate_contact_wrenches_from_impulses = _taped(accumulate_contact_wrenches_from_impulses)
+_taped_accumulate_torsion_wrenches_from_impulses = _taped(accumulate_torsion_wrenches_from_impulses)
+_taped_eval_post_solve_parent_wrenches = _taped(eval_post_solve_parent_wrenches)
+_taped_zero_unattached_parent_wrenches = _taped(zero_unattached_parent_wrenches)
+_taped_subtract_arrays = _taped(subtract_arrays)
 
 
 def validate_differentiable_options(model: Model, options: dict) -> None:
@@ -280,8 +292,6 @@ class DifferentiableStep:
             self.validate_contacts()
         if state_in is state_out:
             raise ValueError("differentiable=True requires distinct input and output states")
-        if observables is not None or state_out.body_parent_f is not None:
-            raise NotImplementedError("differentiable=True does not publish solver observables or State.body_parent_f")
         if control is None:
             control = model.control(clone_variables=False)
         # Deferred: the solver module imports this one.
@@ -595,6 +605,7 @@ class DifferentiableStep:
             device=device,
         )
         eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+        self._publish_observables(b, state_in, state_out, contacts, dt, observables, stage_qd)
         self.finish_friction_patches(b, state_out, contacts, dt)
         solver._step += 1
         return state_out
@@ -1377,6 +1388,159 @@ class DifferentiableStep:
             record_tape=False,
         )
 
+    def _publish_observables(
+        self,
+        b: _StepBuffers,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+        observables: SolverBase.Observables | None,
+        stage_qd: wp.array,
+    ) -> None:
+        """CONTACT_F and BODY_PARENT_F, and State.body_parent_f, from this step's solved impulses, on the tape."""
+        # Deferred: the solver module imports this one.
+        from ..solver import SolverBase  # noqa: PLC0415
+
+        solver = self.solver
+        model = solver.model
+        device = model.device
+        contact_kind, parent_kind = SolverBase.ObservableKind.CONTACT_F, SolverBase.ObservableKind.BODY_PARENT_F
+        contact_f = (
+            observables.contact_f if observables is not None and observables.is_requested(contact_kind) else None
+        )
+        parent_targets = [
+            target
+            for target in (
+                observables.body_parent_f
+                if observables is not None and observables.is_requested(parent_kind)
+                else None,
+                state_out.body_parent_f,
+            )
+            if target is not None
+        ]
+        c = b.contacts if contacts is not None else None
+        inv_dt = 1.0 / dt
+        if contact_f is not None:
+            if c is None or not model.joint_count:
+                contact_f.zero_()
+            else:
+                wp.launch(
+                    _taped_compute_contact_spatial_force_from_impulses,
+                    dim=contact_f.shape[0],
+                    inputs=[c.count, c.normal, *_contact_force_inputs(c), inv_dt, contacts.rigid_contact_max],
+                    outputs=[contact_f],
+                    device=device,
+                )
+        if not parent_targets:
+            return
+        body_parent_f = parent_targets[0]
+        if not model.articulation_count:
+            body_parent_f.zero_()
+        else:
+            o = b.observable_buffers()
+            if c is not None and contacts.rigid_contact_max:
+                wp.launch(
+                    self._ordered(_taped_accumulate_contact_wrenches_from_impulses),
+                    dim=c.capacity,
+                    inputs=[
+                        c.count,
+                        c.capacity,
+                        c.point0,
+                        c.point1,
+                        c.normal,
+                        c.shape0,
+                        c.shape1,
+                        c.margin0,
+                        c.margin1,
+                        model.shape_body,
+                        b.body_q,
+                        solver._body_to_articulation,
+                        b.articulation_origin,
+                        *_contact_force_inputs(c),
+                        int(solver._contact_shared_anchor),
+                        int(solver._contact_friction_shared_anchor),
+                        solver._friction_patches.view,
+                        inv_dt,
+                    ],
+                    outputs=[o.contact_wrench, o.dense_slot_contact],
+                    device=device,
+                )
+                if solver._contact_torsion_enabled:
+                    wp.launch(
+                        self._ordered(_taped_accumulate_torsion_wrenches_from_impulses),
+                        dim=o.dense_slot_contact.shape,
+                        inputs=[
+                            c.row_count,
+                            c.row_type,
+                            c.row_parent,
+                            c.impulses[solver._iterations],
+                            o.dense_slot_contact,
+                            c.count,
+                            c.capacity,
+                            c.world,
+                            c.slot,
+                            c.path,
+                            c.normal,
+                            c.shape0,
+                            c.shape1,
+                            model.shape_body,
+                            inv_dt,
+                        ],
+                        outputs=[o.contact_wrench],
+                        device=device,
+                    )
+            prescale = None
+            if stage_qd is not state_in.joint_qd:
+                # The dynamics start from the prescaled velocities; the acceleration is measured from the input.
+                wp.launch(
+                    _taped_subtract_arrays,
+                    dim=model.joint_dof_count,
+                    inputs=[state_in.joint_qd, stage_qd],
+                    outputs=[o.prescale],
+                    device=device,
+                )
+                prescale = o.prescale
+            wp.launch(
+                _taped_eval_post_solve_parent_wrenches,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    solver._articulation_joint_end,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    b.joint_S_s,
+                    b.joint_qdd_out,
+                    prescale,
+                    inv_dt,
+                    b.body_f_s,
+                    state_in.body_f if state_in.body_count else None,
+                    o.contact_wrench,
+                    model.body_flags,
+                    b.body_q,
+                    model.body_com,
+                    model.body_mass,
+                    model.body_inertia,
+                    b.articulation_origin,
+                    solver._dynamics_art_active,
+                    o.body_a_s,
+                    o.body_ft_s,
+                ],
+                outputs=[body_parent_f],
+                device=device,
+            )
+            wp.launch(
+                _taped_zero_unattached_parent_wrenches,
+                dim=model.body_count,
+                inputs=[solver._body_to_articulation],
+                outputs=[body_parent_f],
+                device=device,
+            )
+        for target in parent_targets[1:]:
+            wp.copy(target, body_parent_f)
+
     def finish_friction_patches(self, b: _StepBuffers, state_out: State, contacts: Contacts | None, dt: float) -> None:
         """Cache the solved patch friction and the poses for the next step's history, as the default step does."""
         solver = self.solver
@@ -1693,6 +1857,7 @@ class _StepBuffers:
         self.v_gyro = zeros(dofs)
         self.gyro_iterates = zeros((max(solver._free_root_joint_count, 1), _GYRO_MAX_MICROSTEPS + 1), wp.vec3)
         self.contacts = None
+        self.observables = None
         self.H = {}
         self.L = {}
         self.factor_tmp = {}
@@ -1701,6 +1866,11 @@ class _StepBuffers:
             self.H[size] = zeros((n_arts, size, size))
             self.L[size] = zeros((n_arts, size, size))
             self.factor_tmp[size] = zeros((n_arts, 2, size, size))
+
+    def observable_buffers(self) -> _ObservableBuffers:
+        if self.observables is None:
+            self.observables = _ObservableBuffers(self.owner.solver)
+        return self.observables
 
     def contact_buffers(self, contacts: Contacts | None) -> _ContactBuffers:
         capacity = 1 if contacts is None else contacts.rigid_contact_max
@@ -3885,6 +4055,8 @@ def _ordered_kernel_set(solver: SolverSteel) -> dict[wp.Kernel, wp.Kernel]:
         _taped_rhs_accum_world_par_row: int(world_dofs),
         _taped_rhs_accum_world_par_art: rows * max_size,
         _taped_apply_impulses_world_par_dof: rows,
+        _taped_accumulate_contact_wrenches_from_impulses: 0,
+        _taped_accumulate_torsion_wrenches_from_impulses: 0,
     }
     kernels = {}
     for kernel, records in bounds.items():
@@ -3902,3 +4074,40 @@ def _ordered_kernel_set(solver: SolverSteel) -> dict[wp.Kernel, wp.Kernel]:
             )
         kernels[kernel] = _ORDERED_KERNELS[key]
     return kernels
+
+
+class _ObservableBuffers:
+    """One step's scratch for the published joint wrenches."""
+
+    def __init__(self, solver: SolverSteel):
+        device = solver.model.device
+        bodies = max(solver.model.body_count, 1)
+        self.contact_wrench = wp.zeros(bodies, dtype=wp.spatial_vector, device=device, requires_grad=True)
+        self.body_a_s = wp.zeros(bodies, dtype=wp.spatial_vector, device=device, requires_grad=True)
+        self.body_ft_s = wp.zeros(bodies, dtype=wp.spatial_vector, device=device, requires_grad=True)
+        self.prescale = wp.zeros(max(solver.model.joint_dof_count, 1), dtype=float, device=device, requires_grad=True)
+        self.dense_slot_contact = wp.full(
+            (solver._world_count, max(solver._articulation_constraint_max, 1)), -1, dtype=int, device=device
+        )
+
+
+def _contact_force_inputs(c: _ContactBuffers) -> list:
+    """The routes, impulses and rows the contact-force kernels read; free-body rows live in the dense arrays."""
+    impulses = c.impulses[-1]
+    return [
+        c.world,
+        c.slot,
+        c.path,
+        impulses,
+        impulses,
+        impulses,
+        c.row_count,
+        c.row_count,
+        c.row_count,
+        c.row_type,
+        c.row_parent,
+        c.row_type,
+        c.row_parent,
+        c.row_type,
+        c.row_parent,
+    ]

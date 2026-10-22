@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import math
 import unittest
 import warnings
@@ -202,13 +203,6 @@ def test_rejects_unsupported_configs(test, device):
     state = model.state(requires_grad=True)
     with test.assertRaisesRegex(ValueError, "distinct input and output states"):
         solver.step(state, state, None, None, _DT)
-    observables = solver.observables({newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F})
-    with test.assertRaisesRegex(NotImplementedError, "observables"):
-        solver.step(state, model.state(requires_grad=True), None, None, _DT, observables=observables)
-    with test.assertWarns(DeprecationWarning):
-        model.request_state_attributes("body_parent_f")
-    with test.assertRaisesRegex(NotImplementedError, "body_parent_f"):
-        solver.step(state, model.state(requires_grad=True), None, None, _DT)
 
 
 def test_forward_matches_default(test, device):
@@ -2671,6 +2665,95 @@ def test_deterministic_gradients_repeat(test, device):
         np.testing.assert_array_equal(repeat, gradients[0])
 
 
+_OBSERVABLE_KINDS = {
+    newton.solvers.SolverBase.ObservableKind.CONTACT_F,
+    newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F,
+}
+
+
+def _observed_rollout(model, options, inputs, steps, *, differentiable, tape=None, dt=_DT):
+    """Step a contact scene and return each step's state, CONTACT_F and BODY_PARENT_F observables."""
+    solver = SolverSteel(model, differentiable=differentiable, **options)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    states[0].joint_q.assign(inputs["joint_q"])
+    states[0].joint_qd.assign(inputs["joint_qd"])
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control = model.control()
+    control.joint_f.assign(inputs["joint_f"])
+    records = []
+    for k in range(steps):
+        pipeline.collide(states[k], contacts)
+        # Fresh buffers per step so the tape seeds only the last step's observables.
+        observables = solver.observables(_OBSERVABLE_KINDS, contacts=contacts)
+        with tape if tape is not None else contextlib.nullcontext():
+            solver.step(states[k], states[k + 1], control, contacts, dt, observables=observables)
+        records.append((observables.contact_f.numpy().copy(), observables.body_parent_f.numpy().copy()))
+    return states, control, observables, records
+
+
+def test_observables_match_default(test, device):
+    """CONTACT_F and BODY_PARENT_F of the differentiable step follow the default step's."""
+    scenes = [("box_chain", lambda requires_grad: _build_box_chain_on_plane(device, requires_grad=requires_grad), {})]
+    if wp.get_device(device).is_cuda:
+        scenes.append(
+            (
+                "arm_on_boxes",
+                lambda requires_grad: _build_arm_on_box_stack(device, requires_grad=requires_grad),
+                {"solve_mode": "matrix_free", "articulation_constraint_max": 64, "contact_regularization": 0.01},
+            )
+        )
+    for name, build, extra in scenes:
+        options = {"friction_anchor_beta": 0.0, "iterations": 16, **extra}
+        model = build(False)
+        inputs = _arm_on_box_inputs(model) if name == "arm_on_boxes" else _contact_inputs(model)
+        _, _, _, reference = _observed_rollout(model, options, inputs, 6, differentiable=False)
+        _, _, _, result = _observed_rollout(build(True), options, inputs, 6, differentiable=True)
+        for k, ((contact_ref, parent_ref), (contact, parent)) in enumerate(zip(reference, result, strict=True)):
+            with test.subTest(scene=name, step=k):
+                test.assertGreater(float(np.abs(contact_ref).max()), 0.0)
+                np.testing.assert_allclose(contact, contact_ref, rtol=1.0e-4, atol=1.0e-3)
+                np.testing.assert_allclose(parent, parent_ref, rtol=1.0e-4, atol=1.0e-3)
+
+
+def test_observables_gradient_matches_finite_difference(test, device):
+    """Tape against central differences of a loss on CONTACT_F and BODY_PARENT_F."""
+    model = _build_box_chain_on_plane(device)
+    inputs = _contact_inputs(model)
+    options = {"friction_anchor_beta": 0.0, "iterations": 16}
+    rng = np.random.default_rng(31)
+    contact_weights = rng.normal(size=(64, 6)).astype(np.float32)
+    parent_weights = rng.normal(size=(model.body_count, 6)).astype(np.float32)
+
+    def loss_of(joint_f, tape=None):
+        values = {**inputs, "joint_f": joint_f}
+        _, control, observables, records = _observed_rollout(model, options, values, 3, differentiable=True, tape=tape)
+        contact, parent = records[-1]
+        return float(np.sum(contact_weights * contact) + np.sum(parent_weights * parent)), control, observables
+
+    tape = wp.Tape()
+    _, control, observables = loss_of(inputs["joint_f"], tape)
+    tape.backward(
+        grads={
+            observables.contact_f: wp.array(contact_weights, dtype=wp.spatial_vector, device=device),
+            observables.body_parent_f: wp.array(parent_weights, dtype=wp.spatial_vector, device=device),
+        }
+    )
+    gradient = control.joint_f.grad.numpy().astype(np.float64)
+    test.assertGreater(float(np.abs(gradient).max()), 0.0)
+    # Large step: the float32 loss is too noisy for central differences below this.
+    eps = 1.0e-1
+    for trial in range(3):
+        direction = rng.normal(size=model.joint_dof_count)
+        direction /= np.linalg.norm(direction)
+        plus = loss_of((inputs["joint_f"] + eps * direction).astype(np.float32))[0]
+        minus = loss_of((inputs["joint_f"] - eps * direction).astype(np.float32))[0]
+        fd = (plus - minus) / (2.0 * eps)
+        with test.subTest(trial=trial):
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=5.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2732,6 +2815,8 @@ for _device in get_test_devices():
         test_joint_limits_gradient_matches_finite_difference,
         test_kinematic_bodies_match_default,
         test_kinematic_velocity_gradient_matches_finite_difference,
+        test_observables_match_default,
+        test_observables_gradient_matches_finite_difference,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
