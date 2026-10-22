@@ -189,8 +189,6 @@ def test_rejects_unsupported_configs(test, device):
         {"articulated_contact_response": "propagation"},
         {"articulated_contact_response": "propagation_colored"},
         {"update_mass_matrix_interval": 2},
-        {"enable_joint_limits": True},
-        {"enable_joint_velocity_limits": True},
         {"enable_joint_friction": True},
         {"contact_compliance": True},
         {"drive_mode": "rows"},
@@ -1913,6 +1911,141 @@ def test_matrix_free_restitution_matches_default(test, device):
                 )
 
 
+def _build_limited_chain(device, *, requires_grad=True, velocity_limit=1.0e6):
+    """Three hinges with position limits [-0.3, 0.4] rad and a joint velocity limit [rad/s]."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    parent = -1
+    joints = []
+    for i in range(3):
+        body = builder.add_link(
+            mass=1.0 + 0.3 * i, inertia=wp.mat33(np.diag([0.02, 0.03, 0.015])), com=wp.vec3(0.25, 0.0, 0.0)
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                body,
+                parent_xform=wp.transform(wp.vec3(0.5 if parent >= 0 else 0.0, 0.0, 0.0), wp.quat_identity()),
+                axis=(0.0, 1.0, 0.0),
+                armature=0.01,
+                limit_lower=-0.3,
+                limit_upper=0.4,
+                velocity_limit=velocity_limit,
+            )
+        )
+        parent = body
+    builder.add_articulation(joints)
+    return builder.finalize(device=device, requires_grad=requires_grad)
+
+
+_LIMIT_FORCE = np.array([5.0, -3.0, 2.0], np.float32)
+
+
+def _limit_cases(device):
+    cases = [("split", {"enable_joint_limits": True, "joint_limit_activation_gap": 0.2}, 1.0e6)]
+    if wp.get_device(device).is_cuda:
+        cases += [
+            ("matrix_free", {"enable_joint_limits": True, "joint_limit_activation_gap": 0.2}, 1.0e6),
+            ("matrix_free", {"enable_joint_velocity_limits": True, "velocity_limit_activation_fraction": 0.7}, 1.5),
+            (
+                "matrix_free",
+                {
+                    "enable_joint_limits": True,
+                    "joint_limit_activation_gap": 0.2,
+                    "enable_joint_velocity_limits": True,
+                    "velocity_limit_activation_fraction": 0.7,
+                    "deterministic": True,
+                },
+                1.5,
+            ),
+        ]
+    return cases
+
+
+def _limited_rollout(model, solver, joint_f, steps, joint_qd=None, tape=None):
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    if joint_qd is not None:
+        states[0].joint_qd.assign(joint_qd)
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control = model.control()
+    control.joint_f.assign(joint_f)
+    if tape is not None:
+        tape.__enter__()
+    for k in range(steps):
+        solver.step(states[k], states[k + 1], control, None, _DT)
+    if tape is not None:
+        tape.__exit__(None, None, None)
+    return states, control
+
+
+def test_joint_limits_match_default(test, device):
+    """Position-limit rows, velocity-limit rows and the velocity prescale follow the default step."""
+    for solve_mode, limit_options, velocity_limit in _limit_cases(device):
+        options = {"solve_mode": solve_mode, "iterations": 12, **limit_options}
+        model = _build_limited_chain(device, requires_grad=False, velocity_limit=velocity_limit)
+        reference = _limited_rollout(model, SolverSteel(model, **options), _LIMIT_FORCE, 40)[0][-1]
+        model = _build_limited_chain(device, requires_grad=False, velocity_limit=velocity_limit)
+        free = _limited_rollout(model, SolverSteel(model, solve_mode=solve_mode, iterations=12), _LIMIT_FORCE, 40)[0][
+            -1
+        ]
+        model = _build_limited_chain(device, velocity_limit=velocity_limit)
+        result = _limited_rollout(model, SolverSteel(model, differentiable=True, **options), _LIMIT_FORCE, 40)[0][-1]
+        with test.subTest(**options):
+            test.assertGreater(float(np.abs(free.joint_q.numpy() - reference.joint_q.numpy()).max()), 0.5)
+            for attribute in ("joint_q", "joint_qd"):
+                np.testing.assert_allclose(
+                    getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=0.0, atol=1.0e-5
+                )
+
+
+def test_joint_limits_gradient_matches_finite_difference(test, device):
+    """Tape against central differences with active position- and velocity-limit rows."""
+    for solve_mode, limit_options, velocity_limit in _limit_cases(device):
+        options = {"solve_mode": solve_mode, "iterations": 12, **limit_options}
+        model = _build_limited_chain(device, velocity_limit=velocity_limit)
+        solver = SolverSteel(model, differentiable=True, **options)
+        # Start inside the activation band and push toward the limits.
+        qd0 = np.array([1.2, -1.3, 1.1], np.float32)
+        rng = np.random.default_rng(13)
+        wq = rng.normal(size=3)
+
+        def loss_of(joint_f, joint_qd, tape=None, model=model, solver=solver, wq=wq):
+            states, control = _limited_rollout(model, solver, joint_f, 10, joint_qd, tape)
+            final = states[-1]
+            return float(wq @ final.joint_q.numpy() + wq @ final.joint_qd.numpy()), states, control
+
+        tape = wp.Tape()
+        _, states, control = loss_of(_LIMIT_FORCE, qd0, tape)
+        seed = wp.array(wq.astype(np.float32), dtype=float, device=device)
+        tape.backward(grads={states[-1].joint_q: seed, states[-1].joint_qd: seed})
+        gradients = {"joint_f": control.joint_f.grad.numpy(), "joint_qd": states[0].joint_qd.grad.numpy()}
+        rows = [int(state._steel_differentiable_buffers.contacts.row_count.numpy()[0]) for state in states[1:]]
+        test.assertGreater(max(rows), 0)
+        eps = 1.0e-3
+        for name, gradient in gradients.items():
+            for trial in range(2):
+                direction = rng.normal(size=3)
+                direction /= np.linalg.norm(direction)
+                values = []
+                for sign in (1.0, -1.0):
+                    joint_f, joint_qd = _LIMIT_FORCE, qd0
+                    if name == "joint_f":
+                        joint_f = (_LIMIT_FORCE + sign * eps * direction).astype(np.float32)
+                    else:
+                        joint_qd = (qd0 + sign * eps * direction).astype(np.float32)
+                    loss, perturbed, _ = loss_of(joint_f, joint_qd)
+                    test.assertEqual(
+                        [
+                            int(state._steel_differentiable_buffers.contacts.row_count.numpy()[0])
+                            for state in perturbed[1:]
+                        ],
+                        rows,
+                    )
+                    values.append(loss)
+                fd = (values[0] - values[1]) / (2.0 * eps)
+                with test.subTest(**options, input=name, trial=trial):
+                    test.assertAlmostEqual(float(gradient @ direction), fd, delta=3.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -1970,6 +2103,8 @@ for _device in get_test_devices():
         test_taped_kernels_keep_adjoints,
         test_runtime_disabled_tree_joint_is_reported,
         test_unarticulated_body_contact_matches_default,
+        test_joint_limits_match_default,
+        test_joint_limits_gradient_matches_finite_difference,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
