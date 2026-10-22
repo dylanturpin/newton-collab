@@ -1784,7 +1784,7 @@ class DifferentiableStep:
             _clamp_row_count,
             dim=solver._world_count,
             inputs=[solver._articulation_constraint_max],
-            outputs=[c.row_count],
+            outputs=[c.row_count, solver._row_dropped_dense],
             device=model.device,
             record_tape=False,
         )
@@ -4200,10 +4200,13 @@ def _rigid_velocity_limit_rows(
 
 
 @wp.kernel
-def _clamp_row_count(max_rows: int, row_count: wp.array[int]):
-    """Rows reserved past the capacity were not written; the count stops at the capacity."""
+def _clamp_row_count(max_rows: int, row_count: wp.array[int], dropped: wp.array[int]):
+    """Rows reserved past the capacity were not written: count them as dropped and stop the count at the capacity."""
     world = wp.tid()
-    row_count[world] = wp.min(row_count[world], max_rows)
+    requested = row_count[world]
+    if requested > max_rows:
+        dropped[world] += requested - max_rows
+        row_count[world] = max_rows
 
 
 _ORDERED_KERNELS: dict[tuple[str, int], wp.Kernel] = {}

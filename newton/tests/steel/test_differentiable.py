@@ -2660,6 +2660,34 @@ def test_rigid_velocity_limits_match_default(test, device):
             np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
 
 
+def test_rigid_velocity_limit_rows_report_overflow(test, device):
+    """Speed-limit rows past articulation_constraint_max fail check_constraint_capacity; enough capacity passes."""
+    for capacity, overflows in ((4, True), (32, False)):
+        model = _build_speed_limited_boxes(device)
+        values = _speed_limited_inputs(model)
+        solver = SolverSteel(
+            model,
+            differentiable=True,
+            solve_mode="matrix_free",
+            friction_anchor_beta=0.0,
+            articulation_constraint_max=capacity,
+            iterations=8,
+        )
+        state, output = model.state(requires_grad=True), model.state(requires_grad=True)
+        state.joint_q.assign(values["joint_q"])
+        state.joint_qd.assign(values["joint_qd"])
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        solver.step(state, output, model.control(), None, 1.0 / 240.0)
+        with test.subTest(capacity=capacity):
+            test.assertEqual(bool(solver.constraint_overflow.numpy().any()), overflows)
+            if overflows:
+                with test.assertRaises(RuntimeError):
+                    solver.check_constraint_capacity()
+            else:
+                solver.check_constraint_capacity()
+                test.assertLess(float(np.abs(output.joint_qd.numpy()).max()), 2.0 + 1.0e-3)
+
+
 def test_rigid_velocity_limits_gradient_matches_finite_difference(test, device):
     """Tape against central differences with active free-body speed-limit rows."""
     model = _build_speed_limited_boxes(device)
@@ -3045,6 +3073,7 @@ for _device in get_test_devices():
             test_production_profile_gradient_matches_finite_difference,
             test_rigid_velocity_limits_match_default,
             test_rigid_velocity_limits_gradient_matches_finite_difference,
+            test_rigid_velocity_limit_rows_report_overflow,
             test_deterministic_gradients_repeat,
             test_drive_rows_match_default,
             test_drive_rows_gradient_matches_finite_difference,
