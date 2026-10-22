@@ -2057,9 +2057,14 @@ class TestSleepingColoredPropagation(unittest.TestCase):
         np.testing.assert_array_equal(after[body_world != 2], before[body_world != 2])
         scene.step()
         self.assertFalse(scene.asleep_this_step()[body_world == 2].any())
-        contact_world = scene.solver._contact_world.numpy()[: int(scene.contacts.rigid_contact_count.numpy()[0])]
+        count = int(scene.contacts.rigid_contact_count.numpy()[0])
+        contact_world = scene.solver._contact_world.numpy()[:count]
+        # Contacts beyond the gap limit get no rows and are never colored.
+        routed = scene.solver._contact_path.numpy()[:count] == 2
         contact, _body_a, _body_b = scene.units()
-        np.testing.assert_array_equal(np.sort(contact[contact_world[contact] == 2]), np.flatnonzero(contact_world == 2))
+        np.testing.assert_array_equal(
+            np.sort(contact[contact_world[contact] == 2]), np.flatnonzero((contact_world == 2) & routed)
+        )
         self.assertTrue(set(np.flatnonzero((body_world == 2) & (before == 0)).tolist()) <= colored_bodies())
 
         # Notification: changing one sleeping body's mass wakes its island in world 3 only.
