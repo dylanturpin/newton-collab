@@ -1925,7 +1925,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_same_articulation_rows: bool = False,
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
-        propagation_color_order: Literal["contact", "longest_first"] = "contact",
         row_schedule: Literal["interleaved", "contact_then_internal", "phased"] = "interleaved",
         friction_mode: Literal["fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton"] = "fixed_normal",
         free_body_constraint_max: int = 512,
@@ -1959,6 +1958,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         deterministic: bool = False,
+        propagation_color_order: Literal["contact", "longest_first"] = "contact",
     ):
         """
         Args:
