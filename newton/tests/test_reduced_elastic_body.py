@@ -4035,7 +4035,11 @@ def test_elastic_chair_stick_slip_example(test, device):
     asset_dir = chair_asset_cache_dir()
     if not all((asset_dir / filename).is_file() for filename in (CHAIR_GLTF_NAME, CHAIR_BIN_NAME)):
         test.skipTest("Poly Haven chair asset is not cached; the offline unit suite does not download it")
-    _run_reduced_elastic_contact_example(ChairStickSlipExample, 240, device)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="rigid_compliant_alm=False is deprecated", category=DeprecationWarning
+        )
+        _run_reduced_elastic_contact_example(ChairStickSlipExample, 240, device)
 
 
 class TestReducedElasticBody(unittest.TestCase):

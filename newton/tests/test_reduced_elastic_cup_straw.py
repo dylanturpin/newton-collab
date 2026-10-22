@@ -3,6 +3,7 @@
 """Focused geometry, POD and integration tests for the single-cap example."""
 
 import unittest
+import warnings
 from collections import Counter
 from types import SimpleNamespace
 
@@ -143,6 +144,12 @@ class TestCapBasis(unittest.TestCase):
         audit = self.data[3]
         self.assertLess(audit["snapshot_max_vertex_error_m"], 0.0015)
         self.assertLess(audit["bending_energy_relative_rms_fit_error"], 0.04)
+
+
+def setUpModule():
+    # The example runs the legacy VBD penalty path on purpose.
+    unittest.addModuleCleanup(warnings.filters.__setitem__, slice(None), warnings.filters[:])
+    warnings.filterwarnings("ignore", message="rigid_compliant_alm=False is deprecated", category=DeprecationWarning)
 
 
 def test_stirring_requires_contact(test, device):
