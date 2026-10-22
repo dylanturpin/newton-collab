@@ -336,8 +336,6 @@ class Example:
             self.model,
             iterations=self.solver_iterations,
             rigid_compliant_alm=True,
-            rigid_joint_linear_k_start=5.0e5,
-            rigid_joint_angular_k_start=5.0e5,
             rigid_joint_linear_ke=5.0e5,
             rigid_joint_angular_ke=5.0e5,
             rigid_joint_linear_kd=3.0e-5,

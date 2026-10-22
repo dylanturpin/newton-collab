@@ -103,7 +103,6 @@ class Example:
             self.model,
             iterations=self.solver_iterations,
             rigid_compliant_alm=True,
-            rigid_contact_k_start=8.0e4,
             rigid_body_contact_buffer_size=64,
             friction_epsilon=2.0e-3,
             elastic_body_relaxation=0.6,

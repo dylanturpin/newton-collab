@@ -242,7 +242,6 @@ def _assert_elastic_modal_projection_matches_joint_force(test, device, joint_kin
     solver = newton.solvers.SolverVBD(
         model,
         iterations=1,
-        rigid_joint_linear_k_start=k,
         rigid_joint_linear_ke=k,
         rigid_joint_angular_ke=0.0,
         rigid_joint_linear_kd=0.0,
@@ -1941,7 +1940,6 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
-            rigid_contact_k_start=1000.0,
             rigid_body_contact_buffer_size=contact_buffer_size,
             elastic_body_relaxation=1.0,
         )
@@ -2446,8 +2444,6 @@ def test_elastic_euler_modal_force(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=24,
-        rigid_joint_linear_k_start=joint_k,
-        rigid_joint_angular_k_start=joint_k,
         rigid_joint_linear_ke=joint_k,
         rigid_joint_angular_ke=joint_k,
         rigid_joint_linear_kd=0.0,
@@ -2873,7 +2869,6 @@ def test_vbd_revolute_constraint_solves_elastic_mode(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=4,
-        rigid_joint_linear_k_start=1.0e6,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_linear_kd=0.0,
     )
@@ -2903,8 +2898,6 @@ def test_vbd_fixed_joint_stiffness_pins_penalties(test, device):
         model,
         iterations=2,
         rigid_compliant_alm=True,
-        rigid_joint_linear_k_start=10.0,
-        rigid_joint_angular_k_start=5.0,
         rigid_joint_linear_ke=1234.0,
         rigid_joint_angular_ke=567.0,
         rigid_joint_adaptive_stiffness=False,
@@ -3417,9 +3410,7 @@ def test_vbd_rigid_angular_damping_includes_modal_velocity(test, device):
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
-            rigid_joint_linear_k_start=0.0,
             rigid_joint_linear_ke=0.0,
-            rigid_joint_angular_k_start=angular_k,
             rigid_joint_angular_ke=angular_k,
             rigid_joint_angular_kd=angular_kd,
             rigid_joint_adaptive_stiffness=False,
@@ -3767,8 +3758,6 @@ def test_vbd_prismatic_rotates_elastic_child(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=20,
-        rigid_joint_linear_k_start=1.0e5,
-        rigid_joint_angular_k_start=1.0e5,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_angular_ke=1.0e6,
     )

@@ -163,8 +163,6 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=24,
-            rigid_joint_linear_k_start=1.0e5,
-            rigid_joint_angular_k_start=1.0e5,
             rigid_joint_linear_ke=2.0e6,
             rigid_joint_angular_ke=2.0e6,
         )
