@@ -3,6 +3,7 @@
 
 import math
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -182,7 +183,6 @@ def test_rejects_unsupported_configs(test, device):
     model = _build_chain(device)
     for kwargs in (
         {"contact_warmstart": True},
-        {"friction_anchor_beta": 0.2},
         {"enable_torsional_rolling_friction": True},
         {"articulated_contact_response": "propagation"},
         {"articulated_contact_response": "propagation_colored"},
@@ -486,7 +486,6 @@ def test_contact_rejects_unsupported_configs(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     unsupported = [
-        {**_CONTACT_OPTIONS, "contact_friction_gap_max": None, "contact_friction_shared_anchor": True},
         {**_CONTACT_OPTIONS, "contact_regularization": 0.1},
     ]
     for options in unsupported:
@@ -963,22 +962,21 @@ def test_frictional_impact_matches_default(test, device):
 
 
 def test_contact_law_options(test, device):
-    """Omitted patch friction raises; shared anchors and runtime depenetration clamps follow the default."""
-    model = _build_free_shape(device, "box")
-    state = model.state(requires_grad=True)
-    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    contacts = newton.CollisionPipeline(model, rigid_contact_max=16).contacts()
-    solver = SolverSteel(model, differentiable=True)
-    with test.assertRaisesRegex(NotImplementedError, "friction_anchor_beta=0"):
-        solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
-
+    """Shared anchors, the default patch friction and runtime depenetration clamps follow the default."""
     q0 = [0.0, 0.0, 0.09, 0.0, 0.0, 0.0, 1.0]
     qd0 = np.array([0.4, 0.1, 0.0, 0.0, 0.0, 0.2], np.float32)
-    for options, clamp in (({"contact_shared_anchor": True}, None), ({}, 0.05)):
+    cases = (
+        ({"friction_anchor_beta": 0.0, "contact_shared_anchor": True}, None),
+        ({"friction_anchor_beta": 0.0, "contact_friction_shared_anchor": True}, None),
+        ({"friction_anchor_beta": 0.0}, 0.05),
+        # An omitted friction_anchor_beta selects the default persistent patch friction.
+        ({}, None),
+    )
+    for options, clamp in cases:
         results = {}
         for differentiable in (False, True):
             model = _build_free_shape(device, "box", requires_grad=differentiable)
-            solver = SolverSteel(model, differentiable=differentiable, friction_anchor_beta=0.0, **options)
+            solver = SolverSteel(model, differentiable=differentiable, **options)
             if clamp is not None:
                 solver._rigid_body_max_depenetration_velocity.fill_(clamp)
             results[differentiable] = _free_body_rollout(model, solver, q0, qd0, 4, _DT)[0][-1]
@@ -1079,9 +1077,11 @@ def _pair_sweep(device, a, c, d, rhs, seed=(0.0, 1.0, 0.0)):
                 0,
                 0,
                 array([[0.0, 0.0, 0.0]]),
+                0,
+                array([[0, 0, 0]], int),
                 array([[0.0, 0.0, 0.0]]),
             ],
-            outputs=[residuals, impulses],
+            outputs=[residuals, wp.zeros((1, 3), device=device), impulses],
             device=device,
         )
     tape.backward(grads={impulses: array([seed])})
@@ -1723,24 +1723,30 @@ def test_contact_torsion_gradient_matches_finite_difference(test, device):
                 test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
-def _build_arm_on_box_stack(device, *, requires_grad=True):
-    """A two-link arm pressing a stack of two free boxes on the ground, all in one world."""
+def _build_arm_on_box_stack(device, *, requires_grad=True, stack=True):
+    """A two-link arm pressing a stack of two free boxes, or one box, on the ground, all in one world."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.0)
     builder.add_ground_plane(cfg=cfg)
     lower = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0995), wp.quat_identity()))
     builder.add_shape_box(lower, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
-    upper = builder.add_body(xform=wp.transform(wp.vec3(0.02, 0.01, 0.2985), wp.quat_identity()))
-    builder.add_shape_box(upper, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    if stack:
+        upper = builder.add_body(xform=wp.transform(wp.vec3(0.02, 0.01, 0.2985), wp.quat_identity()))
+        builder.add_shape_box(upper, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    height = 0.6 if stack else 0.4
     inertia = wp.mat33(np.eye(3) * 0.01)
-    link0 = builder.add_link(mass=1.0, inertia=inertia, xform=wp.transform(wp.vec3(-0.3, 0.0, 0.6), wp.quat_identity()))
-    link1 = builder.add_link(mass=0.5, inertia=inertia, xform=wp.transform(wp.vec3(0.0, 0.0, 0.6), wp.quat_identity()))
+    link0 = builder.add_link(
+        mass=1.0, inertia=inertia, xform=wp.transform(wp.vec3(-0.3, 0.0, height), wp.quat_identity())
+    )
+    link1 = builder.add_link(
+        mass=0.5, inertia=inertia, xform=wp.transform(wp.vec3(0.0, 0.0, height), wp.quat_identity())
+    )
     builder.add_shape_capsule(link1, radius=0.03, half_height=0.12, cfg=cfg)
     joints = [
         builder.add_joint_revolute(
             -1,
             link0,
-            parent_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.6), wp.quat_identity()),
+            parent_xform=wp.transform(wp.vec3(-0.3, 0.0, height), wp.quat_identity()),
             axis=(0.0, 1.0, 0.0),
             armature=0.01,
         ),
@@ -2132,6 +2138,114 @@ def test_sleeping_option_keeps_islands_awake(test, device):
     np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=1.0e-5, atol=2.0e-5)
 
 
+_PATCH_OPTIONS = {**_ARM_ON_BOX_OPTIONS, "friction_anchor_beta": 0.2}
+
+
+def test_friction_patches_match_default(test, device):
+    """Persistent patch friction, with and without shared anchors, follows the default step's patches."""
+    for shared in (False, True):
+        options = {**_PATCH_OPTIONS, "contact_shared_anchor": shared, "contact_friction_shared_anchor": shared}
+        inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device, stack=False))
+        with warnings.catch_warnings():
+            # Patch friction warns that it picks its own friction locations under shared anchors.
+            warnings.simplefilter("ignore", UserWarning)
+            reference, _ = _contact_scene_rollout(
+                _build_arm_on_box_stack(device, requires_grad=False, stack=False),
+                options,
+                inputs,
+                40,
+                differentiable=False,
+            )
+            point, _ = _contact_scene_rollout(
+                _build_arm_on_box_stack(device, requires_grad=False, stack=False),
+                {**options, "friction_anchor_beta": 0.0},
+                inputs,
+                40,
+                differentiable=False,
+            )
+            result, _ = _contact_scene_rollout(
+                _build_arm_on_box_stack(device, stack=False), options, inputs, 40, differentiable=True
+            )
+        with test.subTest(shared=shared):
+            test.assertGreater(float(np.abs(point.joint_q.numpy() - reference.joint_q.numpy()).max()), 1.0e-3)
+            for attribute in ("joint_q", "joint_qd"):
+                np.testing.assert_allclose(
+                    getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=0.0, atol=1.0e-4
+                )
+
+
+def test_friction_patches_gradient_matches_finite_difference(test, device):
+    """Tape against central differences over steps whose patches carry history from earlier steps."""
+    for shared in (False, True):
+        options = {**_PATCH_OPTIONS, "contact_shared_anchor": shared, "contact_friction_shared_anchor": shared}
+        model = _build_arm_on_box_stack(device, stack=False)
+        rng = np.random.default_rng(5)
+        weights_q = rng.normal(size=model.joint_coord_count)
+        weights_qd = rng.normal(size=model.joint_dof_count)
+        settle, steps = 30, 6
+        joint_f = _arm_on_box_inputs(model)["joint_f"]
+
+        def loss_of(
+            force,
+            tape=None,
+            model=model,
+            options=options,
+            weights_q=weights_q,
+            weights_qd=weights_qd,
+            settle=settle,
+            steps=steps,
+            joint_f=joint_f,
+        ):
+            # A fresh solver repeats the same settling steps, so every evaluation starts from the same history.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                solver = SolverSteel(model, differentiable=True, **options)
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+            states = [model.state(requires_grad=True) for _ in range(settle + steps + 1)]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            settling, control = model.control(), model.control()
+            settling.joint_f.assign(joint_f)
+            control.joint_f.assign(force)
+            rows = []
+            for k in range(settle + steps):
+                contacts = pipeline.contacts()
+                pipeline.collide(states[k], contacts)
+                live = k >= settle
+                if tape is not None and live:
+                    tape.__enter__()
+                solver.step(states[k], states[k + 1], control if live else settling, contacts, _DT)
+                if tape is not None and live:
+                    tape.__exit__(None, None, None)
+                if live:
+                    rows.append(int(states[k + 1]._steel_differentiable_buffers.contacts.row_count.numpy()[0]))
+            carried = int(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0))
+            final = states[-1]
+            loss = float(weights_q @ final.joint_q.numpy() + weights_qd @ final.joint_qd.numpy())
+            return loss, final, control, rows, carried
+
+        tape = wp.Tape()
+        _, final, control, rows, carried = loss_of(joint_f, tape)
+        test.assertGreater(carried, 0)
+        tape.backward(
+            grads={
+                final.joint_q: wp.array(weights_q.astype(np.float32), dtype=float, device=device),
+                final.joint_qd: wp.array(weights_qd.astype(np.float32), dtype=float, device=device),
+            }
+        )
+        gradient = control.joint_f.grad.numpy().astype(np.float64)
+        eps = 1.0e-2
+        for trial in range(3):
+            direction = rng.normal(size=model.joint_dof_count)
+            direction /= np.linalg.norm(direction)
+            plus = loss_of((joint_f + eps * direction).astype(np.float32))
+            minus = loss_of((joint_f - eps * direction).astype(np.float32))
+            fd = (plus[0] - minus[0]) / (2.0 * eps)
+            with test.subTest(shared=shared, trial=trial):
+                test.assertEqual(plus[3], rows)
+                test.assertEqual(minus[3], rows)
+                test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2207,6 +2321,8 @@ for _device in get_test_devices():
             test_free_rigid_angular_friction_matches_default,
             test_free_rigid_angular_friction_gradient_matches_finite_difference,
             test_sleeping_option_keeps_islands_awake,
+            test_friction_patches_match_default,
+            test_friction_patches_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

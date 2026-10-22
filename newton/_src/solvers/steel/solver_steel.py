@@ -2538,7 +2538,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 {
                     "enable_sleeping": enable_sleeping,
                     "contact_warmstart": contact_warmstart,
-                    "friction_anchor_beta": friction_anchor_beta,
                     "contact_torsion_device": contact_torsion_device,
                     "enable_torsional_rolling_friction": enable_torsional_rolling_friction,
                     "free_rigid_torsional_friction": free_rigid_torsional_friction,
@@ -2604,14 +2603,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         pgs_kernel = self._kernel_overrides.get("pgs_kernel", "tiled_row")
         # pgs_kernel only runs in split mode on CUDA; CPU resolves to the scalar loop below.
         effective_pgs_kernel = "loop" if model.device.is_cpu or solve_mode == "matrix_free" else pgs_kernel
-        # The default law is patch friction, which the differentiable step does not reproduce; its contacts raise.
-        self._differentiable_patch_friction_default = bool(differentiable and friction_anchor_beta is None)
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if differentiable:
-                friction_anchor_beta = 0.0
-            elif contact_compliance:
+            if contact_compliance:
                 friction_anchor_beta = 0.0
                 warnings.warn(
                     "The selected contact material law uses velocity-only point friction; "

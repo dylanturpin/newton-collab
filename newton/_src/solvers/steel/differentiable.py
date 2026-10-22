@@ -22,7 +22,7 @@ from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import BodyFlags, JointType
 from .contact_torsion import _contact_groups, _group_budget
-from .friction_patches import contact_tangent_basis
+from .friction_patches import _pose_motion, contact_tangent_basis, finish_patch_impulses, link_patch_rows
 from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -97,12 +97,10 @@ _taped_apply_impulses_world_par_dof = _taped(apply_impulses_world_par_dof)
 
 def validate_differentiable_options(model: Model, options: dict) -> None:
     """Raise for constructor options the differentiable step does not reproduce."""
-    beta = options["friction_anchor_beta"]
     checks = (
         (not model.requires_grad, "a model finalized with requires_grad=True"),
         (model.particle_count > 0, "no particles"),
         (options["contact_warmstart"], "contact_warmstart=False"),
-        (beta is not None and beta > 0.0, "friction_anchor_beta=0"),
         (options["enable_torsional_rolling_friction"], "enable_torsional_rolling_friction=False"),
         (options["contact_compliance"], "contact_compliance=False"),
         (options["articulated_contact_response"] != "immediate", 'articulated_contact_response="immediate"'),
@@ -584,6 +582,7 @@ class DifferentiableStep:
             device=device,
         )
         eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+        self.finish_friction_patches(b, state_out, contacts, dt)
         solver._step += 1
         return state_out
 
@@ -595,11 +594,6 @@ class DifferentiableStep:
                 self.has_mixed_free_worlds and solver._solve_mode == "split",
                 'solve_mode="matrix_free" for worlds mixing free rigid bodies and articulations',
             ),
-            (
-                solver._differentiable_patch_friction_default,
-                "an explicit friction_anchor_beta=0 (the default friction law is patch friction)",
-            ),
-            (solver._contact_friction_shared_anchor, "no shared friction anchor"),
             (
                 solver._regularization_enabled and solver._solve_mode == "split",
                 'solve_mode="matrix_free" for contact_regularization',
@@ -669,6 +663,10 @@ class DifferentiableStep:
             self._reserve_joint_limit_rows(c, state_in.joint_q)
         if solver._enable_joint_velocity_limits:
             self._reserve_velocity_limit_rows(c, v_hat)
+        patches = solver._friction_anchors_enabled and has_contacts
+        patch_view = solver._friction_patches.view
+        if patches:
+            self._build_friction_patches(b, c, contacts)
         wp.launch(
             allocate_world_contact_slots,
             dim=threads,
@@ -839,6 +837,15 @@ class DifferentiableStep:
                 solver._dummy_is_free_rigid if solver._is_free_rigid is None else solver._is_free_rigid,
                 solver._free_rigid_mu_torsional,
                 solver._free_rigid_mu_rolling,
+                int(solver._contact_friction_shared_anchor),
+                int(patches),
+                patch_view.point_a if patches else c.patch_local_a,
+                patch_view.phi if patches else c.patch_phi_unused,
+                solver._friction_patches.current.source if patches else c.slot,
+                solver._friction_patches.previous_q if patches else c.patch_q0,
+                c.patch_local_a,
+                c.patch_local_b,
+                c.patch_q0,
             ],
             outputs=[
                 c.row_type,
@@ -884,10 +891,19 @@ class DifferentiableStep:
                     int(solver._contact_shared_anchor),
                     solver._free_rigid_mu_torsional,
                     solver._free_rigid_mu_rolling,
+                    int(solver._contact_friction_shared_anchor),
+                    int(patches),
+                    patch_view.point_a if patches else c.patch_local_a,
+                    patch_view.point_b if patches else c.patch_local_b,
+                    c.patch_local_a,
+                    c.patch_local_b,
+                    c.patch_q0,
                 ],
                 outputs=[c.J[size]],
                 device=device,
             )
+        if patches:
+            self._link_patch_rows(c, contacts)
         if solver._contact_torsion_enabled and has_contacts:
             self._append_torsion_rows(b, c, contacts)
         for size in solver._size_groups:
@@ -1071,9 +1087,11 @@ class DifferentiableStep:
                     int(k < friction_start),
                     int(smooth is not None),
                     c.smooth_impulse,
+                    int(patches),
+                    c.ring,
                     c.impulses[k],
                 ],
-                outputs=[c.residuals[k], sweep_out],
+                outputs=[c.residuals[k], c.pair_load[k] if patches else c.pair_load_dummy, sweep_out],
                 device=device,
             )
             if torsion:
@@ -1267,6 +1285,118 @@ class DifferentiableStep:
                 device=model.device,
                 record_tape=False,
             )
+
+    def _build_friction_patches(self, b: _StepBuffers, c: _ContactBuffers, contacts: Contacts) -> None:
+        """Build this step's friction patches with the default's builder, off the tape.
+
+        The anchors' body-frame points and the patch history are frozen; the rows follow the anchors with the
+        step's poses.
+        """
+        solver = self.solver
+        model = solver.model
+        wp.launch(
+            _copy_transforms,
+            dim=model.body_count,
+            inputs=[b.body_q],
+            outputs=[c.patch_q0],
+            device=model.device,
+            record_tape=False,
+        )
+        solver._friction_patches.build(
+            model,
+            _PoseView(c.patch_q0),
+            contacts,
+            contact_gap_limit=solver._contact_gap_limit,
+            friction_gap_limit=solver._friction_gap,
+            shape_material_mu=solver._shape_mu,
+            angular_mu=(solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling, solver._free_rigid_route_body)
+            if solver._free_rigid_angular_rows
+            else None,
+        )
+        view = solver._friction_patches.view
+        wp.launch(
+            _patch_local_points,
+            dim=c.capacity,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                model.shape_body,
+                c.patch_q0,
+                view.point_a,
+                view.point_b,
+            ],
+            outputs=[c.patch_local_a, c.patch_local_b],
+            device=model.device,
+            record_tape=False,
+        )
+
+    def _link_patch_rows(self, c: _ContactBuffers, contacts: Contacts) -> None:
+        """link_patch_rows on each route's rows, then each normal row's region, for the pooled normal load."""
+        solver = self.solver
+        device = solver.model.device
+        for route in (0, 1):
+            wp.launch(
+                link_patch_rows,
+                dim=c.capacity,
+                inputs=[
+                    c.count,
+                    solver._friction_patches.view,
+                    c.world,
+                    c.slot,
+                    c.path,
+                    c.slots_needed,
+                    route,
+                    c.row_parent,
+                    c.row_mu,
+                ],
+                device=device,
+                record_tape=False,
+            )
+        wp.launch(
+            _patch_rings,
+            dim=solver._world_count,
+            inputs=[c.row_count, c.row_type, c.row_parent],
+            outputs=[c.ring],
+            device=device,
+            record_tape=False,
+        )
+
+    def finish_friction_patches(self, b: _StepBuffers, state_out: State, contacts: Contacts | None, dt: float) -> None:
+        """Cache the solved patch friction and the poses for the next step's history, as the default step does."""
+        solver = self.solver
+        if not solver._friction_anchors_enabled:
+            return
+        if contacts is None:
+            solver._friction_patches.previous.valid.zero_()
+            return
+        c = b.contacts
+        model = solver.model
+        for route in (0, 1):
+            wp.launch(
+                finish_patch_impulses,
+                dim=c.capacity,
+                inputs=[
+                    c.count,
+                    solver._friction_patches.current,
+                    c.patch_q0,
+                    state_out.body_q,
+                    state_out.body_qd,
+                    model.body_com,
+                    c.world,
+                    c.slot,
+                    c.path,
+                    c.slots_needed,
+                    route,
+                    c.row_parent,
+                    c.row_mu,
+                    c.impulses[solver._iterations],
+                    dt,
+                ],
+                device=model.device,
+                record_tape=False,
+            )
+        solver._friction_patches.store(_PoseView(c.patch_q0))
 
     def _assign_slots_by_world(self, c: _ContactBuffers, contacts: Contacts) -> None:
         """_assign_contact_slots_by_world on this step's routes: rows reserved in contact order."""
@@ -1549,6 +1679,15 @@ class _ContactBuffers:
         self.torsion_scaled_sliding = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
         self.torsion_residuals = [zeros((worlds, rows)) for _ in range(torsion_iterations)]
         self.limit_coordinate = zeros((worlds, rows), wp.int32, False)
+        # Friction patches: the build's poses, the anchors' body-frame points and each normal row's region.
+        self.patch_q0 = zeros(max(solver.model.body_count, 1), wp.transform, False)
+        self.patch_local_a = zeros(capacity, wp.vec3, False)
+        self.patch_local_b = zeros(capacity, wp.vec3, False)
+        self.patch_phi_unused = zeros(capacity, wp.vec2, False)
+        self.ring = zeros((worlds, rows), wp.int32, False)
+        patch_iterations = solver._iterations if solver._friction_anchors_enabled else 0
+        self.pair_load = [zeros((worlds, rows)) for _ in range(patch_iterations)]
+        self.pair_load_dummy = zeros((1, 1))
         self.limit_dof = zeros((worlds, rows), wp.int32, False)
         limit_iterations = solver._iterations if solver._enable_joint_velocity_limits else 0
         self.velocity_limit_input = [zeros((worlds, rows)) for _ in range(limit_iterations)]
@@ -2125,6 +2264,15 @@ def _dense_contact_rows(
     is_free_rigid: wp.array[int],
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
+    contact_friction_shared_anchor: int,
+    patches: int,
+    patch_point: wp.array[wp.vec3],
+    patch_phi: wp.array[wp.vec2],
+    patch_source: wp.array[int],
+    patch_previous_q: wp.array[wp.transform],
+    patch_local_a: wp.array[wp.vec3],
+    patch_local_b: wp.array[wp.vec3],
+    patch_q0: wp.array[wp.transform],
     # outputs
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
@@ -2173,8 +2321,8 @@ def _dense_contact_rows(
             row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
             row_restitution[world, slot] = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution)
             # compute_mf_effective_mass_and_rhs clamps free-body depenetration; articulated rows are unclamped.
-            free_a = body_a < 0 or is_free_rigid[body_to_articulation[body_a]] != 0
-            free_b = body_b < 0 or is_free_rigid[body_to_articulation[body_b]] != 0
+            free_a = body_a < 0 or body_to_articulation[body_a] < 0 or is_free_rigid[body_to_articulation[body_a]] != 0
+            free_b = body_b < 0 or body_to_articulation[body_b] < 0 or is_free_rigid[body_to_articulation[body_b]] != 0
             max_depenetration = float(1.0e20)
             if free_a and free_b:
                 if body_a >= 0:
@@ -2205,9 +2353,24 @@ def _dense_contact_rows(
                 t0, t1 = contact_tangent_basis(normal)
                 friction_a = point_a
                 friction_b = point_b
-                if contact_shared_anchor != 0:
+                if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
                     friction_a = anchor
                     friction_b = anchor
+                spring = wp.vec2(0.0)
+                if patches != 0:
+                    friction_a = _patch_point(body_q, patch_q0, body_a, patch_point[c], patch_local_a[c])
+                    friction_b = _patch_point(body_q, patch_q0, body_b, patch_point[c], patch_local_b[c])
+                    spring = patch_phi[c]
+                    if patch_source[c] >= 0:
+                        # The carried displacement is history; this step's pose increment at the location is not.
+                        location = patch_point[c]
+                        motion = _pose_motion(body_q, patch_previous_q, body_a, location) - _pose_motion(
+                            body_q, patch_previous_q, body_b, location
+                        )
+                        motion -= _pose_motion(patch_q0, patch_previous_q, body_a, location) - _pose_motion(
+                            patch_q0, patch_previous_q, body_b, location
+                        )
+                        spring += wp.vec2(wp.dot(t0, motion), wp.dot(t1, motion))
                 for k in range(2):
                     tangent = t0
                     if k == 1:
@@ -2218,7 +2381,7 @@ def _dense_contact_rows(
                     row_mu[world, row] = mu * contact_friction_scale
                     row_beta[world, row] = friction_anchor_beta
                     row_cfm[world, row] = cfm
-                    row_phi[world, row] = 0.0
+                    row_phi[world, row] = spring[k]
                     row_target_velocity[world, row] = prescribed_relative_contact_target(
                         body_a,
                         contact_art_a[c],
@@ -2317,6 +2480,13 @@ def _dense_contact_jacobian(
     contact_shared_anchor: int,
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
+    contact_friction_shared_anchor: int,
+    patches: int,
+    patch_point_a: wp.array[wp.vec3],
+    patch_point_b: wp.array[wp.vec3],
+    patch_local_a: wp.array[wp.vec3],
+    patch_local_b: wp.array[wp.vec3],
+    patch_q0: wp.array[wp.transform],
     # outputs
     J_group: wp.array3d[float],
 ):
@@ -2340,9 +2510,17 @@ def _dense_contact_jacobian(
                 c, point0, point1, normal, body_a, body_b, margin0, margin1, body_q
             )
             anchor = 0.5 * (point_a + point_b)
+            friction_a = point_a
+            friction_b = point_b
             if contact_shared_anchor != 0:
                 point_a = anchor
                 point_b = anchor
+            if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+                friction_a = anchor
+                friction_b = anchor
+            if patches != 0:
+                friction_a = _patch_point(body_q, patch_q0, body_a, patch_point_a[c], patch_local_a[c])
+                friction_b = _patch_point(body_q, patch_q0, body_b, patch_point_b[c], patch_local_b[c])
             art_a = contact_art_a[c]
             art_b = contact_art_b[c]
             a_matches = art_a >= 0 and articulation_response_dof_count[art_a] == target_size
@@ -2376,13 +2554,18 @@ def _dense_contact_jacobian(
                     direction = t0
                 elif k == 2:
                     direction = t1
+                row_a = point_a
+                row_b = point_b
+                if k > 0:
+                    row_a = friction_a
+                    row_b = friction_b
                 if a_matches:
                     value = float(0.0)
                     value += _contact_jacobian_entry(
                         body_a,
                         art_a,
                         1.0,
-                        point_a,
+                        row_a,
                         direction,
                         dof,
                         articulation_dof_start,
@@ -2395,7 +2578,7 @@ def _dense_contact_jacobian(
                             body_b,
                             art_b,
                             -1.0,
-                            point_b,
+                            row_b,
                             direction,
                             dof,
                             articulation_dof_start,
@@ -2410,7 +2593,7 @@ def _dense_contact_jacobian(
                         body_b,
                         art_b,
                         -1.0,
-                        point_b,
+                        row_b,
                         direction,
                         dof,
                         articulation_dof_start,
@@ -2685,9 +2868,12 @@ def _dense_pgs_sweep(
     skip_friction: int,
     smooth_normal: int,
     smooth_impulse: wp.array2d[float],
+    patches: int,
+    ring: wp.array2d[int],
     impulses_in: wp.array2d[float],
     # outputs
     residuals: wp.array2d[float],
+    pair_load: wp.array2d[float],
     impulses_out: wp.array2d[float],
 ):
     """One pgs_solve_loop sweep for normal and point-friction rows; earlier rows read impulses_out.
@@ -2730,13 +2916,22 @@ def _dense_pgs_sweep(
                         new_impulse = 0.0
                     if kind == PGS_CONSTRAINT_TYPE_CONTACT_SPIN:
                         # A box bounded by the spin coefficient times the normal load.
-                        spin_radius = wp.max(row_mu[world, i] * impulses_out[world, row_parent[world, i]], 0.0)
+                        spin_load = impulses_out[world, row_parent[world, i]]
+                        if patches != 0:
+                            spin_load = _ring_load(
+                                row_type, ring, impulses_in, impulses_out, world, row_parent[world, i], i, m, pair_load
+                            )
+                        spin_radius = wp.max(row_mu[world, i] * spin_load, 0.0)
                         new_impulse = wp.clamp(new_impulse, -spin_radius, spin_radius)
                 impulses_out[world, i] = new_impulse
             else:
                 parent = row_parent[world, i]
                 sibling = i + 1
-                radius = wp.max(row_mu[world, i] * impulses_out[world, parent], 0.0)
+                load = impulses_out[world, parent]
+                if patches != 0:
+                    # patch_normal_load: a region's anchors share the load of all its normal rows.
+                    load = _ring_load(row_type, ring, impulses_in, impulses_out, world, parent, i, m, pair_load)
+                radius = wp.max(row_mu[world, i] * load, 0.0)
                 if radius <= 0.0:
                     impulses_out[world, i] = 0.0
                     impulses_out[world, sibling] = 0.0
@@ -3410,3 +3605,102 @@ def _pair_first_row(kind: int, parent: int):
     if kind == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING:
         return parent + 3
     return parent + 1
+
+
+class _PoseView:
+    """A state stand-in that carries only body poses, for the patch builder and history."""
+
+    def __init__(self, body_q: wp.array):
+        self.body_q = body_q
+
+
+@wp.kernel
+def _copy_transforms(source: wp.array[wp.transform], target: wp.array[wp.transform]):
+    i = wp.tid()
+    target[i] = source[i]
+
+
+@wp.kernel
+def _patch_local_points(
+    contact_count: wp.array[int],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    point_a: wp.array[wp.vec3],
+    point_b: wp.array[wp.vec3],
+    # outputs
+    local_a: wp.array[wp.vec3],
+    local_b: wp.array[wp.vec3],
+):
+    """Each anchor's point in the frame of the contact's body on that side; world points for the ground."""
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    a = point_a[c]
+    b = point_b[c]
+    if shape0[c] >= 0 and shape_body[shape0[c]] >= 0:
+        a = wp.transform_point(wp.transform_inverse(body_q[shape_body[shape0[c]]]), a)
+    if shape1[c] >= 0 and shape_body[shape1[c]] >= 0:
+        b = wp.transform_point(wp.transform_inverse(body_q[shape_body[shape1[c]]]), b)
+    local_a[c] = a
+    local_b[c] = b
+
+
+@wp.func
+def _patch_point(
+    body_q: wp.array[wp.transform], body_q0: wp.array[wp.transform], body: int, point: wp.vec3, local: wp.vec3
+):
+    """The anchor's world point: the built value, moving with the body for the derivative."""
+    result = point
+    if body >= 0:
+        result = point + (wp.transform_point(body_q[body], local) - wp.transform_point(body_q0[body], local))
+    return result
+
+
+@wp.kernel
+def _patch_rings(
+    row_count: wp.array[int],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    # outputs
+    ring: wp.array2d[int],
+):
+    """Label each normal row with the lowest row of its region's ring; a point contact is its own region."""
+    world = wp.tid()
+    m = row_count[world]
+    for s in range(m):
+        if row_type[world, s] == PGS_CONSTRAINT_TYPE_CONTACT:
+            label = s
+            row = row_parent[world, s]
+            steps = int(0)
+            while row >= 0 and row != s and steps < m:
+                label = wp.min(label, row)
+                row = row_parent[world, row]
+                steps += 1
+            ring[world, s] = label
+
+
+@wp.func
+def _ring_load(
+    row_type: wp.array2d[int],
+    ring: wp.array2d[int],
+    impulses_in: wp.array2d[float],
+    impulses_out: wp.array2d[float],
+    world: int,
+    parent: int,
+    row: int,
+    m: int,
+    pair_load: wp.array2d[float],
+):
+    """patch_normal_load from the sweep's current impulses, stored and read back for the reverse pass."""
+    label = ring[world, parent]
+    total = float(0.0)
+    for normal in range(m):
+        if row_type[world, normal] == PGS_CONSTRAINT_TYPE_CONTACT and ring[world, normal] == label:
+            impulse = impulses_in[world, normal]
+            if normal < row:
+                impulse = impulses_out[world, normal]
+            total += impulse
+    pair_load[world, row] = total
+    return pair_load[world, row]
