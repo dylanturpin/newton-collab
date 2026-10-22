@@ -111,6 +111,10 @@ _ANYMAL_TEXTURE_WITHOUT_UVS_WARNING_RE = (
     r"[^\n]*[/\\]base\.dae has a texture but no UVs; texture will be ignored\.\n"
     r"  parse_shapes\(link, visuals, density=0\.0, just_visual=True, visible=not hide_visuals\)\n?"
 )
+_VBD_LEGACY_PENALTY_DEPRECATION_RE = (
+    r"(?m)^.*: DeprecationWarning: rigid_compliant_alm=False is deprecated as of Newton .*\n"
+    r"^  .*SolverVBD\(\n?"
+)
 _EXAMPLE_ALLOW_OUTPUT_REGEXES = [
     (_PXR_WORK_THREAD_LIMIT_OUTPUT_RE, "stderr"),
     (_NEWTON_ASSET_DOWNLOAD_OUTPUT_RE, "stdout"),
@@ -524,6 +528,7 @@ for motion, frames in (("stir", 570), ("insert", 270)):
         use_viewer=True,
         test_options={"num-frames": frames, "motion": motion},
         test_suffix=motion,
+        allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
     )
 
 for example, frames in (("gripper", 180), ("fingers", 240), ("whip", 210), ("cushion", 270), ("bin", 240)):
