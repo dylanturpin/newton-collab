@@ -2117,7 +2117,8 @@ def accumulate_connect_wrenches_from_impulses(
     connect_body_c: wp.array[wp.int32],
     connect_joint: wp.array[wp.int32],
     connect_rows: wp.array[wp.int32],
-    connect_axis: wp.array[wp.vec3],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     connect_row_inv_norm: wp.array2d[float],
@@ -2170,7 +2171,8 @@ def accumulate_connect_wrenches_from_impulses(
     if connect_rows[k] < 5:
         return
     # REVOLUTE closure: the two hinge-axis rows are pure couples about e1 / e2.
-    _a_p, _a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, connect_axis[k], joint_X_p, joint_X_c, body_q)
+    axis_local = joint_axis[joint_qd_start[joint]]  # live, so axis edits via JOINT_PROPERTIES apply
+    _a_p, _a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, axis_local, joint_X_p, joint_X_c, body_q)
     for i in range(2):
         slot = base_slot + 3 + i
         if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
@@ -4300,7 +4302,7 @@ def populate_connect_J_for_size(
     connect_body_p: wp.array[int],
     connect_body_c: wp.array[int],
     connect_rows: wp.array[int],
-    connect_axis: wp.array[wp.vec3],
+    joint_axis: wp.array[wp.vec3],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     connect_parent_prescribed: wp.array[int],
@@ -4463,7 +4465,8 @@ def populate_connect_J_for_size(
         if connect_rows[k] < 5:
             continue
         # REVOLUTE closure: two axis-alignment rows, pure couples about e1 / e2.
-        a_p, a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, connect_axis[k], joint_X_p, joint_X_c, body_q)
+        axis_local = joint_axis[joint_qd_start[joint]]  # live, so axis edits via JOINT_PROPERTIES apply
+        a_p, a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, axis_local, joint_X_p, joint_X_c, body_q)
         misalign = wp.cross(a_c, a_p)
         omega_a = wp.vec3(0.0, 0.0, 0.0)
         if prescribed and body_p >= 0:

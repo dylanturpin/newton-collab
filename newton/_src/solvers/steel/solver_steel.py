@@ -4734,8 +4734,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         from the child body's tree articulation, independent of joint ordering. FIXED
         (weld) loop joints warn and are ignored for now. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
-        :attr:`~newton.Model.joint_enabled` and the translations of its
-        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step.
+        :attr:`~newton.Model.joint_enabled`, the translations of its
+        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` and, for a REVOLUTE closure, its
+        :attr:`~newton.Model.joint_axis` and frame rotations every step, so edits announced with
+        :attr:`~newton.ModelFlags.JOINT_PROPERTIES` apply without a rebuild.
 
         A closure's parent may live outside the child's articulation when it is
         prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
@@ -4752,20 +4754,18 @@ class SolverSteel(SolverBase, CouplingInterface):
         joint_type = model.joint_type.numpy()
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
-        joint_qd_start = model.joint_qd_start.numpy()
-        joint_axis = model.joint_axis.numpy() if model.joint_axis is not None else None
         articulation_world = self._model_plan.articulation_world
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
 
-        art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l, axis_l = [], [], [], [], [], [], [], []
+        art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l = [], [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
             if int(joint_type[j]) == int(JointType.BALL):
-                rows, axis = 3, (0.0, 0.0, 0.0)
-            elif int(joint_type[j]) == int(JointType.REVOLUTE) and joint_axis is not None:
-                rows, axis = 5, tuple(float(x) for x in joint_axis[int(joint_qd_start[j])])
+                rows = 3
+            elif int(joint_type[j]) == int(JointType.REVOLUTE):
+                rows = 5  # the hinge axis is read live from Model.joint_axis by the kernels
             else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
@@ -4794,7 +4794,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             joint_l.append(int(j))
             prescribed_l.append(prescribed)
             rows_l.append(rows)
-            axis_l.append(axis)
 
         n = len(art_l)
         if n == 0:
@@ -4811,7 +4810,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
         self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
-        self._connect_axis = wp.array(np.asarray(axis_l, dtype=np.float32), dtype=wp.vec3, device=device)
         self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
         self._connect_count = n
 
@@ -9554,7 +9552,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._connect_body_c,
                     self._connect_joint,
                     self._connect_rows,
-                    self._connect_axis,
+                    model.joint_axis,
+                    model.joint_qd_start,
                     model.joint_X_p,
                     model.joint_X_c,
                     self._connect_row_inv_norm,
@@ -11943,7 +11942,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._connect_body_p,
                         self._connect_body_c,
                         self._connect_rows,
-                        self._connect_axis,
+                        model.joint_axis,
                         model.joint_X_p,
                         model.joint_X_c,
                         self._connect_parent_prescribed,

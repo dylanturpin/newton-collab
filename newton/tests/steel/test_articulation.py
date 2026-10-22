@@ -4186,6 +4186,7 @@ def test_closure_force_uses_the_row_builder_norm(test, device):
                     zero,
                     ints([3]),
                     wp.zeros(1, dtype=wp.vec3, device=device),
+                    qd_start,
                     anchor_xform,
                     anchor_xform,
                     inv_norm,
@@ -4697,7 +4698,7 @@ def _closure_metrics(model, state, joint):
     return float(np.linalg.norm(p_a - p_b)), float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
-def _build_world_hinged_swing(closure):
+def _build_world_hinged_swing(closure, start_angle=0.6):
     """A free body hung from the world by a loop joint whose COM sits along the hinge axis.
 
     Gravity then twists the body about the hinge's perpendicular, which only the hinge
@@ -4705,7 +4706,7 @@ def _build_world_hinged_swing(closure):
     the world, so this also exercises the prescribed-parent target of the closure rows.
     """
     b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
-    start = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.6)
+    start = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), start_angle)
     body = b.add_link(
         xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), start),
         mass=1.0,
@@ -4867,11 +4868,78 @@ def test_revolute_loop_pre_eliminates_five_rows(test, device):
     test.assertLess(misalignment, 0.01)
 
 
+def test_revolute_loop_axis_edit_applies_at_runtime(test, device):
+    """Editing a loop hinge's axis and announcing JOINT_PROPERTIES re-targets the closure without a rebuild.
+
+    The body starts at rest with its centre of mass below the pivot and offset along x, so gravity
+    pulls about y. Hinged about x it must stay put; once the axis is edited to y it must swing about y
+    while staying aligned with the new axis.
+    """
+    builder, joint = _build_world_hinged_swing("revolute", start_angle=0.0)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverSteel(
+        model, solve_mode=_pgs_mode_for(device), iterations=8, enable_joint_limits=True, update_mass_matrix_interval=1
+    )
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_1)
+    control = model.control()
+    q_start = state_0.body_q.numpy()[0, 3:].astype(np.float64)
+
+    def run(steps):
+        nonlocal state_0, state_1
+        for _ in range(steps):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 500.0)
+            state_0, state_1 = state_1, state_0
+
+    def rotation_since_start():
+        """Rotation vector [rad] of the body relative to its start orientation."""
+        q = state_0.body_q.numpy()[0, 3:].astype(np.float64)
+        x0, y0, z0, w0 = q_start
+        x1, y1, z1, w1 = q
+        # q * conj(q_start)
+        rel = np.array(
+            [
+                w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1,
+                w0 * y1 + x0 * z1 - y0 * w1 - z0 * x1,
+                w0 * z1 - x0 * y1 + y0 * x1 - z0 * w1,
+                w0 * w1 + x0 * x1 + y0 * y1 + z0 * z1,
+            ]
+        )
+        if rel[3] < 0.0:
+            rel = -rel
+        angle = 2.0 * np.arctan2(np.linalg.norm(rel[:3]), rel[3])
+        n = np.linalg.norm(rel[:3])
+        return rel[:3] / n * angle if n > 0.0 else np.zeros(3)
+
+    run(200)
+    test.assertLess(
+        np.degrees(np.linalg.norm(rotation_since_start())), 0.05, "hinged about x, gravity about y must not move it"
+    )
+
+    axis = model.joint_axis.numpy()
+    axis[int(model.joint_qd_start.numpy()[joint])] = (0.0, 1.0, 0.0)
+    model.joint_axis.assign(axis)
+    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    run(200)
+    rot = np.degrees(rotation_since_start())
+    test.assertGreater(abs(rot[1]), 5.0, "after the axis edit the body must swing about y")
+    test.assertLess(np.hypot(rot[0], rot[2]), 0.05, "and only about y")
+    gap, misalignment = _closure_metrics(model, state_0, joint)
+    test.assertLess(gap, 5.0e-4)
+    test.assertLess(misalignment, 0.05)
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     """A REVOLUTE loop joint adds two hinge-axis rows to the three point rows of a closure."""
 
 
-for _name in ("test_revolute_loop_world_hinge_holds_its_axis", "test_revolute_loop_spatial_loop_stays_rigid"):
+for _name in (
+    "test_revolute_loop_world_hinge_holds_its_axis",
+    "test_revolute_loop_spatial_loop_stays_rigid",
+    "test_revolute_loop_axis_edit_applies_at_runtime",
+):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_test_devices())
 # Bilateral pre-elimination is a matrix-free feature.
 add_function_test(
