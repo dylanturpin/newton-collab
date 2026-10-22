@@ -1941,8 +1941,8 @@ def _first_fit_reference(solver, world=0):
     return (n, *_first_fit_coloring(contact, body_a, body_b, length, longest_first))
 
 
-def _first_fit_coloring(contact, body_a, body_b, length, longest_first=True):
-    """Sort units longest first then by contact, color first-fit, and counting-sort by color."""
+def _first_fit_coloring(contact, body_a, body_b, length, longest_first):
+    """Sort units by contact (after row count, longest first, if asked), color first-fit, and counting-sort by color."""
     entries = PROPAGATION_COLOR_TAIL + 2
     n = len(contact)
     order = np.lexsort((contact, -np.minimum(length, 15))) if longest_first else np.argsort(contact, kind="stable")
@@ -1974,7 +1974,7 @@ def _sweep_cost(color, length):
     return colored + int(length[tail].sum())
 
 
-def _run_prebuild(worlds, max_constraints, max_body_span, longest_first=True):
+def _run_prebuild(worlds, max_constraints, max_body_span, longest_first):
     """Color per-world unit lists ``(contact, body_a, body_b, length)`` with the pre-build kernel."""
     device = wp.get_device("cuda:0")
     entries = PROPAGATION_COLOR_TAIL + 2

@@ -1925,7 +1925,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_same_articulation_rows: bool = False,
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
-        propagation_color_order: Literal["contact", "longest_first"] = "longest_first",
+        propagation_color_order: Literal["contact", "longest_first"] = "contact",
         row_schedule: Literal["interleaved", "contact_then_internal", "phased"] = "interleaved",
         friction_mode: Literal["fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton"] = "fixed_normal",
         free_body_constraint_max: int = 512,
@@ -2404,7 +2404,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 longest first, then contact index. ``"longest_first"`` lets long units share colors, which
                 shortens the sweep where one body carries many units of mixed length, but on some stacked
                 scenes it converges more slowly at a fixed iteration count. Other responses ignore it.
-                Defaults to ``"longest_first"``.
+                Defaults to ``"contact"``.
             row_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -17870,7 +17870,7 @@ def _get_color_propagation_prebuild_kernel(
     order_stride: int,
     device_arch: str,
     max_body_span: int = 0,
-    longest_first: bool = True,
+    longest_first: bool = False,
 ) -> "wp.Kernel":
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 

@@ -63,7 +63,9 @@ def _build_d6_articulated_free_contact_model(device: str):
     return builder.finalize(device=device)
 
 
-def _step_d6_contact_case(model, contacts, mode: str, iterations: int = 2) -> tuple[np.ndarray, tuple[int, int, int]]:
+def _step_d6_contact_case(
+    model, contacts, mode: str, iterations: int = 2, **options
+) -> tuple[np.ndarray, tuple[int, int, int]]:
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -81,6 +83,7 @@ def _step_d6_contact_case(model, contacts, mode: str, iterations: int = 2) -> tu
         articulation_constraint_max=32,
         free_body_constraint_max=32,
         contact_warmstart=False,
+        **options,
     )
     solver.step(state_in, state_out, control, contacts, 1.0 / 120.0)
     wp.synchronize()
@@ -113,17 +116,18 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
         self.assertGreater(rows_immediate[0], 0)
         self.assertEqual(rows_immediate[2], 0)
 
-        # Colored sweeps the longer units first, unlike the immediate row order, so it is compared once converged.
-        qd_immediate_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
-        for response, iterations, reference in (
-            ("propagation", 2, qd_immediate),
-            ("propagation_colored", 32, qd_immediate_converged),
-        ):
+        for response in ("propagation", "propagation_colored"):
             with self.subTest(response=response):
-                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response, iterations)
+                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response)
                 self.assertEqual(rows_propagation[0], 0)
                 self.assertGreater(rows_propagation[2], 0)
-                np.testing.assert_allclose(qd_propagation, reference, rtol=1.0e-5, atol=1.0e-5)
+                np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+        # Longest-first sweeps the 3-row units first, unlike the immediate row order, so it is compared once converged.
+        qd_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
+        qd_longest_first = _step_d6_contact_case(
+            model, contacts, "propagation_colored", iterations=32, propagation_color_order="longest_first"
+        )[0]
+        np.testing.assert_allclose(qd_longest_first, qd_converged, rtol=1.0e-5, atol=1.0e-5)
 
     def test_steel_propagation_mixed_size_free_body_response(self):
         _require_cuda("CUDA is required for propagation articulated/free contact rows")
