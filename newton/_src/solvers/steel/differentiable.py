@@ -24,7 +24,10 @@ from ...sim.enums import BodyFlags, JointType
 from .contact_torsion import _contact_groups, _group_budget
 from .friction_patches import contact_tangent_basis
 from .kernels import (
+    ANGULAR_FRICTION_FREE_RIGID,
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
@@ -52,6 +55,8 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     find_contact_world_segments,
+    free_rigid_angular_friction_coefficients,
+    free_rigid_angular_row,
     integrate_generalized_joints,
     mixed_contact_restitution,
     populate_joint_velocity_limit_J_for_size,
@@ -100,10 +105,6 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["contact_warmstart"], "contact_warmstart=False"),
         (beta is not None and beta > 0.0, "friction_anchor_beta=0"),
         (options["enable_torsional_rolling_friction"], "enable_torsional_rolling_friction=False"),
-        (
-            options["free_rigid_torsional_friction"] is not None or options["free_rigid_rolling_friction"] is not None,
-            "no free-rigid torsional or rolling friction",
-        ),
         (options["contact_compliance"], "contact_compliance=False"),
         (options["articulated_contact_response"] != "immediate", 'articulated_contact_response="immediate"'),
         (options["update_mass_matrix_interval"] != 1, "update_mass_matrix_interval=1"),
@@ -130,7 +131,6 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
         ),
         (bool(np.any(solver._kinematic_dof_mask_host)), "no kinematic bodies"),
         (not np.array_equal(plan.response_dof_count, plan.articulation_dof_count), "every articulation DOF dynamic"),
-        (solver._free_rigid_angular_rows, "no free-rigid torsional or rolling friction (steel:condim)"),
         # The dense sweep reproduces the loop and tiled_row updates; CPU and matrix_free resolve to loop.
         (
             solver._solve_mode == "split" and solver._pgs_kernel in ("tiled_contact", "streaming"),
@@ -701,7 +701,7 @@ class DifferentiableStep:
                 solver._propagation_max_constraints,
                 solver._friction_gap,
                 solver._friction_patches.view,
-                0,
+                ANGULAR_FRICTION_FREE_RIGID if solver._free_rigid_angular_rows else 0,
                 solver._shape_mu_torsional,
                 solver._shape_mu_rolling,
                 solver._free_rigid_mu_torsional,
@@ -838,6 +838,8 @@ class DifferentiableStep:
                 solver._rigid_body_max_depenetration_velocity,
                 solver._body_to_articulation,
                 solver._dummy_is_free_rigid if solver._is_free_rigid is None else solver._is_free_rigid,
+                solver._free_rigid_mu_torsional,
+                solver._free_rigid_mu_rolling,
             ],
             outputs=[
                 c.row_type,
@@ -881,6 +883,8 @@ class DifferentiableStep:
                     model.shape_body,
                     b.body_q,
                     int(solver._contact_shared_anchor),
+                    solver._free_rigid_mu_torsional,
+                    solver._free_rigid_mu_rolling,
                 ],
                 outputs=[c.J[size]],
                 device=device,
@@ -2120,6 +2124,8 @@ def _dense_contact_rows(
     max_depenetration_velocity: wp.array[float],
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
     # outputs
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
@@ -2196,7 +2202,7 @@ def _dense_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
-            if slots_needed[c] == 3:
+            if slots_needed[c] >= 3:
                 t0, t1 = contact_tangent_basis(normal)
                 friction_a = point_a
                 friction_b = point_b
@@ -2226,6 +2232,39 @@ def _dense_contact_rows(
                         articulation_origin,
                         body_v_s,
                     )
+                # build_mf_angular_friction_rows: free-rigid rolling pair and spin rows after the sliding pair.
+                torsional, rolling = free_rigid_angular_friction_coefficients(
+                    shape0[c], shape1[c], free_rigid_mu_torsional, free_rigid_mu_rolling
+                )
+                for row_offset in range(3, slots_needed[c]):
+                    angular_type, angular_mu, _axis = free_rigid_angular_row(row_offset, torsional, rolling, normal)
+                    row = slot + row_offset
+                    row_type[world, row] = angular_type
+                    row_parent[world, row] = slot
+                    row_mu[world, row] = angular_mu
+                    row_beta[world, row] = 0.0
+                    row_cfm[world, row] = cfm
+                    row_phi[world, row] = 0.0
+                    row_target_velocity[world, row] = 0.0
+
+
+@wp.func
+def _angular_jacobian_entry(
+    body: int,
+    art: int,
+    sign: float,
+    axis: wp.vec3,
+    local_dof: int,
+    articulation_dof_start: wp.array[int],
+    body_dof_chain: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+):
+    """One DOF's projection of the body's angular velocity on ``axis``."""
+    value = float(0.0)
+    if body >= 0 and body_dof_chain[body, local_dof] != 0:
+        S = joint_S_s[articulation_dof_start[art] + local_dof]
+        value = sign * wp.dot(axis, wp.vec3(S[3], S[4], S[5]))
+    return value
 
 
 @wp.func
@@ -2277,10 +2316,16 @@ def _dense_contact_jacobian(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     contact_shared_anchor: int,
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
     # outputs
     J_group: wp.array3d[float],
 ):
-    """Normal and point-friction Jacobian entries per (contact, DOF), summed in populate_world_J_for_size's order."""
+    """Normal, point-friction and free-rigid angular Jacobian entries per (contact, DOF).
+
+    Linear rows sum in populate_world_J_for_size's order; angular rows are pure angular, as in
+    build_mf_angular_friction_rows.
+    """
     c, dof = wp.tid()
     if c < wp.min(contact_count[0], point0.shape[0]):
         slot = contact_slot[c]
@@ -2305,8 +2350,27 @@ def _dense_contact_jacobian(
             b_matches = art_b >= 0 and articulation_response_dof_count[art_b] == target_size
             row_total = 1
             t0, t1 = contact_tangent_basis(normal)
-            if slots_needed[c] == 3:
+            if slots_needed[c] >= 3:
                 row_total = 3
+            torsional, rolling = free_rigid_angular_friction_coefficients(
+                shape0[c], shape1[c], free_rigid_mu_torsional, free_rigid_mu_rolling
+            )
+            for row_offset in range(3, slots_needed[c]):
+                _angular_type, _angular_mu, axis = free_rigid_angular_row(row_offset, torsional, rolling, normal)
+                if a_matches:
+                    value_a = _angular_jacobian_entry(
+                        body_a, art_a, 1.0, axis, dof, articulation_dof_start, body_dof_chain, joint_S_s
+                    )
+                    if b_matches and art_b == art_a:
+                        value_a += _angular_jacobian_entry(
+                            body_b, art_b, -1.0, axis, dof, articulation_dof_start, body_dof_chain, joint_S_s
+                        )
+                    J_group[art_group_idx[art_a], slot + row_offset, dof] = value_a
+                if b_matches and art_b != art_a:
+                    value_b = _angular_jacobian_entry(
+                        body_b, art_b, -1.0, axis, dof, articulation_dof_start, body_dof_chain, joint_S_s
+                    )
+                    J_group[art_group_idx[art_b], slot + row_offset, dof] = value_b
             for k in range(row_total):
                 direction = normal
                 if k == 1:
@@ -2639,9 +2703,9 @@ def _dense_pgs_sweep(
         if kind == PGS_CONSTRAINT_TYPE_TORSION or kind == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             # Torsion and velocity-limit rows follow every other row of the sweep, as in the matrix-free kernel.
             impulses_out[world, i] = impulses_in[world, i]
-        elif kind == PGS_CONSTRAINT_TYPE_FRICTION and skip_friction != 0:
+        elif _is_friction_row(kind) and skip_friction != 0:
             impulses_out[world, i] = 0.0
-        elif kind != PGS_CONSTRAINT_TYPE_FRICTION or i == row_parent[world, i] + 1:
+        elif not _is_pair_row(kind) or i == _pair_first_row(kind, row_parent[world, i]):
             w = rhs[world, i]
             for j in range(m):
                 impulse = impulses_in[world, j]
@@ -2653,7 +2717,7 @@ def _dense_pgs_sweep(
             denom = diag[world, i]
             if kind == PGS_CONSTRAINT_TYPE_CONTACT and smooth_normal != 0:
                 impulses_out[world, i] = smooth_impulse[world, i]
-            elif kind != PGS_CONSTRAINT_TYPE_FRICTION:
+            elif not _is_pair_row(kind):
                 new_impulse = impulses_in[world, i]
                 if denom > 0.0:
                     # Contact regularization: w = 1 / (1 + g) on penetrating contact rows, else 1.
@@ -2665,10 +2729,14 @@ def _dense_pgs_sweep(
                     unilateral = kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                     if unilateral and new_impulse < 0.0:
                         new_impulse = 0.0
+                    if kind == PGS_CONSTRAINT_TYPE_CONTACT_SPIN:
+                        # A box bounded by the spin coefficient times the normal load.
+                        spin_radius = wp.max(row_mu[world, i] * impulses_out[world, row_parent[world, i]], 0.0)
+                        new_impulse = wp.clamp(new_impulse, -spin_radius, spin_radius)
                 impulses_out[world, i] = new_impulse
             else:
                 parent = row_parent[world, i]
-                sibling = parent + 2
+                sibling = i + 1
                 radius = wp.max(row_mu[world, i] * impulses_out[world, parent], 0.0)
                 if radius <= 0.0:
                     impulses_out[world, i] = 0.0
@@ -3320,3 +3388,26 @@ def _prescale_joint_velocity_limits(
             if scaled and ratio_out[art] < 1.0:
                 value = joint_qd[dof2] * ratio_out[art]
             joint_qd_out[dof2] = value
+
+
+@wp.func
+def _is_friction_row(kind: int):
+    """Sliding, rolling and spin rows, which sweeps before the friction start iteration leave at zero."""
+    return (
+        kind == PGS_CONSTRAINT_TYPE_FRICTION
+        or kind == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+        or kind == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
+    )
+
+
+@wp.func
+def _is_pair_row(kind: int):
+    """The sliding and rolling pairs, each solved as one disk block at its first row."""
+    return kind == PGS_CONSTRAINT_TYPE_FRICTION or kind == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+
+
+@wp.func
+def _pair_first_row(kind: int, parent: int):
+    if kind == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING:
+        return parent + 3
+    return parent + 1

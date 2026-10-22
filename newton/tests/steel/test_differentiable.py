@@ -185,7 +185,6 @@ def test_rejects_unsupported_configs(test, device):
         {"contact_warmstart": True},
         {"friction_anchor_beta": 0.2},
         {"enable_torsional_rolling_friction": True},
-        {"free_rigid_torsional_friction": 0.01},
         {"articulated_contact_response": "propagation"},
         {"articulated_contact_response": "propagation_colored"},
         {"update_mass_matrix_interval": 2},
@@ -2046,6 +2045,82 @@ def test_joint_limits_gradient_matches_finite_difference(test, device):
                     test.assertAlmostEqual(float(gradient @ direction), fd, delta=3.0e-3 * max(1.0, abs(fd)))
 
 
+def _free_rigid_angular_options(rolling, torsional):
+    return {
+        "friction_anchor_beta": 0.0,
+        "solve_mode": "matrix_free",
+        "iterations": 8,
+        "free_rigid_rolling_friction": rolling,
+        "free_rigid_torsional_friction": torsional,
+    }
+
+
+def _rolling_inputs(shape):
+    return {
+        "joint_q": np.array([0.0, 0.0, 0.099 if shape == "sphere" else 0.0995, 0.0, 0.0, 0.0, 1.0], np.float32),
+        "joint_qd": np.array([1.0, 0.3, 0.0, -3.0, 10.0, 4.0], np.float32),
+        "joint_f": np.zeros(6, np.float32),
+    }
+
+
+def test_free_rigid_angular_friction_matches_default(test, device):
+    """Free-body rolling pairs and spin rows follow the matrix-free route's angular rows."""
+    cases = (
+        ("sphere", 0.001, 0.0, 30, 1.0e-5),
+        ("sphere", 0.001, 0.01, 30, 1.0e-5),
+        ("sphere", 0.02, 0.0, 30, 1.0e-5),
+        # A tumbling box rounds chaotically.
+        ("box", 0.001, 0.0, 20, 1.0e-4),
+    )
+    for shape, rolling, torsional, steps, tolerance in cases:
+        options = _free_rigid_angular_options(rolling, torsional)
+        inputs = _rolling_inputs(shape)
+        reference, _ = _contact_scene_rollout(
+            _build_free_shape(device, shape, requires_grad=False), options, inputs, steps, differentiable=False
+        )
+        plain, _ = _contact_scene_rollout(
+            _build_free_shape(device, shape, requires_grad=False),
+            _free_rigid_angular_options(None, None),
+            inputs,
+            steps,
+            differentiable=False,
+        )
+        result, _ = _contact_scene_rollout(
+            _build_free_shape(device, shape), options, inputs, steps, differentiable=True
+        )
+        with test.subTest(shape=shape, rolling=rolling, torsional=torsional):
+            test.assertGreater(float(np.abs(plain.joint_qd.numpy() - reference.joint_qd.numpy()).max()), 0.1)
+            np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=tolerance)
+
+
+def test_free_rigid_angular_friction_gradient_matches_finite_difference(test, device):
+    """Tape against central differences for a sphere rolling against its rolling and spin bounds."""
+    for rolling, torsional in ((0.02, 0.0), (0.001, 0.01)):
+        model = _build_free_shape(device, "sphere")
+        solver = SolverSteel(model, differentiable=True, **_free_rigid_angular_options(rolling, torsional))
+        inputs = _rolling_inputs("sphere")
+        rng = np.random.default_rng(17)
+        weights = rng.normal(size=6)
+
+        def loss_of(joint_qd, tape=None, model=model, solver=solver, inputs=inputs, weights=weights):
+            states, _ = _free_body_rollout(model, solver, inputs["joint_q"], joint_qd, 5, _DT, tape=tape)
+            return float(weights @ states[-1].joint_qd.numpy()), states
+
+        tape = wp.Tape()
+        _, states = loss_of(inputs["joint_qd"], tape)
+        tape.backward(grads={states[-1].joint_qd: wp.array(weights.astype(np.float32), dtype=float, device=device)})
+        gradient = states[0].joint_qd.grad.numpy().astype(np.float64)
+        eps = 1.0e-3
+        for trial in range(3):
+            direction = rng.normal(size=6)
+            direction /= np.linalg.norm(direction)
+            plus = loss_of((inputs["joint_qd"] + eps * direction).astype(np.float32))[0]
+            minus = loss_of((inputs["joint_qd"] - eps * direction).astype(np.float32))[0]
+            fd = (plus - minus) / (2.0 * eps)
+            with test.subTest(rolling=rolling, torsional=torsional, trial=trial):
+                test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2118,6 +2193,8 @@ for _device in get_test_devices():
             test_deterministic_rollouts_repeat,
             test_mixed_world_gradient_matches_finite_difference,
             test_matrix_free_restitution_matches_default,
+            test_free_rigid_angular_friction_matches_default,
+            test_free_rigid_angular_friction_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

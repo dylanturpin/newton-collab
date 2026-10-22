@@ -176,7 +176,7 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
     model = solver.model
     if (
         not model.device.is_cuda
-        or model.requires_grad
+        or (model.requires_grad and not solver._differentiable)
         or solver._solve_mode != "matrix_free"
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
