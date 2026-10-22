@@ -185,9 +185,9 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         or (solver._has_free_rigid_bodies and solver._pgs_solve_mf_gs_kernel is None)
     ):
         raise ValueError(
-            "Free-rigid angular friction (steel:condim above 3) requires CUDA non-differentiable matrix_free "
-            "solving with row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
-            "and no contact compliance"
+            "Free-rigid angular friction (steel:condim above 3) requires CUDA matrix_free solving without "
+            "requires_grad (unless differentiable), with row_schedule='interleaved', friction_mode='fixed_normal', "
+            "the fused matrix-free GS kernel, and no contact compliance"
         )
 
 

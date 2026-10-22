@@ -1807,6 +1807,21 @@ def test_mixed_world_contacts_match_default(test, device):
                 )
 
 
+def test_deterministic_split_contacts_match_default(test, device):
+    """deterministic=True in split mode: contact steps match the default step and repeat bitwise."""
+    options = {"friction_anchor_beta": 0.0, "iterations": 16, "deterministic": True}
+    inputs = _contact_inputs(_build_box_chain_on_plane(device))
+    reference, _ = _contact_scene_rollout(
+        _build_box_chain_on_plane(device, requires_grad=False), options, inputs, 20, differentiable=False
+    )
+    results = [
+        _contact_scene_rollout(_build_box_chain_on_plane(device), options, inputs, 20, differentiable=True)[0]
+        for _ in range(2)
+    ]
+    np.testing.assert_array_equal(results[1].joint_qd.numpy(), results[0].joint_qd.numpy())
+    np.testing.assert_allclose(results[0].joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-6)
+
+
 def test_deterministic_rollouts_repeat(test, device):
     """deterministic=True reserves rows in contact order and sums articulations in order: repeats are bitwise."""
     options = {**_ARM_ON_BOX_OPTIONS, "deterministic": True}
@@ -2922,6 +2937,7 @@ for _device in get_test_devices():
         test_kinematic_velocity_gradient_matches_finite_difference,
         test_observables_match_default,
         test_observables_gradient_matches_finite_difference,
+        test_deterministic_split_contacts_match_default,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
