@@ -1664,8 +1664,9 @@ def _build_elastic_ground_contact_model(device, z: float, q0: float = 0.0, is_ki
 def test_elastic_surface_contact_generation(test, device):
     model, body = _build_elastic_ground_contact_model(device, z=0.04)
     state = model.state()
-    contacts = model.contacts()
-    model.collide(state, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
 
     count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(count, 0)
@@ -1764,9 +1765,10 @@ def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device)
 def test_elastic_surface_contact_uses_deformed_vertex(test, device):
     model, _body = _build_elastic_ground_contact_model(device, z=0.07)
     state = model.state()
-    contacts = model.contacts()
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
 
-    model.collide(state, contacts)
+    pipeline.collide(state, contacts)
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
     owner_joint = int(model.elastic_joint.numpy()[0])
@@ -1775,7 +1777,7 @@ def test_elastic_surface_contact_uses_deformed_vertex(test, device):
     q[q_start + 7] = 0.03
     state.joint_q.assign(q)
 
-    model.collide(state, contacts)
+    pipeline.collide(state, contacts)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
 
@@ -1784,10 +1786,11 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
     model, _body = _build_elastic_ground_contact_model(device, z=0.05, q0=q0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
     control = model.control()
 
-    model.collide(state_0, contacts)
+    pipeline.collide(state_0, contacts)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
     # A massless, stiffness-free mode has no inertia scale for compliant ALM's contact rows; this
@@ -1854,8 +1857,9 @@ def test_vbd_elastic_compliant_contact_solves_modal_penetration(test, device):
     model.elastic_mode_mass.fill_(1.0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
-    model.collide(state_0, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state_0, contacts)
 
     solver = newton.solvers.SolverVBD(
         model,
@@ -1889,8 +1893,9 @@ def test_vbd_elastic_compliant_contact_uses_modal_mobility_for_rho_and_forces(te
     model.elastic_mode_mass.fill_(1.0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
-    model.collide(state_0, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state_0, contacts)
     body_q_prev = wp.clone(state_0.body_q)
     joint_q_prev = wp.clone(state_0.joint_q)
 
