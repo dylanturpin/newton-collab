@@ -17860,11 +17860,12 @@ def _get_color_propagation_prebuild_kernel(
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
     Runs after contact classification and BEFORE row build. Each block owns one
-    world: it sorts the world's contact units by global contact index (a bitonic
-    sort over a global scratch permutation, so the schedule does not depend on
-    the atomic order in which ``collect_propagation_units`` gathered the units),
-    colors them by first-fit greedy edge coloring over per-body used-color
-    bitmasks, counting-sorts the units by color in that same order, and rewrites
+    world: it sorts the world's contact units by row count, longest first, then by
+    global contact index (a bitonic sort over a global scratch permutation, so the
+    schedule does not depend on the atomic order in which
+    ``collect_propagation_units`` gathered the units), colors them by first-fit
+    greedy edge coloring over per-body used-color bitmasks, counting-sorts the
+    units by color in that same order, and rewrites
     ``contact_slot`` so the row builder writes every unit's rows at a
     color-ordered slot. Color segments therefore occupy contiguous row memory
     and the colored solve kernel's payload reads are sequential. It also emits
@@ -17888,6 +17889,13 @@ def _get_color_propagation_prebuild_kernel(
     SORT_CAP = min(4096, OS)  # units a world may have for the sort to run on packed keys in shared memory
     # One raw buffer: the sort's keys first, then the masks and the staged chunks.
     RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * WORDS + 4 * CH)
+    # A color costs its longest unit, so longer units sort first and share colors. The rank
+    # takes 4 bits above the 31-bit contact index; packed keys keep the unit in the low 12 bits.
+    assert SORT_CAP <= 1 << 12
+
+    def rank_key(u: str) -> str:
+        rank = f"(15 - min(unit_len.data[world_base + {u}], 15))"
+        return f"(((unsigned long long){rank} << 31) | (unsigned long long)unit_contact.data[world_base + {u}])"
 
     def greedy(mask: str, index_a: str, index_b: str) -> str:
         return f"""
@@ -17961,15 +17969,15 @@ def _get_color_propagation_prebuild_kernel(
     }}
     for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
     __syncthreads();
-    // Bitonic sort of the permutation by global contact index: the greedy pass below
-    // is order-dependent, and this order is independent of the atomic list build.
+    // Bitonic sort of the permutation by (length rank, global contact index): the greedy
+    // pass below is order-dependent, and this order is independent of the atomic list build.
     if (n_pad <= {SORT_CAP}) {{
-        // Packed (contact index, unit) keys sort in shared memory; contact indices are
+        // Packed (rank, contact index, unit) keys sort in shared memory; contact indices are
         // unique per unit, so the order matches the permutation sort below.
         unsigned long long* s_key = reinterpret_cast<unsigned long long*>(s_raw);
         for (int i = t; i < n_pad; i += {B})
             s_key[i] = (i < n_units)
-                ? ((unsigned long long)(unsigned)unit_contact.data[world_base + i] << 32) | (unsigned)i
+                ? ({rank_key("i")} << 12) | (unsigned long long)i
                 : 0xFFFFFFFFFFFFFFFFull;
         __syncthreads();
         for (int k = 2; k <= n_pad; k <<= 1) {{
@@ -17987,7 +17995,7 @@ def _get_color_propagation_prebuild_kernel(
                 __syncthreads();
             }}
         }}
-        for (int i = t; i < n_units; i += {B}) unit_order.data[order_base + i] = (int)(s_key[i] & 0xFFFFFFFFull);
+        for (int i = t; i < n_units; i += {B}) unit_order.data[order_base + i] = (int)(s_key[i] & 0xFFFull);
         __syncthreads();
     }} else {{
         for (int k = 2; k <= n_pad; k <<= 1) {{
@@ -17997,8 +18005,8 @@ def _get_color_propagation_prebuild_kernel(
                     if (partner <= i) continue;
                     const int ui = unit_order.data[order_base + i];
                     const int up = unit_order.data[order_base + partner];
-                    const int ki = (ui >= 0) ? unit_contact.data[world_base + ui] : 0x7FFFFFFF;
-                    const int kp = (up >= 0) ? unit_contact.data[world_base + up] : 0x7FFFFFFF;
+                    const unsigned long long ki = (ui >= 0) ? {rank_key("ui")} : 0xFFFFFFFFFFFFFFFFull;
+                    const unsigned long long kp = (up >= 0) ? {rank_key("up")} : 0xFFFFFFFFFFFFFFFFull;
                     const bool ascending = (i & k) == 0;
                     if ((ki > kp) == ascending) {{
                         unit_order.data[order_base + i] = up;
@@ -18067,7 +18075,7 @@ def _get_color_propagation_prebuild_kernel(
     }}
     __syncthreads();
 
-    // Stable counting sort by color in sorted-contact order, so the serial tail
+    // Stable counting sort by color in sorted unit order, so the serial tail
     // keeps a deterministic sweep order. world_row_order temporarily holds the
     // unit index at each color-ordered position until the slot prefix below.
     for (int base = 0; base < n_units; base += {CH}) {{
