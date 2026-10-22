@@ -526,7 +526,7 @@ for motion, frames in (("stir", 570), ("insert", 270)):
         name="basic.example_basic_reduced_elastic_cup_straw",
         devices=test_devices,
         use_viewer=True,
-        test_options={"num-frames": frames, "motion": motion},
+        test_options={"num-frames": frames, "motion": motion, "allow_deprecation_warnings": True},
         test_suffix=motion,
         allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
     )
@@ -536,7 +536,7 @@ add_basic_example_test(
     name="basic.example_basic_reduced_elastic_chair_stick_slip",
     devices=cuda_test_devices,
     use_viewer=True,
-    test_options={"num-frames": 240},
+    test_options={"num-frames": 240, "allow_deprecation_warnings": True},
     allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
 )
 
