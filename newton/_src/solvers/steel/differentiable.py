@@ -22,7 +22,14 @@ from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import BodyFlags, JointType
 from .contact_torsion import _contact_groups, _group_budget
-from .friction_patches import _pose_motion, contact_tangent_basis, finish_patch_impulses, link_patch_rows
+from .friction_patches import (
+    FrictionPatches,
+    _pose_motion,
+    _store_history,
+    contact_tangent_basis,
+    finish_patch_impulses,
+    link_patch_rows,
+)
 from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -706,7 +713,6 @@ class DifferentiableStep:
         if solver._enable_joint_velocity_limits:
             self._reserve_velocity_limit_rows(c, v_hat)
         patches = solver._friction_anchors_enabled and has_contacts
-        patch_view = solver._friction_patches.view
         if patches:
             self._build_friction_patches(b, c, contacts)
         wp.launch(
@@ -883,10 +889,10 @@ class DifferentiableStep:
                 solver._free_rigid_mu_rolling,
                 int(solver._contact_friction_shared_anchor),
                 int(patches),
-                patch_view.point_a if patches else c.patch_local_a,
-                patch_view.phi if patches else c.patch_phi_unused,
-                solver._friction_patches.current.source if patches else c.slot,
-                solver._friction_patches.previous_q if patches else c.patch_q0,
+                c.patch_view.point_a if patches else c.patch_local_a,
+                c.patch_view.phi if patches else c.patch_phi_unused,
+                c.patch_source if patches else c.slot,
+                c.patch_previous_q if patches else c.patch_q0,
                 c.patch_local_a,
                 c.patch_local_b,
                 c.patch_q0,
@@ -937,8 +943,8 @@ class DifferentiableStep:
                     solver._free_rigid_mu_rolling,
                     int(solver._contact_friction_shared_anchor),
                     int(patches),
-                    patch_view.point_a if patches else c.patch_local_a,
-                    patch_view.point_b if patches else c.patch_local_b,
+                    c.patch_view.point_a if patches else c.patch_local_a,
+                    c.patch_view.point_b if patches else c.patch_local_b,
                     c.patch_local_a,
                     c.patch_local_b,
                     c.patch_q0,
@@ -1453,8 +1459,14 @@ class DifferentiableStep:
             angular_mu=(solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling, solver._free_rigid_route_body)
             if solver._free_rigid_angular_rows
             else None,
+            record_tape=False,
         )
         view = solver._friction_patches.view
+        # Taped kernels read per-step copies: the next step's build rewrites the solver's patch arrays.
+        for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+            wp.copy(getattr(c.patch_view, name), getattr(view, name))
+        wp.copy(c.patch_source, solver._friction_patches.current.source)
+        wp.copy(c.patch_previous_q, solver._friction_patches.previous_q)
         wp.launch(
             _patch_local_points,
             dim=c.capacity,
@@ -1575,7 +1587,7 @@ class DifferentiableStep:
                         *_contact_force_inputs(c),
                         int(solver._contact_shared_anchor),
                         int(solver._contact_friction_shared_anchor),
-                        solver._friction_patches.view,
+                        c.patch_view if solver._friction_anchors_enabled else solver._friction_patches.view,
                         inv_dt,
                     ],
                     outputs=[o.contact_wrench, o.dense_slot_contact],
@@ -1690,7 +1702,15 @@ class DifferentiableStep:
                 device=model.device,
                 record_tape=False,
             )
-        solver._friction_patches.store(_PoseView(c.patch_q0))
+        history = solver._friction_patches
+        wp.launch(
+            _store_history,
+            dim=max(history.capacity, history.previous_q.shape[0]),
+            inputs=[c.patch_q0, history.body_world, history.current, history.previous, history.previous_world],
+            outputs=[history.previous_q],
+            device=model.device,
+            record_tape=False,
+        )
 
     def _reserve_rigid_velocity_limit_rows(self, c: _ContactBuffers, v_hat: wp.array) -> None:
         """The free bodies' velocity-limit rows, which the matrix-free route reserves after its contact rows."""
@@ -2059,6 +2079,13 @@ class _ContactBuffers:
         self.patch_local_b = zeros(capacity, wp.vec3, False)
         self.patch_phi_unused = zeros(capacity, wp.vec2, False)
         self.ring = zeros((worlds, rows), wp.int32, False)
+        patch_view = solver._friction_patches.view
+        self.patch_view = FrictionPatches()
+        self.patch_view.enabled = patch_view.enabled
+        for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+            setattr(self.patch_view, name, wp.empty_like(getattr(patch_view, name), requires_grad=False))
+        self.patch_source = zeros(patch_view.point_a.shape[0], wp.int32, False)
+        self.patch_previous_q = zeros(max(solver.model.body_count, 1), wp.transform, False)
         patch_iterations = solver._iterations if solver._friction_anchors_enabled else 0
         self.pair_load = [zeros((worlds, rows)) for _ in range(patch_iterations)]
         self.pair_load_dummy = zeros((1, 1))

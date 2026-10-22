@@ -1554,7 +1554,6 @@ def _contact_scene_rollout(model, options, inputs, steps, *, differentiable, dt=
     solver = SolverSteel(model, differentiable=differentiable, **options)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
-    model.request_state_attributes("body_parent_f")
     states = [model.state(requires_grad=True) for _ in range(steps + 1)]
     states[0].joint_q.assign(inputs["joint_q"])
     states[0].joint_qd.assign(inputs["joint_qd"])
@@ -2194,6 +2193,41 @@ def test_friction_patches_match_default(test, device):
                 )
 
 
+def test_friction_patches_backward_ignores_later_steps(test, device):
+    """The patch state a step reads is its own: stepping the solver again before backward leaves the gradient."""
+    options = {**_PATCH_OPTIONS, "deterministic": True}
+    model = _build_arm_on_box_stack(device, stack=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        solver = SolverSteel(model, differentiable=True, **options)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    settle, steps, later = 30, 6, 4
+    states = [model.state(requires_grad=True) for _ in range(settle + steps + later + 1)]
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control, later_control = model.control(), model.control()
+    control.joint_f.assign(_arm_on_box_inputs(model)["joint_f"])
+    later_control.joint_f.assign(-2.0 * _arm_on_box_inputs(model)["joint_f"])
+    tape = wp.Tape()
+    for k in range(settle + steps):
+        contacts = pipeline.contacts()
+        pipeline.collide(states[k], contacts)
+        with tape if k >= settle else contextlib.nullcontext():
+            solver.step(states[k], states[k + 1], control, contacts, _DT)
+    final = states[settle + steps]
+    seed = wp.array(np.random.default_rng(4).normal(size=model.joint_dof_count).astype(np.float32), device=device)
+    gradients = []
+    for extra_steps in (0, later):
+        for k in range(settle + steps, settle + steps + extra_steps):
+            contacts = pipeline.contacts()
+            pipeline.collide(states[k], contacts)
+            solver.step(states[k], states[k + 1], later_control, contacts, _DT)
+        tape.zero()
+        tape.backward(grads={final.joint_qd: seed})
+        gradients.append(states[settle].joint_qd.grad.numpy().copy())
+    test.assertGreater(float(np.abs(gradients[0]).max()), 0.0)
+    np.testing.assert_array_equal(gradients[1], gradients[0])
+
+
 def test_friction_patches_gradient_matches_finite_difference(test, device):
     """Tape against central differences over steps whose patches carry history from earlier steps."""
     for shared in (False, True):
@@ -2377,6 +2411,13 @@ def _build_gripper(device, *, requires_grad=True, round_fingers=False):
     return model
 
 
+def _production_solver(model, profile, differentiable=False):
+    with warnings.catch_warnings():
+        # The profile pairs patch friction with contact_shared_anchor, which warns about the combination.
+        warnings.simplefilter("ignore", UserWarning)
+        return SolverSteel(model, differentiable=differentiable, **profile)
+
+
 def _production_pipeline(model):
     return newton.CollisionPipeline(
         model,
@@ -2414,9 +2455,9 @@ def test_production_profile_matches_default(test, device):
 
 def _check_production_profile_step(test, device, profile):
     model = _build_gripper(device, requires_grad=False)
-    reference_solver = SolverSteel(model, **profile)
+    reference_solver = _production_solver(model, profile)
     twin = _build_gripper(device)
-    solver = SolverSteel(twin, differentiable=True, **profile)
+    solver = _production_solver(twin, profile, differentiable=True)
     pipeline = _production_pipeline(model)
     states = [model.state() for _ in range(161)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -2460,7 +2501,7 @@ def _check_production_profile_gradient(test, device, profile, steps):
     base = np.array([0.1, 0.03, 0.03], np.float32)
 
     def loss_of(target, tape=None):
-        solver = SolverSteel(model, differentiable=True, **profile)
+        solver = _production_solver(model, profile, differentiable=True)
         pipeline = _production_pipeline(model)
         states = [model.state(requires_grad=True) for _ in range(settle + steps + 1)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -2753,7 +2794,7 @@ def test_deterministic_gradients_repeat(test, device):
     model = _build_gripper(device)
     gradients = []
     for _ in range(3):
-        solver = SolverSteel(model, differentiable=True, **_PRODUCTION_PROFILE)
+        solver = _production_solver(model, _PRODUCTION_PROFILE, differentiable=True)
         pipeline = _production_pipeline(model)
         states = [model.state(requires_grad=True) for _ in range(21)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -2788,7 +2829,10 @@ def _observed_rollout(model, options, inputs, steps, *, differentiable, tape=Non
     solver = SolverSteel(model, differentiable=differentiable, **options)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
-    model.request_state_attributes("body_parent_f")
+    with warnings.catch_warnings():
+        # State.body_parent_f is deprecated in favor of observables; both are compared here.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        model.request_state_attributes("body_parent_f")
     states = [model.state(requires_grad=True) for _ in range(steps + 1)]
     states[0].joint_q.assign(inputs["joint_q"])
     states[0].joint_qd.assign(inputs["joint_qd"])
@@ -2956,6 +3000,7 @@ for _device in get_test_devices():
             test_sleeping_option_keeps_islands_awake,
             test_friction_patches_match_default,
             test_friction_patches_gradient_matches_finite_difference,
+            test_friction_patches_backward_ignores_later_steps,
             test_production_profile_matches_default,
             test_production_profile_gradient_matches_finite_difference,
             test_rigid_velocity_limits_match_default,
