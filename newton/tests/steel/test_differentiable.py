@@ -2289,11 +2289,23 @@ _PRODUCTION_PROFILE = {
 
 
 def _build_gripper(device, *, requires_grad=True, round_fingers=False):
-    """A lift and two prismatic fingers squeezing a free box on the ground, with contact torsion on every shape."""
+    """A lift and two prismatic fingers squeezing a free box on the ground, with contact torsion on every shape.
+
+    The box carries the speed and depenetration bounds of production task objects.
+    """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    SolverSteel.register_custom_attributes(builder)
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, restitution=0.0)
     builder.add_ground_plane(cfg=cfg)
-    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0495), wp.quat_identity()))
+    # The rigid-body bounds production task objects carry.
+    box = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0495), wp.quat_identity()),
+        custom_attributes={
+            "steel:rigid_body_max_linear_velocity": 2.0,
+            "steel:rigid_body_max_angular_velocity": 2.0 * math.pi,
+            "steel:rigid_body_max_depenetration_velocity": 0.5,
+        },
+    )
     builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(mu=0.8, density=200.0))
     lift = builder.add_link(
         mass=1.0, inertia=wp.mat33(np.eye(3) * 0.002), xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity())
@@ -2456,6 +2468,95 @@ def test_production_profile_gradient_matches_finite_difference(test, device):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def _build_speed_limited_boxes(device, *, requires_grad=True):
+    """Two free boxes with a 1 m/s and 2 rad/s speed limit, one on the ground and one in the air."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    SolverSteel.register_custom_attributes(builder)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.3, restitution=0.0)
+    builder.add_ground_plane(cfg=cfg)
+    for height in (0.0995, 1.0):
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 2.0 * height, height), wp.quat_identity()),
+            custom_attributes={
+                "steel:rigid_body_max_linear_velocity": 1.0,
+                "steel:rigid_body_max_angular_velocity": 2.0,
+            },
+        )
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    return builder.finalize(device=device, requires_grad=requires_grad)
+
+
+def _speed_limited_inputs(model):
+    joint_qd = np.tile(np.array([3.0, -0.4, 0.0, 0.5, -1.0, 4.0], np.float32), 2)
+    return {"joint_q": model.joint_q.numpy().copy(), "joint_qd": joint_qd, "joint_f": np.zeros(12, np.float32)}
+
+
+def test_rigid_velocity_limits_match_default(test, device):
+    """Free bodies' linear and angular speed limits are solved as the matrix-free route's velocity-limit rows."""
+    for fraction in (0.0, 0.7):
+        options = {
+            "friction_anchor_beta": 0.0,
+            "solve_mode": "matrix_free",
+            "iterations": 8,
+            "velocity_limit_activation_fraction": fraction,
+            "articulation_constraint_max": 64,
+        }
+        inputs = _speed_limited_inputs(_build_speed_limited_boxes(device))
+        reference, solver = _contact_scene_rollout(
+            _build_speed_limited_boxes(device, requires_grad=False), options, inputs, 10, differentiable=False
+        )
+        test.assertTrue(solver._has_rigid_body_velocity_limits)
+        result, _ = _contact_scene_rollout(_build_speed_limited_boxes(device), options, inputs, 10, differentiable=True)
+        with test.subTest(velocity_limit_activation_fraction=fraction):
+            # Both boxes end within their limits, from three times the linear one.
+            test.assertLess(float(np.abs(reference.joint_qd.numpy()[:3]).max()), 1.0 + 1.0e-4)
+            np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
+
+
+def test_rigid_velocity_limits_gradient_matches_finite_difference(test, device):
+    """Tape against central differences with active free-body speed-limit rows."""
+    model = _build_speed_limited_boxes(device)
+    options = {
+        "friction_anchor_beta": 0.0,
+        "solve_mode": "matrix_free",
+        "iterations": 8,
+        "articulation_constraint_max": 64,
+    }
+    solver = SolverSteel(model, differentiable=True, **options)
+    inputs = _speed_limited_inputs(model)
+    rng = np.random.default_rng(23)
+    weights = rng.normal(size=12)
+
+    def loss_of(joint_qd, tape=None):
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        states = [model.state(requires_grad=True) for _ in range(5)]
+        states[0].joint_qd.assign(joint_qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        for k in range(4):
+            contacts = pipeline.contacts()
+            pipeline.collide(states[k], contacts)
+            if tape is not None:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], None, contacts, _DT)
+            if tape is not None:
+                tape.__exit__(None, None, None)
+        return float(weights @ states[-1].joint_qd.numpy()), states
+
+    tape = wp.Tape()
+    _, states = loss_of(inputs["joint_qd"], tape)
+    tape.backward(grads={states[-1].joint_qd: wp.array(weights.astype(np.float32), dtype=float, device=device)})
+    gradient = states[0].joint_qd.grad.numpy().astype(np.float64)
+    eps = 1.0e-3
+    for trial in range(3):
+        direction = rng.normal(size=12)
+        direction /= np.linalg.norm(direction)
+        plus = loss_of((inputs["joint_qd"] + eps * direction).astype(np.float32))[0]
+        minus = loss_of((inputs["joint_qd"] - eps * direction).astype(np.float32))[0]
+        fd = (plus - minus) / (2.0 * eps)
+        with test.subTest(trial=trial):
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2535,6 +2636,8 @@ for _device in get_test_devices():
             test_friction_patches_gradient_matches_finite_difference,
             test_production_profile_matches_default,
             test_production_profile_gradient_matches_finite_difference,
+            test_rigid_velocity_limits_match_default,
+            test_rigid_velocity_limits_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

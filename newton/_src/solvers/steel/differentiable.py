@@ -35,10 +35,12 @@ from .kernels import (
     ROW_SLOTS_ATOMIC,
     ROW_SLOTS_COUNT,
     ROW_SLOTS_WRITE,
+    _anchor_to_world,
     _compute_body_net_wrench,
     _gyro_skew,
     _is_identity_rotation,
     allocate_joint_velocity_limit_slots,
+    allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
@@ -120,7 +122,10 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
     """Raise for model features and resolved kernels the differentiable step does not reproduce."""
     plan = solver._model_plan
     checks = (
-        (solver._has_rigid_body_velocity_limits, "no rigid-body velocity limits"),
+        (
+            solver._has_rigid_body_velocity_limits and solver._solve_mode == "split",
+            'solve_mode="matrix_free" for rigid-body velocity limits',
+        ),
         (solver._mimic_count or solver._connect_count, "no mimic or loop-closing joints"),
         (
             not np.array_equal(plan.articulation_joint_end, solver.model.articulation_start.numpy()[1:]),
@@ -535,7 +540,12 @@ class DifferentiableStep:
             v_out = b.v_gyro
         if collide_done_event is not None:
             wp.get_stream(device).wait_event(collide_done_event)
-        if contacts is not None or solver._enable_joint_limits or solver._enable_joint_velocity_limits:
+        if (
+            contacts is not None
+            or solver._enable_joint_limits
+            or solver._enable_joint_velocity_limits
+            or solver._has_rigid_body_velocity_limits
+        ):
             v_out = self._solve_dense_rows(b, state_in, contacts, v_out, dt)
         wp.launch(
             _taped_update_qdd_from_velocity,
@@ -765,6 +775,8 @@ class DifferentiableStep:
                 device=device,
                 record_tape=False,
             )
+            if solver._has_rigid_body_velocity_limits:
+                self._reserve_rigid_velocity_limit_rows(c, v_hat)
         wp.launch(
             _finalize_constraint_status,
             dim=solver._world_count,
@@ -1064,7 +1076,7 @@ class DifferentiableStep:
         c.impulses[0].zero_()
         friction_start = solver._contact_friction_start_iteration(solver._iterations)
         torsion = solver._contact_torsion_enabled
-        velocity_limits = solver._enable_joint_velocity_limits
+        velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
         for k in range(solver._iterations):
             # A sweep is the contact and limit rows, then the torsion rows, then the velocity-limit rows,
             # each pass writing the next one's input.
@@ -1151,7 +1163,7 @@ class DifferentiableStep:
             )
         return c.v_out
 
-    def _reserve_rows(self, launch, slot_counter: wp.array) -> None:
+    def _reserve_rows(self, launch, slot_counter: wp.array, world_index=None) -> None:
         """Reserve one row family like the default's _reserve_rows: per world in articulation order if deterministic."""
         solver = self.solver
         if not solver._deterministic:
@@ -1159,7 +1171,7 @@ class DifferentiableStep:
             return
         solver._row_cursor.zero_()
         launch(ROW_SLOTS_COUNT)
-        start, elements = solver._articulation_world_index
+        start, elements = solver._articulation_world_index if world_index is None else world_index
         wp.launch(
             scan_world_row_requests,
             dim=solver._world_count,
@@ -1397,6 +1409,80 @@ class DifferentiableStep:
                 record_tape=False,
             )
         solver._friction_patches.store(_PoseView(c.patch_q0))
+
+    def _reserve_rigid_velocity_limit_rows(self, c: _ContactBuffers, v_hat: wp.array) -> None:
+        """The free bodies' velocity-limit rows, which the matrix-free route reserves after its contact rows."""
+        solver = self.solver
+        model = solver.model
+        is_free_rigid = solver._dummy_is_free_rigid if solver._is_free_rigid is None else solver._is_free_rigid
+
+        def launch(mode):
+            wp.launch(
+                allocate_rigid_velocity_limit_slots,
+                dim=solver._free_rigid_body_count,
+                inputs=[
+                    solver._free_rigid_body_indices,
+                    solver._body_to_articulation,
+                    solver._art_to_world,
+                    is_free_rigid,
+                    model.body_flags,
+                    solver._rigid_body_max_linear_velocity,
+                    solver._rigid_body_max_angular_velocity,
+                    solver._articulation_root_dof_start,
+                    v_hat,
+                    solver._free_root_anchor,
+                    solver._velocity_limit_activation_fraction,
+                    solver._articulation_constraint_max,
+                    solver._constraint_art_active,
+                ],
+                outputs=[
+                    solver._rigid_velocity_limit_slot,
+                    solver._rigid_velocity_limit_sign,
+                    c.row_count,
+                    mode,
+                    solver._row_cursor,
+                ],
+                device=model.device,
+                record_tape=False,
+            )
+
+        self._reserve_rows(launch, c.row_count, solver._rigid_velocity_limit_world_index)
+        wp.launch(
+            _rigid_velocity_limit_rows,
+            dim=solver._free_rigid_body_count,
+            inputs=[
+                solver._free_rigid_body_indices,
+                solver._body_to_articulation,
+                solver._art_to_world,
+                solver._art_group_idx,
+                solver._free_root_anchor,
+                solver._rigid_body_max_linear_velocity,
+                solver._rigid_body_max_angular_velocity,
+                solver._rigid_velocity_limit_slot,
+                solver._rigid_velocity_limit_sign,
+                solver._cfm,
+            ],
+            outputs=[
+                c.J[6],
+                c.row_type,
+                c.row_parent,
+                c.row_mu,
+                c.row_beta,
+                c.row_cfm,
+                c.phi,
+                c.target_velocity,
+            ],
+            device=model.device,
+            record_tape=False,
+        )
+        wp.launch(
+            _clamp_row_count,
+            dim=solver._world_count,
+            inputs=[solver._articulation_constraint_max],
+            outputs=[c.row_count],
+            device=model.device,
+            record_tape=False,
+        )
 
     def _assign_slots_by_world(self, c: _ContactBuffers, contacts: Contacts) -> None:
         """_assign_contact_slots_by_world on this step's routes: rows reserved in contact order."""
@@ -1689,7 +1775,8 @@ class _ContactBuffers:
         self.pair_load = [zeros((worlds, rows)) for _ in range(patch_iterations)]
         self.pair_load_dummy = zeros((1, 1))
         self.limit_dof = zeros((worlds, rows), wp.int32, False)
-        limit_iterations = solver._iterations if solver._enable_joint_velocity_limits else 0
+        velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
+        limit_iterations = solver._iterations if velocity_limits else 0
         self.velocity_limit_input = [zeros((worlds, rows)) for _ in range(limit_iterations)]
         self.velocity_limit_residuals = [zeros((worlds, rows)) for _ in range(limit_iterations)]
         self.residuals = [zeros((worlds, rows)) for _ in range(solver._iterations)]
@@ -3704,3 +3791,65 @@ def _ring_load(
             total += impulse
     pair_load[world, row] = total
     return pair_load[world, row]
+
+
+@wp.kernel
+def _rigid_velocity_limit_rows(
+    free_rigid_body_indices: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    art_group_idx: wp.array[int],
+    free_root_anchor: wp.array[wp.quat],
+    rigid_body_max_linear_velocity: wp.array[float],
+    rigid_body_max_angular_velocity: wp.array[float],
+    slots: wp.array[int],
+    signs: wp.array[float],
+    cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_cfm: wp.array2d[float],
+    row_phi: wp.array2d[float],
+    row_target_velocity: wp.array2d[float],
+):
+    """populate_rigid_velocity_limit_rows as rows on the free root's DOFs: each bounds one world-axis speed."""
+    candidate = wp.tid()
+    body = free_rigid_body_indices[candidate]
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    world = art_to_world[art]
+    group = art_group_idx[art]
+    for axis in range(6):
+        limit = rigid_body_max_linear_velocity[body]
+        if axis >= 3:
+            limit = rigid_body_max_angular_velocity[body]
+        for side in range(2):
+            index = 12 * candidate + 2 * axis + side
+            slot = slots[index]
+            if slot >= 0:
+                sign = signs[index]
+                block = 3 * (axis // 3)
+                for dof in range(6):
+                    J_group[group, slot, dof] = 0.0
+                # The DOFs hold the anchor-frame velocity; the limit bounds a world-frame component.
+                for k in range(3):
+                    unit = wp.vec3(float(k == 0), float(k == 1), float(k == 2))
+                    J_group[group, slot, block + k] = sign * _anchor_to_world(free_root_anchor[art], unit)[axis % 3]
+                row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+                row_parent[world, slot] = -1
+                row_mu[world, slot] = 0.0
+                row_beta[world, slot] = 0.0
+                row_cfm[world, slot] = cfm
+                row_phi[world, slot] = 0.0
+                row_target_velocity[world, slot] = -limit
+
+
+@wp.kernel
+def _clamp_row_count(max_rows: int, row_count: wp.array[int]):
+    """Rows reserved past the capacity were not written; the count stops at the capacity."""
+    world = wp.tid()
+    row_count[world] = wp.min(row_count[world], max_rows)
