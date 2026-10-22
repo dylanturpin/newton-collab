@@ -63,7 +63,7 @@ def _build_d6_articulated_free_contact_model(device: str):
     return builder.finalize(device=device)
 
 
-def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple[int, int, int]]:
+def _step_d6_contact_case(model, contacts, mode: str, iterations: int = 2) -> tuple[np.ndarray, tuple[int, int, int]]:
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -76,7 +76,7 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
         model,
         solve_mode="matrix_free",
         articulated_contact_response=mode,
-        iterations=2,
+        iterations=iterations,
         velocity_iterations=0,
         articulation_constraint_max=32,
         free_body_constraint_max=32,
@@ -113,12 +113,17 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
         self.assertGreater(rows_immediate[0], 0)
         self.assertEqual(rows_immediate[2], 0)
 
-        for response in ("propagation", "propagation_colored"):
+        # Colored sweeps the longer units first, unlike the immediate row order, so it is compared once converged.
+        qd_immediate_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
+        for response, iterations, reference in (
+            ("propagation", 2, qd_immediate),
+            ("propagation_colored", 32, qd_immediate_converged),
+        ):
             with self.subTest(response=response):
-                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response)
+                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response, iterations)
                 self.assertEqual(rows_propagation[0], 0)
                 self.assertGreater(rows_propagation[2], 0)
-                np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+                np.testing.assert_allclose(qd_propagation, reference, rtol=1.0e-5, atol=1.0e-5)
 
     def test_steel_propagation_mixed_size_free_body_response(self):
         _require_cuda("CUDA is required for propagation articulated/free contact rows")
