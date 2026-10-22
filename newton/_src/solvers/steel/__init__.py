@@ -13,8 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .solver_steel import SolverSteel
+"""Steel solver module.
+
+Use :class:`~newton.solvers.SolverSteel` as the canonical public solver class.
+"""
+
+from .differentiable import SmoothContactLaw
 
 __all__ = [
-    "SolverSteel",
+    "SmoothContactLaw",
 ]

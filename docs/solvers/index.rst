@@ -128,7 +128,7 @@ Supported Features
      - ❌
      - ❌
      - ❌
-     - ❌
+     - 🟨 experimental :sup:`3`
    * - :class:`~newton.solvers.SolverStyle3D`
      - Implicit
      - ❌
@@ -158,6 +158,7 @@ Supported Features
   Set ``use_mujoco_contacts=False`` to use Newton's collision pipeline.
 | :sup:`2` ``basic`` means Newton includes several examples that use these solvers in diffsim workflows,
   see :ref:`Differentiability` for further details.
+| :sup:`3` Opt-in with ``SolverSteel(differentiable=True)``, for a subset of options and a fixed contact set.
 
 .. experimental::
     :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.

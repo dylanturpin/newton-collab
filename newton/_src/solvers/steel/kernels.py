@@ -28,7 +28,7 @@ from ..featherstone.kernels import jcalc_motion
 from .friction import friction_pair_candidate
 from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
-# SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
+# Only the differentiable step needs adjoints, and it rebuilds the kernels it records with them.
 wp.set_module_options({"enable_backward": False})
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0

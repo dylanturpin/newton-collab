@@ -77,6 +77,12 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
+from .differentiable import (
+    DifferentiableStep,
+    SmoothContactLaw,
+    validate_differentiable_model,
+    validate_differentiable_options,
+)
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -280,7 +286,7 @@ from .sparse_mass_matrix import (
 )
 from .sparse_pgs import _get_pgs_solve_sparse_kernel
 
-# SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
+# Only the differentiable step needs adjoints, and it rebuilds the kernels it records with them.
 wp.set_module_options({"enable_backward": False})
 
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
@@ -1957,10 +1963,66 @@ class SolverSteel(SolverBase, CouplingInterface):
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         deterministic: bool = False,
+        differentiable: bool = False,
+        smooth_contact: SmoothContactLaw | None = None,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            differentiable: Experimental opt-in step for reverse-mode differentiation with :class:`warp.Tape`.
+                It runs the same forward law with a fixed generic kernel selection and keeps every
+                intermediate in buffers owned by ``state_out``, so record each step into a distinct output
+                state, as in ``solver.step(states[i], states[i + 1], ...)``. Every step rewrites the buffers it
+                reads, so optimizer loops may reuse one solver and one list of states without :meth:`reset`.
+                Gradients reach ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
+                ``Control.joint_target_q`` and ``Control.joint_target_qd``; model parameters are not validated
+                gradient inputs. Free-joint quaternion gradients are meaningful along tangent directions of
+                the unit quaternion. Unlike the default step, it does not refresh ``state_in.body_q`` in place.
+                Solver observables and ``State.body_parent_f`` are computed from the taped impulses.
+
+                Contacts run in ``solve_mode="split"`` or ``"matrix_free"``, with point or patch friction,
+                shared friction anchors, restitution, contact torsion, free-body rolling and torsional
+                friction, and, in ``"matrix_free"``, contact regularization and worlds that mix free bodies
+                with articulations. The contact set, its row layout and friction-patch history are held fixed
+                for the derivative. Contact points and normals come from the given buffers and are
+                stop-gradient, while the gap and Jacobians are recomputed from the step's poses. Every PGS
+                sweep is differentiated as executed. Each friction pair solve is differentiated in closed form
+                at its computed root, rather than through its root-finding iterates: the sticking
+                (pseudo-)inverse, or the implicit derivative of the sliding root. A rank-one tangent block, as
+                on low-DOF articulations, is differentiated along rank-preserving changes. Where the solve
+                keeps an already feasible sliding impulse, the forward value is unchanged and the derivative
+                of the pair solve it stands in for is substituted. Contact activation, limit activation,
+                restitution firing and stick/slip switches are nonsmooth. Every contact row, free-body rows
+                included, takes an ``articulation_constraint_max`` slot, so size that capacity for all of a
+                world's rows; overflow sets :attr:`constraint_overflow` for :meth:`check_constraint_capacity`,
+                and agreement with the default step excludes overflowing steps. Joint position and velocity
+                limits, rigid-body velocity limits and ``drive_mode="rows"`` (``"matrix_free"``), and kinematic
+                bodies are supported.
+                Both ``contact_torsion_device`` settings are accepted, but contact torsion groups contacts on
+                the host and requires eager stepping: capturing a contact step with torsion enabled in a CUDA
+                graph raises ``RuntimeError``.
+                Sleeping is accepted and the step keeps every body awake. With ``deterministic=True`` the
+                backward is bitwise repeatable too. ``collide_done_event`` is waited on before contacts are
+                read. Contact buffers take about nine times the default step's memory per environment and
+                step.
+
+                Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
+                particles, mimic or loop-closing joints, and the solver uses immediate response,
+                ``row_schedule="interleaved"``, ``friction_mode="fixed_normal"``,
+                ``update_mass_matrix_interval=1``, no joint friction, warm start, compliance, articulated
+                torsional and rolling friction, velocity iterations, fused drive velocity limits or
+                ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"`` dense PGS kernel.
+                Defaults to False.
+
+                .. experimental::
+
+                    ``differentiable=True`` and its supported combinations may change without prior notice.
+            smooth_contact: Experimental, forward-changing contact law for ``differentiable=True``: a smooth
+                explicit spring-damper, evaluated once per step from the predicted velocity, replaces the hard
+                normal rows, restitution and the depenetration clamp; point friction is still solved by PGS
+                against that normal impulse. It is a surrogate model, not Steel contact parity. Requires
+                ``enable_restitution=False``. See :class:`~newton.solvers.steel.SmoothContactLaw`.
+                Defaults to None.
             deterministic: Reserve constraint rows in a fixed order, not in the order GPU threads reach the
                 per-world atomic counters, and sum split-mode right-hand sides in a fixed order. Given identical
                 contact inputs in an identical order, repeated runs are bitwise identical on the same GPU model,
@@ -2472,6 +2534,32 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if smooth_contact is not None and (not differentiable or enable_restitution):
+            raise ValueError("smooth_contact requires differentiable=True and enable_restitution=False")
+        if differentiable:
+            validate_differentiable_options(
+                model,
+                {
+                    "enable_sleeping": enable_sleeping,
+                    "contact_warmstart": contact_warmstart,
+                    "contact_torsion_device": contact_torsion_device,
+                    "enable_torsional_rolling_friction": enable_torsional_rolling_friction,
+                    "free_rigid_torsional_friction": free_rigid_torsional_friction,
+                    "free_rigid_rolling_friction": free_rigid_rolling_friction,
+                    "contact_compliance": contact_compliance,
+                    "articulated_contact_response": articulated_contact_response,
+                    "update_mass_matrix_interval": update_mass_matrix_interval,
+                    "enable_joint_limits": enable_joint_limits,
+                    "enable_joint_velocity_limits": enable_joint_velocity_limits,
+                    "enable_joint_friction": enable_joint_friction,
+                    "drive_mode": drive_mode,
+                    "row_schedule": row_schedule,
+                    "friction_mode": friction_mode,
+                    "velocity_iterations": velocity_iterations,
+                    "parallel_tree": parallel_tree,
+                    "deterministic": deterministic,
+                },
+            )
         if contact_compliance:
             _contact_compliance.validate_configuration(
                 model,
@@ -2500,6 +2588,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
         self._compliance = None
         super().__init__(model)
+        self._differentiable = bool(differentiable)
         _validate_equality_constraints(model)
         _validate_tree_joints_enabled(model)
 
@@ -2686,8 +2775,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._solve_mode = solve_mode
         if self._enable_joint_velocity_limits and self._solve_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires solve_mode='matrix_free'")
-        if model.requires_grad:
-            raise NotImplementedError("SolverSteel does not support gradients (model.requires_grad=True).")
+        if model.requires_grad and not differentiable:
+            raise NotImplementedError("SolverSteel supports model.requires_grad=True only with differentiable=True.")
         if self._enable_joint_friction:
             if self._solve_mode != "matrix_free":
                 raise NotImplementedError("enable_joint_friction=True currently requires solve_mode='matrix_free'")
@@ -3596,7 +3685,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._sleep_skip_constraints = bool(sleep_skip_constraints)
         self._sleeping = (
             _SleepState(self, sleep_linear_threshold, sleep_angular_threshold, sleep_quiet_time, sleep_skip_constraints)
-            if enable_sleeping
+            # The differentiable step keeps every island awake.
+            if enable_sleeping and not differentiable
             else None
         )
         if self._enable_torsional_rolling_friction:
@@ -3620,6 +3710,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             and model.articulation_world is not None
             and np.any(model.articulation_world.numpy() < 0)
         )
+        self._differentiable_step = None
+        if differentiable:
+            validate_differentiable_model(self)
+            self._differentiable_step = DifferentiableStep(self, smooth_contact)
         # Last, so a failed construction leaves the model's reduction keys untouched.
         reduction_key = free_rigid_reduction_material_key(self)
         if reduction_key is not None:
@@ -9412,6 +9506,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 "Steel contact capacity mismatch: received "
                 f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
+            )
+        if self._differentiable_step is not None:
+            return self._differentiable_step.step(
+                state_in, state_out, control, contacts, dt, collide_done_event, observables
             )
         if self._contact_warmstart:
             # A reduced stream is valid when it carries retained identities.
