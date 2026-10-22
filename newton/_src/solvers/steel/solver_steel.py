@@ -3685,7 +3685,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._sleep_skip_constraints = bool(sleep_skip_constraints)
         self._sleeping = (
             _SleepState(self, sleep_linear_threshold, sleep_angular_threshold, sleep_quiet_time, sleep_skip_constraints)
-            if enable_sleeping
+            # The differentiable step keeps every island awake.
+            if enable_sleeping and not differentiable
             else None
         )
         if self._enable_torsional_rolling_friction:

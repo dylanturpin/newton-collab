@@ -181,7 +181,6 @@ def _weighted_loss(
 def test_rejects_unsupported_configs(test, device):
     model = _build_chain(device)
     for kwargs in (
-        {"enable_sleeping": True},
         {"contact_warmstart": True},
         {"friction_anchor_beta": 0.2},
         {"enable_torsional_rolling_friction": True},
@@ -2121,6 +2120,18 @@ def test_free_rigid_angular_friction_gradient_matches_finite_difference(test, de
                 test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def test_sleeping_option_keeps_islands_awake(test, device):
+    """enable_sleeping=True is accepted and has no effect: while no island of the default step sleeps, they match."""
+    options = {**_ARM_ON_BOX_OPTIONS, "enable_sleeping": True}
+    inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
+    reference, _ = _contact_scene_rollout(
+        _build_arm_on_box_stack(device, requires_grad=False), options, inputs, 20, differentiable=False
+    )
+    result, solver = _contact_scene_rollout(_build_arm_on_box_stack(device), options, inputs, 20, differentiable=True)
+    test.assertIsNone(solver._sleeping)
+    np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=1.0e-5, atol=2.0e-5)
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2195,6 +2206,7 @@ for _device in get_test_devices():
             test_matrix_free_restitution_matches_default,
             test_free_rigid_angular_friction_matches_default,
             test_free_rigid_angular_friction_gradient_matches_finite_difference,
+            test_sleeping_option_keeps_islands_awake,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

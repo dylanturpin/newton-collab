@@ -101,7 +101,6 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
     checks = (
         (not model.requires_grad, "a model finalized with requires_grad=True"),
         (model.particle_count > 0, "no particles"),
-        (options["enable_sleeping"], "enable_sleeping=False"),
         (options["contact_warmstart"], "contact_warmstart=False"),
         (beta is not None and beta > 0.0, "friction_anchor_beta=0"),
         (options["enable_torsional_rolling_friction"], "enable_torsional_rolling_friction=False"),
