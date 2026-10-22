@@ -2856,6 +2856,45 @@ def _observed_rollout(model, options, inputs, steps, *, differentiable, tape=Non
     return states, control, observables, records
 
 
+def test_observables_reuse_output_state(test, device):
+    """Stepping into a used output state, also with no contacts and in a replayed graph, publishes this step's wrenches."""
+    model = _build_box_chain_on_plane(device)
+    values = _contact_inputs(model)
+    solver = SolverSteel(model, differentiable=True, friction_anchor_beta=0.0, iterations=16)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    state = model.state(requires_grad=True)
+    state.joint_q.assign(values["joint_q"])
+    state.joint_qd.assign(values["joint_qd"])
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    control = model.control()
+    control.joint_f.assign(values["joint_f"])
+    pipeline.collide(state, contacts)
+    count = contacts.rigid_contact_count.numpy().copy()
+    test.assertGreater(int(count[0]), 0)
+    observables = solver.observables(_OBSERVABLE_KINDS, contacts=contacts)
+
+    def published(output, touching):
+        contacts.rigid_contact_count.assign(count if touching else np.zeros_like(count))
+        solver.step(state, output, control, contacts, _DT, observables=observables)
+        return observables.contact_f.numpy().copy(), observables.body_parent_f.numpy().copy()
+
+    touching = published(model.state(requires_grad=True), True)
+    apart = published(model.state(requires_grad=True), False)
+    test.assertGreater(float(np.abs(touching[1] - apart[1]).max()), 1.0)
+    reused = model.state(requires_grad=True)
+    for expected, contact in ((touching, True), (touching, True), (apart, False)):
+        for value, value_expected in zip(published(reused, contact), expected, strict=True):
+            np.testing.assert_array_equal(value, value_expected)
+    if wp.get_device(device).is_cuda:
+        contacts.rigid_contact_count.assign(count)
+        with wp.ScopedCapture(device) as capture:
+            solver.step(state, reused, control, contacts, _DT, observables=observables)
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(observables.body_parent_f.numpy(), touching[1], rtol=1.0e-6, atol=1.0e-5)
+
+
 def test_observables_match_default(test, device):
     """CONTACT_F and BODY_PARENT_F of the differentiable step follow the default step's."""
     scenes = [("box_chain", lambda requires_grad: _build_box_chain_on_plane(device, requires_grad=requires_grad), {})]
@@ -2981,6 +3020,7 @@ for _device in get_test_devices():
         test_kinematic_velocity_gradient_matches_finite_difference,
         test_observables_match_default,
         test_observables_gradient_matches_finite_difference,
+        test_observables_reuse_output_state,
         test_deterministic_split_contacts_match_default,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])

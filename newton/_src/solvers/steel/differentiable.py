@@ -1566,6 +1566,9 @@ class DifferentiableStep:
             body_parent_f.zero_()
         else:
             o = b.observable_buffers()
+            # The wrench kernels accumulate, and an output state is stepped into again.
+            o.contact_wrench.zero_()
+            o.dense_slot_contact.fill_(-1)
             if c is not None and contacts.rigid_contact_max:
                 wp.launch(
                     self._ordered(_taped_accumulate_contact_wrenches_from_impulses),
