@@ -2486,18 +2486,18 @@ def test_production_profile_gradient_matches_finite_difference(test, device):
 
     Round fingers keep the grasp to one contact per finger; flat fingers make the force split indeterminate.
     """
-    # With drive rows the grasp meets contact events within a few steps; the chain test covers their chaining.
-    for name, steps in (("augmented", 4), ("rows", 1)):
+    for name, profile in _PRODUCTION_VARIANTS.items():
         with test.subTest(drives=name):
-            _check_production_profile_gradient(test, device, _PRODUCTION_VARIANTS[name], steps)
+            _check_production_profile_gradient(test, device, profile)
 
 
-def _check_production_profile_gradient(test, device, profile, steps):
+def _check_production_profile_gradient(test, device, profile):
     model = _build_gripper(device, round_fingers=True)
     rng = np.random.default_rng(2)
     weights_q = rng.normal(size=model.joint_coord_count)
     weights_qd = rng.normal(size=model.joint_dof_count)
-    settle = 30
+    # One step: within a few more the grasp meets contact events, where the differences jump between step sizes.
+    settle, steps = 30, 1
     base = np.array([0.1, 0.03, 0.03], np.float32)
 
     def loss_of(target, tape=None):
