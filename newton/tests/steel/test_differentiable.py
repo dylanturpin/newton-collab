@@ -2246,6 +2246,216 @@ def test_friction_patches_gradient_matches_finite_difference(test, device):
                 test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+# Every option a production Steel profile sets, so each is either accepted here or listed as rejected.
+_PRODUCTION_PROFILE = {
+    "iterations": 32,
+    "velocity_iterations": 0,
+    "contact_regularization": 0.01,
+    "articulation_constraint_max": 1024,
+    "free_body_constraint_max": 4096,
+    "solve_mode": "matrix_free",
+    "row_schedule": "interleaved",
+    "articulated_contact_response": "immediate",
+    "drive_mode": "augmented",
+    "baumgarte": 0.2,
+    "cfm": 1.0e-6,
+    "contact_warmstart": False,
+    "update_mass_matrix_interval": 1,
+    "contact_speculative_scale": 1.0,
+    "contact_friction_gap_max": 0.001,
+    "contact_friction_position_iterations": -1,
+    "contact_shared_anchor": True,
+    "contact_friction_shared_anchor": True,
+    "friction_anchor_beta": 0.2,
+    "deterministic": True,
+    "enable_joint_limits": True,
+    "joint_limit_activation_gap": 0.2,
+    "enable_joint_velocity_limits": True,
+    "velocity_limit_activation_fraction": 0.7,
+    "enable_bilateral_preelimination": False,
+    "contact_torsion_device": True,
+    "contact_compliance": False,
+    "enable_restitution": True,
+    "warn_constraint_overflow": True,
+    "row_watermark": True,
+    "enable_sleeping": True,
+    "sleep_linear_threshold": 0.05,
+    "sleep_angular_threshold": 0.15,
+    "sleep_quiet_time": 0.5,
+    "sleep_skip_constraints": True,
+    "free_rigid_rolling_friction": 0.001,
+    "free_rigid_torsional_friction": 0.0,
+}
+
+
+def _build_gripper(device, *, requires_grad=True, round_fingers=False):
+    """A lift and two prismatic fingers squeezing a free box on the ground, with contact torsion on every shape."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, restitution=0.0)
+    builder.add_ground_plane(cfg=cfg)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0495), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(mu=0.8, density=200.0))
+    lift = builder.add_link(
+        mass=1.0, inertia=wp.mat33(np.eye(3) * 0.002), xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity())
+    )
+    fingers = []
+    for side in (-1.0, 1.0):
+        finger = builder.add_link(
+            mass=0.2,
+            inertia=wp.mat33(np.eye(3) * 2.0e-4),
+            xform=wp.transform(wp.vec3(0.075 * side, 0.0, 0.05), wp.quat_identity()),
+        )
+        if round_fingers:
+            builder.add_shape_sphere(finger, radius=0.02, cfg=cfg)
+        else:
+            builder.add_shape_box(finger, hx=0.015, hy=0.03, hz=0.03, cfg=cfg)
+        fingers.append(finger)
+    joints = [
+        builder.add_joint_prismatic(
+            -1,
+            lift,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+            axis=(0.0, 0.0, 1.0),
+            target_ke=400.0,
+            target_kd=40.0,
+            limit_lower=-0.02,
+            limit_upper=0.3,
+            velocity_limit=0.5,
+            armature=0.01,
+        )
+    ]
+    for side, finger in zip((-1.0, 1.0), fingers, strict=True):
+        joints.append(
+            builder.add_joint_prismatic(
+                lift,
+                finger,
+                parent_xform=wp.transform(wp.vec3(0.075 * side, 0.0, 0.0), wp.quat_identity()),
+                axis=(-side, 0.0, 0.0),
+                target_ke=300.0,
+                target_kd=20.0,
+                limit_lower=-0.02,
+                limit_upper=0.03,
+                velocity_limit=0.3,
+                armature=0.01,
+            )
+        )
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device, requires_grad=requires_grad)
+    set_torsion_radius(model, 0.01)
+    return model
+
+
+def _production_pipeline(model):
+    return newton.CollisionPipeline(
+        model,
+        rigid_contact_max=128,
+        deterministic=True,
+        convex_face_clip=True,
+        contact_matching="sticky",
+        reduce_contacts=False,
+    )
+
+
+def _gripper_targets(control, lift):
+    targets = control.joint_target_q.numpy()
+    targets[-3:] = (lift, 0.03, 0.03)
+    control.joint_target_q.assign(targets)
+
+
+def test_production_profile_matches_default(test, device):
+    """The production option set: each differentiable step matches the default step from the same state.
+
+    The default's grasp is sensitive to rounding when the fingers land, so the steps are compared one at a time
+    along the default's trajectory, a squeeze and a lift.
+    """
+    model = _build_gripper(device, requires_grad=False)
+    reference_solver = SolverSteel(model, **_PRODUCTION_PROFILE)
+    twin = _build_gripper(device)
+    solver = SolverSteel(twin, differentiable=True, **_PRODUCTION_PROFILE)
+    pipeline = _production_pipeline(model)
+    states = [model.state() for _ in range(161)]
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control, twin_control = model.control(), twin.control()
+    errors = []
+    for k in range(160):
+        for each in (control, twin_control):
+            _gripper_targets(each, 0.0 if k < 40 else 0.1)
+        contacts = pipeline.contacts()
+        pipeline.collide(states[k], contacts)
+        state = twin.state(requires_grad=True)
+        state.joint_q.assign(states[k].joint_q)
+        state.joint_qd.assign(states[k].joint_qd)
+        newton.eval_fk(twin, state.joint_q, state.joint_qd, state)
+        output = twin.state(requires_grad=True)
+        reference_solver.step(states[k], states[k + 1], control, contacts, 1.0 / 240.0)
+        solver.step(state, output, twin_control, contacts, 1.0 / 240.0)
+        errors.append(float(np.abs(output.joint_qd.numpy() - states[k + 1].joint_qd.numpy()).max()))
+    # The fingers lift the box off the ground.
+    test.assertGreater(float(states[-1].body_q.numpy()[0][2]), 0.09)
+    test.assertLess(max(errors), 2.0e-5)
+
+
+def test_production_profile_gradient_matches_finite_difference(test, device):
+    """Tape against central differences of the lift and finger targets, after a grasp, with the production options.
+
+    Round fingers keep the grasp to one contact per finger; flat fingers make the force split indeterminate.
+    """
+    model = _build_gripper(device, round_fingers=True)
+    rng = np.random.default_rng(2)
+    weights_q = rng.normal(size=model.joint_coord_count)
+    weights_qd = rng.normal(size=model.joint_dof_count)
+    settle, steps = 30, 4
+    base = np.array([0.1, 0.03, 0.03], np.float32)
+
+    def loss_of(target, tape=None):
+        solver = SolverSteel(model, differentiable=True, **_PRODUCTION_PROFILE)
+        pipeline = _production_pipeline(model)
+        states = [model.state(requires_grad=True) for _ in range(settle + steps + 1)]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        settling, control = model.control(), model.control()
+        _gripper_targets(settling, 0.0)
+        targets = control.joint_target_q.numpy()
+        targets[-3:] = target
+        control.joint_target_q.assign(targets)
+        rows = []
+        for k in range(settle + steps):
+            contacts = pipeline.contacts()
+            pipeline.collide(states[k], contacts)
+            live = k >= settle
+            if tape is not None and live:
+                tape.__enter__()
+            solver.step(states[k], states[k + 1], control if live else settling, contacts, 1.0 / 240.0)
+            if tape is not None and live:
+                tape.__exit__(None, None, None)
+            if live:
+                rows.append(int(states[k + 1]._steel_differentiable_buffers.contacts.row_count.numpy()[0]))
+        final = states[-1]
+        return float(weights_q @ final.joint_q.numpy() + weights_qd @ final.joint_qd.numpy()), final, control, rows
+
+    tape = wp.Tape()
+    _, final, control, rows = loss_of(base, tape)
+    tape.backward(
+        grads={
+            final.joint_q: wp.array(weights_q.astype(np.float32), dtype=float, device=device),
+            final.joint_qd: wp.array(weights_qd.astype(np.float32), dtype=float, device=device),
+        }
+    )
+    gradient = control.joint_target_q.grad.numpy()[-3:].astype(np.float64)
+    test.assertGreater(min(rows), 0)
+    for trial in range(2):
+        direction = rng.normal(size=3)
+        direction /= np.linalg.norm(direction)
+        # Contact and stick/slip events make isolated step sizes see a different regime: take the median.
+        differences = []
+        for eps in (3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2):
+            plus = loss_of((base + eps * direction).astype(np.float32))[0]
+            minus = loss_of((base - eps * direction).astype(np.float32))[0]
+            differences.append((plus - minus) / (2.0 * eps))
+        fd = float(np.median(differences))
+        with test.subTest(trial=trial):
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2323,6 +2533,8 @@ for _device in get_test_devices():
             test_sleeping_option_keeps_islands_awake,
             test_friction_patches_match_default,
             test_friction_patches_gradient_matches_finite_difference,
+            test_production_profile_matches_default,
+            test_production_profile_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

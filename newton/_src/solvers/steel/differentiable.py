@@ -1556,7 +1556,7 @@ class _TorsionGroupingView:
     def __init__(self, solver: SolverSteel, c: _ContactBuffers):
         self.model = solver.model
         self._contact_torsion_shape_radius = solver._contact_torsion_shape_radius
-        self._friction_anchors_enabled = False
+        self._friction_anchors_enabled = solver._friction_anchors_enabled
         self._friction_patches = solver._friction_patches
         self._row_dropped_dense = solver._row_dropped_dense
         self._contact_path = c.path
