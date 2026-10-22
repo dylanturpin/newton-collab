@@ -30,6 +30,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
     ROW_SLOTS_ATOMIC,
@@ -42,6 +43,7 @@ from .kernels import (
     accumulate_contact_wrenches_from_impulses,
     accumulate_torsion_wrenches_from_impulses,
     allocate_joint_velocity_limit_slots,
+    allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_free_root_transport_to_predictor,
@@ -51,6 +53,7 @@ from .kernels import (
     compute_contact_spatial_force_from_impulses,
     compute_link_transform,
     compute_link_velocity,
+    compute_physx_pgs_drive_desc,
     compute_velocity_predictor,
     compute_world_contact_bias,
     contact_restitution_fires,
@@ -66,6 +69,7 @@ from .kernels import (
     integrate_generalized_joints,
     mixed_contact_restitution,
     populate_joint_velocity_limit_J_for_size,
+    populate_physx_drive_J_for_size,
     prescribed_relative_contact_target,
     remove_free_root_transport_from_qdd,
     reserve_world_rows,
@@ -107,6 +111,8 @@ _taped_accumulate_torsion_wrenches_from_impulses = _taped(accumulate_torsion_wre
 _taped_eval_post_solve_parent_wrenches = _taped(eval_post_solve_parent_wrenches)
 _taped_zero_unattached_parent_wrenches = _taped(zero_unattached_parent_wrenches)
 _taped_subtract_arrays = _taped(subtract_arrays)
+_taped_populate_physx_drive_J_for_size = _taped(populate_physx_drive_J_for_size)
+_taped_compute_physx_pgs_drive_desc = _taped(compute_physx_pgs_drive_desc)
 
 
 def validate_differentiable_options(model: Model, options: dict) -> None:
@@ -120,7 +126,7 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["articulated_contact_response"] != "immediate", 'articulated_contact_response="immediate"'),
         (options["update_mass_matrix_interval"] != 1, "update_mass_matrix_interval=1"),
         (options["enable_joint_friction"], "enable_joint_friction=False"),
-        (options["drive_mode"] != "augmented", 'drive_mode="augmented"'),
+        (options["row_schedule"] != "interleaved", 'row_schedule="interleaved"'),
         (options["friction_mode"] != "fixed_normal", 'friction_mode="fixed_normal"'),
         (options["velocity_iterations"] != 0, "velocity_iterations=0"),
         (options["parallel_tree"], "parallel_tree=False"),
@@ -138,6 +144,7 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
             solver._has_rigid_body_velocity_limits and solver._solve_mode == "split",
             'solve_mode="matrix_free" for rigid-body velocity limits',
         ),
+        (solver._velocity_limits_fused, "fuse_joint_velocity_limits=False"),
         (solver._mimic_count or solver._connect_count, "no mimic or loop-closing joints"),
         (
             not np.array_equal(plan.articulation_joint_end, solver.model.articulation_start.numpy()[1:]),
@@ -448,6 +455,7 @@ class DifferentiableStep:
                 model.joint_effort_limit,
                 b.tau_rigid,
                 dt,
+                int(solver._drive_mode == "augmented"),
             ],
             outputs=[b.tau, b.drive_K],
             device=device,
@@ -558,8 +566,9 @@ class DifferentiableStep:
             or solver._enable_joint_limits
             or solver._enable_joint_velocity_limits
             or solver._has_rigid_body_velocity_limits
+            or solver._drive_slot is not None
         ):
-            v_out = self._solve_dense_rows(b, state_in, contacts, v_out, dt)
+            v_out = self._solve_dense_rows(b, state_in, control, contacts, v_out, dt)
         wp.launch(
             _taped_update_qdd_from_velocity,
             dim=model.joint_dof_count,
@@ -628,9 +637,15 @@ class DifferentiableStep:
                 raise NotImplementedError(f"differentiable=True contacts require {requirement}")
 
     def _solve_dense_rows(
-        self, b: _StepBuffers, state_in: State, contacts: Contacts | None, v_hat: wp.array, dt: float
+        self,
+        b: _StepBuffers,
+        state_in: State,
+        control: Control,
+        contacts: Contacts | None,
+        v_hat: wp.array,
+        dt: float,
     ) -> wp.array:
-        """Joint-limit and contact rows in one dense system, and fixed-iteration PGS with every iterate stored."""
+        """Drive, limit and contact rows in one dense system, and fixed-iteration PGS with every iterate stored."""
         # Deferred: the solver module imports this one.
         from .solver_steel import (  # noqa: PLC0415
             _CONTACT_BUILD_THREAD_CAP,
@@ -682,7 +697,10 @@ class DifferentiableStep:
         deterministic = int(solver._deterministic)
         for array in (c.C, c.diag, c.rhs, *c.J.values(), *c.Y.values()):
             array.zero_()
-        # The default reserves joint-limit rows, then velocity-limit rows, ahead of the contact rows.
+        # The default reserves drive rows, then joint-limit rows, then velocity-limit rows, ahead of the contacts.
+        drives = solver._drive_slot is not None
+        if drives:
+            self._reserve_drive_rows(c, state_in, control)
         if solver._enable_joint_limits:
             self._reserve_joint_limit_rows(c, state_in.joint_q)
         if solver._enable_joint_velocity_limits:
@@ -986,6 +1004,30 @@ class DifferentiableStep:
             outputs=[c.diag],
             device=device,
         )
+        if drives:
+            wp.launch(
+                _taped_compute_physx_pgs_drive_desc,
+                dim=solver._world_count,
+                inputs=[
+                    c.row_count,
+                    solver._world_dof_indices,
+                    solver._max_world_dofs,
+                    c.row_type,
+                    c.diag,
+                    c.C,
+                    v_hat,
+                    c.target_velocity,
+                    c.drive_stiffness,
+                    c.drive_damping,
+                    c.drive_geom_error,
+                    c.drive_max_force,
+                    dt,
+                    1.0,
+                    0.0,
+                ],
+                outputs=[c.drive_bias, c.drive_velocity_scale, c.drive_impulse_scale, c.drive_max_impulse],
+                device=device,
+            )
         wp.launch(
             _taped_compute_world_contact_bias,
             dim=solver._world_count,
@@ -1115,6 +1157,10 @@ class DifferentiableStep:
                     c.smooth_impulse,
                     int(patches),
                     c.ring,
+                    c.drive_bias,
+                    c.drive_velocity_scale,
+                    c.drive_impulse_scale,
+                    c.drive_max_impulse,
                     c.impulses[k],
                 ],
                 outputs=[c.residuals[k], c.pair_load[k] if patches else c.pair_load_dummy, sweep_out],
@@ -1195,6 +1241,75 @@ class DifferentiableStep:
             record_tape=False,
         )
         launch(ROW_SLOTS_WRITE)
+
+    def _reserve_drive_rows(self, c: _ContactBuffers, state_in: State, control: Control) -> None:
+        """allocate_physx_drive_slots off the tape; the rows' targets and errors are written on it."""
+        solver = self.solver
+        model = solver.model
+
+        def launch(mode):
+            wp.launch(
+                allocate_physx_drive_slots,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    solver._articulation_dof_start,
+                    solver._articulation_H_rows,
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    solver._art_to_world,
+                    solver._articulation_constraint_max,
+                ],
+                outputs=[c.drive_slot, c.slot_counter, mode, solver._row_cursor],
+                device=model.device,
+                record_tape=False,
+            )
+
+        self._reserve_rows(launch, c.slot_counter)
+        for size in solver._size_groups:
+            wp.launch(
+                _taped_populate_physx_drive_J_for_size,
+                dim=solver._n_arts_by_size[size],
+                inputs=[
+                    model.articulation_start,
+                    solver._articulation_dof_start,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    model.joint_effort_limit,
+                    state_in.joint_q,
+                    control.joint_target_q,
+                    model.joint_target_q_start,
+                    control.joint_target_qd,
+                    c.drive_velocity_limit,
+                    0,
+                    solver._art_to_world,
+                    c.drive_slot,
+                    solver._group_to_art[size],
+                ],
+                outputs=[
+                    c.J[size],
+                    c.row_type,
+                    c.row_parent,
+                    c.row_mu,
+                    c.row_beta,
+                    c.row_cfm,
+                    c.phi,
+                    c.target_velocity,
+                    c.drive_stiffness,
+                    c.drive_damping,
+                    c.drive_geom_error,
+                    c.drive_max_force,
+                    c.drive_velocity_limit_rows,
+                ],
+                device=model.device,
+            )
 
     def _reserve_joint_limit_rows(self, c: _ContactBuffers, joint_q: wp.array) -> None:
         """build_joint_limit_rows_for_size's rows; the gaps are recomputed on the tape by _joint_limit_gap."""
@@ -1948,6 +2063,21 @@ class _ContactBuffers:
         self.pair_load = [zeros((worlds, rows)) for _ in range(patch_iterations)]
         self.pair_load_dummy = zeros((1, 1))
         self.limit_dof = zeros((worlds, rows), wp.int32, False)
+        drive_shape = (worlds, rows) if solver._drive_slot is not None else (1, 1)
+        self.drive_slot = zeros(max(solver.model.joint_dof_count, 1), wp.int32, False)
+        self.drive_velocity_limit = zeros(1)
+        self.drive_velocity_limit_rows = zeros((1, 1))
+        for name in (
+            "drive_stiffness",
+            "drive_damping",
+            "drive_geom_error",
+            "drive_max_force",
+            "drive_bias",
+            "drive_velocity_scale",
+            "drive_impulse_scale",
+            "drive_max_impulse",
+        ):
+            setattr(self, name, zeros(drive_shape))
         velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
         limit_iterations = solver._iterations if velocity_limits else 0
         self.velocity_limit_input = [zeros((worlds, rows)) for _ in range(limit_iterations)]
@@ -2260,17 +2390,18 @@ def _augmented_drives_by_dof(
     joint_effort_limit: wp.array[float],
     tau_in: wp.array[float],
     dt: float,
+    augmented: int,
     # outputs
     tau_out: wp.array[float],
     drive_K: wp.array[float],
 ):
-    """Per-DOF form of prepare_articulation_augmented_drives with the same arithmetic."""
+    """Per-DOF form of prepare_articulation_augmented_drives with the same arithmetic; a pass-through for drive rows."""
     dof = wp.tid()
     joint = dof_joint[dof]
     type = joint_type[joint]
     value = tau_in[dof]
     K = float(0.0)
-    if type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6:
+    if augmented != 0 and (type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6):
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
         if ke > 0.0 or kd > 0.0:
@@ -3130,13 +3261,17 @@ def _dense_pgs_sweep(
     smooth_impulse: wp.array2d[float],
     patches: int,
     ring: wp.array2d[int],
+    drive_bias: wp.array2d[float],
+    drive_velocity_scale: wp.array2d[float],
+    drive_impulse_scale: wp.array2d[float],
+    drive_max_impulse: wp.array2d[float],
     impulses_in: wp.array2d[float],
     # outputs
     residuals: wp.array2d[float],
     pair_load: wp.array2d[float],
     impulses_out: wp.array2d[float],
 ):
-    """One pgs_solve_loop sweep for normal and point-friction rows; earlier rows read impulses_out.
+    """One pgs_solve_loop sweep for drive, limit, normal and point-friction rows; earlier rows read impulses_out.
 
     Residuals are stored and read back: the reverse pass replays code after a dynamic loop with the
     loop-carried sum's initial value, so projections must branch on stored values.
@@ -3162,6 +3297,19 @@ def _dense_pgs_sweep(
             denom = diag[world, i]
             if kind == PGS_CONSTRAINT_TYPE_CONTACT and smooth_normal != 0:
                 impulses_out[world, i] = smooth_impulse[world, i]
+            elif kind == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+                # PhysX's PGS force-drive update; a drive row's rhs is J * v_hat, so the residual is J * v.
+                new_impulse = impulses_in[world, i]
+                if denom > 0.0:
+                    max_impulse = drive_max_impulse[world, i]
+                    new_impulse = wp.clamp(
+                        new_impulse * drive_impulse_scale[world, i]
+                        + residual * drive_velocity_scale[world, i]
+                        + drive_bias[world, i],
+                        -max_impulse,
+                        max_impulse,
+                    )
+                impulses_out[world, i] = new_impulse
             elif not _is_pair_row(kind):
                 new_impulse = impulses_in[world, i]
                 if denom > 0.0:

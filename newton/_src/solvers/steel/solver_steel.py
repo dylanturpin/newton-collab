@@ -1996,18 +1996,20 @@ class SolverSteel(SolverBase, CouplingInterface):
                 included, takes an ``articulation_constraint_max`` slot, so size that capacity for all of a
                 world's rows; overflow sets :attr:`constraint_overflow` for :meth:`check_constraint_capacity`,
                 and agreement with the default step excludes overflowing steps. Joint position and velocity
-                limits, rigid-body velocity limits (``"matrix_free"``) and kinematic bodies are supported.
+                limits, rigid-body velocity limits and ``drive_mode="rows"`` (``"matrix_free"``), and kinematic
+                bodies are supported.
                 Sleeping is accepted and the step keeps every body awake. With ``deterministic=True`` the
                 backward is bitwise repeatable too. ``collide_done_event`` is waited on before contacts are
                 read. Contact buffers take about nine times the default step's memory per environment and
                 step.
 
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
-                particles, mimic or loop-closing joints, and the solver uses immediate response, augmented
-                drives, ``friction_mode="fixed_normal"``, ``update_mass_matrix_interval=1``, no joint
-                friction, warm start, compliance, articulated torsional and rolling friction, velocity
-                iterations or ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"`` dense
-                PGS kernel. Defaults to False.
+                particles, mimic or loop-closing joints, and the solver uses immediate response,
+                ``row_schedule="interleaved"``, ``friction_mode="fixed_normal"``,
+                ``update_mass_matrix_interval=1``, no joint friction, warm start, compliance, articulated
+                torsional and rolling friction, velocity iterations, fused drive velocity limits or
+                ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"`` dense PGS kernel.
+                Defaults to False.
 
                 .. experimental::
 
@@ -2548,6 +2550,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     "enable_joint_velocity_limits": enable_joint_velocity_limits,
                     "enable_joint_friction": enable_joint_friction,
                     "drive_mode": drive_mode,
+                    "row_schedule": row_schedule,
                     "friction_mode": friction_mode,
                     "velocity_iterations": velocity_iterations,
                     "parallel_tree": parallel_tree,

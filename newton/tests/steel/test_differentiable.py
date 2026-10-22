@@ -190,7 +190,7 @@ def test_rejects_unsupported_configs(test, device):
         {"update_mass_matrix_interval": 2},
         {"enable_joint_friction": True},
         {"contact_compliance": True},
-        {"drive_mode": "rows"},
+        {"row_schedule": "phased"},
         {"friction_mode": "bisection"},
         {"velocity_iterations": 2},
     ):
@@ -198,6 +198,15 @@ def test_rejects_unsupported_configs(test, device):
             SolverSteel(model, differentiable=True, **kwargs)
     with test.assertRaisesRegex(ValueError, "requires_grad=True"):
         SolverSteel(_build_chain(device, requires_grad=False), differentiable=True)
+    if wp.get_device(device).is_cuda:
+        with test.assertRaisesRegex(ValueError, "fuse_joint_velocity_limits=False"):
+            SolverSteel(
+                _build_limited_chain(device, velocity_limit=1.0),
+                differentiable=True,
+                solve_mode="matrix_free",
+                drive_mode="rows",
+                enable_joint_velocity_limits=True,
+            )
 
     solver = SolverSteel(model, differentiable=True)
     state = model.state(requires_grad=True)
@@ -1073,6 +1082,7 @@ def _pair_sweep(device, a, c, d, rhs, seed=(0.0, 1.0, 0.0)):
                 array([[0.0, 0.0, 0.0]]),
                 0,
                 array([[0, 0, 0]], int),
+                *(array([[0.0]]) for _ in range(4)),
                 array([[0.0, 0.0, 0.0]]),
             ],
             outputs=[residuals, wp.zeros((1, 3), device=device), impulses],
@@ -2369,16 +2379,29 @@ def _gripper_targets(control, lift):
     control.joint_target_q.assign(targets)
 
 
+# The production profile, and the same with PhysX drive rows in place of the augmented drives.
+_PRODUCTION_VARIANTS = {
+    "augmented": _PRODUCTION_PROFILE,
+    "rows": {**_PRODUCTION_PROFILE, "drive_mode": "rows", "fuse_joint_velocity_limits": False},
+}
+
+
 def test_production_profile_matches_default(test, device):
     """The production option set: each differentiable step matches the default step from the same state.
 
     The default's grasp is sensitive to rounding when the fingers land, so the steps are compared one at a time
     along the default's trajectory, a squeeze and a lift.
     """
+    for name, profile in _PRODUCTION_VARIANTS.items():
+        with test.subTest(drives=name):
+            _check_production_profile_step(test, device, profile)
+
+
+def _check_production_profile_step(test, device, profile):
     model = _build_gripper(device, requires_grad=False)
-    reference_solver = SolverSteel(model, **_PRODUCTION_PROFILE)
+    reference_solver = SolverSteel(model, **profile)
     twin = _build_gripper(device)
-    solver = SolverSteel(twin, differentiable=True, **_PRODUCTION_PROFILE)
+    solver = SolverSteel(twin, differentiable=True, **profile)
     pipeline = _production_pipeline(model)
     states = [model.state() for _ in range(161)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -2407,15 +2430,22 @@ def test_production_profile_gradient_matches_finite_difference(test, device):
 
     Round fingers keep the grasp to one contact per finger; flat fingers make the force split indeterminate.
     """
+    # With drive rows the grasp meets contact events within a few steps; the chain test covers their chaining.
+    for name, steps in (("augmented", 4), ("rows", 1)):
+        with test.subTest(drives=name):
+            _check_production_profile_gradient(test, device, _PRODUCTION_VARIANTS[name], steps)
+
+
+def _check_production_profile_gradient(test, device, profile, steps):
     model = _build_gripper(device, round_fingers=True)
     rng = np.random.default_rng(2)
     weights_q = rng.normal(size=model.joint_coord_count)
     weights_qd = rng.normal(size=model.joint_dof_count)
-    settle, steps = 30, 4
+    settle = 30
     base = np.array([0.1, 0.03, 0.03], np.float32)
 
     def loss_of(target, tape=None):
-        solver = SolverSteel(model, differentiable=True, **_PRODUCTION_PROFILE)
+        solver = SolverSteel(model, differentiable=True, **profile)
         pipeline = _production_pipeline(model)
         states = [model.state(requires_grad=True) for _ in range(settle + steps + 1)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -2461,6 +2491,72 @@ def test_production_profile_gradient_matches_finite_difference(test, device):
         fd = float(np.median(differences))
         with test.subTest(trial=trial):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
+def _build_effort_limited_chain(device, effort_limit, *, requires_grad=True):
+    model = _build_chain(device, drives=True, requires_grad=requires_grad)
+    if effort_limit is not None:
+        model.joint_effort_limit.fill_(effort_limit)
+    return model
+
+
+def test_drive_rows_match_default(test, device):
+    """PhysX drive rows follow the matrix-free solve, with and without the drive force clamp."""
+    for effort_limit in (None, 10.0):
+        for extra in ({}, {"deterministic": True}):
+            options = {"solve_mode": "matrix_free", "iterations": 12, "drive_mode": "rows", **extra}
+            inputs = _random_inputs(_build_chain(device, drives=True), seed=0)
+            model = _build_effort_limited_chain(device, effort_limit, requires_grad=False)
+            reference, _, _ = _rollout(model, SolverSteel(model, **options), inputs, 30, rotate=True)
+            model = _build_chain(device, requires_grad=False)
+            undriven, _, _ = _rollout(model, SolverSteel(model, **options), inputs, 30, rotate=True)
+            model = _build_effort_limited_chain(device, effort_limit)
+            result, _, _ = _rollout(model, SolverSteel(model, differentiable=True, **options), inputs, 30)
+            with test.subTest(effort_limit=effort_limit, **extra):
+                test.assertGreater(float(np.abs(undriven.joint_qd.numpy() - reference.joint_qd.numpy()).max()), 0.5)
+                for attribute in ("joint_q", "joint_qd"):
+                    np.testing.assert_allclose(
+                        getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=0.0, atol=2.0e-5
+                    )
+
+
+def test_drive_rows_gradient_matches_finite_difference(test, device):
+    """Tape against central differences through PhysX drive rows, with free and partly clamped drive forces."""
+    steps, eps = 3, 1.0e-2
+    for effort_limit in (None, 10.0):
+        model = _build_effort_limited_chain(device, effort_limit)
+        solver = SolverSteel(model, differentiable=True, solve_mode="matrix_free", iterations=12, drive_mode="rows")
+        inputs = _random_inputs(model, seed=1)
+        rng = np.random.default_rng(2)
+        wq = rng.normal(size=model.joint_coord_count)
+        wqd = rng.normal(size=model.joint_dof_count)
+
+        def loss_of(values, tape=None, model=model, solver=solver, wq=wq, wqd=wqd):
+            final, initial, control = _rollout(model, solver, values, steps, tape=tape)
+            return float(wq @ final.joint_q.numpy() + wqd @ final.joint_qd.numpy()), final, initial, control
+
+        tape = wp.Tape()
+        _, final, initial, control = loss_of(inputs, tape)
+        tape.backward(
+            grads={
+                final.joint_q: wp.array(wq.astype(np.float32), dtype=float, device=device),
+                final.joint_qd: wp.array(wqd.astype(np.float32), dtype=float, device=device),
+            }
+        )
+        gradients = {
+            "joint_q": initial.joint_q.grad.numpy(),
+            "joint_qd": initial.joint_qd.grad.numpy(),
+            "joint_target_q": control.joint_target_q.grad.numpy(),
+            "joint_target_qd": control.joint_target_qd.grad.numpy(),
+        }
+        for key, gradient in gradients.items():
+            direction = rng.normal(size=gradient.shape[0])
+            direction /= np.linalg.norm(direction)
+            plus = loss_of(dict(inputs, **{key: (inputs[key] + eps * direction).astype(np.float32)}))[0]
+            minus = loss_of(dict(inputs, **{key: (inputs[key] - eps * direction).astype(np.float32)}))[0]
+            fd = (plus - minus) / (2.0 * eps)
+            with test.subTest(effort_limit=effort_limit, input=key):
+                test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
 def _build_speed_limited_boxes(device, *, requires_grad=True):
@@ -2849,6 +2945,8 @@ for _device in get_test_devices():
             test_rigid_velocity_limits_match_default,
             test_rigid_velocity_limits_gradient_matches_finite_difference,
             test_deterministic_gradients_repeat,
+            test_drive_rows_match_default,
+            test_drive_rows_gradient_matches_finite_difference,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 
