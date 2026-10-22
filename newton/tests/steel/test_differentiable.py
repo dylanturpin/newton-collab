@@ -1077,6 +1077,8 @@ def _pair_sweep(device, a, c, d, rhs, seed=(0.0, 1.0, 0.0)):
                 array(row_type, int),
                 array([[-1, 0, 0]], int),
                 array([[1.0, 1.0, 1.0]]),
+                array([[1.0, 1.0, 1.0]]),
+                0,
                 1.0,
                 0,
                 0,
@@ -1779,8 +1781,8 @@ def _arm_on_box_inputs(model):
 
 def test_mixed_world_contacts_match_default(test, device):
     """A world with articulated and free-body contacts follows the matrix-free solve, which sweeps them in turn."""
-    for deterministic in (False, True):
-        options = {**_ARM_ON_BOX_OPTIONS, "deterministic": deterministic}
+    for extra in ({}, {"deterministic": True}, {"contact_regularization": 0.01}, {"contact_regularization": 0.5}):
+        options = {**_ARM_ON_BOX_OPTIONS, **extra}
         inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
         reference, solver = _contact_scene_rollout(
             _build_arm_on_box_stack(device, requires_grad=False), options, inputs, 20, differentiable=False
@@ -1791,7 +1793,7 @@ def test_mixed_world_contacts_match_default(test, device):
             _build_arm_on_box_stack(device), options, inputs, 20, differentiable=True
         )
         solver.check_constraint_capacity()
-        with test.subTest(deterministic=deterministic):
+        with test.subTest(**extra):
             for attribute in ("joint_q", "joint_qd"):
                 np.testing.assert_allclose(
                     getattr(result, attribute).numpy(), getattr(reference, attribute).numpy(), rtol=1.0e-5, atol=2.0e-5
@@ -1812,9 +1814,16 @@ def test_deterministic_rollouts_repeat(test, device):
 
 
 def test_mixed_world_gradient_matches_finite_difference(test, device):
-    """Tape against central differences through the arm's contact with a free box stack."""
+    """Tape against central differences through the arm's contact with a free box stack, with and without
+    contact regularization."""
+    for extra in ({}, {"contact_regularization": 0.01}):
+        with test.subTest(**extra):
+            _check_arm_on_box_gradient(test, device, {**_ARM_ON_BOX_OPTIONS, **extra})
+
+
+def _check_arm_on_box_gradient(test, device, options):
     model = _build_arm_on_box_stack(device)
-    solver = SolverSteel(model, differentiable=True, **_ARM_ON_BOX_OPTIONS)
+    solver = SolverSteel(model, differentiable=True, **options)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     rng = np.random.default_rng(5)
     wq = wp.array(rng.normal(size=model.joint_coord_count).astype(np.float32), device=device)
@@ -1866,6 +1875,42 @@ def test_mixed_world_gradient_matches_finite_difference(test, device):
             test.assertEqual(plus[2], counts)
             test.assertEqual(minus[2], counts)
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
+def test_matrix_free_restitution_matches_default(test, device):
+    """Rebound targets of articulated and free-body rows follow the matrix-free route, regularized or not."""
+    scenes = {
+        "box_chain": lambda requires_grad: _build_box_chain_on_plane(
+            device, restitution=0.5, requires_grad=requires_grad
+        ),
+        "sphere": lambda requires_grad: _build_free_shape(
+            device, "sphere", restitution=0.5, requires_grad=requires_grad
+        ),
+    }
+    for name, build in scenes.items():
+        for regularization in (0.0, 0.01):
+            options = {
+                "friction_anchor_beta": 0.0,
+                "solve_mode": "matrix_free",
+                "iterations": 8,
+                "contact_regularization": regularization,
+            }
+            model = build(False)
+            inputs = {
+                "joint_q": model.joint_q.numpy().copy(),
+                "joint_qd": np.zeros(model.joint_dof_count, np.float32),
+                "joint_f": np.zeros(model.joint_dof_count, np.float32),
+            }
+            # Raised and dropped, so the rows fire their rebound target on impact.
+            inputs["joint_q"][2] += 0.05
+            inputs["joint_qd"][2] = -1.5
+            reference, _ = _contact_scene_rollout(model, options, inputs, 24, differentiable=False, dt=1.0 / 240.0)
+            result, _ = _contact_scene_rollout(build(True), options, inputs, 24, differentiable=True, dt=1.0 / 240.0)
+            with test.subTest(scene=name, contact_regularization=regularization):
+                test.assertGreater(float(reference.joint_qd.numpy()[2]), 0.1)
+                np.testing.assert_allclose(
+                    result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=1.0e-5, atol=1.0e-5
+                )
 
 
 def test_taped_kernels_keep_adjoints(test, device):
@@ -1937,6 +1982,7 @@ for _device in get_test_devices():
             test_mixed_world_contacts_match_default,
             test_deterministic_rollouts_repeat,
             test_mixed_world_gradient_matches_finite_difference,
+            test_matrix_free_restitution_matches_default,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 

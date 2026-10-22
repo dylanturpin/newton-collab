@@ -573,7 +573,10 @@ class DifferentiableStep:
                 "an explicit friction_anchor_beta=0 (the default friction law is patch friction)",
             ),
             (solver._contact_friction_shared_anchor, "no shared friction anchor"),
-            (solver._regularization_enabled, "contact_regularization=0"),
+            (
+                solver._regularization_enabled and solver._solve_mode == "split",
+                'solve_mode="matrix_free" for contact_regularization',
+            ),
         )
         for unsupported, requirement in checks:
             if unsupported:
@@ -937,9 +940,11 @@ class DifferentiableStep:
             )
 
         rhs = c.rhs_restituted
+        row_w = c.row_w_restituted
         smooth = self.smooth_contact
         if smooth is not None:
             rhs = c.rhs
+            row_w = c.row_w
             wp.launch(
                 _smooth_contact_impulse,
                 dim=(solver._world_count, max_rows),
@@ -970,11 +975,12 @@ class DifferentiableStep:
                     c.row_restitution,
                     c.row_max_depenetration,
                     c.rhs,
+                    c.row_w,
                     dt,
                     solver._contact_speculative_scale,
                     solver._rebound_velocity_threshold,
                 ],
-                outputs=[c.rhs_restituted],
+                outputs=[c.rhs_restituted, c.row_w_restituted],
                 device=device,
             )
 
@@ -996,6 +1002,8 @@ class DifferentiableStep:
                     c.row_type,
                     c.row_parent,
                     c.row_mu,
+                    row_w,
+                    int(solver._regularization_enabled),
                     solver._relaxation,
                     int(k < friction_start),
                     int(smooth is not None),
@@ -1309,6 +1317,7 @@ class _ContactBuffers:
         self.row_beta = zeros((worlds, rows))
         self.row_cfm = zeros((worlds, rows))
         self.row_w = zeros((worlds, rows))
+        self.row_w_restituted = zeros((worlds, rows))
         self.phi = zeros((worlds, rows))
         self.target_velocity = zeros((worlds, rows))
         self.rhs = zeros((worlds, rows))
@@ -2239,11 +2248,13 @@ def _dense_contact_restitution(
     row_restitution: wp.array2d[float],
     row_max_depenetration: wp.array2d[float],
     rhs: wp.array2d[float],
+    row_w: wp.array2d[float],
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     # outputs
     rhs_out: wp.array2d[float],
+    row_w_out: wp.array2d[float],
 ):
     """Depenetration clamp and restitution of the default contact RHS, into a separate array.
 
@@ -2253,6 +2264,7 @@ def _dense_contact_restitution(
     if i >= row_count[world]:
         return
     value = rhs[world, i]
+    row_w_out[world, i] = row_w[world, i]
     if row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
         rhs_out[world, i] = value
         return
@@ -2269,6 +2281,8 @@ def _dense_contact_restitution(
         relative_incident = value - geometric_bias
         if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
             value = (1.0 + restitution) * relative_incident
+            # A firing rebound target is solved rigid, as apply_world_contact_restitution_matrix_free does.
+            row_w_out[world, i] = 1.0
     rhs_out[world, i] = value
 
 
@@ -2391,6 +2405,8 @@ def _dense_pgs_sweep(
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
     row_mu: wp.array2d[float],
+    row_w: wp.array2d[float],
+    regularize: int,
     omega: float,
     skip_friction: int,
     smooth_normal: int,
@@ -2429,7 +2445,12 @@ def _dense_pgs_sweep(
             elif kind != PGS_CONSTRAINT_TYPE_FRICTION:
                 new_impulse = impulses_in[world, i]
                 if denom > 0.0:
-                    new_impulse = impulses_in[world, i] + omega * (-residual / denom)
+                    # Contact regularization: w = 1 / (1 + g) on penetrating contact rows, else 1.
+                    w = float(1.0)
+                    if regularize != 0:
+                        w = row_w[world, i]
+                    old = impulses_in[world, i]
+                    new_impulse = old + omega * (-residual / denom * w - (1.0 - w) * old)
                     if kind == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
                         new_impulse = 0.0
                 impulses_out[world, i] = new_impulse
