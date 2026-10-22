@@ -1544,6 +1544,7 @@ def _contact_scene_rollout(model, options, inputs, steps, *, differentiable, dt=
     solver = SolverSteel(model, differentiable=differentiable, **options)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
+    model.request_state_attributes("body_parent_f")
     states = [model.state(requires_grad=True) for _ in range(steps + 1)]
     states[0].joint_q.assign(inputs["joint_q"])
     states[0].joint_qd.assign(inputs["joint_qd"])
@@ -2676,6 +2677,7 @@ def _observed_rollout(model, options, inputs, steps, *, differentiable, tape=Non
     solver = SolverSteel(model, differentiable=differentiable, **options)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
+    model.request_state_attributes("body_parent_f")
     states = [model.state(requires_grad=True) for _ in range(steps + 1)]
     states[0].joint_q.assign(inputs["joint_q"])
     states[0].joint_qd.assign(inputs["joint_qd"])
@@ -2689,7 +2691,13 @@ def _observed_rollout(model, options, inputs, steps, *, differentiable, tape=Non
         observables = solver.observables(_OBSERVABLE_KINDS, contacts=contacts)
         with tape if tape is not None else contextlib.nullcontext():
             solver.step(states[k], states[k + 1], control, contacts, dt, observables=observables)
-        records.append((observables.contact_f.numpy().copy(), observables.body_parent_f.numpy().copy()))
+        records.append(
+            (
+                observables.contact_f.numpy().copy(),
+                observables.body_parent_f.numpy().copy(),
+                states[k + 1].body_parent_f.numpy().copy(),
+            )
+        )
     return states, control, observables, records
 
 
@@ -2710,11 +2718,12 @@ def test_observables_match_default(test, device):
         inputs = _arm_on_box_inputs(model) if name == "arm_on_boxes" else _contact_inputs(model)
         _, _, _, reference = _observed_rollout(model, options, inputs, 6, differentiable=False)
         _, _, _, result = _observed_rollout(build(True), options, inputs, 6, differentiable=True)
-        for k, ((contact_ref, parent_ref), (contact, parent)) in enumerate(zip(reference, result, strict=True)):
+        for k, (expected, actual) in enumerate(zip(reference, result, strict=True)):
             with test.subTest(scene=name, step=k):
-                test.assertGreater(float(np.abs(contact_ref).max()), 0.0)
-                np.testing.assert_allclose(contact, contact_ref, rtol=1.0e-4, atol=1.0e-3)
-                np.testing.assert_allclose(parent, parent_ref, rtol=1.0e-4, atol=1.0e-3)
+                test.assertGreater(float(np.abs(expected[0]).max()), 0.0)
+                np.testing.assert_array_equal(expected[2], expected[1])
+                for value, value_ref in zip(actual, expected, strict=True):
+                    np.testing.assert_allclose(value, value_ref, rtol=1.0e-4, atol=1.0e-3)
 
 
 def test_observables_gradient_matches_finite_difference(test, device):
@@ -2729,7 +2738,7 @@ def test_observables_gradient_matches_finite_difference(test, device):
     def loss_of(joint_f, tape=None):
         values = {**inputs, "joint_f": joint_f}
         _, control, observables, records = _observed_rollout(model, options, values, 3, differentiable=True, tape=tape)
-        contact, parent = records[-1]
+        contact, parent, _ = records[-1]
         return float(np.sum(contact_weights * contact) + np.sum(parent_weights * parent)), control, observables
 
     tape = wp.Tape()

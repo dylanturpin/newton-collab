@@ -1977,38 +1977,37 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Gradients reach ``State.joint_q``, ``State.joint_qd``, ``State.body_f``, ``Control.joint_f``,
                 ``Control.joint_target_q`` and ``Control.joint_target_qd``; model parameters are not validated
                 gradient inputs. Free-joint quaternion gradients are meaningful along tangent directions of
-                the unit quaternion. Unlike the default step, it does not refresh ``state_in.body_q`` in place,
-                and it publishes neither solver observables nor ``State.body_parent_f``.
+                the unit quaternion. Unlike the default step, it does not refresh ``state_in.body_q`` in place.
+                Solver observables and ``State.body_parent_f`` are computed from the taped impulses.
 
-                Contacts support normal rows, point friction and restitution with ``solve_mode="split"``.
-                The contact set and its row layout are held fixed for the derivative. Contact points and
-                normals come from the given buffers and are stop-gradient, while the gap and Jacobians are
-                recomputed from the step's poses. Every PGS sweep is differentiated as executed. Each
-                friction pair solve is differentiated in closed form at its computed root, rather than
-                through its root-finding iterates: the sticking (pseudo-)inverse, or the implicit derivative
-                of the sliding root. A rank-one tangent block, as on low-DOF articulations, is differentiated
-                along rank-preserving changes. Where the solve keeps an already feasible sliding impulse, the
-                forward value is unchanged and the derivative of the pair solve it stands in for is
-                substituted. Contact activation, restitution firing and
-                stick/slip switches are nonsmooth. Free-body rows are assembled with the articulated rows
-                and match the default matrix-free solve up to rounding, including its depenetration clamp.
-                Every contact row, free-body rows included, takes an ``articulation_constraint_max`` slot, so
-                size that capacity for all of a world's contact rows; overflow sets :attr:`constraint_overflow`
-                for :meth:`check_constraint_capacity`, and agreement with the default step excludes
-                overflowing steps. Point friction needs an explicit ``friction_anchor_beta=0``; with it
-                omitted, the default law is persistent patch friction and a contact step raises
-                ``NotImplementedError``. ``step`` also raises for a shared friction anchor, contact
-                regularization, or worlds that mix single-body free articulations with other
-                articulations. ``collide_done_event`` is waited on before contacts are read. Contact
-                buffers take about nine times the default step's memory per environment and step.
+                Contacts run in ``solve_mode="split"`` or ``"matrix_free"``, with point or patch friction,
+                shared friction anchors, restitution, contact torsion, free-body rolling and torsional
+                friction, and, in ``"matrix_free"``, contact regularization and worlds that mix free bodies
+                with articulations. The contact set, its row layout and friction-patch history are held fixed
+                for the derivative. Contact points and normals come from the given buffers and are
+                stop-gradient, while the gap and Jacobians are recomputed from the step's poses. Every PGS
+                sweep is differentiated as executed. Each friction pair solve is differentiated in closed form
+                at its computed root, rather than through its root-finding iterates: the sticking
+                (pseudo-)inverse, or the implicit derivative of the sliding root. A rank-one tangent block, as
+                on low-DOF articulations, is differentiated along rank-preserving changes. Where the solve
+                keeps an already feasible sliding impulse, the forward value is unchanged and the derivative
+                of the pair solve it stands in for is substituted. Contact activation, limit activation,
+                restitution firing and stick/slip switches are nonsmooth. Every contact row, free-body rows
+                included, takes an ``articulation_constraint_max`` slot, so size that capacity for all of a
+                world's rows; overflow sets :attr:`constraint_overflow` for :meth:`check_constraint_capacity`,
+                and agreement with the default step excludes overflowing steps. Joint position and velocity
+                limits, rigid-body velocity limits (``"matrix_free"``) and kinematic bodies are supported.
+                Sleeping is accepted and the step keeps every body awake. With ``deterministic=True`` the
+                backward is bitwise repeatable too. ``collide_done_event`` is waited on before contacts are
+                read. Contact buffers take about nine times the default step's memory per environment and
+                step.
 
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
-                particles, kinematic bodies, mimic or loop-closing joints, rigid-body velocity limits, contact
-                torsion or torsional and rolling friction, and the solver uses immediate response, augmented
-                drives, ``friction_mode="fixed_normal"``, ``update_mass_matrix_interval=1``, no joint or
-                velocity limits, no joint friction, warm start, sleeping, compliance, friction patches,
-                velocity iterations, ``parallel_tree`` or ``deterministic``, and the ``"loop"`` or
-                ``"tiled_row"`` dense PGS kernel. Defaults to False.
+                particles, mimic or loop-closing joints, and the solver uses immediate response, augmented
+                drives, ``friction_mode="fixed_normal"``, ``update_mass_matrix_interval=1``, no joint
+                friction, warm start, compliance, articulated torsional and rolling friction, velocity
+                iterations or ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"`` dense
+                PGS kernel. Defaults to False.
 
                 .. experimental::
 

@@ -1,1 +1,1 @@
-Add experimental `SolverSteel(differentiable=True)` for `wp.Tape` gradients through articulated and free-body steps, including normal contact, point friction and restitution with a fixed contact set.
+Add experimental `SolverSteel(differentiable=True)` for `wp.Tape` gradients through articulated and free-body steps with a fixed contact set, covering point and patch friction, restitution, contact torsion, rolling friction, regularization, joint and velocity limits, kinematic bodies, solver observables and `State.body_parent_f` in both solve modes.
