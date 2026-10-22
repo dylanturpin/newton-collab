@@ -334,8 +334,8 @@ class Example:
         self.elastic_joint = int(self.model.elastic_joint.numpy()[0])
         self.elastic_q_start = int(self.model.joint_q_start.numpy()[self.elastic_joint])
         self.elastic_qd_start = int(self.model.joint_qd_start.numpy()[self.elastic_joint])
-        self.drive_qd_start = int(self.model.joint_qd_start.numpy()[self.j_left_ground])
-        self._target_pos = self.control.joint_target_pos.numpy()
+        self.drive_q_start = int(self.model.joint_target_q_start.numpy()[self.j_left_ground])
+        self._target_pos = self.control.joint_target_q.numpy()
         self._joint_f = self.control.joint_f.numpy()
         self.max_volume_ratio_error = abs(elastic_shape_volume_ratio(self.model, self.state_0) - 1.0)
 
@@ -390,8 +390,8 @@ class Example:
         return float(np.linalg.norm(actual_right_pin - expected_right_pin))
 
     def _set_controls(self, t: float):
-        self._target_pos[self.drive_qd_start] = self.theta0 + self.drive_amplitude * math.sin(1.15 * t)
-        self.control.joint_target_pos.assign(self._target_pos)
+        self._target_pos[self.drive_q_start] = self.theta0 + self.drive_amplitude * math.sin(1.15 * t)
+        self.control.joint_target_q.assign(self._target_pos)
 
         self._joint_f[:] = 0.0
         self.control.joint_f.assign(self._joint_f)
