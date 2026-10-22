@@ -531,6 +531,15 @@ for motion, frames in (("stir", 570), ("insert", 270)):
         allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
     )
 
+# The tail stick check starts at 2 s.
+add_basic_example_test(
+    name="basic.example_basic_reduced_elastic_chair_stick_slip",
+    devices=cuda_test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 240},
+    allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
+)
+
 for example, frames in (("gripper", 180), ("fingers", 240), ("whip", 210), ("cushion", 270), ("bin", 240)):
     add_basic_example_test(
         name=f"basic.example_basic_steel_elastic_{example}",

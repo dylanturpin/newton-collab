@@ -493,6 +493,8 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=self.solver_iterations,
+            # The ramp contact is tuned for the legacy penalty path.
+            rigid_compliant_alm=False,
             elastic_solver_metrics=True,
             rigid_contact_k_start=5.0e3,
             rigid_body_contact_buffer_size=256,
