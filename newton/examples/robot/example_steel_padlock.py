@@ -35,12 +35,21 @@ class Example:
         self.key = args.key
         self.cutaway = args.cutaway
         newton.use_coord_layout_targets = True
-        scene, self.design, key_body, self.coordinates, self.views = _padlock.build(self.key)
+        scene, self.design, key_body, self.coordinates, self.views = _padlock.build(self.key, self.sim_dt)
         builder = newton.ModelBuilder(gravity=(0, 0, 0))
         builder.add_world(scene)
         self.model = builder.finalize()
         self.pipeline = newton.CollisionPipeline(
-            self.model, rigid_contact_max=4096, deterministic=True, convex_face_clip=False
+            self.model,
+            rigid_contact_max=16384,
+            deterministic=True,
+            contact_matching="latest",
+            contact_matching_pos_threshold=0.0005 * _padlock.LENGTH,
+            convex_face_clip=True,
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
+                body_pairs=True, body_pair_cell_size=self.design["scale"]
+            ),
+            speculative_contact_gap_max=0.001 * _padlock.LENGTH * self.design["scale"],
         )
         self.contacts = self.pipeline.contacts()
         self.solver = SolverSteel(
@@ -50,18 +59,24 @@ class Example:
             solve_mode="matrix_free",
             articulated_contact_response="immediate",
             row_schedule="interleaved",
-            drive_mode="augmented",
-            articulation_constraint_max=1024,
-            free_body_constraint_max=1024,
+            drive_mode="rows",
+            articulation_constraint_max=4096,
+            free_body_constraint_max=32,
             enable_joint_limits=True,
+            enable_joint_velocity_limits=True,
+            fuse_joint_velocity_limits=True,
             contact_friction_gap_max=self.design["scale"] * 0.01,
             contact_regularization=0.001,
             baumgarte=0.2,
+            relaxation=1.5,
             enable_restitution=False,
             deterministic=True,
             row_watermark=True,
+            contact_warmstart=True,
         )
-        self.observables = self.solver.observables([self.solver.ObservableKind.CONTACT_F], contacts=self.contacts)
+        self.observables = self.solver.observables(
+            [self.solver.ObservableKind.CONTACT_F, self.solver.ObservableKind.BODY_PARENT_F], contacts=self.contacts
+        )
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.initial = self.model.state()
@@ -70,15 +85,11 @@ class Example:
         self.clock = wp.zeros(1, dtype=float)
         self.playing = wp.ones(1, dtype=int)
         self.metrics = wp.zeros(4, dtype=int)
-        self.key_ids = wp.array([key_body], dtype=int)
-        self.key_mass = wp.array([scene.body_mass[key_body]], dtype=float)
-        self.key_inertia = wp.array([scene.body_inertia[key_body]], dtype=wp.mat33)
+        self.key_body = key_body
         self.target = wp.array(
             [0, 0, self.design["seated_target_z"] * _padlock.LENGTH, self.design["start_z"] * _padlock.LENGTH],
             dtype=float,
         )
-        self.rotation = wp.array([wp.quat_identity()], dtype=wp.quat)
-        self.command = wp.zeros(1, dtype=wp.spatial_vector)
         self.opacities = self.model.shape_opacity.numpy()
         self.set_cutaway(self.cutaway)
         self.viewer.set_model(self.model)
@@ -93,9 +104,9 @@ class Example:
             renderer.spotlight_enabled = False
             renderer.exposure = 2.0
         self.graph = None
-        self.simulate()
+        self.simulate(substeps=1)
         self.reset()
-        with wp.ScopedCapture() as capture:
+        with wp.ScopedCapture(force_module_load=False) as capture:
             self.simulate()
         self.graph = capture.graph
         self.reset()
@@ -104,8 +115,8 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.set_defaults(num_frames=216)
-        parser.add_argument("--substeps", type=int, default=32, help="Physics substeps per 60 Hz frame")
-        parser.add_argument("--iterations", type=int, default=16, help="Steel sweeps per substep")
+        parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
+        parser.add_argument("--iterations", type=int, default=32, help="Steel sweeps per substep")
         parser.add_argument("--key", choices=("matched", "wrong"), default="matched")
         parser.add_argument("--cutaway", action=argparse.BooleanOptionalAction, default=True)
         return parser
@@ -129,30 +140,23 @@ class Example:
         self.sim_time = 0.0
         self.has_turned = False
 
-    def simulate(self):
-        for _ in range(self.sim_substeps):
+    def simulate(self, substeps=None):
+        substeps = self.sim_substeps if substeps is None else substeps
+        for _ in range(substeps):
             self.state_0.clear_forces()
             wp.launch(
                 _padlock.drive,
                 1,
                 inputs=[
-                    self.state_0.body_q,
-                    self.state_0.body_qd,
-                    self.state_0.body_f,
-                    self.key_ids,
-                    self.model.body_com,
                     self.clock,
                     self.target,
-                    self.rotation,
-                    self.key_mass,
-                    self.key_inertia,
-                    self.command,
-                    self.sim_dt,
+                    self.coordinates["key_drive"],
+                    self.control.joint_target_q,
                     self.design["turn"],
                 ],
             )
             self.viewer.apply_forces(self.state_0)
-            self.pipeline.collide(self.state_0, self.contacts)
+            self.pipeline.collide(self.state_0, self.contacts, dt=self.sim_dt)
             self.solver.step(
                 self.state_0, self.state_1, self.control, self.contacts, self.sim_dt, observables=self.observables
             )
@@ -169,8 +173,12 @@ class Example:
                     self.contacts.rigid_contact_max,
                 ],
             )
-            wp.launch(_padlock.tick, 1, inputs=[self.clock, self.playing, self.sim_dt])
-        if self.sim_substeps % 2:
+            wp.launch(
+                _padlock.tick,
+                1,
+                inputs=[self.clock, self.playing, self.state_0.joint_q, self.coordinates["key_drive"], self.sim_dt],
+            )
+        if substeps % 2:
             self.state_1.assign(self.state_0)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -202,12 +210,19 @@ class Example:
         q = self.state_0.joint_q.numpy()
         ui.text(f"Plug: {np.rad2deg(q[self.coordinates['plug_turn']]):.1f} deg")
         ui.text(f"Shackle lift: {q[self.coordinates['shackle_lift']]:.2f} mm")
-        ui.text(f"Applied key force: {np.linalg.norm(self.command.numpy()[0, :3]):.2f} N")
+        key_force = self.observables.body_parent_f.numpy()[self.key_body, :3] / _padlock.LENGTH
+        ui.text(f"Applied key force: {np.linalg.norm(key_force):.2f} N")
 
     def test_post_step(self):
         """Keep the shackle latched until contact has turned the plug."""
         q = self.state_0.joint_q.numpy()
-        self.has_turned |= q[self.coordinates["plug_turn"]] > 0.05
+        pose = self.state_0.body_q.numpy()[self.key_body]
+        assert np.isfinite(q).all() and np.isfinite(pose).all(), "Nonfinite mechanism state"
+        assert np.max(np.abs(pose[:2])) < 0.2, f"Key lost alignment: {pose[:3]} mm"
+        plug = q[self.coordinates["plug_turn"]]
+        if self.key == "wrong" or pose[2] < -0.2:
+            assert abs(plug) < 0.05, "Plug turned before a matching key seated"
+        self.has_turned |= plug > 0.5
         if not self.has_turned:
             assert q[self.coordinates["shackle_lift"]] < 1.0, "Shackle released before the plug turned"
 
@@ -218,7 +233,7 @@ class Example:
         stats = self.solver.constraint_row_watermarks()
         assert all(v == 0 for k, v in stats.items() if "overflow" in k or "dropped" in k), stats
         q = self.state_0.joint_q.numpy()
-        pose = self.state_0.body_q.numpy()[int(self.key_ids.numpy()[0])]
+        pose = self.state_0.body_q.numpy()[self.key_body]
         assert abs(pose[2]) < 0.2, f"Key did not seat: z={pose[2]} mm"
         plug, shackle = q[self.coordinates["plug_turn"]], q[self.coordinates["shackle_lift"]]
         if self.key == "matched":
