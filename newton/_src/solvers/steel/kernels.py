@@ -12015,9 +12015,9 @@ def compute_delta_and_accumulate(
 # share its color.
 #
 # Coloring is first-fit greedy edge coloring over the world's contact units taken
-# longest first, then in global-contact-index order (the pre-build kernel sorts
-# them first, so the schedule is independent of the atomic list-build order; a
-# color costs its longest unit, so long units share colors): a unit takes the lowest
+# in global-contact-index order, after row count with propagation_color_order=
+# "longest_first" (the pre-build kernel sorts them first, so the schedule is
+# independent of the atomic list-build order): a unit takes the lowest
 # color neither of its bodies uses yet, tracked as one bitmask per body. That uses
 # at most 2*degree-1 colors and makes every color a near-maximal matching. Units
 # that find no free color below the cap go to a serial tail bucket (color

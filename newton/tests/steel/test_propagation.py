@@ -1937,7 +1937,8 @@ def _first_fit_reference(solver, world=0):
     body_a = solver._color_unit_body_a.numpy()[base : base + n]
     body_b = solver._color_unit_body_b.numpy()[base : base + n]
     length = solver._color_unit_len.numpy()[base : base + n]
-    return (n, *_first_fit_coloring(contact, body_a, body_b, length))
+    longest_first = solver.propagation_color_order == "longest_first"
+    return (n, *_first_fit_coloring(contact, body_a, body_b, length, longest_first))
 
 
 def _first_fit_coloring(contact, body_a, body_b, length, longest_first=True):
@@ -1973,7 +1974,7 @@ def _sweep_cost(color, length):
     return colored + int(length[tail].sum())
 
 
-def _run_prebuild(worlds, max_constraints, max_body_span):
+def _run_prebuild(worlds, max_constraints, max_body_span, longest_first=True):
     """Color per-world unit lists ``(contact, body_a, body_b, length)`` with the pre-build kernel."""
     device = wp.get_device("cuda:0")
     entries = PROPAGATION_COLOR_TAIL + 2
@@ -1994,7 +1995,7 @@ def _run_prebuild(worlds, max_constraints, max_body_span):
     offsets = wp.zeros(count * entries, dtype=wp.int32, device=device)
     sorted_contact = wp.zeros(count * max_constraints, dtype=wp.int32, device=device)
     kernel = _get_color_propagation_prebuild_kernel(
-        max_constraints, entries, 256, stride, device.arch, max_body_span=max_body_span
+        max_constraints, entries, 256, stride, device.arch, max_body_span=max_body_span, longest_first=longest_first
     )
     wp.launch_tiled(
         kernel,
@@ -2196,31 +2197,39 @@ class TestSteelColoredScheduling(unittest.TestCase):
         self.assertEqual(int(prescribed[link]), 0)
 
     def test_prebuild_matches_the_first_fit_reference(self):
-        """The device coloring reproduces longest-first, then by-contact, first-fit exactly.
+        """The device coloring reproduces the first-fit reference exactly in either color order.
 
         The prebuild stages units in shared memory for its serial passes, sorts packed
         keys in shared memory when a world has at most 4096 units, and keeps the
         used-color masks in shared memory when the unit bodies span at most 256
         indices. The large heap spans more bodies than that and takes the global masks.
         """
-        for shape in ((6, 6, 3), (7, 7, 6)):
+        for shape, order in (((6, 6, 3), "longest_first"), ((7, 7, 6), "longest_first"), ((7, 7, 6), "contact")):
             model, _ = _heap(*shape)
-            solver, state, _ = _settle(model, steps=4)
+            solver, state, _ = _settle(model, steps=4, propagation_color_order=order)
             self.assertTrue(np.isfinite(state.body_q.numpy()).all())
             n, color, offsets, row_start, sorted_contact = _first_fit_reference(solver)
             self.assertGreater(n, 400)
             entries = PROPAGATION_COLOR_TAIL + 2
-            np.testing.assert_array_equal(solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} colors")
-            np.testing.assert_array_equal(solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape}")
+            np.testing.assert_array_equal(
+                solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} {order} colors"
+            )
+            np.testing.assert_array_equal(
+                solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape} {order}"
+            )
+            np.testing.assert_array_equal(
+                solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape} {order}"
+            )
+            np.testing.assert_array_equal(
+                solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape} {order}"
+            )
 
     def test_longest_first_reaches_the_hub_lower_bound(self):
-        """Long units mixed with short ones on a hub cost only the hub's own rows.
+        """Long units mixed with short ones on a hub cost only the hub's own rows with longest_first.
 
         Every hub unit needs its own color, so a sweep walks at least the hub units' rows. Here
         a star of long units with the lowest contact indices and ground contacts on the hub's
-        partners fill the colors of short hub units under the by-contact order.
+        partners fill the colors of short hub units under the contact order, which costs more.
         """
         k, star = 6, 4
         hub, star_center = 0, 50
@@ -2239,18 +2248,20 @@ class TestSteelColoredScheduling(unittest.TestCase):
         hub_rows = int(length[(body_a == hub) | (body_b == hub)].sum())
 
         by_contact = _first_fit_coloring(contact, body_a, body_b, length, longest_first=False)[0]
-        self.assertGreater(_sweep_cost(by_contact, length), hub_rows, "the case does not discriminate the order")
-        for span in (0, 256):
+        contact_rows = _sweep_cost(by_contact, length)
+        self.assertGreater(contact_rows, hub_rows, "the case does not discriminate the order")
+        for longest_first, span in ((True, 0), (True, 256), (False, 0), (False, 256)):
             color, offsets, row_start, sorted_contact, slot = _run_prebuild(
-                [(contact, body_a, body_b, length)], 64, span
+                [(contact, body_a, body_b, length)], 64, span, longest_first
             )[0]
-            self.assertEqual(_sweep_cost(color, length), hub_rows, f"span {span}")
+            expected_rows = hub_rows if longest_first else contact_rows
+            self.assertEqual(_sweep_cost(color, length), expected_rows, f"longest_first {longest_first} span {span}")
             self.assertFalse(np.any(color == PROPAGATION_COLOR_TAIL))
             for c in np.unique(color):
                 bodies = np.concatenate([body_a[color == c], body_b[color == c]])
                 bodies = bodies[bodies >= 0]
                 self.assertEqual(len(bodies), len(np.unique(bodies)), f"color {c} shares a body")
-            expected = _first_fit_coloring(contact, body_a, body_b, length)
+            expected = _first_fit_coloring(contact, body_a, body_b, length, longest_first)
             np.testing.assert_array_equal(color, expected[0])
             np.testing.assert_array_equal(offsets, expected[1])
             np.testing.assert_array_equal(row_start, expected[2])
@@ -2258,7 +2269,7 @@ class TestSteelColoredScheduling(unittest.TestCase):
             np.testing.assert_array_equal(slot[sorted_contact], row_start)
 
     def test_prebuild_matches_the_reference_on_both_sort_paths(self):
-        """A world over 4096 units sorts in global memory; both paths give the longest-first coloring.
+        """A world over 4096 units sorts in global memory; both paths give the reference coloring in either order.
 
         Each world is colored twice from differently shuffled unit lists, as the atomic gather
         would produce, and both launches must match the reference exactly.
@@ -2275,18 +2286,32 @@ class TestSteelColoredScheduling(unittest.TestCase):
             length = rng.choice(np.array([1, 3, 6, 7], dtype=np.int32), n_units)
             worlds.append((contact, body_a, body_b, length))
             body_base += n_bodies
-        for trial in range(2):
+        for longest_first, trial in ((True, 0), (True, 1), (False, 0), (False, 1)):
             shuffled = []
             for units in worlds:
                 perm = rng.permutation(len(units[0]))
                 shuffled.append(tuple(f[perm] for f in units))
-            results = _run_prebuild(shuffled, 8192, 256)
+            results = _run_prebuild(shuffled, 8192, 256, longest_first)
             for w, (units, result) in enumerate(zip(shuffled, results, strict=True)):
-                expected = _first_fit_coloring(*units)
+                expected = _first_fit_coloring(*units, longest_first)
                 for name, got, want in zip(
                     ("color", "offsets", "row start", "contact"), result, expected, strict=False
                 ):
-                    np.testing.assert_array_equal(got, want, err_msg=f"trial {trial} world {w} {name}")
+                    np.testing.assert_array_equal(
+                        got, want, err_msg=f"longest_first {longest_first} trial {trial} world {w} {name}"
+                    )
+
+    def test_color_order_option_is_validated(self):
+        """Reject an unknown propagation_color_order and keep the option read-only."""
+        model, _ = _heap(nx=2, ny=2, nz=1)
+        model.rigid_contact_max = 256
+        kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        with self.assertRaisesRegex(ValueError, "propagation_color_order must be"):
+            newton.solvers.SolverSteel(model, propagation_color_order="longest", **kwargs)
+        solver = newton.solvers.SolverSteel(model, propagation_color_order="contact", **kwargs)
+        self.assertEqual(solver.propagation_color_order, "contact")
+        with self.assertRaises(AttributeError):
+            solver.propagation_color_order = "longest_first"
 
     def test_colored_accepts_a_large_row_budget(self):
         """The coloring keeps per-unit state in global scratch, so no staging cap applies."""
