@@ -1998,6 +1998,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 and agreement with the default step excludes overflowing steps. Joint position and velocity
                 limits, rigid-body velocity limits and ``drive_mode="rows"`` (``"matrix_free"``), and kinematic
                 bodies are supported.
+                Both ``contact_torsion_device`` settings are accepted, but contact torsion groups contacts on
+                the host and requires eager stepping: capturing a contact step with torsion enabled in a CUDA
+                graph raises ``RuntimeError``.
                 Sleeping is accepted and the step keeps every body awake. With ``deterministic=True`` the
                 backward is bitwise repeatable too. ``collide_done_event`` is waited on before contacts are
                 read. Contact buffers take about nine times the default step's memory per environment and

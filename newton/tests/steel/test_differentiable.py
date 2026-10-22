@@ -1633,6 +1633,25 @@ def _torsion_inputs(model, spin):
     }
 
 
+def test_contact_torsion_requires_eager_steps(test, device):
+    """Either contact_torsion_device setting groups on the host: capturing a torsion contact step raises."""
+    # Without device preparation the solver's own capture check raises first.
+    for device_preparation, message in ((False, "contact_torsion_device=True"), (True, "step eagerly")):
+        model = _build_torsion_scene(device, "sphere")
+        solver = SolverSteel(
+            model, differentiable=True, **{**_TORSION_OPTIONS, "contact_torsion_device": device_preparation}
+        )
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        contacts = pipeline.contacts()
+        state, output = model.state(requires_grad=True), model.state(requires_grad=True)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline.collide(state, contacts)
+        solver.step(state, output, None, contacts, _DT)
+        with test.subTest(contact_torsion_device=device_preparation), test.assertRaisesRegex(RuntimeError, message):
+            with wp.ScopedCapture(device):
+                solver.step(state, output, None, contacts, _DT)
+
+
 def test_contact_torsion_matches_default(test, device):
     """Spin rows of sliding (saturated) and sticking contact groups follow the default matrix-free solve."""
     # The device preparation builds the host's groups; the differentiable step groups on the host for both.
@@ -3059,6 +3078,7 @@ for _device in get_test_devices():
             test_matrix_free_contacts_match_default,
             test_contact_torsion_matches_default,
             test_contact_torsion_gradient_matches_finite_difference,
+            test_contact_torsion_requires_eager_steps,
             test_mixed_world_contacts_match_default,
             test_deterministic_rollouts_repeat,
             test_mixed_world_gradient_matches_finite_difference,
