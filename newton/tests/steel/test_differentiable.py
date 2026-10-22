@@ -2557,6 +2557,91 @@ def test_rigid_velocity_limits_gradient_matches_finite_difference(test, device):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def _build_kinematic_belt(device, *, requires_grad=True):
+    """A free box on a kinematic belt."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity()))
+    builder.add_shape_box(belt, hx=2.0, hy=2.0, hz=0.05, cfg=cfg)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    builder.body_flags[belt] = int(newton.BodyFlags.KINEMATIC)
+    return builder.finalize(device=device, requires_grad=requires_grad)
+
+
+def _kinematic_inputs(model):
+    joint_qd = np.zeros(model.joint_dof_count, np.float32)
+    # The belt moves at 0.5 m/s along x.
+    joint_qd[0] = 0.5
+    return {"joint_q": model.joint_q.numpy().copy(), "joint_qd": joint_qd, "joint_f": np.zeros_like(joint_qd)}
+
+
+def test_kinematic_bodies_match_default(test, device):
+    """Kinematic bodies drive contact rows through their prescribed velocity, as in the default step."""
+    cases = [("split", 0.0), ("split", 0.2)]
+    if wp.get_device(device).is_cuda:
+        cases += [("matrix_free", 0.0), ("matrix_free", 0.2)]
+    for solve_mode, beta in cases:
+        options = {
+            "friction_anchor_beta": beta,
+            "solve_mode": solve_mode,
+            "iterations": 32,
+            "articulation_constraint_max": 64,
+        }
+        inputs = _kinematic_inputs(_build_kinematic_belt(device))
+        reference, _ = _contact_scene_rollout(
+            _build_kinematic_belt(device, requires_grad=False),
+            options,
+            inputs,
+            60,
+            differentiable=False,
+            dt=1.0 / 240.0,
+        )
+        result, _ = _contact_scene_rollout(
+            _build_kinematic_belt(device), options, inputs, 60, differentiable=True, dt=1.0 / 240.0
+        )
+        with test.subTest(solve_mode=solve_mode, friction_anchor_beta=beta):
+            # The belt drags the box to its speed.
+            test.assertAlmostEqual(float(reference.joint_qd.numpy()[6]), 0.5, delta=1.0e-3)
+            np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
+
+
+def test_kinematic_velocity_gradient_matches_finite_difference(test, device):
+    """Tape against central differences of the box's and the kinematic belt's initial velocities.
+
+    The contacts are frozen: a turning belt also turns the contact normals, which are stop-gradient.
+    """
+    model = _build_kinematic_belt(device)
+    solver = SolverSteel(model, differentiable=True, friction_anchor_beta=0.0, iterations=32)
+    inputs = _kinematic_inputs(model)
+    rng = np.random.default_rng(29)
+    weights = rng.normal(size=model.joint_dof_count)
+
+    _, contacts = _free_body_rollout(model, solver, inputs["joint_q"], inputs["joint_qd"], 5, 1.0 / 240.0)
+
+    def loss_of(joint_qd, tape=None):
+        states, _ = _free_body_rollout(
+            model, solver, inputs["joint_q"], joint_qd, 5, 1.0 / 240.0, contacts=contacts, tape=tape
+        )
+        return float(weights @ states[-1].joint_qd.numpy()), states
+
+    tape = wp.Tape()
+    _, states = loss_of(inputs["joint_qd"], tape)
+    tape.backward(grads={states[-1].joint_qd: wp.array(weights.astype(np.float32), dtype=float, device=device)})
+    gradient = states[0].joint_qd.grad.numpy().astype(np.float64)
+    # The belt's velocity reaches the box only through the friction rows' target.
+    test.assertGreater(abs(float(gradient[0])), 0.1)
+    eps = 1.0e-3
+    for trial in range(3):
+        direction = rng.normal(size=model.joint_dof_count)
+        direction /= np.linalg.norm(direction)
+        plus = loss_of((inputs["joint_qd"] + eps * direction).astype(np.float32))[0]
+        minus = loss_of((inputs["joint_qd"] - eps * direction).astype(np.float32))[0]
+        fd = (plus - minus) / (2.0 * eps)
+        with test.subTest(trial=trial):
+            test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_taped_kernels_keep_adjoints(test, device):
     """Every launch the step records has an adjoint, although the Steel kernel modules disable them."""
     for model in (_build_box_chain_on_plane(device), _build_free_shape(device, "box")):
@@ -2616,6 +2701,8 @@ for _device in get_test_devices():
         test_unarticulated_body_contact_matches_default,
         test_joint_limits_match_default,
         test_joint_limits_gradient_matches_finite_difference,
+        test_kinematic_bodies_match_default,
+        test_kinematic_velocity_gradient_matches_finite_difference,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:

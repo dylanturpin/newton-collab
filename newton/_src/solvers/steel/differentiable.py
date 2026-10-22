@@ -131,8 +131,6 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
             not np.array_equal(plan.articulation_joint_end, solver.model.articulation_start.numpy()[1:]),
             "no mimic or loop-closing joints",
         ),
-        (bool(np.any(solver._kinematic_dof_mask_host)), "no kinematic bodies"),
-        (not np.array_equal(plan.response_dof_count, plan.articulation_dof_count), "every articulation DOF dynamic"),
         # The dense sweep reproduces the loop and tiled_row updates; CPU and matrix_free resolve to loop.
         (
             solver._solve_mode == "split" and solver._pgs_kernel in ("tiled_contact", "streaming"),
