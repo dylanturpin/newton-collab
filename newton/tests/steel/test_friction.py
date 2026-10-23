@@ -428,9 +428,7 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         self.assertGreater(status["friction_history_dropped"], 0)
         model, _jaws, _box = _build_v_jaws(5.0)
         with self.assertRaises(ValueError):
-            newton.solvers.SolverSteel(
-                model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.05, friction_locations_max=4
-            )
+            newton.solvers.SolverSteel(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.05, friction_locations_max=4)
         model.rigid_contact_max = 256
         with self.assertRaises(ValueError):
             newton.solvers.SolverSteel(
@@ -442,35 +440,64 @@ class TestSteelFrictionAnchors(unittest.TestCase):
             )
 
     def test_compact_history_graph_capture_replays(self):
-        """Replay the packed history store (flags, scan, compact store) under a CUDA graph."""
-        model, jaws, box = _build_v_jaws(5.0)
-        solver = newton.solvers.SolverSteel(
-            model, friction_anchor_beta=0.05, friction_history_compact=True, **_SQUEEZE_SOLVER
-        )
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest")
-        contacts = pipeline.contacts()
-        s0, s1 = model.state(), model.state()
-        control = model.control()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        """Replay the packed history store (flags, scan, compact store) under a CUDA graph with pose parity."""
 
-        def step():
-            nonlocal s0, s1
-            pipeline.collide(s0, contacts)
-            s0.clear_forces()
-            solver.step(s0, s1, control, contacts, 0.005)
-            s0, s1 = s1, s0
+        def captured_run(compact):
+            model, jaws, box = _build_v_jaws(5.0)
+            solver = newton.solvers.SolverSteel(
+                model, friction_anchor_beta=0.05, friction_history_compact=compact, **_SQUEEZE_SOLVER
+            )
+            pipeline = newton.CollisionPipeline(
+                model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest"
+            )
+            contacts = pipeline.contacts()
+            s0, s1 = model.state(), model.state()
+            control = model.control()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
 
-        for _ in range(4):
-            step()
-        with wp.ScopedCapture(device=model.device) as capture:
-            step()
-            step()
-        for _ in range(200):
-            wp.capture_launch(capture.graph)
-        bq = s0.body_q.numpy()
-        self.assertTrue(np.all(np.isfinite(bq)))
-        self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
+            def step():
+                nonlocal s0, s1
+                pipeline.collide(s0, contacts)
+                s0.clear_forces()
+                solver.step(s0, s1, control, contacts, 0.005)
+                s0, s1 = s1, s0
+
+            for _ in range(4):
+                step()
+            with wp.ScopedCapture(device=model.device) as capture:
+                step()
+                step()
+            for _ in range(200):
+                wp.capture_launch(capture.graph)
+            return s0.body_q.numpy(), solver, jaws, box
+
+        mirrored, _, _, _ = captured_run(False)
+        packed, solver, jaws, box = captured_run(True)
+        self.assertTrue(np.all(np.isfinite(packed)))
+        self.assertLess(abs(packed[box][2] - packed[jaws[0]][2]), 0.01)
         self.assertEqual(solver.friction_history_status()["friction_history_dropped"], 0)
+        np.testing.assert_array_equal(packed, mirrored)
+
+    def test_compact_history_geometry_invalidation_follows_the_table(self):
+        """Retire packed records whose supporting shape changed, as the mirrored frame does."""
+        counts = {}
+        for compact in (False, True):
+            _drift, solver, _state = _run_squeeze(
+                5.0, int(0.8 / 0.005), friction_anchor_beta=0.05, friction_history_compact=compact
+            )
+            patches = solver._friction_patches
+            before = int(patches.previous.valid.numpy().sum())
+            self.assertGreater(before, 0)
+            # Move the box's collision shape: every carried record touches the box, so all retire.
+            model = solver.model
+            transforms = model.shape_transform.numpy()
+            transforms[-1][0] += 0.01
+            model.shape_transform.assign(transforms)
+            patches.update_geometry(model)
+            counts[compact] = (before, int(patches.previous.valid.numpy().sum()))
+        self.assertEqual(counts[True][1], 0)
+        self.assertEqual(counts[False][1], 0)
+        self.assertEqual(counts[True][0], counts[False][0])
 
 
 def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, device="cpu"):

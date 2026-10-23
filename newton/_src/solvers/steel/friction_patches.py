@@ -1576,11 +1576,10 @@ class _FrictionPatchState:
     @staticmethod
     def _history_frame(n, device):
         """A previous frame holding only the carried fields plus the matcher's scratch."""
-        full = _FrictionPatchState._frame(n, device)
         frame = _PatchFrame()
-        for name in _PatchFrame.vars:
+        for name, var in _PatchFrame.vars.items():
             count = n if (name in _CARRIED_HISTORY_FIELDS or name in ("used", "members")) else 0
-            setattr(frame, name, wp.zeros(count, dtype=getattr(full, name).dtype, device=device))
+            setattr(frame, name, wp.zeros(count, dtype=var.type.dtype, device=device))
         frame.keys.fill_(0x7FFFFFFFFFFFFFFF)
         return frame
 

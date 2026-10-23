@@ -2209,13 +2209,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 the loop-closure rows. Defaults to True.
             friction_history_compact (bool, optional): Carry the friction-anchor history as a packed
                 table of the live friction locations (the carried fields only, in key order) instead
-                of mirroring the whole contact frame. The solve is unchanged; the history costs less
-                memory and the per-step store touches only the live records. Defaults to False.
+                of mirroring the whole contact frame. While no record is dropped the carried history,
+                and so the solve, is unchanged; the history costs less memory and the per-step store
+                touches only the live records. Defaults to False.
             friction_locations_max (int | None, optional): Size of that table in records (total over
                 all worlds). ``None`` keeps one record per contact slot, so no live friction location
                 is ever dropped; a smaller budget shrinks the table, and records past it are dropped
-                and counted (see :meth:`friction_history_status`). Needs ``friction_history_compact``.
-                Defaults to None.
+                and counted (see :meth:`friction_history_status`). Records are packed in key order and
+                a pair's key orders by its body indices, which are laid out world by world, so an
+                overflowing table drops the highest keys first: the last worlds lose their history
+                before the first, and the budget is global rather than per world. Needs
+                ``friction_history_compact``. Defaults to None.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -2571,8 +2575,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._friction_locations_max = None if friction_locations_max is None else int(friction_locations_max)
         if self._friction_locations_max is not None and not self._friction_history_compact:
             raise ValueError("friction_locations_max needs friction_history_compact=True")
-        if self._friction_history_compact and enable_sleeping:
-            raise NotImplementedError("friction_history_compact does not support enable_sleeping yet")
+        if self._friction_history_compact and enable_sleeping and self._friction_anchors_enabled:
+            raise NotImplementedError(
+                "friction_history_compact does not support enable_sleeping with friction anchors yet"
+            )
         if self._contact_compliance and self._friction_anchors_enabled:
             raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
         if self._friction_anchors_enabled and friction_mode != "fixed_normal":
@@ -10543,7 +10549,9 @@ class SolverSteel(SolverBase, CouplingInterface):
 
     def friction_history_status(self) -> dict[str, int]:
         """Return the compact friction-history table size, its record high-water mark and the records
-        dropped past it since construction; empty unless ``friction_history_compact`` is on with anchors."""
+        dropped past it since construction; empty unless ``friction_history_compact`` is on with anchors.
+
+        Reads the counters back from the device, so it synchronizes; do not call it inside a captured step."""
         patches = getattr(self, "_friction_patches", None)
         if patches is None or not patches.view.enabled or not patches.compact:
             return {}
