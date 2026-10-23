@@ -1,0 +1,1 @@
+Run the Steel padlock with four substeps and 32 sweeps using coupled, bounded key drives, implicit passive springs and timestep-aware contact search. Delay turning until the key seats and validate key alignment and wrong-key blocking. Reduce startup overhead by warming only one physics substep and avoiding eager loading of unrelated CUDA modules.

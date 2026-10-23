@@ -10,6 +10,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.robot._tabletop_demo import TabletopDemo
+from newton.examples.robot.example_steel_padlock import Example as Padlock
 from newton.examples.robot.example_steel_plate_rack import Example as PlateRack
 from newton.examples.robot.example_steel_wrecking_ball import Example
 from newton.solvers import SolverSteel
@@ -59,6 +60,49 @@ def test_capture_substeps(test, device, substeps):
 
 class TestTabletopCapture(unittest.TestCase):
     pass
+
+
+def test_padlock_startup(test, device):
+    """Warm one substep and preserve captured frame/reset equivalence."""
+    startup_substeps = []
+
+    class StartupPadlock(Padlock):
+        def simulate(self, *args, **kwargs):
+            startup_substeps.append(kwargs.get("substeps", self.sim_substeps))
+            return super().simulate(*args, **kwargs)
+
+    with wp.ScopedDevice(device):
+        args = newton.examples.default_args(Padlock.create_parser())
+        test.assertEqual(args.substeps, 4)
+        example = StartupPadlock(ViewerNull(), args)
+        test.assertEqual(startup_substeps, [1, args.substeps])
+        np.testing.assert_array_equal(example.state_0.body_q.numpy(), example.initial.body_q.numpy())
+        test.assertEqual(float(example.clock.numpy()[0]), 0.0)
+        example.step()
+        captured_pose = example.state_0.body_q.numpy()
+        captured_velocity = example.state_0.body_qd.numpy()
+        captured_coordinates = example.state_0.joint_q.numpy()
+        captured_clock = example.clock.numpy()
+        example.reset()
+        example.simulate()
+        np.testing.assert_allclose(example.state_0.body_q.numpy(), captured_pose, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(example.state_0.body_qd.numpy(), captured_velocity, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(example.state_0.joint_q.numpy(), captured_coordinates, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(example.clock.numpy(), captured_clock, atol=1e-8, rtol=0)
+        np.testing.assert_allclose(captured_clock, [1 / 60], atol=1e-8, rtol=0)
+        example.reset()
+        example.clock.fill_(1.8)
+        example.step()
+        test.assertLess(example.state_0.joint_q.numpy()[example.coordinates["key_drive"] + 2], -0.2)
+        test.assertAlmostEqual(float(example.clock.numpy()[0]), 1.8, places=6)
+
+
+add_function_test(
+    TestTabletopCapture,
+    "test_padlock_startup",
+    test_padlock_startup,
+    devices=get_selected_cuda_test_devices(),
+)
 
 
 for count in (1, 2, 3, 4):
