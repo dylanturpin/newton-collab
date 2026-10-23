@@ -551,8 +551,8 @@ def _warn_constraint_row_overflow(
         if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
             wp.printf(
                 "Warning: Steel propagation constraint-row overflow in world %d: requested %d rows, "
-                "limit %d; dropped %d contact/friction rows. Increase articulation_constraint_max or "
-                "free_body_constraint_max.\n",
+                "limit %d; dropped %d contact/friction rows. Increase propagation_constraint_max (or, when "
+                "it is unset, articulation_constraint_max or free_body_constraint_max).\n",
                 world,
                 propagation_requested,
                 propagation_capacity,
@@ -1661,6 +1661,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     row_schedule = _ConstructionOption()
     friction_mode = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
+    propagation_constraint_max = _ConstructionOption()
     use_parallel_streams = _ConstructionOption()
     double_buffer = _ConstructionOption()
     drive_mode = _ConstructionOption()
@@ -1944,6 +1945,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
+        propagation_constraint_max: int | None = None,
         contact_torsion_device: bool = False,
         enable_torsional_rolling_friction: bool = False,
         torsional_rolling_friction_cone: Literal["elliptic", "pyramidal"] = "elliptic",
@@ -2441,6 +2443,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``"propagation"`` raises ``NotImplementedError``.
                 Defaults to ``"fixed_normal"``.
             free_body_constraint_max (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
+            propagation_constraint_max (int | None, optional): Capacity of the propagation row family per world
+                in the ``"propagation"`` and ``"propagation_colored"`` responses, where every contact row lives
+                on this family. ``None`` keeps the default of ``free_body_constraint_max +
+                articulation_constraint_max``. Set it to size the propagation rows on their own, so
+                ``free_body_constraint_max`` only has to hold the rows that stay matrix-free (the velocity-limit
+                rows). Rejected with ``articulated_contact_response="immediate"``, where no propagation rows
+                exist. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
             parallel_tree: Opt in to parallel branches for forward dynamics, backward
@@ -2785,12 +2794,22 @@ class SolverSteel(SolverBase, CouplingInterface):
         # alone (32 by default) allocate_world_contact_slots silently dropped every
         # contact past the cap (contact_path = -1): on a tote-nesting manifold that
         # kept 10 of 24 contacts and sank the stack. Other modes keep the dense cap.
-        if articulated_contact_response in ("propagation", "propagation_colored"):
+        self._propagation_constraint_max = (
+            None if propagation_constraint_max is None else int(propagation_constraint_max)
+        )
+        if self._propagation_constraint_max is not None:
+            self._propagation_max_constraints = self._propagation_constraint_max
+        elif articulated_contact_response in ("propagation", "propagation_colored"):
             self._propagation_max_constraints = int(free_body_constraint_max) + self._requested_dense_max_constraints
         else:
             self._propagation_max_constraints = self._requested_dense_max_constraints
         if self._propagation_max_constraints < 1:
-            raise ValueError("propagation_max_constraints must be positive")
+            raise ValueError("propagation_constraint_max must be positive")
+        if self._propagation_constraint_max is not None and articulated_contact_response == "immediate":
+            raise ValueError(
+                "propagation_constraint_max requires articulated_contact_response "
+                "'propagation' or 'propagation_colored'"
+            )
         self._double_buffer = double_buffer
         self._nvtx = PROFILE_ENABLED
 
