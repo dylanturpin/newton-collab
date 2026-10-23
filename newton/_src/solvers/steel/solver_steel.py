@@ -30,7 +30,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ...core.types import override
+from ...core.types import MAXVAL, override
 from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -1490,12 +1490,16 @@ class SolverSteel(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
-    Loop-closing BALL joints (joints outside the articulation tree whose child belongs to
-    an articulation) are enforced by three bilateral rows. The rows read
-    :attr:`~newton.Model.joint_enabled` and the translations of
-    :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step, so a
-    closure is released, engaged or re-anchored by editing those arrays in place, also
-    from a kernel between CUDA graph replays. An eager step reads a replaced array; a
+    Loop-closing BALL and REVOLUTE joints (joints outside the articulation tree whose child
+    belongs to an articulation) are enforced as bilateral rows: three that pin the joint's
+    anchors together, plus, for a REVOLUTE closure, two that keep the child's hinge axis
+    aligned with the parent's. A loop closure carries no joint coordinate, so limits and
+    drive gains on a loop REVOLUTE joint are ignored (with a warning). The rows read
+    :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_X_p` /
+    :attr:`~newton.Model.joint_X_c` and, for REVOLUTE closures,
+    :attr:`~newton.Model.joint_axis` every step, so a closure is released, engaged,
+    re-anchored or re-aimed by editing those arrays in place, also from a kernel between
+    CUDA graph replays. An eager step reads a replaced array; a
     captured graph keeps the arrays it was captured with, so recapture after replacing
     one.
 
@@ -4758,6 +4762,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+        joint_qd_start = model.joint_qd_start.numpy()
+        limit_lower, limit_upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        target_ke, target_kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
 
         art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l = [], [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
@@ -4766,6 +4773,16 @@ class SolverSteel(SolverBase, CouplingInterface):
                 rows = 3
             elif int(joint_type[j]) == int(JointType.REVOLUTE):
                 rows = 5  # the hinge axis is read live from Model.joint_axis by the kernels
+                dof = int(joint_qd_start[j])
+                limited = abs(float(limit_lower[dof])) < MAXVAL or abs(float(limit_upper[dof])) < MAXVAL
+                driven = float(target_ke[dof]) != 0.0 or float(target_kd[dof]) != 0.0
+                if limited or driven:
+                    ignored = " and ".join(n for n, f in (("position limits", limited), ("drive gains", driven)) if f)
+                    warnings.warn(
+                        f"SolverSteel: loop-closing REVOLUTE joint {j} has {ignored}; a loop closure carries no "
+                        "joint coordinate, so they are ignored (only the hinge itself is enforced).",
+                        stacklevel=2,
+                    )
             else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
