@@ -1,0 +1,1 @@
+Fix body-pair contact reduction in `CollisionPipeline` merging shapes of one free body whose `steel:condim` gives them different `SolverSteel` torsional or rolling friction, which could discard every contact of the opted-in shape.

@@ -1,1 +1,0 @@
-`SolverFeatherPGS.reset` also accepts the `SolverBase.reset` world mask of shape `(model.world_count + 1,)`, whose final entry selects global articulations; masks with one entry per solver world keep working unchanged.

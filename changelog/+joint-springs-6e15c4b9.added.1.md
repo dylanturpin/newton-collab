@@ -1,1 +1,1 @@
-Add passive joint spring support and an `enable_joint_springs` toggle to `SolverFeatherPGS`.
+Add passive joint spring support and an `enable_joint_springs` toggle to `SolverSteel`.

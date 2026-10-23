@@ -14,7 +14,7 @@
 # Command: python -m newton.examples admm_contact_solver
 #          python -m newton.examples admm_contact_solver --solver free
 #          python -m newton.examples admm_contact_solver --tray-solver mujoco
-#          python -m newton.examples admm_contact_solver --tray-solver featherpgs
+#          python -m newton.examples admm_contact_solver --tray-solver steel
 #
 ###########################################################################
 
@@ -26,7 +26,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverSemiImplicit, SolverXPBD
+from newton.solvers import SolverMuJoCo, SolverSemiImplicit, SolverSteel, SolverXPBD
 
 
 @wp.kernel(enable_backward=False)
@@ -70,10 +70,10 @@ class Example:
         self.model.soft_contact_kf = 0.0
         self.model.soft_contact_mu = 0.0
 
-        if args.tray_solver == "featherpgs":
+        if args.tray_solver == "steel":
 
             def tray_factory(v):
-                return SolverFeatherPGS(v, solve_mode="matrix_free")
+                return SolverSteel(v, solve_mode="matrix_free")
 
         elif args.tray_solver == "mujoco":
 
@@ -375,7 +375,7 @@ class Example:
             "--tray-solver",
             help="Rigid solver that owns the ball-jointed tray",
             type=str,
-            choices=["semi_implicit", "mujoco", "featherpgs"],
+            choices=["semi_implicit", "mujoco", "steel"],
             default="semi_implicit",
         )
         parser.add_argument(

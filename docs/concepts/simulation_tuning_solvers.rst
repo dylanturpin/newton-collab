@@ -71,7 +71,7 @@ Contact reduction
    universally supported mesh/heightfield producer stage.  The optional
    ``CollisionPipeline.ContactReductionConfig(body_pairs=True)`` postpass is a
    different, solver-visible approximation intended for compound-body patches;
-   it is currently supported only by :class:`newton.solvers.SolverFeatherPGS`.
+   it is currently supported only by :class:`newton.solvers.SolverSteel`.
    Keep it off unless measured end-to-end solver savings outweigh its fixed
    collision cost and validate tipping- and yaw-sensitive behavior.  See
    :ref:`Contact Reduction` for the stage and compatibility contracts.
@@ -229,7 +229,7 @@ repository examples spend tuning effort, not a shared solver API.
        generally requires smaller ``dt``. Examples use
        ``update_mass_matrix_interval`` when articulation dynamics are coupled
        with cloth or soft-body work.
-   * - :class:`~newton.solvers.SolverFeatherPGS`
+   * - :class:`~newton.solvers.SolverSteel`
      - ``solve_mode``, ``iterations``, ``baumgarte``, ``cfm``, ``relaxation``,
        ``update_mass_matrix_interval``, ``enable_joint_limits``,
        ``joint_limit_activation_gap``, ``enable_joint_velocity_limits``,
@@ -249,6 +249,7 @@ repository examples spend tuning effort, not a shared solver API.
        ``sleep_quiet_time``, ``sleep_skip_constraints``,
        ``articulated_contact_response``, ``propagation_same_articulation_rows``,
        ``propagation_cached_response``, ``propagation_cached_response_body_max``,
+       ``propagation_color_order``,
        ``contact_shared_anchor``, ``contact_friction_shared_anchor``,
        ``row_watermark``, ``row_schedule``, ``use_parallel_streams``,
        ``double_buffer``, ``friction_mode``.
@@ -284,14 +285,16 @@ repository examples spend tuning effort, not a shared solver API.
        the work and the closing allowance of speculative contacts.
        Experimental contact torsion adds spin friction to the contacts of
        articulated bodies whose shapes carry a positive
-       ``feather_pgs:min_torsional_patch_radius`` (imported from
+       ``steel:min_torsional_patch_radius`` (imported from
        ``physxCollision:minTorsionalPatchRadius``), bounded by the shared
        Coulomb budget; the radius is an effective footprint (``2 R / 3`` for
        a uniformly loaded disk of radius ``R``). ``contact_torsion_device``
        prepares these rows on the device, which CUDA graph capture requires.
        The experimental ``contact_compliance`` option solves hydroelastic
-       contacts with positive stiffness as implicit spring-dampers instead; it
-       uses point friction and does not support CUDA graph capture.
+       contacts with positive stiffness as implicit spring-dampers instead, with
+       the ``"immediate"`` or ``"propagation_colored"`` articulated contact
+       response; it uses point friction, and a captured step reports its input
+       errors through ``validate_contact_compliance()`` after replay.
        Joint drives are integrated implicitly by default, which keeps large
        drive gains stable at ordinary ``dt``; ``drive_mode="rows"`` solves
        them as PGS rows together with contacts and limits instead, and each
@@ -339,9 +342,15 @@ repository examples spend tuning effort, not a shared solver API.
        parallel batches of contacts that share no responding body, which pays off on
        scenes with many contacts per world. ``propagation_cached_response`` replaces the
        per-iteration tree walk with cached per-body responses (on by default); which is
-       faster depends on the model. The propagation responses reject contact torsion,
-       contact compliance, sleeping and loop-closing joints, and fall back from bilateral
-       pre-elimination to iterative mimic rows with a warning.
+       faster depends on the model. ``"propagation"`` rejects
+       contact compliance; the propagation responses reject loop-closing joints, and fall
+       back from bilateral pre-elimination to iterative mimic rows with a warning. ``"propagation"`` and ``"propagation_colored"`` support
+       contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
+       ``enable_torsional_rolling_friction``, and ``deterministic=True``
+       (``"propagation_colored"`` without ``contact_warmstart``); ``"propagation_colored"``
+       also supports sleeping and the ``friction_mode`` values other than ``"fixed_normal"``,
+       which it applies to articulated contacts as well; ``enable_torsional_rolling_friction``
+       requires ``"fixed_normal"`` and no contact compliance on every response.
        ``use_parallel_streams`` and ``double_buffer`` overlap the work of
        articulation-size groups and of consecutive steps without changing results;
        measure the full step before relying on them.

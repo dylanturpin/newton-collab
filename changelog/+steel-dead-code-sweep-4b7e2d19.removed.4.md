@@ -1,0 +1,1 @@
+Remove `SolverSteel`'s `pgs_velocity_omega` in favor of `relaxation`, which the velocity-only pass now uses as its relaxation factor.

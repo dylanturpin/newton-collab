@@ -1,0 +1,1 @@
+Fix the `SolverSteel` motion subspace of angular-only D6 joints with two or three angular axes, which disagreed with forward kinematics and left out the bias acceleration of the configuration-dependent axes. Steel now shares `SolverFeatherstone`'s joint motion computation.

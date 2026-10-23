@@ -1,0 +1,1 @@
+Reduce Steel tabletop IK launch overhead using CUDA graphs and load the pelican mechanism from a local USD instead of converting CAD/MJCF at startup; use four substeps and 16 propagation-colored iterations for the wrecking ball example, and propagation coloring for cup unpacking.

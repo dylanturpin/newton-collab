@@ -22,7 +22,7 @@ whose production branch (`fpgs-main`) pins exact commits of the branches below. 
 changes the branch rules:
 
 - Lineage (full map: `reports/vishal/robotiq/branches.md` in skild-IL-solver):
-  base `3ee2ff96` → `vishal/fpgs-mimic-rows` (FPGS mimic/connect rows, passive joint
+  base `3ee2ff96` → `vishal/fpgs-mimic-rows` (Steel mimic/connect rows, passive joint
   springs, CRBA loop-joint indexing fix) → `vishal/fpgs-preelim` (bilateral
   pre-elimination). `vishal/kamino-robotiq` is a pinned workspace at the mimic-rows tip.
   New solver features branch off the current validated tip (`<username>/<feature-desc>`
@@ -34,19 +34,21 @@ changes the branch rules:
   Remote GC can prune orphaned SHAs and break every parent checkout pinned to them.
   When splitting history for upstream PRs (`git rebase --onto origin/main 3ee2ff96`),
   create *new* branches and leave the referenced ones intact.
-- **Validation gates before a tip may become a parent pointer**: the FPGS test modules
-  pass (`uv run --extra dev python -m unittest newton.tests.feather_pgs.test_articulation`),
+- **Validation gates before a tip may become a parent pointer**: the Steel test modules
+  pass (`uv run --extra dev python -m unittest newton.tests.steel.test_articulation`),
   regression-first discipline holds (tests
   verified failing without the change), and solver changes that affect grasp behavior
   pass the parent repo's P25 sustained-squeeze gate
-  (`P25_FPGS_PREELIM=1 P25_FPGS_ITERS=64 ... p25_curling_grasp.py --solver feather_pgs
+  (`P25_STEEL_PREELIM=1 P25_STEEL_ITERS=64 ... p25_curling_grasp.py --solver steel
   --object pinch --headless --steps 300 --close-at 60 --rigid-gap 0.005` must hold the
   cube).
-- **Warp kernel cache when bisecting generated-source edits** (e.g. the FPGS sweep-phase
+- **Warp kernel cache when bisecting generated-source edits** (e.g. the Steel sweep-phase
   filters): stale caches in `~/.cache/warp` silently run the old kernels — clear the
   cache between bisection steps.
 
 ## Tests
+
+Follow the canonical [test organization and runtime guidelines](CODING_GUIDELINES.rst#test-organization-and-runtime) when changing or reviewing tests.
 
 ```bash
 uv run --extra dev -m newton.tests
