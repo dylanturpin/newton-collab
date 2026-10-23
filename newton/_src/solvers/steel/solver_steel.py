@@ -1657,6 +1657,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_same_articulation_rows = _ConstructionOption()
     propagation_cached_response = _ConstructionOption()
     propagation_cached_response_body_max = _ConstructionOption()
+    propagation_color_order = _ConstructionOption()
     row_schedule = _ConstructionOption()
     friction_mode = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
@@ -1957,6 +1958,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         deterministic: bool = False,
+        propagation_color_order: Literal["contact", "longest_first"] = "contact",
     ):
         """
         Args:
@@ -2397,6 +2399,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 and (worlds, cap, cap, 36); worlds with more simultaneously active
                 eligible bodies than the cap fall back to the tree walk for that step.
                 Defaults to 8.
+            propagation_color_order (str, optional): Order in which ``"propagation_colored"`` colors a
+                world's contact units: ``"contact"`` by contact index, or ``"longest_first"`` by row count,
+                longest first, then contact index. ``"longest_first"`` lets long units share colors, which
+                shortens the sweep where one body carries many units of mixed length, but on some stacked
+                scenes it converges more slowly at a fixed iteration count. Other responses ignore it.
+                Defaults to ``"contact"``.
             row_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -2650,6 +2658,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         self._propagation_cached_response = bool(propagation_cached_response)
         self._propagation_cached_response_body_max = int(propagation_cached_response_body_max)
+        if propagation_color_order not in ("contact", "longest_first"):
+            raise ValueError(
+                f"propagation_color_order must be 'contact' or 'longest_first', got {propagation_color_order!r}"
+            )
+        self._propagation_color_order = propagation_color_order
         self._contact_warmstart = bool(contact_warmstart)
         self.contact_warmstart_decay = contact_warmstart_decay
         self._ws_prev_dense_impulses = None
@@ -7498,6 +7511,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_color_order_stride,
                 device_arch,
                 max_body_span=max_body_span,
+                longest_first=self._propagation_color_order == "longest_first",
             )
         if (
             model.device.is_cuda
@@ -17856,15 +17870,17 @@ def _get_color_propagation_prebuild_kernel(
     order_stride: int,
     device_arch: str,
     max_body_span: int = 0,
+    longest_first: bool = False,
 ) -> "wp.Kernel":
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
     Runs after contact classification and BEFORE row build. Each block owns one
-    world: it sorts the world's contact units by global contact index (a bitonic
-    sort over a global scratch permutation, so the schedule does not depend on
-    the atomic order in which ``collect_propagation_units`` gathered the units),
-    colors them by first-fit greedy edge coloring over per-body used-color
-    bitmasks, counting-sorts the units by color in that same order, and rewrites
+    world: it sorts the world's contact units by global contact index, after row
+    count (longest first) when ``longest_first`` is set (a bitonic sort over a
+    global scratch permutation, so the schedule does not depend on the atomic
+    order in which ``collect_propagation_units`` gathered the units), colors them
+    by first-fit greedy edge coloring over per-body used-color bitmasks,
+    counting-sorts the units by color in that same order, and rewrites
     ``contact_slot`` so the row builder writes every unit's rows at a
     color-ordered slot. Color segments therefore occupy contiguous row memory
     and the colored solve kernel's payload reads are sequential. It also emits
@@ -17888,6 +17904,13 @@ def _get_color_propagation_prebuild_kernel(
     SORT_CAP = min(4096, OS)  # units a world may have for the sort to run on packed keys in shared memory
     # One raw buffer: the sort's keys first, then the masks and the staged chunks.
     RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * WORDS + 4 * CH)
+    # A color costs its longest unit, so longest_first sorts longer units first to share colors. The
+    # rank takes 4 bits above the 31-bit contact index; packed keys keep the unit in the low 12 bits.
+    assert SORT_CAP <= 1 << 12
+
+    def rank_key(u: str) -> str:
+        rank = f"(15 - min(unit_len.data[world_base + {u}], 15))" if longest_first else "0"
+        return f"(((unsigned long long){rank} << 31) | (unsigned long long)unit_contact.data[world_base + {u}])"
 
     def greedy(mask: str, index_a: str, index_b: str) -> str:
         return f"""
@@ -17961,15 +17984,15 @@ def _get_color_propagation_prebuild_kernel(
     }}
     for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
     __syncthreads();
-    // Bitonic sort of the permutation by global contact index: the greedy pass below
-    // is order-dependent, and this order is independent of the atomic list build.
+    // Bitonic sort of the permutation by (length rank, global contact index): the greedy
+    // pass below is order-dependent, and this order is independent of the atomic list build.
     if (n_pad <= {SORT_CAP}) {{
-        // Packed (contact index, unit) keys sort in shared memory; contact indices are
+        // Packed (rank, contact index, unit) keys sort in shared memory; contact indices are
         // unique per unit, so the order matches the permutation sort below.
         unsigned long long* s_key = reinterpret_cast<unsigned long long*>(s_raw);
         for (int i = t; i < n_pad; i += {B})
             s_key[i] = (i < n_units)
-                ? ((unsigned long long)(unsigned)unit_contact.data[world_base + i] << 32) | (unsigned)i
+                ? ({rank_key("i")} << 12) | (unsigned long long)i
                 : 0xFFFFFFFFFFFFFFFFull;
         __syncthreads();
         for (int k = 2; k <= n_pad; k <<= 1) {{
@@ -17987,7 +18010,7 @@ def _get_color_propagation_prebuild_kernel(
                 __syncthreads();
             }}
         }}
-        for (int i = t; i < n_units; i += {B}) unit_order.data[order_base + i] = (int)(s_key[i] & 0xFFFFFFFFull);
+        for (int i = t; i < n_units; i += {B}) unit_order.data[order_base + i] = (int)(s_key[i] & 0xFFFull);
         __syncthreads();
     }} else {{
         for (int k = 2; k <= n_pad; k <<= 1) {{
@@ -17997,8 +18020,8 @@ def _get_color_propagation_prebuild_kernel(
                     if (partner <= i) continue;
                     const int ui = unit_order.data[order_base + i];
                     const int up = unit_order.data[order_base + partner];
-                    const int ki = (ui >= 0) ? unit_contact.data[world_base + ui] : 0x7FFFFFFF;
-                    const int kp = (up >= 0) ? unit_contact.data[world_base + up] : 0x7FFFFFFF;
+                    const unsigned long long ki = (ui >= 0) ? {rank_key("ui")} : 0xFFFFFFFFFFFFFFFFull;
+                    const unsigned long long kp = (up >= 0) ? {rank_key("up")} : 0xFFFFFFFFFFFFFFFFull;
                     const bool ascending = (i & k) == 0;
                     if ((ki > kp) == ascending) {{
                         unit_order.data[order_base + i] = up;
@@ -18067,7 +18090,7 @@ def _get_color_propagation_prebuild_kernel(
     }}
     __syncthreads();
 
-    // Stable counting sort by color in sorted-contact order, so the serial tail
+    // Stable counting sort by color in sorted unit order, so the serial tail
     // keeps a deterministic sweep order. world_row_order temporarily holds the
     // unit index at each color-ordered position until the slot prefix below.
     for (int base = 0; base < n_units; base += {CH}) {{
@@ -18169,7 +18192,7 @@ def _get_color_propagation_prebuild_kernel(
             unit_sorted_contact,
         )
 
-    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}_mbw{MBW}"
+    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}_mbw{MBW}{'_lf' if longest_first else ''}"
     color_propagation_prebuild_template.__name__ = name
     color_propagation_prebuild_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(color_propagation_prebuild_template)
