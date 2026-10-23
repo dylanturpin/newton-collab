@@ -6857,6 +6857,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_tree_D_inv = None
             self._propagation_tree_pA = None
             self._propagation_tree_u = None
+            self._propagation_tree_u_basis = None
             self._propagation_tree_qdd = None
             self._propagation_tree_body_delta = None
             self._propagation_body_count = None
@@ -7028,6 +7029,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_tree_D_inv = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
         self._propagation_tree_pA = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
         self._propagation_tree_u = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
+        self._propagation_tree_u_basis = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
         self._propagation_tree_qdd = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
         self._propagation_tree_body_delta = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
 
@@ -8589,6 +8591,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         outputs=[
                             self._propagation_tree_pA,
                             self._propagation_tree_u,
+                            self._propagation_tree_u_basis,
                             self._propagation_tree_qdd,
                             self._propagation_tree_body_delta,
                             self._propagation_body_response,
