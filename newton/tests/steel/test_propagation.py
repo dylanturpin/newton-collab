@@ -1000,6 +1000,29 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                 self.assertGreater(float(np.abs(exact).max()), 0.0)
                 np.testing.assert_allclose(split, 3.0 * exact, rtol=1.0e-5, atol=1.0e-7)
 
+    def test_shared_root_split_matches_across_kernels(self):
+        """Split only the shared free root of four feet with private leg joints, alike on the warp and serial kernels."""
+        model = _quadruped_model("cuda:0")
+        feet = [1, 2, 3, 4]
+        responses = []
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
+                solver = _solver(model, "propagation_colored", 1)
+                self.assertIsNotNone(solver._response_tree_warp_kernels_by_size[int(solver._size_groups[0])])
+                if serial:
+                    _force_serial_fallback(solver)
+                list(_rollout(model, solver, np.zeros(model.joint_dof_count, dtype=np.float32), 1))
+                np.testing.assert_array_equal(solver._propagation_joint_split.numpy(), [4, 1, 1, 1, 1])
+                exact = solver._propagation_body_response.numpy()[feet]
+                split = solver._propagation_body_response_split.numpy()[feet]
+                # The split differs from both the exact response and the whole-response split.
+                self.assertGreater(float(np.abs(split - exact).max()), 1.0e-3 * float(np.abs(exact).max()))
+                self.assertGreater(float(np.abs(4.0 * exact - split).max()), 1.0e-3 * float(np.abs(exact).max()))
+                responses.append((exact, split))
+        for warp, serial in zip(*responses, strict=True):
+            np.testing.assert_allclose(serial, warp, rtol=1.0e-4, atol=1.0e-5 * float(np.abs(warp).max()))
+
     def test_regularized_feet_reach_immediate_equilibrium(self):
         """Splitting leaves the regularized contact fixed point of three coupled feet unchanged."""
         model = _three_foot_slider_model("cuda:0")
@@ -1062,14 +1085,14 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                         solver.step(source, target, control, contacts, 1.0 / 800.0)
                 joint_target = model.joint_target_q.numpy()
                 grasped = None
-                for tick in range(260):
-                    # Close the driver, then lift by 0.2 m along a smoothstep.
-                    joint_target[2] = 0.8 if tick >= 40 else 0.0
-                    lift = min(max(tick - 120, 0) / 100.0, 1.0)
+                # Close the driver, then lift by 0.2 m along a smoothstep and hold.
+                joint_target[2] = 0.8
+                for tick in range(110):
+                    lift = min(max(tick - 40, 0) / 50.0, 1.0)
                     joint_target[0] = 0.2 * lift * lift * (3.0 - 2.0 * lift)
                     control.joint_target_q.assign(joint_target)
                     wp.capture_launch(capture.graph)
-                    if tick == 119:
+                    if tick == 39:
                         grasped = self._box_below_palm(state, palm, box)
                 self.assertLess(abs(grasped - self._box_below_palm(state, palm, box)), 0.01)
 
