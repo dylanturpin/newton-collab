@@ -20,6 +20,62 @@ from newton.tests.unittest_utils import USD_AVAILABLE
 
 class TestImportUsdJoints(unittest.TestCase):
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_authored_drive_targets_can_preload_joint_limits(self):
+        """Preserve out-of-range USD drive targets without moving the initial joint pose."""
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        for angular in (False, True):
+            upper = 90.0 if angular else 0.02
+            for target in (-upper / 4, upper * 2):
+                for form in ("single", "d6", "stacked"):
+                    with self.subTest(angular=angular, target=target, form=form):
+                        stage = Usd.Stage.CreateInMemory()
+                        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                        root = UsdGeom.Xform.Define(stage, "/Root")
+                        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+                        for name in ("Parent", "Child"):
+                            body = UsdGeom.Cube.Define(stage, f"/Root/{name}")
+                            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+                            UsdPhysics.CollisionAPI.Apply(body.GetPrim())
+                        schema = UsdPhysics.RevoluteJoint if angular else UsdPhysics.PrismaticJoint
+                        joint = (UsdPhysics.Joint if form == "d6" else schema).Define(stage, "/Root/Joint")
+                        joint.CreateBody0Rel().SetTargets(["/Root/Parent"])
+                        joint.CreateBody1Rel().SetTargets(["/Root/Child"])
+                        axis = "rotX" if angular else "transX"
+                        if form == "d6":
+                            for name in ("transX", "transY", "transZ", "rotX", "rotY", "rotZ"):
+                                limit = UsdPhysics.LimitAPI.Apply(joint.GetPrim(), name)
+                                limit.CreateLowAttr(0.0 if name == axis else 1.0)
+                                limit.CreateHighAttr(upper if name == axis else -1.0)
+                        else:
+                            joint.CreateAxisAttr("X")
+                            joint.CreateLowerLimitAttr(0.0)
+                            joint.CreateUpperLimitAttr(upper)
+                        drive = UsdPhysics.DriveAPI.Apply(
+                            joint.GetPrim(), axis if form == "d6" else ("angular" if angular else "linear")
+                        )
+                        drive.CreateStiffnessAttr(2.0)
+                        drive.CreateTargetPositionAttr(target)
+                        if form == "stacked":
+                            other = schema.Define(stage, "/Root/Other")
+                            other.CreateAxisAttr("Y")
+                            other.CreateBody0Rel().SetTargets(["/Root/Parent"])
+                            other.CreateBody1Rel().SetTargets(["/Root/Child"])
+                        builder = newton.ModelBuilder()
+                        builder.add_usd(stage)
+                        dofs = [i for i, gain in enumerate(builder.joint_target_ke) if gain > 0]
+                        self.assertEqual(len(dofs), 1)
+                        dof = dofs[0]
+                        j = next(
+                            i
+                            for i, start in enumerate(builder.joint_qd_start)
+                            if start <= dof < start + sum(builder.joint_dof_dim[i])
+                        )
+                        q = builder.joint_q_start[j] + dof - builder.joint_qd_start[j]
+                        self.assertAlmostEqual(builder.joint_target_q[q], math.radians(target) if angular else target)
+                        self.assertAlmostEqual(builder.joint_q[q], 0.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_scene_drive_scale_and_per_import_joint_defaults(self):
         """Use scene drive scaling and keep joint defaults scoped to each import."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics
