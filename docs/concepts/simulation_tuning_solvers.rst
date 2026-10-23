@@ -269,7 +269,14 @@ repository examples spend tuning effort, not a shared solver API.
        step. In the matrix-free solve, friction acts through persistent patches by
        default (``friction_anchor_beta``), which hold static loads without creep;
        ``friction_anchor_beta=0`` selects point friction, which the split solve
-       always uses. A small
+       always uses. ``friction_history_compact=True`` carries the anchor history as a
+       packed table of the live friction locations instead of a mirror of the whole
+       contact frame: the same results as long as no record is dropped, less memory, and
+       a per-step store that touches only the live records. ``friction_locations_max``
+       caps that table and ``friction_history_status()`` reports its high-water mark and
+       any records dropped past it; the table is packed in key order, so an overflowing
+       budget drops the highest keys first and the last worlds lose their history before
+       the first. A small
        ``contact_regularization`` (for example ``0.02``) makes the
        normal-force split of redundant contacts unique and helps stacks hold at
        low iteration counts, at the cost of a small resting sag.
