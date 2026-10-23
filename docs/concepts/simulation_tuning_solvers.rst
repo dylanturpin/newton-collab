@@ -335,10 +335,9 @@ repository examples spend tuning effort, not a shared solver API.
        contact row, free bodies included, shares one family of ``free_body_constraint_max +
        articulation_constraint_max`` rows per world (a scene whose bodies are all free keeps a
        single dense row, since none of its rows can land there), or of
-       ``propagation_constraint_max`` rows when that is set, which in those two responses lets
+       ``propagation_constraint_max`` rows when that is set, which lets
        ``free_body_constraint_max`` shrink to the rows that stay matrix-free (the velocity-limit
-       rows); ``"propagation_fused"`` keeps free/free contact rows on the matrix-free family, so
-       its free-body budget must still hold them. ``"propagation_colored"`` sweeps them in
+       rows). ``"propagation_colored"`` sweeps them in
        parallel batches of contacts that share no responding body, which pays off on
        scenes with many contacts per world. A scene whose bodies are all free can also set
        ``articulation_constraint_max=1``: none of its rows can land on the dense family, and

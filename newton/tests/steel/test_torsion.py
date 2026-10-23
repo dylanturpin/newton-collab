@@ -2711,7 +2711,8 @@ class TestPropagationTorsion(unittest.TestCase):
         lines = [line for line in output.splitlines() if not (line.startswith("Module") and "load on device" in line)]
         overflow = (
             r"Warning: Steel propagation constraint-row overflow in world 0: requested 16 rows, limit 10; "
-            r"dropped 8 contact/friction rows\. Increase articulation_constraint_max or free_body_constraint_max\."
+            r"dropped 8 contact/friction rows\. Increase propagation_constraint_max \(or, when it is unset, "
+            r"articulation_constraint_max or free_body_constraint_max\)\."
         )
         self.assertEqual(len(lines), 1, output)
         self.assertRegex(lines[0], overflow)
