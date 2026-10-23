@@ -1,0 +1,1 @@
+Accept experimental `contact_compliance=True` with `SolverSteel` `articulated_contact_response="propagation_colored"`. Compliant contacts on colored propagation rows get the same device-prepared coefficients and `gamma * lambda` residual term as on the immediate response's rows, and the step stays CUDA graph capturable.

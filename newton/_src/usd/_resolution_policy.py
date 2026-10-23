@@ -142,6 +142,8 @@ class _UsdJointProperties:
     mjc_angle_scale: float
     """Radians per unit of authored ``mjc:springref`` on angular DOFs."""
     verbose: bool
+    legacy_angular_velocity_units: bool = False
+    legacy_springref_units: bool = False
 
     # Keep source tracking local until schema applicability and provenance are modeled globally (#3307).
     def _mjc_joint_limit_source(self, prim: Usd.Prim) -> Literal["mjc_authored", "mjc_default"] | None:
@@ -325,7 +327,7 @@ class _UsdJointProperties:
                 velocity_limit *= self.degrees_to_radian
             if initial_position is not None:
                 initial_position *= self.degrees_to_radian
-            if initial_velocity is not None:
+            if initial_velocity is not None and not self.legacy_angular_velocity_units:
                 initial_velocity *= self.degrees_to_radian
 
         return _DofParams(

@@ -67,7 +67,7 @@ def test_cloth_block_graph_matches_eager(test, device):
     for substeps in (1, 2, 3):
         results = []
         for graph in (True, False):
-            args = ["--viewer", "null", "--rigid-solver", "featherpgs", "--substeps", str(substeps)]
+            args = ["--viewer", "null", "--rigid-solver", "steel", "--substeps", str(substeps)]
             if not graph:
                 args.append("--no-graph-capture")
             with wp.ScopedDevice(device):
@@ -84,7 +84,7 @@ def test_cloth_block_graph_matches_eager(test, device):
 def test_shirt_finger_friction_reaches_coupled_entries(test, device):
     """The shirt's pinch and release friction reaches every coupled entry's shape materials in place."""
     module = example_franka_shirt_fold_stack
-    for rigid_solver in ("mujoco", "featherpgs"):
+    for rigid_solver in ("mujoco", "steel"):
         with wp.ScopedDevice(device):
             example = _build_example(module, ["--viewer", "null", "--rigid-solver", rigid_solver])
         solver = example.solver

@@ -22,7 +22,7 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverFeatherPGS, SolverImplicitMPM, SolverKamino, SolverMuJoCo
+from newton.solvers import SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverSteel
 
 # A grain that leaves the fixed MPM grid gets runaway velocities. The cap clips MPM advection velocity (not collider
 # impulses), and the padding is a conservative single-flight estimate: a grain launched at the cap from the bed or the
@@ -36,7 +36,7 @@ def _add_rigid_solver_arg(parser) -> None:
         "--rigid-solver",
         help="Rigid-body solver used by the coupled path.",
         type=str,
-        choices=["mujoco", "kamino", "featherpgs"],
+        choices=["mujoco", "kamino", "steel"],
         default="mujoco",
     )
 
@@ -70,8 +70,8 @@ def _rigid_solver_entry_args(
         return "kamino", SolverKamino, {"config": _make_kamino_config()}
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
-    if rigid_solver == "featherpgs":
-        return "fpgs", SolverFeatherPGS, {"solve_mode": "matrix_free"}
+    if rigid_solver == "steel":
+        return "steel", SolverSteel, {"solve_mode": "matrix_free"}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 

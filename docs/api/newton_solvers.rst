@@ -37,14 +37,12 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :nosignatures:
 
    SolverBase
-   SolverFeatherPGS
    SolverFeatherstone
    SolverImplicitMPM
    SolverKamino
    SolverMuJoCo
-   SolverObservableFlags
-   SolverObservables
    SolverSemiImplicit
+   SolverSteel
    SolverStyle3D
    SolverVBD
    SolverXPBD

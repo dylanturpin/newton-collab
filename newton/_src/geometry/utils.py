@@ -403,18 +403,11 @@ def load_mesh(filename: str, method: str | None = None):
 
             m = trimesh.load(filename)
             if hasattr(m, "geometry"):
-                # multiple meshes are contained in a scene; combine to one mesh
-                mesh_points = []
-                mesh_indices = []
-                index_offset = 0
-                for geom in m.geometry.values():
-                    vertices = np.array(geom.vertices, dtype=np.float32)
-                    faces = np.array(geom.faces.flatten(), dtype=np.int32)
-                    mesh_points.append(vertices)
-                    mesh_indices.append(faces + index_offset)
-                    index_offset += len(vertices)
-                mesh_points = np.concatenate(mesh_points, axis=0)
-                mesh_indices = np.concatenate(mesh_indices)
+                # Combine scene parts with their node transforms applied;
+                # raw vertices are in node-local space.
+                combined = m.to_mesh()
+                mesh_points = np.array(combined.vertices, dtype=np.float32)
+                mesh_indices = np.array(combined.faces.flatten(), dtype=np.int32)
             else:
                 # a single mesh
                 mesh_points = np.array(m.vertices, dtype=np.float32)
@@ -875,20 +868,24 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
     verts = vertices.astype(np.float32)
     faces = hull.simplices.astype(np.int32)
 
-    # fix winding order of faces
+    # fix winding order of faces so every normal points away from the centroid
     centre_f = verts.mean(0)
-    for i, tri in enumerate(faces):
-        a, b, c = verts[tri]
-        normal = np.cross(b - a, c - a)
-        if np.dot(normal, a - centre_f) < 0:
-            faces[i] = tri[[0, 2, 1]]
+    a, b, c = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    normal = np.cross(b - a, c - a)
+    offset = a - centre_f
+    alignment = np.einsum("ij,ij->i", normal, offset)
+    # Summation order can flip the sign of a near-zero dot product, so faces within a few float32
+    # rounding errors of zero take the scalar np.dot decision, face by face.
+    magnitude = np.einsum("ij,ij->i", np.abs(normal).astype(np.float64), np.abs(offset).astype(np.float64))
+    for i in np.flatnonzero(np.abs(alignment) <= 8.0 * np.finfo(np.float32).eps * magnitude):
+        alignment[i] = np.dot(normal[i], offset[i])
+    inward = alignment < 0
+    faces[inward] = faces[inward][:, [0, 2, 1]]
 
     # trim vertices to only those that are used in the faces
-    unique_verts = np.unique(faces.flatten())
+    unique_verts, faces_flat = np.unique(faces, return_inverse=True)
     verts = verts[unique_verts]
-    # update face indices to use the new vertex indices
-    mapping = {v: i for i, v in enumerate(unique_verts)}
-    faces = np.array([mapping[v] for v in faces.flatten()], dtype=np.int32).reshape(faces.shape)
+    faces = faces_flat.reshape(faces.shape).astype(np.int32)
 
     return verts, faces
 

@@ -7,14 +7,14 @@
 # A rigid block rests on a VBD cloth hammock pinned along two edges, as in
 # the cloth Franka example but at meter scale and with a block between the
 # robot and the cloth. A fixed-base Franka, simulated by MuJoCo or
-# FeatherPGS, picks the block up off the sagging cloth with GPU IK and
+# Steel, picks the block up off the sagging cloth with GPU IK and
 # places it on a table beside the hammock. SolverCoupledProxy exposes the
 # block and the gripper to VBD as proxies: the cloth carries the block's
 # weight and sags under it, and springs back once the robot lifts the
 # block off.
 #
 # Command: python -m newton.examples franka_cloth_block
-#          python -m newton.examples franka_cloth_block --rigid-solver featherpgs
+#          python -m newton.examples franka_cloth_block --rigid-solver steel
 #
 ###########################################################################
 
@@ -28,7 +28,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverFeatherPGS, SolverMuJoCo, SolverVBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 
 # Initial Franka joint configuration (7 arm + 2 finger).
 FRANKA_Q = [0.0, -0.3, 0.0, -2.2, 0.0, 1.9, 0.785, 0.04, 0.04]
@@ -94,8 +94,8 @@ class Example:
         self.control = self.model.control()
         self.collision_pipeline = newton.CollisionPipeline(self.model, broad_phase="explicit")
         self.contacts = self.collision_pipeline.contacts()
-        if self.rigid_solver == "featherpgs":
-            # FeatherPGS sizes its contact scratch from the model before it sees a contact buffer.
+        if self.rigid_solver == "steel":
+            # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
         self._build_solver(args)
         self._build_ik()
@@ -127,6 +127,7 @@ class Example:
             enable_self_collisions=False,
             parse_visuals_as_colliders=False,
             force_show_colliders=False,
+            joint_damping_mode="drive",
         )
         builder.joint_q[: len(FRANKA_Q)] = FRANKA_Q
         builder.joint_target_q[: len(FRANKA_Q)] = FRANKA_Q
@@ -152,7 +153,7 @@ class Example:
             gravcomp.values = {}
         for body in self.franka_bodies:
             gravcomp.values[body] = 1.0
-            if self.rigid_solver == "featherpgs":
+            if self.rigid_solver == "steel":
                 builder.body_disable_gravity[body] = True
 
         cx, cy, cz = CLOTH_CENTER
@@ -248,11 +249,11 @@ class Example:
     # Solver
     # ------------------------------------------------------------------
     def _build_solver(self, args):
-        if self.rigid_solver == "featherpgs":
-            rigid_name = "fpgs"
+        if self.rigid_solver == "steel":
+            rigid_name = "steel"
 
             def rigid_solver(view):
-                return SolverFeatherPGS(
+                return SolverSteel(
                     view,
                     solve_mode="matrix_free",
                     iterations=24,
@@ -509,7 +510,7 @@ class Example:
         parser.add_argument(
             "--rigid-solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Solver that owns the Franka arm and the block.",
         )

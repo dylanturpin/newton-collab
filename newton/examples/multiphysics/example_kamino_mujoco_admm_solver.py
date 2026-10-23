@@ -5,12 +5,12 @@
 # Example Kamino-MuJoCo ADMM Coupled Solver
 #
 # A closed four-bar linkage is split across two rigid solvers: two links are
-# owned by Kamino and two links are owned by MuJoCo (or FeatherPGS).
+# owned by Kamino and two links are owned by MuJoCo (or Steel).
 # SolverCoupledADMM detects the model revolute joints that connect bodies owned
 # by different solvers and turns them into ADMM attachments.
 #
 # Command: python -m newton.examples kamino_mujoco_admm_solver
-#          python -m newton.examples kamino_mujoco_admm_solver --rigid-solver featherpgs
+#          python -m newton.examples kamino_mujoco_admm_solver --rigid-solver steel
 #
 ###########################################################################
 
@@ -24,7 +24,7 @@ from newton.solvers.experimental.coupled import ModelView, SolverCoupled, Solver
 
 import newton
 import newton.examples
-from newton.solvers import SolverFeatherPGS, SolverKamino, SolverMuJoCo
+from newton.solvers import SolverKamino, SolverMuJoCo, SolverSteel
 
 
 def _configure_kamino_rigid_view(view: ModelView) -> None:
@@ -140,11 +140,11 @@ class Example:
         kamino_config = _make_kamino_config()
         kamino_config.padmm.max_iterations = args.kamino_iterations
 
-        if args.rigid_solver == "featherpgs":
-            rigid_name = "fpgs"
+        if args.rigid_solver == "steel":
+            rigid_name = "steel"
 
             def rigid_factory(v):
-                return SolverFeatherPGS(v, solve_mode="matrix_free")
+                return SolverSteel(v, solve_mode="matrix_free")
 
         else:
             rigid_name = "mjc"
@@ -178,8 +178,8 @@ class Example:
                 joint_angular_stiffness=args.joint_stiffness,
                 joint_damping=args.joint_damping,
                 joint_angular_damping=args.joint_damping,
-                # FeatherPGS warns on and ignores the revolute joint proxies, so only Kamino carries them.
-                joint_proximal_destination_entries=("kamino",) if args.rigid_solver == "featherpgs" else None,
+                # Steel warns on and ignores the revolute joint proxies, so only Kamino carries them.
+                joint_proximal_destination_entries=("kamino",) if args.rigid_solver == "steel" else None,
             ),
         )
 
@@ -384,7 +384,7 @@ class Example:
         parser.add_argument(
             "--rigid-solver",
             type=str,
-            choices=["mujoco", "featherpgs"],
+            choices=["mujoco", "steel"],
             default="mujoco",
             help="Rigid solver that owns the ground link and the coupler.",
         )

@@ -1026,8 +1026,9 @@ Pipeline construction publishes the resolved rigid and soft capacities as
 ``model.rigid_contact_max`` and ``model.soft_contact_max``. Before collision
 setup these are ``None``; zero is a valid empty capacity. Contact-indexed
 :ref:`solver_observables` use these capacities for eager allocation and freeze them
-once allocated. Construct the pipeline before calling ``solver.observables()`` for
-contact diagnostics; the live contact counts are not needed during allocation.
+once allocated. Construct the pipeline and create its contacts before calling
+``solver.observables(contacts=contacts, kinds=...)`` for contact diagnostics; the live
+contact counts are not needed during allocation.
 
 .. _Mesh Collisions:
 
@@ -1113,9 +1114,11 @@ An SDF built without ``scale`` follows the shape's current ``shape_scale``. When
 shape has unit scale at construction, :class:`~newton.CollisionPipeline` compiles its SDF
 queries for unit scale. To change ``shape_scale`` of such a shape afterwards, construct the
 pipeline with ``dynamic_shape_scale=True``, which keeps the slower scaled queries. Otherwise,
-rescaling a shape whose queries were compiled for unit scale prints a device warning, and a
-later :meth:`~newton.CollisionPipeline.collide` call outside graph capture raises
-:class:`RuntimeError`; graph replays alone do not raise.
+routing a rescaled shape whose queries were compiled for unit scale through mesh-SDF
+collision prints a device warning, and a later :meth:`~newton.CollisionPipeline.collide`
+call outside graph capture raises :class:`RuntimeError`; graph replays alone do not raise.
+Mesh-plane and mesh-convex contacts read the current scale directly and do not trigger
+this diagnostic.
 
 **Edge simplification.** ``mesh.build_sdf(...)`` also runs a dihedral-angle pre-filter over
 the mesh's manifold edges and caches the surviving subset on the mesh; the SDF-mesh contact
@@ -1249,7 +1252,7 @@ changed at runtime, call
 :meth:`~CollisionPipeline.refresh_body_pair_reduction_groups` so contacts with
 different material laws stop competing in a stale equivalence class.
 
-Body-pair reduction is supported by :class:`~newton.solvers.SolverFeatherPGS`,
+Body-pair reduction is supported by :class:`~newton.solvers.SolverSteel`,
 including warm starting with ``contact_matching="latest"``. Sorting precedes
 reduction, and matching saves the retained stream, so cached impulses refer to
 the contacts actually solved. With matching enabled,
@@ -1807,7 +1810,7 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
 
    * - Observable
      - Description
-   * - ``SolverObservableFlags.CONTACT_F`` / ``SolverObservables.contact_f``
+   * - ``SolverBase.ObservableKind.CONTACT_F`` / ``SolverBase.Observables.contact_f``
      - Contact spatial forces (used by :class:`~sensors.SensorContact`).
        Bind the observable allocation to the contacts buffer and pass it to the
        solver step.
@@ -1816,13 +1819,13 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
 
    :class:`~solvers.SolverXPBD` with ``rigid_contact_con_weighting`` enabled
    (the default) does not conserve momentum at contacts.  The per-contact
-   forces written to ``SolverObservables.contact_f`` are
+   forces written to ``SolverBase.Observables.contact_f`` are
    approximate -- see that method's documentation for details.
 
 .. note::
 
    :class:`~solvers.SolverVBD` populates the rigid-contact rows of
-   :attr:`~solvers.SolverObservables.contact_f` when it integrates the rigid bodies, and the
+   :attr:`~solvers.SolverBase.Observables.contact_f` when it integrates the rigid bodies, and the
    soft-contact rows (row ``rigid_contact_max + i`` for soft contact ``i``) for
    rigid-soft particle, edge, and face records. With an external rigid solver, VBD's
    rigid rows are zero; consume that solver's forces from its own observables.
@@ -2227,7 +2230,7 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
-   :class:`~newton.solvers.SolverFeatherPGS` applies restitution in ``dense``,
+   :class:`~newton.solvers.SolverSteel` applies restitution in ``dense``,
    ``split``, and ``matrix_free`` modes. Its ordinary normal row averages the
    two shape coefficients, freezes incident relative normal velocity, and uses
    the rebound target only when a sufficiently fast contact is predicted to
@@ -2238,7 +2241,7 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
    so in-place zero-to-positive material updates work under an already-captured
    graph.
 
-   FeatherPGS applies the qualifying rebound velocity over the whole discrete
+   Steel applies the qualifying rebound velocity over the whole discrete
    step, like conventional PGS. This makes post-impact velocity accurate but
    leaves a first-order, impact-phase-dependent position offset because no
    time-of-impact substep is introduced. Use a smaller timestep when impact
