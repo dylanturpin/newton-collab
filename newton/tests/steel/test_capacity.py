@@ -778,12 +778,12 @@ class TestSteelRowAllocation(unittest.TestCase):
         model = builder.finalize()
         model.rigid_contact_max = 256
         kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
-        summed = newton.solvers.SolverFeatherPGS(
+        summed = newton.solvers.SolverSteel(
             model, articulation_constraint_max=32, free_body_constraint_max=256, **kwargs
         )
         self.assertEqual(int(summed._propagation_max_constraints), 256 + 32)
         self.assertIsNone(summed.propagation_constraint_max)
-        decoupled = newton.solvers.SolverFeatherPGS(
+        decoupled = newton.solvers.SolverSteel(
             model,
             articulation_constraint_max=32,
             free_body_constraint_max=16,
@@ -794,7 +794,56 @@ class TestSteelRowAllocation(unittest.TestCase):
         self.assertEqual(decoupled.propagation_constraint_max, 288)
         self.assertEqual(int(decoupled._free_body_constraint_max), 16)
         with self.assertRaises(ValueError):
-            newton.solvers.SolverFeatherPGS(model, propagation_constraint_max=0, **kwargs)
+            newton.solvers.SolverSteel(model, propagation_constraint_max=0, **kwargs)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverSteel(
+                model, solve_mode="matrix_free", articulated_contact_response="immediate", propagation_constraint_max=64
+            )
+
+    def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget(self):
+        """With the propagation family sized to the contacts, a tiny free-body budget drops no contact rows."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.add_ground_plane()
+        for i in range(3):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1 + 0.2 * i), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize()
+        model.rigid_contact_max = 256
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        contacts = pipeline.contacts()
+        for name, value in (
+            ("rigid_contact_stiffness", 0.0),
+            ("rigid_contact_damping", 0.0),
+            ("rigid_contact_friction", 1.0),
+        ):
+            setattr(contacts, name, wp.full(256, value, dtype=float))
+
+        def dropped(**options):
+            solver = newton.solvers.SolverSteel(
+                model,
+                solve_mode="matrix_free",
+                articulated_contact_response="propagation_colored",
+                free_body_constraint_max=4,
+                row_watermark=True,
+                warn_constraint_overflow=False,
+                **options,
+            )
+            state, nxt = model.state(), model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            control = model.control()
+            for _ in range(5):
+                state.clear_forces()
+                pipeline.collide(state, contacts)
+                solver.step(state, nxt, control, contacts, 0.005)
+                state, nxt = nxt, state
+            marks = solver.constraint_row_watermarks()
+            return marks["propagation_dropped_contact_rows_high_water"], marks["propagation_high_water"]
+
+        starved, _ = dropped()
+        self.assertGreater(starved, 0, "a 4-row free-body budget must starve the summed propagation family")
+        sized, used = dropped(propagation_constraint_max=256)
+        self.assertEqual(sized, 0)
+        self.assertGreater(used, 4)
 
 
 def _scene(device):

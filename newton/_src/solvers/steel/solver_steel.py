@@ -551,8 +551,8 @@ def _warn_constraint_row_overflow(
         if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
             wp.printf(
                 "Warning: Steel propagation constraint-row overflow in world %d: requested %d rows, "
-                "limit %d; dropped %d contact/friction rows. Increase articulation_constraint_max or "
-                "free_body_constraint_max.\n",
+                "limit %d; dropped %d contact/friction rows. Increase propagation_constraint_max (or, when "
+                "it is unset, articulation_constraint_max or free_body_constraint_max).\n",
                 world,
                 propagation_requested,
                 propagation_capacity,
@@ -2443,12 +2443,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``"propagation"`` raises ``NotImplementedError``.
                 Defaults to ``"fixed_normal"``.
             free_body_constraint_max (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
-            propagation_constraint_max (int | None, optional): Capacity of the propagation row family per world.
-                ``None`` keeps the default: ``free_body_constraint_max + articulation_constraint_max`` in the
-                ``"propagation"`` and ``"propagation_colored"`` responses, where every contact row lives on
-                this family, and ``articulation_constraint_max`` otherwise. Set it to size the propagation rows
-                on their own, so ``free_body_constraint_max`` only has to hold the rows that stay matrix-free
-                (the velocity-limit rows). Defaults to None.
+            propagation_constraint_max (int | None, optional): Capacity of the propagation row family per world
+                in the propagation responses. ``None`` keeps the default: ``free_body_constraint_max +
+                articulation_constraint_max`` in ``"propagation"`` and ``"propagation_colored"``, where every
+                contact row lives on this family, and ``articulation_constraint_max`` in ``"propagation_fused"``.
+                Set it to size the propagation rows on their own: in ``"propagation"`` and
+                ``"propagation_colored"`` ``free_body_constraint_max`` then only has to hold the rows that stay
+                matrix-free (the velocity-limit rows), while ``"propagation_fused"`` keeps free/free contact rows
+                on the matrix-free family, so its free-body budget must still hold them. Rejected with
+                ``articulated_contact_response="immediate"``, where no propagation rows exist. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
             parallel_tree: Opt in to parallel branches for forward dynamics, backward
@@ -2804,6 +2807,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_max_constraints = self._requested_dense_max_constraints
         if self._propagation_max_constraints < 1:
             raise ValueError("propagation_constraint_max must be positive")
+        if self._propagation_constraint_max is not None and articulated_contact_response == "immediate":
+            raise ValueError(
+                "propagation_constraint_max requires articulated_contact_response "
+                "'propagation', 'propagation_fused' or 'propagation_colored'"
+            )
         self._double_buffer = double_buffer
         self._nvtx = PROFILE_ENABLED
 
