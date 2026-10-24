@@ -30,7 +30,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ...core.types import override
+from ...core.types import MAXVAL, override
 from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -1490,12 +1490,16 @@ class SolverSteel(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
-    Loop-closing BALL joints (joints outside the articulation tree whose child belongs to
-    an articulation) are enforced by three bilateral rows. The rows read
-    :attr:`~newton.Model.joint_enabled` and the translations of
-    :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step, so a
-    closure is released, engaged or re-anchored by editing those arrays in place, also
-    from a kernel between CUDA graph replays. An eager step reads a replaced array; a
+    Loop-closing BALL and REVOLUTE joints (joints outside the articulation tree whose child
+    belongs to an articulation) are enforced as bilateral rows: three that pin the joint's
+    anchors together, plus, for a REVOLUTE closure, two that keep the child's hinge axis
+    aligned with the parent's. A loop closure carries no joint coordinate, so limits and
+    drive gains on a loop REVOLUTE joint are ignored (with a warning). The rows read
+    :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_X_p` /
+    :attr:`~newton.Model.joint_X_c` and, for REVOLUTE closures,
+    :attr:`~newton.Model.joint_axis` every step, so a closure is released, engaged,
+    re-anchored or re-aimed by editing those arrays in place, also from a kernel between
+    CUDA graph replays. An eager step reads a replaced array; a
     captured graph keeps the arrays it was captured with, so recapture after replacing
     one.
 
@@ -2945,7 +2949,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._init_joint_friction_check(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
-                "SolverSteel: loop-closing joints (imported connect/weld equalities) are "
+                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
                 f"only supported with articulated_contact_response='immediate' "
                 f"(got {self._articulated_contact_response!r})."
             )
@@ -4759,14 +4763,17 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing BALL joints are excluded from FK/ID by
-        :meth:`_SteelModelPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. Their stored owner comes from
-        the child body's tree articulation, independent of joint ordering. FIXED (weld)
-        loop joints warn and are ignored for now. All buffers are allocated once
+        Loop-closing BALL and REVOLUTE joints are excluded from FK/ID by
+        :meth:`_SteelModelPlan.build` and enforced here as bilateral rows: three
+        pinning the joint's parent/child anchors together, plus, for a REVOLUTE closure,
+        two aligning the child's hinge axis with the parent's. Their stored owner comes
+        from the child body's tree articulation, independent of joint ordering. FIXED
+        (weld) loop joints warn and are ignored for now. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
-        :attr:`~newton.Model.joint_enabled` and the translations of its
-        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step.
+        :attr:`~newton.Model.joint_enabled`, the translations of its
+        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` and, for a REVOLUTE closure, its
+        :attr:`~newton.Model.joint_axis` and frame rotations every step, so edits announced with
+        :attr:`~newton.ModelFlags.JOINT_PROPERTIES` apply without a rebuild.
 
         A closure's parent may live outside the child's articulation when it is
         prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
@@ -4787,14 +4794,31 @@ class SolverSteel(SolverBase, CouplingInterface):
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+        joint_qd_start = model.joint_qd_start.numpy()
+        limit_lower, limit_upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        target_ke, target_kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
 
-        art_l, body_p, body_c, world_l, joint_l, prescribed_l = [], [], [], [], [], []
+        art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l = [], [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
-            if int(joint_type[j]) != int(JointType.BALL):
+            if int(joint_type[j]) == int(JointType.BALL):
+                rows = 3
+            elif int(joint_type[j]) == int(JointType.REVOLUTE):
+                rows = 5  # the hinge axis is read live from Model.joint_axis by the kernels
+                dof = int(joint_qd_start[j])
+                limited = abs(float(limit_lower[dof])) < MAXVAL or abs(float(limit_upper[dof])) < MAXVAL
+                driven = float(target_ke[dof]) != 0.0 or float(target_kd[dof]) != 0.0
+                if limited or driven:
+                    ignored = " and ".join(n for n, f in (("position limits", limited), ("drive gains", driven)) if f)
+                    warnings.warn(
+                        f"SolverSteel: loop-closing REVOLUTE joint {j} has {ignored}; a loop closure carries no "
+                        "joint coordinate, so they are ignored (only the hinge itself is enforced).",
+                        stacklevel=2,
+                    )
+            else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
+                    f"{int(joint_type[j])} (only BALL/connect and REVOLUTE closures are enforced); ignored.",
                     stacklevel=2,
                 )
                 continue
@@ -4818,6 +4842,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             world_l.append(int(articulation_world[art]))
             joint_l.append(int(j))
             prescribed_l.append(prescribed)
+            rows_l.append(rows)
 
         n = len(art_l)
         if n == 0:
@@ -4832,7 +4857,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
-        self._connect_row_inv_norm = wp.zeros((n, 3), dtype=float, device=device)
+        self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
+        self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
@@ -4919,7 +4946,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             connect_art_np = self._connect_art.numpy()
             for k in range(self._connect_count):
                 a = int(connect_art_np[k])
-                counts[a] = counts.get(a, 0) + 3
+                counts[a] = counts.get(a, 0) + int(self._connect_rows_np[k])
         if not counts:
             return
         n_b_max = max(counts.values())
@@ -4970,6 +4997,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(self._mimic_count or 0) if self._bilateral_preelimination_include_mimics else 0,
                 self._connect_slot if self._connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
+                self._connect_rows if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),
                 self._J_by_size[size],
                 self._Y_by_size[size],
@@ -5195,8 +5223,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if has_connect_rows and self._connect_world_np is not None:
             # Model.joint_enabled can engage any closure at runtime, so each one counts.
             connect_worlds = self._connect_world_np
-            in_range = connect_worlds[(connect_worlds >= 0) & (connect_worlds < per_world.shape[0])]
-            np.add.at(per_world, in_range, 3)
+            valid = (connect_worlds >= 0) & (connect_worlds < per_world.shape[0])
+            np.add.at(per_world, connect_worlds[valid], self._connect_rows_np[valid])
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
@@ -9579,6 +9607,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._connect_body_p,
                     self._connect_body_c,
                     self._connect_joint,
+                    self._connect_rows,
+                    model.joint_axis,
+                    model.joint_qd_start,
                     model.joint_X_p,
                     model.joint_X_c,
                     self._connect_row_inv_norm,
@@ -11937,6 +11968,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     dim=self._connect_count,
                     inputs=[
                         self._connect_joint,
+                        self._connect_rows,
                         model.joint_enabled,
                         self._connect_world,
                         max_constraints,
@@ -11965,6 +11997,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._connect_joint,
                         self._connect_body_p,
                         self._connect_body_c,
+                        self._connect_rows,
+                        model.joint_axis,
                         model.joint_X_p,
                         model.joint_X_c,
                         self._connect_parent_prescribed,
