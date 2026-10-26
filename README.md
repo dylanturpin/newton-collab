@@ -386,6 +386,10 @@ If you run the examples from a source checkout with uv, use
     <td align="center" width="33%"><a href="newton/examples/robot/example_steel_cup_unpacking.py"><img width="320" src="docs/images/examples/example_steel_cup_unpacking.jpg" alt="Cup unpacking"></a><br><code>python -m newton.examples steel_cup_unpacking</code></td>
     <td align="center" width="33%"><a href="newton/examples/robot/example_steel_toy_well.py"><img width="320" src="docs/images/examples/example_steel_toy_well.jpg" alt="Toy well"></a><br><code>python -m newton.examples steel_toy_well</code></td>
   </tr>
+  <tr><td colspan="3"><h3>Steel Heterogeneous Worlds with Policies (CUDA and CPU)</h3></td></tr>
+  <tr>
+    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_heterogeneous.py"><img width="320" src="docs/images/examples/example_steel_heterogeneous.jpg" alt="Heterogeneous worlds"></a><br><code>python -m newton.examples steel_heterogeneous</code></td>
+  </tr>
   <tr>
     <td align="center" width="33%">
       <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_initial_rest_pose.py">
