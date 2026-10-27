@@ -4198,8 +4198,9 @@ def test_closure_force_uses_the_row_builder_norm(test, device):
                     row_type,
                     impulses,
                     1.0,
+                    0,
                 ],
-                outputs=[wrench],
+                outputs=[wrench, wp.zeros((1, 6), dtype=wp.int64, device=device)],
                 device=device,
             )
             np.testing.assert_allclose(J.numpy()[0, 1], [0.0, -1.0], atol=1.0e-6)
