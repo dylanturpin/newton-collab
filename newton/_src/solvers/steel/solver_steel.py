@@ -1768,11 +1768,11 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         One per-DOF attribute makes joint friction grow with the joint reaction, see ``enable_joint_friction``:
 
-        - ``steel:joint_friction_load_coefficient`` [unitless, as PhysX sums force and torque], experimental, adds ``c (|F| + |T|)``
-          to the DOF's :attr:`~newton.Model.joint_friction` (``physxJoint:jointFriction``, default 0).
-          ``F`` and ``T`` are the parent's wrench on the child body, as reported by ``BODY_PARENT_F``,
-          with ``T`` taken about the child-side joint anchor and the components along the joint's own
-          DOF axes removed, so only the transverse reaction loads the bearing.
+        - ``steel:joint_friction_load_coefficient``, experimental, adds ``c (|F| + |T|)`` to the DOF's
+          :attr:`~newton.Model.joint_friction` (``physxJoint:jointFriction``, default 0). ``F`` [N] and ``T`` [N·m]
+          are the parent's wrench on the child body, as reported by ``BODY_PARENT_F``, with ``T`` taken about the
+          child-side joint anchor and the components along the joint's own DOF axes removed, so only the
+          transverse reaction loads the bearing. As in PhysX, the sum mixes units and depends on the anchor.
 
         The solver reads them from the model at every step, for example
         ``model.steel.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
