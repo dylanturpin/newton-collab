@@ -1518,9 +1518,12 @@ class SolverSteel(SolverBase, CouplingInterface):
     Rigid-contact restitution is part of the ordinary normal contact row in
     ``"split"`` and ``"matrix_free"`` modes. It uses the
     arithmetic mean of the two shape coefficients and freezes the incident
-    relative normal velocity before contact impulses are applied. A sufficiently
-    fast contact predicted to reach the surface during the step replaces its
-    geometric/speculative bias with Newton's rebound target. Optional
+    relative normal velocity before contact impulses are applied. A contact
+    that is already closing faster than the threshold at the start of the step
+    and is predicted to reach the surface during the step replaces its
+    geometric/speculative bias with Newton's rebound target. Forces applied
+    during the step (gravity, drives, joint and body forces) add to the rebound
+    target but never make a resting contact an impact. Optional
     ``velocity_iterations`` refine the result but are never enabled
     implicitly. As in a conventional discrete PGS solver, the qualifying
     rebound velocity is used for the whole step; this gives the intended
@@ -2484,11 +2487,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 zero, so a model that authors no restitution does not bounce.
                 ``False`` turns restitution off for every contact regardless of the
                 coefficients.
-            restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
-                relative normal velocity required to apply restitution. The contact must also be at the surface or
-                be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
-                Baumgarte contact law, preventing resting contacts from repeatedly bouncing under small
-                accelerations.
+            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact, both at
+                the start of the step and in the frozen pre-contact relative normal velocity, required to apply
+                restitution. The contact must also be at the surface or be predicted to reach it during the
+                timestep. Slower contacts retain the speculative or Baumgarte contact law, so a resting contact
+                pressed by gravity, a drive or an applied force does not bounce.
                 Restitution coefficients are averaged across the two shapes after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
@@ -12477,6 +12480,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._cfm,
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._row_type,
@@ -12685,6 +12689,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._cfm,
                             self._friction_patches.view,
                             self._friction_anchor_beta,
+                            self._rebound_velocity_threshold,
                         ],
                         outputs=[
                             self._J_by_size[size],
@@ -12738,6 +12743,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12844,6 +12850,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        self._articulation_origin,
+                        state_aug._body_v_s,
                         self._shape_mu,
                         self._shape_restitution,
                         int(self._contact_friction_shared_anchor),
@@ -12851,6 +12859,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                         builder_unit_order,
                         builder_unit_count,
                         self._propagation_max_constraints,

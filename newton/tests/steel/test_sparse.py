@@ -461,6 +461,7 @@ class TestSparseContacts(unittest.TestCase):
                 1.0e-6,
                 f["patches"],
                 0.0,
+                0.5,
             ],
             outputs=[row_type, row_parent, *other],
             device="cpu",

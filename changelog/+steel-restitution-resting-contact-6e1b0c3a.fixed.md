@@ -1,0 +1,1 @@
+Fix `SolverSteel` restitution re-firing on a resting contact that gravity, a joint drive or an applied force presses down hard enough to exceed `restitution_velocity_threshold` within one step. A contact now bounces only when it is already closing faster than the threshold at the start of the step, which removes foot chatter under stiff drives.

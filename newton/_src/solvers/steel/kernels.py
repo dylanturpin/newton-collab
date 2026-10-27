@@ -5686,6 +5686,7 @@ def prepare_world_contact_rows(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     # outputs
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -5739,6 +5740,19 @@ def prepare_world_contact_rows(
         if material_count > 0:
             mu /= float(material_count)
         restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+        restitution = impact_contact_restitution(
+            restitution,
+            body_a,
+            art_a,
+            body_b,
+            art_b,
+            point_a_world,
+            point_b_world,
+            normal,
+            articulation_origin,
+            body_v_s,
+            restitution_velocity_threshold,
+        )
 
         friction_mu = mu * contact_friction_scale
 
@@ -6291,6 +6305,45 @@ def mixed_contact_restitution(
 
 
 @wp.func
+def impact_contact_restitution(
+    restitution: float,
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+    point_a_world: wp.vec3,
+    point_b_world: wp.vec3,
+    normal: wp.vec3,
+    articulation_origin: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+    restitution_velocity_threshold: float,
+):
+    """Return ``restitution`` for a contact closing faster than the threshold at step start, else zero.
+
+    The step-start twists exclude this step's forces, so a drive or gravity pressing a resting contact never
+    counts as an impact.
+    """
+    if restitution <= 0.0:
+        return 0.0
+    normal_velocity = float(0.0)
+    if body_a >= 0 and art_a >= 0:
+        twist = body_v_s[body_a]
+        point_velocity = wp.spatial_top(twist) + wp.cross(
+            wp.spatial_bottom(twist), point_a_world - articulation_origin[art_a]
+        )
+        normal_velocity += wp.dot(normal, point_velocity)
+    if body_b >= 0 and art_b >= 0:
+        twist = body_v_s[body_b]
+        point_velocity = wp.spatial_top(twist) + wp.cross(
+            wp.spatial_bottom(twist), point_b_world - articulation_origin[art_b]
+        )
+        normal_velocity -= wp.dot(normal, point_velocity)
+    if normal_velocity >= -restitution_velocity_threshold:
+        return 0.0
+    return restitution
+
+
+@wp.func
 def _populate_world_J_for_size_contact(
     c: int,
     contact_point0: wp.array[wp.vec3],
@@ -6328,6 +6381,7 @@ def _populate_world_J_for_size_contact(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -6406,6 +6460,19 @@ def _populate_world_J_for_size_contact(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    restitution = impact_contact_restitution(
+        restitution,
+        body_a,
+        art_a,
+        body_b,
+        art_b,
+        point_a_world,
+        point_b_world,
+        normal,
+        articulation_origin,
+        body_v_s,
+        restitution_velocity_threshold,
+    )
     friction_mu = mu * contact_friction_scale
 
     # Compute tangent basis for friction
@@ -6707,6 +6774,7 @@ def populate_world_J_for_size(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -6758,6 +6826,7 @@ def populate_world_J_for_size(
             pgs_cfm,
             friction_patches,
             friction_anchor_beta,
+            restitution_velocity_threshold,
             J_group,
             world_row_type,
             world_row_parent,
@@ -7558,6 +7627,7 @@ def _build_mf_contact_row(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7643,6 +7713,19 @@ def _build_mf_contact_row(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    restitution = impact_contact_restitution(
+        restitution,
+        body_a,
+        contact_art_a[c],
+        body_b,
+        contact_art_b[c],
+        point_a_world,
+        point_b_world,
+        normal,
+        articulation_origin,
+        body_v_s,
+        restitution_velocity_threshold,
+    )
     friction_mu = mu * contact_friction_scale
 
     # Tangent basis
@@ -7768,6 +7851,7 @@ def build_mf_contact_rows(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7812,6 +7896,7 @@ def build_mf_contact_rows(
             contact_shared_anchor,
             friction_patches,
             friction_anchor_beta,
+            restitution_velocity_threshold,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -8156,6 +8241,8 @@ def build_propagation_contact_rows(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
+    articulation_origin: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     contact_friction_shared_anchor: int,
@@ -8163,6 +8250,7 @@ def build_propagation_contact_rows(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    restitution_velocity_threshold: float,
     unit_order: wp.array[int],
     world_unit_count: wp.array[int],
     unit_capacity: int,
@@ -8256,6 +8344,19 @@ def build_propagation_contact_rows(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    restitution = impact_contact_restitution(
+        restitution,
+        body_a,
+        contact_art_a[c],
+        body_b,
+        contact_art_b[c],
+        point_a_world,
+        point_b_world,
+        normal,
+        articulation_origin,
+        body_v_s,
+        restitution_velocity_threshold,
+    )
 
     friction_mu = mu * contact_friction_scale
 
