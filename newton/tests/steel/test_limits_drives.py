@@ -2505,6 +2505,37 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
             _load_coefficient(ball).fill_(LOAD_COEFFICIENT)
             _solver(ball)
 
+    def test_rejects_wrong_shape_replacement_at_notify(self):
+        """Raise before any launch when a notified coefficient array is replaced with a wrong shape."""
+        flags = newton.ModelFlags.JOINT_DOF_PROPERTIES
+        for name in ("joint_friction", "joint_friction_load_coefficient"):
+            for count in (0, 2):
+                for captured in (False, True):
+                    with self.subTest(name=name, count=count, captured=captured):
+                        model = _lateral_hinge_model(1.0)
+                        solver = _solver(model)
+                        solver.notify_model_changed(flags)
+                        owner = model if name == "joint_friction" else model.steel
+                        setattr(owner, name, wp.full(count, 0.5, dtype=wp.float32, device=model.device))
+                        with self.assertRaisesRegex(ValueError, rf"{name} has shape \({count},\), expected \(1,\)"):
+                            if captured:
+                                with wp.ScopedCapture(device=model.device):
+                                    solver.notify_model_changed(flags)
+                            else:
+                                solver.notify_model_changed(flags)
+                        self.assertFalse(wp.get_stream(model.device).is_capturing)
+
+    def test_unregistered_coefficient_notifies(self):
+        """Notify eagerly and under capture without the coefficient attribute."""
+        model = _payload_hinge_model(2.0, coefficient=None)
+        solver = _solver(model)
+        flags = newton.ModelFlags.JOINT_DOF_PROPERTIES
+        solver.notify_model_changed(flags)
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.notify_model_changed(flags)
+        wp.capture_launch(capture.graph)
+        solver.check_joint_friction()
+
     def test_disabled_friction_ignores_coefficients(self):
         """Leave the coefficients unused when enable_joint_friction is off."""
         model = _lateral_hinge_model(1.0)

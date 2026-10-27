@@ -3933,10 +3933,13 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _flag_invalid_joint_friction(self) -> None:
         """Latch :attr:`joint_friction_invalid` for worlds with coefficients the friction rows cannot represent."""
         model = self.model
-        if model.joint_friction.shape != (model.joint_dof_count,):
-            raise ValueError(
-                f"joint_friction has shape {model.joint_friction.shape}, expected ({model.joint_dof_count},)"
-            )
+        load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+        for name, array in (
+            ("joint_friction", model.joint_friction),
+            ("steel:joint_friction_load_coefficient", load_coefficient),
+        ):
+            if array is not None and array.shape != (model.joint_dof_count,):
+                raise ValueError(f"{name} has shape {array.shape}, expected ({model.joint_dof_count},)")
         if model.joint_dof_count and self._world_count:
             wp.launch(
                 flag_invalid_joint_friction,
@@ -3945,7 +3948,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._joint_friction_invalid],
                 device=model.device,
             )
-            load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
             if load_coefficient is not None:
                 # Without the load pass from construction, every nonzero coefficient is unsupported.
                 supported = (
