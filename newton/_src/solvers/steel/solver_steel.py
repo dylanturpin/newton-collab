@@ -2273,11 +2273,11 @@ class SolverSteel(SolverBase, CouplingInterface):
 
                 A positive ``steel:joint_friction_load_coefficient`` (see :meth:`register_custom_attributes`)
                 at construction adds load-proportional friction: each step, the DOF's bound grows by the current
-                coefficient times the load its joint transmits under that step's free dynamics. A DOF with an
-                active drive (positive effort limit and stiffness or damping) gets no load term: PhysX solves
-                each DOF's drive after its friction in every iteration, so the drive is not held back by it.
-                With ``drive_mode="augmented"`` the implicit drive forces are part of the free dynamics and
-                count toward the load of other joints; ``drive_mode="rows"`` leaves them out, as PhysX does. The coefficients follow the validity rules and notify contract of
+                coefficient times the load its joint transmits under that step's free dynamics. The friction
+                row is solved together with the drives, so it resists a drive up to its bound; PhysX applies the
+                friction before each DOF's drive in every iteration, which lets a stiff drive largely override it.
+                With ``drive_mode="augmented"`` the implicit drive forces are part of the free dynamics and count
+                toward the load; ``drive_mode="rows"`` leaves them out, as PhysX does. The coefficients follow the validity rules and notify contract of
                 ``joint_friction``; a model built with every coefficient zero must keep them zero.
 
                 .. experimental::
@@ -4075,9 +4075,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._friction_dof_supported,
                 self._joint_friction_load_dof_joint,
                 model.joint_child,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                model.joint_effort_limit,
                 self._joint_friction_free_f,
             ],
             outputs=[self._joint_friction_load],

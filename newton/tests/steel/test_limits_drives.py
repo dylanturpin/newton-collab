@@ -2413,18 +2413,18 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
         expected = (0.4 + 0.6) * GRAVITY + 0.6 * GRAVITY * 0.2
         self.assertAlmostEqual(float(solver._joint_friction_load.numpy()[0]), expected, delta=1.0e-3)
 
-    def test_driven_dofs_get_no_load_term(self):
-        """Track a position target identically with and without the coefficient, on both drive routes."""
-        for drive_mode in ("augmented", "rows"):
-            runs = []
-            for coefficient in (0.0, 10.0):
-                model = _lateral_hinge_model(0.03, inertia=1.0e-5, ke=20.0, kd=1.0, coefficient=coefficient)
-                solver = _solver(model, drive_mode=drive_mode)
+    def test_moving_joint_with_a_weak_drive_is_stopped(self):
+        """Decelerate a spinning hinge by c m g / I in one step, however weak its drive, as PhysX does."""
+        for ke in (0.0, 1.0e-6):
+            with self.subTest(ke=ke):
+                model = _lateral_hinge_model(1.0, ke=ke)
+                solver = _solver(model, drive_mode="rows")
                 states, control = [model.state(), model.state()], model.control()
-                control.joint_target_q.fill_(0.5)
-                runs.append(_advance(solver, states, control, 30)[0])
-            with self.subTest(drive_mode=drive_mode):
-                np.testing.assert_array_equal(runs[0], runs[1])
+                states[0].joint_qd.fill_(1.0)
+                _, qd = _advance(solver, states, control, 2)
+                expected = 1.0 - LOAD_COEFFICIENT * GRAVITY / INERTIA_LOAD * DT_joint_friction
+                self.assertAlmostEqual(float(qd[0]), expected, delta=1.0e-4)
+                self.assertAlmostEqual(float(qd[1]), 0.0, delta=1.0e-4)
 
     def test_zero_coefficients_match_unregistered_bitwise(self):
         """Keep a model with registered zero coefficients bit-identical to one without the attribute."""
@@ -2642,7 +2642,7 @@ def _lateral_hinge_builder(mass, *, axial_offset=0.0, inertia=INERTIA_LOAD, grav
         armature=0.0,
         target_ke=ke,
         target_kd=kd,
-        effort_limit=0.7 if ke or kd else 1.0e6,
+        effort_limit=1.0 if ke or kd else 1.0e6,
     )
     builder.add_articulation([joint])
     return builder

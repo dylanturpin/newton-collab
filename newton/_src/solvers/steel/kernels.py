@@ -1892,18 +1892,14 @@ def compute_joint_friction_load(
     joint_friction_load_dof: wp.array[wp.int32],
     dof_joint: wp.array[wp.int32],
     joint_child: wp.array[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_effort_limit: wp.array[float],
     body_free_f: wp.array[wp.spatial_vector],
     # outputs
     joint_friction_load: wp.array[float],
 ):
-    """Write ``|F| + |T|`` of the wrench each undriven DOF's joint transmits to its child under the free dynamics."""
+    """Write ``|F| + |T|`` of the wrench each DOF's joint transmits to its child under the step's free dynamics."""
     dof = wp.tid()
     load = float(0.0)
-    driven = joint_effort_limit[dof] > 0.0 and (joint_target_ke[dof] > 0.0 or joint_target_kd[dof] > 0.0)
-    if joint_friction_load_dof[dof] != 0 and not driven:
+    if joint_friction_load_dof[dof] != 0:
         wrench = body_free_f[joint_child[int(dof_joint[dof])]]
         load = wp.length(wp.spatial_top(wrench)) + wp.length(wp.spatial_bottom(wrench))
     joint_friction_load[dof] = load
