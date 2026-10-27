@@ -629,6 +629,7 @@ class Example:
             raise ValueError("The world count must be positive")
         self.world_scene = [types[i % len(types)] for i in range(self.world_count)]
         self.scene_types = [name for name in types if name in self.world_scene]
+        self.walker_types = [name for name in self.scene_types if SCENE_TYPES[name].is_walker]
         # --max-worlds renders the first worlds only; the command arrows follow the rendered subset
         self.visible_worlds = self.world_count if args.max_worlds is None else min(args.max_worlds, self.world_count)
         # a walker runs on random joint targets instead of its policy when asked to
@@ -869,7 +870,7 @@ class Example:
         status = {key: np.zeros(self.world_count) for key in ("height", "tilt_cos", "forward", "commanded")}
         status["upright"] = np.zeros(self.world_count, dtype=bool)
         for world, name in enumerate(self.world_scene):
-            if self.drive_mode[name] != "policy":
+            if not SCENE_TYPES[name].is_walker:
                 continue
             qs, ds = coord_start[world], dof_start[world]
             rot = wp.quat(*joint_q[qs + 3 : qs + 7])
@@ -890,12 +891,12 @@ class Example:
         )
         marks = self.solver.constraint_row_watermarks()
         upright = ""
-        if self.batches:
+        if self.walker_types:
             status = self.walker_status()
             kinds = np.array(self.world_scene)
             upright = "; upright: " + ", ".join(
-                f"{batch.robot.name} {int(status['upright'][kinds == batch.robot.name].sum())}/{len(batch.worlds)}"
-                for batch in self.batches
+                f"{name} {int(status['upright'][kinds == name].sum())}/{int((kinds == name).sum())}"
+                for name in self.walker_types
             )
         print(
             f"  after {self.sim_time:.1f} s: resets by scene type: {resets}{upright}; row high-water per world: "
@@ -1107,18 +1108,17 @@ class Example:
         """Reject nonfinite states after every control step and tally how the walkers do under their policies."""
         assert np.isfinite(self.state_0.body_q.numpy()).all(), "Nonfinite rigid body pose"
         assert np.isfinite(self.state_0.joint_qd.numpy()).all(), "Nonfinite joint velocity"
-        if not self.batches:
+        if not self.walker_types:
             return
         # a walker is judged once it has landed and taken its first steps after a reset
         judged = self.episode_frame.numpy() >= LANDING_FRAMES
         status = self.walker_status()
-        for batch in self.batches:
-            for world in batch.worlds:
-                if judged[world]:
-                    self.judged_frames[world] += 1
-                    self.upright_frames[world] += int(status["upright"][world])
-                    self.forward_sum[world] += status["forward"][world]
-                    self.commanded_sum[world] += status["commanded"][world]
+        for world, name in enumerate(self.world_scene):
+            if SCENE_TYPES[name].is_walker and judged[world]:
+                self.judged_frames[world] += 1
+                self.upright_frames[world] += int(status["upright"][world])
+                self.forward_sum[world] += status["forward"][world]
+                self.commanded_sum[world] += status["commanded"][world]
 
     def test_final(self):
         """Check that every world reset at least once, no row budget overflowed, nothing exploded and the policies
@@ -1152,26 +1152,46 @@ class Example:
         newton.examples.test_body_state(model, state, "bodies above the ground", lambda q, qd: q[2] > -0.05)
         newton.examples.test_body_state(model, state, "bodies not flying away", lambda q, qd: wp.length(qd) < 50.0)
 
-        # the policies keep their robots upright after landing and move them the way they were commanded
+        # every walker world was judged after landing. A walker that falls before the landing window ends is reset
+        # unjudged, so a policy that falls every episode would otherwise skip the checks below while its falls
+        # satisfy the reset check above.
         kinds = np.array(self.world_scene)
-        for batch in self.batches:
-            name = batch.robot.name
+        walker = np.array([SCENE_TYPES[name].is_walker for name in self.world_scene])
+        unjudged = [
+            f"{w} ({self.world_scene[w]})" for w in range(self.world_count) if walker[w] and not self.judged_frames[w]
+        ]
+        if unjudged:
+            raise ValueError(f"walker worlds never judged after landing in {self.frame} frames: {', '.join(unjudged)}")
+
+        # falls end episodes early, so they are bounded against the episodes: a walker world may lose at most half
+        # of its episodes to falls (rounded up, so one fall in one episode passes), and a walker type at most half of
+        # its episodes (rounded down, so a type whose every episode ends in a fall fails)
+        falls = self.fall_count.numpy()
+        for world in np.flatnonzero(walker):
+            if falls[world] > (resets[world] + 1) // 2:
+                name = self.world_scene[world]
+                raise ValueError(f"world {world} ({name}) lost {falls[world]} of its {resets[world]} episodes to falls")
+
+        # the policies keep their robots upright after landing and move them the way they were commanded
+        for name in self.walker_types:
             worlds = kinds == name
             judged = int(self.judged_frames[worlds].sum())
-            if judged == 0:
-                continue
             upright = self.upright_frames[worlds].sum() / judged
             forward = self.forward_sum[worlds].sum() / judged
             commanded = self.commanded_sum[worlds].sum() / judged
-            falls = int(self.fall_count.numpy()[worlds].sum())
+            episodes = int(resets[worlds].sum())
+            type_falls = int(falls[worlds].sum())
             print(
                 f"  {name}: upright in {100.0 * upright:.0f}% of {judged} judged world-steps, forward speed "
-                f"{forward:.2f} m/s against {commanded:.2f} m/s commanded, {falls} episodes ended by a fall"
+                f"{forward:.2f} m/s against {commanded:.2f} m/s commanded, {type_falls} of {episodes} episodes "
+                f"ended by a fall"
             )
             if upright < 0.9:
                 raise ValueError(f"{name} robots were upright in only {100.0 * upright:.0f}% of the judged steps")
             if forward < 0.3 * commanded:
                 raise ValueError(f"{name} robots walked at {forward:.2f} m/s against {commanded:.2f} m/s commanded")
+            if type_falls > episodes // 2:
+                raise ValueError(f"{name} robots fell in {type_falls} of their {episodes} episodes")
         self.print_resets()
 
     @staticmethod
