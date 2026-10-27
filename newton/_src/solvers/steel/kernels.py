@@ -68,6 +68,8 @@ PGS_CONSTRAINT_TYPE_COUNT = 12
 # Bits of the allocator's ``angular_friction_enabled``: articulated rows on the dense and propagation families,
 # free-rigid rows.
 ANGULAR_FRICTION_DENSE = 1
+# Fixed-point scale of deterministic wrench accumulation [1/N or 1/(N m)]; resolves 1e-9 up to about 8e9.
+WRENCH_FIXED_POINT_SCALE = wp.constant(1073741824.0)
 ANGULAR_FRICTION_FREE_RIGID = 2
 ANGULAR_FRICTION_PROPAGATION = 4
 
@@ -1866,9 +1868,32 @@ def subtract_arrays(a: wp.array[float], b: wp.array[float], out: wp.array[float]
 
 
 @wp.func
-def _add_torque(body: int, torque: wp.vec3, body_wrench: wp.array[wp.spatial_vector]):
-    if body >= 0:
-        wp.atomic_add(body_wrench, body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque))
+def _add_wrench(
+    body: int,
+    wrench: wp.spatial_vector,
+    body_wrench: wp.array[wp.spatial_vector],
+    body_wrench_fixed: wp.array2d[wp.int64],
+    fixed: int,
+):
+    """Accumulate a wrench, in fixed point when ``fixed`` is set so the sum is independent of thread order."""
+    if body < 0:
+        return
+    if fixed != 0:
+        for k in range(6):
+            wp.atomic_add(body_wrench_fixed, body, k, wp.int64(wp.round(wrench[k] * WRENCH_FIXED_POINT_SCALE)))
+    else:
+        wp.atomic_add(body_wrench, body, wrench)
+
+
+@wp.func
+def _add_torque(
+    body: int,
+    torque: wp.vec3,
+    body_wrench: wp.array[wp.spatial_vector],
+    body_wrench_fixed: wp.array2d[wp.int64],
+    fixed: int,
+):
+    _add_wrench(body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque), body_wrench, body_wrench_fixed, fixed)
 
 
 @wp.func
@@ -1879,12 +1904,107 @@ def _add_point_force(
     body_to_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     body_wrench: wp.array[wp.spatial_vector],
+    body_wrench_fixed: wp.array2d[wp.int64],
+    fixed: int,
 ):
     if body >= 0:
         origin = wp.vec3()
         if body_to_articulation[body] >= 0:
             origin = articulation_origin[body_to_articulation[body]]
-        wp.atomic_add(body_wrench, body, wp.spatial_vector(force, wp.cross(point - origin, force)))
+        _add_wrench(
+            body, wp.spatial_vector(force, wp.cross(point - origin, force)), body_wrench, body_wrench_fixed, fixed
+        )
+
+
+@wp.kernel
+def finalize_fixed_point_wrenches(body_wrench_fixed: wp.array2d[wp.int64], body_wrench: wp.array[wp.spatial_vector]):
+    body = wp.tid()
+    inv_scale = 1.0 / WRENCH_FIXED_POINT_SCALE
+    w = wp.spatial_vector()
+    for k in range(6):
+        w[k] = wp.float32(body_wrench_fixed[body, k]) * inv_scale
+    body_wrench[body] = w
+
+
+@wp.kernel
+def compute_joint_friction_load(
+    joint_friction_load_coefficient: wp.array[float],
+    dof_joint: wp.array[wp.int32],
+    joint_child: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_parent_f: wp.array[wp.spatial_vector],
+    # outputs
+    joint_friction_load: wp.array[float],
+):
+    """Bound each DOF's friction by its coefficient times the transverse joint reaction of the last step."""
+    dof = wp.tid()
+    coefficient = joint_friction_load_coefficient[dof]
+    load = float(0.0)
+    if coefficient > 0.0:
+        joint = int(dof_joint[dof])
+        child = joint_child[joint]
+        X_wc = body_q[child]
+        X_wj = X_wc * joint_X_c[joint]
+        wrench = body_parent_f[child]
+        force = wp.spatial_top(wrench)
+        # Move the torque reference from the child COM to the joint anchor.
+        torque = wp.spatial_bottom(wrench) + wp.cross(
+            wp.transform_point(X_wc, body_com[child]) - wp.transform_get_translation(X_wj), force
+        )
+        q_wj = wp.transform_get_rotation(X_wj)
+        start = joint_qd_start[joint]
+        lin_count = joint_dof_dim[joint, 0]
+        force = _remove_joint_axes(force, q_wj, joint_axis, start, lin_count)
+        torque = _remove_joint_axes(torque, q_wj, joint_axis, start + lin_count, joint_dof_dim[joint, 1])
+        load = coefficient * (wp.length(force) + wp.length(torque))
+    joint_friction_load[dof] = load
+
+
+@wp.kernel
+def add_joint_friction_load(
+    joint_friction: wp.array[float],
+    joint_friction_load: wp.array[float],
+    # outputs
+    joint_friction_total: wp.array[float],
+):
+    dof = wp.tid()
+    joint_friction_total[dof] = joint_friction[dof] + joint_friction_load[dof]
+
+
+@wp.kernel
+def reset_joint_friction_load(
+    world_mask: wp.array[wp.bool],
+    dof_world: wp.array[wp.int32],
+    # outputs
+    joint_friction_load: wp.array[float],
+):
+    dof = wp.tid()
+    if world_mask[dof_world[dof]]:
+        joint_friction_load[dof] = 0.0
+
+
+@wp.func
+def _remove_joint_axes(v: wp.vec3, q_wj: wp.quat, joint_axis: wp.array[wp.vec3], first: int, count: int):
+    """Remove the components of ``v`` along a joint's world axes, orthonormalized in DOF order."""
+    e0 = wp.vec3()
+    e1 = wp.vec3()
+    for k in range(count):
+        a = wp.quat_rotate(q_wj, joint_axis[first + k])
+        a = a - wp.dot(a, e0) * e0 - wp.dot(a, e1) * e1
+        n = wp.length(a)
+        if n > 1.0e-6:
+            a = a / n
+            v = v - wp.dot(v, a) * a
+            if wp.length_sq(e0) == 0.0:
+                e0 = a
+            else:
+                e1 = a
+    return v
 
 
 @wp.kernel
@@ -1921,8 +2041,10 @@ def accumulate_contact_wrenches_from_impulses(
     contact_friction_shared_anchor: int,
     friction_patches: FrictionPatches,
     inv_dt: float,
+    fixed: int,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
+    body_contact_wrench_fixed: wp.array2d[wp.int64],
     dense_slot_contact: wp.array2d[int],
 ):
     """Add each contact's solved force on its two bodies at the points its rows act on.
@@ -2023,17 +2145,49 @@ def accumulate_contact_wrenches_from_impulses(
     normal_force = lam[0] * inv_dt * normal
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction_force = (lam[1] * tangent0 + lam[2] * tangent1) * inv_dt
-    _add_point_force(body_a, normal_force, normal_a, body_to_articulation, articulation_origin, body_contact_wrench)
-    _add_point_force(body_b, -normal_force, normal_b, body_to_articulation, articulation_origin, body_contact_wrench)
-    _add_point_force(body_a, friction_force, friction_a, body_to_articulation, articulation_origin, body_contact_wrench)
     _add_point_force(
-        body_b, -friction_force, friction_b, body_to_articulation, articulation_origin, body_contact_wrench
+        body_a,
+        normal_force,
+        normal_a,
+        body_to_articulation,
+        articulation_origin,
+        body_contact_wrench,
+        body_contact_wrench_fixed,
+        fixed,
+    )
+    _add_point_force(
+        body_b,
+        -normal_force,
+        normal_b,
+        body_to_articulation,
+        articulation_origin,
+        body_contact_wrench,
+        body_contact_wrench_fixed,
+        fixed,
+    )
+    _add_point_force(
+        body_a,
+        friction_force,
+        friction_a,
+        body_to_articulation,
+        articulation_origin,
+        body_contact_wrench,
+        body_contact_wrench_fixed,
+        fixed,
+    )
+    _add_point_force(
+        body_b,
+        -friction_force,
+        friction_b,
+        body_to_articulation,
+        articulation_origin,
+        body_contact_wrench,
+        body_contact_wrench_fixed,
+        fixed,
     )
     torque = (angular[0] * normal + angular[1] * tangent0 + angular[2] * tangent1) * inv_dt
-    if body_a >= 0:
-        wp.atomic_add(body_contact_wrench, body_a, wp.spatial_vector(wp.vec3(0.0), torque))
-    if body_b >= 0:
-        wp.atomic_add(body_contact_wrench, body_b, wp.spatial_vector(wp.vec3(0.0), -torque))
+    _add_torque(body_a, torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
+    _add_torque(body_b, -torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
 
 
 @wp.kernel
@@ -2053,8 +2207,10 @@ def accumulate_torsion_wrenches_from_impulses(
     contact_shape1: wp.array[int],
     shape_body: wp.array[int],
     inv_dt: float,
+    fixed: int,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
+    body_contact_wrench_fixed: wp.array2d[wp.int64],
 ):
     """Add each solved spin row's torque about its lead contact's normal to the contact's bodies."""
     world, row = wp.tid()
@@ -2070,10 +2226,10 @@ def accumulate_torsion_wrenches_from_impulses(
     if contact_path[c] != 0 or contact_world[c] != world or contact_slot[c] != lead:
         return
     torque = world_impulses[world, row] * inv_dt * (-contact_normal[c])
-    if contact_shape0[c] >= 0 and shape_body[contact_shape0[c]] >= 0:
-        wp.atomic_add(body_contact_wrench, shape_body[contact_shape0[c]], wp.spatial_vector(wp.vec3(0.0), torque))
-    if contact_shape1[c] >= 0 and shape_body[contact_shape1[c]] >= 0:
-        wp.atomic_add(body_contact_wrench, shape_body[contact_shape1[c]], wp.spatial_vector(wp.vec3(0.0), -torque))
+    if contact_shape0[c] >= 0:
+        _add_torque(shape_body[contact_shape0[c]], torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
+    if contact_shape1[c] >= 0:
+        _add_torque(shape_body[contact_shape1[c]], -torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
 
 
 @wp.kernel
@@ -2086,8 +2242,10 @@ def accumulate_propagation_torsion_wrenches_from_impulses(
     propagation_J_b: wp.array3d[wp.float32],
     propagation_impulses: wp.array2d[wp.float32],
     inv_dt: float,
+    fixed: int,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
+    body_contact_wrench_fixed: wp.array2d[wp.int64],
 ):
     """Add each solved propagation torsion row's torque about its lead contact's normal to the row's bodies."""
     world, row = wp.tid()
@@ -2102,11 +2260,11 @@ def accumulate_propagation_torsion_wrenches_from_impulses(
     body_a = propagation_body_a[world, row]
     if body_a >= 0:
         torque = wp.vec3(propagation_J_a[world, row, 3], propagation_J_a[world, row, 4], propagation_J_a[world, row, 5])
-        wp.atomic_add(body_contact_wrench, body_a, wp.spatial_vector(wp.vec3(0.0), impulse * torque))
+        _add_torque(body_a, impulse * torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
     body_b = propagation_body_b[world, row]
     if body_b >= 0:
         torque = wp.vec3(propagation_J_b[world, row, 3], propagation_J_b[world, row, 4], propagation_J_b[world, row, 5])
-        wp.atomic_add(body_contact_wrench, body_b, wp.spatial_vector(wp.vec3(0.0), impulse * torque))
+        _add_torque(body_b, impulse * torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
 
 
 @wp.kernel
@@ -2130,8 +2288,10 @@ def accumulate_connect_wrenches_from_impulses(
     world_row_type: wp.array2d[wp.int32],
     world_impulses: wp.array2d[wp.float32],
     inv_dt: float,
+    fixed: int,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
+    body_contact_wrench_fixed: wp.array2d[wp.int64],
 ):
     """Add each loop closure's solved forces and torques to its parent and child bodies.
 
@@ -2166,8 +2326,26 @@ def accumulate_connect_wrenches_from_impulses(
         axis = wp.vec3(0.0)
         axis[axis_index] = 1.0
         force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
-        _add_point_force(body_p, force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
-        _add_point_force(body_c, -force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
+        _add_point_force(
+            body_p,
+            force,
+            p_m,
+            body_to_articulation,
+            articulation_origin,
+            body_contact_wrench,
+            body_contact_wrench_fixed,
+            fixed,
+        )
+        _add_point_force(
+            body_c,
+            -force,
+            p_m,
+            body_to_articulation,
+            articulation_origin,
+            body_contact_wrench,
+            body_contact_wrench_fixed,
+            fixed,
+        )
     if connect_rows[k] < 5:
         return
     # REVOLUTE closure: the two hinge-axis rows are pure couples about e1 / e2.
@@ -2184,8 +2362,8 @@ def accumulate_connect_wrenches_from_impulses(
         if i == 1:
             e = e2
         torque = e * (world_impulses[world, slot] * inv_dt * inv_norm)
-        _add_torque(body_p, torque, body_contact_wrench)
-        _add_torque(body_c, -torque, body_contact_wrench)
+        _add_torque(body_p, torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
+        _add_torque(body_c, -torque, body_contact_wrench, body_contact_wrench_fixed, fixed)
 
 
 @wp.kernel

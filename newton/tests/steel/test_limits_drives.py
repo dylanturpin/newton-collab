@@ -37,7 +37,7 @@ from newton._src.solvers.steel.solver_steel import (
     _prepare_augmented_joint_drives_by_dof,
     _use_resident_mfgs_metadata,
 )
-from newton.solvers import SolverSteel
+from newton.solvers import SolverBase, SolverSteel
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -2359,6 +2359,145 @@ class TestSteelJointFriction(unittest.TestCase):
             _solver(model)
 
 
+LOAD_COEFFICIENT = 0.02
+
+
+ARM_LENGTH = 0.3
+
+
+GRAVITY = 9.81
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "matrix-free joint friction requires CUDA")
+class TestSteelJointFrictionLoad(unittest.TestCase):
+    def test_hold_matches_analytic_condition(self):
+        """Hold a payload hinge iff the torque is below c (|F| + |T|) and slide against that bound otherwise."""
+        effort = 0.2
+        for mass, observed in itertools.product((0.5, 2.0), (False, True)):
+            with self.subTest(mass=mass, observed=observed):
+                model = _payload_hinge_model(mass)
+                solver = _solver(model)
+                observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F}) if observed else None
+                _, qd = _advance_hinge(solver, model, effort, 20, observables)
+                bound = LOAD_COEFFICIENT * mass * GRAVITY * (1.0 + ARM_LENGTH)
+                inertia = 0.01 + mass * ARM_LENGTH**2
+                # The first step sees no reaction yet and slides on the constant friction alone.
+                self.assertAlmostEqual(float(qd[0]), effort / inertia * DT_joint_friction, delta=1.0e-5)
+                if effort < bound:
+                    np.testing.assert_allclose(qd[1:], 0.0, atol=1.0e-6)
+                    self.assertAlmostEqual(float(solver._joint_friction_load.numpy()[0]), bound, delta=1.0e-5)
+                else:
+                    acceleration = np.diff(qd[1:]) / DT_joint_friction
+                    np.testing.assert_allclose(acceleration, (effort - bound) / inertia, rtol=1.0e-2)
+
+    def test_axial_reaction_is_excluded(self):
+        """Leave the gravity torque about a horizontal hinge's own axis out of its friction load."""
+        # Holding needs c m g >= m g L once the axial torque m g L is excluded, and only c >= L / (1 + L) with it.
+        for coefficient, holds in ((0.27, False), (0.33, True)):
+            with self.subTest(coefficient=coefficient):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+                SolverSteel.register_custom_attributes(builder)
+                body = builder.add_link(mass=1.0, com=wp.vec3(ARM_LENGTH, 0.0, 0.0), inertia=wp.mat33(np.eye(3) * 0.01))
+                builder.add_articulation([builder.add_joint_revolute(-1, body, axis=(0.0, 1.0, 0.0), armature=0.0)])
+                model = builder.finalize()
+                _load_coefficient(model).fill_(coefficient)
+                _, qd = _advance_hinge(_solver(model), model, 0.0, 30)
+                # The lagged reaction is light while the arm falls, so a holding hinge stops after a short slip.
+                if holds:
+                    np.testing.assert_allclose(qd[-5:], 0.0, atol=1.0e-6)
+                else:
+                    self.assertGreater(abs(float(qd[-1])), 0.1)
+
+    def test_zero_coefficients_match_unregistered_bitwise(self):
+        """Keep a model with registered zero coefficients bit-identical to one without the attribute."""
+        runs = []
+        for registered in (False, True):
+            model = _payload_hinge_model(2.0, coefficient=0.0 if registered else None, ground=True, boxes=3)
+            solver = _solver(model, deterministic=True)
+            self.assertFalse(solver._joint_friction_load_active)
+            observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F})
+            pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=64)
+            runs.append(
+                (*_advance_hinge(solver, model, 0.2, 30, observables, pipeline), observables.body_parent_f.numpy())
+            )
+        for unregistered, registered in zip(*runs, strict=True):
+            np.testing.assert_array_equal(unregistered, registered)
+
+    def test_deterministic_runs_are_bitwise_identical(self):
+        """Reproduce a contact-loaded hinge bit for bit under deterministic=True."""
+        runs = []
+        for _ in range(2):
+            model = _payload_hinge_model(2.0, ground=True, boxes=6)
+            solver = _solver(model, deterministic=True, articulation_constraint_max=64)
+            self.assertTrue(solver._parent_wrench_fixed_point)
+            pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=256)
+            q, qd = _advance_hinge(solver, model, 0.5, 40, None, pipeline)
+            runs.append((q, qd, solver._joint_friction_load.numpy()))
+        self.assertGreater(float(runs[0][2][0]), 0.0)
+        for first, second in zip(*runs, strict=True):
+            np.testing.assert_array_equal(first, second)
+
+    def test_graph_replay_matches_eager(self):
+        """Replay captured steps with the lagged bound bit-identically to eager stepping."""
+        model = _payload_hinge_model(0.5)
+        _, eager = _advance_hinge(_solver(model), model, 0.2, 10)
+        solver = _solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control.joint_f.assign([0.2])
+        _advance(solver, states, control, 2)
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.step(states[0], states[1], control, None, DT_joint_friction)
+            solver.step(states[1], states[0], control, None, DT_joint_friction)
+        replayed = []
+        for _ in range(4):
+            wp.capture_launch(capture.graph)
+            replayed.append(states[0].joint_qd.numpy()[0])
+        np.testing.assert_array_equal(np.array(replayed, dtype=np.float32), eager[3::2])
+
+    def test_reset_clears_the_lagged_load(self):
+        """Reproduce a fresh trajectory after a full or masked reset."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+        SolverSteel.register_custom_attributes(builder)
+        for mass in (0.5, 2.0):
+            builder.add_world(_payload_hinge_builder(mass))
+        model = builder.finalize()
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        _, fresh = _advance_hinge(_solver(model), model, 0.2, 10, dofs=2)
+        for mask in (None, [True, True]):
+            with self.subTest(mask=mask):
+                solver = _solver(model)
+                states, control = [model.state(), model.state()], model.control()
+                control.joint_f.fill_(0.2)
+                _advance(solver, states, control, 5)
+                states[0].joint_q.zero_()
+                states[0].joint_qd.zero_()
+                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+                world_mask = None if mask is None else wp.array(mask, dtype=wp.bool, device=model.device)
+                solver.reset(states[0], world_mask=world_mask)
+                _, qd = _advance(solver, states, control, 10)
+                np.testing.assert_array_equal(qd, fresh)
+
+    def test_rejects_invalid_coefficients(self):
+        """Raise for invalid coefficients and for enabling the mode after construction."""
+        for value in (-1.0, float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and non-negative"):
+                _solver(_payload_hinge_model(1.0, coefficient=value))
+        model = _payload_hinge_model(1.0, coefficient=0.0)
+        solver = _solver(model)
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        with self.assertRaisesRegex(ValueError, "zero at construction"):
+            solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+
+    def test_disabled_friction_ignores_coefficients(self):
+        """Leave the coefficients unused when enable_joint_friction is off."""
+        model = _payload_hinge_model(2.0)
+        solver = _solver(model, enable_joint_friction=False)
+        _, qd = _advance_hinge(solver, model, 0.2, 5)
+        inertia = 0.01 + 2.0 * ARM_LENGTH**2
+        np.testing.assert_allclose(qd, 0.2 / inertia * DT_joint_friction * np.arange(1, 6), rtol=1.0e-4)
+
+
 def _solver(model, **overrides):
     options = {
         "solve_mode": "matrix_free",
@@ -2469,6 +2608,63 @@ def _unsupported_joint_model(joint, *, friction):
     builder.add_articulation([index])
     builder.joint_friction = [friction] * len(builder.joint_friction)
     return builder.finalize()
+
+
+def _payload_hinge_builder(mass, *, ground=False, boxes=0, register=True):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+    if register:
+        SolverSteel.register_custom_attributes(builder)
+    body = builder.add_link(mass=mass, com=wp.vec3(ARM_LENGTH, 0.0, 0.0), inertia=wp.mat33(np.eye(3) * 0.01))
+    joint = builder.add_joint_revolute(
+        -1,
+        body,
+        axis=(0.0, 0.0, 1.0),
+        parent_xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()),
+        friction=0.0,
+        armature=0.0,
+    )
+    builder.add_articulation([joint])
+    if ground:
+        # A massless plate under the payload carries the boxes resting on it.
+        plate = newton.ModelBuilder.ShapeConfig(density=0.0)
+        builder.add_shape_box(
+            body, xform=wp.transform((ARM_LENGTH, 0.0, -0.02), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.02, cfg=plate
+        )
+        for i in range(boxes):
+            box = builder.add_body(
+                xform=wp.transform((ARM_LENGTH + 0.08 * (i % 3 - 1), 0.08 * (i // 3) - 0.04, 0.53), wp.quat_identity())
+            )
+            builder.add_shape_box(box, hx=0.03, hy=0.03, hz=0.03)
+    return builder
+
+
+def _payload_hinge_model(mass, *, coefficient=LOAD_COEFFICIENT, ground=False, boxes=0):
+    if coefficient is None:
+        return _payload_hinge_builder(mass, ground=ground, boxes=boxes, register=False).finalize()
+    model = _payload_hinge_builder(mass, ground=ground, boxes=boxes).finalize()
+    _load_coefficient(model)[:1].fill_(coefficient)
+    return model
+
+
+def _load_coefficient(model):
+    return model.steel.joint_friction_load_coefficient
+
+
+def _advance_hinge(solver, model, effort, steps, observables=None, pipeline=None, dofs=1):
+    states, control = [model.state(), model.state()], model.control()
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control.joint_f.fill_(effort)
+    contacts = None if pipeline is None else pipeline.contacts()
+    q, qd = [], []
+    for _ in range(steps):
+        states[0].clear_forces()
+        if pipeline is not None:
+            pipeline.collide(states[0], contacts)
+        solver.step(states[0], states[1], control, contacts, DT_joint_friction, observables=observables)
+        states.reverse()
+        q.append(states[0].joint_q.numpy().copy())
+        qd.append(states[0].joint_qd.numpy().copy())
+    return np.squeeze(np.array(q)[:, :dofs]), np.squeeze(np.array(qd)[:, :dofs])
 
 
 def _arm_and_box_model():
