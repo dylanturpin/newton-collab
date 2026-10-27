@@ -121,6 +121,7 @@ from .kernels import (
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     accumulate_torsion_wrenches_from_impulses,
+    add_joint_friction_load,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -160,6 +161,7 @@ from .kernels import (
     compute_delta_and_accumulate,
     compute_effective_joint_armature,
     compute_free_root_rotation,
+    compute_joint_friction_load,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -1762,6 +1764,18 @@ class SolverSteel(SolverBase, CouplingInterface):
           ``"propagation"`` and ``"propagation_colored"``, which solves them inside their contact's colored
           unit; the rows start cold every step, also under ``contact_warmstart``.
 
+        One per-DOF attribute makes joint friction grow with the force the joint transmits, see
+        ``enable_joint_friction``:
+
+        - ``steel:joint_friction_load_coefficient``, experimental, adds ``c (|F| + |T|)`` to the DOF's
+          :attr:`~newton.Model.joint_friction` (default 0; USD reads it only from an explicitly authored
+          ``newton:steel:joint_friction_load_coefficient``). ``F`` [N] and ``T`` [N·m] are the force and the torque
+          about the child body's center of mass that the joint transmits to its child's subtree under the step's
+          free dynamics: gravity, applied body and joint forces, velocity-dependent terms and the resulting
+          accelerations, before contacts, limits, friction and ``drive_mode="rows"`` drives act. ``T`` keeps its
+          component about the joint axis, so a joint's own applied effort raises its friction. This is the joint
+          friction law of PhysX articulations before PhysX 5.6 (``physxJoint:jointFriction``); the sum mixes units.
+
         The solver reads them from the model at every step, for example
         ``model.steel.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
 
@@ -1845,6 +1859,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dtype=wp.float32,
                 default=float("inf"),
                 usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="joint_friction_load_coefficient",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.JOINT_DOF,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                usd_attribute_name="newton:steel:joint_friction_load_coefficient",
             )
         )
 
@@ -2246,6 +2271,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
 
+                A positive ``steel:joint_friction_load_coefficient`` (see :meth:`register_custom_attributes`)
+                at construction adds load-proportional friction: each step, the DOF's bound grows by the current
+                coefficient times the load its joint transmits under that step's free dynamics. The friction
+                row is solved together with the drives, so it resists a drive up to its bound; PhysX applies the
+                friction before each DOF's drive in every iteration, which lets a stiff drive largely override it.
+                With ``drive_mode="augmented"`` the implicit drive forces are part of the free dynamics and count
+                toward the load; ``drive_mode="rows"`` leaves them out, as PhysX does. The coefficients follow the validity rules and notify contract of
+                ``joint_friction``; a model built with every coefficient zero must keep them zero.
+
                 .. experimental::
 
                     ``enable_joint_friction=True`` and its supported combinations may change without
@@ -2607,6 +2641,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._enable_joint_velocity_limits = enable_joint_velocity_limits
         self._enable_joint_friction = bool(enable_joint_friction)
         self._joint_friction_warp_kernels: dict[int, wp.Kernel] = {}
+        self._joint_friction_load_active = False
         try:
             self._velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         except (TypeError, ValueError) as exc:
@@ -2945,8 +2980,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         # articulation joint ranges, so gate that mode rather than corrupt silently.
         self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
         if self._enable_joint_friction:
+            load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+            self._joint_friction_load_active = bool(
+                load_coefficient is not None and model.joint_dof_count and np.any(load_coefficient.numpy() > 0.0)
+            )
             self._validate_joint_friction()
             self._init_joint_friction_check(model)
+            if self._joint_friction_load_active:
+                self._init_joint_friction_load(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
                 "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
@@ -3892,10 +3933,13 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _flag_invalid_joint_friction(self) -> None:
         """Latch :attr:`joint_friction_invalid` for worlds with coefficients the friction rows cannot represent."""
         model = self.model
-        if model.joint_friction.shape != (model.joint_dof_count,):
-            raise ValueError(
-                f"joint_friction has shape {model.joint_friction.shape}, expected ({model.joint_dof_count},)"
-            )
+        load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+        for name, array in (
+            ("joint_friction", model.joint_friction),
+            ("steel:joint_friction_load_coefficient", load_coefficient),
+        ):
+            if array is not None and array.shape != (model.joint_dof_count,):
+                raise ValueError(f"{name} has shape {array.shape}, expected ({model.joint_dof_count},)")
         if model.joint_dof_count and self._world_count:
             wp.launch(
                 flag_invalid_joint_friction,
@@ -3904,6 +3948,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._joint_friction_invalid],
                 device=model.device,
             )
+            if load_coefficient is not None:
+                # Without the load pass from construction, every nonzero coefficient is unsupported.
+                supported = (
+                    self._friction_dof_supported if self._joint_friction_load_active else self._friction_dof_unsupported
+                )
+                wp.launch(
+                    flag_invalid_joint_friction,
+                    model.joint_dof_count,
+                    inputs=[load_coefficient, supported, self._friction_dof_world],
+                    outputs=[self._joint_friction_invalid],
+                    device=model.device,
+                )
 
     def _warmstart_dt_scale(self, dt: float) -> wp.array:
         """Return the device scalar that rescales carried impulses from the previous step size to ``dt``."""
@@ -3921,23 +3977,30 @@ class SolverSteel(SolverBase, CouplingInterface):
         model = self.model
         if model.joint_dof_count == 0:
             return
-        friction = model.joint_friction.numpy()
-        if friction.shape != (model.joint_dof_count,):
-            raise ValueError(f"joint_friction has shape {friction.shape}, expected ({model.joint_dof_count},)")
-        if not np.all(np.isfinite(friction)) or np.any(friction < 0.0):
-            raise ValueError("joint_friction must be finite and non-negative")
         joint_qd_start = model.joint_qd_start.numpy()
         joint_dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
         joint_type = model.joint_type.numpy()
         supported = np.isin(joint_type, (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6)))
         if self._model_plan is not None:
             supported &= self._model_plan.loop_joint_articulation < 0
-        unsupported = np.flatnonzero((friction > 0.0) & ~supported[joint_dof_joint])
-        if unsupported.size:
-            joint = int(joint_dof_joint[unsupported[0]])
-            raise ValueError(
-                f"joint_friction is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
-            )
+        coefficients = {"joint_friction": model.joint_friction}
+        load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+        if load_coefficient is not None:
+            coefficients["steel:joint_friction_load_coefficient"] = load_coefficient
+        for name, array in coefficients.items():
+            values = array.numpy()
+            if values.shape != (model.joint_dof_count,):
+                raise ValueError(f"{name} has shape {values.shape}, expected ({model.joint_dof_count},)")
+            if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+                raise ValueError(f"{name} must be finite and non-negative")
+            if array is load_coefficient and not self._joint_friction_load_active and np.any(values > 0.0):
+                raise ValueError(f"{name} was zero at construction and must stay zero")
+            unsupported = np.flatnonzero((values > 0.0) & ~supported[joint_dof_joint])
+            if unsupported.size:
+                joint = int(joint_dof_joint[unsupported[0]])
+                raise ValueError(
+                    f"{name} is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
+                )
 
     def _init_joint_friction_check(self, model) -> None:
         """Upload the per-DOF support mask and world of :meth:`_validate_joint_friction` for the device check."""
@@ -3960,6 +4023,65 @@ class SolverSteel(SolverBase, CouplingInterface):
             supported[joint_dof_joint].astype(np.int32), dtype=wp.int32, device=model.device
         )
         self._friction_dof_world = wp.array(joint_world[joint_dof_joint], dtype=wp.int32, device=model.device)
+        self._friction_dof_unsupported = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+
+    def _init_joint_friction_load(self, model) -> None:
+        """Allocate the per-DOF load and the free-dynamics joint wrenches it is computed from."""
+        joint_qd_start = model.joint_qd_start.numpy()
+        dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
+        self._joint_friction_load_dof_joint = wp.array(dof_joint.astype(np.int32), dtype=wp.int32, device=model.device)
+        self._joint_friction_load = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+        self._joint_friction_total = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+        self._joint_friction_free_f = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+        self._joint_friction_no_contact = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+
+    def _compute_joint_friction_load(self, state_in: State, state_aug: State) -> None:
+        """Write each DOF's load from the wrenches its joint transmits under the free accelerations of stage 3."""
+        model = self.model
+        _, body_a_s, body_ft_s, _ = self._parent_wrench_scratch
+        wp.launch(
+            eval_post_solve_parent_wrenches,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self._articulation_joint_end,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                state_aug._joint_S_s,
+                state_aug._joint_qdd,
+                None,
+                0.0,
+                state_aug._body_f_s,
+                state_in.body_f if state_in.body_count else None,
+                self._joint_friction_no_contact,
+                model.body_flags,
+                state_in.body_q,
+                model.body_com,
+                model.body_mass,
+                model.body_inertia,
+                self._articulation_origin,
+                self._dynamics_art_active,
+                body_a_s,
+                body_ft_s,
+            ],
+            outputs=[self._joint_friction_free_f],
+            block_dim=self._serial_kernel_block_dim,
+            device=model.device,
+        )
+        wp.launch(
+            compute_joint_friction_load,
+            dim=model.joint_dof_count,
+            inputs=[
+                self._friction_dof_supported,
+                self._joint_friction_load_dof_joint,
+                model.joint_child,
+                self._joint_friction_free_f,
+            ],
+            outputs=[self._joint_friction_load],
+            device=model.device,
+        )
 
     @override
     def reset(
@@ -9861,6 +9983,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
             self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
+            if self._joint_friction_load_active:
+                self._compute_joint_friction_load(state_in, state_aug)
             self._clamp_rigid_velocity_limits(self._v_hat)
             wp.copy(self._debug_stage3_qd_work, stage3_qd)
             wp.copy(self._debug_stage3_joint_qdd, state_aug._joint_qdd)
@@ -12186,6 +12310,20 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         # Joint-friction rows are internal rows of the phase-3 range.
         if self._joint_friction_warp_kernels:
+            joint_friction = model.joint_friction
+            if self._joint_friction_load_active:
+                wp.launch(
+                    add_joint_friction_load,
+                    dim=model.joint_dof_count,
+                    inputs=[
+                        model.joint_friction,
+                        self._namespaced_attribute("joint_friction_load_coefficient"),
+                        self._joint_friction_load,
+                    ],
+                    outputs=[self._joint_friction_total],
+                    device=model.device,
+                )
+                joint_friction = self._joint_friction_total
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self._size_groups:
                     self._J_by_size[size].zero_()
@@ -12205,7 +12343,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._constraint_art_active,
                             self._friction_dof_eligible,
                             self._kinematic_dof_mask,
-                            model.joint_friction,
+                            joint_friction,
                             max_constraints,
                             dt,
                             self._cfm,
