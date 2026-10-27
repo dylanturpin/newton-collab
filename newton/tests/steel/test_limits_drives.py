@@ -2530,7 +2530,13 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
 
     def test_fixed_point_overflow_is_clamped_and_reported(self):
         """Clamp out-of-range fixed-point terms, flag them and flag sums that could wrap."""
-        for values, total, flagged in (([1.0, 2.0, 3.0], 6.0, 0), ([1.0e10], 2.0**29, 1), ([3.0e8] * 1000, None, 1)):
+        cases = (
+            ([1.0, 2.0, 3.0], 6.0, 0),
+            ([1.0e10], 2.0**29, 1),
+            ([3.0e8] * 1000, None, None),
+            ([2.0**29] * 2048, None, None),
+        )
+        for values, total, flagged in cases:
             with self.subTest(count=len(values), value=values[0]):
                 device = wp.get_device()
                 fixed = wp.zeros((2, 6), dtype=wp.int64, device=device)
@@ -2538,12 +2544,19 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
                 inputs = [wp.array(values, dtype=wp.float32, device=device)]
                 wp.launch(_add_wrench_kernel, dim=len(values), inputs=inputs, outputs=[wrench, fixed], device=device)
                 wp.launch(finalize_fixed_point_wrenches, dim=1, inputs=[fixed], outputs=[wrench], device=device)
-                self.assertEqual(int(fixed.numpy()[1, 0]), flagged)
+                if flagged is None:
+                    self.assertGreater(int(fixed.numpy()[1, 0]), 0)
+                else:
+                    self.assertEqual(int(fixed.numpy()[1, 0]), flagged)
                 if total is not None:
                     self.assertAlmostEqual(float(wrench.numpy()[0, 0]), total, delta=1.0e-6 * total)
+        # The count survives later steps until a check reports it.
         model = _payload_hinge_model(2.0)
         solver = _solver(model, deterministic=True)
         solver._parent_wrench_fixed[-1:].fill_(1)
+        states, control = [model.state(), model.state()], model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        _advance(solver, states, control, 2)
         with self.assertRaisesRegex(RuntimeError, "fixed-point range"):
             solver.check_joint_friction()
         solver.check_joint_friction()

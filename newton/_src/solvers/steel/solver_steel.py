@@ -3919,7 +3919,9 @@ class SolverSteel(SolverBase, CouplingInterface):
     def check_joint_friction(self) -> None:
         """Raise :class:`ValueError` if a notify flagged :attr:`joint_friction_invalid`, then clear the flag.
 
-        Call outside CUDA graph capture, after captured notify replays. An eager notify calls it itself.
+        Call outside CUDA graph capture, after captured notify replays. An eager notify calls it itself. With
+        load-proportional friction and ``deterministic=True`` it first raises :class:`RuntimeError`, and clears
+        the count, if any step since the last check clamped or flagged a fixed-point joint reaction term.
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_joint_friction() must run outside CUDA graph capture")
@@ -9632,7 +9634,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         inv_dt = 1.0 / dt
         fixed = int(self._parent_wrench_fixed_point)
         if fixed:
-            self._parent_wrench_fixed.zero_()
+            # The last row holds the overflow count, latched until check_joint_friction reports it.
+            self._parent_wrench_fixed[:-1].zero_()
         if contacts is not None and contacts.rigid_contact_max:
             wp.launch(
                 accumulate_contact_wrenches_from_impulses,

@@ -70,9 +70,9 @@ PGS_CONSTRAINT_TYPE_COUNT = 12
 ANGULAR_FRICTION_DENSE = 1
 # Fixed-point scale of deterministic wrench accumulation [1/N or 1/(N m)].
 WRENCH_FIXED_POINT_SCALE = wp.constant(16777216.0)
-# Largest fixed-point term (2^53); a body's sum stays exact for up to 1024 terms of this size.
+# Largest fixed-point term (2^53).
 WRENCH_FIXED_POINT_TERM_MAX = wp.constant(9007199254740992.0)
-# Finalized sums beyond 2^62 are flagged as possibly wrapped.
+# Sums beyond 2^62 are flagged; one more term of at most 2^53 cannot wrap such a sum.
 WRENCH_FIXED_POINT_SUM_MAX = wp.constant(wp.int64(4611686018427387904))
 ANGULAR_FRICTION_FREE_RIGID = 2
 ANGULAR_FRICTION_PROPAGATION = 4
@@ -1881,7 +1881,7 @@ def _add_wrench(
 ):
     """Accumulate a wrench, in fixed point when ``fixed`` is set so the sum is independent of thread order.
 
-    The fixed-point buffer's last row counts terms clamped to the representable range.
+    The fixed-point buffer's last row counts clamped terms and sums that left the safe range.
     """
     if body < 0:
         return
@@ -1891,7 +1891,9 @@ def _add_wrench(
             if not (wp.abs(term) <= WRENCH_FIXED_POINT_TERM_MAX):
                 wp.atomic_add(body_wrench_fixed, body_wrench_fixed.shape[0] - 1, 0, wp.int64(1))
                 term = wp.clamp(term, -WRENCH_FIXED_POINT_TERM_MAX, WRENCH_FIXED_POINT_TERM_MAX)
-            wp.atomic_add(body_wrench_fixed, body, k, wp.int64(wp.round(term)))
+            previous = wp.atomic_add(body_wrench_fixed, body, k, wp.int64(wp.round(term)))
+            if previous > WRENCH_FIXED_POINT_SUM_MAX or previous < -WRENCH_FIXED_POINT_SUM_MAX:
+                wp.atomic_add(body_wrench_fixed, body_wrench_fixed.shape[0] - 1, 0, wp.int64(1))
     else:
         wp.atomic_add(body_wrench, body, wrench)
 
