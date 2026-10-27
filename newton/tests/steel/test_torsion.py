@@ -3368,9 +3368,7 @@ def _skip_wrenches(
     J_b: wp.array3d[wp.float32],
     impulses: wp.array2d[wp.float32],
     inv_dt: float,
-    fixed: int,
     body_contact_wrench: wp.array[wp.spatial_vector],
-    body_contact_wrench_fixed: wp.array2d[wp.int64],
 ):
     pass
 
