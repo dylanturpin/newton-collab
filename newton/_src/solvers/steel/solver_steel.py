@@ -161,7 +161,7 @@ from .kernels import (
     compute_delta_and_accumulate,
     compute_effective_joint_armature,
     compute_free_root_rotation,
-    compute_joint_friction_load,
+    compute_joint_friction_reaction,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -246,7 +246,7 @@ from .kernels import (
     refresh_propagation_tree_body_qd_for_size,
     remove_free_root_transport_from_qdd,
     reset_friction_anchor_history,
-    reset_joint_friction_load,
+    reset_joint_friction_reaction,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     rhs_accum_world_par_row,
@@ -1768,11 +1768,12 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         One per-DOF attribute makes joint friction grow with the joint reaction, see ``enable_joint_friction``:
 
-        - ``steel:joint_friction_load_coefficient``, experimental, adds ``c (|F| + |T|)`` to the DOF's
-          :attr:`~newton.Model.joint_friction` (``physxJoint:jointFriction``, default 0). ``F`` [N] and ``T`` [N·m]
-          are the parent's wrench on the child body, as reported by ``BODY_PARENT_F``, with ``T`` taken about the
-          child-side joint anchor and the components along the joint's own DOF axes removed, so only the
-          transverse reaction loads the bearing. As in PhysX, the sum mixes units and depends on the anchor.
+        - ``steel:joint_friction_load_coefficient``, experimental, adds ``c (|F| + |T|)`` to the
+          :attr:`~newton.Model.joint_friction` of a REVOLUTE or PRISMATIC DOF (default 0, USD only from an explicitly
+          authored ``newton:steel:joint_friction_load_coefficient``). ``F`` [N] and ``T`` [N·m] are the parent's
+          wrench on the child body, as reported by ``BODY_PARENT_F``, with ``T`` taken about the child-side joint
+          anchor and the component along the joint axis removed, so only the transverse reaction loads the bearing.
+          Like the legacy PhysX joint friction coefficient, the sum mixes units and depends on the anchor.
 
         The solver reads them from the model at every step, for example
         ``model.steel.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
@@ -1867,7 +1868,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
                 default=0.0,
-                usd_attribute_name="physxJoint:jointFriction",
+                usd_attribute_name="newton:steel:joint_friction_load_coefficient",
             )
         )
 
@@ -2271,11 +2272,13 @@ class SolverSteel(SolverBase, CouplingInterface):
 
                 A positive ``steel:joint_friction_load_coefficient`` (see :meth:`register_custom_attributes`)
                 at construction adds load-proportional friction: each step the DOF's bound grows by the
-                coefficient times the transverse joint reaction of the previous step, so the first step
-                after construction or :meth:`reset` uses ``joint_friction`` alone. The coefficients follow
-                the validity rules and notify contract of ``joint_friction``; a model built with every
-                coefficient zero must keep them zero. With ``deterministic=True`` the reaction is
-                accumulated in fixed point.
+                current coefficient times the transverse joint reaction of the previous step, so the first
+                step after construction or :meth:`reset` uses ``joint_friction`` alone. The coefficients
+                follow the validity rules and notify contract of ``joint_friction``, except that only
+                REVOLUTE and PRISMATIC DOFs accept them; a model built with every coefficient zero must keep
+                them zero. With ``deterministic=True`` the contact wrenches of the reaction are summed in
+                fixed point; a term beyond about 5e8 N or N·m is clamped, and :meth:`check_joint_friction`
+                raises for it.
 
                 .. experimental::
 
@@ -3922,6 +3925,12 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise RuntimeError("check_joint_friction() must run outside CUDA graph capture")
         if not self._enable_joint_friction:
             return
+        if self._parent_wrench_fixed_point:
+            overflow = self._parent_wrench_fixed[-1:]
+            count = int(overflow.numpy()[0, 0])
+            if count:
+                overflow.zero_()
+                raise RuntimeError(f"{count} joint reaction terms left the deterministic fixed-point range")
         worlds = np.flatnonzero(self._joint_friction_invalid.numpy())
         if worlds.size == 0:
             return
@@ -3934,13 +3943,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         joint_qd_start = model.joint_qd_start.numpy()
         dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
         self._joint_friction_load_dof_joint = wp.array(dof_joint.astype(np.int32), dtype=wp.int32, device=model.device)
-        self._joint_friction_load = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+        self._joint_friction_reaction = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
         self._joint_friction_total = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
         self._joint_friction_load_parent_f = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
         if self._deterministic:
             # Contact wrenches are summed by atomics; fixed point makes the bound independent of their order.
             self._parent_wrench_fixed_point = True
-            self._parent_wrench_fixed = wp.zeros((model.body_count, 6), dtype=wp.int64, device=model.device)
+            self._parent_wrench_fixed = wp.zeros((model.body_count + 1, 6), dtype=wp.int64, device=model.device)
 
     def _flag_invalid_joint_friction(self) -> None:
         """Latch :attr:`joint_friction_invalid` for worlds with coefficients the friction rows cannot represent."""
@@ -3961,7 +3970,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             if load_coefficient is not None:
                 # Without load rows from construction, every nonzero coefficient is unsupported.
                 supported = (
-                    self._friction_dof_supported if self._joint_friction_load_active else self._friction_dof_unsupported
+                    self._friction_load_dof_supported
+                    if self._joint_friction_load_active
+                    else self._friction_dof_unsupported
                 )
                 wp.launch(
                     flag_invalid_joint_friction,
@@ -3993,11 +4004,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         supported = np.isin(joint_type, (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6)))
         if self._model_plan is not None:
             supported &= self._model_plan.loop_joint_articulation < 0
-        coefficients = {"joint_friction": model.joint_friction}
+        coefficients = {"joint_friction": (model.joint_friction, supported)}
         load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
         if load_coefficient is not None:
-            coefficients["steel:joint_friction_load_coefficient"] = load_coefficient
-        for name, array in coefficients.items():
+            single_axis = np.isin(joint_type, (int(JointType.REVOLUTE), int(JointType.PRISMATIC)))
+            coefficients["steel:joint_friction_load_coefficient"] = (load_coefficient, supported & single_axis)
+        for name, (array, joint_supported) in coefficients.items():
             values = array.numpy()
             if values.shape != (model.joint_dof_count,):
                 raise ValueError(f"{name} has shape {values.shape}, expected ({model.joint_dof_count},)")
@@ -4005,7 +4017,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 raise ValueError(f"{name} must be finite and non-negative")
             if array is load_coefficient and not self._joint_friction_load_active and np.any(values > 0.0):
                 raise ValueError(f"{name} was zero at construction and must stay zero")
-            unsupported = np.flatnonzero((values > 0.0) & ~supported[joint_dof_joint])
+            unsupported = np.flatnonzero((values > 0.0) & ~joint_supported[joint_dof_joint])
             if unsupported.size:
                 joint = int(joint_dof_joint[unsupported[0]])
                 raise ValueError(
@@ -4034,6 +4046,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._friction_dof_world = wp.array(joint_world[joint_dof_joint], dtype=wp.int32, device=model.device)
         self._friction_dof_unsupported = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+        single_axis = np.isin(model.joint_type.numpy(), (int(JointType.REVOLUTE), int(JointType.PRISMATIC)))
+        self._friction_load_dof_supported = wp.array(
+            (supported & single_axis)[joint_dof_joint].astype(np.int32), dtype=wp.int32, device=model.device
+        )
 
     @override
     def reset(
@@ -4121,13 +4137,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._fk_id_cache_source_state = state
         if self._joint_friction_load_active:
             if world_mask is None:
-                self._joint_friction_load.zero_()
+                self._joint_friction_reaction.zero_()
             else:
                 wp.launch(
-                    reset_joint_friction_load,
+                    reset_joint_friction_reaction,
                     dim=self.model.joint_dof_count,
                     inputs=[world_mask, self._friction_dof_world],
-                    outputs=[self._joint_friction_load],
+                    outputs=[self._joint_friction_reaction],
                     device=self.model.device,
                 )
         self._clear_warmstart_history(world_mask)
@@ -9765,21 +9781,20 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         if self._joint_friction_load_active:
             wp.launch(
-                compute_joint_friction_load,
+                compute_joint_friction_reaction,
                 dim=model.joint_dof_count,
                 inputs=[
-                    self._namespaced_attribute("joint_friction_load_coefficient"),
+                    self._friction_load_dof_supported,
                     self._joint_friction_load_dof_joint,
                     model.joint_child,
                     model.joint_X_c,
                     model.joint_axis,
-                    model.joint_qd_start,
                     model.joint_dof_dim,
                     state_in.body_q,
                     model.body_com,
                     body_parent_f,
                 ],
-                outputs=[self._joint_friction_load],
+                outputs=[self._joint_friction_reaction],
                 device=model.device,
             )
 
@@ -12318,7 +12333,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 wp.launch(
                     add_joint_friction_load,
                     dim=model.joint_dof_count,
-                    inputs=[model.joint_friction, self._joint_friction_load],
+                    inputs=[
+                        model.joint_friction,
+                        self._namespaced_attribute("joint_friction_load_coefficient"),
+                        self._joint_friction_reaction,
+                    ],
                     outputs=[self._joint_friction_total],
                     device=model.device,
                 )

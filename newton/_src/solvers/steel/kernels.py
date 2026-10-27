@@ -68,8 +68,12 @@ PGS_CONSTRAINT_TYPE_COUNT = 12
 # Bits of the allocator's ``angular_friction_enabled``: articulated rows on the dense and propagation families,
 # free-rigid rows.
 ANGULAR_FRICTION_DENSE = 1
-# Fixed-point scale of deterministic wrench accumulation [1/N or 1/(N m)]; resolves 1e-9 up to about 8e9.
-WRENCH_FIXED_POINT_SCALE = wp.constant(1073741824.0)
+# Fixed-point scale of deterministic wrench accumulation [1/N or 1/(N m)].
+WRENCH_FIXED_POINT_SCALE = wp.constant(16777216.0)
+# Largest fixed-point term (2^53); a body's sum stays exact for up to 1024 terms of this size.
+WRENCH_FIXED_POINT_TERM_MAX = wp.constant(9007199254740992.0)
+# Finalized sums beyond 2^62 are flagged as possibly wrapped.
+WRENCH_FIXED_POINT_SUM_MAX = wp.constant(wp.int64(4611686018427387904))
 ANGULAR_FRICTION_FREE_RIGID = 2
 ANGULAR_FRICTION_PROPAGATION = 4
 
@@ -1875,12 +1879,19 @@ def _add_wrench(
     body_wrench_fixed: wp.array2d[wp.int64],
     fixed: int,
 ):
-    """Accumulate a wrench, in fixed point when ``fixed`` is set so the sum is independent of thread order."""
+    """Accumulate a wrench, in fixed point when ``fixed`` is set so the sum is independent of thread order.
+
+    The fixed-point buffer's last row counts terms clamped to the representable range.
+    """
     if body < 0:
         return
     if fixed != 0:
         for k in range(6):
-            wp.atomic_add(body_wrench_fixed, body, k, wp.int64(wp.round(wrench[k] * WRENCH_FIXED_POINT_SCALE)))
+            term = wrench[k] * WRENCH_FIXED_POINT_SCALE
+            if not (wp.abs(term) <= WRENCH_FIXED_POINT_TERM_MAX):
+                wp.atomic_add(body_wrench_fixed, body_wrench_fixed.shape[0] - 1, 0, wp.int64(1))
+                term = wp.clamp(term, -WRENCH_FIXED_POINT_TERM_MAX, WRENCH_FIXED_POINT_TERM_MAX)
+            wp.atomic_add(body_wrench_fixed, body, k, wp.int64(wp.round(term)))
     else:
         wp.atomic_add(body_wrench, body, wrench)
 
@@ -1922,89 +1933,76 @@ def finalize_fixed_point_wrenches(body_wrench_fixed: wp.array2d[wp.int64], body_
     inv_scale = 1.0 / WRENCH_FIXED_POINT_SCALE
     w = wp.spatial_vector()
     for k in range(6):
-        w[k] = wp.float32(body_wrench_fixed[body, k]) * inv_scale
+        total = body_wrench_fixed[body, k]
+        if total > WRENCH_FIXED_POINT_SUM_MAX or total < -WRENCH_FIXED_POINT_SUM_MAX:
+            wp.atomic_add(body_wrench_fixed, body_wrench_fixed.shape[0] - 1, 0, wp.int64(1))
+        w[k] = wp.float32(total) * inv_scale
     body_wrench[body] = w
 
 
 @wp.kernel
-def compute_joint_friction_load(
-    joint_friction_load_coefficient: wp.array[float],
+def compute_joint_friction_reaction(
+    joint_friction_reaction_dof: wp.array[wp.int32],
     dof_joint: wp.array[wp.int32],
     joint_child: wp.array[int],
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
-    joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     body_parent_f: wp.array[wp.spatial_vector],
     # outputs
-    joint_friction_load: wp.array[float],
+    joint_friction_reaction: wp.array[float],
 ):
-    """Bound each DOF's friction by its coefficient times the transverse joint reaction of the last step."""
+    """Write ``|F| + |T|`` of each single-axis DOF's transverse joint reaction, with ``T`` about the joint anchor."""
     dof = wp.tid()
-    coefficient = joint_friction_load_coefficient[dof]
-    load = float(0.0)
-    if coefficient > 0.0:
+    reaction = float(0.0)
+    if joint_friction_reaction_dof[dof] != 0:
         joint = int(dof_joint[dof])
         child = joint_child[joint]
         X_wc = body_q[child]
         X_wj = X_wc * joint_X_c[joint]
         wrench = body_parent_f[child]
         force = wp.spatial_top(wrench)
-        # Move the torque reference from the child COM to the joint anchor.
         torque = wp.spatial_bottom(wrench) + wp.cross(
             wp.transform_point(X_wc, body_com[child]) - wp.transform_get_translation(X_wj), force
         )
-        q_wj = wp.transform_get_rotation(X_wj)
-        start = joint_qd_start[joint]
-        lin_count = joint_dof_dim[joint, 0]
-        force = _remove_joint_axes(force, q_wj, joint_axis, start, lin_count)
-        torque = _remove_joint_axes(torque, q_wj, joint_axis, start + lin_count, joint_dof_dim[joint, 1])
-        load = coefficient * (wp.length(force) + wp.length(torque))
-    joint_friction_load[dof] = load
+        # A single REVOLUTE or PRISMATIC axis is the same in the parent and child joint frames.
+        axis = wp.normalize(wp.quat_rotate(wp.transform_get_rotation(X_wj), joint_axis[dof]))
+        if joint_dof_dim[joint, 0] > 0:
+            force = force - wp.dot(force, axis) * axis
+        else:
+            torque = torque - wp.dot(torque, axis) * axis
+        reaction = wp.length(force) + wp.length(torque)
+    joint_friction_reaction[dof] = reaction
 
 
 @wp.kernel
 def add_joint_friction_load(
     joint_friction: wp.array[float],
-    joint_friction_load: wp.array[float],
+    joint_friction_load_coefficient: wp.array[float],
+    joint_friction_reaction: wp.array[float],
     # outputs
     joint_friction_total: wp.array[float],
 ):
     dof = wp.tid()
-    joint_friction_total[dof] = joint_friction[dof] + joint_friction_load[dof]
+    total = joint_friction[dof]
+    coefficient = joint_friction_load_coefficient[dof]
+    if coefficient > 0.0:
+        total += coefficient * joint_friction_reaction[dof]
+    joint_friction_total[dof] = total
 
 
 @wp.kernel
-def reset_joint_friction_load(
+def reset_joint_friction_reaction(
     world_mask: wp.array[wp.bool],
     dof_world: wp.array[wp.int32],
     # outputs
-    joint_friction_load: wp.array[float],
+    joint_friction_reaction: wp.array[float],
 ):
     dof = wp.tid()
     if world_mask[dof_world[dof]]:
-        joint_friction_load[dof] = 0.0
-
-
-@wp.func
-def _remove_joint_axes(v: wp.vec3, q_wj: wp.quat, joint_axis: wp.array[wp.vec3], first: int, count: int):
-    """Remove the components of ``v`` along a joint's world axes, orthonormalized in DOF order."""
-    e0 = wp.vec3()
-    e1 = wp.vec3()
-    for k in range(count):
-        a = wp.quat_rotate(q_wj, joint_axis[first + k])
-        a = a - wp.dot(a, e0) * e0 - wp.dot(a, e1) * e1
-        n = wp.length(a)
-        if n > 1.0e-6:
-            a = a / n
-            v = v - wp.dot(v, a) * a
-            if wp.length_sq(e0) == 0.0:
-                e0 = a
-            else:
-                e1 = a
-    return v
+        joint_friction_reaction[dof] = 0.0
 
 
 @wp.kernel

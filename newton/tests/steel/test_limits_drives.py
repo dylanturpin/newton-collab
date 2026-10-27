@@ -23,12 +23,14 @@ from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     ROW_SLOTS_ATOMIC,
+    _add_wrench,
     allocate_joint_velocity_limit_slots,
     allocate_rigid_velocity_limit_slots,
     build_joint_limit_rows_for_size,
     eval_rigid_tau,
     eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
+    finalize_fixed_point_wrenches,
     prepare_augmented_joint_drives,
     prescale_joint_velocity_limits,
 )
@@ -2385,7 +2387,8 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
                 self.assertAlmostEqual(float(qd[0]), effort / inertia * DT_joint_friction, delta=1.0e-5)
                 if effort < bound:
                     np.testing.assert_allclose(qd[1:], 0.0, atol=1.0e-6)
-                    self.assertAlmostEqual(float(solver._joint_friction_load.numpy()[0]), bound, delta=1.0e-5)
+                    load = LOAD_COEFFICIENT * float(solver._joint_friction_reaction.numpy()[0])
+                    self.assertAlmostEqual(load, bound, delta=1.0e-5)
                 else:
                     acceleration = np.diff(qd[1:]) / DT_joint_friction
                     np.testing.assert_allclose(acceleration, (effort - bound) / inertia, rtol=1.0e-2)
@@ -2432,7 +2435,7 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
             self.assertTrue(solver._parent_wrench_fixed_point)
             pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=256)
             q, qd = _advance_hinge(solver, model, 0.5, 40, None, pipeline)
-            runs.append((q, qd, solver._joint_friction_load.numpy()))
+            runs.append((q, qd, solver._joint_friction_reaction.numpy()))
         self.assertGreater(float(runs[0][2][0]), 0.0)
         for first, second in zip(*runs, strict=True):
             np.testing.assert_array_equal(first, second)
@@ -2477,6 +2480,73 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
                 solver.reset(states[0], world_mask=world_mask)
                 _, qd = _advance(solver, states, control, 10)
                 np.testing.assert_array_equal(qd, fresh)
+
+    def test_coefficient_edits_apply_at_the_next_step(self):
+        """Scale the lagged reaction by the coefficient current at the step, not the one that measured it."""
+        model = _payload_hinge_model(2.0)
+        solver = _solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control.joint_f.fill_(0.2)
+        _, qd = _advance(solver, states, control, 5)
+        np.testing.assert_allclose(qd[1:], 0.0, atol=1.0e-6)
+        _load_coefficient(model).zero_()
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        _, qd = _advance(solver, states, control, 1)
+        inertia = 0.01 + 2.0 * ARM_LENGTH**2
+        self.assertAlmostEqual(float(qd), 0.2 / inertia * DT_joint_friction, delta=1.0e-5)
+
+    def test_masked_reset_keeps_other_worlds(self):
+        """Clear the lagged reaction of reset worlds only."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+        SolverSteel.register_custom_attributes(builder)
+        for mass in (0.5, 2.0):
+            builder.add_world(_payload_hinge_builder(mass))
+        model = builder.finalize()
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        solver = _solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        _advance(solver, states, control, 3)
+        before = solver._joint_friction_reaction.numpy().copy()
+        solver.reset(states[0], world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
+        np.testing.assert_array_equal(solver._joint_friction_reaction.numpy(), [0.0, before[1]])
+        self.assertGreater(float(before[1]), 0.0)
+
+    def test_rejects_multi_axis_joints(self):
+        """Reject coefficients on D6 DOFs, whose motion subspace the single-axis projection does not cover."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+        SolverSteel.register_custom_attributes(builder)
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+        cfg = newton.ModelBuilder.JointDofConfig
+        joint = builder.add_joint_d6(
+            -1, body, linear_axes=[cfg(axis=(1.0, 0.0, 0.0))], angular_axes=[cfg(axis=(0.0, 0.0, 1.0))]
+        )
+        builder.add_articulation([joint])
+        model = builder.finalize()
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        with self.assertRaisesRegex(ValueError, "D6"):
+            _solver(model)
+
+    def test_fixed_point_overflow_is_clamped_and_reported(self):
+        """Clamp out-of-range fixed-point terms, flag them and flag sums that could wrap."""
+        for values, total, flagged in (([1.0, 2.0, 3.0], 6.0, 0), ([1.0e10], 2.0**29, 1), ([3.0e8] * 1000, None, 1)):
+            with self.subTest(count=len(values), value=values[0]):
+                device = wp.get_device()
+                fixed = wp.zeros((2, 6), dtype=wp.int64, device=device)
+                wrench = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+                inputs = [wp.array(values, dtype=wp.float32, device=device)]
+                wp.launch(_add_wrench_kernel, dim=len(values), inputs=inputs, outputs=[wrench, fixed], device=device)
+                wp.launch(finalize_fixed_point_wrenches, dim=1, inputs=[fixed], outputs=[wrench], device=device)
+                self.assertEqual(int(fixed.numpy()[1, 0]), flagged)
+                if total is not None:
+                    self.assertAlmostEqual(float(wrench.numpy()[0, 0]), total, delta=1.0e-6 * total)
+        model = _payload_hinge_model(2.0)
+        solver = _solver(model, deterministic=True)
+        solver._parent_wrench_fixed[-1:].fill_(1)
+        with self.assertRaisesRegex(RuntimeError, "fixed-point range"):
+            solver.check_joint_friction()
+        solver.check_joint_friction()
 
     def test_rejects_invalid_coefficients(self):
         """Raise for invalid coefficients and for enabling the mode after construction."""
@@ -2608,6 +2678,12 @@ def _unsupported_joint_model(joint, *, friction):
     builder.add_articulation([index])
     builder.joint_friction = [friction] * len(builder.joint_friction)
     return builder.finalize()
+
+
+@wp.kernel
+def _add_wrench_kernel(values: wp.array[wp.float32], wrench: wp.array[wp.spatial_vector], fixed: wp.array2d[wp.int64]):
+    i = wp.tid()
+    _add_wrench(0, wp.spatial_vector(values[i], 0.0, 0.0, 0.0, 0.0, 0.0), wrench, fixed, 1)
 
 
 def _payload_hinge_builder(mass, *, ground=False, boxes=0, register=True):
