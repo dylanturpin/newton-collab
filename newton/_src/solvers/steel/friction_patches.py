@@ -589,6 +589,8 @@ def _build(
     prev: _PatchFrame,
     patches: FrictionPatches,
     flooded: int,
+    contact_surface_velocity: wp.array[wp.vec3],
+    dt: float,
 ):
     """One thread per sorted body pair; writes disjoint current/previous records.
 
@@ -833,6 +835,12 @@ def _build(
             motion = wp.vec3(0.0)
             if prev_start < prev_stop:
                 motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
+                if contact_surface_velocity:
+                    # Anchors ride moving surfaces; the velocity is shape 1's relative to shape 0.
+                    surface_motion = contact_surface_velocity[c] * dt
+                    if frame.flipped[c] == 0:
+                        surface_motion = -surface_motion
+                    motion += surface_motion
             for j in range(prev_start, prev_anchor_stop):
                 p = prev.members[j]
                 if (
@@ -1349,6 +1357,7 @@ class _FrictionPatchState:
         frozen_bodies=None,
         shape_material_mu=None,
         angular_mu=None,
+        dt=0.0,
     ):
         """Build this step's friction patches.
 
@@ -1436,6 +1445,8 @@ class _FrictionPatchState:
                 self.previous,
                 self.view,
                 int(flooded),
+                contacts.rigid_contact_surface_velocity,
+                dt,
             ],
             device=model.device,
         )
@@ -1622,6 +1633,7 @@ def finish_patch_impulses(
     q_out: wp.array[wp.transform],
     qd_out: wp.array[wp.spatial_vector],
     com: wp.array[wp.vec3],
+    contact_surface_velocity: wp.array[wp.vec3],
     world: wp.array[int],
     slot: wp.array[int],
     path: wp.array[int],
@@ -1674,6 +1686,11 @@ def finish_patch_impulses(
     speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
         q_out, qd_out, com, b, frame.anchor_b[c]
     )
+    if contact_surface_velocity:
+        if frame.flipped[c] == 0:
+            speed -= contact_surface_velocity[c]
+        else:
+            speed += contact_surface_velocity[c]
     # Check opposing tangential motion to distinguish slipping from impending slip.
     if radius > 0.0 and wp.length(tangent) >= (1.0 - 1.0e-5) * radius:
         if wp.dot(speed, tangent) < -radius * (1.0e-5 * frame.radius[c] / dt):

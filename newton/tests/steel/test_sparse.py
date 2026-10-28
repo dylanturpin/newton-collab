@@ -450,6 +450,7 @@ class TestSparseContacts(unittest.TestCase):
                 f["shape_body"],
                 f["body_q"],
                 _full(4, wp.spatial_vector(0.0), wp.spatial_vector),
+                None,
                 _array([0], int),
                 f["origin"],
                 _array([0.8] * 4),

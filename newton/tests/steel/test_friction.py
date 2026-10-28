@@ -500,6 +500,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 phi_arr,
                 row_type,
                 zeros3(),
+                zeros3(),
+                0,
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
                 inf,
                 1.0e-6,
@@ -525,6 +527,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 phi_arr,
                 row_type,
                 zeros3(),
+                zeros3(),
+                0,
                 dt,
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
                 3,
@@ -836,6 +840,72 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                     # The free box's contact is a matrix-free row; the articulated box's is a dense one.
                     self.assertEqual(mf_rows == 0, articulated)
                     self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    def test_surface_velocity_belt_drags_the_box(self):
+        """A box on a mesh belt with surface velocity reaches the surface speed.
+
+        Covers free and articulated boxes, every articulated response and friction mode with point friction, and
+        fixed-normal friction with persistent anchors, which must follow the moving surface. Uncolored propagation
+        supports only fixed-normal friction.
+        """
+        modes = ("fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton")
+        cases = [(mode, 0.0) for mode in modes] + [("fixed_normal", 0.2)]
+        for articulated, response, response_cases in (
+            (False, "immediate", cases),
+            (True, "immediate", cases),
+            (True, "propagation", [("fixed_normal", 0.0), ("fixed_normal", 0.2)]),
+            (True, "propagation_colored", cases),
+        ):
+            for mode, anchor_beta in response_cases:
+                with self.subTest(articulated=articulated, response=response, mode=mode, anchor_beta=anchor_beta):
+                    mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
+                    self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
+
+
+def _surface_belt_ride(mode, articulated, response, anchor_beta, speed=0.5, steps=120, window=30):
+    """Step a box on a static mesh belt whose surface moves at ``speed`` along x; return its mean x velocity."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    pose = wp.transform((0.0, 0.0, 0.05), wp.quat_identity())
+    box = (builder.add_link if articulated else builder.add_body)(xform=pose)
+    if articulated:
+        joint = builder.add_joint_d6(
+            parent=-1,
+            child=box,
+            parent_xform=pose,
+            linear_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+            angular_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+        )
+        builder.add_articulation([joint])
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        articulated_contact_response=response,
+        friction_mode=mode,
+        friction_anchor_beta=anchor_beta,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    for step in range(steps):
+        if step == steps - window:
+            x_start = state.body_q.numpy()[box, 0]
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+        state, next_state = next_state, state
+    return (state.body_q.numpy()[box, 0] - x_start) * 240.0 / window
 
 
 def _resting_box(response, mode, articulated, steps=120):
@@ -1338,6 +1408,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             state.body_q,
             velocity,
             wp.zeros(2, dtype=wp.vec3, device="cpu"),
+            None,
             zeros,
             zeros,
             zeros,
@@ -1530,6 +1601,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         state.body_q,
                         qd,
                         com,
+                        None,
                         zeros,
                         wp.array([slot], dtype=int, device="cpu"),
                         zeros,
