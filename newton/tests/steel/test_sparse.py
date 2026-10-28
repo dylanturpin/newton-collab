@@ -658,7 +658,7 @@ class TestSparseContacts(unittest.TestCase):
                 self._check_joint_limit_parallel_scan("cuda:0", capacity)
 
     def test_restitution_matches_dense_incident_projection(self):
-        """Preserve impact selection and target subtraction from the dense matrix-free law."""
+        """Preserve the reach test and target subtraction from the dense matrix-free law."""
         row_count = 7
         kinds = _array([[PGS_CONSTRAINT_TYPE_CONTACT] * 5 + [PGS_CONSTRAINT_TYPE_FRICTION] * 2], int)
         phi = _array([[-0.01, 0.01, 0.5, -0.01, -0.01, -0.01, -0.01]])
@@ -683,7 +683,6 @@ class TestSparseContacts(unittest.TestCase):
                 _array([np.arange(row_count)], int),
                 _array(np.eye(row_count)[None]),
                 0.01,
-                0.1,
                 0,
             ],
             outputs=[dense_rhs, _full((1, row_count), 1.0)],
@@ -700,13 +699,12 @@ class TestSparseContacts(unittest.TestCase):
                 rebound_velocity,
                 incident,
                 0.01,
-                0.1,
             ],
             outputs=[sparse_rhs],
             device="cpu",
         )
         np.testing.assert_array_equal(sparse_rhs.numpy(), dense_rhs.numpy())
-        np.testing.assert_allclose(sparse_rhs.numpy()[0], [-0.8, -1.08, -7.0, -7.0, -1.2, -7.0, -7.0], atol=1.0e-6)
+        np.testing.assert_allclose(sparse_rhs.numpy()[0], [-0.8, -1.08, -7.0, -0.02, -1.2, -7.0, -7.0], atol=1.0e-6)
 
     def test_decode_factor_velocity(self):
         """Decode accumulated factor impulses into the original physical DOF order."""

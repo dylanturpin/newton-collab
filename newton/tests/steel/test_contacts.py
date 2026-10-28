@@ -211,7 +211,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             1.0,
             0.5,
             scale,
-            0.5,
             1,
         ],
         outputs=[
@@ -250,7 +249,6 @@ def _propagation_speculative_rhs(scale: float) -> float:
             1.0,
             0.5,
             scale,
-            0.5,
             1,
         ],
         outputs=[
@@ -281,7 +279,6 @@ def _dense_restitution_rhs(scale: float) -> float:
             wp.array([[1.0]], dtype=wp.float32, device="cpu"),  # rebound of e = 0.5 from a 2 m/s step-start closing
             1.0,
             scale,
-            0.0,
             0,
         ],
         outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
@@ -2577,6 +2574,69 @@ def test_pressed_landing_rebounds_from_step_start_speed_and_settles(test, device
             test.assertLess(float(forces[tail].max()), 1.1 * load, f"{label}: the contact force spiked")
 
 
+def test_exit_velocity_is_monotonic_in_a_separating_force(test, device):
+    """Leave a touching impact at ``max(e * u_start, post-force velocity)`` as an upward force grows.
+
+    The force slows the closing contact within the step, then reverses it; the exit velocity must never drop.
+    """
+    closing_speed = 2.0
+    forces = np.linspace(0.0, 700.0, 29)
+    post_force = -closing_speed + PRESSED_DT * (forces - 9.81)
+    expected = np.maximum(PRESSED_RESTITUTION * closing_speed, post_force)
+    for scene, solve_mode, response in (
+        ("free", "split", None),
+        ("free", "matrix_free", "immediate"),
+        ("free", "matrix_free", "propagation"),
+        ("articulated", "split", None),
+        ("articulated", "matrix_free", "immediate"),
+        ("articulated", "matrix_free", "propagation"),
+    ):
+        label = f"{scene}/{solve_mode}/{response}"
+        with test.subTest(case=label):
+            exit_velocity = _sweep_separating_force(device, scene, solve_mode, response, forces, closing_speed)
+            np.testing.assert_allclose(exit_velocity, expected, atol=2.0e-3, err_msg=f"{label}: exit velocity")
+            test.assertGreaterEqual(float(np.diff(exit_velocity).min()), -1.0e-4, f"{label}: exit velocity dropped")
+
+
+def _sweep_separating_force(device, scene, solve_mode, response, forces, closing_speed):
+    """Step one world per force once: a 1 kg box touching the ground, closing, pushed up; return its exit speed."""
+    env = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, restitution=PRESSED_RESTITUTION, gap=0.01)
+    pose = wp.transform(wp.vec3(0.0, 0.0, BOX_HALF_HEIGHT), wp.quat_identity())
+    if scene == "free":
+        body = env.add_body(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
+    else:
+        body = env.add_link(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
+        env.add_articulation([env.add_joint_prismatic(-1, body, axis=(0.0, 0.0, 1.0), parent_xform=pose)])
+    env.add_shape_box(body, hx=0.05, hy=0.05, hz=BOX_HALF_HEIGHT, cfg=cfg)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    builder.replicate(env, len(forces))
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    kwargs = {"solve_mode": solve_mode, "iterations": 16, "restitution_velocity_threshold": PRESSED_THRESHOLD}
+    if response is not None:
+        kwargs["articulated_contact_response"] = response
+    solver = SolverSteel(model, **kwargs)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    dofs_per_world = model.joint_dof_count // len(forces)
+    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    joint_qd[(2 if scene == "free" else 0) :: dofs_per_world] = -closing_speed
+    state_in.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    state_in.clear_forces()
+    if scene == "free":
+        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+        wrench[:, 2] = forces
+        state_in.body_f.assign(wrench)
+    else:
+        control.joint_f.assign(forces.astype(np.float32))
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, control, contacts, PRESSED_DT)
+    return state_out.body_qd.numpy()[:, 2].astype(np.float64)
+
+
 def _roll_pressed_box(device, *, solve_mode, response, steps, initial_gap=0.0, initial_speed=0.0):
     """Step a 1 kg free box pressed down by a body force; return its bottom height, vertical speed and contact force."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -3390,6 +3450,7 @@ for _fn in (
     test_drive_pressed_resting_contact_does_not_bounce,
     test_force_pressed_resting_free_body_does_not_bounce,
     test_pressed_landing_rebounds_from_step_start_speed_and_settles,
+    test_exit_velocity_is_monotonic_in_a_separating_force,
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
@@ -3643,7 +3704,6 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 0.5,
                 position_velocity,
                 position_velocity,
-                0.5,
                 1,
             ],
             outputs=[rhs],

@@ -621,7 +621,6 @@ def apply_sparse_contact_restitution(
     row_rebound_velocity: wp.array2d[float],
     row_incident: wp.array2d[float],
     dt: float,
-    restitution_velocity_threshold: float,
     rhs: wp.array2d[float],
 ):
     """Use the already projected incident velocity for the unchanged impact law."""
@@ -630,9 +629,7 @@ def apply_sparse_contact_restitution(
         return
     rebound_velocity = row_rebound_velocity[world, row]
     relative_incident = row_incident[world, row] - target_velocity[world, row]
-    if rebound_velocity > 0.0 and contact_restitution_fires(
-        phi[world, row], relative_incident, dt, restitution_velocity_threshold
-    ):
+    if rebound_velocity > 0.0 and contact_restitution_fires(phi[world, row], relative_incident, dt):
         rhs[world, row] = -target_velocity[world, row] - rebound_velocity
 
 

@@ -1529,14 +1529,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
     Rigid-contact restitution is part of the ordinary normal contact row in
-    ``"split"`` and ``"matrix_free"`` modes. It uses the
-    two shape coefficients combined by ``restitution_combine``. A contact whose
-    relative normal velocity ``u_start`` at the start of the step closes faster
-    than the threshold, and which is predicted to reach the surface during the
-    step, replaces its geometric/speculative bias with Newton's rebound target
-    ``-e * u_start``. Forces applied during the step (gravity, drives, joint and
-    body forces) count toward reaching the surface but neither make a resting
-    contact an impact nor enlarge the rebound. Optional
+    ``"split"`` and ``"matrix_free"`` modes. It uses the two shape coefficients
+    combined by ``restitution_combine``. A contact whose relative normal
+    velocity ``u_start`` at the start of the step closes faster than the
+    threshold, and which touches the surface or is predicted to reach it during
+    the step, replaces its geometric/speculative bias with Newton's rebound
+    target ``-e * u_start`` as a lower bound on the separating velocity. Forces
+    applied during the step (gravity, drives, joint and body forces) count
+    toward reaching the surface but neither make a resting contact an impact nor
+    enlarge the rebound. Optional
     ``velocity_iterations`` refine the result but are never enabled
     implicitly. As in a conventional discrete PGS solver, the qualifying
     rebound velocity is used for the whole step; this gives the intended
@@ -2545,12 +2546,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 zero, so a model that authors no restitution does not bounce.
                 ``False`` turns restitution off for every contact regardless of the
                 coefficients.
-            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact, both at
-                the start of the step and in the frozen pre-contact relative normal velocity, required to apply
-                restitution. The contact must also be at the surface or be predicted to reach it during the
-                timestep. Slower contacts retain the speculative or Baumgarte contact law, so a resting contact
-                pressed by gravity, a drive or an applied force does not bounce. A qualifying contact leaves with
-                ``e`` times its step-start closing speed.
+            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact at the
+                start of the step required to apply restitution. The contact must also be at the surface or be
+                predicted to reach it during the timestep. Slower contacts retain the speculative or Baumgarte
+                contact law, so a resting contact pressed by gravity, a drive or an applied force does not bounce.
+                A qualifying contact leaves with at least ``e`` times its step-start closing speed, or faster if
+                this step's forces already separate it faster.
                 Restitution coefficients are combined by ``restitution_combine`` after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
@@ -8891,7 +8892,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_w,
                     dt,
                     self._contact_speculative_scale,
-                    self._rebound_velocity_threshold,
                     self._propagation_max_constraints,
                 ],
                 outputs=[
@@ -13923,7 +13923,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -14004,7 +14003,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._row_rebound_velocity,
                         self._sparse_row_incident,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14030,7 +14028,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._sparse_diagonal_row_dof,
                         self._sparse_diagonal_row_jy,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14051,7 +14048,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
                 outputs=[self._rhs, self._row_w],
@@ -14071,7 +14067,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._row_rebound_velocity,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 int(self._regularization_enabled),
             ],
             outputs=[self._rhs, self._row_w],
@@ -14450,7 +14445,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_w,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[
@@ -14488,7 +14482,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dt,
                 self._v_out_snap,
                 self._v_hat,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[output],

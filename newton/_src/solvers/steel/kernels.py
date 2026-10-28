@@ -6199,7 +6199,6 @@ def apply_sparse_diagonal_contact_restitution_matrix_free(
     sparse_row_dof: wp.array3d[int],
     sparse_row_jy: wp.array3d[float],
     dt: float,
-    restitution_velocity_threshold: float,
     # in/out
     world_rhs: wp.array2d[float],
 ):
@@ -6232,7 +6231,7 @@ def apply_sparse_diagonal_contact_restitution_matrix_free(
     target_vel = world_target_velocity[world, row]
     relative_incident -= target_vel
     phi = world_phi[world, row]
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+    if contact_restitution_fires(phi, relative_incident, dt):
         world_rhs[world, row] = -target_vel - rebound_velocity
 
 
@@ -6306,16 +6305,11 @@ def contact_restitution_fires(
     phi: float,
     relative_incident: float,
     dt: float,
-    restitution_velocity_threshold: float,
 ):
-    """Return whether a frozen incident impact qualifies for a rebound target.
+    """Return whether a contact with a rebound target touches the surface or is predicted to reach it this step.
 
-    Fires only for a sufficiently fast closing contact that is already at the
-    surface or is predicted to reach it during the step; the end-gap slop
-    absorbs float32 residuals on rows that land exactly at contact.
+    The end-gap slop absorbs float32 residuals on rows that land exactly at contact.
     """
-    if relative_incident >= -restitution_velocity_threshold:
-        return False
     if phi <= _CONTACT_END_GAP_SLOP:
         return True
     return phi + dt * relative_incident <= _CONTACT_END_GAP_SLOP
@@ -7254,7 +7248,6 @@ def apply_world_contact_restitution_matrix_free(
     world_dof_indices: wp.array2d[int],
     world_J: wp.array3d[float],
     dt: float,
-    restitution_velocity_threshold: float,
     write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
@@ -7280,7 +7273,7 @@ def apply_world_contact_restitution_matrix_free(
         - target_vel
     )
 
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+    if contact_restitution_fires(phi, relative_incident, dt):
         # Matrix-free GS adds live J*v itself, so store only the target as the row bias.
         world_rhs[world, i] = -target_vel - rebound_velocity
         if write_row_w != 0:
@@ -7297,7 +7290,6 @@ def apply_world_contact_restitution_accumulated(
     world_row_rebound_velocity: wp.array2d[float],
     dt: float,
     contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
     write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
@@ -7321,7 +7313,7 @@ def apply_world_contact_restitution_accumulated(
     if phi < 0.0:
         geometric_bias = world_row_beta[world, i] * phi / dt
     relative_incident = world_rhs[world, i] - geometric_bias
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+    if contact_restitution_fires(phi, relative_incident, dt):
         # Impulse-space RHS contains u_incident already; the rebound replaces the geometric bias.
         world_rhs[world, i] = relative_incident - rebound_velocity
         if write_row_w != 0:
@@ -7342,7 +7334,6 @@ def compute_world_contact_velocity_bias(
     world_dof_indices: wp.array2d[int],
     world_J: wp.array3d[float],
     dt: float,
-    restitution_velocity_threshold: float,
     # outputs
     world_rhs: wp.array2d[float],
 ):
@@ -7368,7 +7359,7 @@ def compute_world_contact_velocity_bias(
                 world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
                 - target_vel
             )
-            if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+            if contact_restitution_fires(phi, relative_incident, dt):
                 bounce = int(1)
 
         if bounce != 0:
@@ -9438,7 +9429,6 @@ def compute_mf_effective_mass_and_rhs(
     contact_w: float,
     dt: float,
     contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
     mf_max_constraints: int,
     # outputs
     mf_eff_mass_inv: wp.array2d[float],
@@ -9557,7 +9547,7 @@ def compute_mf_effective_mass_and_rhs(
             if has_target_velocity != 0:
                 target_vel = mf_target_velocity[world, i]
             relative_incident -= target_vel
-            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
+            if contact_restitution_fires(phi_val, relative_incident, dt):
                 bias = -rebound_velocity
                 # An impact is impulsive, not a spring: keep the rebound exact.
                 row_w = 1.0
@@ -9589,7 +9579,6 @@ def compute_mf_rhs_bias(
     dt: float,
     position_velocity: wp.array[float],
     incident_velocity: wp.array[float],
-    restitution_velocity_threshold: float,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d[float],
@@ -9620,7 +9609,7 @@ def compute_mf_rhs_bias(
             if has_target_velocity != 0:
                 target_velocity = mf_target_velocity[world, i]
             relative_incident -= target_velocity
-            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
+            if contact_restitution_fires(phi_val, relative_incident, dt):
                 bounce = int(1)
 
         if bounce != 0:
@@ -9707,7 +9696,6 @@ def compute_propagation_effective_mass_and_rhs(
     contact_w: float,
     dt: float,
     contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
     propagation_max_constraints: int,
     # outputs
     propagation_eff_mass_inv: wp.array2d[float],
@@ -9787,7 +9775,7 @@ def compute_propagation_effective_mass_and_rhs(
             relative_incident = propagation_contact_row_dot(
                 propagation_J_a, propagation_J_b, propagation_body_qd, world, i, ba, bb
             )
-            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
+            if contact_restitution_fires(phi_val, relative_incident, dt):
                 restitution_target = rebound_velocity
                 # The propagation solve adds live J*v to this bias, so the
                 # Newton target replaces (rather than augments) speculative or
