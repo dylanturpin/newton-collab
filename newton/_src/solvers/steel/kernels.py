@@ -95,6 +95,12 @@ def local_solve_launch_gate():
 # activation to 1e-6 m of linearized separation.
 _CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 
+# How a contact pair combines its two shapes' friction or restitution coefficients; PhysX's combine modes.
+MATERIAL_COMBINE_AVERAGE = wp.constant(0)
+MATERIAL_COMBINE_MIN = wp.constant(1)
+MATERIAL_COMBINE_MULTIPLY = wp.constant(2)
+MATERIAL_COMBINE_MAX = wp.constant(3)
+
 # Row-slot reservation modes of the joint-row families. ATOMIC reserves from the per-world counter, so a
 # family's rows land in thread-scheduling order. COUNT and WRITE run a family twice around
 # :func:`scan_world_row_requests`, so each element's rows land in world-element order.
@@ -5076,22 +5082,11 @@ def contact_angular_friction_coefficients(
     shape_b: int,
     shape_material_mu_torsional: wp.array[float],
     shape_material_mu_rolling: wp.array[float],
+    friction_combine: int,
 ):
-    """Return the pair torsional and rolling coefficients [m], the mean of the shapes like sliding mu."""
-    torsional = float(0.0)
-    rolling = float(0.0)
-    count = int(0)
-    if shape_a >= 0:
-        torsional += shape_material_mu_torsional[shape_a]
-        rolling += shape_material_mu_rolling[shape_a]
-        count += 1
-    if shape_b >= 0:
-        torsional += shape_material_mu_torsional[shape_b]
-        rolling += shape_material_mu_rolling[shape_b]
-        count += 1
-    if count > 0:
-        torsional /= float(count)
-        rolling /= float(count)
+    """Return the pair torsional and rolling coefficients [m], combined like sliding mu."""
+    torsional = combine_shape_coefficients(shape_a, shape_b, shape_material_mu_torsional, friction_combine)
+    rolling = combine_shape_coefficients(shape_a, shape_b, shape_material_mu_rolling, friction_combine)
     if not wp.isfinite(torsional) or torsional < 0.0:
         torsional = 0.0
     if not wp.isfinite(rolling) or rolling < 0.0:
@@ -5187,6 +5182,7 @@ def _allocate_world_contact_slot(
     classify_only: int,
     shape_torsion_radius: wp.array[float],
     torsion_spares: int,
+    friction_combine: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -5365,7 +5361,7 @@ def _allocate_world_contact_slot(
             articulated_bit = ANGULAR_FRICTION_PROPAGATION
         if (angular_friction_enabled & articulated_bit) != 0 and free_rigid_pair == 0:
             torsional, rolling = contact_angular_friction_coefficients(
-                shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+                shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling, friction_combine
             )
             if torsional > 0.0 or rolling > 0.0:
                 slots_needed = 6
@@ -5484,6 +5480,7 @@ def allocate_world_contact_slots(
     classify_only: int,
     shape_torsion_radius: wp.array[float],
     torsion_spares: int,
+    friction_combine: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -5566,6 +5563,7 @@ def allocate_world_contact_slots(
             classify_only,
             shape_torsion_radius,
             torsion_spares,
+            friction_combine,
             contact_world,
             contact_slot,
             contact_art_a,
@@ -5720,6 +5718,8 @@ def prepare_world_contact_rows(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -5762,17 +5762,8 @@ def prepare_world_contact_rows(
             point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
 
         phi = wp.dot(normal, point_a_world - point_b_world)
-        mu = float(0.0)
-        material_count = int(0)
-        if shape_a >= 0:
-            mu += shape_material_mu[shape_a]
-            material_count += 1
-        if shape_b >= 0:
-            mu += shape_material_mu[shape_b]
-            material_count += 1
-        if material_count > 0:
-            mu /= float(material_count)
-        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+        mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
 
         friction_mu = mu * contact_friction_scale
 
@@ -6305,23 +6296,54 @@ def mixed_contact_restitution(
     shape_a: int,
     shape_b: int,
     shape_material_restitution: wp.array[float],
+    combine: int,
 ):
-    """Return the arithmetic-mean coefficient for one shape pair."""
-    restitution = float(0.0)
-    material_count = int(0)
+    """Return one shape pair's restitution: each coefficient clamped to [0, 1] (non-finite as 0), then combined."""
+    value_a = float(0.0)
+    value_b = float(0.0)
     if shape_a >= 0:
         value_a = shape_material_restitution[shape_a]
         if wp.isfinite(value_a):
-            restitution += wp.clamp(value_a, 0.0, 1.0)
-        material_count += 1
+            value_a = wp.clamp(value_a, 0.0, 1.0)
+        else:
+            value_a = 0.0
     if shape_b >= 0:
         value_b = shape_material_restitution[shape_b]
         if wp.isfinite(value_b):
-            restitution += wp.clamp(value_b, 0.0, 1.0)
-        material_count += 1
-    if material_count > 0:
-        restitution /= float(material_count)
-    return restitution
+            value_b = wp.clamp(value_b, 0.0, 1.0)
+        else:
+            value_b = 0.0
+    return combine_coefficient_pair(value_a, shape_a >= 0, value_b, shape_b >= 0, combine)
+
+
+@wp.func
+def combine_coefficient_pair(value_a: float, has_a: bool, value_b: float, has_b: bool, combine: int):
+    """Combine a contact pair's two coefficients by ``combine``; a pair with one shape keeps that shape's value."""
+    if has_a and has_b:
+        if combine == MATERIAL_COMBINE_MIN:
+            return wp.min(value_a, value_b)
+        if combine == MATERIAL_COMBINE_MULTIPLY:
+            return value_a * value_b
+        if combine == MATERIAL_COMBINE_MAX:
+            return wp.max(value_a, value_b)
+        return (value_a + value_b) / 2.0
+    if has_a:
+        return value_a
+    if has_b:
+        return value_b
+    return 0.0
+
+
+@wp.func
+def combine_shape_coefficients(shape_a: int, shape_b: int, coefficients: wp.array[float], combine: int):
+    """Return a contact pair's combined per-shape coefficient; a negative shape index has none."""
+    value_a = float(0.0)
+    value_b = float(0.0)
+    if shape_a >= 0:
+        value_a = coefficients[shape_a]
+    if shape_b >= 0:
+        value_b = coefficients[shape_b]
+    return combine_coefficient_pair(value_a, shape_a >= 0, value_b, shape_b >= 0, combine)
 
 
 @wp.func
@@ -6362,6 +6384,8 @@ def _populate_world_J_for_size_contact(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -6429,17 +6453,8 @@ def _populate_world_J_for_size_contact(
     phi = wp.dot(normal, point_a_world - point_b_world)
 
     # Compute friction coefficient
-    mu = 0.0
-    mat_count = 0
-    if shape_a >= 0:
-        mu += shape_material_mu[shape_a]
-        mat_count += 1
-    if shape_b >= 0:
-        mu += shape_material_mu[shape_b]
-        mat_count += 1
-    if mat_count > 0:
-        mu /= float(mat_count)
-    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
+    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
     friction_mu = mu * contact_friction_scale
 
     # Compute tangent basis for friction
@@ -6741,6 +6756,8 @@ def populate_world_J_for_size(
     pgs_cfm: float,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -6792,6 +6809,8 @@ def populate_world_J_for_size(
             pgs_cfm,
             friction_patches,
             friction_anchor_beta,
+            friction_combine,
+            restitution_combine,
             J_group,
             world_row_type,
             world_row_parent,
@@ -6860,6 +6879,7 @@ def populate_world_angular_friction_rows(
     shape_material_mu_rolling: wp.array[float],
     pgs_cfm: float,
     write_metadata: int,
+    friction_combine: int,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -6929,7 +6949,7 @@ def populate_world_angular_friction_rows(
                 world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
             if write_metadata != 0:
                 torsional, rolling = contact_angular_friction_coefficients(
-                    shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling
+                    shape_a, shape_b, shape_material_mu_torsional, shape_material_mu_rolling, friction_combine
                 )
                 world_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION
                 world_row_parent[world, row] = slot
@@ -7592,6 +7612,8 @@ def _build_mf_contact_row(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7666,17 +7688,8 @@ def _build_mf_contact_row(
     phi = wp.dot(normal, point_a_world - point_b_world)
 
     # Friction coefficient
-    mu = 0.0
-    mat_count = 0
-    if shape_a >= 0:
-        mu += shape_material_mu[shape_a]
-        mat_count += 1
-    if shape_b >= 0:
-        mu += shape_material_mu[shape_b]
-        mat_count += 1
-    if mat_count > 0:
-        mu /= float(mat_count)
-    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
+    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
     friction_mu = mu * contact_friction_scale
 
     # Tangent basis
@@ -7802,6 +7815,8 @@ def build_mf_contact_rows(
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7846,6 +7861,8 @@ def build_mf_contact_rows(
             contact_shared_anchor,
             friction_patches,
             friction_anchor_beta,
+            friction_combine,
+            restitution_combine,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -8068,6 +8085,7 @@ def build_propagation_articulated_angular_friction_rows(
     contact_mf_origin: wp.array[int],
     shape_material_mu_torsional: wp.array[float],
     shape_material_mu_rolling: wp.array[float],
+    friction_combine: int,
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -8092,7 +8110,11 @@ def build_propagation_articulated_angular_friction_rows(
             continue
         world = contact_world[c]
         torsional, rolling = contact_angular_friction_coefficients(
-            contact_shape0[c], contact_shape1[c], shape_material_mu_torsional, shape_material_mu_rolling
+            contact_shape0[c],
+            contact_shape1[c],
+            shape_material_mu_torsional,
+            shape_material_mu_rolling,
+            friction_combine,
         )
         body_a = propagation_body_a[world, slot]
         body_b = propagation_body_b[world, slot]
@@ -8201,6 +8223,8 @@ def build_propagation_contact_rows(
     world_unit_count: wp.array[int],
     unit_capacity: int,
     use_unit_order: int,
+    friction_combine: int,
+    restitution_combine: int,
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -8279,17 +8303,8 @@ def build_propagation_contact_rows(
 
     phi = wp.dot(normal, point_a_world - point_b_world)
 
-    mu = 0.0
-    mat_count = 0
-    if shape_a >= 0:
-        mu += shape_material_mu[shape_a]
-        mat_count += 1
-    if shape_b >= 0:
-        mu += shape_material_mu[shape_b]
-        mat_count += 1
-    if mat_count > 0:
-        mu /= float(mat_count)
-    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
+    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
 
     friction_mu = mu * contact_friction_scale
 
