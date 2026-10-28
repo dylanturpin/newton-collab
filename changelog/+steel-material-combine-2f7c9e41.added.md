@@ -1,0 +1,1 @@
+Add `friction_combine` and `restitution_combine` options to `SolverSteel` to combine a contact's two shape coefficients by `"average"` (the default and previous behaviour), `"min"`, `"multiply"` or `"max"`, as PhysX material combine modes do. `friction_combine` also applies to the articulated torsional and rolling coefficients.
