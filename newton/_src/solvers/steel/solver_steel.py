@@ -2463,8 +2463,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             friction_combine (str, optional): How a contact combines its two shapes' friction coefficients:
                 ``"average"``, ``"min"``, ``"multiply"`` or ``"max"``, as PhysX's material combine modes. It applies
                 to sliding friction (:attr:`~newton.Model.shape_material_mu`) and to the articulated torsional and
-                rolling coefficients; the ``steel:condim`` free-rigid rows keep the larger contributed coefficient. A
-                contact with one shape keeps that shape's coefficient. Construction-only. Defaults to
+                rolling coefficients. Exception: the ``steel:condim`` free-rigid angular rows keep the larger
+                contributed coefficient under every mode. A contact with one shape keeps that shape's coefficient. Construction-only. Defaults to
                 ``"average"``.
             restitution_combine (str, optional): How a contact combines its two shapes' restitution coefficients,
                 with the same modes as ``friction_combine``, after each coefficient is clamped to ``[0, 1]``.
