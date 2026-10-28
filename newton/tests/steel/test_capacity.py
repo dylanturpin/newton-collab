@@ -390,6 +390,7 @@ class TestSteelContactCapacity(unittest.TestCase):
                 0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 0,
+                0,
             ],
             outputs=[
                 contact_world,
@@ -539,6 +540,7 @@ class TestSteelContactCapacity(unittest.TestCase):
                 0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 0,
+                0,
             ],
             outputs=[
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -656,6 +658,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
             0,
         ],
         outputs=[

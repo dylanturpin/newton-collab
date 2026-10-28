@@ -19,14 +19,18 @@ from newton._src.solvers.steel.friction_patches import FrictionPatches, contact_
 from newton._src.solvers.steel.kernels import (
     allocate_world_contact_slots,
     apply_world_contact_restitution_accumulated,
+    combine_shape_coefficients,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
     compute_propagation_effective_mass_and_rhs,
     compute_world_contact_bias,
+    contact_angular_friction_coefficients,
+    mixed_contact_restitution,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
+from newton._src.solvers.steel.solver_steel import _MATERIAL_COMBINE_MODES
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import (
     _build_sparse_contact_friction_model,
@@ -128,6 +132,7 @@ def _launch_contact_allocator(
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
             0,
         ],
         outputs=[
@@ -398,6 +403,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0e-6,
             _disabled_patches(device),  # patch friction off
             0.0,  # friction_anchor_beta
+            0,
+            0,
             0.5,  # restitution_velocity_threshold
         ],
         outputs=list(serial.values()),
@@ -432,6 +439,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0e-6,
             _disabled_patches(device),  # patch friction off
             0.0,  # friction_anchor_beta
+            0,
+            0,
             0.5,  # restitution_velocity_threshold
         ],
         outputs=list(compact.values())[1:],
@@ -1812,6 +1821,7 @@ def _make_solver(
     contact_warmstart=False,
     mf_warmstart=False,
     solve_mode="matrix_free",
+    restitution_combine="average",
 ):
     """Construct a deterministic frictionless Steel test solver."""
     kwargs = {
@@ -1823,6 +1833,7 @@ def _make_solver(
         "cfm": 0.0,
         "relaxation": 1.0,
         "contact_warmstart": contact_warmstart or mf_warmstart,
+        "restitution_combine": restitution_combine,
     }
     if enable_restitution is not None:
         kwargs["enable_restitution"] = enable_restitution
@@ -1861,6 +1872,7 @@ def _step_plane(
     restitution_velocity_threshold=0.0,
     iterations=16,
     solve_mode="matrix_free",
+    restitution_combine="average",
 ):
     """Run one sphere-plane step and return observable contact and state data."""
     model, body = _build_plane_model(
@@ -1880,6 +1892,7 @@ def _step_plane(
         restitution_velocity_threshold=restitution_velocity_threshold,
         iterations=iterations,
         solve_mode=solve_mode,
+        restitution_combine=restitution_combine,
     )
     state_in, state_out = model.state(), model.state()
     vz = -speed if initial_vertical_velocity is None else initial_vertical_velocity
@@ -2092,6 +2105,213 @@ def test_shape_restitution_uses_symmetric_arithmetic_average(test, device):
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
             _assert_velocity(test, result["after"], mixed * speed, speed, label)
+
+
+COMBINE_MODES = ("average", "min", "multiply", "max")
+
+
+def _combined(mode, a, b):
+    """Return the float32 reference combination of two coefficients."""
+    a, b = np.float32(a), np.float32(b)
+    return {
+        "average": (a + b) / np.float32(2.0),
+        "min": min(a, b),
+        "multiply": a * b,
+        "max": max(a, b),
+    }[mode]
+
+
+def test_restitution_combine_modes_on_every_route(test, device):
+    """Rebound at each mode's combined coefficient on every free and articulated route."""
+    speed = 3.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    sphere_e, plane_e = 0.8, 0.4
+    routes = [(scene, "matrix_free", response) for scene in ("free", "articulated") for response in RESPONSE_MODES]
+    routes += [("free", "split", "immediate"), ("articulated", "split", "immediate")]
+    for mode in COMBINE_MODES:
+        expected = float(_combined(mode, sphere_e, plane_e))
+        for scene, solve_mode, response in routes:
+            label = f"{mode}/{scene}/{solve_mode}/{response}"
+            with test.subTest(case=label):
+                result = _step_plane(
+                    device,
+                    separation=separation,
+                    speed=speed,
+                    restitution=sphere_e,
+                    plane_restitution=plane_e,
+                    scene=scene,
+                    response=response,
+                    solve_mode=solve_mode,
+                    restitution_combine=mode,
+                )
+                _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
+                _assert_velocity(test, result["after"], expected * speed, speed, label, rtol=5.0e-3)
+
+
+SLIDE_DT = 5.0e-3
+SLIDE_STEPS = 40
+SLIDE_SPEED = 3.0
+SLIDE_HALF = 0.1
+
+
+def _slide_box(device, *, scene, solve_mode, response, friction_combine, box_mu=0.8, ground_mu=0.4, edit=None):
+    """Slide a box across the ground and return its x speeds per step and the contact routes it used.
+
+    ``edit`` is ``(step, box_mu)``: replace the box's friction coefficient in place before that step and notify.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    ground_cfg = newton.ModelBuilder.ShapeConfig(mu=ground_mu, restitution=0.0, gap=0.01)
+    box_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=box_mu, restitution=0.0, gap=0.01)
+    builder.add_ground_plane(cfg=ground_cfg)
+    xform = wp.transform(wp.vec3(0.0, 0.0, SLIDE_HALF), wp.quat_identity())
+    inertia = _diagonal_inertia(2.0 / 3.0 * SLIDE_HALF * SLIDE_HALF)
+    if scene == "free":
+        body = builder.add_body(xform=xform, mass=1.0, inertia=inertia, lock_inertia=True)
+    else:
+        body = builder.add_link(xform=xform, mass=1.0, inertia=inertia, lock_inertia=True)
+        child = builder.add_link(xform=xform, mass=0.25, inertia=_diagonal_inertia(0.001), lock_inertia=True)
+        root_joint = builder.add_joint_free(child=body)
+        fixed_joint = builder.add_joint_fixed(parent=body, child=child)
+        builder.add_articulation([root_joint, fixed_joint])
+    box_shape = builder.add_shape_box(body, hx=SLIDE_HALF, hy=SLIDE_HALF, hz=SLIDE_HALF, cfg=box_cfg)
+    model = builder.finalize(device=device)
+    kwargs = {"solve_mode": solve_mode, "iterations": 32, "friction_combine": friction_combine}
+    if solve_mode == "matrix_free":
+        kwargs["articulated_contact_response"] = response
+    solver = SolverSteel(model, **kwargs)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    joint_qd[0] = SLIDE_SPEED
+    state_in.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    speeds, paths = [], set()
+    for step in range(SLIDE_STEPS):
+        if edit is not None and step == edit[0]:
+            mu = model.shape_material_mu.numpy()
+            mu[box_shape] = edit[1]
+            model.shape_material_mu.assign(mu)
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, SLIDE_DT)
+        state_in, state_out = state_out, state_in
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        paths |= {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
+        speeds.append(float(state_in.body_qd.numpy()[body][0]))
+    return np.array(speeds), paths
+
+
+def _assert_sliding_deceleration(test, speeds, mu, label, first=5, last=None):
+    """Assert the box decelerates at mu * g between two steps while it is still sliding."""
+    last = len(speeds) - 1 if last is None else last
+    test.assertGreater(speeds[last], 0.1, f"{label}: the box stopped, so the slide no longer measures mu")
+    deceleration = (speeds[first] - speeds[last]) / ((last - first) * SLIDE_DT)
+    test.assertAlmostEqual(
+        deceleration, mu * 9.81, delta=0.02 * mu * 9.81, msg=f"{label}: deceleration {deceleration:.4f} m/s^2"
+    )
+
+
+def test_friction_combine_modes_on_every_route(test, device):
+    """Decelerate a sliding box at each mode's combined coefficient on every free and articulated route."""
+    routes = [(scene, "matrix_free", response) for scene in ("free", "articulated") for response in RESPONSE_MODES]
+    routes += [("free", "split", "immediate"), ("articulated", "split", "immediate")]
+    for mode in COMBINE_MODES:
+        mu = float(_combined(mode, 0.8, 0.4))
+        for scene, solve_mode, response in routes:
+            label = f"{mode}/{scene}/{solve_mode}/{response}"
+            with test.subTest(case=label):
+                speeds, paths = _slide_box(
+                    device, scene=scene, solve_mode=solve_mode, response=response, friction_combine=mode
+                )
+                if solve_mode == "matrix_free":
+                    test.assertEqual(paths, EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
+                _assert_sliding_deceleration(test, speeds, mu, label)
+
+
+def test_friction_combine_reads_notified_coefficient_edits(test, device):
+    """Combine an in-place, notified shape friction edit under a non-average mode."""
+    for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("articulated", "propagation")):
+        label = f"{scene}/{response}"
+        with test.subTest(case=label):
+            speeds, _ = _slide_box(
+                device,
+                scene=scene,
+                solve_mode="matrix_free",
+                response=response,
+                friction_combine="min",
+                edit=(20, 0.2),
+            )
+            _assert_sliding_deceleration(test, speeds, 0.4, f"{label}, before the edit", first=5, last=19)
+            _assert_sliding_deceleration(test, speeds, 0.2, f"{label}, after the edit", first=22, last=39)
+
+
+@wp.kernel
+def _combine_probe(
+    shape_a: wp.array[int],
+    shape_b: wp.array[int],
+    coefficients: wp.array[float],
+    combine: int,
+    mixed: wp.array[float],
+    restitution: wp.array[float],
+    torsional: wp.array[float],
+    rolling: wp.array[float],
+):
+    i = wp.tid()
+    mixed[i] = combine_shape_coefficients(shape_a[i], shape_b[i], coefficients, combine)
+    restitution[i] = mixed_contact_restitution(shape_a[i], shape_b[i], coefficients, combine)
+    spin, roll = contact_angular_friction_coefficients(shape_a[i], shape_b[i], coefficients, coefficients, combine)
+    torsional[i] = spin
+    rolling[i] = roll
+
+
+class TestSteelMaterialCombine(unittest.TestCase):
+    def test_combine_helpers_match_float32_references(self):
+        """Combine pairs exactly per mode, keep a lone shape's value, and sanitize restitution first."""
+        values = np.array([0.8, 0.4, 0.3, 1.7, np.nan, -0.5], dtype=np.float32)
+        pairs = [(0, 1), (1, 0), (2, 3), (0, -1), (-1, 2), (-1, -1), (4, 0), (5, 3)]
+        coefficients = wp.array(values, dtype=wp.float32, device="cpu")
+        shape_a = wp.array([a for a, _ in pairs], dtype=wp.int32, device="cpu")
+        shape_b = wp.array([b for _, b in pairs], dtype=wp.int32, device="cpu")
+        for mode, mode_id in _MATERIAL_COMBINE_MODES.items():
+            with self.subTest(mode=mode):
+                mixed = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
+                restitution = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
+                torsional = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
+                rolling = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
+                wp.launch(
+                    _combine_probe,
+                    dim=len(pairs),
+                    inputs=[shape_a, shape_b, coefficients, mode_id],
+                    outputs=[mixed, restitution, torsional, rolling],
+                    device="cpu",
+                )
+                for i, (a, b) in enumerate(pairs):
+                    raw = [values[k] for k in (a, b) if k >= 0]
+                    clean = [np.float32(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else np.float32(0.0) for v in raw]
+                    expected_mixed = np.float32(0.0) if not raw else raw[0] if len(raw) == 1 else _combined(mode, *raw)
+                    expected_e = (
+                        np.float32(0.0) if not clean else clean[0] if len(clean) == 1 else _combined(mode, *clean)
+                    )
+                    if all(np.isfinite(raw)):  # Unsanitized non-finite mu is undefined input.
+                        np.testing.assert_array_equal(mixed.numpy()[i], expected_mixed, err_msg=f"pair {a},{b}")
+                        angular = max(expected_mixed, np.float32(0.0))
+                        np.testing.assert_array_equal(torsional.numpy()[i], angular, err_msg=f"pair {a},{b}")
+                        np.testing.assert_array_equal(rolling.numpy()[i], angular, err_msg=f"pair {a},{b}")
+                    np.testing.assert_array_equal(restitution.numpy()[i], expected_e, err_msg=f"pair {a},{b}")
+
+    def test_rejects_unknown_combine_mode_and_stays_read_only(self):
+        """Reject an unknown mode at construction and keep both options construction-only."""
+        model = newton.ModelBuilder().finalize(device="cpu")
+        for name in ("friction_combine", "restitution_combine"):
+            with self.subTest(option=name):
+                with self.assertRaisesRegex(ValueError, f"{name} must be one of"):
+                    SolverSteel(model, **{name: "geometric"})
+                solver = SolverSteel(model, **{name: "max"})
+                self.assertEqual(getattr(solver, name), "max")
+                with self.assertRaises(AttributeError):
+                    setattr(solver, name, "min")
 
 
 def test_restitution_velocity_threshold_uses_incident_relative_speed(test, device):
@@ -3162,6 +3382,9 @@ for _fn in (
     test_restitution_uses_the_step_start_closing_speed,
     test_non_crossing_speculative_contact_does_not_bounce,
     test_shape_restitution_uses_symmetric_arithmetic_average,
+    test_restitution_combine_modes_on_every_route,
+    test_friction_combine_modes_on_every_route,
+    test_friction_combine_reads_notified_coefficient_edits,
     test_restitution_velocity_threshold_uses_incident_relative_speed,
     test_bouncing_ball_settles_to_rest_under_gravity,
     test_drive_pressed_resting_contact_does_not_bounce,

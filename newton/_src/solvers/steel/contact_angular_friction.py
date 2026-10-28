@@ -355,6 +355,7 @@ def launch_angular_friction_rows(solver, state_aug, contacts, threads: int) -> N
                 solver._shape_mu_rolling,
                 solver._cfm,
                 int(index == 0),
+                solver._friction_combine_id,
             ],
             outputs=[
                 solver._J_by_size[size],
@@ -389,6 +390,7 @@ def launch_propagation_angular_friction_rows(solver, contacts, threads: int) -> 
             solver._contact_mf_origin,
             solver._shape_mu_torsional,
             solver._shape_mu_rolling,
+            solver._friction_combine_id,
         ],
         outputs=[
             solver._propagation_body_a,
