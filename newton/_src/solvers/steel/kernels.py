@@ -1888,6 +1888,40 @@ def _add_point_force(
 
 
 @wp.kernel
+def compute_joint_friction_load(
+    joint_friction_load_dof: wp.array[wp.int32],
+    dof_joint: wp.array[wp.int32],
+    joint_child: wp.array[int],
+    body_free_f: wp.array[wp.spatial_vector],
+    # outputs
+    joint_friction_load: wp.array[float],
+):
+    """Write ``|F| + |T|`` of the wrench each DOF's joint transmits to its child under the step's free dynamics."""
+    dof = wp.tid()
+    load = float(0.0)
+    if joint_friction_load_dof[dof] != 0:
+        wrench = body_free_f[joint_child[int(dof_joint[dof])]]
+        load = wp.length(wp.spatial_top(wrench)) + wp.length(wp.spatial_bottom(wrench))
+    joint_friction_load[dof] = load
+
+
+@wp.kernel
+def add_joint_friction_load(
+    joint_friction: wp.array[float],
+    joint_friction_load_coefficient: wp.array[float],
+    joint_friction_load: wp.array[float],
+    # outputs
+    joint_friction_total: wp.array[float],
+):
+    dof = wp.tid()
+    total = joint_friction[dof]
+    coefficient = joint_friction_load_coefficient[dof]
+    if coefficient > 0.0:
+        total += coefficient * joint_friction_load[dof]
+    joint_friction_total[dof] = total
+
+
+@wp.kernel
 def accumulate_contact_wrenches_from_impulses(
     contact_count: wp.array[wp.int32],
     rigid_contact_max: int,
