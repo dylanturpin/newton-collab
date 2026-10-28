@@ -273,7 +273,7 @@ def _dense_restitution_rhs(scale: float) -> float:
             wp.array([[1.0]], dtype=wp.float32, device="cpu"),
             wp.array([[0.2]], dtype=wp.float32, device="cpu"),
             wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.array([[0.5]], dtype=wp.float32, device="cpu"),
+            wp.array([[1.0]], dtype=wp.float32, device="cpu"),  # rebound of e = 0.5 from a 2 m/s step-start closing
             1.0,
             scale,
             0.0,
@@ -296,7 +296,7 @@ def _contact_row_outputs(device: str) -> dict[str, wp.array]:
         "row_cfm": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_restitution": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "row_rebound_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
     }
 
 
@@ -477,7 +477,8 @@ class TestSteelContactControls(unittest.TestCase):
         for name in serial:
             with self.subTest(output=name):
                 np.testing.assert_allclose(compact[name].numpy(), serial[name].numpy(), rtol=0.0, atol=1.0e-6)
-        self.assertAlmostEqual(float(serial["row_restitution"].numpy()[0, 0]), 0.3, delta=1.0e-6)
+        # Mixed restitution 0.3 times the 2 m/s step-start closing speed.
+        self.assertAlmostEqual(float(serial["row_rebound_velocity"].numpy()[0, 0]), 0.6, delta=1.0e-6)
 
     def test_solver_exposes_documented_defaults(self):
         """Expose legacy-preserving defaults through the public constructor."""
@@ -2027,14 +2028,13 @@ def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
             _assert_velocity(test, result["after"], restitution * speed, speed, label)
 
 
-def test_restitution_uses_the_post_force_incident_predictor(test, device):
-    """Include this step's known gravity impulse in the frozen incident speed."""
+def test_restitution_uses_the_step_start_closing_speed(test, device):
+    """Rebound from the step-start closing speed; this step's gravity impulse only helps reach the surface."""
     restitution = 0.6
     initial_speed = 2.0
     gravity = 9.81
     dt = 1.0e-2
-    incident_speed = initial_speed + gravity * dt
-    separation = IMPACT_FRACTION * incident_speed * dt
+    separation = IMPACT_FRACTION * initial_speed * dt
     result = _step_plane(
         device,
         separation=separation,
@@ -2044,18 +2044,11 @@ def test_restitution_uses_the_post_force_incident_predictor(test, device):
         gravity=(0.0, 0.0, -gravity),
     )
 
+    label = "gravity, step-start closing speed"
     test.assertEqual(result["contact_count"], 1, "gravity case generated no unique contact")
     _assert_velocity(test, result["before"], -initial_speed, initial_speed, "gravity, authored velocity")
-    _assert_restitution_row_position(
-        test, result, separation, incident_speed, restitution, dt, "gravity, post-force incident predictor"
-    )
-    _assert_velocity(
-        test,
-        result["after"],
-        restitution * incident_speed,
-        incident_speed,
-        "gravity, post-force incident predictor",
-    )
+    _assert_restitution_row_position(test, result, separation, initial_speed, restitution, dt, label)
+    _assert_velocity(test, result["after"], restitution * initial_speed, initial_speed, label)
 
 
 def test_non_crossing_speculative_contact_does_not_bounce(test, device):
@@ -2316,72 +2309,90 @@ def test_drive_pressed_resting_contact_does_not_bounce(test, device):
             test.assertLess(float(forces.max()), 1.1 * load, f"{label}: the contact force spiked")
 
 
+BOX_PRESS_FORCE = 400.0
+BOX_HALF_HEIGHT = 0.05
+
+
 def test_force_pressed_resting_free_body_does_not_bounce(test, device):
     """Keep a free box that a large body force presses onto the ground at rest."""
-    mass = 1.0
-    press = 400.0
-    test.assertGreater(PRESSED_DT * press / mass, 2.0 * PRESSED_THRESHOLD)
+    test.assertGreater(PRESSED_DT * BOX_PRESS_FORCE, 2.0 * PRESSED_THRESHOLD)
     for solve_mode, response in (("matrix_free", "immediate"), ("matrix_free", "propagation"), ("split", None)):
         label = f"{solve_mode}/{response}"
         with test.subTest(case=label):
-            builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-            cfg = newton.ModelBuilder.ShapeConfig(density=0.0, restitution=PRESSED_RESTITUTION, gap=0.01)
-            builder.add_ground_plane(cfg=cfg)
-            body = builder.add_body(
-                xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
-                mass=mass,
-                inertia=_diagonal_inertia(0.002),
-                lock_inertia=True,
-            )
-            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
-            model = builder.finalize(device=device)
-            kwargs = {"solve_mode": solve_mode, "iterations": 16, "restitution_velocity_threshold": PRESSED_THRESHOLD}
-            if response is not None:
-                kwargs["articulated_contact_response"] = response
-            solver = SolverSteel(model, **kwargs)
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-            contacts = pipeline.contacts()
-            state_in, state_out = model.state(), model.state()
-            wrench = np.zeros((model.body_count, 6), dtype=np.float32)
-            wrench[body, 2] = -press
-            speeds, heights = [], []
-            for _ in range(60):
-                state_in.clear_forces()
-                state_in.body_f.assign(wrench)
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, PRESSED_DT)
-                state_in, state_out = state_out, state_in
-                speeds.append(float(state_in.body_qd.numpy()[body][2]))
-                heights.append(float(state_in.body_q.numpy()[body][2]))
+            heights, speeds, _forces = _roll_pressed_box(device, solve_mode=solve_mode, response=response, steps=60)
             test.assertLess(float(np.abs(speeds).max()), 1.0e-2, f"{label}: the pressed box moved")
-            test.assertLess(float(max(heights)), 0.05 + 1.0e-3, f"{label}: the pressed box left the ground")
+            test.assertLess(float(heights.max()), 1.0e-3, f"{label}: the pressed box left the ground")
 
 
-def test_driven_foot_impact_still_bounces(test, device):
-    """Rebound a driven foot that lands faster than the threshold."""
-    for drive, solve_mode, response in (
-        ("explicit", "matrix_free", "immediate"),
-        ("explicit", "matrix_free", "propagation"),
-        ("augmented", "split", None),
-    ):
+def test_pressed_landing_rebounds_from_step_start_speed_and_settles(test, device):
+    """Rebound a pressed landing at ``e`` times its step-start closing speed, then settle under the press.
+
+    The press adds about 1.3 m/s (foot) or 2 m/s (box) of closing speed per step. A rebound target that included it
+    would leave every later landing above the threshold, a bounce cycle that never settles.
+    """
+    cases = [("explicit", "split", None), ("augmented", "split", None), ("rows", "matrix_free", "immediate")]
+    cases += [(drive, "matrix_free", response) for drive in ("explicit", "augmented") for response in RESPONSE_MODES]
+    cases += [("body_f", "split", None)] + [("body_f", "matrix_free", response) for response in RESPONSE_MODES]
+    for drive, solve_mode, response in cases:
         label = f"{drive}/{solve_mode}/{response}"
         with test.subTest(case=label):
-            _heights, speeds, forces = _roll_pressed_foot(
-                device,
-                drive=drive,
-                solve_mode=solve_mode,
-                response=response,
-                steps=12,
-                initial_gap=0.02,
-                initial_speed=2.0,
-            )
+            landing = {"solve_mode": solve_mode, "response": response, "steps": 40, "initial_gap": 0.02}
+            if drive == "body_f":
+                heights, speeds, forces = _roll_pressed_box(device, **landing, initial_speed=0.6)
+                load = BOX_PRESS_FORCE + 9.81
+            else:
+                heights, speeds, forces = _roll_pressed_foot(device, drive=drive, **landing, initial_speed=0.6)
+                load = FOOT_PRESS_FORCE + FOOT_LEG_MASS * 9.81
             impact = int(np.argmax(forces > 0.0))
-            test.assertGreater(forces[impact], 0.0, f"{label}: the foot never landed")
+            test.assertGreater(impact, 0, f"{label}: the contact was active before the landing")
             landing_speed = -speeds[impact - 1]
-            test.assertGreater(landing_speed, 2.0, f"{label}: the foot landed slower than it started")
-            test.assertGreater(
-                speeds[impact], 0.9 * PRESSED_RESTITUTION * landing_speed, f"{label}: the landing did not rebound"
-            )
+            test.assertGreater(landing_speed, 2.0 * PRESSED_THRESHOLD, f"{label}: the landing was not an impact")
+            rebound = PRESSED_RESTITUTION * landing_speed
+            test.assertGreater(speeds[impact], 0.9 * rebound, f"{label}: the landing did not rebound")
+            test.assertLess(speeds[impact], 1.05 * rebound, f"{label}: the press enlarged the rebound")
+            tail = slice(20, None)
+            test.assertLess(float(np.abs(speeds[tail]).max()), 1.0e-2, f"{label}: the landing did not settle")
+            test.assertLess(float(heights[tail].max()), 1.0e-3, f"{label}: the foot kept leaving the ground")
+            test.assertGreater(float(forces[tail].min()), 0.9 * load, f"{label}: the contact released")
+            test.assertLess(float(forces[tail].max()), 1.1 * load, f"{label}: the contact force spiked")
+
+
+def _roll_pressed_box(device, *, solve_mode, response, steps, initial_gap=0.0, initial_speed=0.0):
+    """Step a 1 kg free box pressed down by a body force; return its bottom height, vertical speed and contact force."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, restitution=PRESSED_RESTITUTION, gap=0.01)
+    builder.add_ground_plane(cfg=cfg)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, BOX_HALF_HEIGHT + initial_gap), wp.quat_identity()),
+        mass=1.0,
+        inertia=_diagonal_inertia(0.002),
+        lock_inertia=True,
+    )
+    builder.add_shape_box(body, hx=0.05, hy=0.05, hz=BOX_HALF_HEIGHT, cfg=cfg)
+    model = builder.finalize(device=device)
+    kwargs = {"solve_mode": solve_mode, "iterations": 16, "restitution_velocity_threshold": PRESSED_THRESHOLD}
+    if response is not None:
+        kwargs["articulated_contact_response"] = response
+    solver = SolverSteel(model, **kwargs)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    state_in, state_out = model.state(), model.state()
+    _reset_state(model, state_in, -initial_speed)
+    wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+    wrench[body, 2] = -BOX_PRESS_FORCE
+    heights, speeds, forces = [], [], []
+    for _ in range(steps):
+        state_in.clear_forces()
+        state_in.body_f.assign(wrench)
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, PRESSED_DT, observables=observables)
+        state_in, state_out = state_out, state_in
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        heights.append(float(state_in.body_q.numpy()[body][2]) - BOX_HALF_HEIGHT)
+        speeds.append(float(state_in.body_qd.numpy()[body][2]))
+        forces.append(float(np.abs(observables.contact_f.numpy()[:count, 2]).sum()))
+    return np.array(heights), np.array(speeds), np.array(forces)
 
 
 def _build_two_sphere_model(device, *, separation, restitution, mass_a, mass_b):
@@ -2676,8 +2687,8 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
     solver = _make_solver(positive_model, velocity_iterations=0)
     test.assertEqual(solver._velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
-    test.assertEqual(solver._row_restitution.shape, (solver._world_count, solver._articulation_constraint_max))
-    test.assertEqual(solver._mf_row_restitution.shape, (solver._world_count, solver._free_body_constraint_max))
+    test.assertEqual(solver._row_rebound_velocity.shape, (solver._world_count, solver._articulation_constraint_max))
+    test.assertEqual(solver._mf_row_rebound_velocity.shape, (solver._world_count, solver._free_body_constraint_max))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -3148,14 +3159,14 @@ for _fn in (
     test_one_step_restitution_law_over_coefficient_speed_and_mass,
     test_crossing_result_is_invariant_to_dt_and_time_of_impact,
     test_penetrating_impact_replaces_baumgarte_with_restitution,
-    test_restitution_uses_the_post_force_incident_predictor,
+    test_restitution_uses_the_step_start_closing_speed,
     test_non_crossing_speculative_contact_does_not_bounce,
     test_shape_restitution_uses_symmetric_arithmetic_average,
     test_restitution_velocity_threshold_uses_incident_relative_speed,
     test_bouncing_ball_settles_to_rest_under_gravity,
     test_drive_pressed_resting_contact_does_not_bounce,
     test_force_pressed_resting_free_body_does_not_bounce,
-    test_driven_foot_impact_still_bounces,
+    test_pressed_landing_rebounds_from_step_start_speed_and_settles,
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
@@ -3384,7 +3395,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     phi = wp.array([[1.0]], dtype=wp.float32, device=device)
     row_type = wp.array([[0]], dtype=wp.int32, device=device)
     target_velocity = wp.zeros((1, 1), dtype=wp.float32, device=device)
-    row_restitution = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    row_rebound_velocity = wp.zeros((1, 1), dtype=wp.float32, device=device)
     position_velocity = wp.zeros((6,), dtype=wp.float32, device=device)
     rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
 
@@ -3404,7 +3415,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 phi,
                 row_type,
                 target_velocity,
-                row_restitution,
+                row_rebound_velocity,
                 has_target,
                 0.5,
                 position_velocity,

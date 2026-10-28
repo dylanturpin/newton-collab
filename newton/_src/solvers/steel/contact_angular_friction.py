@@ -226,7 +226,7 @@ def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads
             solver._mf_row_mu,
             solver._mf_phi,
             solver._mf_target_velocity,
-            solver._mf_row_restitution,
+            solver._mf_row_rebound_velocity,
         ],
         device=solver.model.device,
     )
@@ -260,7 +260,7 @@ def launch_propagation_free_rigid_angular_friction_rows(solver, contacts, thread
             solver._propagation_row_parent,
             solver._propagation_row_mu,
             solver._propagation_phi,
-            solver._propagation_row_restitution,
+            solver._propagation_row_rebound_velocity,
         ],
         device=solver.model.device,
     )
@@ -365,7 +365,7 @@ def launch_angular_friction_rows(solver, state_aug, contacts, threads: int) -> N
                 solver._row_cfm,
                 solver._phi,
                 solver._target_velocity,
-                solver._row_restitution,
+                solver._row_rebound_velocity,
             ],
             device=model.device,
         )
@@ -399,7 +399,7 @@ def launch_propagation_angular_friction_rows(solver, contacts, threads: int) -> 
             solver._propagation_row_parent,
             solver._propagation_row_mu,
             solver._propagation_phi,
-            solver._propagation_row_restitution,
+            solver._propagation_row_rebound_velocity,
         ],
         device=solver.model.device,
     )
