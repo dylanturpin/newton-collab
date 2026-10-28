@@ -316,7 +316,6 @@ _STATIC_SHARED_MEMORY_MAX_BYTES = 48 * 1024
 # Headroom for the static shared storage Warp adds to a kernel beyond the solver's own arrays.
 _WARP_STATIC_SHARED_RESERVE_BYTES = 2048
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
-# Per-world preset of the first rejected row slot: no reservation was rejected.
 # ``friction_combine``/``restitution_combine`` names and their kernel ids, in PhysX's combine-mode order.
 _MATERIAL_COMBINE_MODES = {
     "average": int(MATERIAL_COMBINE_AVERAGE),
@@ -324,6 +323,7 @@ _MATERIAL_COMBINE_MODES = {
     "multiply": int(MATERIAL_COMBINE_MULTIPLY),
     "max": int(MATERIAL_COMBINE_MAX),
 }
+# Per-world preset of the first rejected row slot: no reservation was rejected.
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
 _ATTRIBUTE_NAMESPACE = "steel"
 # PhysX's default rigid-body angular damping [1/s].
