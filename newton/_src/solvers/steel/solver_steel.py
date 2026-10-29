@@ -1529,11 +1529,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
     Rigid-contact restitution is part of the ordinary normal contact row in
-    ``"split"`` and ``"matrix_free"`` modes. It uses the
-    two shape coefficients combined by ``restitution_combine`` and freezes the incident
-    relative normal velocity before contact impulses are applied. A sufficiently
-    fast contact predicted to reach the surface during the step replaces its
-    geometric/speculative bias with Newton's rebound target. Optional
+    ``"split"`` and ``"matrix_free"`` modes. It uses the two shape coefficients
+    combined by ``restitution_combine``. A contact whose relative normal
+    velocity ``u_start`` at the start of the step closes faster than the
+    threshold, and which touches the surface or is predicted to reach it during
+    the step, replaces its geometric/speculative bias with Newton's rebound
+    target ``-e * u_start`` as a lower bound on the separating velocity. Forces
+    applied during the step (gravity, drives, joint and body forces) count
+    toward reaching the surface but neither make a resting contact an impact nor
+    enlarge the rebound. Optional
     ``velocity_iterations`` refine the result but are never enabled
     implicitly. As in a conventional discrete PGS solver, the qualifying
     rebound velocity is used for the whole step; this gives the intended
@@ -2542,11 +2546,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 zero, so a model that authors no restitution does not bounce.
                 ``False`` turns restitution off for every contact regardless of the
                 coefficients.
-            restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
-                relative normal velocity required to apply restitution. The contact must also be at the surface or
-                be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
-                Baumgarte contact law, preventing resting contacts from repeatedly bouncing under small
-                accelerations.
+            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact at the
+                start of the step required to apply restitution. The contact must also be at the surface or be
+                predicted to reach it during the timestep. Slower contacts retain the speculative or Baumgarte
+                contact law, so a resting contact pressed by gravity, a drive or an applied force does not bounce.
+                A qualifying contact leaves with at least ``e`` times its step-start closing speed, or faster if
+                this step's forces already separate it faster.
                 Restitution coefficients are combined by ``restitution_combine`` after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
@@ -6772,7 +6777,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._row_mu = wp.zeros(
             (self._world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._row_restitution = wp.zeros(
+        self._row_rebound_velocity = wp.zeros(
             (self._world_count, max_constraints),
             dtype=wp.float32,
             device=device,
@@ -6911,7 +6916,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self._mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._mf_row_restitution = wp.zeros(
+        self._mf_row_rebound_velocity = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
@@ -6994,7 +6999,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             setattr(
                 self, f"_{name}", wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
             )
-        self._mf_row_restitution = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
+        self._mf_row_rebound_velocity = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
         self._mf_row_w = self._contact_row_w_dummy
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(
@@ -7039,7 +7044,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_row_parent = None
             self._propagation_row_mu = None
             self._propagation_phi = None
-            self._propagation_row_restitution = None
+            self._propagation_row_rebound_velocity = None
             self._propagation_restitution_target = None
             self._propagation_body_response = None
             self._propagation_body_response_split = None
@@ -7165,7 +7170,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._propagation_row_restitution = wp.zeros(
+        self._propagation_row_rebound_velocity = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self._propagation_restitution_target = wp.zeros(
@@ -8879,7 +8884,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_response_split,
                     self._propagation_phi,
                     self._propagation_row_type,
-                    self._propagation_row_restitution,
+                    self._propagation_row_rebound_velocity,
                     self._propagation_body_qd,
                     self._rigid_body_max_depenetration_velocity,
                     self._cfm,
@@ -8887,7 +8892,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_w,
                     dt,
                     self._contact_speculative_scale,
-                    self._rebound_velocity_threshold,
                     self._propagation_max_constraints,
                 ],
                 outputs=[
@@ -12649,6 +12653,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_anchor_beta,
                         self._friction_combine_id,
                         self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._row_type,
@@ -12658,7 +12663,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._row_cfm,
                         self._phi,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -12859,6 +12864,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._friction_anchor_beta,
                             self._friction_combine_id,
                             self._restitution_combine_id,
+                            self._rebound_velocity_threshold,
                         ],
                         outputs=[
                             self._J_by_size[size],
@@ -12869,7 +12875,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._row_cfm,
                             self._phi,
                             self._target_velocity,
-                            self._row_restitution,
+                            self._row_rebound_velocity,
                         ],
                         device=model.device,
                     )
@@ -12914,6 +12920,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_anchor_beta,
                         self._friction_combine_id,
                         self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12925,7 +12932,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._mf_row_mu,
                         self._mf_phi,
                         self._mf_target_velocity,
-                        self._mf_row_restitution,
+                        self._mf_row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -13020,6 +13027,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        self._articulation_origin,
+                        state_aug._body_v_s,
                         self._shape_mu,
                         self._shape_restitution,
                         int(self._contact_friction_shared_anchor),
@@ -13027,6 +13036,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                         builder_unit_order,
                         builder_unit_count,
                         self._propagation_max_constraints,
@@ -13043,7 +13053,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._propagation_row_parent,
                         self._propagation_row_mu,
                         self._propagation_phi,
-                        self._propagation_row_restitution,
+                        self._propagation_row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -13075,7 +13085,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_row_parent,
                             self._propagation_row_mu,
                             self._propagation_phi,
-                            self._propagation_row_restitution,
+                            self._propagation_row_rebound_velocity,
                             self._propagation_torsion_row_radius,
                         ],
                         device=model.device,
@@ -13647,7 +13657,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     world_dof_offset,
                     self._constraint_count,
                     self._local_solve_owner,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     size,
                     n_arts,
                     int(self._hinv_jt_writes_world),
@@ -13907,13 +13917,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_out_snap,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -13991,10 +14000,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._sparse_row_incident,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14010,7 +14018,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._v_hat,
                         self._world_dof_indices,
                         self._sparse_diagonal_dense_offsets,
@@ -14020,7 +14028,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._sparse_diagonal_row_dof,
                         self._sparse_diagonal_row_jy,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14036,12 +14043,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
                 outputs=[self._rhs, self._row_w],
@@ -14058,10 +14064,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._phi,
                 self._row_beta,
                 self._row_type,
-                self._row_restitution,
+                self._row_rebound_velocity,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 int(self._regularization_enabled),
             ],
             outputs=[self._rhs, self._row_w],
@@ -14429,7 +14434,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
+                self._mf_row_rebound_velocity,
                 int(self._has_prescribed_response),
                 self._body_to_articulation,
                 self._articulation_dof_start,
@@ -14440,7 +14445,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_w,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[
@@ -14473,12 +14477,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
+                self._mf_row_rebound_velocity,
                 int(self._has_prescribed_response),
                 dt,
                 self._v_out_snap,
                 self._v_hat,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[output],

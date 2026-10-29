@@ -463,6 +463,7 @@ class TestSparseContacts(unittest.TestCase):
                 0.0,
                 0,
                 0,
+                0.5,
             ],
             outputs=[row_type, row_parent, *other],
             device="cpu",
@@ -657,13 +658,13 @@ class TestSparseContacts(unittest.TestCase):
                 self._check_joint_limit_parallel_scan("cuda:0", capacity)
 
     def test_restitution_matches_dense_incident_projection(self):
-        """Preserve impact selection and target subtraction from the dense matrix-free law."""
+        """Preserve the reach test and target subtraction from the dense matrix-free law."""
         row_count = 7
         kinds = _array([[PGS_CONSTRAINT_TYPE_CONTACT] * 5 + [PGS_CONSTRAINT_TYPE_FRICTION] * 2], int)
         phi = _array([[-0.01, 0.01, 0.5, -0.01, -0.01, -0.01, -0.01]])
         incident = _array([[-2.0, -2.0, -2.0, -0.05, 0.5, -3.0, -4.0]])
         target = _array([[0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 0.0]])
-        restitution = _array([[0.4] * row_count])
+        rebound_velocity = _array([[0.8, 0.88, 0.8, 0.02, 0.2, 1.2, 1.6]])
         count = _array([6], int)
         dense_rhs = _full((1, row_count), -7.0)
         sparse_rhs = _full((1, row_count), -7.0)
@@ -677,12 +678,11 @@ class TestSparseContacts(unittest.TestCase):
                 phi,
                 kinds,
                 target,
-                restitution,
+                rebound_velocity,
                 _array(incident.numpy()[0]),
                 _array([np.arange(row_count)], int),
                 _array(np.eye(row_count)[None]),
                 0.01,
-                0.1,
                 0,
             ],
             outputs=[dense_rhs, _full((1, row_count), 1.0)],
@@ -696,16 +696,15 @@ class TestSparseContacts(unittest.TestCase):
                 phi,
                 kinds,
                 target,
-                restitution,
+                rebound_velocity,
                 incident,
                 0.01,
-                0.1,
             ],
             outputs=[sparse_rhs],
             device="cpu",
         )
         np.testing.assert_array_equal(sparse_rhs.numpy(), dense_rhs.numpy())
-        np.testing.assert_allclose(sparse_rhs.numpy()[0], [-0.8, -1.08, -7.0, -7.0, -1.2, -7.0, -7.0], atol=1.0e-6)
+        np.testing.assert_allclose(sparse_rhs.numpy()[0], [-0.8, -1.08, -7.0, -0.02, -1.2, -7.0, -7.0], atol=1.0e-6)
 
     def test_decode_factor_velocity(self):
         """Decode accumulated factor impulses into the original physical DOF order."""
@@ -1863,7 +1862,7 @@ class TestSteelSparseSolver(unittest.TestCase):
             "row_cfm",
             "phi",
             "target_velocity",
-            "row_restitution",
+            "row_rebound_velocity",
         ]
         names += ["_sparse_row_dof", "_sparse_row_factor", "_sparse_row_incident"] if sparse else ["J_world", "Y_world"]
         arrays = {name: getattr(solver, name if name.startswith("_") else f"_{name}").numpy() for name in names}
