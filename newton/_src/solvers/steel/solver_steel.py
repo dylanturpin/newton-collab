@@ -286,6 +286,13 @@ from .sparse_mass_matrix import (
     solve_sparse_mass_matrix,
 )
 from .sparse_pgs import _get_pgs_solve_sparse_kernel
+from .world_islands import (
+    island_shared_bytes,
+    island_warp_count,
+    islands_kernel,
+    islands_snippet,
+    world_dof_components,
+)
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
 wp.set_module_options({"enable_backward": False})
@@ -304,6 +311,7 @@ _STEEL_SYNC_TIMINGS = os.environ.get("STEEL_SYNC_TIMINGS", "0").lower() in {"1",
 _STEEL_SYNC_TIMINGS_START = int(os.environ.get("STEEL_SYNC_TIMINGS_START", "20"))
 _STEEL_SYNC_TIMINGS_COUNT = max(int(os.environ.get("STEEL_SYNC_TIMINGS_COUNT", "1")), 0)
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
+_ISLAND_MAX_WARPS = 4
 _SMALL_DOF_THRESHOLD_DEFAULT = 12
 # Beyond this guard, the relaxation weight is too close to zero to be a
 # useful float32 PGS update and the assembled split path risks overflow when
@@ -1695,6 +1703,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_color_order = _ConstructionOption()
     friction_combine = _ConstructionOption()
     restitution_combine = _ConstructionOption()
+    world_parallel = _ConstructionOption()
     row_schedule = _ConstructionOption()
     friction_mode = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
@@ -2023,6 +2032,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_color_order: Literal["contact", "longest_first"] = "contact",
         friction_combine: Literal["average", "min", "multiply", "max"] = "average",
         restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
+        world_parallel: Literal["warp", "islands", "auto"] = "warp",
     ):
         """
         Args:
@@ -2487,6 +2497,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             restitution_combine (str, optional): How a contact combines its two shapes' restitution coefficients,
                 with the same modes as ``friction_combine``, after each coefficient is clamped to ``[0, 1]``.
                 Construction-only. Defaults to ``"average"``.
+            world_parallel (str, optional): Threads per world in the fused matrix-free Gauss-Seidel solve.
+                ``"warp"`` sweeps each world on one warp. ``"islands"`` gives each world a block of up to four
+                warps and sweeps each group of independent islands (articulations that share no row) on its own
+                warp, in the one-warp row order, so results match ``"warp"``. ``"islands"`` requires
+                ``solve_mode="matrix_free"`` without the local internal fast path or articulated torsional and
+                rolling friction. ``"auto"`` selects ``"islands"`` when it is supported and the model has fewer
+                worlds than the device has SMs. Construction-only. Defaults to ``"warp"``.
             row_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -2759,6 +2776,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 raise ValueError(f"{name} must be one of {tuple(_MATERIAL_COMBINE_MODES)}, got {value!r}")
         self._friction_combine = friction_combine
         self._restitution_combine = restitution_combine
+        if world_parallel not in ("warp", "islands", "auto"):
+            raise ValueError(f"world_parallel must be 'warp', 'islands' or 'auto', got {world_parallel!r}")
+        self._world_parallel = world_parallel
         self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
         self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
         self._contact_warmstart = bool(contact_warmstart)
@@ -7640,6 +7660,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
             }
             self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
+        self._setup_world_islands(model)
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "_max_mf_bodies") and self._free_body_constraint_max > 0:
@@ -8400,65 +8421,81 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=64,
                         device=self.model.device,
                     )
-            phase_kernel = self._pgs_solve_mf_gs_kernels.get(row_phase)
+            islands = self._island_dof_component is not None
+            kernels = self._pgs_solve_mf_gs_islands_kernels if islands else self._pgs_solve_mf_gs_kernels
+            phase_kernel = kernels.get(row_phase)
             if phase_kernel is None:
-                phase_kernel = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=row_phase)
-                self._pgs_solve_mf_gs_kernels[row_phase] = phase_kernel
-            with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
-                wp.launch_tiled(
-                    phase_kernel,
-                    dim=[general_block_count],
-                    inputs=[
-                        self._local_general_world_count,
-                        self._local_general_worlds,
-                        general_block_count,
-                        int(use_general_queue),
-                        self._constraint_count,
-                        self._dense_phase_bounds,
-                        self._local_solve_owner,
-                        self._world_dof_indices,
-                        dense_rhs,
-                        self._diag,
-                        self._row_w,
-                        self._impulses,
-                        self._J_world,
-                        self._Y_world,
-                        self._row_type,
-                        self._row_parent,
-                        self._row_mu,
-                        self._contact_torsion_group,
-                        self._torsion_row_radius,
-                        self._drive_target_vel_bias,
-                        self._drive_vel_multiplier,
-                        self._drive_impulse_multiplier,
-                        self._drive_max_impulse,
-                        # (1, 1) dummy when the fused clamp is off; the kernel
-                        # only reads it when built with fuse_vel_limits.
-                        self._drive_vel_limit,
-                        self._mf_constraint_count,
-                        self._mf_contact_rows_end,
-                        mf_meta,
-                        self._mf_impulses,
-                        self._mf_J_a,
-                        self._mf_J_b,
-                        self._mf_MiJt_a,
-                        self._mf_MiJt_b,
-                        self._mf_row_mu,
-                        self._mf_row_w,
-                        self._compliance.dense_gamma if self._compliance is not None else self._compliance_off_gamma,
-                        self._compliance.mf_gamma if self._compliance is not None else self._compliance_off_gamma,
-                        phase_iterations,
-                        omega,
-                        int(self._regularization_enabled and not soft_relax),
-                        row_phase,
-                        int(friction_start_iteration),
-                        int(phase_iteration_offset),
-                        int(freeze_drive_rows),
-                    ],
-                    outputs=[self._v_out],
-                    block_dim=32,
-                    device=self.model.device,
+                phase_kernel = self._pgs_solve_mf_gs_kernel_for_phase(
+                    row_phase=row_phase, island_warps=self._island_warps if islands else 0
                 )
+                kernels[row_phase] = phase_kernel
+            mf_gs_inputs = [
+                self._local_general_world_count,
+                self._local_general_worlds,
+                general_block_count,
+                int(use_general_queue),
+                self._constraint_count,
+                self._dense_phase_bounds,
+                self._local_solve_owner,
+                self._world_dof_indices,
+                dense_rhs,
+                self._diag,
+                self._row_w,
+                self._impulses,
+                self._J_world,
+                self._Y_world,
+                self._row_type,
+                self._row_parent,
+                self._row_mu,
+                self._contact_torsion_group,
+                self._torsion_row_radius,
+                self._drive_target_vel_bias,
+                self._drive_vel_multiplier,
+                self._drive_impulse_multiplier,
+                self._drive_max_impulse,
+                # (1, 1) dummy when the fused clamp is off; the kernel
+                # only reads it when built with fuse_vel_limits.
+                self._drive_vel_limit,
+                self._mf_constraint_count,
+                self._mf_contact_rows_end,
+                mf_meta,
+                self._mf_impulses,
+                self._mf_J_a,
+                self._mf_J_b,
+                self._mf_MiJt_a,
+                self._mf_MiJt_b,
+                self._mf_row_mu,
+                self._mf_row_w,
+                self._compliance.dense_gamma if self._compliance is not None else self._compliance_off_gamma,
+                self._compliance.mf_gamma if self._compliance is not None else self._compliance_off_gamma,
+                phase_iterations,
+                omega,
+                int(self._regularization_enabled and not soft_relax),
+                row_phase,
+                int(friction_start_iteration),
+                int(phase_iteration_offset),
+                int(freeze_drive_rows),
+            ]
+            with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
+                if islands:
+                    # Drops the general-world queue arguments and adds the DOF components after the DOF map.
+                    wp.launch_tiled(
+                        phase_kernel,
+                        dim=[self._world_count],
+                        inputs=[*mf_gs_inputs[4:8], self._island_dof_component, *mf_gs_inputs[8:]],
+                        outputs=[self._v_out],
+                        block_dim=32 * self._island_warps,
+                        device=self.model.device,
+                    )
+                else:
+                    wp.launch_tiled(
+                        phase_kernel,
+                        dim=[general_block_count],
+                        inputs=mf_gs_inputs,
+                        outputs=[self._v_out],
+                        block_dim=32,
+                        device=self.model.device,
+                    )
             local_done_events = []
             if launch_local:
                 if local_stream is not None:
@@ -8522,6 +8559,71 @@ class SolverSteel(SolverBase, CouplingInterface):
                     launch_row_phase(row_phase, 1, phase_iteration_offset)
         else:
             launch_row_phase(0, iterations, iteration_offset)
+
+    def _setup_world_islands(self, model) -> None:
+        """Build the island-parallel MF-GS kernel when ``world_parallel`` selects it."""
+        self._pgs_solve_mf_gs_islands_kernels = {}
+        self._island_dof_component = None
+        self._island_warps = 1
+        # The articulated torsional/rolling block updates velocities through a helper the island rewrite cannot guard.
+        supported = self._pgs_solve_mf_gs_kernel is not None and not (
+            getattr(self, "_local_internal_fast_path", False)
+            or getattr(self, "_paired_factor_coordinates", False)
+            or getattr(self, "_dense_angular_friction", False)
+        )
+        if self._world_parallel == "islands" and not supported:
+            raise ValueError(
+                "world_parallel='islands' requires the fused matrix-free solve without the local fast path "
+                "or articulated torsional/rolling friction"
+            )
+        if self._world_parallel == "warp" or not supported:
+            return
+        if self._world_parallel == "auto" and self._world_count >= int(getattr(model.device, "sm_count", 0)):
+            return
+        dof_articulation = np.full(model.joint_dof_count, -1, dtype=np.int32)
+        qd_start = model.joint_qd_start.numpy()
+        for joint, articulation in enumerate(model.joint_articulation.numpy()):
+            dof_articulation[qd_start[joint] : qd_start[joint + 1]] = articulation
+        components = world_dof_components(self._world_dof_indices.numpy(), dof_articulation)
+        warps = island_warp_count(components, _ISLAND_MAX_WARPS)
+        if warps < 2:
+            return
+        kwargs = self._pgs_solve_mf_gs_kernel_for_phase.keywords
+        metadata_bytes = (
+            _mfgs_resident_metadata_bytes(
+                self._articulation_constraint_max,
+                has_drive_rows=kwargs["has_drive_rows"],
+                fuse_vel_limits=kwargs["fuse_vel_limits"],
+            )
+            if kwargs["shared_metadata"]
+            else 0
+        )
+        shared_bytes = (
+            _estimate_mfgs_shared_memory(
+                self._articulation_constraint_max,
+                self._free_body_constraint_max,
+                self._max_world_dofs,
+                metadata_bytes=metadata_bytes,
+                torsion_links=kwargs["torsion_links"],
+                pair_cache=kwargs["pair_cache"],
+            )
+            + island_shared_bytes(
+                self._articulation_constraint_max, self._free_body_constraint_max, self._max_world_dofs, warps
+            )
+            + _WARP_STATIC_SHARED_RESERVE_BYTES
+        )
+        if shared_bytes > min(
+            _STATIC_SHARED_MEMORY_MAX_BYTES, int(getattr(model.device, "max_shared_memory_per_block", 0))
+        ):
+            if self._world_parallel == "islands":
+                raise ValueError(f"world_parallel='islands' needs {shared_bytes} B of static shared memory per block")
+            return
+        self._pgs_solve_mf_gs_islands_kernels = {
+            phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase, island_warps=warps)
+            for phase in self._pgs_solve_mf_gs_kernels
+        }
+        self._island_dof_component = wp.array(components, dtype=wp.int32, device=model.device)
+        self._island_warps = warps
 
     def _propagation_tree_refresh_forced(self) -> bool:
         """True when dense GS phases other than contacts may write tree dofs.
@@ -24978,6 +25080,7 @@ def _get_pgs_solve_mf_gs_kernel(
     pair_cache: bool = False,
     free_rigid_angular_friction: bool = False,
     row_phase: int | None = None,
+    island_warps: int = 0,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -25010,6 +25113,9 @@ def _get_pgs_solve_mf_gs_kernel(
     matrix-free contacts' sliding pairs in phase 2.
 
     ``row_phase`` compiles the row phase in; the launch argument is then ignored. ``None`` reads it at launch.
+
+    ``island_warps`` gives each world a block of that many warps, each sweeping whole independent islands
+    (see :mod:`world_islands`); the kernel then takes ``island_dof_component`` and no general-world queue.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
     stateless joint-velocity clamp as an end-of-iteration pass over the
@@ -26740,6 +26846,10 @@ def _get_pgs_solve_mf_gs_kernel(
         1,
     )
     snippet = _butterfly_warp_sums(snippet)
+    if island_warps:
+        if factor_coordinates or skip_local_internal_worlds:
+            raise ValueError("the island sweep requires the general one-world-per-block solve")
+        snippet = islands_snippet(snippet, max_constraints=M_D, mf_max_constraints=M_MF, dofs=D, warps=island_warps)
     if row_phase is not None:
         # A constant phase lets the compiler drop the per-row phase filters from the sweep.
         snippet = re.sub(r"\brow_phase\b", str(row_phase), snippet)
@@ -26921,6 +27031,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_compliance"
     if free_rigid_angular_friction:
         name += "_free_rigid_angular"
+    if island_warps:
+        return islands_kernel(snippet, f"{name}_islands{island_warps}")
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)

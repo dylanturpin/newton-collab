@@ -1,0 +1,1 @@
+Add an experimental `SolverSteel(world_parallel="islands" | "auto")` option that sweeps the independent islands of a world on separate warps in the fused matrix-free Gauss-Seidel solve; in the tested configurations its results match the default one-warp sweep bit for bit.
