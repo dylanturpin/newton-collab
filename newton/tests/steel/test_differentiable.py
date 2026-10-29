@@ -877,6 +877,48 @@ def test_restitution_bounce_matches_default_and_finite_difference(test, device):
         test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
+def test_material_combine_matches_default(test, device):
+    """A box lands and slides on a plane with unequal per-shape mu and e under every combine mode."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    body = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()))
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(mu=0.8, restitution=0.8))
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.2, restitution=0.4))
+    models = {flag: builder.finalize(device=device, requires_grad=flag) for flag in (False, True)}
+    pipeline = newton.CollisionPipeline(models[True], rigid_contact_max=8)
+    solve_modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
+
+    def rollout(differentiable, solve_mode, mode):
+        model = models[differentiable]
+        solver = SolverSteel(
+            model,
+            differentiable=differentiable,
+            solve_mode=solve_mode,
+            friction_anchor_beta=0.0,
+            enable_restitution=True,
+            iterations=8,
+            friction_combine=mode,
+            restitution_combine=mode,
+        )
+        states = [model.state(requires_grad=differentiable) for _ in range(31)]
+        states[0].joint_qd.assign(np.array([2.0, 0.0, -2.0, 0.0, 0.0, 0.0], np.float32))
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        contacts = pipeline.contacts()
+        for k in range(30):
+            pipeline.collide(states[k], contacts)
+            solver.step(states[k], states[k + 1], None, contacts, 1.0 / 240.0)
+        return states[-1].joint_qd.numpy()
+
+    for solve_mode in solve_modes:
+        results = {}
+        for mode in ("average", "min", "multiply", "max"):
+            with test.subTest(solve_mode=solve_mode, mode=mode):
+                results[mode] = rollout(False, solve_mode, mode)
+                np.testing.assert_allclose(rollout(True, solve_mode, mode), results[mode], rtol=0.0, atol=1.0e-5)
+        test.assertGreater(abs(results["max"][0] - results["min"][0]), 0.05)
+        test.assertGreater(abs(results["max"][2] - results["min"][2]), 0.05)
+
+
 def _build_free_shape(device, shape, *, restitution=0.0, requires_grad=True):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, density=1000.0, restitution=restitution)
@@ -3044,6 +3086,7 @@ for _device in get_test_devices():
         test_sphere_friction_matches_default_and_finite_difference,
         test_repeated_rollouts_reuse_buffers,
         test_restitution_bounce_matches_default_and_finite_difference,
+        test_material_combine_matches_default,
         test_sliding_box_velocity_jacobian,
         test_frictional_impact_matches_default,
         test_contact_law_options,
