@@ -862,6 +862,42 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                     mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
                     self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
+    def test_surface_velocity_leaves_the_normal_response_alone(self):
+        """A box dropped with restitution rebounds the same off a moving belt, even one whose velocity has a normal part."""
+        for solve_mode in ("split", "matrix_free"):
+            with self.subTest(solve_mode=solve_mode):
+                rebound_static, _ = _surface_belt_drop(solve_mode, (0.0, 0.0, 0.0))
+                rebound, vx = _surface_belt_drop(solve_mode, (0.5, 0.0, 1.0))
+                self.assertGreater(rebound_static, 0.2)
+                self.assertAlmostEqual(rebound, rebound_static, delta=1.0e-3)
+                self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+
+def _surface_belt_drop(solve_mode, velocity, steps=240):
+    """Drop a box with restitution 0.5 onto a mesh belt with surface ``velocity``; return its peak rebound speed and final x velocity."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.5, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    belt.mesh.velocities.fill_(wp.vec3(*velocity))
+    solver = SolverSteel(model, solve_mode=solve_mode, enable_restitution=True, iterations=32, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    rebound = 0.0
+    for _ in range(steps):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+        state, next_state = next_state, state
+        rebound = max(rebound, float(state.body_qd.numpy()[box, 2]))
+    return rebound, float(state.body_qd.numpy()[box, 0])
+
 
 def _surface_belt_ride(mode, articulated, response, anchor_beta, speed=0.5, steps=120, window=30):
     """Step a box on a static mesh belt whose surface moves at ``speed`` along x; return its mean x velocity."""
