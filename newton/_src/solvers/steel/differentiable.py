@@ -295,6 +295,8 @@ class DifferentiableStep:
         self._implicit_scratch = None
         # The factorization's adjoint as four parallel kernels instead of one serial thread per articulation.
         self.parallel_cholesky_adjoint = True
+        # Untaped PGS sweeps (all of them under pgs_adjoint="implicit") run one warp per world.
+        self.tiled_pgs = True
         self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
@@ -1179,9 +1181,11 @@ class DifferentiableStep:
             # each pass writing the next one's input.
             torsion_out = c.velocity_limit_input[k] if velocity_limits else c.impulses[k + 1]
             sweep_out = c.torsion_input[k] if torsion else torsion_out
+            tiled = self.tiled_pgs and not record
             wp.launch(
-                _dense_pgs_sweep,
-                dim=solver._world_count,
+                _dense_pgs_sweep_tiled if tiled else _dense_pgs_sweep,
+                dim=(solver._world_count, TILE_LANES) if tiled else solver._world_count,
+                block_dim=TILE_LANES if tiled else 256,
                 inputs=[
                     c.row_count,
                     c.diag,
@@ -3509,6 +3513,137 @@ def _dense_pgs_sweep(
                         b *= scale
                     impulses_out[world, i] = a
                     impulses_out[world, sibling] = b
+
+
+@wp.kernel(enable_backward=False)
+def _dense_pgs_sweep_tiled(
+    row_count: wp.array[int],
+    diag: wp.array2d[float],
+    C: wp.array3d[float],
+    rhs: wp.array2d[float],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_w: wp.array2d[float],
+    regularize: int,
+    omega: float,
+    skip_friction: int,
+    smooth_normal: int,
+    smooth_impulse: wp.array2d[float],
+    patches: int,
+    ring: wp.array2d[int],
+    drive_bias: wp.array2d[float],
+    drive_velocity_scale: wp.array2d[float],
+    drive_impulse_scale: wp.array2d[float],
+    drive_max_impulse: wp.array2d[float],
+    impulses_in: wp.array2d[float],
+    # outputs
+    residuals: wp.array2d[float],
+    pair_load: wp.array2d[float],
+    impulses_out: wp.array2d[float],
+):
+    """_dense_pgs_sweep with one warp per world: each row's dot product is split across lanes and reduced.
+
+    Every lane computes the same projection from the reduced residual and writes the same values; impulses of
+    earlier rows are read after the reduction's barrier. Untaped, and the residual sum order differs from the loop.
+    """
+    world, lane = wp.tid()
+    m = row_count[world]
+    for i in range(m):
+        kind = row_type[world, i]
+        if kind == PGS_CONSTRAINT_TYPE_TORSION or kind == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+            # Torsion and velocity-limit rows follow every other row of the sweep, as in the matrix-free kernel.
+            impulses_out[world, i] = impulses_in[world, i]
+        elif _is_friction_row(kind) and skip_friction != 0:
+            impulses_out[world, i] = 0.0
+        elif not _is_pair_row(kind) or i == _pair_first_row(kind, row_parent[world, i]):
+            partial = float(0.0)
+            for j in range(lane, m, TILE_LANES):
+                impulse = impulses_in[world, j]
+                if j < i:
+                    impulse = impulses_out[world, j]
+                partial += C[world, i, j] * impulse
+            residual = rhs[world, i] + wp.tile_extract(wp.tile_sum(wp.tile(partial)), 0)
+            residuals[world, i] = residual
+            denom = diag[world, i]
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT and smooth_normal != 0:
+                impulses_out[world, i] = smooth_impulse[world, i]
+            elif kind == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+                # PhysX's PGS force-drive update; a drive row's rhs is J * v_hat, so the residual is J * v.
+                new_impulse = impulses_in[world, i]
+                if denom > 0.0:
+                    max_impulse = drive_max_impulse[world, i]
+                    new_impulse = wp.clamp(
+                        new_impulse * drive_impulse_scale[world, i]
+                        + residual * drive_velocity_scale[world, i]
+                        + drive_bias[world, i],
+                        -max_impulse,
+                        max_impulse,
+                    )
+                impulses_out[world, i] = new_impulse
+            elif not _is_pair_row(kind):
+                new_impulse = impulses_in[world, i]
+                if denom > 0.0:
+                    # Contact regularization: w = 1 / (1 + g) on penetrating contact rows, else 1.
+                    w = float(1.0)
+                    if regularize != 0:
+                        w = row_w[world, i]
+                    old = impulses_in[world, i]
+                    new_impulse = old + omega * (-residual / denom * w - (1.0 - w) * old)
+                    unilateral = kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+                    if unilateral and new_impulse < 0.0:
+                        new_impulse = 0.0
+                    if kind == PGS_CONSTRAINT_TYPE_CONTACT_SPIN:
+                        # A box bounded by the spin coefficient times the normal load.
+                        spin_load = impulses_out[world, row_parent[world, i]]
+                        if patches != 0:
+                            spin_load = _ring_load(
+                                row_type, ring, impulses_in, impulses_out, world, row_parent[world, i], i, m, pair_load
+                            )
+                        spin_radius = wp.max(row_mu[world, i] * spin_load, 0.0)
+                        new_impulse = wp.clamp(new_impulse, -spin_radius, spin_radius)
+                impulses_out[world, i] = new_impulse
+            else:
+                parent = row_parent[world, i]
+                sibling = i + 1
+                load = impulses_out[world, parent]
+                if patches != 0:
+                    # patch_normal_load: a region's anchors share the load of all its normal rows.
+                    load = _ring_load(row_type, ring, impulses_in, impulses_out, world, parent, i, m, pair_load)
+                radius = wp.max(row_mu[world, i] * load, 0.0)
+                if radius <= 0.0:
+                    impulses_out[world, i] = 0.0
+                    impulses_out[world, sibling] = 0.0
+                else:
+                    partial_sibling = float(0.0)
+                    for k in range(lane, m, TILE_LANES):
+                        impulse_k = impulses_in[world, k]
+                        if k < i:
+                            impulse_k = impulses_out[world, k]
+                        partial_sibling += C[world, sibling, k] * impulse_k
+                    w_sibling = rhs[world, sibling] + wp.tile_extract(wp.tile_sum(wp.tile(partial_sibling)), 0)
+                    residuals[world, sibling] = w_sibling
+                    trial = _friction_pair(
+                        denom,
+                        C[world, i, sibling],
+                        diag[world, sibling],
+                        wp.vec2(residual, residuals[world, sibling]),
+                        wp.vec2(impulses_in[world, i], impulses_in[world, sibling]),
+                        radius,
+                        omega,
+                    )
+                    a = trial[0]
+                    b = trial[1]
+                    magnitude = _guarded_sqrt(a * a + b * b)
+                    if magnitude > radius:
+                        scale = radius / magnitude
+                        a *= scale
+                        b *= scale
+                    impulses_out[world, i] = a
+                    impulses_out[world, sibling] = b
+
+
+TILE_LANES = wp.constant(32)
 
 
 @wp.func
