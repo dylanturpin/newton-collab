@@ -1139,6 +1139,27 @@ def _ground_box(device, **solver_kwargs):
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_surface_motion_transports_with_relocated_anchors(self):
+        """Keep zero anchor error on a co-rotating surface when the anchor points move inward."""
+        theta, dt = 0.01, 1.0 / 240.0
+        rot = np.array([[np.cos(theta), -np.sin(theta), 0.0], [np.sin(theta), np.cos(theta), 0.0], [0.0, 0.0, 1.0]])
+        points = np.array([[-0.05, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float32)
+        model, state, contacts, patches = _patch_fixture(points.tolist())
+        # Shape 1's surface rotates about z; the body follows it exactly over the step.
+        contacts.rigid_contact_surface_velocity = wp.array((points @ rot.T - points) / dt, dtype=wp.vec3, device="cpu")
+        patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+        patches.store(state)
+        q = state.body_q.numpy()
+        q[0, 3:] = (0.0, 0.0, np.sin(theta / 2), np.cos(theta / 2))
+        state.body_q.assign(q)
+        moved = 0.8 * points
+        contacts.rigid_contact_point0.assign(moved)
+        contacts.rigid_contact_point1.assign((moved @ rot.T).astype(np.float32))
+        contacts.rigid_contact_surface_velocity.assign(((moved @ rot.T - moved) / dt).astype(np.float32))
+        patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+        np.testing.assert_array_equal(patches.current.source.numpy()[:2] >= 0, True)
+        self.assertLess(float(np.abs(patches.view.phi.numpy()).max()), 5.0e-6)
+
     def test_support_edge_centers_ignore_contact_order(self):
         """Keep the same edge centers when contact ordering changes at rest."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"

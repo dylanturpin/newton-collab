@@ -915,6 +915,9 @@ def _build(
             if chosen >= 0:
                 prev.used[chosen] = 1
                 error = _carried_displacement(q, prev, chosen, n)
+                if contact_surface_velocity:
+                    # Surface displacement joins the spring samples so the field below carries both.
+                    error += prev.surface_motion[chosen]
                 old_center = 0.5 * (
                     _world_point(q, a, prev.anchor_a[chosen]) + _world_point(q, b, prev.anchor_b[chosen])
                 )
@@ -944,14 +947,14 @@ def _build(
                         span_sq = wp.length_sq(span)
                         if span_sq > 1.0e-8 * r * r:
                             other_error = _carried_displacement(q, prev, partner, n)
+                            if contact_surface_velocity:
+                                other_error += prev.surface_motion[partner]
                             spin = wp.dot(other_error - error, wp.cross(n, span)) / span_sq
                             error = 0.5 * (error + other_error) + spin * wp.cross(
                                 n, pa - 0.5 * (old_center + other_center)
                             )
                         break
                 error += motion
-                if contact_surface_velocity:
-                    error += prev.surface_motion[chosen]
                 error -= n * wp.dot(error, n)
                 carried_impulse = prev.tangent_impulse[chosen]
             stored_error = error
