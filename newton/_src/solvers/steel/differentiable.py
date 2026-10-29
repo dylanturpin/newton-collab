@@ -22,6 +22,13 @@ from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import BodyFlags, JointType
 from .contact_torsion import _contact_groups, _group_budget
+from .differentiable_implicit import (
+    cholesky_adjoint_left,
+    cholesky_adjoint_phi,
+    cholesky_adjoint_right,
+    cholesky_adjoint_scatter,
+    pgs_implicit_adjoint,
+)
 from .friction_patches import (
     FrictionPatches,
     _pose_motion,
@@ -279,6 +286,16 @@ class DifferentiableStep:
         worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
+        # PGS gradient: "unrolled" tapes every sweep, "truncated" only the last pgs_truncate sweeps, and "implicit"
+        # differentiates the converged complementarity conditions with one dense solve per world.
+        self.pgs_adjoint = "unrolled"
+        self.pgs_truncate = 1
+        self.implicit_regularization = 1.0e-4
+        self.implicit_slide_tolerance = 1.0e-3
+        self._implicit_scratch = None
+        # The factorization's adjoint as four parallel kernels instead of one serial thread per articulation.
+        self.parallel_cholesky_adjoint = True
+        self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
         """The copy of ``kernel`` whose atomics, its adjoint's included, reduce in a fixed order under deterministic=True."""
@@ -506,7 +523,10 @@ class DifferentiableStep:
                 inputs=[b.H[size], solver._R_by_size[size], size, b.factor_tmp[size]],
                 outputs=[b.L[size]],
                 device=device,
+                record_tape=not self.parallel_cholesky_adjoint,
             )
+            if self.parallel_cholesky_adjoint:
+                self._record_cholesky_adjoint(b.H[size], b.L[size], b.factor_tmp[size], size, n_arts)
             wp.launch(
                 _solve_dense,
                 dim=n_arts,
@@ -1144,7 +1164,17 @@ class DifferentiableStep:
         friction_start = solver._contact_friction_start_iteration(solver._iterations)
         torsion = solver._contact_torsion_enabled
         velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
-        for k in range(solver._iterations):
+        iterations = solver._iterations
+        if self.pgs_adjoint == "unrolled":
+            first_taped = 0
+        elif self.pgs_adjoint == "truncated":
+            first_taped = max(iterations - self.pgs_truncate, 0)
+        elif self.pgs_adjoint == "implicit":
+            first_taped = iterations
+        else:
+            raise ValueError(f"unknown pgs_adjoint {self.pgs_adjoint!r}")
+        for k in range(iterations):
+            record = k >= first_taped
             # A sweep is the contact and limit rows, then the torsion rows, then the velocity-limit rows,
             # each pass writing the next one's input.
             torsion_out = c.velocity_limit_input[k] if velocity_limits else c.impulses[k + 1]
@@ -1176,6 +1206,7 @@ class DifferentiableStep:
                 ],
                 outputs=[c.residuals[k], c.pair_load[k] if patches else c.pair_load_dummy, sweep_out],
                 device=device,
+                record_tape=record,
             )
             if torsion:
                 wp.launch(
@@ -1204,6 +1235,7 @@ class DifferentiableStep:
                         torsion_out,
                     ],
                     device=device,
+                    record_tape=record,
                 )
             if velocity_limits:
                 wp.launch(
@@ -1212,7 +1244,10 @@ class DifferentiableStep:
                     inputs=[c.row_count, c.row_type, c.diag, c.C, rhs, c.velocity_limit_input[k]],
                     outputs=[c.velocity_limit_residuals[k], c.impulses[k + 1]],
                     device=device,
+                    record_tape=record,
                 )
+        if self.pgs_adjoint == "implicit":
+            self._record_implicit_adjoint(c, rhs, smooth is not None)
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
@@ -1233,6 +1268,67 @@ class DifferentiableStep:
                 device=device,
             )
         return c.v_out
+
+    def _record_cholesky_adjoint(self, H: wp.array, L: wp.array, tmp: wp.array, n: int, n_arts: int) -> None:
+        """Record the parallel Cholesky adjoint on the active tape."""
+        tape = wp._src.context.runtime.tape
+        if tape is None:
+            return
+        device = self.solver.model.device
+
+        def backward():
+            wp.launch(cholesky_adjoint_phi, dim=(n_arts, n, n), inputs=[L, L.grad, n], outputs=[tmp], device=device)
+            wp.launch(cholesky_adjoint_left, dim=(n_arts, n), inputs=[L, n], outputs=[tmp], device=device)
+            wp.launch(cholesky_adjoint_right, dim=(n_arts, n), inputs=[L, n], outputs=[tmp], device=device)
+            wp.launch(cholesky_adjoint_scatter, dim=(n_arts, n, n), inputs=[tmp], outputs=[H.grad, L.grad], device=device)
+
+        tape.record_func(backward, [H, L])
+
+    def _record_implicit_adjoint(self, c: _ContactBuffers, rhs: wp.array, smooth: bool) -> None:
+        """Record the implicit PGS adjoint on the active tape; the sweeps themselves stay off the tape."""
+        tape = wp._src.context.runtime.tape
+        if tape is None:
+            return
+        solver = self.solver
+        worlds, rows = solver._world_count, solver._articulation_constraint_max
+        if self._implicit_scratch is None:
+            device = solver.model.device
+            self._implicit_scratch = (
+                wp.zeros((worlds, rows, rows), dtype=wp.float32, device=device),
+                wp.zeros((worlds, rows), dtype=wp.int32, device=device),
+                wp.zeros((worlds, rows), dtype=wp.int32, device=device),
+                wp.zeros((worlds, rows), dtype=wp.float32, device=device),
+            )
+        M, row_class, perm, u = self._implicit_scratch
+        lam = c.impulses[solver._iterations]
+        regularization, tolerance = self.implicit_regularization, self.implicit_slide_tolerance
+
+        def backward():
+            wp.launch(
+                pgs_implicit_adjoint,
+                dim=worlds,
+                inputs=[
+                    c.row_count,
+                    c.row_type,
+                    c.row_parent,
+                    c.row_mu,
+                    c.C,
+                    rhs,
+                    lam,
+                    lam.grad,
+                    int(smooth),
+                    regularization,
+                    tolerance,
+                    M,
+                    row_class,
+                    perm,
+                    u,
+                ],
+                outputs=[c.C.grad, rhs.grad, c.smooth_impulse.grad, self.implicit_status],
+                device=solver.model.device,
+            )
+
+        tape.record_func(backward, [c.C, rhs, lam, c.smooth_impulse])
 
     def _reserve_rows(self, launch, slot_counter: wp.array, world_index=None) -> None:
         """Reserve one row family like the default's _reserve_rows: per world in articulation order if deterministic."""
