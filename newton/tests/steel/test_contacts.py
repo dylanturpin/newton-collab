@@ -3913,6 +3913,67 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
                         np.testing.assert_array_equal(body_qd, np.array(self.PRESCRIBED_QD, dtype=np.float32))
 
 
+def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
+    """Reach the plain Gauss-Seidel solution of a ten-box tower in fewer sweeps, on supported routes only."""
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.75, gap=0.002)
+    jitter = np.random.default_rng(0).uniform(-0.002, 0.002, (10, 2))
+    for i in range(10):
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(jitter[i, 0], jitter[i, 1], 0.05 + 0.1001 * i), wp.quat_identity())
+        )
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    dt = 1.0 / 60.0
+    control = model.control()
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state, output = model.state(), model.state()
+    settle = SolverSteel(model, solve_mode="matrix_free", iterations=64)
+    for _ in range(5):
+        pipeline.collide(state, contacts)
+        settle.step(state, output, control, contacts, dt)
+        state, output = output, state
+    pipeline.collide(state, contacts)
+    start = model.state()
+
+    def solve(iterations, momentum):
+        start.assign(state)
+        solver = SolverSteel(model, solve_mode="matrix_free", iterations=iterations, nesterov_momentum=momentum)
+        solver.step(start, output, control, contacts, dt)
+        return output.body_qd.numpy()
+
+    mass = model.body_mass.numpy()
+    inertia = np.trace(model.body_inertia.numpy(), axis1=1, axis2=2) / 3.0
+    reference = solve(8000, False)
+
+    def error(body_qd):
+        # Mass-weighted velocity error in units of one step of gravity.
+        delta = body_qd - reference
+        energy = np.sum(mass * np.sum(delta[:, :3] ** 2, 1)) + np.sum(inertia * np.sum(delta[:, 3:] ** 2, 1))
+        return np.sqrt(energy) / (np.sqrt(mass.sum()) * 9.81 * dt)
+
+    test.assertLess(error(solve(2000, True)), 0.05)
+    plain, accelerated = error(solve(24, False)), error(solve(24, True))
+    test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.3f}, momentum {accelerated:.3f}")
+
+    with test.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
+        SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation", nesterov_momentum=True)
+
+
+class TestSteelNesterovMomentum(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelNesterovMomentum,
+    "test_nesterov_momentum_converges_a_tower_in_fewer_sweeps",
+    test_nesterov_momentum_converges_a_tower_in_fewer_sweeps,
+    devices=cuda_devices,
+)
+
+
 class TestSteelPairedResponse(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
     def test_paired_response_without_factor_coordinates_matches_general(self):

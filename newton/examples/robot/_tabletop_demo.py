@@ -41,6 +41,7 @@ class TabletopDemo:
 
     task = ""
     robot_root = None
+    friction_anchor_beta = 0.0
     camera_position = (1.65, -2.1, 1.6)
 
     def __init__(self, viewer, args):
@@ -129,7 +130,7 @@ class TabletopDemo:
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             enable_joint_friction=self.task == "crane",
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=self.friction_anchor_beta,
             articulation_constraint_max=512,
             free_body_constraint_max=4096,
             row_watermark=True,
