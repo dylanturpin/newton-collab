@@ -863,6 +863,14 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                     self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
+    def test_surface_velocity_wakes_a_sleeping_box(self):
+        """A box asleep on a still mesh belt wakes and rides when the belt starts moving."""
+        awake_before, awake_after, vx = _surface_belt_start(steps_still=240, steps_moving=120)
+        self.assertEqual(awake_before, 0)
+        self.assertEqual(awake_after, 1)
+        self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
     def test_surface_velocity_leaves_the_normal_response_alone(self):
         """A box dropped with restitution rebounds the same off a moving belt, even one whose velocity has a normal part."""
         for solve_mode in ("split", "matrix_free"):
@@ -872,6 +880,43 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                 self.assertGreater(rebound_static, 0.2)
                 self.assertAlmostEqual(rebound, rebound_static, delta=1.0e-3)
                 self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+
+def _surface_belt_start(steps_still, steps_moving):
+    """Let a box fall asleep on a still mesh belt, then start the belt at 0.5 m/s.
+
+    Returns the box's awake flag before and after the start and its final x velocity.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        enable_sleeping=True,
+        sleep_quiet_time=0.1,
+        iterations=32,
+        free_body_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    awake = []
+    for speed, steps in ((0.0, steps_still), (0.5, steps_moving)):
+        belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
+        for _ in range(steps):
+            state.clear_forces()
+            pipeline.collide(state, contacts)
+            solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+            state, next_state = next_state, state
+        awake.append(int(solver._sleeping.body_awake.numpy()[box]))
+    return awake[0], awake[1], float(state.body_qd.numpy()[box, 0])
 
 
 def _surface_belt_drop(solve_mode, velocity, steps=240):
