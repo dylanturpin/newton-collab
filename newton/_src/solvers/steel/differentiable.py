@@ -300,7 +300,8 @@ class DifferentiableStep:
         # Untaped PGS sweeps (all of them under pgs_adjoint="implicit") run one warp per world.
         self.tiled_pgs = True
         # The mass-matrix factorization as one tile Cholesky per articulation (needs parallel_cholesky_adjoint).
-        self.tiled_factor = True
+        # Opt-in: it changes the forward's summation order.
+        self.tiled_factor = False
         self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
