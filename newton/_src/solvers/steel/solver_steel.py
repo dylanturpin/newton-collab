@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import gc
 import json
 import math
@@ -30,7 +31,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ...core.types import override
+from ...core.types import MAXVAL, override
 from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -84,6 +85,10 @@ from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     ANGULAR_FRICTION_PROPAGATION,
     CONTACT_GENERATION_NONE,
+    MATERIAL_COMBINE_AVERAGE,
+    MATERIAL_COMBINE_MAX,
+    MATERIAL_COMBINE_MIN,
+    MATERIAL_COMBINE_MULTIPLY,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -121,6 +126,7 @@ from .kernels import (
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     accumulate_torsion_wrenches_from_impulses,
+    add_joint_friction_load,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -160,6 +166,7 @@ from .kernels import (
     compute_delta_and_accumulate,
     compute_effective_joint_armature,
     compute_free_root_rotation,
+    compute_joint_friction_load,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -310,6 +317,13 @@ _STATIC_SHARED_MEMORY_MAX_BYTES = 48 * 1024
 # Headroom for the static shared storage Warp adds to a kernel beyond the solver's own arrays.
 _WARP_STATIC_SHARED_RESERVE_BYTES = 2048
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
+# ``friction_combine``/``restitution_combine`` names and their kernel ids, in PhysX's combine-mode order.
+_MATERIAL_COMBINE_MODES = {
+    "average": int(MATERIAL_COMBINE_AVERAGE),
+    "min": int(MATERIAL_COMBINE_MIN),
+    "multiply": int(MATERIAL_COMBINE_MULTIPLY),
+    "max": int(MATERIAL_COMBINE_MAX),
+}
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
 _ATTRIBUTE_NAMESPACE = "steel"
@@ -551,8 +565,8 @@ def _warn_constraint_row_overflow(
         if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
             wp.printf(
                 "Warning: Steel propagation constraint-row overflow in world %d: requested %d rows, "
-                "limit %d; dropped %d contact/friction rows. Increase articulation_constraint_max or "
-                "free_body_constraint_max.\n",
+                "limit %d; dropped %d contact/friction rows. Increase propagation_constraint_max (or, when "
+                "it is unset, articulation_constraint_max or free_body_constraint_max).\n",
                 world,
                 propagation_requested,
                 propagation_capacity,
@@ -1031,6 +1045,19 @@ def _replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new)
 
 
+def _butterfly_warp_sums(snippet: str) -> str:
+    """Turn the warp sums into xor butterflies and drop the lane-0 broadcasts of the dot products.
+
+    Every lane ends with lane 0's down-sweep sum, since each butterfly level adds the same pair in either order.
+    """
+    snippet = snippet.replace("__shfl_down_sync(MASK, ", "__shfl_xor_sync(MASK, ")
+    return re.sub(
+        r"__shfl_sync\(MASK, (my_sum|cross|sibling_residual|dot|my_sum_vlim|my_sum_mf_vlim|my_sum_fvl), 0\)",
+        r"\1",
+        snippet,
+    )
+
+
 def _prefetch_streamed_dense_metadata(snippet: str) -> str:
     """Load row i+1's streamed metadata with its prefetched J/Y rows in the MF-GS dense loop.
 
@@ -1490,12 +1517,16 @@ class SolverSteel(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
-    Loop-closing BALL joints (joints outside the articulation tree whose child belongs to
-    an articulation) are enforced by three bilateral rows. The rows read
-    :attr:`~newton.Model.joint_enabled` and the translations of
-    :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step, so a
-    closure is released, engaged or re-anchored by editing those arrays in place, also
-    from a kernel between CUDA graph replays. An eager step reads a replaced array; a
+    Loop-closing BALL and REVOLUTE joints (joints outside the articulation tree whose child
+    belongs to an articulation) are enforced as bilateral rows: three that pin the joint's
+    anchors together, plus, for a REVOLUTE closure, two that keep the child's hinge axis
+    aligned with the parent's. A loop closure carries no joint coordinate, so limits and
+    drive gains on a loop REVOLUTE joint are ignored (with a warning). The rows read
+    :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_X_p` /
+    :attr:`~newton.Model.joint_X_c` and, for REVOLUTE closures,
+    :attr:`~newton.Model.joint_axis` every step, so a closure is released, engaged,
+    re-anchored or re-aimed by editing those arrays in place, also from a kernel between
+    CUDA graph replays. An eager step reads a replaced array; a
     captured graph keeps the arrays it was captured with, so recapture after replacing
     one.
 
@@ -1512,11 +1543,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
     Rigid-contact restitution is part of the ordinary normal contact row in
-    ``"split"`` and ``"matrix_free"`` modes. It uses the
-    arithmetic mean of the two shape coefficients and freezes the incident
-    relative normal velocity before contact impulses are applied. A sufficiently
-    fast contact predicted to reach the surface during the step replaces its
-    geometric/speculative bias with Newton's rebound target. Optional
+    ``"split"`` and ``"matrix_free"`` modes. It uses the two shape coefficients
+    combined by ``restitution_combine``. A contact whose relative normal
+    velocity ``u_start`` at the start of the step closes faster than the
+    threshold, and which touches the surface or is predicted to reach it during
+    the step, replaces its geometric/speculative bias with Newton's rebound
+    target ``-e * u_start`` as a lower bound on the separating velocity. Forces
+    applied during the step (gravity, drives, joint and body forces) count
+    toward reaching the surface but neither make a resting contact an impact nor
+    enlarge the rebound. Optional
     ``velocity_iterations`` refine the result but are never enabled
     implicitly. As in a conventional discrete PGS solver, the qualifying
     rebound velocity is used for the whole step; this gives the intended
@@ -1658,9 +1693,12 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_cached_response = _ConstructionOption()
     propagation_cached_response_body_max = _ConstructionOption()
     propagation_color_order = _ConstructionOption()
+    friction_combine = _ConstructionOption()
+    restitution_combine = _ConstructionOption()
     row_schedule = _ConstructionOption()
     friction_mode = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
+    propagation_constraint_max = _ConstructionOption()
     use_parallel_streams = _ConstructionOption()
     double_buffer = _ConstructionOption()
     drive_mode = _ConstructionOption()
@@ -1759,6 +1797,18 @@ class SolverSteel(SolverBase, CouplingInterface):
           ``"propagation"`` and ``"propagation_colored"``, which solves them inside their contact's colored
           unit; the rows start cold every step, also under ``contact_warmstart``.
 
+        One per-DOF attribute makes joint friction grow with the force the joint transmits, see
+        ``enable_joint_friction``:
+
+        - ``steel:joint_friction_load_coefficient``, experimental, adds ``c (|F| + |T|)`` to the DOF's
+          :attr:`~newton.Model.joint_friction` (default 0; USD reads it only from an explicitly authored
+          ``newton:steel:joint_friction_load_coefficient``). ``F`` [N] and ``T`` [N·m] are the force and the torque
+          about the child body's center of mass that the joint transmits to its child's subtree under the step's
+          free dynamics: gravity, applied body and joint forces, velocity-dependent terms and the resulting
+          accelerations, before contacts, limits, friction and ``drive_mode="rows"`` drives act. ``T`` keeps its
+          component about the joint axis, so a joint's own applied effort raises its friction. This is the joint
+          friction law of PhysX articulations before PhysX 5.6 (``physxJoint:jointFriction``); the sum mixes units.
+
         The solver reads them from the model at every step, for example
         ``model.steel.rigid_body_max_linear_velocity``. Models built without these attributes use the defaults.
 
@@ -1842,6 +1892,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dtype=wp.float32,
                 default=float("inf"),
                 usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="joint_friction_load_coefficient",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.JOINT_DOF,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                usd_attribute_name="newton:steel:joint_friction_load_coefficient",
             )
         )
 
@@ -1946,6 +2007,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         *,
         enable_joint_friction: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
+        propagation_constraint_max: int | None = None,
         friction_history_compact: bool = False,
         friction_locations_max: int | None = None,
         contact_torsion_device: bool = False,
@@ -1963,6 +2025,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         sleep_skip_constraints: bool = True,
         deterministic: bool = False,
         propagation_color_order: Literal["contact", "longest_first"] = "contact",
+        friction_combine: Literal["average", "min", "multiply", "max"] = "average",
+        restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
     ):
         """
         Args:
@@ -2047,8 +2111,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 responses require ``contact_torsion_device=True`` and ``velocity_iterations=0``.
             enable_torsional_rolling_friction: Experimental opt-in per-contact torsional and rolling
                 friction from :attr:`~newton.Model.shape_material_mu_torsional` and
-                :attr:`~newton.Model.shape_material_mu_rolling` [m]. The pair coefficient is the mean of
-                the two shapes, as for sliding friction; MuJoCo's ``condim`` attribute and its max pair rule
+                :attr:`~newton.Model.shape_material_mu_rolling` [m]. The pair coefficient combines
+                the two shapes by ``friction_combine``, as for sliding friction; MuJoCo's ``condim`` attribute and its max pair rule
                 are ignored, so enabling this applies every positive material coefficient, including on
                 shapes a MuJoCo model treats as ``condim=3``. Each articulated contact with sliding
                 friction and a positive pair coefficient gets one spin row about the normal and two
@@ -2257,6 +2321,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 such combinations raise :class:`NotImplementedError`. When False,
                 :attr:`~newton.Model.joint_friction` is ignored. Defaults to False.
 
+                A positive ``steel:joint_friction_load_coefficient`` (see :meth:`register_custom_attributes`)
+                at construction adds load-proportional friction: each step, the DOF's bound grows by the current
+                coefficient times the load its joint transmits under that step's free dynamics. The friction
+                row is solved together with the drives, so it resists a drive up to its bound; PhysX applies the
+                friction before each DOF's drive in every iteration, which lets a stiff drive largely override it.
+                With ``drive_mode="augmented"`` the implicit drive forces are part of the free dynamics and count
+                toward the load; ``drive_mode="rows"`` leaves them out, as PhysX does. The coefficients follow the validity rules and notify contract of
+                ``joint_friction``; a model built with every coefficient zero must keep them zero.
+
                 .. experimental::
 
                     ``enable_joint_friction=True`` and its supported combinations may change without
@@ -2422,6 +2495,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shortens the sweep where one body carries many units of mixed length, but on some stacked
                 scenes it converges more slowly at a fixed iteration count. Other responses ignore it.
                 Defaults to ``"contact"``.
+            friction_combine (str, optional): How a contact combines its two shapes' friction coefficients:
+                ``"average"``, ``"min"``, ``"multiply"`` or ``"max"``, as PhysX's material combine modes. It applies
+                to sliding friction (:attr:`~newton.Model.shape_material_mu`) and to the articulated torsional and
+                rolling coefficients. Exception: the ``steel:condim`` free-rigid angular rows keep the larger
+                contributed coefficient under every mode. A contact with one shape keeps that shape's coefficient. Construction-only. Defaults to
+                ``"average"``.
+            restitution_combine (str, optional): How a contact combines its two shapes' restitution coefficients,
+                with the same modes as ``friction_combine``, after each coefficient is clamped to ``[0, 1]``.
+                Construction-only. Defaults to ``"average"``.
             row_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -2458,6 +2540,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``"propagation"`` raises ``NotImplementedError``.
                 Defaults to ``"fixed_normal"``.
             free_body_constraint_max (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
+            propagation_constraint_max (int | None, optional): Capacity of the propagation row family per world
+                in the ``"propagation"`` and ``"propagation_colored"`` responses, where every contact row lives
+                on this family. ``None`` keeps the default of ``free_body_constraint_max +
+                articulation_constraint_max``. Set it to size the propagation rows on their own, so
+                ``free_body_constraint_max`` only has to hold the rows that stay matrix-free (the velocity-limit
+                rows). Rejected with ``articulated_contact_response="immediate"``, where no propagation rows
+                exist. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
             parallel_tree: Opt in to parallel branches for forward dynamics, backward
@@ -2488,12 +2577,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 zero, so a model that authors no restitution does not bounce.
                 ``False`` turns restitution off for every contact regardless of the
                 coefficients.
-            restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
-                relative normal velocity required to apply restitution. The contact must also be at the surface or
-                be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
-                Baumgarte contact law, preventing resting contacts from repeatedly bouncing under small
-                accelerations.
-                Restitution coefficients are averaged across the two shapes after clamping finite values to
+            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact at the
+                start of the step required to apply restitution. The contact must also be at the surface or be
+                predicted to reach it during the timestep. Slower contacts retain the speculative or Baumgarte
+                contact law, so a resting contact pressed by gravity, a drive or an applied force does not bounce.
+                A qualifying contact leaves with at least ``e`` times its step-start closing speed, or faster if
+                this step's forces already separate it faster.
+                Restitution coefficients are combined by ``restitution_combine`` after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
@@ -2619,6 +2709,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._enable_joint_velocity_limits = enable_joint_velocity_limits
         self._enable_joint_friction = bool(enable_joint_friction)
         self._joint_friction_warp_kernels: dict[int, wp.Kernel] = {}
+        self._joint_friction_load_active = False
         try:
             self._velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         except (TypeError, ValueError) as exc:
@@ -2688,6 +2779,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 f"propagation_color_order must be 'contact' or 'longest_first', got {propagation_color_order!r}"
             )
         self._propagation_color_order = propagation_color_order
+        for name, value in (("friction_combine", friction_combine), ("restitution_combine", restitution_combine)):
+            if value not in _MATERIAL_COMBINE_MODES:
+                raise ValueError(f"{name} must be one of {tuple(_MATERIAL_COMBINE_MODES)}, got {value!r}")
+        self._friction_combine = friction_combine
+        self._restitution_combine = restitution_combine
+        self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
+        self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
         self._contact_warmstart = bool(contact_warmstart)
         self.contact_warmstart_decay = contact_warmstart_decay
         self._ws_prev_dense_impulses = None
@@ -2810,12 +2908,22 @@ class SolverSteel(SolverBase, CouplingInterface):
         # alone (32 by default) allocate_world_contact_slots silently dropped every
         # contact past the cap (contact_path = -1): on a tote-nesting manifold that
         # kept 10 of 24 contacts and sank the stack. Other modes keep the dense cap.
-        if articulated_contact_response in ("propagation", "propagation_colored"):
+        self._propagation_constraint_max = (
+            None if propagation_constraint_max is None else int(propagation_constraint_max)
+        )
+        if self._propagation_constraint_max is not None:
+            self._propagation_max_constraints = self._propagation_constraint_max
+        elif articulated_contact_response in ("propagation", "propagation_colored"):
             self._propagation_max_constraints = int(free_body_constraint_max) + self._requested_dense_max_constraints
         else:
             self._propagation_max_constraints = self._requested_dense_max_constraints
         if self._propagation_max_constraints < 1:
-            raise ValueError("propagation_max_constraints must be positive")
+            raise ValueError("propagation_constraint_max must be positive")
+        if self._propagation_constraint_max is not None and articulated_contact_response == "immediate":
+            raise ValueError(
+                "propagation_constraint_max requires articulated_contact_response "
+                "'propagation' or 'propagation_colored'"
+            )
         self._double_buffer = double_buffer
         self._nvtx = PROFILE_ENABLED
 
@@ -2947,11 +3055,17 @@ class SolverSteel(SolverBase, CouplingInterface):
         # articulation joint ranges, so gate that mode rather than corrupt silently.
         self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
         if self._enable_joint_friction:
+            load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+            self._joint_friction_load_active = bool(
+                load_coefficient is not None and model.joint_dof_count and np.any(load_coefficient.numpy() > 0.0)
+            )
             self._validate_joint_friction()
             self._init_joint_friction_check(model)
+            if self._joint_friction_load_active:
+                self._init_joint_friction_load(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
-                "SolverSteel: loop-closing joints (imported connect/weld equalities) are "
+                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
                 f"only supported with articulated_contact_response='immediate' "
                 f"(got {self._articulated_contact_response!r})."
             )
@@ -3894,10 +4008,13 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _flag_invalid_joint_friction(self) -> None:
         """Latch :attr:`joint_friction_invalid` for worlds with coefficients the friction rows cannot represent."""
         model = self.model
-        if model.joint_friction.shape != (model.joint_dof_count,):
-            raise ValueError(
-                f"joint_friction has shape {model.joint_friction.shape}, expected ({model.joint_dof_count},)"
-            )
+        load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+        for name, array in (
+            ("joint_friction", model.joint_friction),
+            ("steel:joint_friction_load_coefficient", load_coefficient),
+        ):
+            if array is not None and array.shape != (model.joint_dof_count,):
+                raise ValueError(f"{name} has shape {array.shape}, expected ({model.joint_dof_count},)")
         if model.joint_dof_count and self._world_count:
             wp.launch(
                 flag_invalid_joint_friction,
@@ -3906,6 +4023,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._joint_friction_invalid],
                 device=model.device,
             )
+            if load_coefficient is not None:
+                # Without the load pass from construction, every nonzero coefficient is unsupported.
+                supported = (
+                    self._friction_dof_supported if self._joint_friction_load_active else self._friction_dof_unsupported
+                )
+                wp.launch(
+                    flag_invalid_joint_friction,
+                    model.joint_dof_count,
+                    inputs=[load_coefficient, supported, self._friction_dof_world],
+                    outputs=[self._joint_friction_invalid],
+                    device=model.device,
+                )
 
     def _warmstart_dt_scale(self, dt: float) -> wp.array:
         """Return the device scalar that rescales carried impulses from the previous step size to ``dt``."""
@@ -3923,23 +4052,30 @@ class SolverSteel(SolverBase, CouplingInterface):
         model = self.model
         if model.joint_dof_count == 0:
             return
-        friction = model.joint_friction.numpy()
-        if friction.shape != (model.joint_dof_count,):
-            raise ValueError(f"joint_friction has shape {friction.shape}, expected ({model.joint_dof_count},)")
-        if not np.all(np.isfinite(friction)) or np.any(friction < 0.0):
-            raise ValueError("joint_friction must be finite and non-negative")
         joint_qd_start = model.joint_qd_start.numpy()
         joint_dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
         joint_type = model.joint_type.numpy()
         supported = np.isin(joint_type, (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6)))
         if self._model_plan is not None:
             supported &= self._model_plan.loop_joint_articulation < 0
-        unsupported = np.flatnonzero((friction > 0.0) & ~supported[joint_dof_joint])
-        if unsupported.size:
-            joint = int(joint_dof_joint[unsupported[0]])
-            raise ValueError(
-                f"joint_friction is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
-            )
+        coefficients = {"joint_friction": model.joint_friction}
+        load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+        if load_coefficient is not None:
+            coefficients["steel:joint_friction_load_coefficient"] = load_coefficient
+        for name, array in coefficients.items():
+            values = array.numpy()
+            if values.shape != (model.joint_dof_count,):
+                raise ValueError(f"{name} has shape {values.shape}, expected ({model.joint_dof_count},)")
+            if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+                raise ValueError(f"{name} must be finite and non-negative")
+            if array is load_coefficient and not self._joint_friction_load_active and np.any(values > 0.0):
+                raise ValueError(f"{name} was zero at construction and must stay zero")
+            unsupported = np.flatnonzero((values > 0.0) & ~supported[joint_dof_joint])
+            if unsupported.size:
+                joint = int(joint_dof_joint[unsupported[0]])
+                raise ValueError(
+                    f"{name} is nonzero on joint {joint} ({JointType(int(joint_type[joint])).name} or loop joint)"
+                )
 
     def _init_joint_friction_check(self, model) -> None:
         """Upload the per-DOF support mask and world of :meth:`_validate_joint_friction` for the device check."""
@@ -3962,6 +4098,65 @@ class SolverSteel(SolverBase, CouplingInterface):
             supported[joint_dof_joint].astype(np.int32), dtype=wp.int32, device=model.device
         )
         self._friction_dof_world = wp.array(joint_world[joint_dof_joint], dtype=wp.int32, device=model.device)
+        self._friction_dof_unsupported = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+
+    def _init_joint_friction_load(self, model) -> None:
+        """Allocate the per-DOF load and the free-dynamics joint wrenches it is computed from."""
+        joint_qd_start = model.joint_qd_start.numpy()
+        dof_joint = np.repeat(np.arange(model.joint_count), np.diff(joint_qd_start))
+        self._joint_friction_load_dof_joint = wp.array(dof_joint.astype(np.int32), dtype=wp.int32, device=model.device)
+        self._joint_friction_load = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+        self._joint_friction_total = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+        self._joint_friction_free_f = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+        self._joint_friction_no_contact = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+
+    def _compute_joint_friction_load(self, state_in: State, state_aug: State) -> None:
+        """Write each DOF's load from the wrenches its joint transmits under the free accelerations of stage 3."""
+        model = self.model
+        _, body_a_s, body_ft_s, _ = self._parent_wrench_scratch
+        wp.launch(
+            eval_post_solve_parent_wrenches,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self._articulation_joint_end,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                state_aug._joint_S_s,
+                state_aug._joint_qdd,
+                None,
+                0.0,
+                state_aug._body_f_s,
+                state_in.body_f if state_in.body_count else None,
+                self._joint_friction_no_contact,
+                model.body_flags,
+                state_in.body_q,
+                model.body_com,
+                model.body_mass,
+                model.body_inertia,
+                self._articulation_origin,
+                self._dynamics_art_active,
+                body_a_s,
+                body_ft_s,
+            ],
+            outputs=[self._joint_friction_free_f],
+            block_dim=self._serial_kernel_block_dim,
+            device=model.device,
+        )
+        wp.launch(
+            compute_joint_friction_load,
+            dim=model.joint_dof_count,
+            inputs=[
+                self._friction_dof_supported,
+                self._joint_friction_load_dof_joint,
+                model.joint_child,
+                self._joint_friction_free_f,
+            ],
+            outputs=[self._joint_friction_load],
+            device=model.device,
+        )
 
     @override
     def reset(
@@ -4765,14 +4960,17 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing BALL joints are excluded from FK/ID by
-        :meth:`_SteelModelPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. Their stored owner comes from
-        the child body's tree articulation, independent of joint ordering. FIXED (weld)
-        loop joints warn and are ignored for now. All buffers are allocated once
+        Loop-closing BALL and REVOLUTE joints are excluded from FK/ID by
+        :meth:`_SteelModelPlan.build` and enforced here as bilateral rows: three
+        pinning the joint's parent/child anchors together, plus, for a REVOLUTE closure,
+        two aligning the child's hinge axis with the parent's. Their stored owner comes
+        from the child body's tree articulation, independent of joint ordering. FIXED
+        (weld) loop joints warn and are ignored for now. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
-        :attr:`~newton.Model.joint_enabled` and the translations of its
-        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` every step.
+        :attr:`~newton.Model.joint_enabled`, the translations of its
+        :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` and, for a REVOLUTE closure, its
+        :attr:`~newton.Model.joint_axis` and frame rotations every step, so edits announced with
+        :attr:`~newton.ModelFlags.JOINT_PROPERTIES` apply without a rebuild.
 
         A closure's parent may live outside the child's articulation when it is
         prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
@@ -4793,14 +4991,31 @@ class SolverSteel(SolverBase, CouplingInterface):
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
         kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+        joint_qd_start = model.joint_qd_start.numpy()
+        limit_lower, limit_upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        target_ke, target_kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
 
-        art_l, body_p, body_c, world_l, joint_l, prescribed_l = [], [], [], [], [], []
+        art_l, body_p, body_c, world_l, joint_l, prescribed_l, rows_l = [], [], [], [], [], [], []
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
-            if int(joint_type[j]) != int(JointType.BALL):
+            if int(joint_type[j]) == int(JointType.BALL):
+                rows = 3
+            elif int(joint_type[j]) == int(JointType.REVOLUTE):
+                rows = 5  # the hinge axis is read live from Model.joint_axis by the kernels
+                dof = int(joint_qd_start[j])
+                limited = abs(float(limit_lower[dof])) < MAXVAL or abs(float(limit_upper[dof])) < MAXVAL
+                driven = float(target_ke[dof]) != 0.0 or float(target_kd[dof]) != 0.0
+                if limited or driven:
+                    ignored = " and ".join(n for n, f in (("position limits", limited), ("drive gains", driven)) if f)
+                    warnings.warn(
+                        f"SolverSteel: loop-closing REVOLUTE joint {j} has {ignored}; a loop closure carries no "
+                        "joint coordinate, so they are ignored (only the hinge itself is enforced).",
+                        stacklevel=2,
+                    )
+            else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
+                    f"{int(joint_type[j])} (only BALL/connect and REVOLUTE closures are enforced); ignored.",
                     stacklevel=2,
                 )
                 continue
@@ -4824,6 +5039,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             world_l.append(int(articulation_world[art]))
             joint_l.append(int(j))
             prescribed_l.append(prescribed)
+            rows_l.append(rows)
 
         n = len(art_l)
         if n == 0:
@@ -4838,7 +5054,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
-        self._connect_row_inv_norm = wp.zeros((n, 3), dtype=float, device=device)
+        self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
+        self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
@@ -4925,7 +5143,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             connect_art_np = self._connect_art.numpy()
             for k in range(self._connect_count):
                 a = int(connect_art_np[k])
-                counts[a] = counts.get(a, 0) + 3
+                counts[a] = counts.get(a, 0) + int(self._connect_rows_np[k])
         if not counts:
             return
         n_b_max = max(counts.values())
@@ -4976,6 +5194,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(self._mimic_count or 0) if self._bilateral_preelimination_include_mimics else 0,
                 self._connect_slot if self._connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
+                self._connect_rows if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),
                 self._J_by_size[size],
                 self._Y_by_size[size],
@@ -5201,8 +5420,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if has_connect_rows and self._connect_world_np is not None:
             # Model.joint_enabled can engage any closure at runtime, so each one counts.
             connect_worlds = self._connect_world_np
-            in_range = connect_worlds[(connect_worlds >= 0) & (connect_worlds < per_world.shape[0])]
-            np.add.at(per_world, in_range, 3)
+            valid = (connect_worlds >= 0) & (connect_worlds < per_world.shape[0])
+            np.add.at(per_world, connect_worlds[valid], self._connect_rows_np[valid])
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
@@ -6599,7 +6818,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._row_mu = wp.zeros(
             (self._world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._row_restitution = wp.zeros(
+        self._row_rebound_velocity = wp.zeros(
             (self._world_count, max_constraints),
             dtype=wp.float32,
             device=device,
@@ -6738,7 +6957,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self._mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._mf_row_restitution = wp.zeros(
+        self._mf_row_rebound_velocity = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
@@ -6821,7 +7040,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             setattr(
                 self, f"_{name}", wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
             )
-        self._mf_row_restitution = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
+        self._mf_row_rebound_velocity = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
         self._mf_row_w = self._contact_row_w_dummy
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(
@@ -6866,7 +7085,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_row_parent = None
             self._propagation_row_mu = None
             self._propagation_phi = None
-            self._propagation_row_restitution = None
+            self._propagation_row_rebound_velocity = None
             self._propagation_restitution_target = None
             self._propagation_body_response = None
             self._propagation_body_response_split = None
@@ -6884,6 +7103,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_tree_D_inv = None
             self._propagation_tree_pA = None
             self._propagation_tree_u = None
+            self._propagation_tree_u_basis = None
             self._propagation_tree_qdd = None
             self._propagation_tree_body_delta = None
             self._propagation_body_count = None
@@ -6991,7 +7211,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._propagation_row_restitution = wp.zeros(
+        self._propagation_row_rebound_velocity = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self._propagation_restitution_target = wp.zeros(
@@ -7055,6 +7275,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_tree_D_inv = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
         self._propagation_tree_pA = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
         self._propagation_tree_u = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
+        self._propagation_tree_u_basis = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
         self._propagation_tree_qdd = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
         self._propagation_tree_body_delta = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
 
@@ -7418,7 +7639,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     sm_count=int(getattr(model.device, "sm_count", 0)),
                 )
             )
-            self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
+            self._pgs_solve_mf_gs_kernel_for_phase = functools.partial(
+                _get_pgs_solve_mf_gs_kernel,
                 self._articulation_constraint_max,
                 self._free_body_constraint_max,
                 self._max_world_dofs,
@@ -7439,6 +7661,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 pair_cache=self._mfgs_pair_cache,
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
             )
+            # One kernel per row phase of the schedule, each with its phase compiled in.
+            phases = {"contact_then_internal": (1, 2), "phased": (3, 4, 5)}.get(self._row_schedule, (0,))
+            self._pgs_solve_mf_gs_kernels = {
+                phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
+            }
+            self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "_max_mf_bodies") and self._free_body_constraint_max > 0:
@@ -8056,8 +8284,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
             return
-        mf_gs_kernel = self._pgs_solve_mf_gs_kernel
-        if mf_gs_kernel is None:
+        if self._pgs_solve_mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
@@ -8200,9 +8427,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=64,
                         device=self.model.device,
                     )
+            phase_kernel = self._pgs_solve_mf_gs_kernels.get(row_phase)
+            if phase_kernel is None:
+                phase_kernel = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=row_phase)
+                self._pgs_solve_mf_gs_kernels[row_phase] = phase_kernel
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 wp.launch_tiled(
-                    mf_gs_kernel,
+                    phase_kernel,
                     dim=[general_block_count],
                     inputs=[
                         self._local_general_world_count,
@@ -8616,6 +8847,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         outputs=[
                             self._propagation_tree_pA,
                             self._propagation_tree_u,
+                            self._propagation_tree_u_basis,
                             self._propagation_tree_qdd,
                             self._propagation_tree_body_delta,
                             self._propagation_body_response,
@@ -8703,7 +8935,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_response_split,
                     self._propagation_phi,
                     self._propagation_row_type,
-                    self._propagation_row_restitution,
+                    self._propagation_row_rebound_velocity,
                     self._propagation_body_qd,
                     self._rigid_body_max_depenetration_velocity,
                     self._cfm,
@@ -8711,7 +8943,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_w,
                     dt,
                     self._contact_speculative_scale,
-                    self._rebound_velocity_threshold,
                     self._propagation_max_constraints,
                 ],
                 outputs=[
@@ -9584,6 +9815,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._connect_body_p,
                     self._connect_body_c,
                     self._connect_joint,
+                    self._connect_rows,
+                    model.joint_axis,
+                    model.joint_qd_start,
                     model.joint_X_p,
                     model.joint_X_c,
                     self._connect_row_inv_norm,
@@ -9835,6 +10069,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
             self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
+            if self._joint_friction_load_active:
+                self._compute_joint_friction_load(state_in, state_aug)
             self._clamp_rigid_velocity_limits(self._v_hat)
             wp.copy(self._debug_stage3_qd_work, stage3_qd)
             wp.copy(self._debug_stage3_joint_qdd, state_aug._joint_qdd)
@@ -11952,6 +12188,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     dim=self._connect_count,
                     inputs=[
                         self._connect_joint,
+                        self._connect_rows,
                         model.joint_enabled,
                         self._connect_world,
                         max_constraints,
@@ -11980,6 +12217,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._connect_joint,
                         self._connect_body_p,
                         self._connect_body_c,
+                        self._connect_rows,
+                        model.joint_axis,
                         model.joint_X_p,
                         model.joint_X_c,
                         self._connect_parent_prescribed,
@@ -12167,6 +12406,20 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         # Joint-friction rows are internal rows of the phase-3 range.
         if self._joint_friction_warp_kernels:
+            joint_friction = model.joint_friction
+            if self._joint_friction_load_active:
+                wp.launch(
+                    add_joint_friction_load,
+                    dim=model.joint_dof_count,
+                    inputs=[
+                        model.joint_friction,
+                        self._namespaced_attribute("joint_friction_load_coefficient"),
+                        self._joint_friction_load,
+                    ],
+                    outputs=[self._joint_friction_total],
+                    device=model.device,
+                )
+                joint_friction = self._joint_friction_total
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self._size_groups:
                     self._J_by_size[size].zero_()
@@ -12186,7 +12439,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._constraint_art_active,
                             self._friction_dof_eligible,
                             self._kinematic_dof_mask,
-                            model.joint_friction,
+                            joint_friction,
                             max_constraints,
                             dt,
                             self._cfm,
@@ -12384,6 +12637,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     if self._propagation_torsion_rows
                     else self._contact_torsion_radius_dummy,
                     int(self._propagation_torsion_rows),
+                    self._friction_combine_id,
                 ],
                 outputs=[
                     self._contact_world,
@@ -12458,6 +12712,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._cfm,
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._friction_combine_id,
+                        self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._row_type,
@@ -12467,7 +12724,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._row_cfm,
                         self._phi,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -12666,6 +12923,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._cfm,
                             self._friction_patches.view,
                             self._friction_anchor_beta,
+                            self._friction_combine_id,
+                            self._restitution_combine_id,
+                            self._rebound_velocity_threshold,
                         ],
                         outputs=[
                             self._J_by_size[size],
@@ -12676,7 +12936,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._row_cfm,
                             self._phi,
                             self._target_velocity,
-                            self._row_restitution,
+                            self._row_rebound_velocity,
                         ],
                         device=model.device,
                     )
@@ -12719,6 +12979,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._friction_combine_id,
+                        self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12730,7 +12993,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._mf_row_mu,
                         self._mf_phi,
                         self._mf_target_velocity,
-                        self._mf_row_restitution,
+                        self._mf_row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -12825,6 +13088,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        self._articulation_origin,
+                        state_aug._body_v_s,
                         self._shape_mu,
                         self._shape_restitution,
                         int(self._contact_friction_shared_anchor),
@@ -12832,10 +13097,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                         builder_unit_order,
                         builder_unit_count,
                         self._propagation_max_constraints,
                         builder_use_unit_order,
+                        self._friction_combine_id,
+                        self._restitution_combine_id,
                     ],
                     outputs=[
                         self._propagation_body_a,
@@ -12846,7 +13114,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._propagation_row_parent,
                         self._propagation_row_mu,
                         self._propagation_phi,
-                        self._propagation_row_restitution,
+                        self._propagation_row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -12878,7 +13146,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_row_parent,
                             self._propagation_row_mu,
                             self._propagation_phi,
-                            self._propagation_row_restitution,
+                            self._propagation_row_rebound_velocity,
                             self._propagation_torsion_row_radius,
                         ],
                         device=model.device,
@@ -13450,7 +13718,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     world_dof_offset,
                     self._constraint_count,
                     self._local_solve_owner,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     size,
                     n_arts,
                     int(self._hinv_jt_writes_world),
@@ -13710,13 +13978,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_out_snap,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -13794,10 +14061,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._sparse_row_incident,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -13813,7 +14079,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._v_hat,
                         self._world_dof_indices,
                         self._sparse_diagonal_dense_offsets,
@@ -13823,7 +14089,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._sparse_diagonal_row_dof,
                         self._sparse_diagonal_row_jy,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -13839,12 +14104,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
                 outputs=[self._rhs, self._row_w],
@@ -13861,10 +14125,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._phi,
                 self._row_beta,
                 self._row_type,
-                self._row_restitution,
+                self._row_rebound_velocity,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 int(self._regularization_enabled),
             ],
             outputs=[self._rhs, self._row_w],
@@ -14232,7 +14495,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
+                self._mf_row_rebound_velocity,
                 int(self._has_prescribed_response),
                 self._body_to_articulation,
                 self._articulation_dof_start,
@@ -14243,7 +14506,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_w,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[
@@ -14276,12 +14538,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
+                self._mf_row_rebound_velocity,
                 int(self._has_prescribed_response),
                 dt,
                 self._v_out_snap,
                 self._v_hat,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[output],
@@ -24753,6 +25014,7 @@ def _get_pgs_solve_mf_gs_kernel(
     contact_compliance: bool = False,
     pair_cache: bool = False,
     free_rigid_angular_friction: bool = False,
+    row_phase: int | None = None,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -24783,6 +25045,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
     ``free_rigid_angular_friction`` solves the rolling pair and spin rows that follow
     matrix-free contacts' sliding pairs in phase 2.
+
+    ``row_phase`` compiles the row phase in; the launch argument is then ignored. ``None`` reads it at launch.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
     stateless joint-velocity clamp as an end-of-iteration pass over the
@@ -26512,6 +26776,10 @@ def _get_pgs_solve_mf_gs_kernel(
         "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + (angular_sources["helpers"] if angular_sources else ""),
         1,
     )
+    snippet = _butterfly_warp_sums(snippet)
+    if row_phase is not None:
+        # A constant phase lets the compiler drop the per-row phase filters from the sweep.
+        snippet = re.sub(r"\brow_phase\b", str(row_phase), snippet)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
@@ -26670,6 +26938,8 @@ def _get_pgs_solve_mf_gs_kernel(
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
     )
+    if row_phase is not None:
+        name += f"_phase{row_phase}"
     if fuse_vel_limits:
         name += "_fvl"
     if not shared_metadata:
