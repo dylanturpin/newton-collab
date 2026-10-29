@@ -28,6 +28,7 @@ from .differentiable_implicit import (
     cholesky_adjoint_right,
     cholesky_adjoint_scatter,
     pgs_implicit_adjoint,
+    pgs_implicit_adjoint_tiled,
 )
 from .friction_patches import (
     FrictionPatches,
@@ -1308,9 +1309,11 @@ class DifferentiableStep:
         regularization, tolerance = self.implicit_regularization, self.implicit_slide_tolerance
 
         def backward():
+            tiled = self.tiled_pgs
             wp.launch(
-                pgs_implicit_adjoint,
-                dim=worlds,
+                pgs_implicit_adjoint_tiled if tiled else pgs_implicit_adjoint,
+                dim=(worlds, TILE_LANES) if tiled else worlds,
+                block_dim=TILE_LANES if tiled else 256,
                 inputs=[
                     c.row_count,
                     c.row_type,

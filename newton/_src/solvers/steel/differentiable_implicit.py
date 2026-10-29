@@ -252,3 +252,200 @@ def cholesky_adjoint_scatter(phi: wp.array4d[float], H_bar: wp.array3d[float], L
     elif j == i:
         H_bar[g, i, i] = H_bar[g, i, i] + phi[g, 0, i, i]
         L_bar[g, i, i] = 0.0
+
+
+LANES = wp.constant(32)
+
+
+@wp.func
+def _barrier():
+    """Block-wide barrier: a reduction syncs the block, ordering earlier global writes before later reads."""
+    return wp.tile_extract(wp.tile_sum(wp.tile(0.0)), 0)
+
+
+@wp.kernel
+def pgs_implicit_adjoint_tiled(
+    row_count: wp.array[int],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    C: wp.array3d[float],
+    rhs: wp.array2d[float],
+    lam: wp.array2d[float],
+    lam_bar: wp.array2d[float],
+    smooth_normal: int,
+    regularization: float,
+    slide_tolerance: float,
+    M: wp.array3d[float],
+    row_class: wp.array2d[int],
+    perm: wp.array2d[int],
+    u: wp.array2d[float],
+    # outputs, accumulated
+    C_bar: wp.array3d[float],
+    rhs_bar: wp.array2d[float],
+    smooth_bar: wp.array2d[float],
+    status: wp.array[int],
+):
+    """pgs_implicit_adjoint with one warp per world: lanes split columns while building, rows while factoring."""
+    world, lane = wp.tid()
+    m = row_count[world]
+    if m == 0:
+        return
+    # Build: lane j % LANES owns column j of every row, so the build needs no barrier.
+    for i in range(m):
+        for j in range(lane, m, LANES):
+            M[world, i, j] = wp.where(i == j, 1.0, 0.0)
+        if lane == 0:
+            row_class[world, i] = ROW_FROZEN
+    unsupported = int(0)
+    for i in range(m):
+        kind = row_type[world, i]
+        if kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT and smooth_normal != 0:
+                if lane == 0:
+                    row_class[world, i] = ROW_SMOOTH
+            elif lam[world, i] > 0.0:
+                reg = regularization * C[world, i, i]
+                for j in range(lane, m, LANES):
+                    M[world, i, j] = C[world, i, j] + wp.where(i == j, reg, 0.0)
+                if lane == 0:
+                    row_class[world, i] = ROW_ACTIVE
+        elif kind == PGS_CONSTRAINT_TYPE_FRICTION:
+            parent = row_parent[world, i]
+            if i == parent + 1 and i + 1 < m:
+                sib = i + 1
+                load = lam[world, parent]
+                mu = row_mu[world, i]
+                radius = mu * load
+                t0 = lam[world, i]
+                t1 = lam[world, sib]
+                rho = wp.sqrt(t0 * t0 + t1 * t1)
+                if radius > 0.0 and load > 0.0:
+                    if rho < radius * (1.0 - slide_tolerance):
+                        reg0 = regularization * C[world, i, i]
+                        reg1 = regularization * C[world, sib, sib]
+                        for j in range(lane, m, LANES):
+                            M[world, i, j] = C[world, i, j] + wp.where(i == j, reg0, 0.0)
+                            M[world, sib, j] = C[world, sib, j] + wp.where(sib == j, reg1, 0.0)
+                        if lane == 0:
+                            row_class[world, i] = ROW_STICK
+                            row_class[world, sib] = ROW_STICK
+                    else:
+                        d0 = t0 / rho
+                        d1 = t1 / rho
+                        p0 = -d1
+                        p1 = d0
+                        part0 = float(0.0)
+                        part1 = float(0.0)
+                        for j in range(lane, m, LANES):
+                            part0 += C[world, i, j] * lam[world, j]
+                            part1 += C[world, sib, j] * lam[world, j]
+                        w0 = rhs[world, i] + wp.tile_extract(wp.tile_sum(wp.tile(part0)), 0)
+                        w1 = rhs[world, sib] + wp.tile_extract(wp.tile_sum(wp.tile(part1)), 0)
+                        alpha = wp.max(-(d0 * w0 + d1 * w1), 0.0) / rho
+                        alpha += regularization * 0.5 * (C[world, i, i] + C[world, sib, sib])
+                        for j in range(lane, m, LANES):
+                            radial = wp.where(j == i, d0, 0.0) + wp.where(j == sib, d1, 0.0)
+                            M[world, i, j] = radial - wp.where(j == parent, mu, 0.0)
+                            M[world, sib, j] = (
+                                p0 * C[world, i, j]
+                                + p1 * C[world, sib, j]
+                                + wp.where(j == i, alpha * p0, 0.0)
+                                + wp.where(j == sib, alpha * p1, 0.0)
+                            )
+                        if lane == 0:
+                            row_class[world, i] = ROW_SLIDE_RADIAL
+                            row_class[world, sib] = ROW_SLIDE_TANGENT
+        else:
+            unsupported += 1
+            if lane == 0:
+                row_class[world, i] = ROW_UNSUPPORTED
+    if lane == 0:
+        for i in range(m):
+            perm[world, i] = i
+    _barrier()
+
+    # LU with partial pivoting: lane i % LANES owns row i during elimination.
+    singular = int(0)
+    for k in range(m):
+        best = float(-1.0)
+        best_row = k
+        for i in range(k + (lane - k % LANES + LANES) % LANES, m, LANES):
+            value = wp.abs(M[world, i, k])
+            if value > best:
+                best = value
+                best_row = i
+        best_tile = wp.tile(best)
+        winner = wp.tile_extract(wp.tile_argmax(best_tile), 0)
+        pivot = wp.tile_extract(wp.tile(best_row), winner)
+        if pivot != k:
+            for j in range(lane, m, LANES):
+                tmp = M[world, k, j]
+                M[world, k, j] = M[world, pivot, j]
+                M[world, pivot, j] = tmp
+            if lane == 0:
+                tmp_p = perm[world, k]
+                perm[world, k] = perm[world, pivot]
+                perm[world, pivot] = tmp_p
+        _barrier()
+        diag = M[world, k, k]
+        if diag == 0.0:
+            singular += 1
+            diag = 1.0
+        _barrier()
+        if lane == 0 and M[world, k, k] == 0.0:
+            M[world, k, k] = 1.0
+        inv = 1.0 / diag
+        for i in range(k + 1 + ((lane - (k + 1) % LANES + LANES) % LANES), m, LANES):
+            factor = M[world, i, k] * inv
+            M[world, i, k] = factor
+            if factor != 0.0:
+                for j in range(k + 1, m):
+                    M[world, i, j] = M[world, i, j] - factor * M[world, k, j]
+    _barrier()
+
+    # U^T y = lam_bar, then L^T z = y, one reduction per row; every lane writes the same value.
+    for k in range(m):
+        part = float(0.0)
+        for i in range(lane, k, LANES):
+            part += M[world, i, k] * u[world, i]
+        s = wp.tile_extract(wp.tile_sum(wp.tile(part)), 0)
+        u[world, k] = (lam_bar[world, k] - s) / M[world, k, k]
+    for kk in range(m):
+        k = m - 1 - kk
+        part = float(0.0)
+        for i in range(k + 1 + lane, m, LANES):
+            part += M[world, i, k] * u[world, i]
+        s = wp.tile_extract(wp.tile_sum(wp.tile(part)), 0)
+        u[world, k] = u[world, k] - s
+    _barrier()
+    for k in range(lane, m, LANES):
+        M[world, perm[world, k], 0] = u[world, k]
+    _barrier()
+    for k in range(lane, m, LANES):
+        u[world, k] = M[world, k, 0]
+    _barrier()
+
+    for i in range(m):
+        cls = row_class[world, i]
+        b = float(0.0)
+        if cls == ROW_ACTIVE or cls == ROW_STICK:
+            b = -u[world, i]
+        elif cls == ROW_SLIDE_RADIAL:
+            t0 = lam[world, i]
+            t1 = lam[world, i + 1]
+            b = (t1 / wp.sqrt(t0 * t0 + t1 * t1)) * u[world, i + 1]
+        elif cls == ROW_SLIDE_TANGENT:
+            t0 = lam[world, i - 1]
+            t1 = lam[world, i]
+            b = -(t0 / wp.sqrt(t0 * t0 + t1 * t1)) * u[world, i]
+        elif cls == ROW_SMOOTH and lane == 0:
+            smooth_bar[world, i] = smooth_bar[world, i] + u[world, i]
+        if b != 0.0:
+            if lane == 0:
+                rhs_bar[world, i] = rhs_bar[world, i] + b
+            for j in range(lane, m, LANES):
+                C_bar[world, i, j] = C_bar[world, i, j] + b * lam[world, j]
+    if lane == 0 and (unsupported > 0 or singular > 0):
+        wp.atomic_add(status, 0, unsupported)
+        wp.atomic_add(status, 1, singular)
