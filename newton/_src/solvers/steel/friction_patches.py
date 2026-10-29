@@ -875,8 +875,10 @@ def _build(
                 if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
                     continue
                 error = _carried_displacement(q, prev, p, n)
-                # Anchors ride moving surfaces over the same completed step as the pose motion.
-                error += motion + prev.surface_motion[p]
+                error += motion
+                if contact_surface_velocity:
+                    # Anchors ride moving surfaces over the same completed step as the pose motion.
+                    error += prev.surface_motion[p]
                 tangent_delta = error - n * wp.dot(error, n)
                 # The tangential gate bounds uncorrected slip of a carried pair at a
                 # tenth of the smaller body's radius, about three times the measured
@@ -947,7 +949,9 @@ def _build(
                                 n, pa - 0.5 * (old_center + other_center)
                             )
                         break
-                error += motion + prev.surface_motion[chosen]
+                error += motion
+                if contact_surface_velocity:
+                    error += prev.surface_motion[chosen]
                 error -= n * wp.dot(error, n)
                 carried_impulse = prev.tangent_impulse[chosen]
             stored_error = error
