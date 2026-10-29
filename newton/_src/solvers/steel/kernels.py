@@ -21,6 +21,7 @@ from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
+    elastic_frame_layout,
     eval_single_articulation_fk,
 )
 from ...sim.contacts import GENERATION_SENTINEL
@@ -614,7 +615,7 @@ def mul_com_spatial_inertia(mass: float, com: wp.vec3, inertia_origin: wp.mat33,
 
 # compute transform across a joint
 @wp.func
-def jcalc_transform(
+def _jcalc_transform_rigid(
     type: int,
     joint_axis: wp.array[wp.vec3],
     axis_start: int,
@@ -714,7 +715,7 @@ def jcalc_transform(
 
 # computes joint space forces/torques in tau
 @wp.func
-def jcalc_tau(
+def _jcalc_tau_rigid(
     type: int,
     joint_S_s: wp.array[wp.spatial_vector],
     joint_f: wp.array[float],
@@ -774,7 +775,7 @@ def jcalc_tau(
 
 
 @wp.func
-def jcalc_integrate(
+def _jcalc_integrate_rigid(
     type: int,
     child: int,
     body_com: wp.array[wp.vec3],
@@ -939,6 +940,144 @@ def jcalc_integrate(
 
 
 @wp.func
+def frame_dof_count(frame_type: int, lin_axis_count: int, ang_axis_count: int):
+    """Velocity DOFs of a joint frame (excluding elastic modes)."""
+    if frame_type == JointType.FREE or frame_type == JointType.DISTANCE:
+        return 6
+    if frame_type == JointType.BALL:
+        return 3
+    if frame_type == JointType.FIXED:
+        return 0
+    return lin_axis_count + ang_axis_count
+
+
+@wp.func
+def frame_coord_count(frame_type: int, lin_axis_count: int, ang_axis_count: int):
+    """Position coordinates of a joint frame (excluding elastic modes)."""
+    if frame_type == JointType.FREE or frame_type == JointType.DISTANCE:
+        return 7
+    if frame_type == JointType.BALL:
+        return 4
+    if frame_type == JointType.FIXED:
+        return 0
+    return lin_axis_count + ang_axis_count
+
+
+# compute transform across a joint
+@wp.func
+def jcalc_transform(
+    type: int,
+    joint_axis: wp.array[wp.vec3],
+    axis_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    joint_q: wp.array[float],
+    q_start: int,
+):
+    frame_type, lin, ang, _modes = elastic_frame_layout(type, joint_axis, axis_start, lin_axis_count, ang_axis_count)
+    return _jcalc_transform_rigid(frame_type, joint_axis, axis_start, lin, ang, joint_q, q_start)
+
+
+# computes joint space forces/torques in tau
+@wp.func
+def jcalc_tau(
+    type: int,
+    joint_S_s: wp.array[wp.spatial_vector],
+    joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_spring_stiffness: wp.array[float],
+    joint_spring_ref: wp.array[float],
+    joint_damping: wp.array[float],
+    coord_start: int,
+    dof_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    body_f_s: wp.spatial_vector,
+    add_existing_tau: int,
+    # outputs
+    tau: wp.array[float],
+):
+    if type != JointType.ELASTIC:
+        _jcalc_tau_rigid(
+            type,
+            joint_S_s,
+            joint_f,
+            joint_q,
+            joint_qd,
+            joint_spring_stiffness,
+            joint_spring_ref,
+            joint_damping,
+            coord_start,
+            dof_start,
+            lin_axis_count,
+            ang_axis_count,
+            body_f_s,
+            add_existing_tau,
+            tau,
+        )
+        return
+    # Elastic frames are passive: no spring/damping on the frame axes, modal forces come from joint_f.
+    total = lin_axis_count + ang_axis_count
+    for i in range(total):
+        j = dof_start + i
+        value = joint_f[j]
+        if wp.length_sq(joint_S_s[j]) > 0.0:
+            value -= wp.dot(joint_S_s[j], body_f_s)
+        if add_existing_tau != 0:
+            value += tau[j]
+        tau[j] = value
+
+
+@wp.func
+def jcalc_integrate(
+    type: int,
+    joint_axis: wp.array[wp.vec3],
+    child: int,
+    body_com: wp.array[wp.vec3],
+    X_cj: wp.transform,
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    coord_start: int,
+    dof_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    dt: float,
+    angular_damping: float,
+    parent: int,
+    # outputs
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+):
+    frame_type, lin, ang, mode_count = elastic_frame_layout(type, joint_axis, dof_start, lin_axis_count, ang_axis_count)
+    _jcalc_integrate_rigid(
+        frame_type,
+        child,
+        body_com,
+        X_cj,
+        joint_q,
+        joint_qd,
+        joint_qdd,
+        coord_start,
+        dof_start,
+        lin,
+        ang,
+        dt,
+        angular_damping,
+        parent,
+        joint_q_new,
+        joint_qd_new,
+    )
+    mode_dof = dof_start + frame_dof_count(frame_type, lin, ang)
+    mode_coord = coord_start + frame_coord_count(frame_type, lin, ang)
+    for m in range(mode_count):
+        qd_new = joint_qd[mode_dof + m] + joint_qdd[mode_dof + m] * dt
+        joint_qd_new[mode_dof + m] = qd_new
+        joint_q_new[mode_coord + m] = joint_q[mode_coord + m] + qd_new * dt
+
+
+@wp.func
 def compute_link_transform(
     i: int,
     joint_type: wp.array[int],
@@ -1081,14 +1220,19 @@ def compute_link_kinematics(
     )
 
     # compute motion subspace and velocity across the joint (also stores S_s to global memory)
-    lin_axis_count = joint_dof_dim[i, 0]
-    ang_axis_count = joint_dof_dim[i, 1]
+    frame_type, lin_axis_count, ang_axis_count, mode_count = elastic_frame_layout(
+        type, joint_axis, qd_start, joint_dof_dim[i, 0], joint_dof_dim[i, 1]
+    )
     # FREE/DISTANCE twists are referenced at the root COM, so their motion subspace takes only the rotation.
     X_sc = X_wpj_local
-    if type == JointType.FREE or type == JointType.DISTANCE:
+    if frame_type == JointType.FREE or frame_type == JointType.DISTANCE:
         X_sc = wp.transform(wp.vec3(), wp.transform_get_rotation(X_wpj_local))
+    # Elastic modes do not move the link frame: their motion-subspace columns are zero.
+    mode_dof = qd_start + frame_dof_count(frame_type, lin_axis_count, ang_axis_count)
+    for m in range(mode_count):
+        joint_S_s[mode_dof + m] = wp.spatial_vector()
     v_j_s, c_app_s = jcalc_motion(
-        type,
+        frame_type,
         joint_axis,
         joint_q,
         lin_axis_count,
@@ -3194,6 +3338,7 @@ def integrate_generalized_joints(
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
     joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     joint_X_c: wp.array[wp.transform],
     joint_q: wp.array[float],
@@ -3228,6 +3373,7 @@ def integrate_generalized_joints(
 
     jcalc_integrate(
         type,
+        joint_axis,
         child,
         body_com,
         joint_X_c[index],

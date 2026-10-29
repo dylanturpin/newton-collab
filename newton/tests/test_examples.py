@@ -111,6 +111,10 @@ _ANYMAL_TEXTURE_WITHOUT_UVS_WARNING_RE = (
     r"[^\n]*[/\\]base\.dae has a texture but no UVs; texture will be ignored\.\n"
     r"  parse_shapes\(link, visuals, density=0\.0, just_visual=True, visible=not hide_visuals\)\n?"
 )
+_VBD_LEGACY_PENALTY_DEPRECATION_RE = (
+    r"(?m)^.*: DeprecationWarning: rigid_compliant_alm=False is deprecated as of Newton .*\n"
+    r"^  .*SolverVBD\(\n?"
+)
 _EXAMPLE_ALLOW_OUTPUT_REGEXES = [
     (_PXR_WORK_THREAD_LIMIT_OUTPUT_RE, "stderr"),
     (_NEWTON_ASSET_DOWNLOAD_OUTPUT_RE, "stdout"),
@@ -516,6 +520,33 @@ add_basic_example_test(
     test_suffix="kamino",
     allow_output_regexes=[(_KAMINO_NON_FLOATING_ROOT_WARNING_RE, "stderr")],
 )
+
+for motion, frames in (("stir", 570), ("insert", 270)):
+    add_basic_example_test(
+        name="basic.example_basic_reduced_elastic_cup_straw",
+        devices=test_devices,
+        use_viewer=True,
+        test_options={"num-frames": frames, "motion": motion, "allow_deprecation_warnings": True},
+        test_suffix=motion,
+        allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
+    )
+
+# The tail stick check starts at 2 s.
+add_basic_example_test(
+    name="basic.example_basic_reduced_elastic_chair_stick_slip",
+    devices=cuda_test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 240, "allow_deprecation_warnings": True},
+    allow_output_regexes=[(_VBD_LEGACY_PENALTY_DEPRECATION_RE, "stderr")],
+)
+
+for example, frames in (("gripper", 180), ("fingers", 240), ("whip", 210), ("cushion", 270), ("bin", 240)):
+    add_basic_example_test(
+        name=f"basic.example_basic_steel_elastic_{example}",
+        devices=cuda_test_devices,
+        use_viewer=True,
+        test_options={"num-frames": frames},
+    )
 
 add_basic_example_test(
     name="basic.example_recording",
@@ -1028,6 +1059,13 @@ add_example_test(
     test_options={"usd_required": True, "num-frames": 100, "world-count": 2, "solver": "kamino"},
     use_viewer=True,
     test_suffix="kamino",
+)
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_robot_ur10_elastic_panel",
+    devices=cuda_test_devices,
+    test_options={"usd_required": True, "num-frames": 120, "carhoods_dir": "/tmp/newton_missing_carhoods"},
+    use_viewer=True,
 )
 add_example_test(
     TestRobotExamples,

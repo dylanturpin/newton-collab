@@ -247,6 +247,33 @@ def eval_angular_coordinates(
 
 
 @wp.func
+def elastic_frame_layout(
+    joint_type: int,
+    joint_axis: wp.array[wp.vec3],
+    axis_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+):
+    """Return ``(frame_type, lin, ang, mode_count)`` of a joint; non-ELASTIC joints pass through.
+
+    An ELASTIC joint's frame axes are its leading non-zero ``joint_axis`` entries: six mean a FREE
+    frame, fewer a D6 frame; the remaining zero axes are modal coordinates.
+    """
+    if joint_type != JointType.ELASTIC:
+        return joint_type, lin_axis_count, ang_axis_count, 0
+    total = lin_axis_count + ang_axis_count
+    frame = int(0)
+    while frame < total:
+        if wp.length_sq(joint_axis[axis_start + frame]) == 0.0:
+            break
+        frame += 1
+    modes = total - frame
+    if frame == 6:
+        return int(JointType.FREE), 3, 3, modes
+    return int(JointType.D6), lin_axis_count, frame - lin_axis_count, modes
+
+
+@wp.func
 def eval_joint_motion(
     type: int,
     q_start: int,
@@ -280,7 +307,7 @@ def eval_joint_motion(
             wp.vec3(joint_qd[qd_start], joint_qd[qd_start + 1], joint_qd[qd_start + 2]),
         )
 
-    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD:
+    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD or type == JointType.ELASTIC:
         X_j = wp.transform(
             wp.vec3(joint_q[q_start], joint_q[q_start + 1], joint_q[q_start + 2]),
             wp.quat(
@@ -379,7 +406,7 @@ def eval_joint_child_state(
 
     linear_joint_world = wp.transform_vector(X_wpj, wp.spatial_top(v_j))
     angular_joint_world = wp.transform_vector(X_wpj, wp.spatial_bottom(v_j))
-    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD:
+    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD or type == JointType.ELASTIC:
         # These joint velocities are COM-referenced, while the tree recurrence is origin-referenced.
         v_joint_origin = com_twist_to_origin_twist(
             wp.spatial_vector(linear_joint_world, angular_joint_world),
@@ -437,11 +464,12 @@ def eval_single_articulation_fk(
 
         q_start = joint_q_start[i]
         qd_start = joint_qd_start[i]
-        lin_axis_count = joint_dof_dim[i, 0]
-        ang_axis_count = joint_dof_dim[i, 1]
+        frame_type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+            type, joint_axis, qd_start, joint_dof_dim[i, 0], joint_dof_dim[i, 1]
+        )
 
         X_j, v_j = eval_joint_motion(
-            type,
+            frame_type,
             q_start,
             qd_start,
             lin_axis_count,
@@ -455,7 +483,7 @@ def eval_single_articulation_fk(
         if parent >= 0:
             X_wp = body_q[parent]
         X_wc, v_wc = eval_joint_child_state(
-            type,
+            frame_type,
             parent,
             child,
             X_wp,
@@ -840,8 +868,12 @@ def eval_articulation_ik(
     w_c = wp.spatial_bottom(v_wc)
     v_c = com_twist_to_point_velocity(v_wc, X_wc, body_com[child], wp.transform_get_translation(X_wcj))
 
-    # joint properties
-    type = joint_type[joint_idx]
+    # joint properties; an ELASTIC joint's frame part reconstructs like FREE or D6, its modes are left as they are
+    q_start = joint_q_start[joint_idx]
+    qd_start = joint_qd_start[joint_idx]
+    type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+        joint_type[joint_idx], joint_axis, qd_start, joint_dof_dim[joint_idx, 0], joint_dof_dim[joint_idx, 1]
+    )
 
     # compute position and orientation differences between anchor frames
     x_p = wp.transform_get_translation(X_wpj)
@@ -853,11 +885,6 @@ def eval_articulation_ik(
     x_err = x_c - x_p
     v_err = v_c - v_p
     w_err = w_c - w_p
-
-    q_start = joint_q_start[joint_idx]
-    qd_start = joint_qd_start[joint_idx]
-    lin_axis_count = joint_dof_dim[joint_idx, 0]
-    ang_axis_count = joint_dof_dim[joint_idx, 1]
 
     if type == JointType.PRISMATIC:
         axis = joint_axis[qd_start]
@@ -903,7 +930,7 @@ def eval_articulation_ik(
     if type == JointType.FIXED:
         return
 
-    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD:
+    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.ROD or type == JointType.ELASTIC:
         q_pc = wp.quat_inverse(q_p) * q_c
 
         x_err_c = wp.quat_rotate_inv(q_p, x_err)
@@ -1185,6 +1212,7 @@ def jcalc_motion_subspace(
         joint_type_value == JointType.FREE
         or joint_type_value == JointType.DISTANCE
         or joint_type_value == JointType.ROD
+        or joint_type_value == JointType.ELASTIC
     ):
         x_child_com_world = wp.transform_point(X_wc, body_com_child)
         write_free_distance_motion_subspace(X_pa_world, x_child_com_world, qd_start, joint_S_s)
@@ -1248,11 +1276,12 @@ def eval_articulation_jacobian(
 
         q_start = joint_q_start[j]
         qd_start = joint_qd_start[j]
-        lin_axis_count = joint_dof_dim[j, 0]
-        ang_axis_count = joint_dof_dim[j, 1]
+        frame_type, lin_axis_count, ang_axis_count, _mode_count = elastic_frame_layout(
+            type, joint_axis, qd_start, joint_dof_dim[j, 0], joint_dof_dim[j, 1]
+        )
 
         jcalc_motion_subspace(
-            type,
+            frame_type,
             joint_axis,
             joint_q,
             lin_axis_count,
