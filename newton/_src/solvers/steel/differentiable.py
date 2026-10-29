@@ -62,7 +62,9 @@ from .kernels import (
     compute_link_velocity,
     compute_physx_pgs_drive_desc,
     compute_velocity_predictor,
+    combine_shape_coefficients,
     compute_world_contact_bias,
+    contact_rebound_velocity,
     contact_restitution_fires,
     copy_unarticulated_body_state,
     eval_post_solve_parent_wrenches,
@@ -754,6 +756,7 @@ class DifferentiableStep:
                 deterministic,
                 solver._contact_torsion_radius_dummy,
                 0,
+                solver._friction_combine_id,
             ],
             outputs=[
                 c.world,
@@ -877,6 +880,9 @@ class DifferentiableStep:
                 b.articulation_origin,
                 solver._shape_mu,
                 solver._shape_restitution,
+                solver._friction_combine_id,
+                solver._restitution_combine_id,
+                solver._rebound_velocity_threshold,
                 int(solver._contact_shared_anchor),
                 solver._contact_friction_scale,
                 solver._friction_anchor_beta,
@@ -905,7 +911,7 @@ class DifferentiableStep:
                 c.row_cfm,
                 c.phi,
                 c.target_velocity,
-                c.row_restitution,
+                c.row_rebound_velocity,
                 c.row_max_depenetration,
             ],
             device=device,
@@ -1122,13 +1128,12 @@ class DifferentiableStep:
                     c.phi,
                     c.row_beta,
                     c.row_type,
-                    c.row_restitution,
+                    c.row_rebound_velocity,
                     c.row_max_depenetration,
                     c.rhs,
                     c.row_w,
                     dt,
                     solver._contact_speculative_scale,
-                    solver._rebound_velocity_threshold,
                 ],
                 outputs=[c.rhs_restituted, c.row_w_restituted],
                 device=device,
@@ -1914,7 +1919,7 @@ class DifferentiableStep:
                 c.row_cfm,
                 c.phi,
                 c.target_velocity,
-                c.row_restitution,
+                c.row_rebound_velocity,
                 c.row_max_depenetration,
                 c.torsion_radius,
             ],
@@ -2058,7 +2063,7 @@ class _ContactBuffers:
         self.target_velocity = zeros((worlds, rows))
         self.rhs = zeros((worlds, rows))
         self.rhs_restituted = zeros((worlds, rows))
-        self.row_restitution = zeros((worlds, rows))
+        self.row_rebound_velocity = zeros((worlds, rows))
         self.row_max_depenetration = zeros((worlds, rows))
         self.smooth_impulse = zeros((worlds, rows))
         self.diag = zeros((worlds, rows))
@@ -2675,6 +2680,9 @@ def _dense_contact_rows(
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
+    friction_combine: int,
+    restitution_combine: int,
+    restitution_velocity_threshold: float,
     contact_shared_anchor: int,
     contact_friction_scale: float,
     friction_anchor_beta: float,
@@ -2702,7 +2710,7 @@ def _dense_contact_rows(
     row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
-    row_restitution: wp.array2d[float],
+    row_rebound_velocity: wp.array2d[float],
     row_max_depenetration: wp.array2d[float],
 ):
     """Row metadata of _populate_world_J_for_size_contact for point contacts, one thread per contact.
@@ -2717,18 +2725,11 @@ def _dense_contact_rows(
             normal = -contact_normal[c]
             body_a = int(-1)
             body_b = int(-1)
-            mu = float(0.0)
-            mat_count = int(0)
             if shape0[c] >= 0:
                 body_a = shape_body[shape0[c]]
-                mu += shape_material_mu[shape0[c]]
-                mat_count += 1
             if shape1[c] >= 0:
                 body_b = shape_body[shape1[c]]
-                mu += shape_material_mu[shape1[c]]
-                mat_count += 1
-            if mat_count > 0:
-                mu /= float(mat_count)
+            mu = combine_shape_coefficients(shape0[c], shape1[c], shape_material_mu, friction_combine)
             point_a, point_b = _contact_world_points(
                 c, point0, point1, normal, body_a, body_b, margin0, margin1, body_q
             )
@@ -2740,7 +2741,20 @@ def _dense_contact_rows(
                 target_a = anchor
                 target_b = anchor
             row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
-            row_restitution[world, slot] = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution)
+            restitution = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution, restitution_combine)
+            row_rebound_velocity[world, slot] = contact_rebound_velocity(
+                restitution,
+                body_a,
+                contact_art_a[c],
+                body_b,
+                contact_art_b[c],
+                point_a,
+                point_b,
+                normal,
+                articulation_origin,
+                body_v_s,
+                restitution_velocity_threshold,
+            )
             # compute_mf_effective_mass_and_rhs clamps free-body depenetration; articulated rows are unclamped.
             free_a = body_a < 0 or body_to_articulation[body_a] < 0 or is_free_rigid[body_to_articulation[body_a]] != 0
             free_b = body_b < 0 or body_to_articulation[body_b] < 0 or is_free_rigid[body_to_articulation[body_b]] != 0
@@ -3123,13 +3137,12 @@ def _dense_contact_restitution(
     row_phi: wp.array2d[float],
     row_beta: wp.array2d[float],
     row_type: wp.array2d[int],
-    row_restitution: wp.array2d[float],
+    row_rebound_velocity: wp.array2d[float],
     row_max_depenetration: wp.array2d[float],
     rhs: wp.array2d[float],
     row_w: wp.array2d[float],
     dt: float,
     contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
     # outputs
     rhs_out: wp.array2d[float],
     row_w_out: wp.array2d[float],
@@ -3154,11 +3167,11 @@ def _dense_contact_restitution(
         if max_depenetration > 0.0 and wp.isfinite(max_depenetration) and geometric_bias < -max_depenetration:
             value = value - geometric_bias - max_depenetration
             geometric_bias = -max_depenetration
-    restitution = row_restitution[world, i]
-    if restitution > 0.0:
+    rebound_velocity = row_rebound_velocity[world, i]
+    if rebound_velocity > 0.0:
         relative_incident = value - geometric_bias
-        if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
-            value = (1.0 + restitution) * relative_incident
+        if contact_restitution_fires(phi, relative_incident, dt):
+            value = relative_incident - rebound_velocity
             # A firing rebound target is solved rigid, as apply_world_contact_restitution_matrix_free does.
             row_w_out[world, i] = 1.0
     rhs_out[world, i] = value
@@ -3630,7 +3643,7 @@ def _write_torsion_rows(
     row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
-    row_restitution: wp.array2d[float],
+    row_rebound_velocity: wp.array2d[float],
     row_max_depenetration: wp.array2d[float],
     torsion_radius: wp.array2d[float],
 ):
@@ -3645,7 +3658,7 @@ def _write_torsion_rows(
     row_cfm[world, row] = cfm
     row_phi[world, row] = 0.0
     row_target_velocity[world, row] = 0.0
-    row_restitution[world, row] = 0.0
+    row_rebound_velocity[world, row] = 0.0
     row_max_depenetration[world, row] = 0.0
     torsion_radius[world, row] = coefficients[e, 1]
 

@@ -24,6 +24,7 @@ from newton._src.solvers.steel.kernels import PROPAGATION_UNIT_META, PROPAGATION
 from newton._src.solvers.steel.solver_steel import (
     PROPAGATION_COLOR_TAIL,
     _colored_staging_supported,
+    _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
 )
 from newton.solvers import SolverSteel
@@ -853,6 +854,64 @@ def _three_foot_slider_model(device):
     return builder.finalize(device=device)
 
 
+def _linkage_gripper_model(device):
+    """Two pads on passive mimic linkages of one soft, effort-limited driver, under a stiff lift, around a box."""
+    builder = newton.ModelBuilder()
+    lift = builder.add_link(mass=5.0, inertia=wp.mat33(np.eye(3) * 0.05))
+    joints = [
+        builder.add_joint_prismatic(
+            -1,
+            lift,
+            axis=(0.0, 0.0, 1.0),
+            parent_xform=wp.transform((0.0, 0.0, 0.175), wp.quat_identity()),
+            target_ke=5.0e4,
+            target_kd=500.0,
+        )
+    ]
+    palm = builder.add_link(mass=0.7, inertia=wp.mat33(np.eye(3) * 1.0e-3))
+    joints.append(builder.add_joint_revolute(lift, palm, axis=(0.0, 0.0, 1.0), target_ke=5.0e4, target_kd=50.0))
+    pad_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=5.0, gap=0.005)
+    knuckles, fingers = {}, {}
+    for side in (-1.0, 1.0):
+        driven = side < 0.0
+        knuckle = builder.add_link(mass=0.013, inertia=wp.mat33(np.eye(3) * 2.0e-6))
+        knuckles[side] = builder.add_joint_revolute(
+            palm,
+            knuckle,
+            axis=(0.0, side, 0.0),
+            parent_xform=wp.transform((side * 0.0532, 0.0, -0.03), wp.quat_identity()),
+            target_ke=100.0 if driven else 0.0,
+            target_kd=10.0 if driven else 0.0,
+            effort_limit=10.0 if driven else 1.0e6,
+            limit_lower=-0.1,
+            limit_upper=0.9,
+        )
+        pad = builder.add_link(mass=0.04, inertia=wp.mat33(np.eye(3) * 1.0e-5))
+        builder.add_shape_box(
+            pad, xform=wp.transform((0.0, 0.0, -0.03), wp.quat_identity()), hx=0.006, hy=0.012, hz=0.03, cfg=pad_cfg
+        )
+        fingers[side] = builder.add_joint_revolute(
+            knuckle,
+            pad,
+            axis=(0.0, side, 0.0),
+            parent_xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()),
+            limit_lower=-0.9,
+            limit_upper=0.1,
+        )
+        joints += [knuckles[side], fingers[side]]
+    builder.add_articulation(joints)
+    # The left knuckle drives the right knuckle and both pad joints.
+    builder.set_joint_mimic(knuckles[1.0], knuckles[-1.0], coeffs=(0.0, 1.0))
+    for finger in fingers.values():
+        builder.set_joint_mimic(finger, knuckles[-1.0], coeffs=(0.0, -1.0))
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.0305), wp.quat_identity()))
+    builder.add_shape_box(
+        box, hx=0.03, hy=0.024, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / 1.728e-4, mu=0.5, gap=0.005)
+    )
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    return builder.finalize(device=device), palm, box
+
+
 def _solver(model, response, iterations, cached=False, **kwargs):
     return SolverSteel(
         model,
@@ -913,6 +972,7 @@ class TestPropagationSharedBody(unittest.TestCase):
                 self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
 class TestPropagationCoupledContacts(unittest.TestCase):
     def test_shared_dof_feet_reach_rest(self):
         """Three feet on one prismatic DOF stop at the plane for every sweep count."""
@@ -923,6 +983,45 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                     solver = _solver(model, response, iterations, baumgarte=0.0, cfm=0.0)
                     (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
                     self.assertLess(abs(float(qd[0])), 1.0e-3)
+
+    def test_shared_dof_feet_split_their_whole_response(self):
+        """Feet whose only mobility is one shared DOF split all of it, on the warp and the serial response kernels."""
+        model = _three_foot_slider_model("cuda:0")
+        feet = [1, 2, 3]
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
+                solver = _solver(model, "propagation_colored", 1, baumgarte=0.0, cfm=0.0)
+                if serial:
+                    _force_serial_fallback(solver)
+                list(_rollout(model, solver, np.array([-1.0], dtype=np.float32), 1))
+                exact = solver._propagation_body_response.numpy()[feet]
+                split = solver._propagation_body_response_split.numpy()[feet]
+                self.assertGreater(float(np.abs(exact).max()), 0.0)
+                np.testing.assert_allclose(split, 3.0 * exact, rtol=1.0e-5, atol=1.0e-7)
+
+    def test_shared_root_split_matches_across_kernels(self):
+        """Split only the shared free root of four feet with private leg joints, alike on the warp and serial kernels."""
+        model = _quadruped_model("cuda:0")
+        feet = [1, 2, 3, 4]
+        responses = []
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
+                solver = _solver(model, "propagation_colored", 1)
+                self.assertIsNotNone(solver._response_tree_warp_kernels_by_size[int(solver._size_groups[0])])
+                if serial:
+                    _force_serial_fallback(solver)
+                list(_rollout(model, solver, np.zeros(model.joint_dof_count, dtype=np.float32), 1))
+                np.testing.assert_array_equal(solver._propagation_joint_split.numpy(), [4, 1, 1, 1, 1])
+                exact = solver._propagation_body_response.numpy()[feet]
+                split = solver._propagation_body_response_split.numpy()[feet]
+                # The split differs from both the exact response and the whole-response split.
+                self.assertGreater(float(np.abs(split - exact).max()), 1.0e-3 * float(np.abs(exact).max()))
+                self.assertGreater(float(np.abs(4.0 * exact - split).max()), 1.0e-3 * float(np.abs(exact).max()))
+                responses.append((exact, split))
+        for warp, serial in zip(*responses, strict=True):
+            np.testing.assert_allclose(serial, warp, rtol=1.0e-4, atol=1.0e-5 * float(np.abs(warp).max()))
 
     def test_regularized_feet_reach_immediate_equilibrium(self):
         """Splitting leaves the regularized contact fixed point of three coupled feet unchanged."""
@@ -959,7 +1058,48 @@ class TestPropagationCoupledContacts(unittest.TestCase):
                 for _ in range(3):
                     wp.capture_launch(capture.graph)
                 np.testing.assert_allclose(output.joint_qd.numpy(), expected, atol=1.0e-6)
-                self.assertEqual(int(solver._propagation_coupling_group_body_count.numpy().max()), 3)
+                self.assertEqual(int(solver._propagation_joint_split.numpy().max()), 3)
+
+    def test_linkage_gripper_holds_lifted_box(self):
+        """Pads whose mobility is their own passive linkage keep their unsplit step and hold a box through a lift."""
+        model, palm, box = _linkage_gripper_model("cuda:0")
+        for response in PROPAGATION_RESPONSES:
+            with self.subTest(response=response):
+                solver = SolverSteel(
+                    model,
+                    solve_mode="matrix_free",
+                    articulated_contact_response=response,
+                    iterations=64,
+                    friction_anchor_beta=0.0,
+                    contact_friction_gap_max=0.001,
+                    enable_sleeping=False,
+                )
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state, output, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+                with wp.ScopedCapture(device=model.device) as capture:
+                    pipeline.collide(state, contacts)
+                    for source, target in ((state, output), (output, state)) * 2:
+                        source.clear_forces()
+                        solver.step(source, target, control, contacts, 1.0 / 800.0)
+                joint_target = model.joint_target_q.numpy()
+                grasped = None
+                # Close the driver, then lift by 0.2 m along a smoothstep and hold.
+                joint_target[2] = 0.8
+                for tick in range(110):
+                    lift = min(max(tick - 40, 0) / 50.0, 1.0)
+                    joint_target[0] = 0.2 * lift * lift * (3.0 - 2.0 * lift)
+                    control.joint_target_q.assign(joint_target)
+                    wp.capture_launch(capture.graph)
+                    if tick == 39:
+                        grasped = self._box_below_palm(state, palm, box)
+                self.assertLess(abs(grasped - self._box_below_palm(state, palm, box)), 0.01)
+
+    @staticmethod
+    def _box_below_palm(state, palm, box):
+        body_q = state.body_q.numpy()
+        return float(body_q[palm, 2] - body_q[box, 2])
 
     def test_floating_quadruped_with_joint_velocities_stays_bounded(self):
         """Four feet coupled through a light free root keep their roll rate physical."""
@@ -1812,8 +1952,7 @@ def _settle(model, steps=12, **solver_kwargs):
 
 
 def _first_fit_reference(solver, world=0):
-    """Reference coloring of world 0's units: sort by contact, first-fit, stable counting sort."""
-    entries = PROPAGATION_COLOR_TAIL + 2
+    """Reference coloring of world 0's units."""
     stride = solver._propagation_max_constraints
     n = min(int(solver._color_world_unit_cursor.numpy()[world]), stride)
     base = world * stride
@@ -1821,7 +1960,15 @@ def _first_fit_reference(solver, world=0):
     body_a = solver._color_unit_body_a.numpy()[base : base + n]
     body_b = solver._color_unit_body_b.numpy()[base : base + n]
     length = solver._color_unit_len.numpy()[base : base + n]
-    order = np.argsort(contact, kind="stable")
+    longest_first = solver.propagation_color_order == "longest_first"
+    return (n, *_first_fit_coloring(contact, body_a, body_b, length, longest_first))
+
+
+def _first_fit_coloring(contact, body_a, body_b, length, longest_first):
+    """Sort units by contact (after row count, longest first, if asked), color first-fit, and counting-sort by color."""
+    entries = PROPAGATION_COLOR_TAIL + 2
+    n = len(contact)
+    order = np.lexsort((contact, -np.minimum(length, 15))) if longest_first else np.argsort(contact, kind="stable")
     used = {}
     color = np.zeros(n, dtype=np.int64)
     for u in order:
@@ -1840,7 +1987,70 @@ def _first_fit_reference(solver, world=0):
         position_unit[cursor[color[u]]] = u
         cursor[color[u]] += 1
     row_start = np.concatenate([[0], np.cumsum(length[position_unit])])[:n]
-    return n, color, offsets, row_start, contact[position_unit]
+    return color, offsets, row_start, contact[position_unit]
+
+
+def _sweep_cost(color, length):
+    """Rows a world's colored sweep walks: each color costs its longest unit, each tail unit its own rows."""
+    tail = color == PROPAGATION_COLOR_TAIL
+    colored = sum(int(length[color == c].max()) for c in np.unique(color[~tail]))
+    return colored + int(length[tail].sum())
+
+
+def _run_prebuild(worlds, max_constraints, max_body_span, longest_first):
+    """Color per-world unit lists ``(contact, body_a, body_b, length)`` with the pre-build kernel."""
+    device = wp.get_device("cuda:0")
+    entries = PROPAGATION_COLOR_TAIL + 2
+    words = (PROPAGATION_COLOR_TAIL + 31) // 32
+    stride = 1 << max(max_constraints - 1, 0).bit_length()
+    count = len(worlds)
+    fields = np.zeros((4, count * max_constraints), dtype=np.int32)
+    for w, units in enumerate(worlds):
+        for f, values in enumerate(units):
+            fields[f, w * max_constraints : w * max_constraints + len(values)] = values
+    body_count = int(fields[1:3].max()) + 1
+    contact_count = int(fields[0].max()) + 1
+    cursor = wp.array([len(units[0]) for units in worlds], dtype=wp.int32, device=device)
+    unit_contact, unit_body_a, unit_body_b, unit_len = (wp.array(f, dtype=wp.int32, device=device) for f in fields)
+    unit_color = wp.zeros(count * max_constraints, dtype=wp.int32, device=device)
+    contact_slot = wp.full(contact_count, -1, dtype=wp.int32, device=device)
+    row_order = wp.zeros(count * max_constraints, dtype=wp.int32, device=device)
+    offsets = wp.zeros(count * entries, dtype=wp.int32, device=device)
+    sorted_contact = wp.zeros(count * max_constraints, dtype=wp.int32, device=device)
+    kernel = _get_color_propagation_prebuild_kernel(
+        max_constraints, entries, 256, stride, device.arch, max_body_span=max_body_span, longest_first=longest_first
+    )
+    wp.launch_tiled(
+        kernel,
+        dim=[count],
+        inputs=[
+            count,
+            cursor,
+            unit_contact,
+            unit_body_a,
+            unit_body_b,
+            unit_len,
+            wp.zeros(body_count * words, dtype=wp.int32, device=device),
+            wp.zeros(count * stride, dtype=wp.int32, device=device),
+            unit_color,
+            contact_slot,
+            row_order,
+            offsets,
+            sorted_contact,
+        ],
+        block_dim=256,
+        device=device,
+    )
+    return [
+        (
+            unit_color.numpy()[w * max_constraints : w * max_constraints + len(units[0])],
+            offsets.numpy()[w * entries : (w + 1) * entries],
+            row_order.numpy()[w * max_constraints : w * max_constraints + len(units[0])],
+            sorted_contact.numpy()[w * max_constraints : w * max_constraints + len(units[0])],
+            contact_slot.numpy(),
+        )
+        for w, units in enumerate(worlds)
+    ]
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "propagation_colored requires CUDA")
@@ -1932,7 +2142,7 @@ class TestSteelColoredScheduling(unittest.TestCase):
 
         The unit list is gathered with an atomic cursor, so its order differs between
         launches; the coloring must not inherit that order. The pre-build kernel sorts
-        units by global contact index before the order-dependent greedy pass.
+        units by row count and global contact index before the order-dependent greedy pass.
         """
         model, _ = _heap()
         _, state, _ = _settle(model)
@@ -2010,24 +2220,121 @@ class TestSteelColoredScheduling(unittest.TestCase):
         self.assertEqual(int(prescribed[link]), 0)
 
     def test_prebuild_matches_the_first_fit_reference(self):
-        """The device coloring reproduces sort-by-contact first-fit exactly.
+        """The device coloring reproduces the first-fit reference exactly in either color order.
 
         The prebuild stages units in shared memory for its serial passes, sorts packed
         keys in shared memory when a world has at most 4096 units, and keeps the
         used-color masks in shared memory when the unit bodies span at most 256
         indices. The large heap spans more bodies than that and takes the global masks.
         """
-        for shape in ((6, 6, 3), (7, 7, 6)):
+        for shape, order in (((6, 6, 3), "longest_first"), ((7, 7, 6), "longest_first"), ((7, 7, 6), "contact")):
             model, _ = _heap(*shape)
-            solver, state, _ = _settle(model, steps=4)
+            solver, state, _ = _settle(model, steps=4, propagation_color_order=order)
             self.assertTrue(np.isfinite(state.body_q.numpy()).all())
             n, color, offsets, row_start, sorted_contact = _first_fit_reference(solver)
             self.assertGreater(n, 400)
             entries = PROPAGATION_COLOR_TAIL + 2
-            np.testing.assert_array_equal(solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} colors")
-            np.testing.assert_array_equal(solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape}")
-            np.testing.assert_array_equal(solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape}")
+            np.testing.assert_array_equal(
+                solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} {order} colors"
+            )
+            np.testing.assert_array_equal(
+                solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape} {order}"
+            )
+            np.testing.assert_array_equal(
+                solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape} {order}"
+            )
+            np.testing.assert_array_equal(
+                solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape} {order}"
+            )
+
+    def test_longest_first_reaches_the_hub_lower_bound(self):
+        """Long units mixed with short ones on a hub cost only the hub's own rows with longest_first.
+
+        Every hub unit needs its own color, so a sweep walks at least the hub units' rows. Here
+        a star of long units with the lowest contact indices and ground contacts on the hub's
+        partners fill the colors of short hub units under the contact order, which costs more.
+        """
+        k, star = 6, 4
+        hub, star_center = 0, 50
+        units = []
+        for j in range(star):
+            units.append((j, star_center, star_center + 1 + j, 6))
+        for j in range(k):
+            units.append((10 + 2 * j, hub, 1 + j, 1))
+            units.append((11 + 2 * j, hub, 1 + k + j, 6))
+        for j in range(k):
+            units.append((100 + j, -1, 1 + j, 3))
+        contact, body_a, body_b, length = (np.array(f, dtype=np.int32) for f in zip(*units, strict=True))
+        rng = np.random.default_rng(0)
+        perm = rng.permutation(len(contact))
+        contact, body_a, body_b, length = contact[perm], body_a[perm], body_b[perm], length[perm]
+        hub_rows = int(length[(body_a == hub) | (body_b == hub)].sum())
+
+        by_contact = _first_fit_coloring(contact, body_a, body_b, length, longest_first=False)[0]
+        contact_rows = _sweep_cost(by_contact, length)
+        self.assertGreater(contact_rows, hub_rows, "the case does not discriminate the order")
+        for longest_first, span in ((True, 0), (True, 256), (False, 0), (False, 256)):
+            color, offsets, row_start, sorted_contact, slot = _run_prebuild(
+                [(contact, body_a, body_b, length)], 64, span, longest_first
+            )[0]
+            expected_rows = hub_rows if longest_first else contact_rows
+            self.assertEqual(_sweep_cost(color, length), expected_rows, f"longest_first {longest_first} span {span}")
+            self.assertFalse(np.any(color == PROPAGATION_COLOR_TAIL))
+            for c in np.unique(color):
+                bodies = np.concatenate([body_a[color == c], body_b[color == c]])
+                bodies = bodies[bodies >= 0]
+                self.assertEqual(len(bodies), len(np.unique(bodies)), f"color {c} shares a body")
+            expected = _first_fit_coloring(contact, body_a, body_b, length, longest_first)
+            np.testing.assert_array_equal(color, expected[0])
+            np.testing.assert_array_equal(offsets, expected[1])
+            np.testing.assert_array_equal(row_start, expected[2])
+            np.testing.assert_array_equal(sorted_contact, expected[3])
+            np.testing.assert_array_equal(slot[sorted_contact], row_start)
+
+    def test_prebuild_matches_the_reference_on_both_sort_paths(self):
+        """A world over 4096 units sorts in global memory; both paths give the reference coloring in either order.
+
+        Each world is colored twice from differently shuffled unit lists, as the atomic gather
+        would produce, and both launches must match the reference exactly.
+        """
+        rng = np.random.default_rng(1)
+        worlds, next_contact, body_base = [], 0, 0
+        for n_units, n_bodies in ((700, 40), (5000, 400)):
+            contact = np.sort(rng.choice(4 * n_units, n_units, replace=False)).astype(np.int32) + next_contact
+            next_contact = int(contact.max()) + 1
+            body_a = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
+            body_b = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
+            body_b[body_b == body_a] = -1
+            body_a[rng.random(n_units) < 0.2] = -1
+            length = rng.choice(np.array([1, 3, 6, 7], dtype=np.int32), n_units)
+            worlds.append((contact, body_a, body_b, length))
+            body_base += n_bodies
+        for longest_first, trial in ((True, 0), (True, 1), (False, 0), (False, 1)):
+            shuffled = []
+            for units in worlds:
+                perm = rng.permutation(len(units[0]))
+                shuffled.append(tuple(f[perm] for f in units))
+            results = _run_prebuild(shuffled, 8192, 256, longest_first)
+            for w, (units, result) in enumerate(zip(shuffled, results, strict=True)):
+                expected = _first_fit_coloring(*units, longest_first)
+                for name, got, want in zip(
+                    ("color", "offsets", "row start", "contact"), result, expected, strict=False
+                ):
+                    np.testing.assert_array_equal(
+                        got, want, err_msg=f"longest_first {longest_first} trial {trial} world {w} {name}"
+                    )
+
+    def test_color_order_option_is_validated(self):
+        """Reject an unknown propagation_color_order and keep the option read-only."""
+        model, _ = _heap(nx=2, ny=2, nz=1)
+        model.rigid_contact_max = 256
+        kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        with self.assertRaisesRegex(ValueError, "propagation_color_order must be"):
+            newton.solvers.SolverSteel(model, propagation_color_order="longest", **kwargs)
+        solver = newton.solvers.SolverSteel(model, propagation_color_order="contact", **kwargs)
+        self.assertEqual(solver.propagation_color_order, "contact")
+        with self.assertRaises(AttributeError):
+            solver.propagation_color_order = "longest_first"
 
     def test_colored_accepts_a_large_row_budget(self):
         """The coloring keeps per-unit state in global scratch, so no staging cap applies."""

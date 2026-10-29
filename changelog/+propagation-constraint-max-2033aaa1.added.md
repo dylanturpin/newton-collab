@@ -1,0 +1,1 @@
+Add `propagation_constraint_max` to `SolverSteel` to size the propagation contact-row family independently of `free_body_constraint_max` in the `propagation` and `propagation_colored` responses, where every contact row lives on that family, so the free-body budget then only has to hold the velocity-limit rows.

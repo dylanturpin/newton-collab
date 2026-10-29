@@ -1011,7 +1011,7 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         _propagation_torsion_first=full((1, 1), -1),
         _propagation_torsion_next=full((1, 1), -1),
     )
-    for name in ("_row_beta", "_row_cfm", "_phi", "_target_velocity", "_row_restitution"):
+    for name in ("_row_beta", "_row_cfm", "_phi", "_target_velocity", "_row_rebound_velocity"):
         setattr(solver, name, zero((worlds, dense)))
     return solver, state, augmented, contacts
 
@@ -1049,7 +1049,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             "_row_cfm",
             "_phi",
             "_target_velocity",
-            "_row_restitution",
+            "_row_rebound_velocity",
             "_contact_torsion_group",
         ):
             np.testing.assert_allclose(
@@ -2711,7 +2711,8 @@ class TestPropagationTorsion(unittest.TestCase):
         lines = [line for line in output.splitlines() if not (line.startswith("Module") and "load on device" in line)]
         overflow = (
             r"Warning: Steel propagation constraint-row overflow in world 0: requested 16 rows, limit 10; "
-            r"dropped 8 contact/friction rows\. Increase articulation_constraint_max or free_body_constraint_max\."
+            r"dropped 8 contact/friction rows\. Increase propagation_constraint_max \(or, when it is unset, "
+            r"articulation_constraint_max or free_body_constraint_max\)\."
         )
         self.assertEqual(len(lines), 1, output)
         self.assertRegex(lines[0], overflow)

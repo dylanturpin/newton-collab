@@ -579,7 +579,7 @@ def _apply_rows(
     cfm: wp.array2d[float],
     phi: wp.array2d[float],
     target: wp.array2d[float],
-    restitution: wp.array2d[float],
+    rebound_velocity: wp.array2d[float],
     membership: wp.array2d[int],
     row_radius: wp.array2d[float],
     propagation_body_a: wp.array2d[int],
@@ -604,7 +604,7 @@ def _apply_rows(
     if work.family[c] == _PROPAGATION:
         if c != rep:
             return
-        # A body-space spin row about the lead normal; the reserved spare already carries no phi or restitution.
+        # A body-space spin row about the lead normal; the reserved spare already carries no phi or rebound velocity.
         lead = work.lead[rep]
         normal = work.normal[lead]
         propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
@@ -635,7 +635,7 @@ def _apply_rows(
     cfm[world, row] = pgs_cfm
     row_radius[world, row] = work.radius[rep]
     phi[world, row] = 0.0
-    restitution[world, row] = 0.0
+    rebound_velocity[world, row] = 0.0
     velocity = float(0.0)
     for side in range(2):
         body = work.body_a[lead]
@@ -1004,7 +1004,7 @@ class DeviceTorsionPreparation:
                 s._row_cfm,
                 s._phi,
                 s._target_velocity,
-                s._row_restitution,
+                s._row_rebound_velocity,
                 s._contact_torsion_group,
                 s._torsion_row_radius,
                 *self._propagation_rows(

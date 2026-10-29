@@ -488,6 +488,35 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         np.testing.assert_array_equal(first, second)
         np.testing.assert_array_equal(first, captured)
 
+    def test_condim_rows_keep_the_larger_coefficient_under_every_friction_combine(self):
+        """Combine sliding friction by friction_combine while condim rows keep the larger contributed coefficient."""
+        mu = np.array([0.5, 0.8], dtype=np.float32)
+        torsional = np.array([0.002, 0.004], dtype=np.float32)
+        rolling = np.array([0.003, 0.001], dtype=np.float32)
+        sliding = {"average": (mu[0] + mu[1]) / np.float32(2.0), "min": mu[0], "multiply": mu[0] * mu[1], "max": mu[1]}
+        for mode, expected_mu in sliding.items():
+            seen = {}
+
+            def on_solver(solver):
+                solver.model.shape_material_mu.assign(mu)
+                solver.model.shape_material_mu_torsional.assign(torsional)
+                solver.model.shape_material_mu_rolling.assign(rolling)
+                solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+
+            def observe(solver, contacts, observables, seen=seen):
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                needed = solver._contact_slots_needed.numpy()[:count]
+                slots = solver._contact_slot.numpy()[:count]
+                row = int(slots[int(np.flatnonzero(needed == 6)[0])])
+                types = solver._mf_row_type.numpy()[0]
+                self.assertEqual(types[row + 3], PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+                self.assertEqual(types[row + 5], PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+                seen["mu"] = solver._mf_row_mu.numpy()[0][[row, row + 3, row + 5]]
+
+            with self.subTest(mode=mode):
+                _simulate("sphere", 0.0, steps=1, condim=6, friction_combine=mode, on_solver=on_solver, observe=observe)
+                np.testing.assert_array_equal(seen["mu"], [expected_mu, rolling.max(), torsional.max()])
+
     def test_one_override_keeps_the_other_coefficient_on_condim(self):
         """Override only the rolling coefficient: shapes at condim 3 get the rolling pair and no spin row."""
         seen = {}

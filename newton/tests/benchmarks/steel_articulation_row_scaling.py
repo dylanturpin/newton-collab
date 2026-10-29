@@ -386,6 +386,7 @@ def _propagation_extra_bytes(solver: SolverSteel) -> int:
         "_propagation_tree_D_inv",
         "_propagation_tree_pA",
         "_propagation_tree_u",
+        "_propagation_tree_u_basis",
         "_propagation_tree_qdd",
         "_propagation_tree_body_delta",
     )

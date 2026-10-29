@@ -384,7 +384,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             "row_cfm",
             "phi",
             "target_velocity",
-            "row_restitution",
+            "row_rebound_velocity",
         )
     }
     jacobians = {size: array.numpy() for size, array in solver._J_by_size.items()}

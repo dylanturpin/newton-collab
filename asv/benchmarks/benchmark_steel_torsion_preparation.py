@@ -36,7 +36,7 @@ def main():
                     "_row_cfm",
                     "_phi",
                     "_target_velocity",
-                    "_row_restitution",
+                    "_row_rebound_velocity",
                     "_contact_torsion_group",
                 )
                 saved = [(getattr(solver, name), wp.clone(getattr(solver, name))) for name in names]
