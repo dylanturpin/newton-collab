@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import gc
 import json
 import math
@@ -1042,6 +1043,19 @@ def _replace_once(source: str, old: str, new: str) -> str:
     if source.count(old) != 1:
         raise RuntimeError(f"Expected one generated-source fragment: {old.strip()!r}")
     return source.replace(old, new)
+
+
+def _butterfly_warp_sums(snippet: str) -> str:
+    """Turn the warp sums into xor butterflies and drop the lane-0 broadcasts of the dot products.
+
+    Every lane ends with lane 0's down-sweep sum, since each butterfly level adds the same pair in either order.
+    """
+    snippet = snippet.replace("__shfl_down_sync(MASK, ", "__shfl_xor_sync(MASK, ")
+    return re.sub(
+        r"__shfl_sync\(MASK, (my_sum|cross|sibling_residual|dot|my_sum_vlim|my_sum_mf_vlim|my_sum_fvl), 0\)",
+        r"\1",
+        snippet,
+    )
 
 
 def _prefetch_streamed_dense_metadata(snippet: str) -> str:
@@ -7598,7 +7612,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     sm_count=int(getattr(model.device, "sm_count", 0)),
                 )
             )
-            self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
+            self._pgs_solve_mf_gs_kernel_for_phase = functools.partial(
+                _get_pgs_solve_mf_gs_kernel,
                 self._articulation_constraint_max,
                 self._free_body_constraint_max,
                 self._max_world_dofs,
@@ -7619,6 +7634,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 pair_cache=self._mfgs_pair_cache,
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
             )
+            # One kernel per row phase of the schedule, each with its phase compiled in.
+            phases = {"contact_then_internal": (1, 2), "phased": (3, 4, 5)}.get(self._row_schedule, (0,))
+            self._pgs_solve_mf_gs_kernels = {
+                phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
+            }
+            self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "_max_mf_bodies") and self._free_body_constraint_max > 0:
@@ -8236,8 +8257,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
             return
-        mf_gs_kernel = self._pgs_solve_mf_gs_kernel
-        if mf_gs_kernel is None:
+        if self._pgs_solve_mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
@@ -8380,9 +8400,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=64,
                         device=self.model.device,
                     )
+            phase_kernel = self._pgs_solve_mf_gs_kernels.get(row_phase)
+            if phase_kernel is None:
+                phase_kernel = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=row_phase)
+                self._pgs_solve_mf_gs_kernels[row_phase] = phase_kernel
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 wp.launch_tiled(
-                    mf_gs_kernel,
+                    phase_kernel,
                     dim=[general_block_count],
                     inputs=[
                         self._local_general_world_count,
@@ -24953,6 +24977,7 @@ def _get_pgs_solve_mf_gs_kernel(
     contact_compliance: bool = False,
     pair_cache: bool = False,
     free_rigid_angular_friction: bool = False,
+    row_phase: int | None = None,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -24983,6 +25008,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
     ``free_rigid_angular_friction`` solves the rolling pair and spin rows that follow
     matrix-free contacts' sliding pairs in phase 2.
+
+    ``row_phase`` compiles the row phase in; the launch argument is then ignored. ``None`` reads it at launch.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
     stateless joint-velocity clamp as an end-of-iteration pass over the
@@ -26712,6 +26739,10 @@ def _get_pgs_solve_mf_gs_kernel(
         "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + (angular_sources["helpers"] if angular_sources else ""),
         1,
     )
+    snippet = _butterfly_warp_sums(snippet)
+    if row_phase is not None:
+        # A constant phase lets the compiler drop the per-row phase filters from the sweep.
+        snippet = re.sub(r"\brow_phase\b", str(row_phase), snippet)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
@@ -26870,6 +26901,8 @@ def _get_pgs_solve_mf_gs_kernel(
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
     )
+    if row_phase is not None:
+        name += f"_phase{row_phase}"
     if fuse_vel_limits:
         name += "_fvl"
     if not shared_metadata:
