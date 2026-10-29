@@ -47,8 +47,8 @@ def _build_chains_and_boxes(device):
     return scene.finalize(device=device)
 
 
-def _rollout(model, runtime_phase, **options):
-    solver = SolverSteel(
+def _solver(model, **options):
+    return SolverSteel(
         model,
         solve_mode="matrix_free",
         iterations=12,
@@ -57,6 +57,11 @@ def _rollout(model, runtime_phase, **options):
         free_body_constraint_max=64,
         **options,
     )
+
+
+def _rollout(model, runtime_phase, **options):
+    solver = _solver(model, **options)
+    prebuilt = set(solver._pgs_solve_mf_gs_kernels)
     if runtime_phase:
         # Every launch takes the kernel that reads the phase argument.
         runtime_kernel = solver._pgs_solve_mf_gs_kernel_for_phase(row_phase=None)
@@ -72,17 +77,53 @@ def _rollout(model, runtime_phase, **options):
         solver.step(state, next_state, control, contacts, 1.0 / 240.0)
         state, next_state = next_state, state
         trace.append(np.concatenate([state.body_q.numpy().ravel(), state.body_qd.numpy().ravel()]))
-    return solver, np.asarray(trace)
+    return solver, prebuilt, np.asarray(trace)
 
 
 def test_compiled_row_phase_matches_runtime_phase(test, device, **options):
     """Kernels with the row phase compiled in reproduce the runtime-phase kernel bit for bit."""
     model = _build_chains_and_boxes(device)
-    solver, compiled = _rollout(model, False, **options)
-    _, runtime = _rollout(model, True, **options)
+    solver, prebuilt, compiled = _rollout(model, False, **options)
+    _, _, runtime = _rollout(model, True, **options)
     test.assertTrue(all("_phase" in kernel.key for kernel in solver._pgs_solve_mf_gs_kernels.values()))
+    # The constructor prebuilds exactly the phases the step launches.
+    test.assertEqual(set(solver._pgs_solve_mf_gs_kernels), prebuilt)
     test.assertTrue(np.isfinite(runtime).all())
     np.testing.assert_array_equal(compiled.view(np.uint32), runtime.view(np.uint32))
+
+
+def test_capture_first_step_matches_eager(test, device, **options):
+    """Capturing the first steps of a fresh solver replays like eager steps and builds no kernel inside the capture."""
+    model = _build_chains_and_boxes(device)
+    traces = []
+    for captured in (True, False):
+        solver = _solver(model, **options)
+        prebuilt = set(solver._pgs_solve_mf_gs_kernels)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_a, state_b, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_a)
+
+        def two_steps(solver=solver, pipeline=pipeline, contacts=contacts, a=state_a, b=state_b, control=control):
+            for state_in, state_out in ((a, b), (b, a)):
+                state_in.clear_forces()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+
+        if captured:
+            with wp.ScopedCapture() as capture:
+                two_steps()
+            test.assertEqual(set(solver._pgs_solve_mf_gs_kernels), prebuilt)
+        trace = []
+        for _ in range(30):
+            if captured:
+                wp.capture_launch(capture.graph)
+            else:
+                two_steps()
+            trace.append(np.concatenate([state_a.body_q.numpy().ravel(), state_a.body_qd.numpy().ravel()]))
+        traces.append(np.asarray(trace))
+    test.assertTrue(np.isfinite(traces[1]).all())
+    np.testing.assert_array_equal(traces[0].view(np.uint32), traces[1].view(np.uint32))
 
 
 class TestSteelMatrixFreeRowPhase(unittest.TestCase):
@@ -94,11 +135,34 @@ for _name, _options in (
     ("phased", {"row_schedule": "phased"}),
     ("contact_then_internal", {"row_schedule": "contact_then_internal"}),
     ("velocity_limits", {"enable_joint_velocity_limits": True, "velocity_limit_activation_fraction": 0.0}),
+    ("propagation", {"articulated_contact_response": "propagation"}),
+    ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
+    (
+        "propagation_velocity_limits",
+        {
+            "articulated_contact_response": "propagation",
+            "enable_joint_velocity_limits": True,
+            "velocity_limit_activation_fraction": 0.0,
+        },
+    ),
 ):
     add_function_test(
         TestSteelMatrixFreeRowPhase,
         f"test_compiled_row_phase_matches_runtime_phase_{_name}",
         test_compiled_row_phase_matches_runtime_phase,
+        devices=get_selected_cuda_test_devices(),
+        **_options,
+    )
+
+for _name, _options in (
+    ("interleaved", {}),
+    ("propagation", {"articulated_contact_response": "propagation"}),
+    ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
+):
+    add_function_test(
+        TestSteelMatrixFreeRowPhase,
+        f"test_capture_first_step_matches_eager_{_name}",
+        test_capture_first_step_matches_eager,
         devices=get_selected_cuda_test_devices(),
         **_options,
     )

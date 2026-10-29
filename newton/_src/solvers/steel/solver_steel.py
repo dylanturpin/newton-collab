@@ -7634,8 +7634,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 pair_cache=self._mfgs_pair_cache,
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
             )
-            # One kernel per row phase of the schedule, each with its phase compiled in.
-            phases = {"contact_then_internal": (1, 2), "phased": (3, 4, 5)}.get(self._row_schedule, (0,))
+            # One kernel per row phase the step launches, each with its phase compiled in.
+            phases = self._matrix_free_gs_row_phases()
             self._pgs_solve_mf_gs_kernels = {
                 phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
             }
@@ -9412,6 +9412,19 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
         self._propagate_response()
+
+    def _matrix_free_gs_row_phases(self) -> tuple[int, ...]:
+        """Return the row phases the fused MF-GS solve launches for this schedule and contact response."""
+        if self._row_schedule == "contact_then_internal":
+            phases = (1, 2)
+        elif self._row_schedule == "phased" or self._propagation_contacts_enabled():
+            phases = (3, 4, 5)
+        else:
+            phases = (0,)
+        if not self._propagation_contacts_enabled():
+            return phases
+        # The propagation responses run the interleaved sweep as the phased passes and skip phases without rows.
+        return tuple(phase for phase in phases if self._split_matrix_free_row_phase_may_have_work(phase))
 
     def _launch_matrix_free_gs_solve_propagation_tree(
         self,
