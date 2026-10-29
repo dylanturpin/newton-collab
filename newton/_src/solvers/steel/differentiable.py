@@ -65,13 +65,13 @@ from .kernels import (
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
     assign_world_contact_slots,
+    combine_shape_coefficients,
     compute_composite_inertia,
     compute_contact_spatial_force_from_impulses,
     compute_link_transform,
     compute_link_velocity,
     compute_physx_pgs_drive_desc,
     compute_velocity_predictor,
-    combine_shape_coefficients,
     compute_world_contact_bias,
     contact_rebound_velocity,
     contact_restitution_fires,
@@ -289,7 +289,8 @@ class DifferentiableStep:
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
         # PGS gradient: "unrolled" tapes every sweep, "truncated" only the last pgs_truncate sweeps, and "implicit"
-        # differentiates the converged complementarity conditions with one dense solve per world.
+        # differentiates the converged complementarity conditions with one dense solve per world. Implicit treats
+        # friction coefficients as constant, and a world whose rows it cannot linearize gets NaN gradients.
         self.pgs_adjoint = "unrolled"
         self.pgs_truncate = 1
         self.implicit_regularization = 1.0e-4
@@ -302,6 +303,7 @@ class DifferentiableStep:
         # The mass-matrix factorization as one tile Cholesky per articulation (needs parallel_cholesky_adjoint).
         # Opt-in: it changes the forward's summation order.
         self.tiled_factor = False
+        # Cumulative [unsupported rows, singular pivots] seen by the implicit adjoint; callers reset it.
         self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
@@ -524,7 +526,7 @@ class DifferentiableStep:
                 outputs=[b.H[size]],
                 device=device,
             )
-            if self.tiled_factor and self.parallel_cholesky_adjoint:
+            if self.tiled_factor and self.parallel_cholesky_adjoint and wp.get_device(device).is_cuda:
                 wp.launch_tiled(
                     tiled_factor_kernel(size),
                     dim=n_arts,
@@ -1183,6 +1185,9 @@ class DifferentiableStep:
         torsion = solver._contact_torsion_enabled
         velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
         iterations = solver._iterations
+        is_cuda = wp.get_device(device).is_cuda
+        if self.pgs_adjoint == "implicit":
+            self._validate_implicit(patches, drives)
         if self.pgs_adjoint == "unrolled":
             first_taped = 0
         elif self.pgs_adjoint == "truncated":
@@ -1197,7 +1202,7 @@ class DifferentiableStep:
             # each pass writing the next one's input.
             torsion_out = c.velocity_limit_input[k] if velocity_limits else c.impulses[k + 1]
             sweep_out = c.torsion_input[k] if torsion else torsion_out
-            tiled = self.tiled_pgs and not record
+            tiled = self.tiled_pgs and not record and is_cuda
             wp.launch(
                 _dense_pgs_sweep_tiled if tiled else _dense_pgs_sweep,
                 dim=(solver._world_count, TILE_LANES) if tiled else solver._world_count,
@@ -1300,9 +1305,25 @@ class DifferentiableStep:
             wp.launch(cholesky_adjoint_phi, dim=(n_arts, n, n), inputs=[L, L.grad, n], outputs=[tmp], device=device)
             wp.launch(cholesky_adjoint_left, dim=(n_arts, n), inputs=[L, n], outputs=[tmp], device=device)
             wp.launch(cholesky_adjoint_right, dim=(n_arts, n), inputs=[L, n], outputs=[tmp], device=device)
-            wp.launch(cholesky_adjoint_scatter, dim=(n_arts, n, n), inputs=[tmp], outputs=[H.grad, L.grad], device=device)
+            wp.launch(
+                cholesky_adjoint_scatter, dim=(n_arts, n, n), inputs=[tmp], outputs=[H.grad, L.grad], device=device
+            )
 
         tape.record_func(backward, [H, L])
+
+    def _validate_implicit(self, patches: bool, drives: bool) -> None:
+        """Raise for forward laws the implicit adjoint does not linearize; rows that only appear at runtime poison their world."""
+        solver = self.solver
+        checks = (
+            (solver._regularization_enabled, "contact_regularization=0"),
+            (patches, "friction_anchor_beta=0 (no friction patches)"),
+            (drives, "no PhysX drive rows"),
+            (solver._contact_torsion_enabled, "no contact torsion"),
+            (solver._enable_joint_velocity_limits, "enable_joint_velocity_limits=False"),
+        )
+        for unsupported, requirement in checks:
+            if unsupported:
+                raise NotImplementedError(f'pgs_adjoint="implicit" requires {requirement}')
 
     def _record_implicit_adjoint(self, c: _ContactBuffers, rhs: wp.array, smooth: bool) -> None:
         """Record the implicit PGS adjoint on the active tape; the sweeps themselves stay off the tape."""
@@ -1324,7 +1345,7 @@ class DifferentiableStep:
         regularization, tolerance = self.implicit_regularization, self.implicit_slide_tolerance
 
         def backward():
-            tiled = self.tiled_pgs
+            tiled = self.tiled_pgs and wp.get_device(solver.model.device).is_cuda
             wp.launch(
                 pgs_implicit_adjoint_tiled if tiled else pgs_implicit_adjoint,
                 dim=(worlds, TILE_LANES) if tiled else worlds,
@@ -2859,7 +2880,9 @@ def _dense_contact_rows(
                 target_a = anchor
                 target_b = anchor
             row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
-            restitution = mixed_contact_restitution(shape0[c], shape1[c], shape_material_restitution, restitution_combine)
+            restitution = mixed_contact_restitution(
+                shape0[c], shape1[c], shape_material_restitution, restitution_combine
+            )
             row_rebound_velocity[world, slot] = contact_rebound_velocity(
                 restitution,
                 body_a,

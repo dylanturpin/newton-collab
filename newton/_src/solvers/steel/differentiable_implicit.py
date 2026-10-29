@@ -14,7 +14,8 @@ per world. Row equations:
 - sliding friction pair, ``lambda_t = mu lambda_n d``: ``d^T dlambda_t = mu dlambda_n`` and
   ``(alpha + eps) p^T dlambda_t + p^T dw_t = 0`` with ``p`` perpendicular to ``d`` and ``w_t = -alpha lambda_t``
 
-where ``w = rhs + C lambda`` and ``eps_i = regularization * C_ii`` acts as a small compliance on the equality rows.
+where ``w = rhs + C lambda`` and ``eps_i = regularization * C_ii`` damps the backward system only (the forward solve
+has no such compliance). Friction coefficients are constant. Worlds with other row kinds or a zero pivot get NaN gradients.
 """
 
 from __future__ import annotations
@@ -201,6 +202,9 @@ def pgs_implicit_adjoint(
             for j in range(m):
                 C_bar[world, i, j] = C_bar[world, i, j] + b * lam[world, j]
     if unsupported > 0 or singular > 0:
+        # The linearization does not hold for this world: poison its gradient rather than return a surrogate.
+        for i in range(m):
+            rhs_bar[world, i] = wp.nan
         wp.atomic_add(status, 0, unsupported)
         wp.atomic_add(status, 1, singular)
 
@@ -446,9 +450,12 @@ def pgs_implicit_adjoint_tiled(
                 rhs_bar[world, i] = rhs_bar[world, i] + b
             for j in range(lane, m, LANES):
                 C_bar[world, i, j] = C_bar[world, i, j] + b * lam[world, j]
-    if lane == 0 and (unsupported > 0 or singular > 0):
-        wp.atomic_add(status, 0, unsupported)
-        wp.atomic_add(status, 1, singular)
+    if unsupported > 0 or singular > 0:
+        for i in range(lane, m, LANES):
+            rhs_bar[world, i] = wp.nan
+        if lane == 0:
+            wp.atomic_add(status, 0, unsupported)
+            wp.atomic_add(status, 1, singular)
 
 
 _TILED_FACTOR_KERNELS = {}
