@@ -449,3 +449,23 @@ def pgs_implicit_adjoint_tiled(
     if lane == 0 and (unsupported > 0 or singular > 0):
         wp.atomic_add(status, 0, unsupported)
         wp.atomic_add(status, 1, singular)
+
+
+_TILED_FACTOR_KERNELS = {}
+
+
+def tiled_factor_kernel(n: int) -> wp.Kernel:
+    """One block per articulation: L = cholesky(H + diag(R)) with the tile Cholesky, for n generalized DOFs."""
+    kernel = _TILED_FACTOR_KERNELS.get(n)
+    if kernel is not None:
+        return kernel
+
+    @wp.kernel(module="unique")
+    def factor(H: wp.array3d[float], R: wp.array2d[float], L: wp.array3d[float]):
+        g = wp.tid()
+        A = wp.tile_load(H[g], shape=(n, n))
+        A = wp.tile_diag_add(A, wp.tile_load(R[g], shape=n))
+        wp.tile_store(L[g], wp.tile_cholesky(A))
+
+    _TILED_FACTOR_KERNELS[n] = factor
+    return factor

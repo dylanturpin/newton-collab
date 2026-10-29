@@ -29,6 +29,7 @@ from .differentiable_implicit import (
     cholesky_adjoint_scatter,
     pgs_implicit_adjoint,
     pgs_implicit_adjoint_tiled,
+    tiled_factor_kernel,
 )
 from .friction_patches import (
     FrictionPatches,
@@ -298,6 +299,8 @@ class DifferentiableStep:
         self.parallel_cholesky_adjoint = True
         # Untaped PGS sweeps (all of them under pgs_adjoint="implicit") run one warp per world.
         self.tiled_pgs = True
+        # The mass-matrix factorization as one tile Cholesky per articulation (needs parallel_cholesky_adjoint).
+        self.tiled_factor = True
         self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
@@ -520,14 +523,25 @@ class DifferentiableStep:
                 outputs=[b.H[size]],
                 device=device,
             )
-            wp.launch(
-                _factor_dense,
-                dim=n_arts,
-                inputs=[b.H[size], solver._R_by_size[size], size, b.factor_tmp[size]],
-                outputs=[b.L[size]],
-                device=device,
-                record_tape=not self.parallel_cholesky_adjoint,
-            )
+            if self.tiled_factor and self.parallel_cholesky_adjoint:
+                wp.launch_tiled(
+                    tiled_factor_kernel(size),
+                    dim=n_arts,
+                    inputs=[b.H[size], solver._R_by_size[size]],
+                    outputs=[b.L[size]],
+                    block_dim=64,
+                    device=device,
+                    record_tape=False,
+                )
+            else:
+                wp.launch(
+                    _factor_dense,
+                    dim=n_arts,
+                    inputs=[b.H[size], solver._R_by_size[size], size, b.factor_tmp[size]],
+                    outputs=[b.L[size]],
+                    device=device,
+                    record_tape=not self.parallel_cholesky_adjoint,
+                )
             if self.parallel_cholesky_adjoint:
                 self._record_cholesky_adjoint(b.H[size], b.L[size], b.factor_tmp[size], size, n_arts)
             wp.launch(
