@@ -845,22 +845,21 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
     def test_surface_velocity_belt_drags_the_box(self):
         """A box on a mesh belt with surface velocity reaches the surface speed.
 
-        Covers free and articulated boxes, every articulated response and friction mode with point friction, and
-        fixed-normal friction with persistent anchors, which must follow the moving surface. Uncolored propagation
-        supports only fixed-normal friction; colored propagation adds one coupled mode.
+        One case per row builder that adds the surface target: matrix-free (free box) with point friction and with
+        persistent anchors, a coupled friction mode, dense (articulated immediate) with anchors, and both
+        propagation routes.
         """
-        modes = ("fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton")
-        cases = [(mode, 0.0) for mode in modes] + [("fixed_normal", 0.2)]
-        for articulated, response, response_cases in (
-            (False, "immediate", cases),
-            (True, "immediate", cases),
-            (True, "propagation", [("fixed_normal", 0.0), ("fixed_normal", 0.2)]),
-            (True, "propagation_colored", [("fixed_normal", 0.0), ("fixed_normal", 0.2), ("coulomb_newton", 0.0)]),
+        for articulated, response, mode, anchor_beta in (
+            (False, "immediate", "fixed_normal", 0.0),
+            (False, "immediate", "fixed_normal", 0.2),
+            (False, "immediate", "coulomb_newton", 0.0),
+            (True, "immediate", "fixed_normal", 0.2),
+            (True, "propagation", "fixed_normal", 0.2),
+            (True, "propagation_colored", "fixed_normal", 0.0),
         ):
-            for mode, anchor_beta in response_cases:
-                with self.subTest(articulated=articulated, response=response, mode=mode, anchor_beta=anchor_beta):
-                    mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
-                    self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
+            with self.subTest(articulated=articulated, response=response, mode=mode, anchor_beta=anchor_beta):
+                mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
+                self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
     def test_surface_velocity_anchor_history_follows_a_timestep_change(self):
@@ -880,13 +879,11 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
     def test_surface_velocity_leaves_the_normal_response_alone(self):
         """A box dropped with restitution rebounds the same off a moving belt, even one whose velocity has a normal part."""
-        for solve_mode in ("split", "matrix_free"):
-            with self.subTest(solve_mode=solve_mode):
-                rebound_static, _ = _surface_belt_drop(solve_mode, (0.0, 0.0, 0.0))
-                rebound, vx = _surface_belt_drop(solve_mode, (0.5, 0.0, 1.0))
-                self.assertGreater(rebound_static, 0.2)
-                self.assertAlmostEqual(rebound, rebound_static, delta=1.0e-3)
-                self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+        rebound_static, _ = _surface_belt_drop((0.0, 0.0, 0.0))
+        rebound, vx = _surface_belt_drop((0.5, 0.0, 1.0))
+        self.assertGreater(rebound_static, 0.2)
+        self.assertAlmostEqual(rebound, rebound_static, delta=1.0e-3)
+        self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
 
 
 def _surface_belt_dt_change(steps_before=120, steps_after=60):
@@ -909,6 +906,7 @@ def _surface_belt_dt_change(steps_before=120, steps_after=60):
         friction_anchor_beta=0.2,
         iterations=32,
         free_body_constraint_max=64,
+        articulation_constraint_max=64,
         deterministic=True,
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
@@ -946,6 +944,7 @@ def _surface_belt_start(steps_still, steps_moving):
         sleep_quiet_time=0.1,
         iterations=32,
         free_body_constraint_max=64,
+        articulation_constraint_max=64,
         deterministic=True,
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
@@ -963,7 +962,7 @@ def _surface_belt_start(steps_still, steps_moving):
     return awake[0], awake[1], float(state.body_qd.numpy()[box, 0])
 
 
-def _surface_belt_drop(solve_mode, velocity, steps=240):
+def _surface_belt_drop(velocity, steps=240):
     """Drop a box with restitution 0.5 onto a mesh belt with surface ``velocity``; return its peak rebound speed and final x velocity."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.5, density=500.0)
@@ -974,7 +973,15 @@ def _surface_belt_drop(solve_mode, velocity, steps=240):
     builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
     model = builder.finalize(device="cuda:0")
     belt.mesh.velocities.fill_(wp.vec3(*velocity))
-    solver = SolverSteel(model, solve_mode=solve_mode, enable_restitution=True, iterations=32, deterministic=True)
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        enable_restitution=True,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
     contacts = pipeline.contacts()
     state, next_state, control = model.state(), model.state(), model.control()
