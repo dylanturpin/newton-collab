@@ -3877,6 +3877,17 @@ class SolverSteel(SolverBase, CouplingInterface):
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
 
+        Mesh switching at reset: after :meth:`newton.Model.copy_shape_geometry` (or an equivalent
+        in-place write of a shape's geometry arrays) and the body's inertial arrays, notify with
+        ``SHAPE_PROPERTIES | BODY_INERTIAL_PROPERTIES`` and the ``world_mask`` of the reset worlds,
+        then call :meth:`reset` with the same mask and
+        :meth:`newton.CollisionPipeline.reset_contact_matching`. The notification re-derives the
+        spatial inertia buffers and requests a mass refresh, retires the friction-anchor history of
+        the shapes whose geometry changed and clears the masked worlds' impulse history; contact
+        rows are rebuilt from the pipeline's contacts every step and need no refresh. Without the
+        mask every world loses its warm start. The copy and the notification are device-side and
+        may be captured in a CUDA graph with the step, unless sleeping is enabled.
+
         The narrow joint DOF flags are handled like :attr:`~newton.ModelFlags.JOINT_DOF_PROPERTIES`
         for what they cover: DOF inertial changes (armature) re-read armature, refresh the mass
         matrix and discard warm-start impulses; DOF force changes re-read joint damping, refresh the
