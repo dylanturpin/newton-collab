@@ -5711,6 +5711,72 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         np.testing.assert_allclose(converted_solver.mj_model.eq_solref, legacy_solver.mj_model.eq_solref, atol=1e-6)
         np.testing.assert_allclose(converted_solver.mj_model.eq_solimp, legacy_solver.mj_model.eq_solimp, atol=1e-6)
 
+    def test_converted_weld_loop_joint_frames_follow_mujoco(self):
+        """Converted welds keep the reference relative pose, or the authored relpose of body2 in body1's frame."""
+        mjcf = """<?xml version="1.0" ?>
+<mujoco model="weld_frames">
+    <worldbody>
+        <body name="a" pos="0.1 0 0.5" euler="0 30 0">
+            <joint type="hinge" axis="0 1 0"/>
+            <geom type="sphere" size="0.05"/>
+            <body name="b" pos="0.3 0 0" euler="20 0 10">
+                <joint type="hinge" axis="1 0 0"/>
+                <geom type="sphere" size="0.05"/>
+            </body>
+        </body>
+    </worldbody>
+    <equality>
+        <weld name="ref" body1="a" body2="b" anchor="0.05 0.02 0"/>
+        <weld name="rel" body1="a" body2="b" anchor="0.05 0 0" relpose="0.1 0.2 0.3 0.9238795 0 0 0.3826834"/>
+        <weld name="world" body1="b" relpose="0.4 0 1 0.7071068 0.7071068 0 0"/>
+    </equality>
+</mujoco>
+"""
+        builder = newton.ModelBuilder()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the welds parallel the hinges
+            builder.add_mjcf(mjcf)
+
+        def pose(body):
+            return builder.body_q[body] if body >= 0 else wp.transform_identity()
+
+        def assert_same_pose(actual, expected):
+            np.testing.assert_allclose(np.array(actual.p), np.array(expected.p), atol=1e-5)
+            q_a, q_e = np.array(actual.q), np.array(expected.q)
+            np.testing.assert_allclose(q_a * np.sign(q_a @ q_e), q_e, atol=1e-5)
+
+        def weld(label):
+            j = builder.joint_label.index(f"weld_frames/{label}")
+            self.assertEqual(builder.joint_type[j], newton.JointType.FIXED)
+            return builder.joint_parent[j], builder.joint_child[j], builder.joint_X_p[j], builder.joint_X_c[j]
+
+        a, b = (
+            builder.body_label.index("weld_frames/worldbody/a"),
+            builder.body_label.index("weld_frames/worldbody/a/b"),
+        )
+
+        # Default relpose: the two frames coincide at the reference pose, on body2's anchor.
+        parent, child, x_p, x_c = weld("ref")
+        self.assertEqual((parent, child), (a, b))
+        world_p = wp.transform_multiply(pose(parent), x_p)
+        assert_same_pose(world_p, wp.transform_multiply(pose(child), x_c))
+        np.testing.assert_allclose(
+            np.array(world_p.p), np.array(wp.transform_point(pose(b), wp.vec3(0.05, 0.02, 0.0))), atol=1e-5
+        )
+
+        # Explicit relpose: body2's anchor is held at relpose's position in body1's frame, with body2 at relpose's
+        # rotation relative to body1 (MuJoCo quaternions are w x y z).
+        relpose = wp.transform(wp.vec3(0.1, 0.2, 0.3), wp.quat(0.0, 0.0, 0.3826834, 0.9238795))
+        _, _, x_p, x_c = weld("rel")
+        held = wp.transform_multiply(relpose, wp.transform(wp.vec3(-0.05, 0.0, 0.0), wp.quat_identity()))
+        assert_same_pose(wp.transform_multiply(x_p, wp.transform_inverse(x_c)), held)
+
+        # Weld to the world: body1's held pose is the inverse of relpose.
+        relpose = wp.transform(wp.vec3(0.4, 0.0, 1.0), wp.quat(0.7071068, 0.0, 0.0, 0.7071068))
+        parent, child, x_p, x_c = weld("world")
+        self.assertEqual((parent, child), (-1, b))
+        assert_same_pose(wp.transform_multiply(x_p, wp.transform_inverse(x_c)), wp.transform_inverse(relpose))
+
     def test_parse_mjcf_registers_converted_equality_attributes(self):
         """Direct parse_mjcf() calls register MuJoCo preservation attributes."""
         mjcf = """<?xml version="1.0" ?>
