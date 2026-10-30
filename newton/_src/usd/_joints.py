@@ -180,6 +180,8 @@ def parse_joint(
             joint_index = builder.add_joint_revolute(**joint_params)
         else:
             joint_index = builder.add_joint_prismatic(**joint_params)
+        if dof.has_drive:
+            builder.joint_target_q[builder.joint_q_start[joint_index]] = dof.target_pos
     elif key == UsdPhysics.ObjectType.SphericalJoint:
         joint_params["armature"] = R.get_value(
             joint_prim, prim_type=PrimType.JOINT, key="armature", default=default_joint_armature, verbose=verbose
@@ -336,7 +338,7 @@ def parse_joint(
                     limit_ke, limit_kd, fallback_limit_kd, limit_kd_source, default_joint_limit_kd
                 )
                 linear_axes.append(
-                    ModelBuilder.JointDofConfig(
+                    _authored_dof_config(
                         axis=_trans_axes[dof],
                         limit_lower=limit_lower,
                         limit_upper=limit_upper,
@@ -406,7 +408,7 @@ def parse_joint(
                 )
 
                 angular_axes.append(
-                    ModelBuilder.JointDofConfig(
+                    _authored_dof_config(
                         axis=_rot_axes[dof],
                         limit_lower=limit_lower * DegreesToRadian,
                         limit_upper=limit_upper * DegreesToRadian,
@@ -702,7 +704,7 @@ def parse_merged_joints(
             rotated = wp.quat_rotate(relative_q, wp.vec3(axis_unit[0], axis_unit[1], axis_unit[2]))
             dof_axis = (float(rotated[0]), float(rotated[1]), float(rotated[2]))
 
-        ax = ModelBuilder.JointDofConfig(
+        ax = _authored_dof_config(
             axis=dof_axis,
             limit_lower=dof.limit_lower,
             limit_upper=dof.limit_upper,
@@ -804,3 +806,10 @@ def parse_merged_joints(
         )
 
     return joint_index
+
+
+def _authored_dof_config(*, target_pos: float, **kwargs: Any) -> ModelBuilder.JointDofConfig:
+    """Keep authored preload targets independently of the joint motion limits."""
+    config = ModelBuilder.JointDofConfig(target_pos=target_pos, **kwargs)
+    config.target_pos = target_pos
+    return config
