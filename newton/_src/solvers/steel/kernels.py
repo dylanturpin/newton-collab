@@ -2193,8 +2193,8 @@ def accumulate_connect_wrenches_from_impulses(
     The point rows are built at the shared anchor ``p_M``, the midpoint of the two anchors (see
     ``populate_connect_J_for_size``), scaled by the row builder's stored inverse norm, so the impulse maps back to
     an equal and opposite force along ``e_k`` applied to both bodies at ``p_M``: the readout carries no couple across
-    an open closure, exactly like the solve. A REVOLUTE closure's two axis rows map back to an equal and opposite
-    torque about their directions.
+    an open closure, exactly like the solve. A REVOLUTE closure's two axis rows and a FIXED closure's three
+    rotation rows map back to an equal and opposite torque about their directions.
     """
     k = wp.tid()
     base_slot = connect_slot[k]
@@ -2223,21 +2223,18 @@ def accumulate_connect_wrenches_from_impulses(
         force = axis * (world_impulses[world, slot] * inv_dt * inv_norm)
         _add_point_force(body_p, force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
         _add_point_force(body_c, -force, p_m, body_to_articulation, articulation_origin, body_contact_wrench)
-    if connect_rows[k] < 5:
-        return
-    # REVOLUTE closure: the two hinge-axis rows are pure couples about e1 / e2.
-    axis_local = joint_axis[joint_qd_start[joint]]  # live, so axis edits via JOINT_PROPERTIES apply
-    _a_p, _a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, axis_local, joint_X_p, joint_X_c, body_q)
-    for i in range(2):
+    # Rotation rows are pure couples: two hinge-axis rows for REVOLUTE, three weld rows for FIXED.
+    n_rot = connect_rows[k] - 3
+    for i in range(n_rot):
         slot = base_slot + 3 + i
         if slot >= world_constraint_count[world] or world_row_type[world, slot] != PGS_CONSTRAINT_TYPE_CONNECT:
             continue
         inv_norm = connect_row_inv_norm[k, 3 + i]
         if inv_norm == 0.0:
             continue
-        e = e1
-        if i == 1:
-            e = e2
+        e, _phi = _connect_rotation_row(
+            i, connect_rows[k], body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+        )
         torque = e * (world_impulses[world, slot] * inv_dt * inv_norm)
         _add_torque(body_p, torque, body_contact_wrench)
         _add_torque(body_c, -torque, body_contact_wrench)
@@ -4302,7 +4299,7 @@ def allocate_connect_slots(
     """Allocate consecutive dense slots per loop closure enabled in ``Model.joint_enabled``.
 
     Launched with ``dim = n_connect``. A BALL closure takes three rows, a REVOLUTE
-    closure five (``connect_rows``). If the buffer cannot hold all of them the closure
+    closure five and a FIXED closure six (``connect_rows``). If the buffer cannot hold all of them the closure
     is dropped whole (``connect_slot = -1``) rather than partially enforced.
     """
     k = wp.tid()
@@ -4343,6 +4340,68 @@ def _connect_hinge_frame(
     t1 = wp.normalize(wp.cross(u, helper))
     t2 = wp.cross(u, t1)
     return wp.quat_rotate(q_p, u), wp.quat_rotate(q_c, u), wp.quat_rotate(q_p, t1), wp.quat_rotate(q_p, t2)
+
+
+@wp.func
+def _connect_weld_rotation(
+    body_p: int,
+    body_c: int,
+    joint: int,
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+):
+    """Rotation vector [rad] (world) of a FIXED closure's parent anchor frame relative to its child anchor frame.
+
+    For a small misalignment its rate is ``omega_parent - omega_child``, the same sign convention as the hinge rows of a
+    REVOLUTE closure, so each world axis ``e_k`` gives a row ``J = e_k . (omega_p - omega_c)`` with ``phi = e_k . r``.
+    """
+    q_p = wp.transform_get_rotation(joint_X_p[joint])
+    if body_p >= 0:
+        q_p = wp.transform_get_rotation(body_q[body_p]) * q_p
+    q_c = wp.transform_get_rotation(body_q[body_c]) * wp.transform_get_rotation(joint_X_c[joint])
+    q = q_p * wp.quat_inverse(q_c)
+    v = wp.vec3(q[0], q[1], q[2])
+    w = q[3]
+    if w < 0.0:
+        v = -v
+        w = -w
+    s = wp.length(v)
+    if s < 1.0e-9:
+        return 2.0 * v
+    return v * (2.0 * wp.atan2(s, w) / s)
+
+
+@wp.func
+def _connect_rotation_row(
+    i: int,
+    rows: int,
+    body_p: int,
+    body_c: int,
+    joint: int,
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+):
+    """Direction ``e`` and position error ``phi`` of rotation row ``i`` of a closure.
+
+    REVOLUTE (5 rows): the two directions perpendicular to the hinge, ``phi = e . (a_c x a_p)``; the hinge axis is read
+    live from ``joint_axis`` so edits announced with ``JOINT_PROPERTIES`` apply.
+    FIXED (6 rows): the three world axes, ``phi = e . r`` with ``r`` the weld's rotation vector.
+    """
+    if rows == 5:
+        axis_local = joint_axis[joint_qd_start[joint]]
+        a_p, a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, axis_local, joint_X_p, joint_X_c, body_q)
+        e = e1
+        if i == 1:
+            e = e2
+        return e, wp.dot(e, wp.cross(a_c, a_p))
+    r = _connect_weld_rotation(body_p, body_c, joint, joint_X_p, joint_X_c, body_q)
+    e = wp.vec3(0.0)
+    e[i] = 1.0
+    return e, r[i]
 
 
 @wp.kernel
@@ -4388,7 +4447,9 @@ def populate_connect_J_for_size(
     axis-alignment rows, ``J = e_i . (omega_parent - omega_child)`` for the two
     directions ``e_i`` perpendicular to the hinge axis, with position error
     ``phi_i = e_i . (a_child x a_parent)`` (the small rotation that would realign the
-    child's hinge axis onto the parent's). Those rows are pure couples, so they need no
+    child's hinge axis onto the parent's). A FIXED (weld) closure adds three rotation rows,
+    one per world axis ``e_k``, with ``phi_k = e_k . r`` and ``r`` the rotation vector of the
+    parent anchor frame relative to the child's. Those rows are pure couples, so they need no
     shared anchor.
 
     Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
@@ -4517,20 +4578,18 @@ def populate_connect_J_for_size(
             world_row_cfm[world, slot] = pgs_cfm
             world_phi[world, slot] = phi_axis
             world_target_velocity[world, slot] = target
-        if connect_rows[k] < 5:
+        n_rot = connect_rows[k] - 3
+        if n_rot <= 0:
             continue
-        # REVOLUTE closure: two axis-alignment rows, pure couples about e1 / e2.
-        axis_local = joint_axis[joint_qd_start[joint]]  # live, so axis edits via JOINT_PROPERTIES apply
-        a_p, a_c, e1, e2 = _connect_hinge_frame(body_p, body_c, joint, axis_local, joint_X_p, joint_X_c, body_q)
-        misalign = wp.cross(a_c, a_p)
+        # Rotation rows, pure couples: REVOLUTE aligns the hinge axis (2 rows), FIXED welds the frames (3 rows).
         omega_a = wp.vec3(0.0, 0.0, 0.0)
         if prescribed and body_p >= 0:
             omega_a = wp.spatial_bottom(body_qd[body_p])
-        for i in range(2):
+        for i in range(n_rot):
             slot = base_slot + 3 + i
-            e = e1
-            if i == 1:
-                e = e2
+            e, phi_rot = _connect_rotation_row(
+                i, connect_rows[k], body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+            )
             for d in range(n_dofs):
                 J_group[group_idx, slot, d] = 0.0
             target = float(0.0)
@@ -4568,7 +4627,7 @@ def populate_connect_J_for_size(
             norm_sq = float(0.0)
             for d in range(n_dofs):
                 norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
-            phi_axis = wp.dot(e, misalign)
+            phi_axis = phi_rot
             inv_norm = float(0.0)
             if norm_sq > 1.0e-8:
                 inv_norm = 1.0 / wp.sqrt(norm_sq)

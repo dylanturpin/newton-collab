@@ -518,6 +518,34 @@ def test_imported_connect_equality_is_enforced(test, device):
         test.assertLess(abs(float(state_0.joint_q.numpy()[0])), 1.0e-2)
 
 
+def test_imported_weld_equality_holds_the_authored_pose(test, device):
+    """An imported MuJoCo WELD on a tilted body holds it where it is authored instead of snapping it to the world axes."""
+    mjcf = """
+    <mujoco>
+      <worldbody>
+        <body name="paddle" pos="0 0 1" euler="0 45 0">
+          <joint name="hinge" type="hinge" axis="0 1 0"/>
+          <geom type="box" pos="0.3 0 0" size="0.3 0.05 0.05"/>
+        </body>
+      </worldbody>
+      <equality><weld body1="paddle"/></equality>
+    </mujoco>
+    """
+    b = newton.ModelBuilder()
+    # The converted WELD becomes a FIXED loop joint parallel to the hinge.
+    _expect_one_warning(test, UserWarning, "another joint already connects these bodies", lambda: b.add_mjcf(mjcf))
+    model = b.finalize(device=device)
+    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
+    test.assertEqual(solver._connect_count, 1)
+    state_0, state_1 = model.state(), model.state()
+    q_start = state_0.body_q.numpy()[0, 3:].copy()
+    for _ in range(120):
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertLess(abs(float(state_0.joint_q.numpy()[0])), 1.0e-3)
+    test.assertGreater(abs(float(state_0.body_q.numpy()[0, 3:] @ q_start)), 1.0 - 1.0e-6)
+
+
 def _expect_one_warning(test, category, pattern, call):
     """Return ``call()``, requiring it to emit exactly one warning, of ``category`` and matching ``pattern``."""
     with warnings.catch_warnings(record=True) as caught:
@@ -547,6 +575,7 @@ cuda_devices = get_cuda_test_devices()
 for _name in (
     "test_four_bar_capture_matches_eager",
     "test_imported_connect_equality_is_enforced",
+    "test_imported_weld_equality_holds_the_authored_pose",
 ):
     add_function_test(TestSteelConnectUpstream, _name, globals()[_name], devices=cuda_devices)
 

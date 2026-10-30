@@ -81,8 +81,16 @@ def mjc_loop_joint_xforms(
     body1: int,
     body2: int,
     anchor: wp.vec3,
+    relpose: wp.transform | None = None,
+    weld: bool = False,
 ) -> tuple[int, int, wp.transform, wp.transform]:
-    """Compute Newton loop-joint endpoints and local anchors for a MuJoCo body equality."""
+    """Compute Newton loop-joint endpoints and local frames for a MuJoCo body equality.
+
+    A CONNECT anchor is a point in ``body1``'s frame. A WELD follows MuJoCo: ``anchor`` is a point in ``body2``'s frame
+    (the world when ``body2`` is -1) that is held at ``relpose``'s position in ``body1``'s frame, and ``relpose``'s
+    rotation is ``body2``'s orientation relative to ``body1``. A ``relpose`` whose quaternion is all zeros (MuJoCo's
+    default) keeps the relative pose of the builder's current body poses.
+    """
     if body2 >= 0:
         parent = body1
         child = body2
@@ -92,7 +100,26 @@ def mjc_loop_joint_xforms(
     else:
         raise ValueError("At least one body is required for converted MuJoCo equality constraints.")
 
-    body1_xform = builder.body_q[body1] if body1 >= 0 else wp.transform_identity()
+    def body_pose(body: int) -> wp.transform:
+        return builder.body_q[body] if body >= 0 else wp.transform_identity()
+
+    if weld:
+        anchor_frame = wp.transform(anchor, wp.quat_identity())
+        if relpose is None or not any(float(x) != 0.0 for x in relpose.q):
+            # Both frames sit on body2's anchor frame at the current poses, so the weld holds them where they are.
+            world_frame = wp.transform_multiply(body_pose(body2), anchor_frame)
+            return (
+                parent,
+                child,
+                wp.transform_multiply(wp.transform_inverse(body_pose(parent)), world_frame),
+                wp.transform_multiply(wp.transform_inverse(body_pose(child)), world_frame),
+            )
+        # MuJoCo's weld residual: body1 * relpose.p == body2 * anchor and body1.q * relpose.q == body2.q
+        if body2 >= 0:
+            return parent, child, relpose, anchor_frame
+        return parent, child, anchor_frame, relpose
+
+    body1_xform = body_pose(body1)
     child_xform_world = builder.body_q[child]
     world_anchor = wp.transform_point(body1_xform, anchor) if body1 >= 0 else anchor
     if parent >= 0:
@@ -121,7 +148,9 @@ def mjc_add_equality_loop_joint(
     custom_attrs: dict[str, Any],
 ) -> tuple[int, int]:
     """Add a Newton loop joint and its authoritative MuJoCo equality row."""
-    parent, child, parent_xform, child_xform = mjc_loop_joint_xforms(builder, body1, body2, anchor)
+    parent, child, parent_xform, child_xform = mjc_loop_joint_xforms(
+        builder, body1, body2, anchor, relpose, weld=eq_type == EqType.WELD
+    )
     add_joint = builder.add_joint_ball if eq_type == EqType.CONNECT else builder.add_joint_fixed
     joint_idx = add_joint(
         parent=parent,
@@ -131,8 +160,8 @@ def mjc_add_equality_loop_joint(
         label=label,
         enabled=enabled,
     )
-    # For WELD, relpose/torquescale remain on the equality row; the loop joint only
-    # gives Newton a projected simulation object.
+    # For WELD, torquescale (and the solref/solimp softness) remain on the equality row only;
+    # the loop joint's frames carry the anchor and relpose for Newton's other solvers.
     eq_idx = _add_equality_constraint(
         builder,
         constraint_type=eq_type,
