@@ -208,6 +208,51 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
     return float(np.dot(v, down_slope)), float(np.linalg.norm(v - np.dot(v, down_slope) * down_slope)), solver, contacts
 
 
+def _mesh_incline_model(mus):
+    """Boxes released on 15-degree static mesh slabs, one world per friction coefficient.
+
+    Each slab's top face is two triangles whose shared diagonal runs under the box, so the box's footprint
+    gets redundant contacts. Returns the model and the down-slope direction.
+    """
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, -1.0, 0.0), float(np.radians(15.0)))
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    for mu in mus:
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        world.add_shape_mesh(
+            -1,
+            mesh=newton.Mesh.create_box(1.0, 0.1, 0.025, compute_inertia=False),
+            xform=wp.transform(wp.vec3(0.0), rot),
+            cfg=newton.ModelBuilder.ShapeConfig(mu=mu, restitution=0.0),
+        )
+        start = wp.quat_rotate(rot, wp.vec3(-0.3, 0.0, 0.025 + 0.04 + 0.0005))
+        box = world.add_body(xform=wp.transform(start, rot))
+        world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.04, cfg=newton.ModelBuilder.ShapeConfig(mu=mu, density=500.0))
+        builder.add_world(world)
+    return builder.finalize(), -np.array(wp.quat_rotate(rot, wp.vec3(1.0, 0.0, 0.0)))
+
+
+def _run_mesh_incline(model, seconds: float, dt: float, iterations: int):
+    """Step the inclines with friction patches; return per-step body poses and velocities, and the solver."""
+    solver = newton.solvers.SolverSteel(
+        model, solve_mode="matrix_free", iterations=iterations, friction_anchor_beta=0.2
+    )
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    s0, s1 = model.state(), model.state()
+    control = model.control()
+    steps, bodies = round(seconds / dt), model.body_count
+    poses = wp.empty(steps * bodies, dtype=wp.transform)
+    velocities = wp.empty(steps * bodies, dtype=wp.spatial_vector)
+    for step in range(steps):
+        pipeline.collide(s0, contacts)
+        s0.clear_forces()
+        solver.step(s0, s1, control, contacts, dt)
+        s0, s1 = s1, s0
+        wp.copy(poses, s0.body_q, dest_offset=step * bodies, count=bodies)
+        wp.copy(velocities, s0.body_qd, dest_offset=step * bodies, count=bodies)
+    return poses.numpy().reshape(steps, bodies, 7), velocities.numpy().reshape(steps, bodies, 6), solver
+
+
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
 class TestSteelFrictionAnchors(unittest.TestCase):
     def setUp(self):
@@ -311,6 +356,51 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         n = int(contacts.rigid_contact_count.numpy()[0])
         if n > 0:
             self.assertEqual(int(solver._friction_patches.current.valid.numpy()[:n].sum()), 0)
+
+    def test_anchors_release_on_a_sliding_mesh_footprint(self):
+        """Slide down a mesh incline at the Coulomb acceleration when the footprint has redundant contacts."""
+        dt, mu = 1.0 / 120.0, 0.25
+        model, down_slope = _mesh_incline_model([mu])
+        _, velocities, _ = _run_mesh_incline(model, 2.0, dt, iterations=32)
+        speed = velocities[:, 0, :3] @ down_slope
+        t = dt * np.arange(1, len(speed) + 1)
+        window = t > 0.5
+        accel = np.polyfit(t[window], speed[window], 1)[0]
+        theta = np.radians(15.0)
+        expected = 9.81 * (np.sin(theta) - mu * np.cos(theta))
+        self.assertAlmostEqual(accel, expected, delta=0.01 * expected)
+
+    def test_anchors_hold_near_the_cone_on_a_mesh_incline(self):
+        """Hold boxes that need 95 to 99% of their Coulomb budget on a mesh incline, within bounded creep.
+
+        At 8 and 12 iterations and 240 Hz the boxes hold and carry their anchors. Fewer iterations or a coarser
+        step can release a near-cone anchor during the landing; the accepted creep there is bounded.
+        """
+        demands = (0.95, 0.97, 0.99)
+        model, down_slope = _mesh_incline_model([np.tan(np.radians(15.0)) / demand for demand in demands])
+        # (iterations, rate [Hz], measured window after 0.5 s [s], creep bound [m])
+        for iterations, rate, window, bound in (
+            (8, 240, 0.5, 1.0e-5),
+            (12, 240, 0.5, 1.0e-5),
+            (4, 240, 3.5, 6.0e-3),
+            (8, 120, 1.0, 6.0e-4),
+        ):
+            dt = 1.0 / rate
+            poses, _, solver = _run_mesh_incline(model, 0.5 + window, dt, iterations)
+            creep = (poses[-1, :, :3] - poses[round(0.5 / dt) - 1, :, :3]) @ down_slope
+            for demand, distance in zip(demands, creep, strict=True):
+                with self.subTest(iterations=iterations, rate=rate, demand=demand):
+                    self.assertLess(abs(distance), bound)
+            if bound > 1.0e-5:
+                continue
+            anchors = solver._friction_patches.view.weight.numpy() > 0.0
+            boxes = solver._friction_patches.current.body_a.numpy()
+            sources = solver._friction_patches.current.source.numpy()
+            for box, demand in enumerate(demands):
+                with self.subTest(iterations=iterations, rate=rate, demand=demand):
+                    held = anchors & (boxes == box)
+                    self.assertTrue(held.any())
+                    self.assertTrue((sources[held] >= 0).all())
 
     def test_row_builders_store_anchor_separation_per_route(self):
         """Store raw separation in dense rows and gain-scaled separation in the other routes."""
@@ -456,7 +546,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 1.0,
                 dt,
                 1.0,
-                0.5,
                 3,
             ],
             outputs=[zeros3(), zJ(), zJ(), rhs, zeros3()],
@@ -481,7 +570,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 dt,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 wp.zeros((1,), dtype=wp.float32, device=device),
-                0.5,
                 3,
             ],
             outputs=[rhs],
@@ -502,6 +590,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 phi_arr,
                 row_type,
                 zeros3(),
+                zeros3(),
+                0,
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
                 inf,
                 1.0e-6,
@@ -509,7 +599,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 1.0,
                 dt,
                 1.0,
-                0.5,
                 3,
             ],
             outputs=[zeros3(), zJ(), zJ(), rhs, zeros3(), zeros3()],
@@ -528,6 +617,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, baumgarte, dt, bias_scale, de
                 phi_arr,
                 row_type,
                 zeros3(),
+                zeros3(),
+                0,
                 dt,
                 wp.zeros((1, 6), dtype=wp.float32, device=device),
                 3,
@@ -840,6 +931,205 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                     self.assertEqual(mf_rows == 0, articulated)
                     self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    def test_surface_velocity_belt_drags_the_box(self):
+        """A box on a mesh belt with surface velocity reaches the surface speed.
+
+        One case per row builder that adds the surface target: matrix-free (free box) with point friction and with
+        persistent anchors, a coupled friction mode, dense (articulated immediate) with anchors, and both
+        propagation routes.
+        """
+        for articulated, response, mode, anchor_beta in (
+            (False, "immediate", "fixed_normal", 0.0),
+            (False, "immediate", "fixed_normal", 0.2),
+            (False, "immediate", "coulomb_newton", 0.0),
+            (True, "immediate", "fixed_normal", 0.2),
+            (True, "propagation", "fixed_normal", 0.2),
+            (True, "propagation_colored", "fixed_normal", 0.0),
+        ):
+            with self.subTest(articulated=articulated, response=response, mode=mode, anchor_beta=anchor_beta):
+                mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
+                self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    def test_surface_velocity_anchor_history_follows_a_timestep_change(self):
+        """A box riding a mesh belt with persistent anchors keeps no anchor error when the timestep changes."""
+        phi_after_change, vx = _surface_belt_dt_change()
+        self.assertLess(phi_after_change, 1.0e-5)
+        self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
+    def test_surface_velocity_wakes_a_sleeping_box(self):
+        """A box asleep on a still mesh belt wakes and rides when the belt starts moving."""
+        awake_before, awake_after, vx = _surface_belt_start(steps_still=240, steps_moving=120)
+        self.assertEqual(awake_before, 0)
+        self.assertEqual(awake_after, 1)
+        self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Steel requires CUDA")
+    def test_surface_velocity_leaves_the_normal_response_alone(self):
+        """A box dropped with restitution rebounds the same off a moving belt, even one whose velocity has a normal part."""
+        rebound_static, _ = _surface_belt_drop((0.0, 0.0, 0.0))
+        rebound, vx = _surface_belt_drop((0.5, 0.0, 1.0))
+        self.assertGreater(rebound_static, 0.2)
+        self.assertAlmostEqual(rebound, rebound_static, delta=1.0e-3)
+        self.assertAlmostEqual(vx, 0.5, delta=5.0e-3)
+
+
+def _surface_belt_dt_change(steps_before=120, steps_after=60):
+    """Ride a mesh belt at 0.5 m/s with persistent anchors at 1/240 s, then switch to 1/60 s.
+
+    Returns the largest anchor error one step after the switch and the box's mean x velocity after it.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform((-1.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    belt.mesh.velocities.fill_(wp.vec3(0.5, 0.0, 0.0))
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        friction_anchor_beta=0.2,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    phi_after_change = 0.0
+    for step in range(steps_before + steps_after):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 1.0 / 240.0 if step < steps_before else 1.0 / 60.0)
+        state, next_state = next_state, state
+        if step == steps_before:
+            phi_after_change = float(np.abs(solver._friction_patches.view.phi.numpy()).max())
+            x_start = state.body_q.numpy()[box, 0]
+    return phi_after_change, float((state.body_q.numpy()[box, 0] - x_start) * 60.0 / (steps_after - 1))
+
+
+def _surface_belt_start(steps_still, steps_moving):
+    """Let a box fall asleep on a still mesh belt, then start the belt at 0.5 m/s.
+
+    Returns the box's awake flag before and after the start and its final x velocity.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        enable_sleeping=True,
+        sleep_quiet_time=0.1,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    awake = []
+    for speed, steps in ((0.0, steps_still), (0.5, steps_moving)):
+        belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
+        for _ in range(steps):
+            state.clear_forces()
+            pipeline.collide(state, contacts)
+            solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+            state, next_state = next_state, state
+        awake.append(int(solver._sleeping.body_awake.numpy()[box]))
+    return awake[0], awake[1], float(state.body_qd.numpy()[box, 0])
+
+
+def _surface_belt_drop(velocity, steps=240):
+    """Drop a box with restitution 0.5 onto a mesh belt with surface ``velocity``; return its peak rebound speed and final x velocity."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, restitution=0.5, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    belt.mesh.velocities.fill_(wp.vec3(*velocity))
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        enable_restitution=True,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    box_qd = wp.empty(steps, dtype=wp.spatial_vector, device="cuda:0")
+    for step in range(steps):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+        state, next_state = next_state, state
+        wp.copy(box_qd, state.body_qd, dest_offset=step, src_offset=box, count=1)
+    qd = box_qd.numpy()
+    return float(qd[:, 2].max()), float(qd[-1, 0])
+
+
+def _surface_belt_ride(mode, articulated, response, anchor_beta, speed=0.5, steps=60, window=30):
+    """Step a box on a static mesh belt whose surface moves at ``speed`` along x; return its mean x velocity."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    pose = wp.transform((0.0, 0.0, 0.05), wp.quat_identity())
+    box = (builder.add_link if articulated else builder.add_body)(xform=pose)
+    if articulated:
+        joint = builder.add_joint_d6(
+            parent=-1,
+            child=box,
+            parent_xform=pose,
+            linear_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+            angular_axes=[newton.ModelBuilder.JointDofConfig(axis=axis) for axis in newton.Axis],
+        )
+        builder.add_articulation([joint])
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device="cuda:0")
+    belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        articulated_contact_response=response,
+        friction_mode=mode,
+        friction_anchor_beta=anchor_beta,
+        iterations=32,
+        free_body_constraint_max=64,
+        articulation_constraint_max=64,
+        deterministic=True,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    state, next_state, control = model.state(), model.state(), model.control()
+    for step in range(steps):
+        if step == steps - window:
+            x_start = state.body_q.numpy()[box, 0]
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 1.0 / 240.0)
+        state, next_state = next_state, state
+    return (state.body_q.numpy()[box, 0] - x_start) * 240.0 / window
+
 
 def _resting_box(response, mode, articulated, steps=120):
     """Step a box placed flat on a static floor with zero contact gap.
@@ -946,6 +1236,51 @@ def _ground_box(device, **solver_kwargs):
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_surface_motion_transports_with_relocated_anchors(self):
+        """Keep zero anchor error on a co-rotating surface when the anchor points move inward."""
+        theta, dt = 0.01, 1.0 / 240.0
+        rot = np.array([[np.cos(theta), -np.sin(theta), 0.0], [np.sin(theta), np.cos(theta), 0.0], [0.0, 0.0, 1.0]])
+        points = np.array([[-0.05, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float32)
+        model, state, contacts, patches = _patch_fixture(points.tolist())
+        # Shape 1's surface rotates about z; the body follows it exactly over the step.
+        contacts.rigid_contact_surface_velocity = wp.array((points @ rot.T - points) / dt, dtype=wp.vec3, device="cpu")
+        patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+        patches.store(state)
+        q = state.body_q.numpy()
+        q[0, 3:] = (0.0, 0.0, np.sin(theta / 2), np.cos(theta / 2))
+        state.body_q.assign(q)
+        moved = 0.8 * points
+        contacts.rigid_contact_point0.assign(moved)
+        contacts.rigid_contact_point1.assign((moved @ rot.T).astype(np.float32))
+        contacts.rigid_contact_surface_velocity.assign(((moved @ rot.T - moved) / dt).astype(np.float32))
+        patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+        np.testing.assert_array_equal(patches.current.source.numpy()[:2] >= 0, True)
+        self.assertLess(float(np.abs(patches.view.phi.numpy()).max()), 5.0e-6)
+
+    def test_surface_motion_keeps_only_its_tangential_part_when_the_normal_turns(self):
+        """Carry a surface step's tangential displacement at full length, and none of its normal part, across a turned normal."""
+        dt, tilt = 1.0 / 60.0, 0.08
+        for velocity, expected in (
+            ((0.0, 0.0, 1.0), 0.0),
+            ((0.0, 0.0, 0.0), 0.0),
+            ((1.0, 0.0, 0.0), dt),
+            ((0.0, 1.0, 0.0), dt),
+        ):
+            with self.subTest(velocity=velocity):
+                model, state, contacts, patches = _patch_fixture([[0.0, 0.0, 0.0]])
+                contacts.rigid_contact_surface_velocity = wp.array([velocity], dtype=wp.vec3, device="cpu")
+                patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+                patches.store(state)
+                contacts.rigid_contact_surface_velocity.zero_()
+                contacts.rigid_contact_normal.assign([[-np.sin(tilt), 0.0, -np.cos(tilt)]])
+                patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
+                self.assertEqual(patches.current.source.numpy()[0], 0)
+                phi = float(np.linalg.norm(patches.view.phi.numpy()[0]))
+                if expected == 0.0:
+                    self.assertEqual(phi, 0.0)
+                else:
+                    self.assertAlmostEqual(phi, expected, delta=1.0e-6 * expected)
+
     def test_support_edge_centers_ignore_contact_order(self):
         """Keep the same edge centers when contact ordering changes at rest."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
@@ -1326,7 +1661,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
 
     def test_saturation_only_releases_an_anchor_with_sliding_motion(self):
-        """Keep history under impending slip, and release it under motion against saturated friction."""
+        """Keep history under impending slip; release it under motion against friction at or just inside the cone."""
         _, state, contacts, patches = _patch_fixture([[0, 0, 0]])
         zeros = wp.zeros(1, dtype=int, device="cpu")
         lengths = wp.array([3], dtype=int, device="cpu")
@@ -1341,6 +1676,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             state.body_q,
             velocity,
             wp.zeros(2, dtype=wp.vec3, device="cpu"),
+            None,
             zeros,
             zeros,
             zeros,
@@ -1361,6 +1697,14 @@ class TestFrictionPatchHistory(unittest.TestCase):
         velocity.assign([[0, -0.1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]])
         wp.launch(finish_patch_impulses, dim=1, inputs=args, device="cpu")
         self.assertEqual(patches.current.valid.numpy()[0], 0)
+        # Normal impulse 2 and mu 0.5 give a radius of 1. A slipping anchor a few percent inside it is
+        # released; one well inside it keeps its history.
+        for tangent, retained in ((0.97, 0), (0.5, 1)):
+            with self.subTest(tangent=tangent):
+                patches.current.valid.fill_(1)
+                impulses.assign([[2, tangent, 0]])
+                wp.launch(finish_patch_impulses, dim=1, inputs=args, device="cpu")
+                self.assertEqual(patches.current.valid.numpy()[0], retained)
 
     def test_convex_shapes_share_one_body_patch(self):
         """Pool friction load across adjacent convex pieces with compatible materials."""
@@ -1533,6 +1877,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         state.body_q,
                         qd,
                         com,
+                        None,
                         zeros,
                         wp.array([slot], dtype=int, device="cpu"),
                         zeros,

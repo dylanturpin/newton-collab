@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import gc
 import json
 import math
@@ -32,7 +33,7 @@ import warp as wp
 
 from ...core.types import MAXVAL, override
 from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
-from ...geometry.flags import ParticleFlags, ShapeFlags
+from ...geometry.flags import MeshProperties, ParticleFlags, ShapeFlags
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian
 from ...sim.enums import BodyFlags, JointType
@@ -190,6 +191,7 @@ from .kernels import (
     eval_post_solve_parent_wrenches,
     eval_rigid_fk_id,
     eval_rigid_fk_kinematics,
+    eval_rigid_fk_poses,
     eval_rigid_tau,
     eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
@@ -1044,6 +1046,19 @@ def _replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new)
 
 
+def _butterfly_warp_sums(snippet: str) -> str:
+    """Turn the warp sums into xor butterflies and drop the lane-0 broadcasts of the dot products.
+
+    Every lane ends with lane 0's down-sweep sum, since each butterfly level adds the same pair in either order.
+    """
+    snippet = snippet.replace("__shfl_down_sync(MASK, ", "__shfl_xor_sync(MASK, ")
+    return re.sub(
+        r"__shfl_sync\(MASK, (my_sum|cross|sibling_residual|dot|my_sum_vlim|my_sum_mf_vlim|my_sum_fvl), 0\)",
+        r"\1",
+        snippet,
+    )
+
+
 def _prefetch_streamed_dense_metadata(snippet: str) -> str:
     """Load row i+1's streamed metadata with its prefetched J/Y rows in the MF-GS dense loop.
 
@@ -1529,11 +1544,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
     Rigid-contact restitution is part of the ordinary normal contact row in
-    ``"split"`` and ``"matrix_free"`` modes. It uses the
-    two shape coefficients combined by ``restitution_combine`` and freezes the incident
-    relative normal velocity before contact impulses are applied. A sufficiently
-    fast contact predicted to reach the surface during the step replaces its
-    geometric/speculative bias with Newton's rebound target. Optional
+    ``"split"`` and ``"matrix_free"`` modes. It uses the two shape coefficients
+    combined by ``restitution_combine``. A contact whose relative normal
+    velocity ``u_start`` at the start of the step closes faster than the
+    threshold, and which touches the surface or is predicted to reach it during
+    the step, replaces its geometric/speculative bias with Newton's rebound
+    target ``-e * u_start`` as a lower bound on the separating velocity. Forces
+    applied during the step (gravity, drives, joint and body forces) count
+    toward reaching the surface but neither make a resting contact an impact nor
+    enlarge the rebound. Optional
     ``velocity_iterations`` refine the result but are never enabled
     implicitly. As in a conventional discrete PGS solver, the qualifying
     rebound velocity is used for the whole step; this gives the intended
@@ -2554,11 +2573,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 zero, so a model that authors no restitution does not bounce.
                 ``False`` turns restitution off for every contact regardless of the
                 coefficients.
-            restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
-                relative normal velocity required to apply restitution. The contact must also be at the surface or
-                be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
-                Baumgarte contact law, preventing resting contacts from repeatedly bouncing under small
-                accelerations.
+            restitution_velocity_threshold (float, optional): Minimum closing speed [m/s] of a contact at the
+                start of the step required to apply restitution. The contact must also be at the surface or be
+                predicted to reach it during the timestep. Slower contacts retain the speculative or Baumgarte
+                contact law, so a resting contact pressed by gravity, a drive or an applied force does not bounce.
+                A qualifying contact leaves with at least ``e`` times its step-start closing speed, or faster if
+                this step's forces already separate it faster.
                 Restitution coefficients are combined by ``restitution_combine`` after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
@@ -3023,6 +3043,12 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
+        shape_mesh_properties = getattr(model, "_shape_mesh_properties", None)
+        self._has_surface_velocity = shape_mesh_properties is not None and bool(
+            np.any(shape_mesh_properties.numpy() & int(MeshProperties.SURFACE_VELOCITY))
+        )
+        # Kinematic bodies and moving mesh surfaces both enter contact rows as target velocities.
+        self._has_contact_target_velocity = self._has_prescribed_response or self._has_surface_velocity
         self._refresh_body_prescribed()
         self._compute_articulation_metadata(model)
         self._warn_unsolvable_global_contacts(model)
@@ -3603,7 +3629,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._compliance = _contact_compliance.ComplianceBuffers(self)
         self._mf_target_velocity = (
             wp.zeros_like(self._mf_rhs, requires_grad=model.requires_grad)
-            if self._has_prescribed_response
+            if self._has_contact_target_velocity
             else wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         )
         self._update_effective_armature()
@@ -6797,7 +6823,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._row_mu = wp.zeros(
             (self._world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._row_restitution = wp.zeros(
+        self._row_rebound_velocity = wp.zeros(
             (self._world_count, max_constraints),
             dtype=wp.float32,
             device=device,
@@ -6936,7 +6962,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self._mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._mf_row_restitution = wp.zeros(
+        self._mf_row_rebound_velocity = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
@@ -7019,7 +7045,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             setattr(
                 self, f"_{name}", wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
             )
-        self._mf_row_restitution = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
+        self._mf_row_rebound_velocity = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
         self._mf_row_w = self._contact_row_w_dummy
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(
@@ -7064,8 +7090,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_row_parent = None
             self._propagation_row_mu = None
             self._propagation_phi = None
-            self._propagation_row_restitution = None
+            self._propagation_row_rebound_velocity = None
             self._propagation_restitution_target = None
+            self._propagation_target_velocity = None
             self._propagation_body_response = None
             self._propagation_body_response_split = None
             self._propagation_body_qd = None
@@ -7163,6 +7190,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_rhs_unbiased = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        # Moving mesh surfaces set the friction rows' target velocity; prescribed motion is folded per sweep.
+        self._propagation_target_velocity = (
+            wp.zeros((worlds, propagation_max_c), dtype=wp.float32, device=device)
+            if self._has_surface_velocity
+            else wp.zeros((1, 1), dtype=wp.float32, device=device)
+        )
         self._propagation_impulses = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -7190,7 +7223,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._propagation_row_restitution = wp.zeros(
+        self._propagation_row_rebound_velocity = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self._propagation_restitution_target = wp.zeros(
@@ -7618,7 +7651,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     sm_count=int(getattr(model.device, "sm_count", 0)),
                 )
             )
-            self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
+            self._pgs_solve_mf_gs_kernel_for_phase = functools.partial(
+                _get_pgs_solve_mf_gs_kernel,
                 self._articulation_constraint_max,
                 self._free_body_constraint_max,
                 self._max_world_dofs,
@@ -7640,6 +7674,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
                 nesterov_momentum=self._nesterov_momentum,
             )
+            # One kernel per row phase the step launches, each with its phase compiled in.
+            phases = self._matrix_free_gs_row_phases()
+            self._pgs_solve_mf_gs_kernels = {
+                phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
+            }
+            self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
         # Per-world sweep history for nesterov_momentum; a (1, 1) dummy when it is off.
         momentum_shape = (
             (
@@ -8267,8 +8307,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
             return
-        mf_gs_kernel = self._pgs_solve_mf_gs_kernel
-        if mf_gs_kernel is None:
+        if self._pgs_solve_mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
@@ -8411,9 +8450,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=64,
                         device=self.model.device,
                     )
+            phase_kernel = self._pgs_solve_mf_gs_kernels.get(row_phase)
+            if phase_kernel is None:
+                phase_kernel = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=row_phase)
+                self._pgs_solve_mf_gs_kernels[row_phase] = phase_kernel
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 wp.launch_tiled(
-                    mf_gs_kernel,
+                    phase_kernel,
                     dim=[general_block_count],
                     inputs=[
                         self._local_general_world_count,
@@ -8916,7 +8959,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_response_split,
                     self._propagation_phi,
                     self._propagation_row_type,
-                    self._propagation_row_restitution,
+                    self._propagation_row_rebound_velocity,
+                    self._propagation_target_velocity,
+                    int(self._has_surface_velocity),
                     self._propagation_body_qd,
                     self._rigid_body_max_depenetration_velocity,
                     self._cfm,
@@ -8924,7 +8969,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_w,
                     dt,
                     self._contact_speculative_scale,
-                    self._rebound_velocity_threshold,
                     self._propagation_max_constraints,
                 ],
                 outputs=[
@@ -9199,6 +9243,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_phi,
                 self._propagation_row_type,
                 self._propagation_restitution_target,
+                self._propagation_target_velocity,
+                int(self._has_surface_velocity),
                 dt,
                 self._propagation_body_qd,
                 self._propagation_max_constraints,
@@ -9421,6 +9467,19 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
         self._propagate_response()
+
+    def _matrix_free_gs_row_phases(self) -> tuple[int, ...]:
+        """Return the row phases the fused MF-GS solve launches for this schedule and contact response."""
+        if self._row_schedule == "contact_then_internal":
+            phases = (1, 2)
+        elif self._row_schedule == "phased" or self._propagation_contacts_enabled():
+            phases = (3, 4, 5)
+        else:
+            phases = (0,)
+        if not self._propagation_contacts_enabled():
+            return phases
+        # The propagation responses run the interleaved sweep as the phased passes and skip phases without rows.
+        return tuple(phase for phase in phases if self._split_matrix_free_row_phase_may_have_work(phase))
 
     def _launch_matrix_free_gs_solve_propagation_tree(
         self,
@@ -10448,6 +10507,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 state_out.body_q,
                                 state_out.body_qd,
                                 model.body_com,
+                                contacts.rigid_contact_surface_velocity,
                                 self._contact_world,
                                 self._contact_slot,
                                 self._contact_path,
@@ -11064,6 +11124,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._tree_plan is not None:
             self._launch_tree_fk("id", [*fk_inputs, self._dynamics_art_active], fk_outputs)
         else:
+            self._launch_fk_poses(
+                state_in.joint_q,
+                int(self._fk_id_cache_enabled or self._sleep_skips_dynamics),
+                False,
+                state_in.body_q,
+                state_aug._body_q_com,
+                self._articulation_origin,
+            )
             wp.launch(
                 eval_rigid_fk_id,
                 dim=model.articulation_count,
@@ -11942,7 +12010,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         max_constraints = self._articulation_constraint_max
         mf_active = self._has_free_rigid_bodies
         propagation_active = self._propagation_contacts_enabled()
-        if self._has_prescribed_response:
+        if self._has_contact_target_velocity:
             self._mf_target_velocity.zero_()
 
         # Zero world-level buffers (only arrays that require it)
@@ -12558,6 +12626,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     friction_gap_limit=self._friction_gap,
                     frozen_bodies=self._sleeping.patch_frozen_bodies if self._sleeping is not None else None,
                     shape_material_mu=self._shape_mu,
+                    dt=dt,
                     angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling, self._free_rigid_route_body)
                     if self._free_rigid_angular_rows
                     else None,
@@ -12673,6 +12742,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         state_aug._body_v_s,
+                        contacts.rigid_contact_surface_velocity,
                         self._prescribed_articulation,
                         self._articulation_origin,
                         self._shape_mu,
@@ -12686,6 +12756,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_anchor_beta,
                         self._friction_combine_id,
                         self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._row_type,
@@ -12695,7 +12766,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._row_cfm,
                         self._phi,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -12883,6 +12954,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             model.shape_body,
                             state_in.body_q,
                             state_aug._body_v_s,
+                            contacts.rigid_contact_surface_velocity,
                             self._prescribed_articulation,
                             self._shape_mu,
                             self._shape_restitution,
@@ -12896,6 +12968,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._friction_anchor_beta,
                             self._friction_combine_id,
                             self._restitution_combine_id,
+                            self._rebound_velocity_threshold,
                         ],
                         outputs=[
                             self._J_by_size[size],
@@ -12906,7 +12979,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._row_cfm,
                             self._phi,
                             self._target_velocity,
-                            self._row_restitution,
+                            self._row_rebound_velocity,
                         ],
                         device=model.device,
                     )
@@ -12939,8 +13012,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         state_aug._body_v_s,
+                        contacts.rigid_contact_surface_velocity,
                         self._prescribed_articulation,
-                        int(self._has_prescribed_response),
+                        int(self._has_contact_target_velocity),
                         self._shape_mu,
                         self._shape_restitution,
                         self._friction_gap,
@@ -12951,6 +13025,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_anchor_beta,
                         self._friction_combine_id,
                         self._restitution_combine_id,
+                        self._rebound_velocity_threshold,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -12962,7 +13037,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._mf_row_mu,
                         self._mf_phi,
                         self._mf_target_velocity,
-                        self._mf_row_restitution,
+                        self._mf_row_rebound_velocity,
                     ],
                     device=model.device,
                 )
@@ -13057,6 +13132,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        self._articulation_origin,
+                        state_aug._body_v_s,
+                        contacts.rigid_contact_surface_velocity,
+                        int(self._has_surface_velocity),
                         self._shape_mu,
                         self._shape_restitution,
                         int(self._contact_friction_shared_anchor),
@@ -13064,6 +13143,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         int(self._contact_shared_anchor),
                         self._friction_patches.view,
                         self._friction_anchor_beta,
+                        self._rebound_velocity_threshold,
                         builder_unit_order,
                         builder_unit_count,
                         self._propagation_max_constraints,
@@ -13080,7 +13160,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._propagation_row_parent,
                         self._propagation_row_mu,
                         self._propagation_phi,
-                        self._propagation_row_restitution,
+                        self._propagation_row_rebound_velocity,
+                        self._propagation_target_velocity,
                     ],
                     device=model.device,
                 )
@@ -13112,7 +13193,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_row_parent,
                             self._propagation_row_mu,
                             self._propagation_phi,
-                            self._propagation_row_restitution,
+                            self._propagation_row_rebound_velocity,
                             self._propagation_torsion_row_radius,
                         ],
                         device=model.device,
@@ -13684,7 +13765,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     world_dof_offset,
                     self._constraint_count,
                     self._local_solve_owner,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     size,
                     n_arts,
                     int(self._hinv_jt_writes_world),
@@ -13944,13 +14025,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_out_snap,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -14028,10 +14108,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._sparse_row_incident,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14047,7 +14126,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._phi,
                         self._row_type,
                         self._target_velocity,
-                        self._row_restitution,
+                        self._row_rebound_velocity,
                         self._v_hat,
                         self._world_dof_indices,
                         self._sparse_diagonal_dense_offsets,
@@ -14057,7 +14136,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._sparse_diagonal_row_dof,
                         self._sparse_diagonal_row_jy,
                         dt,
-                        self._rebound_velocity_threshold,
                     ],
                     outputs=[self._rhs],
                     device=self.model.device,
@@ -14073,12 +14151,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._row_type,
                     self._target_velocity,
-                    self._row_restitution,
+                    self._row_rebound_velocity,
                     self._v_hat,
                     self._world_dof_indices,
                     self._J_world,
                     dt,
-                    self._rebound_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
                 outputs=[self._rhs, self._row_w],
@@ -14095,10 +14172,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._phi,
                 self._row_beta,
                 self._row_type,
-                self._row_restitution,
+                self._row_rebound_velocity,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 int(self._regularization_enabled),
             ],
             outputs=[self._rhs, self._row_w],
@@ -14466,8 +14542,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
-                int(self._has_prescribed_response),
+                self._mf_row_rebound_velocity,
+                int(self._has_contact_target_velocity),
                 self._body_to_articulation,
                 self._articulation_dof_start,
                 self._v_hat,
@@ -14477,7 +14553,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_w,
                 dt,
                 self._contact_speculative_scale,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[
@@ -14510,12 +14585,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_phi,
                 self._mf_row_type,
                 self._mf_target_velocity,
-                self._mf_row_restitution,
-                int(self._has_prescribed_response),
+                self._mf_row_rebound_velocity,
+                int(self._has_contact_target_velocity),
                 dt,
                 self._v_out_snap,
                 self._v_hat,
-                self._rebound_velocity_threshold,
                 self._free_body_constraint_max,
             ],
             outputs=[output],
@@ -14822,6 +14896,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
             )
         else:
+            self._launch_fk_poses(state_out.joint_q, 0, True, state_out.body_q, body_q_com, articulation_origin)
             wp.launch(
                 eval_rigid_fk_kinematics,
                 dim=model.articulation_count,
@@ -14869,6 +14944,45 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=model.device,
         )
         self._fk_id_cache_source_state = state_out
+
+    def _launch_fk_poses(
+        self,
+        joint_q: wp.array,
+        reuse_cached: int,
+        gate_on_active: bool,
+        body_q: wp.array,
+        body_q_com: wp.array,
+        articulation_origin: wp.array,
+    ) -> None:
+        """Launch the pose pass that both the step-start and step-end FK share."""
+        model = self.model
+        wp.launch(
+            eval_rigid_fk_poses,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self._articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_X_p,
+                model.joint_X_c,
+                self._body_X_com,
+                model.joint_axis,
+                model.joint_dof_dim,
+                model.body_com,
+                reuse_cached,
+                self._fk_id_cache_valid,
+                int(gate_on_active),
+                self._dynamics_art_active,
+            ],
+            outputs=[body_q, body_q_com, articulation_origin],
+            block_dim=16,
+            device=model.device,
+        )
 
     def __del__(self):
         """Wait for solver-owned streams before releasing their buffers."""
@@ -24987,6 +25101,7 @@ def _get_pgs_solve_mf_gs_kernel(
     contact_compliance: bool = False,
     pair_cache: bool = False,
     free_rigid_angular_friction: bool = False,
+    row_phase: int | None = None,
     nesterov_momentum: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
@@ -25018,6 +25133,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
     ``free_rigid_angular_friction`` solves the rolling pair and spin rows that follow
     matrix-free contacts' sliding pairs in phase 2.
+
+    ``row_phase`` compiles the row phase in; the launch argument is then ignored. ``None`` reads it at launch.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
     stateless joint-velocity clamp as an end-of-iteration pass over the
@@ -26806,6 +26923,10 @@ def _get_pgs_solve_mf_gs_kernel(
         "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + (angular_sources["helpers"] if angular_sources else ""),
         1,
     )
+    snippet = _butterfly_warp_sums(snippet)
+    if row_phase is not None:
+        # A constant phase lets the compiler drop the per-row phase filters from the sweep.
+        snippet = re.sub(r"\brow_phase\b", str(row_phase), snippet)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
@@ -26967,6 +27088,8 @@ def _get_pgs_solve_mf_gs_kernel(
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
     )
+    if row_phase is not None:
+        name += f"_phase{row_phase}"
     if fuse_vel_limits:
         name += "_fvl"
     if not shared_metadata:
