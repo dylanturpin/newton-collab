@@ -1167,20 +1167,29 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_array_equal(patches.current.source.numpy()[:2] >= 0, True)
         self.assertLess(float(np.abs(patches.view.phi.numpy()).max()), 5.0e-6)
 
-    def test_surface_motion_keeps_no_normal_part_when_the_normal_turns(self):
-        """Leave no anchor error from a normal-only surface velocity after the contact normal turns."""
+    def test_surface_motion_keeps_only_its_tangential_part_when_the_normal_turns(self):
+        """Carry a surface step's tangential displacement at full length, and none of its normal part, across a turned normal."""
         dt, tilt = 1.0 / 60.0, 0.08
-        for speed in (1.0, 0.0):
-            with self.subTest(speed=speed):
+        for velocity, expected in (
+            ((0.0, 0.0, 1.0), 0.0),
+            ((0.0, 0.0, 0.0), 0.0),
+            ((1.0, 0.0, 0.0), dt),
+            ((0.0, 1.0, 0.0), dt),
+        ):
+            with self.subTest(velocity=velocity):
                 model, state, contacts, patches = _patch_fixture([[0.0, 0.0, 0.0]])
-                contacts.rigid_contact_surface_velocity = wp.array([[0.0, 0.0, speed]], dtype=wp.vec3, device="cpu")
+                contacts.rigid_contact_surface_velocity = wp.array([velocity], dtype=wp.vec3, device="cpu")
                 patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
                 patches.store(state)
                 contacts.rigid_contact_surface_velocity.zero_()
                 contacts.rigid_contact_normal.assign([[-np.sin(tilt), 0.0, -np.cos(tilt)]])
                 patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu, dt=dt)
                 self.assertEqual(patches.current.source.numpy()[0], 0)
-                self.assertEqual(float(np.linalg.norm(patches.view.phi.numpy()[0])), 0.0)
+                phi = float(np.linalg.norm(patches.view.phi.numpy()[0]))
+                if expected == 0.0:
+                    self.assertEqual(phi, 0.0)
+                else:
+                    self.assertAlmostEqual(phi, expected, delta=1.0e-6 * expected)
 
     def test_support_edge_centers_ignore_contact_order(self):
         """Keep the same edge centers when contact ordering changes at rest."""
