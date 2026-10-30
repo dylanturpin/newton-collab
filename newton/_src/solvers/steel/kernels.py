@@ -1198,7 +1198,7 @@ def compute_link_velocity(
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
-def eval_rigid_fk_kinematics(
+def eval_rigid_fk_poses(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
     joint_type: wp.array[int],
@@ -1207,26 +1207,29 @@ def eval_rigid_fk_kinematics(
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_q: wp.array[float],
-    joint_qd: wp.array[float],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     body_X_com: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
+    reuse_cached: int,
+    fk_id_cache_valid: wp.array[int],
+    gate_on_active: int,
     articulation_active: wp.array[int],
     # outputs
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     articulation_origin: wp.array[wp.vec3],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    fk_id_cache_valid: wp.array[int],
 ):
-    """Propagate articulation poses, motion subspaces, velocities, and accelerations."""
+    """Propagate articulation poses for the step-start and step-end FK passes.
+
+    Both passes share this kernel, so a cached step-end pose matches a fresh step-start pose bitwise.
+    """
     index = wp.tid()
-    if articulation_active[index] == 0:
+    if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
+        return
+    if gate_on_active != 0 and articulation_active[index] == 0:
         return
     start = articulation_start[index]
     end = articulation_joint_end[index]
@@ -1255,6 +1258,42 @@ def eval_rigid_fk_kinematics(
         if root_body >= 0:
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     articulation_origin[index] = origin
+
+
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
+def eval_rigid_fk_kinematics(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    articulation_active: wp.array[int],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    articulation_origin: wp.array[wp.vec3],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    fk_id_cache_valid: wp.array[int],
+):
+    """Propagate motion subspaces, velocities, and accelerations from the poses of eval_rigid_fk_poses."""
+    index = wp.tid()
+    if articulation_active[index] == 0:
+        return
+    start = articulation_start[index]
+    end = articulation_joint_end[index]
+    origin = articulation_origin[index]
 
     cached_child = int(-1)
     cached_v_s = wp.spatial_vector()
@@ -1418,37 +1457,13 @@ def eval_rigid_fk_id(
     body_a_s: wp.array[wp.spatial_vector],
     fk_id_cache_valid: wp.array[int],
 ):
-    """Evaluate and cache articulation poses and inverse dynamics."""
+    """Evaluate and cache inverse dynamics from the poses of eval_rigid_fk_poses."""
     index = wp.tid()
     if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
         return
     start = articulation_start[index]
     end = articulation_joint_end[index]
-
-    for i in range(start, end):
-        compute_link_transform(
-            i,
-            joint_type,
-            joint_parent,
-            joint_child,
-            joint_q_start,
-            joint_qd_start,
-            joint_q,
-            joint_X_p,
-            joint_X_c,
-            body_X_com,
-            joint_axis,
-            joint_dof_dim,
-            body_q,
-            body_q_com,
-        )
-
-    origin = wp.vec3()
-    if start < articulation_start[index + 1]:
-        root_body = joint_child[start]
-        if root_body >= 0:
-            origin = wp.transform_point(body_q[root_body], body_com[root_body])
-    articulation_origin[index] = origin
+    origin = articulation_origin[index]
 
     write_body_inertia = materialize_all_body_inertia
     if is_free_rigid[index] != 0:

@@ -191,6 +191,7 @@ from .kernels import (
     eval_post_solve_parent_wrenches,
     eval_rigid_fk_id,
     eval_rigid_fk_kinematics,
+    eval_rigid_fk_poses,
     eval_rigid_tau,
     eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
@@ -11086,6 +11087,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._tree_plan is not None:
             self._launch_tree_fk("id", [*fk_inputs, self._dynamics_art_active], fk_outputs)
         else:
+            self._launch_fk_poses(
+                state_in.joint_q,
+                int(self._fk_id_cache_enabled or self._sleep_skips_dynamics),
+                False,
+                state_in.body_q,
+                state_aug._body_q_com,
+                self._articulation_origin,
+            )
             wp.launch(
                 eval_rigid_fk_id,
                 dim=model.articulation_count,
@@ -14850,6 +14859,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
             )
         else:
+            self._launch_fk_poses(state_out.joint_q, 0, True, state_out.body_q, body_q_com, articulation_origin)
             wp.launch(
                 eval_rigid_fk_kinematics,
                 dim=model.articulation_count,
@@ -14897,6 +14907,45 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=model.device,
         )
         self._fk_id_cache_source_state = state_out
+
+    def _launch_fk_poses(
+        self,
+        joint_q: wp.array,
+        reuse_cached: int,
+        gate_on_active: bool,
+        body_q: wp.array,
+        body_q_com: wp.array,
+        articulation_origin: wp.array,
+    ) -> None:
+        """Launch the pose pass that both the step-start and step-end FK share."""
+        model = self.model
+        wp.launch(
+            eval_rigid_fk_poses,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self._articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_X_p,
+                model.joint_X_c,
+                self._body_X_com,
+                model.joint_axis,
+                model.joint_dof_dim,
+                model.body_com,
+                reuse_cached,
+                self._fk_id_cache_valid,
+                int(gate_on_active),
+                self._dynamics_art_active,
+            ],
+            outputs=[body_q, body_q_com, articulation_origin],
+            block_dim=16,
+            device=model.device,
+        )
 
     def __del__(self):
         """Wait for solver-owned streams before releasing their buffers."""
