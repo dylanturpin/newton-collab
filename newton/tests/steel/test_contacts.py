@@ -4184,6 +4184,122 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
                         np.testing.assert_array_equal(body_qd, np.array(self.PRESCRIBED_QD, dtype=np.float32))
 
 
+def _momentum_solves(model, **options):
+    """Settle a scene, then return a one-step solver at a chosen sweep count and its velocity error.
+
+    The error is the mass-weighted body velocity distance from an 8000-sweep plain Gauss-Seidel
+    solve, in units of one step of gravity.
+    """
+    dt = 1.0 / 60.0
+    options = {"solve_mode": "matrix_free", **options}
+    control = model.control()
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state, output = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    settle = SolverSteel(model, iterations=64, **options)
+    for _ in range(5):
+        pipeline.collide(state, contacts)
+        settle.step(state, output, control, contacts, dt)
+        state, output = output, state
+    pipeline.collide(state, contacts)
+    start = model.state()
+
+    def solve(iterations, momentum):
+        start.assign(state)
+        SolverSteel(model, iterations=iterations, nesterov_momentum=momentum, **options).step(
+            start, output, control, contacts, dt
+        )
+        return output.body_qd.numpy()
+
+    mass = model.body_mass.numpy()
+    inertia = np.trace(model.body_inertia.numpy(), axis1=1, axis2=2) / 3.0
+    reference = solve(8000, False)
+
+    def error(iterations, momentum):
+        delta = solve(iterations, momentum) - reference
+        energy = np.sum(mass * np.sum(delta[:, :3] ** 2, 1)) + np.sum(inertia * np.sum(delta[:, 3:] ** 2, 1))
+        return np.sqrt(energy) / (np.sqrt(mass.sum()) * 9.81 * dt)
+
+    return error
+
+
+def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
+    """Reach the plain Gauss-Seidel solution of a ten-box tower in fewer sweeps; reject unsupported routes."""
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.75, gap=0.002)
+    jitter = np.random.default_rng(0).uniform(-0.002, 0.002, (10, 2))
+    for i in range(10):
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(jitter[i, 0], jitter[i, 1], 0.05 + 0.1001 * i), wp.quat_identity())
+        )
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    error = _momentum_solves(model)
+
+    test.assertLess(error(2000, True), 0.05)
+    plain, accelerated = error(24, False), error(24, True)
+    test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.3f}, momentum {accelerated:.3f}")
+
+    for options in (
+        {"solve_mode": "split"},
+        {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
+        {"solve_mode": "matrix_free", "row_schedule": "phased"},
+    ):
+        with test.subTest(**options), test.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
+            SolverSteel(model, nesterov_momentum=True, **options)
+
+
+def test_nesterov_momentum_on_articulated_rows(test, device):
+    """Accelerate dense articulated contact, joint-limit and velocity-limit rows on the general sweep only."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    parent, joints = -1, []
+    for i in range(3):
+        link = builder.add_link(xform=wp.transform((0.2 * i + 0.1, 0.0, 0.031), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.1, hy=0.04, hz=0.03)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=(0.0, 1.0, 0.0),
+                parent_xform=wp.transform((0.0, 0.0, 0.031) if parent < 0 else (0.1, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((-0.1, 0.0, 0.0), wp.quat_identity()),
+                limit_lower=-0.3,
+                limit_upper=0.3,
+                velocity_limit=2.0,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    box = builder.add_body(xform=wp.transform((0.5, 0.0, 0.112), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
+    model = builder.finalize(device=device)
+
+    # The specialized owners have no momentum sweep, so the option must route around them.
+    test.assertTrue(SolverSteel(model, solve_mode="matrix_free")._local_internal_fast_path)
+    general = SolverSteel(model, solve_mode="matrix_free", nesterov_momentum=True)
+    for name in ("_local_internal_fast_path", "_paired_factor_coordinates", "_sparse_diagonal_contact_solve"):
+        test.assertFalse(getattr(general, name), name)
+    test.assertIsNone(general._sparse_mass_matrix_size)
+
+    error = _momentum_solves(
+        model, articulation_constraint_max=128, enable_joint_limits=True, enable_joint_velocity_limits=True
+    )
+    test.assertLess(error(2000, True), 1.0e-4)
+    plain, accelerated = error(24, False), error(24, True)
+    test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.4f}, momentum {accelerated:.4f}")
+
+
+class TestSteelNesterovMomentum(unittest.TestCase):
+    pass
+
+
+for _name in ("test_nesterov_momentum_converges_a_tower_in_fewer_sweeps", "test_nesterov_momentum_on_articulated_rows"):
+    add_function_test(TestSteelNesterovMomentum, _name, globals()[_name], devices=cuda_devices)
+
+
 class TestSteelPairedResponse(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
     def test_paired_response_without_factor_coordinates_matches_general(self):
