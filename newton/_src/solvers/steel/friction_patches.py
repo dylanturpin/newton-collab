@@ -69,8 +69,6 @@ class _PatchFrame:
     anchor_b: wp.array[wp.vec3]
     surface_a: wp.array[wp.vec3]
     surface_b: wp.array[wp.vec3]
-    # Relative surface displacement of shape a against shape b over the step that built this record [m].
-    surface_motion: wp.array[wp.vec3]
     valid: wp.array[int]
     used: wp.array[int]
     source: wp.array[int]
@@ -136,7 +134,6 @@ def _prepare(
     frame.source[c] = -1
     frame.eligible[c] = 0
     frame.tangent_impulse[c] = wp.vec3(0.0)
-    frame.surface_motion[c] = wp.vec3(0.0)
     patches.weight[c] = 0.0
     patches.next_contact[c] = -1
     patches.phi[c] = wp.vec2(0.0)
@@ -876,9 +873,6 @@ def _build(
                     continue
                 error = _carried_displacement(q, prev, p, n)
                 error += motion
-                if contact_surface_velocity:
-                    # Anchors ride moving surfaces over the same completed step as the pose motion.
-                    error += prev.surface_motion[p]
                 tangent_delta = error - n * wp.dot(error, n)
                 # The tangential gate bounds uncorrected slip of a carried pair at a
                 # tenth of the smaller body's radius, about three times the measured
@@ -915,10 +909,6 @@ def _build(
             if chosen >= 0:
                 prev.used[chosen] = 1
                 error = _carried_displacement(q, prev, chosen, n)
-                surface = wp.vec3(0.0)
-                if contact_surface_velocity:
-                    # The completed step's surface displacement is transported like the spring samples below.
-                    surface = prev.surface_motion[chosen]
                 old_center = 0.5 * (
                     _world_point(q, a, prev.anchor_a[chosen]) + _world_point(q, b, prev.anchor_b[chosen])
                 )
@@ -952,29 +942,22 @@ def _build(
                             error = 0.5 * (error + other_error) + spin * wp.cross(
                                 n, pa - 0.5 * (old_center + other_center)
                             )
-                            if contact_surface_velocity:
-                                other_surface = prev.surface_motion[partner]
-                                surface_spin = wp.dot(other_surface - surface, wp.cross(n, span)) / span_sq
-                                surface = 0.5 * (surface + other_surface) + surface_spin * wp.cross(
-                                    n, pa - 0.5 * (old_center + other_center)
-                                )
                         break
                 error += motion
-                if contact_surface_velocity:
-                    error += surface
                 error -= n * wp.dot(error, n)
                 carried_impulse = prev.tangent_impulse[chosen]
             stored_error = error
-            if a >= 0:
-                stored_error = wp.transform_vector(wp.transform_inverse(q[a]), error)
-            frame.displacement[c] = stored_error
-            frame.source[c] = chosen
             if contact_surface_velocity:
-                # The velocity is shape 1's relative to shape 0; the next build carries it with this step's poses.
+                # The rows drive the surface's tangential motion over the coming step, which the next build
+                # pairs with that step's pose motion. The velocity is shape 1's relative to shape 0.
                 surface_motion = contact_surface_velocity[c] * dt
                 if frame.flipped[c] == 0:
                     surface_motion = -surface_motion
-                frame.surface_motion[c] = surface_motion
+                stored_error += surface_motion - n * wp.dot(surface_motion, n)
+            if a >= 0:
+                stored_error = wp.transform_vector(wp.transform_inverse(q[a]), stored_error)
+            frame.displacement[c] = stored_error
+            frame.source[c] = chosen
             if carry_only != 0 and chosen < 0:
                 # Filtered members only carry existing history; they never start
                 # it, because no friction row held the pair during this step.
@@ -1087,7 +1070,6 @@ def _store_history(
     prev.anchor_b[c] = frame.anchor_b[c]
     prev.surface_a[c] = frame.surface_a[c]
     prev.surface_b[c] = frame.surface_b[c]
-    prev.surface_motion[c] = frame.surface_motion[c]
     prev.valid[c] = frame.valid[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
     world = int(-1)
@@ -1206,7 +1188,6 @@ _CARRIED_HISTORY_FIELDS = frozenset(
         "anchor_b",
         "surface_a",
         "surface_b",
-        "surface_motion",
         "valid",
         "tangent_impulse",
     )
@@ -1242,7 +1223,6 @@ def _copy_carried_history(
     dst.anchor_b[c] = src.anchor_b[c]
     dst.surface_a[c] = src.surface_a[c]
     dst.surface_b[c] = src.surface_b[c]
-    dst.surface_motion[c] = src.surface_motion[c]
     dst.valid[c] = src.valid[c]
     dst.tangent_impulse[c] = src.tangent_impulse[c]
     dst_world[c] = src_world[c]
@@ -1340,7 +1320,6 @@ class _FrictionPatchState:
             "anchor_b",
             "surface_a",
             "surface_b",
-            "surface_motion",
             "tangent_impulse",
         ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
