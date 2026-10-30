@@ -611,7 +611,7 @@ def _build(
 
     # Binary search the previous pair, avoiding a scan over other worlds/pairs.
     lo = int(0)
-    hi = prev.center.shape[0]
+    hi = prev.valid.shape[0]
     while lo < hi:
         mid = (lo + hi) // 2
         if prev.keys[mid] < key:
@@ -623,7 +623,7 @@ def _build(
     # Index valid history once per pair rather than rescanning all old contacts
     # for every new friction location. Keep sorted order for matching ties.
     prev_anchor_stop = prev_start
-    while prev_stop < prev.center.shape[0] and prev.keys[prev_stop] == key:
+    while prev_stop < prev.valid.shape[0] and prev.keys[prev_stop] == key:
         p = prev.indices[prev_stop]
         prev.used[p] = 0
         if prev.valid[p] != 0:
@@ -1084,6 +1084,84 @@ def _store_history(
 
 
 @wp.kernel(enable_backward=False)
+def _history_flags(frame: _PatchFrame, flags: wp.array[int]):
+    """1 at every sorted position whose contact is a friction location carrying history."""
+    i = wp.tid()
+    flags[i] = frame.valid[frame.indices[i]]
+
+
+@wp.kernel(enable_backward=False)
+def _store_history_compact(
+    q: wp.array[wp.transform],
+    body_world: wp.array[int],
+    frame: _PatchFrame,
+    flags: wp.array[int],
+    offsets: wp.array[int],
+    prev: _PatchFrame,
+    previous_world: wp.array[int],
+    previous_q: wp.array[wp.transform],
+    status: wp.array[int],
+):
+    """Carry only the friction locations, packed in sorted-key order.
+
+    Record ``j = offsets[i]`` (the exclusive scan of ``flags``) holds the history of the contact at
+    sorted position ``i``; ``prev.indices[j] = j`` keeps the matcher's indirection valid. Positions at
+    or past the record count are cleared so searches terminate as they do with the full frame. The
+    table holds ``prev.keys.shape[0]`` records: one per contact slot by default, so no live location
+    is ever dropped, or a smaller location budget. Records past the table are dropped and counted in
+    ``status[1]``; ``status[0]`` keeps the high-water mark of the record count.
+    """
+    i = wp.tid()
+    if i < previous_q.shape[0]:
+        previous_q[i] = q[i]
+    n = flags.shape[0]
+    if i >= n:
+        return
+    count = offsets[n - 1] + flags[n - 1]
+    table = prev.keys.shape[0]
+    if i == 0:
+        wp.atomic_max(status, 0, count)
+    if i >= count and i < table:
+        prev.keys[i] = wp.int64(0x7FFFFFFFFFFFFFFF)
+        prev.indices[i] = i
+        prev.valid[i] = 0
+        previous_world[i] = -1
+    if flags[i] == 0:
+        return
+    j = offsets[i]
+    if j >= table:
+        wp.atomic_add(status, 1, 1)
+        return
+    c = frame.indices[i]
+    normal = frame.normal[c]
+    if frame.body_a[c] >= 0:
+        normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
+    prev.keys[j] = frame.keys[i]
+    prev.indices[j] = j
+    prev.normal[j] = normal
+    prev.displacement[j] = frame.displacement[c]
+    prev.mu[j] = frame.mu[c]
+    prev.body_a[j] = frame.body_a[c]
+    prev.body_b[j] = frame.body_b[c]
+    prev.owner[j] = frame.owner[c]
+    prev.shape_a[j] = frame.shape_a[c]
+    prev.shape_b[j] = frame.shape_b[c]
+    prev.anchor_a[j] = frame.anchor_a[c]
+    prev.anchor_b[j] = frame.anchor_b[c]
+    prev.surface_a[j] = frame.surface_a[c]
+    prev.surface_b[j] = frame.surface_b[c]
+    prev.valid[j] = 1
+    prev.tangent_impulse[j] = frame.tangent_impulse[c]
+    world = int(-1)
+    if frame.body_a[c] >= 0:
+        world = body_world[frame.body_a[c]]
+    if world < 0 and frame.body_b[c] >= 0:
+        world = body_world[frame.body_b[c]]
+    # The solver maps the default, unpartitioned world (-1) to world zero.
+    previous_world[j] = wp.max(world, 0)
+
+
+@wp.kernel(enable_backward=False)
 def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shapes: wp.array[int]):
     """Discard material points whose supporting geometry changed."""
     c = wp.tid()
@@ -1243,11 +1321,22 @@ _GEOMETRY_FIELDS = (
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
-    def __init__(self, model, capacity, enabled, phi):
+    def __init__(self, model, capacity, enabled, phi, compact=False, history_max=None):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
         self.capacity = capacity
+        # Compact history keeps one carried record per friction location, packed in sorted order
+        # (see _store_history_compact), instead of mirroring the whole current frame. A location
+        # budget (history_max < capacity) shrinks that table; overflow is counted, never silent.
+        self.compact = bool(compact)
+        self.history_max = int(capacity)
+        if history_max is not None:
+            if not self.compact:
+                raise ValueError("friction_locations_max needs friction_history_compact=True")
+            if int(history_max) < 1 or int(history_max) > int(capacity):
+                raise ValueError(f"friction_locations_max must be in [1, {capacity}], got {history_max}")
+            self.history_max = int(history_max)
         device = model.device
         n = capacity if enabled else 0
         self.view.weight = wp.zeros(n, dtype=float, device=device)
@@ -1264,8 +1353,12 @@ class _FrictionPatchState:
         self._changed_shapes = wp.zeros(model.shape_body.shape[0], dtype=int, device=device)
         self._changed_bodies = wp.zeros(model.body_count, dtype=int, device=device)
         self.current = self._frame(capacity, device)
-        self.previous = self._frame(capacity, device)
-        self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
+        self.previous = self._history_frame(self.history_max, device) if self.compact else self._frame(capacity, device)
+        self._history_flags = wp.zeros(capacity, dtype=int, device=device) if self.compact else None
+        self._history_offsets = wp.zeros(capacity, dtype=int, device=device) if self.compact else None
+        # [record-count high water, records dropped past the table (cumulative)]
+        self._history_status = wp.zeros(2, dtype=int, device=device)
+        self.previous_world = wp.full(self.history_max if self.compact else capacity, -1, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
         # Body pairs large enough for the warp flood: at most one per _FLOOD_MIN_CONTACTS + 1
         # contacts, grown by a fixed grid of warps so the launch does not scale with capacity.
@@ -1291,7 +1384,7 @@ class _FrictionPatchState:
         # Unrelated bodies and static shapes keep their history.
         wp.launch(
             _invalidate_geometry_history,
-            dim=self.capacity,
+            dim=self.previous.valid.shape[0],
             inputs=[self.previous, self._changed_bodies, self._changed_shapes],
             device=model.device,
         )
@@ -1366,6 +1459,8 @@ class _FrictionPatchState:
         coefficient arrays [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
         contacts then share a patch only if their pair coefficients match; other contacts group as before.
         """
+        if self.compact and frozen_bodies is not None and frozen_bodies.shape[0] > 0:
+            raise NotImplementedError("compact friction history does not support frozen (sleeping) body pairs yet")
         wp.launch(
             _prepare,
             dim=self.capacity,
@@ -1458,7 +1553,11 @@ class _FrictionPatchState:
             device = self.previous_q.device
             frame = _PatchFrame()
             for name in _PatchFrame.vars:
-                count = self.capacity if name in _CARRIED_HISTORY_FIELDS else 0
+                count = (
+                    min(getattr(self.previous, name).shape[0], self.history_max)
+                    if name in _CARRIED_HISTORY_FIELDS
+                    else 0
+                )
                 setattr(frame, name, wp.empty(count, dtype=getattr(self.previous, name).dtype, device=device))
             self._history_snapshot = (frame, wp.empty_like(self.previous_world), wp.empty_like(self.previous_q))
 
@@ -1486,7 +1585,51 @@ class _FrictionPatchState:
             device=src_q.device,
         )
 
+    @staticmethod
+    def _history_frame(n, device):
+        """A previous frame holding only the carried fields plus the matcher's scratch."""
+        frame = _PatchFrame()
+        for name, var in _PatchFrame.vars.items():
+            count = n if (name in _CARRIED_HISTORY_FIELDS or name in ("used", "members")) else 0
+            setattr(frame, name, wp.zeros(count, dtype=var.type.dtype, device=device))
+        frame.keys.fill_(0x7FFFFFFFFFFFFFFF)
+        return frame
+
+    def history_status(self) -> dict[str, int]:
+        """Table size, high-water mark of carried records and the cumulative count dropped past the table."""
+        high_water, dropped = (int(v) for v in self._history_status.numpy())
+        return {
+            "friction_history_max": int(self.history_max),
+            "friction_history_high_water": high_water,
+            "friction_history_dropped": dropped,
+        }
+
     def store(self, state):
+        if self.compact:
+            wp.launch(
+                _history_flags,
+                dim=self.capacity,
+                inputs=[self.current, self._history_flags],
+                device=state.body_q.device,
+            )
+            wp.utils.array_scan(self._history_flags, self._history_offsets, inclusive=False)
+            wp.launch(
+                _store_history_compact,
+                dim=max(self.capacity, self.previous_q.shape[0]),
+                inputs=[
+                    state.body_q,
+                    self.body_world,
+                    self.current,
+                    self._history_flags,
+                    self._history_offsets,
+                    self.previous,
+                    self.previous_world,
+                    self.previous_q,
+                    self._history_status,
+                ],
+                device=state.body_q.device,
+            )
+            return
         wp.launch(
             _store_history,
             dim=max(self.capacity, self.previous_q.shape[0]),
