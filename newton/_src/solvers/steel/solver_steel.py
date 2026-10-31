@@ -1762,7 +1762,8 @@ class SolverSteel(SolverBase, CouplingInterface):
           default 0.05, as :class:`~newton.solvers.SolverFeatherstone`); joints with a parent
           body are not damped. Fill the attribute for one value on every body.
         - ``steel:rigid_body_linear_damping`` [1/s] damps the COM velocity of the same bodies as
-          ``v *= 1 - d dt`` each step (``physxRigidBody:linearDamping``, default 0).
+          ``v *= 1 - d dt`` each step (``physxRigidBody:linearDamping``, default 0). Keep it
+          nonnegative with ``d dt < 1``.
         - ``steel:rigid_body_max_linear_velocity`` [m/s] and ``steel:rigid_body_max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).

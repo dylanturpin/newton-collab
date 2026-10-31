@@ -5148,7 +5148,7 @@ def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01):
 
 
 def test_free_body_linear_damping_decays_com_speed(test, device):
-    """steel:rigid_body_linear_damping scales a free body's COM velocity by 1 - d dt each step, spin untouched."""
+    """Verify linear damping scales a free body's COM velocity by ``1 - d dt`` per step and leaves its spin."""
     steps, dt, damping = 50, 0.01, 0.4
     speeds, spins = _free_sphere_speeds(device, damping, steps, dt)
     v0 = np.linalg.norm((2.0, -1.0, 0.5))
@@ -5158,7 +5158,7 @@ def test_free_body_linear_damping_decays_com_speed(test, device):
 
 
 def test_free_body_linear_damping_defaults_to_zero(test, device):
-    """Without an authored value the COM velocity of a force-free body is conserved."""
+    """Verify a force-free body keeps its COM velocity when no linear damping is authored."""
     speeds, _ = _free_sphere_speeds(device, None)
     np.testing.assert_allclose(speeds, np.linalg.norm((2.0, -1.0, 0.5)), rtol=1e-5)
 
@@ -5236,7 +5236,7 @@ def _horizontal_root_velocities(device, damping, steps, dt, **solver_options):
 
 
 def test_linear_damping_on_every_route(test, device):
-    """Damped roots follow (1 - d dt)^n on frictionless ground on every solve route; an undamped body coasts."""
+    """Verify damped roots follow ``(1 - d dt)^n`` on frictionless ground on every solve route."""
     steps, dt, damping = 40, 0.01, 0.5
     expected = np.outer((1.0 - damping * dt) ** np.arange(1, steps + 1), (1.0, 0.5))
     routes = _LINEAR_DAMPING_ROUTES if wp.get_device(device).is_cuda else {"split": _LINEAR_DAMPING_ROUTES["split"]}
@@ -5249,7 +5249,7 @@ def test_linear_damping_on_every_route(test, device):
 
 
 def test_linear_damping_edit_applies_to_next_step(test, device):
-    """An in-place edit of steel:rigid_body_linear_damping takes effect on the next step."""
+    """Verify an in-place edit of ``steel:rigid_body_linear_damping`` takes effect on the next step."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
     SolverSteel.register_custom_attributes(builder)
     body = builder.add_body()
@@ -5270,7 +5270,7 @@ def test_linear_damping_edit_applies_to_next_step(test, device):
 class TestSteelLinearDamping(unittest.TestCase):
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_usd_linear_damping_imports_from_physx_attribute(self):
-        """physxRigidBody:linearDamping fills steel:rigid_body_linear_damping; an unauthored body reads 0."""
+        """Verify ``physxRigidBody:linearDamping`` imports into ``steel:rigid_body_linear_damping``, 0 when unauthored."""
         # USD is an optional importer dependency.
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
