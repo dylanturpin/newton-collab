@@ -2166,6 +2166,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
                 wp.zeros_like(state.joint_qd),  # joint_qdd = 0
                 DT_free_root_predictor,
                 wp.zeros(model.body_count, dtype=wp.float32, device=device),
+                wp.zeros(model.body_count, dtype=wp.float32, device=device),
                 wp.ones(model.joint_count, dtype=wp.int32, device=device),
             ],
             outputs=[q_new, qd_new],
@@ -5117,6 +5118,57 @@ add_function_test(
     test_revolute_loop_pre_eliminates_five_rows,
     devices=get_cuda_test_devices(),
 )
+
+
+def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01):
+    """Spin and slide one gravity-free sphere; return its COM speed and spin after each step."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    SolverSteel.register_custom_attributes(builder)
+    body = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=0.1)
+    model = builder.finalize(device=device)
+    if linear_damping is not None:
+        model.steel.rigid_body_linear_damping.fill_(linear_damping)
+    state_0, state_1 = model.state(), model.state()
+    qd = state_0.joint_qd.numpy()
+    qd[0:6] = (2.0, -1.0, 0.5, 0.0, 0.0, 4.0)
+    state_0.joint_qd.assign(qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    solver = SolverSteel(model)
+    solver._rigid_body_angular_damping.zero_()
+    control = model.control()
+    speeds, spins = [], []
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+        v = state_0.joint_qd.numpy()
+        speeds.append(np.linalg.norm(v[0:3]))
+        spins.append(v[5])
+    return np.asarray(speeds), np.asarray(spins)
+
+
+def test_free_body_linear_damping_decays_com_speed(test, device):
+    """steel:rigid_body_linear_damping scales a free body's COM velocity by 1 - d dt each step, spin untouched."""
+    steps, dt, damping = 50, 0.01, 0.4
+    speeds, spins = _free_sphere_speeds(device, damping, steps, dt)
+    v0 = np.linalg.norm((2.0, -1.0, 0.5))
+    expected = v0 * (1.0 - damping * dt) ** np.arange(1, steps + 1)
+    np.testing.assert_allclose(speeds, expected, rtol=1e-4)
+    np.testing.assert_allclose(spins, 4.0, rtol=1e-5)
+
+
+def test_free_body_linear_damping_defaults_to_zero(test, device):
+    """Without an authored value the COM velocity of a force-free body is conserved."""
+    speeds, _ = _free_sphere_speeds(device, None)
+    np.testing.assert_allclose(speeds, np.linalg.norm((2.0, -1.0, 0.5)), rtol=1e-5)
+
+
+class TestSteelLinearDamping(unittest.TestCase):
+    pass
+
+
+for _name in ("test_free_body_linear_damping_decays_com_speed", "test_free_body_linear_damping_defaults_to_zero"):
+    add_function_test(TestSteelLinearDamping, _name, globals()[_name], devices=get_test_devices())
 
 
 if __name__ == "__main__":

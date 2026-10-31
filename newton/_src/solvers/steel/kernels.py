@@ -788,6 +788,7 @@ def jcalc_integrate(
     ang_axis_count: int,
     dt: float,
     angular_damping: float,
+    linear_damping: float,
     parent: int,
     # outputs
     joint_q_new: wp.array[float],
@@ -900,6 +901,7 @@ def jcalc_integrate(
 
         if parent < 0:
             w_s = w_s * (1.0 - angular_damping * dt)
+            v_com = v_com * (1.0 - linear_damping * dt)
 
         # update transform
         joint_q_new[coord_start + 0] = p_s_new[0]
@@ -3216,6 +3218,7 @@ def integrate_generalized_joints(
     joint_qdd: wp.array[float],
     dt: float,
     body_angular_damping: wp.array[float],
+    body_linear_damping: wp.array[float],
     joint_active: wp.array[int],
     # outputs
     joint_q_new: wp.array[float],
@@ -3255,6 +3258,7 @@ def integrate_generalized_joints(
         ang_axis_count,
         dt,
         body_angular_damping[child],
+        body_linear_damping[child],
         parent,
         joint_q_new,
         joint_qd_new,
