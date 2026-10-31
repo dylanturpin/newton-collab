@@ -5120,7 +5120,7 @@ add_function_test(
 )
 
 
-def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01):
+def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01, **solver_options):
     """Spin and slide one gravity-free sphere; return its COM speed and spin after each step."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
     SolverSteel.register_custom_attributes(builder)
@@ -5134,7 +5134,7 @@ def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01):
     qd[0:6] = (2.0, -1.0, 0.5, 0.0, 0.0, 4.0)
     state_0.joint_qd.assign(qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    solver = SolverSteel(model)
+    solver = SolverSteel(model, **solver_options)
     solver._rigid_body_angular_damping.zero_()
     control = model.control()
     speeds, spins = [], []
@@ -5157,6 +5157,14 @@ def test_free_body_linear_damping_decays_com_speed(test, device):
     np.testing.assert_allclose(spins, 4.0, rtol=1e-5)
 
 
+def test_free_body_linear_damping_survives_velocity_post_pass(test, device):
+    """The matrix-free velocity post-pass rewrites the final velocity; linear damping must still apply."""
+    steps, dt, damping = 20, 0.01, 0.4
+    speeds, _ = _free_sphere_speeds(device, damping, steps, dt, solve_mode="matrix_free", velocity_iterations=1)
+    v0 = np.linalg.norm((2.0, -1.0, 0.5))
+    np.testing.assert_allclose(speeds, v0 * (1.0 - damping * dt) ** np.arange(1, steps + 1), rtol=1e-4)
+
+
 def test_free_body_linear_damping_defaults_to_zero(test, device):
     """Without an authored value the COM velocity of a force-free body is conserved."""
     speeds, _ = _free_sphere_speeds(device, None)
@@ -5169,6 +5177,13 @@ class TestSteelLinearDamping(unittest.TestCase):
 
 for _name in ("test_free_body_linear_damping_decays_com_speed", "test_free_body_linear_damping_defaults_to_zero"):
     add_function_test(TestSteelLinearDamping, _name, globals()[_name], devices=get_test_devices())
+# matrix_free (the route with a velocity post-pass) is CUDA only.
+add_function_test(
+    TestSteelLinearDamping,
+    "test_free_body_linear_damping_survives_velocity_post_pass",
+    test_free_body_linear_damping_survives_velocity_post_pass,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":

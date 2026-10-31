@@ -218,6 +218,7 @@ from .kernels import (
     hinv_jt_diagonal,
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
+    damp_free_root_linear_velocity,
     integrate_generalized_joints,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
@@ -14787,6 +14788,23 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self._v_out)
+            # The velocity post-pass replaces the integrated velocity; reapply linear damping to it.
+            wp.launch(
+                damp_free_root_linear_velocity,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    self._dynamics_joint_active,
+                    self._rigid_body_linear_damping,
+                    dt,
+                ],
+                outputs=[state_out.joint_qd],
+                device=model.device,
+            )
             self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
