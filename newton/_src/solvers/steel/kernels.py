@@ -3267,8 +3267,7 @@ def integrate_generalized_joints(
 
 @wp.kernel
 def damp_free_root_linear_velocity(
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
+    free_root_joint_indices: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
@@ -3279,16 +3278,16 @@ def damp_free_root_linear_velocity(
     joint_qd: wp.array[float],
 ):
     """Scale free-root COM velocity by ``1 - d dt``, as ``jcalc_integrate`` does on the position route."""
-    index = wp.tid()
-    if joint_active[index] == 0 or kinematic_joint_mask[index] != 0 or joint_parent[index] >= 0:
+    root_index = wp.tid()
+    joint = free_root_joint_indices[root_index]
+    if joint_active[joint] == 0:
         return
-    type = joint_type[index]
-    if type != JointType.FREE and type != JointType.DISTANCE:
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
+    if d < 0:
         return
-    scale = 1.0 - body_linear_damping[joint_child[index]] * dt
-    start = joint_qd_start[index]
+    scale = 1.0 - body_linear_damping[joint_child[joint]] * dt
     for i in range(3):
-        joint_qd[start + i] = joint_qd[start + i] * scale
+        joint_qd[d + i] = joint_qd[d + i] * scale
 
 
 @wp.kernel

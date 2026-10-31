@@ -5120,7 +5120,7 @@ add_function_test(
 )
 
 
-def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01, **solver_options):
+def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01):
     """Spin and slide one gravity-free sphere; return its COM speed and spin after each step."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
     SolverSteel.register_custom_attributes(builder)
@@ -5134,7 +5134,7 @@ def _free_sphere_speeds(device, linear_damping, steps=50, dt=0.01, **solver_opti
     qd[0:6] = (2.0, -1.0, 0.5, 0.0, 0.0, 4.0)
     state_0.joint_qd.assign(qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    solver = SolverSteel(model, **solver_options)
+    solver = SolverSteel(model)
     solver._rigid_body_angular_damping.zero_()
     control = model.control()
     speeds, spins = [], []
@@ -5157,33 +5157,150 @@ def test_free_body_linear_damping_decays_com_speed(test, device):
     np.testing.assert_allclose(spins, 4.0, rtol=1e-5)
 
 
-def test_free_body_linear_damping_survives_velocity_post_pass(test, device):
-    """The matrix-free velocity post-pass rewrites the final velocity; linear damping must still apply."""
-    steps, dt, damping = 20, 0.01, 0.4
-    speeds, _ = _free_sphere_speeds(device, damping, steps, dt, solve_mode="matrix_free", velocity_iterations=1)
-    v0 = np.linalg.norm((2.0, -1.0, 0.5))
-    np.testing.assert_allclose(speeds, v0 * (1.0 - damping * dt) ** np.arange(1, steps + 1), rtol=1e-4)
-
-
 def test_free_body_linear_damping_defaults_to_zero(test, device):
     """Without an authored value the COM velocity of a force-free body is conserved."""
     speeds, _ = _free_sphere_speeds(device, None)
     np.testing.assert_allclose(speeds, np.linalg.norm((2.0, -1.0, 0.5)), rtol=1e-5)
 
 
+_LINEAR_DAMPING_ROUTES = {
+    "split": {"solve_mode": "split"},
+    "matrix_free": {"solve_mode": "matrix_free"},
+    "propagation": {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
+    "propagation_colored": {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"},
+    "velocity_post_pass": {"solve_mode": "matrix_free", "velocity_iterations": 2},
+    "propagation_velocity_post_pass": {
+        "solve_mode": "matrix_free",
+        "articulated_contact_response": "propagation",
+        "velocity_iterations": 2,
+    },
+}
+
+
+def _sliding_on_frictionless_ground(device, damping):
+    """Slide a free box, an undamped free box and a two-link floating base across frictionless ground.
+
+    Returns the model and the root joint of each, in that order.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    SolverSteel.register_custom_attributes(builder)
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.0, density=500.0)
+    roots = []
+    for y, body_damping in ((0.0, damping), (1.0, 0.0)):
+        body = builder.add_body(
+            xform=wp.transform((0.0, y, 0.1), wp.quat_identity()),
+            custom_attributes={"steel:rigid_body_linear_damping": body_damping},
+        )
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+        roots.append(builder.body_count - 1)
+    base = builder.add_link(
+        xform=wp.transform((0.0, 2.0, 0.1), wp.quat_identity()),
+        custom_attributes={"steel:rigid_body_linear_damping": damping},
+    )
+    builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    arm = builder.add_link(xform=wp.transform((0.3, 2.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(arm, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    free = builder.add_joint_free(parent=-1, child=base)
+    hinge = builder.add_joint_revolute(
+        parent=base, child=arm, axis=(0.0, 0.0, 1.0), parent_xform=wp.transform((0.3, 0.0, 0.0), wp.quat_identity())
+    )
+    builder.add_articulation([free, hinge])
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    body_joint = {int(child): joint for joint, child in enumerate(model.joint_child.numpy())}
+    return model, [body_joint[body] for body in (*roots, base)]
+
+
+def _horizontal_root_velocities(device, damping, steps, dt, **solver_options):
+    """Return each root's horizontal COM velocity after every step of a frictionless slide."""
+    model, root_joints = _sliding_on_frictionless_ground(device, damping)
+    qd_start = model.joint_qd_start.numpy()
+    solver = SolverSteel(model, iterations=8, **solver_options)
+    state_0, state_1 = model.state(), model.state()
+    qd = state_0.joint_qd.numpy()
+    for joint in root_joints:
+        qd[qd_start[joint] : qd_start[joint] + 2] = (1.0, 0.5)
+    state_0.joint_qd.assign(qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    history = []
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, dt)
+        state_0, state_1 = state_1, state_0
+        qd = state_0.joint_qd.numpy()
+        history.append([qd[qd_start[joint] : qd_start[joint] + 2].copy() for joint in root_joints])
+    return np.asarray(history)
+
+
+def test_linear_damping_on_every_route(test, device):
+    """Damped roots follow (1 - d dt)^n on frictionless ground on every solve route; an undamped body coasts."""
+    steps, dt, damping = 40, 0.01, 0.5
+    expected = np.outer((1.0 - damping * dt) ** np.arange(1, steps + 1), (1.0, 0.5))
+    routes = _LINEAR_DAMPING_ROUTES if wp.get_device(device).is_cuda else {"split": _LINEAR_DAMPING_ROUTES["split"]}
+    for route, options in routes.items():
+        with test.subTest(route=route):
+            history = _horizontal_root_velocities(device, damping, steps, dt, **options)
+            np.testing.assert_allclose(history[:, 0], expected, rtol=1e-3, atol=1e-5, err_msg="free box")
+            np.testing.assert_allclose(history[:, 1], np.broadcast_to((1.0, 0.5), (steps, 2)), rtol=1e-4)
+            np.testing.assert_allclose(history[:, 2], expected, rtol=1e-3, atol=1e-5, err_msg="floating base")
+
+
+def test_linear_damping_edit_applies_to_next_step(test, device):
+    """An in-place edit of steel:rigid_body_linear_damping takes effect on the next step."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    SolverSteel.register_custom_attributes(builder)
+    body = builder.add_body()
+    builder.add_shape_sphere(body, radius=0.1)
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model)
+    state_0, state_1 = model.state(), model.state()
+    state_0.joint_qd.assign(np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    for damping, expected in ((0.0, 2.0), (0.5, 2.0 * 0.995), (0.0, 2.0 * 0.995)):
+        model.steel.rigid_body_linear_damping.fill_(damping)
+        solver.step(state_0, state_1, control, None, 0.01)
+        state_0, state_1 = state_1, state_0
+        test.assertAlmostEqual(float(state_0.joint_qd.numpy()[0]), expected, places=5)
+
+
 class TestSteelLinearDamping(unittest.TestCase):
-    pass
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_usd_linear_damping_imports_from_physx_attribute(self):
+        """physxRigidBody:linearDamping fills steel:rigid_body_linear_damping; an unauthored body reads 0."""
+        # USD is an optional importer dependency.
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        for index, damping in enumerate((0.3, None)):
+            cube = UsdGeom.Cube.Define(stage, f"/body_{index}")
+            cube.AddTranslateOp().Set((float(index), 0.0, 1.0))
+            prim = cube.GetPrim()
+            UsdPhysics.RigidBodyAPI.Apply(prim)
+            UsdPhysics.CollisionAPI.Apply(prim)
+            if damping is not None:
+                prim.CreateAttribute("physxRigidBody:linearDamping", Sdf.ValueTypeNames.Float).Set(damping)
+        builder = newton.ModelBuilder()
+        SolverSteel.register_custom_attributes(builder)
+        builder.add_usd(stage, schema_resolvers=[SchemaResolverNewton(), SchemaResolverPhysx()])
+        model = builder.finalize(device="cpu")
+        damping = model.steel.rigid_body_linear_damping.numpy()
+        np.testing.assert_allclose(damping[model.body_label.index("/body_0")], 0.3, rtol=1e-6)
+        self.assertEqual(damping[model.body_label.index("/body_1")], 0.0)
 
 
-for _name in ("test_free_body_linear_damping_decays_com_speed", "test_free_body_linear_damping_defaults_to_zero"):
+for _name in (
+    "test_free_body_linear_damping_decays_com_speed",
+    "test_free_body_linear_damping_defaults_to_zero",
+    "test_linear_damping_on_every_route",
+    "test_linear_damping_edit_applies_to_next_step",
+):
     add_function_test(TestSteelLinearDamping, _name, globals()[_name], devices=get_test_devices())
-# matrix_free (the route with a velocity post-pass) is CUDA only.
-add_function_test(
-    TestSteelLinearDamping,
-    "test_free_body_linear_damping_survives_velocity_post_pass",
-    test_free_body_linear_damping_survives_velocity_post_pass,
-    devices=get_cuda_test_devices(),
-)
 
 
 if __name__ == "__main__":
