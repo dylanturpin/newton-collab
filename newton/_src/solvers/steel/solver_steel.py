@@ -2048,12 +2048,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 per-step sort of the contacts by world and 16 bytes of sort storage per contact-capacity slot.
             nesterov_momentum: Accelerate the matrix-free Gauss-Seidel sweep with Nesterov momentum and
                 O'Donoghue-Candes gradient restart, as in MuJoCo's PGS solver. Each sweep starts from the
-                impulses and velocities extrapolated along the previous sweep's change; momentum restarts
-                when a sweep's correction opposes the extrapolation. Converges to the same solution in
-                fewer iterations on stacks, mass ratios and long chains; gains appear above a few
-                iterations. Every world then runs the general sweep, bypassing the specialized sparse,
-                local and paired-factor solves, and keeps ``4 * (2 * articulation_constraint_max +
-                2 * free_body_constraint_max + max world DOFs)`` bytes of sweep history. Requires
+                impulses extrapolated along the previous sweep's change, applied to the velocity through each
+                row's response; momentum restarts when a sweep's correction opposes the extrapolation.
+                Converges to the same solution in fewer iterations on stacks, mass ratios and long chains;
+                gains appear above a few iterations. The ``velocity_iterations`` post-pass runs the same
+                sweep. Every world then runs the general sweep, bypassing the specialized sparse, local and
+                paired-factor solves, and keeps ``8 * (articulation_constraint_max +
+                free_body_constraint_max)`` bytes of sweep history per world. Requires
                 ``solve_mode="matrix_free"``, ``articulated_contact_response="immediate"`` and
                 ``row_schedule="interleaved"``.
             enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
@@ -7684,7 +7685,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         momentum_shape = (
             (
                 self._world_count,
-                2 * self._articulation_constraint_max + 2 * self._free_body_constraint_max + self._max_world_dofs,
+                2 * (self._articulation_constraint_max + self._free_body_constraint_max),
             )
             if self._nesterov_momentum
             else (1, 1)
@@ -26328,18 +26329,16 @@ def _get_pgs_solve_mf_gs_kernel(
     )
 
     # Nesterov momentum with O'Donoghue-Candes restart; per-world scratch holds
-    # [lam_prev dense][lam_prev mf][e dense][e mf][v_prev].
+    # [lam_prev dense][lam_prev mf][e dense][e mf].
     momentum_init = (
         f"""
-    float* mom_prev_d = &momentum_scratch.data[world * (2 * {M_D} + 2 * {M_MF} + {D})];
+    float* mom_prev_d = &momentum_scratch.data[world * 2 * ({M_D} + {M_MF})];
     float* mom_prev_m = mom_prev_d + {M_D};
     float* mom_e_d = mom_prev_m + {M_MF};
     float* mom_e_m = mom_e_d + {M_D};
-    float* mom_v_prev = mom_e_m + {M_MF};
     int mom_k = 0;
     for (int i = dense_lo + lane; i < dense_hi; i += 32) {{ mom_prev_d[i] = s_lam_dense[i]; mom_e_d[i] = 0.0f; }}
     for (int i = lane; i < m_mf; i += 32) {{ mom_prev_m[i] = s_lam_mf[i]; mom_e_m[i] = 0.0f; }}
-    for (int d = lane; d < {D}; d += 32) mom_v_prev[d] = s_v[d];
     __syncwarp();
 """
         if nesterov_momentum
@@ -26359,27 +26358,41 @@ def _get_pgs_solve_mf_gs_kernel(
             bool restart = __shfl_sync(MASK, mom_dot, 0) < 0.0f || global_iter == friction_start_iteration;
             mom_k = restart ? 0 : mom_k + 1;
             float beta = mom_k > 1 ? (float)(mom_k - 1) / (float)(mom_k + 2) : 0.0f;
-            // Extrapolate impulses and velocity together; stateless velocity-limit rows keep their last clamp.
+            // Extrapolate the impulses; stateless velocity-limit rows keep their last clamp. e holds the
+            // change the stored impulse actually took, so v below follows it exactly as a sweep update would.
             for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
                 float lam = s_lam_dense[i];
-                float e = (s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} ? 0.0f : beta * (lam - mom_prev_d[i]);
+                float y = (s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} ? lam : lam + beta * (lam - mom_prev_d[i]);
                 mom_prev_d[i] = lam;
-                mom_e_d[i] = e;
-                s_lam_dense[i] = lam + e;
+                mom_e_d[i] = y - lam;
+                s_lam_dense[i] = y;
             }}
             for (int i = lane; i < m_mf; i += 32) {{
                 float lam = s_lam_mf[i];
-                float e = (mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} ? 0.0f : beta * (lam - mom_prev_m[i]);
+                float y = (mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} ? lam : lam + beta * (lam - mom_prev_m[i]);
                 mom_prev_m[i] = lam;
-                mom_e_m[i] = e;
-                s_lam_mf[i] = lam + e;
-            }}
-            for (int d = lane; d < {D}; d += 32) {{
-                float v = s_v[d];
-                s_v[d] = v + beta * (v - mom_v_prev[d]);
-                mom_v_prev[d] = v;
+                mom_e_m[i] = y - lam;
+                s_lam_mf[i] = y;
             }}
             __syncwarp();
+            // Apply each row's impulse change through its own response, as the sweep does.
+            for (int i = dense_lo; i < dense_hi; i++) {{
+                float e = mom_e_d[i];
+                if (e == 0.0f) continue;
+                int row_base = jy_world_base + i * {D};
+                for (int d = lane; d < {D}; d += 32) s_v[d] += Y_world.data[row_base + d] * e;
+            }}
+            __syncwarp();
+            for (int i = 0; i < m_mf; i++) {{
+                float e = mom_e_m[i];
+                if (e == 0.0f) continue;
+                int packed_dofs = mf_meta.data[off_meta + i * 4];
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                if (lane < 6 && dof_a >= 0) s_v[dof_a + lane] += mf_MiJt_a.data[mf6_base + i * 6 + lane] * e;
+                if (lane >= 6 && lane < 12 && dof_b >= 0) s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6_base + i * 6 + lane - 6] * e;
+                __syncwarp();
+            }}
         }}
 """
         if nesterov_momentum
