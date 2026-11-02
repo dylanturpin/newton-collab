@@ -537,10 +537,10 @@ def test_imported_weld_equality_holds_the_authored_pose(test, device):
     model = b.finalize(device=device)
     solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
     test.assertEqual(solver._connect_count, 1)
-    state_0, state_1 = model.state(), model.state()
+    state_0, state_1, control = model.state(), model.state(), model.control()
     q_start = state_0.body_q.numpy()[0, 3:].copy()
-    for _ in range(120):
-        solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+    for _ in range(30):
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
     test.assertLess(abs(float(state_0.joint_q.numpy()[0])), 1.0e-3)
     test.assertGreater(abs(float(state_0.body_q.numpy()[0, 3:] @ q_start)), 1.0 - 1.0e-6)

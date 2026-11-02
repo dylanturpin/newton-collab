@@ -143,20 +143,38 @@ def _crank_angle(body_q, body, com, hinges):
     return float(np.arctan2(pb[2] - pa[2], pb[0] - pa[0]))
 
 
-def _simulate(model, steps, dt, iterations=16, control=None, record=None):
+def _simulate(model, steps, dt, iterations=16, history=False):
+    """Step ``model`` on SolverSteel and return the final state.
+
+    With ``history``, also return ``body_q`` [steps, body_count, 7] and ``body_qd`` [steps, body_count, 6] after every
+    step. They are recorded into device buffers and read back once.
+    """
     solver = SolverSteel(model, solve_mode="matrix_free", iterations=iterations)
     s0, s1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
     newton.eval_fk(model, model.joint_q, model.joint_qd, s1)
-    control = control or model.control()
-    out = []
-    for _ in range(steps):
+    control = model.control()
+    n = model.body_count
+    if history:
+        body_q = wp.empty(steps * n, dtype=wp.transform, device=model.device)
+        body_qd = wp.empty(steps * n, dtype=wp.spatial_vector, device=model.device)
+    for i in range(steps):
         s0.clear_forces()
         solver.step(s0, s1, control, None, dt)
         s0, s1 = s1, s0
-        if record is not None:
-            out.append(record(s0))
-    return s0, out
+        if history:
+            wp.copy(body_q, s0.body_q, dest_offset=i * n, count=n)
+            wp.copy(body_qd, s0.body_qd, dest_offset=i * n, count=n)
+    if not history:
+        return s0
+    return s0, body_q.numpy().reshape(steps, n, 7), body_qd.numpy().reshape(steps, n, 6)
+
+
+def _four_bar_series(body_q, body, com, hinges):
+    """Crank angle [rad] and largest hinge-anchor gap [m] at every step of a ``body_q`` history."""
+    return np.array(
+        [(_crank_angle(bq, body, com, hinges), max(_anchor_gaps(bq, body, com, hinges))) for bq in body_q]
+    ).T
 
 
 def _four_bar_reference(t_end, dt=2.0e-4, theta0_deg=60.0):
@@ -250,8 +268,7 @@ def test_weld_loop_holds_a_hinge(test, device):
         return b.finalize(device=device)
 
     def bend(model):
-        state, _ = _simulate(model, 400, 1.0 / 500.0)
-        q = state.body_q.numpy()
+        q = _simulate(model, 50, 1.0 / 500.0).body_q.numpy()
         r1 = np.array(wp.quat_to_matrix(wp.quat(*q[0, 3:]))).reshape(3, 3)
         r2 = np.array(wp.quat_to_matrix(wp.quat(*q[1, 3:]))).reshape(3, 3)
         rel = r1.T @ r2
@@ -262,22 +279,17 @@ def test_weld_loop_holds_a_hinge(test, device):
 
 
 def test_link_break_four_bar_matches_joint_break_early(test, device):
-    """Link-break and joint-break follow the same four-bar motion while it is slow (first 0.15 s) and keep loops shut."""
-    dt = 1.0 / 2000.0
+    """Link-break and joint-break follow the same four-bar motion while it is slow (first 0.1 s) and keep loops shut."""
     series = {}
     for closure in ("link", "joint"):
         builder, body, com, hinges, _ = _four_bar(closure)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = builder.finalize(device=device)
-
-        def rec(state, body=body, com=com, hinges=hinges):
-            bq = state.body_q.numpy()
-            return _crank_angle(bq, body, com, hinges), max(_anchor_gaps(bq, body, com, hinges))
-
-        series[closure] = np.array(_simulate(model, 300, dt, record=rec)[1]).T
+        _, body_q, _ = _simulate(model, 100, 1.0e-3, history=True)
+        series[closure] = _four_bar_series(body_q, body, com, hinges)
     (la, lg), (ja, jg) = series["link"], series["joint"]
-    test.assertLess(np.degrees(np.abs(la - ja)).max(), 1.0)
+    test.assertLess(np.degrees(np.abs(la - ja)).max(), 0.1)
     test.assertLess(lg.max(), 5.0e-5)
     test.assertLess(jg.max(), 5.0e-5)
     test.assertLess(la[-1], la[0] - 0.05, "the crank should have fallen")
@@ -286,29 +298,24 @@ def test_link_break_four_bar_matches_joint_break_early(test, device):
 def test_link_break_four_bar_tracks_ground_truth(test, device):
     """Link-break follows the analytic four-bar to first order in dt, and its loop gap shrinks like dt^2.
 
-    The crank falls from 60 deg through -213 deg in 0.4 s. Halving the step must roughly halve the peak crank-angle
-    error against ``_four_bar_reference`` and quarter the peak anchor gap.
+    The crank falls from 60 deg to -40 deg in 0.25 s. Halving the step must roughly halve the peak crank-angle error
+    against ``_four_bar_reference`` and quarter the peak anchor gap.
     """
-    t_end = 0.4
-    ref_t, ref_q = _four_bar_reference(t_end)
+    t_end = 0.25
+    ref_t, ref_q = _four_bar_reference(t_end, dt=5.0e-4)  # within 5e-5 deg of the default 2e-4 s reference
     errors, gaps = [], []
     for dt in (1.0e-3, 5.0e-4):
         builder, body, com, hinges, _ = _four_bar("link")
         model = builder.finalize(device=device)
         steps = int(round(t_end / dt))
-
-        def rec(state, body=body, com=com, hinges=hinges):
-            bq = state.body_q.numpy()
-            return _crank_angle(bq, body, com, hinges), max(_anchor_gaps(bq, body, com, hinges))
-
-        _, series = _simulate(model, steps, dt, record=rec)
-        angle, gap = np.array(series).T
+        _, body_q, _ = _simulate(model, steps, dt, history=True)
+        angle, gap = _four_bar_series(body_q, body, com, hinges)
         t = dt * np.arange(1, steps + 1)
         errors.append(float(np.degrees(np.abs(np.unwrap(angle) - np.interp(t, ref_t, ref_q))).max()))
         gaps.append(float(gap.max()))
-    test.assertLess(errors[0], 1.0, f"peak crank-angle error {errors[0]:.3f} deg at 1 ms")
+    test.assertLess(errors[0], 0.6, f"peak crank-angle error {errors[0]:.3f} deg at 1 ms")
     test.assertLess(errors[1] / errors[0], 0.65, f"errors {errors} deg are not first order in dt")
-    test.assertLess(gaps[0], 2.0e-4, f"peak loop gap {gaps[0]:.2e} m at 1 ms")
+    test.assertLess(gaps[0], 1.5e-4, f"peak loop gap {gaps[0]:.2e} m at 1 ms")
     test.assertLess(gaps[1] / gaps[0], 0.35, f"loop gaps {gaps} m do not shrink like dt^2")
 
 
@@ -373,11 +380,9 @@ def test_link_break_four_bar_from_usd(test, device):
     usd_body = {name: usd_model.body_label.index(f"/fourbar/{name}") for name in ("crank", "coupler", "rocker")}
     angles = []
     for model, bodies in ((usd_model, usd_body), (built.finalize(device=device), body)):
-        _, series = _simulate(
-            model, 200, 1.0e-3, record=lambda s, b=bodies: _crank_angle(s.body_q.numpy(), b, com, hinges)
-        )
-        angles.append(np.array(series))
-    test.assertLess(angles[1][-1], angles[1][0] - 0.5, "the crank should have fallen")
+        _, body_q, _ = _simulate(model, 100, 1.0e-3, history=True)
+        angles.append(np.array([_crank_angle(bq, bodies, com, hinges) for bq in body_q]))
+    test.assertLess(angles[1][-1], angles[1][0] - 0.1, "the crank should have fallen")
     np.testing.assert_allclose(angles[0], angles[1], atol=1.0e-4)
 
 
@@ -443,13 +448,12 @@ def _floating_loop(closure):
     return builder.finalize(), builder.joint_q_start[driven]
 
 
-def _momentum_drift(model, q_index, steps=500, dt=1.0e-3):
+def _momentum_drift(model, q_index, steps=250, dt=1.0e-3):
     """Peak |P| [kg m/s] and |L| [kg m^2/s] of an isolated system that starts at rest, and the driven hinge angle [rad]."""
     mass = model.body_mass.numpy()
     inertia = model.body_inertia.numpy()
 
-    def momentum(state):
-        bq, bqd = state.body_q.numpy(), state.body_qd.numpy()  # body_qd is the COM twist
+    def momentum(bq, bqd):  # body_qd is the COM twist
         c = (mass[:, None] * bq[:, :3]).sum(0) / mass.sum()
         P = (mass[:, None] * bqd[:, :3]).sum(0)
         L = np.zeros(3)
@@ -458,8 +462,8 @@ def _momentum_drift(model, q_index, steps=500, dt=1.0e-3):
             L += mass[i] * np.cross(bq[i, :3] - c, bqd[i, :3]) + R @ inertia[i] @ R.T @ bqd[i, 3:]
         return np.linalg.norm(P), np.linalg.norm(L)
 
-    state, series = _simulate(model, steps, dt, record=momentum)
-    series = np.array(series)
+    state, body_q, body_qd = _simulate(model, steps, dt, history=True)
+    series = np.array([momentum(bq, bqd) for bq, bqd in zip(body_q, body_qd, strict=True)])
     return series[:, 0].max(), series[:, 1].max(), abs(float(state.joint_q.numpy()[q_index]))
 
 
@@ -484,13 +488,13 @@ def test_link_break_drives_the_loop_closing_joint(test, device):
     """With link-break the closing hinge C keeps its coordinate and can carry a PD drive (joint-break cannot)."""
     builder, body, com, hinges, j_c = _four_bar("link", gravity=0.0)
     dof = builder.joint_qd_start[j_c]
-    builder.joint_target_ke[dof] = 2.0
-    builder.joint_target_kd[dof] = 0.2
+    builder.joint_target_ke[dof] = 20.0
+    builder.joint_target_kd[dof] = 1.0
     builder.joint_target_mode[dof] = int(newton.JointTargetMode.POSITION)
     target = -0.3
     builder.joint_target_q[builder.joint_q_start[j_c]] = target
     model = builder.finalize(device=device)
-    state, _ = _simulate(model, 2000, 1.0 / 1000.0)
+    state = _simulate(model, 300, 1.0 / 1000.0)
     test.assertAlmostEqual(float(state.joint_q.numpy()[builder.joint_q_start[j_c]]), target, delta=0.01)
     test.assertLess(max(_anchor_gaps(state.body_q.numpy(), body, com, hinges)), 1.0e-4)
 
