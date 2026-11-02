@@ -278,9 +278,9 @@ def parse_joint(
                 actuator_mode = JointTargetMode.from_gains(
                     target_ke, target_kd, force_position_velocity_actuation, has_drive=has_drive
                 )
-                return target_pos, target_vel, target_ke, target_kd, effort_limit, actuator_mode
+                return target_pos, target_vel, target_ke, target_kd, effort_limit, actuator_mode, has_drive
 
-            target_pos, target_vel, target_ke, target_kd, effort_limit, actuator_mode = define_joint_targets(
+            target_pos, target_vel, target_ke, target_kd, effort_limit, actuator_mode, has_drive = define_joint_targets(
                 dof, joint_desc
             )
 
@@ -339,6 +339,7 @@ def parse_joint(
                 )
                 linear_axes.append(
                     _authored_dof_config(
+                        has_drive=has_drive,
                         axis=_trans_axes[dof],
                         limit_lower=limit_lower,
                         limit_upper=limit_upper,
@@ -409,6 +410,7 @@ def parse_joint(
 
                 angular_axes.append(
                     _authored_dof_config(
+                        has_drive=has_drive,
                         axis=_rot_axes[dof],
                         limit_lower=limit_lower * DegreesToRadian,
                         limit_upper=limit_upper * DegreesToRadian,
@@ -705,6 +707,7 @@ def parse_merged_joints(
             dof_axis = (float(rotated[0]), float(rotated[1]), float(rotated[2]))
 
         ax = _authored_dof_config(
+            has_drive=dof.has_drive,
             axis=dof_axis,
             limit_lower=dof.limit_lower,
             limit_upper=dof.limit_upper,
@@ -808,8 +811,9 @@ def parse_merged_joints(
     return joint_index
 
 
-def _authored_dof_config(*, target_pos: float, **kwargs: Any) -> ModelBuilder.JointDofConfig:
+def _authored_dof_config(*, has_drive: bool, target_pos: float, **kwargs: Any) -> ModelBuilder.JointDofConfig:
     """Keep authored preload targets independently of the joint motion limits."""
     config = ModelBuilder.JointDofConfig(target_pos=target_pos, **kwargs)
-    config.target_pos = target_pos
+    if has_drive:
+        config.target_pos = target_pos
     return config
