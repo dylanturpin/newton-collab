@@ -281,6 +281,50 @@ def test_plain_atomics_adjoint_matches_ordered(test, device):
     test.assertLess(float(np.linalg.norm(gradients[1] - gradients[0])), 1.0e-4 * scale)
 
 
+def test_world_diagnostics_in_captured_graph(test, device):
+    """A captured forward and backward with diagnostics and zeroing replays the eager diagnostics."""
+    model = _build_worlds(device, worlds=2)
+    options = steel.DifferentiableOptions(world_diagnostics=True, zero_nonfinite_adjoints=True)
+    solver = SolverSteel(model, differentiable=True, differentiable_options=options, **_OPTIONS)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
+    contacts = pipeline.contacts()
+    steps = 3
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    start_q, start_qd = model.state().joint_q, wp.array(_initial_velocity(model), dtype=float, device=device)
+    control = model.control()
+    control.joint_target_q.fill_(0.3)
+    seed_q, seed_qd = (wp.array(seed, dtype=float, device=device) for seed in _seed(model))
+    tape = wp.Tape()
+
+    def run():
+        wp.copy(states[0].joint_q, start_q)
+        wp.copy(states[0].joint_qd, start_qd)
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        tape.reset()
+        for k in range(steps):
+            pipeline.collide(states[k], contacts)
+            with tape:
+                solver.step(states[k], states[k + 1], control, contacts, _DT)
+        tape.backward(grads={states[-1].joint_q: seed_q, states[-1].joint_qd: seed_qd})
+
+    def snapshot():
+        diagnostics = [solver.differentiable_diagnostics(states[k]) for k in range(1, steps + 1)]
+        return [np.concatenate([d.adjoint_in.numpy(), d.adjoint_out.numpy(), d.flags.numpy()]) for d in diagnostics]
+
+    run()
+    eager = snapshot()
+    with wp.ScopedCapture(device=device) as capture:
+        run()
+    for k in range(1, steps + 1):
+        diagnostics = solver.differentiable_diagnostics(states[k])
+        for array in (diagnostics.adjoint_in, diagnostics.adjoint_out, diagnostics.flags):
+            array.fill_(-1)
+    wp.capture_launch(capture.graph)
+    for k, (expected, actual) in enumerate(zip(eager, snapshot(), strict=True)):
+        with test.subTest(step=k):
+            np.testing.assert_allclose(actual, expected, rtol=1.0e-5, atol=0.0)
+
+
 class TestSteelDifferentiableBackward(unittest.TestCase):
     pass
 
@@ -295,6 +339,13 @@ for _device in get_test_devices():
         test_plain_atomics_adjoint_matches_ordered,
     ):
         add_function_test(TestSteelDifferentiableBackward, _test.__name__, _test, devices=[_device])
+    if _device.is_cuda:
+        add_function_test(
+            TestSteelDifferentiableBackward,
+            "test_world_diagnostics_in_captured_graph",
+            test_world_diagnostics_in_captured_graph,
+            devices=[_device],
+        )
 
 
 if __name__ == "__main__":
