@@ -110,6 +110,7 @@ class RowArgs:
     mf_row_w: wp.array2d(dtype=float)
     dense_gamma: wp.array2d(dtype=float)
     mf_gamma: wp.array2d(dtype=float)
+    momentum_scratch: wp.array2d(dtype=float)
 
 
 @wp.struct
@@ -280,7 +281,7 @@ def get_fused_iteration_kernel(
                         rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
                         rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
                         rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 3, friction_start_iteration, g,
-                        freeze_drive_rows, v_out,
+                        freeze_drive_rows, rows.momentum_scratch, v_out,
                     )  # fmt: skip
                 wp.static(row_native)(
                     world, rows.constraint_count, rows.dense_phase_bounds, rows.local_solve_owner,
@@ -291,7 +292,7 @@ def get_fused_iteration_kernel(
                     rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
                     rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
                     rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 4, friction_start_iteration, g,
-                    freeze_drive_rows, v_out,
+                    freeze_drive_rows, rows.momentum_scratch, v_out,
                 )  # fmt: skip
             _block_sync()
             # live body twists from the generalized velocities
@@ -410,7 +411,7 @@ def get_fused_iteration_kernel(
                         rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
                         rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
                         rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 5, friction_start_iteration, g,
-                        freeze_drive_rows, v_out,
+                        freeze_drive_rows, rows.momentum_scratch, v_out,
                     )  # fmt: skip
             # phase 5 and the next iteration's phases 3 and 4 share warp 0; the barrier after phase 4
             # orders them against the other warps

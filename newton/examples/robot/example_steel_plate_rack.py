@@ -16,6 +16,8 @@ from ._tabletop_demo import TabletopDemo
 
 class Example(TabletopDemo):
     task = "plates"
+    # Anchored patch friction keeps the plate from creeping in the pinch.
+    friction_anchor_beta = None
 
     def populate(self, builder, info, ee, down, fingers):
         _plate_rack.populate(builder, info, ee, fingers, wp.get_device(), 3)
