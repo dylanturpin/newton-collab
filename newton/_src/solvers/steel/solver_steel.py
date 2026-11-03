@@ -3892,13 +3892,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
     def _refresh_body_prescribed(self) -> None:
-        """Mark bodies whose propagation response is identically zero.
+        """Mark bodies whose propagation response is zero, so rows sharing one may share a color.
 
-        Only a kinematic free rigid body qualifies: its spatial inverse inertia is
-        zeroed, so no contact row ever updates its velocity and rows sharing it may
-        share a color. The kinematic root of a multi-body articulation still carries the
-        tree response of its joint dofs (the factorization does not read the kinematic
-        flag), so it stays a coloring conflict. Requires the model plan.
+        Kinematic bodies are articulation roots: a free one has zeroed inverse inertia, and the
+        dofs of any other root joint carry the large-armature fallback, so contacts cannot change
+        its velocity (a dynamic child link keeps its own response). Requires the model plan.
         """
         model = self.model
         # Construction refreshes kinematic state before the model plan exists.
@@ -3907,9 +3905,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         prescribed = np.zeros(model.body_count, dtype=np.int32)
         if model.joint_count and model.articulation_count:
             kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
-            first_joints = model.articulation_start.numpy()[:-1][self._model_plan.is_free_rigid != 0]
-            free_bodies = model.joint_child.numpy()[first_joints]
-            prescribed[free_bodies] = kinematic[free_bodies]
+            child = model.joint_child.numpy()
+            prescribed[child[kinematic[child] & (model.joint_parent.numpy() < 0)]] = 1
         self._body_prescribed.assign(prescribed)
 
     @override

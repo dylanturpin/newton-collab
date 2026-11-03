@@ -2179,12 +2179,10 @@ class TestSteelColoredScheduling(unittest.TestCase):
             np.testing.assert_array_equal(other_order, order)
             np.testing.assert_array_equal(other_qd, body_qd)
 
-    def test_prescribed_mask_marks_only_kinematic_free_bodies(self):
-        """Only a kinematic free rigid body has a zero response and may be shared by a color.
+    def test_prescribed_mask_marks_kinematic_roots(self):
+        """Kinematic bodies, free or articulation roots, have zero response and may be shared by a color.
 
-        The kinematic root of a multi-body articulation still carries the tree response of
-        its joint dofs (the factorization does not read the kinematic flag), so it must
-        remain a coloring conflict; the builder only allows kinematic bodies at roots.
+        A dynamic link below a kinematic root keeps its own response and stays a conflict.
         """
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.add_ground_plane()
@@ -2218,7 +2216,7 @@ class TestSteelColoredScheduling(unittest.TestCase):
         prescribed = solver._body_prescribed.numpy()
         self.assertEqual(int(prescribed[free_kinematic]), 1)
         self.assertEqual(int(prescribed[free_dynamic]), 0)
-        self.assertEqual(int(prescribed[root]), 0)
+        self.assertEqual(int(prescribed[root]), 1)
         self.assertEqual(int(prescribed[link]), 0)
 
     def test_prebuild_matches_the_first_fit_reference(self):
