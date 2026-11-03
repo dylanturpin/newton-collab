@@ -1450,8 +1450,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
 
     support_funcs = create_support_map_function(support_func, use_precomputed_center=True)
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
-    # Overlap refinement can run one pair per warp: a box against a detailed convex hull streams every hull
-    # triangle through the separating-axis certificate, which on one thread is the narrow phase's long tail.
+    # Overlap refinement can run one pair per warp: a box against a detailed hull streams every hull triangle.
     solve_mpr_refine = create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
@@ -1585,12 +1584,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     def create_distance_kernel(refine_overlap: bool):
         # Compile refinement separately: its retries and raycast would raise
         # register pressure for every ordinary separated GJK query.
-        # Refinement runs one pair per warp when the queue fits (all lanes take the same pair, split the
-        # box-mesh certificate's triangle stream, and lane 0 writes the result), and one pair per thread
-        # when it does not, so long queues of cheap pairs keep the full grid's parallelism.
-        per_warp = refine_overlap
-
-        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}_w{int(per_warp)}")
+        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}")
         def narrow_phase_gjk_kernel(
             candidate_pair: wp.array[wp.vec2i],
             shape_types: wp.array[int],
@@ -1621,9 +1615,10 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             num_work_items = num_distance
             if wp.static(refine_overlap):
                 num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
-            # Uniform across the launch: every thread reads the same count.
+            # One pair per warp when the queue fits (lane 0 writes the result), else one per thread so long
+            # queues of cheap pairs keep the grid's parallelism; every thread reads the same count.
             lanes = int(1)
-            if wp.static(per_warp):
+            if wp.static(refine_overlap):
                 if num_work_items * 32 <= total_num_threads:
                     lanes = 32
             lane = tid % lanes

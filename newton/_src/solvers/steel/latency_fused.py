@@ -12,24 +12,19 @@ own world's data, so one block per world can run the whole loop in a single laun
 The block's warps take fixed roles and call the existing device functions (each factory exposes its
 ``kernel.native``), so the math is the same code:
 
-* warp 0: row phases (3, 4, then 5), the cache snapshot, and the GEMV; every warp the colored sweep
-  (a color wider than one warp spreads over the block);
+* warp 0: row phases 3, 4 and 5, the cache snapshot and the GEMV; every warp the colored sweep (a color
+  wider than one warp spreads over the block);
 * warp 1 + i: tree variant ``i`` (a size group's warp kernels), refresh and impulse propagation for the
   world's articulations of that group, one after another;
 * the last warp: free-rigid body velocity refresh and flush.
 
-Per iteration the order is the chain's, with block barriers between dependent stages:
-
-    w0: phase 3, phase 4 | sync | trees, free bodies: refresh | sync | w0: snapshot, colored sweep | sync
-    | w0: GEMV, trees: propagate, free bodies: flush (disjoint data) | sync | w0: phase 5
-
-Global writes are visible block-wide after ``__syncthreads``, and the device functions read data written
-in the loop only through plain loads, so results match the chain bit for bit.
+Stages keep the chain's order with block barriers between dependent ones. Global writes are visible
+block-wide after ``__syncthreads``, and the device functions read data written in the loop only through
+plain loads, so results match the chain bit for bit.
 """
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 import warp as wp
@@ -224,29 +219,44 @@ def get_fused_iteration_kernel(
     """Build the fused loop kernel for one solver configuration.
 
     ``colored_native`` is the block-wide variant (built with ``block_threads`` equal to the launch's block
-    size), which every warp calls so wide colors use the whole block.
-    ``tree_natives`` holds ``(propagate, refresh)`` device functions per tree variant (at most
-    :data:`MAX_TREE_SLOTS`); ``gemv_native`` is ``None`` without cached responses. Launch it with
+    size). ``tree_natives`` holds ``(propagate, refresh)`` per tree variant, matching the ``slots`` launch
+    argument; ``gemv_native`` is ``None`` without cached responses. Launch it with
     ``wp.launch_tiled(dim=[world_count], block_dim=32 * warp_count(len(tree_natives)))``.
     """
     n_slots = len(tree_natives)
-    assert 0 <= n_slots <= MAX_TREE_SLOTS
-    # unused slots get placeholders; their branches compile out
-    filler = tree_natives[0] if n_slots else (_free_refresh, _free_refresh)
-    natives = list(tree_natives) + [filler] * (MAX_TREE_SLOTS - n_slots)
-    has_cache = gemv_native is not None
-    if gemv_native is None:
-        gemv_native = colored_native  # placeholder; the GEMV branch compiles out
     free_warp = 1 + n_slots
 
-    def fused_template(
+    @wp.func(module="unique")
+    def row_phase(
+        world: int,
+        phase: int,
+        rows: RowArgs,
+        omega: float,
+        regularize: int,
+        friction_start_iteration: int,
+        g: int,
+        freeze_drive_rows: int,
+        v_out: wp.array(dtype=float),
+    ):
+        wp.static(row_native)(
+            world, rows.constraint_count, rows.dense_phase_bounds, rows.local_solve_owner,
+            rows.world_dof_indices, rows.rhs, rows.diag, rows.row_w, rows.impulses, rows.J_world,
+            rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.torsion_group,
+            rows.torsion_row_radius, rows.drive_target_vel_bias, rows.drive_vel_multiplier,
+            rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
+            rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
+            rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
+            rows.dense_gamma, rows.mf_gamma, 1, omega, regularize, phase, friction_start_iteration, g,
+            freeze_drive_rows, rows.momentum_scratch, v_out,
+        )  # fmt: skip
+
+    def steel_fused_iteration(
         world_count: int,
         iterations: int,
         iteration_offset: int,
         friction_start_iteration: int,
         omega: float,
-        colored_regularize: int,
-        row_regularize: int,
+        regularize: int,
         freeze_drive_rows: int,
         force_refresh: int,
         cache_max_bodies: int,
@@ -254,10 +264,7 @@ def get_fused_iteration_kernel(
         rows: RowArgs,
         cache: CacheArgs,
         tree: TreeArgs,
-        slot0: TreeSlot,
-        slot1: TreeSlot,
-        slot2: TreeSlot,
-        slot3: TreeSlot,
+        slots: wp.array(dtype=TreeSlot),
         free: FreeArgs,
         body_to_articulation: wp.array(dtype=int),
         body_qd: wp.array2d(dtype=float),
@@ -272,75 +279,29 @@ def get_fused_iteration_kernel(
             # row phases 3 (drives, position limits, joint friction) and 4 (dense / matrix-free contacts)
             if warp_id == 0:
                 if wp.static(has_phase3):
-                    wp.static(row_native)(
-                        world, rows.constraint_count, rows.dense_phase_bounds, rows.local_solve_owner,
-                        rows.world_dof_indices, rows.rhs, rows.diag, rows.row_w, rows.impulses, rows.J_world,
-                        rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.torsion_group,
-                        rows.torsion_row_radius, rows.drive_target_vel_bias, rows.drive_vel_multiplier,
-                        rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
-                        rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
-                        rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
-                        rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 3, friction_start_iteration, g,
-                        freeze_drive_rows, rows.momentum_scratch, v_out,
-                    )  # fmt: skip
-                wp.static(row_native)(
-                    world, rows.constraint_count, rows.dense_phase_bounds, rows.local_solve_owner,
-                    rows.world_dof_indices, rows.rhs, rows.diag, rows.row_w, rows.impulses, rows.J_world,
-                    rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.torsion_group,
-                    rows.torsion_row_radius, rows.drive_target_vel_bias, rows.drive_vel_multiplier,
-                    rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
-                    rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
-                    rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
-                    rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 4, friction_start_iteration, g,
-                    freeze_drive_rows, rows.momentum_scratch, v_out,
-                )  # fmt: skip
+                    row_phase(world, 3, rows, omega, regularize, friction_start_iteration, g, freeze_drive_rows, v_out)
+                row_phase(world, 4, rows, omega, regularize, friction_start_iteration, g, freeze_drive_rows, v_out)
             _block_sync()
             # live body twists from the generalized velocities
-            if wp.static(n_slots > 0):
-                if warp_id == 1:
-                    for k in range(slot0.world_offsets[world], slot0.world_offsets[world + 1]):
-                        wp.static(natives[0][1])(
-                            slot0.world_groups[k], slot0.group_to_art, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
-                            tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
-                            v_out, body_qd,
-                        )  # fmt: skip
-            if wp.static(n_slots > 1):
-                if warp_id == 2:
-                    for k in range(slot1.world_offsets[world], slot1.world_offsets[world + 1]):
-                        wp.static(natives[1][1])(
-                            slot1.world_groups[k], slot1.group_to_art, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
-                            tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
-                            v_out, body_qd,
-                        )  # fmt: skip
-            if wp.static(n_slots > 2):
-                if warp_id == 3:
-                    for k in range(slot2.world_offsets[world], slot2.world_offsets[world + 1]):
-                        wp.static(natives[2][1])(
-                            slot2.world_groups[k], slot2.group_to_art, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
-                            tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
-                            v_out, body_qd,
-                        )  # fmt: skip
-            if wp.static(n_slots > 3):
-                if warp_id == 4:
-                    for k in range(slot3.world_offsets[world], slot3.world_offsets[world + 1]):
-                        wp.static(natives[3][1])(
-                            slot3.world_groups[k], slot3.group_to_art, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
-                            tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
-                            v_out, body_qd,
+            for s in range(wp.static(n_slots)):
+                if warp_id == 1 + s:
+                    slot = slots[s]
+                    for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
+                        wp.static(tree_natives[s][1])(
+                            slot.world_groups[k], slot.group_to_art, tree.art_to_world,
+                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start,
+                            tree.joint_parent, tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot,
+                            tree.S_flat, tree.com_rel, v_out, body_qd,
                         )  # fmt: skip
             if warp_id == wp.static(free_warp):
                 _free_refresh(world, lane, free, v_out, body_qd)
             _block_sync()
-            # colored contact sweep (with the pre-sweep snapshot the GEMV rebuilds from; the snapshot only
-            # reads the twists the sweep stages)
-            if warp_id == 0:
-                if wp.static(has_cache):
+            # colored contact sweep, with the pre-sweep snapshot the GEMV rebuilds from; the snapshot may
+            # overlap the sweep's start because the block sweep only stages twists in shared memory before
+            # a block barrier that warp 0 reaches after the snapshot
+            if wp.static(gemv_native is not None):
+                if warp_id == 0:
                     _cache_snapshot(world, lane, cache, cache_max_bodies, colored.body_list, body_qd)
-            # every warp: a color wider than one warp spreads over the block
             wp.static(colored_native)(
                 world, world_count, colored.constraint_count, colored.body_a, colored.body_b, colored.MiJt_a,
                 colored.MiJt_b, colored.J_a, colored.J_b, colored.eff_mass_inv, colored.rhs, colored.row_w,
@@ -348,50 +309,24 @@ def get_fused_iteration_kernel(
                 colored.torsion_first, colored.torsion_next, colored.torsion_row_radius, colored.row_order,
                 colored.color_offsets, colored.body_list, colored.body_count, colored.body_local_slot,
                 colored.unit_meta, colored.unit_friction_setup, colored.unit_payload, colored.ring_overflow, omega,
-                colored_regularize, friction_start_iteration, g, colored.impulses, body_qd, body_impulses,
+                regularize, friction_start_iteration, g, colored.impulses, body_qd, body_impulses,
             )  # fmt: skip
             _block_sync()
             # push the deferred impulses into generalized velocities: GEMV, trees and free bodies own
             # disjoint DOFs, bodies and impulses, so they run side by side
-            if wp.static(has_cache):
+            if wp.static(gemv_native is not None):
                 if warp_id == 0:
                     wp.static(gemv_native)(
                         world, world_count, cache.world_flag, cache.body_count, colored.body_list,
                         cache.art_eligible, body_to_articulation, tree.articulation_start, tree.joint_qd_start,
                         cache.R, cache.B, cache.qd_base, body_impulses, body_qd, v_out,
                     )  # fmt: skip
-            if wp.static(n_slots > 0):
-                if warp_id == 1:
-                    for k in range(slot0.world_offsets[world], slot0.world_offsets[world + 1]):
-                        wp.static(natives[0][0])(
-                            slot0.world_groups[k], slot0.group_to_art, tree.art_to_world, slot0.guard_flag,
-                            tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
-                            tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
-                            body_qd, v_out,
-                        )  # fmt: skip
-            if wp.static(n_slots > 1):
-                if warp_id == 2:
-                    for k in range(slot1.world_offsets[world], slot1.world_offsets[world + 1]):
-                        wp.static(natives[1][0])(
-                            slot1.world_groups[k], slot1.group_to_art, tree.art_to_world, slot1.guard_flag,
-                            tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
-                            tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
-                            body_qd, v_out,
-                        )  # fmt: skip
-            if wp.static(n_slots > 2):
-                if warp_id == 3:
-                    for k in range(slot2.world_offsets[world], slot2.world_offsets[world + 1]):
-                        wp.static(natives[2][0])(
-                            slot2.world_groups[k], slot2.group_to_art, tree.art_to_world, slot2.guard_flag,
-                            tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
-                            tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
-                            body_qd, v_out,
-                        )  # fmt: skip
-            if wp.static(n_slots > 3):
-                if warp_id == 4:
-                    for k in range(slot3.world_offsets[world], slot3.world_offsets[world + 1]):
-                        wp.static(natives[3][0])(
-                            slot3.world_groups[k], slot3.group_to_art, tree.art_to_world, slot3.guard_flag,
+            for s in range(wp.static(n_slots)):
+                if warp_id == 1 + s:
+                    slot = slots[s]
+                    for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
+                        wp.static(tree_natives[s][0])(
+                            slot.world_groups[k], slot.group_to_art, tree.art_to_world, slot.guard_flag,
                             tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
                             tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
                             body_qd, v_out,
@@ -399,27 +334,9 @@ def get_fused_iteration_kernel(
             if warp_id == wp.static(free_warp):
                 _free_flush(world, lane, free, body_qd, body_impulses, v_out)
             _block_sync()
-            # row phase 5 (velocity limits); the next iteration's phase 3 follows on the same warp
+            # row phase 5 (velocity limits); warp 0 runs it before the next iteration's phases 3 and 4
             if wp.static(has_phase5):
                 if warp_id == 0:
-                    wp.static(row_native)(
-                        world, rows.constraint_count, rows.dense_phase_bounds, rows.local_solve_owner,
-                        rows.world_dof_indices, rows.rhs, rows.diag, rows.row_w, rows.impulses, rows.J_world,
-                        rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.torsion_group,
-                        rows.torsion_row_radius, rows.drive_target_vel_bias, rows.drive_vel_multiplier,
-                        rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
-                        rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
-                        rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
-                        rows.dense_gamma, rows.mf_gamma, 1, omega, row_regularize, 5, friction_start_iteration, g,
-                        freeze_drive_rows, rows.momentum_scratch, v_out,
-                    )  # fmt: skip
-            # phase 5 and the next iteration's phases 3 and 4 share warp 0; the barrier after phase 4
-            # orders them against the other warps
+                    row_phase(world, 5, rows, omega, regularize, friction_start_iteration, g, freeze_drive_rows, v_out)
 
-    # the device functions' keys identify the variant; hash them to keep the module name short
-    parts = [colored_native, row_native, gemv_native, *(f for pair in tree_natives for f in pair)]
-    digest = hashlib.sha1("|".join(getattr(f, "key", repr(f)) for f in parts).encode()).hexdigest()[:10]
-    key = f"p{int(has_phase3)}{int(has_phase5)}_c{int(has_cache)}_t{n_slots}_{digest}"
-    fused_template.__name__ = f"steel_fused_iteration_{key}"
-    fused_template.__qualname__ = fused_template.__name__
-    return wp.kernel(enable_backward=False, module="unique")(fused_template)
+    return wp.kernel(enable_backward=False, module="unique")(steel_fused_iteration)
