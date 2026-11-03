@@ -86,6 +86,7 @@ from .kernels import (
     ANGULAR_FRICTION_FREE_RIGID,
     ANGULAR_FRICTION_PROPAGATION,
     CONTACT_GENERATION_NONE,
+    JOINT_VELOCITY_LIMIT_UNSET,
     MATERIAL_COMBINE_AVERAGE,
     MATERIAL_COMBINE_MAX,
     MATERIAL_COMBINE_MIN,
@@ -2320,7 +2321,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 bilateral box ``[-qdot_max_i, +qdot_max_i]`` through the articulated-body
                 response ``J M^-1 J^T + cfm``, so momentum redistributes correctly across
                 the articulation (rather than a naive joint-space clip which breaks
-                multi-body Newton's third law). No Baumgarte bias.
+                multi-body Newton's third law). No Baumgarte bias. A DOF at the builder's
+                default limit (1e6) or above has no rows.
 
                 Only supported with ``solve_mode="matrix_free"``; passing any other
                 ``solve_mode`` together with ``enable_joint_velocity_limits=True`` raises
@@ -5522,7 +5524,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                             per_world[world] += 1
                         if abs(joint_limit_upper[dof]) < MAXVAL:
                             per_world[world] += 1
-                    if has_velocity_limit_rows and joint_velocity_limit is not None and joint_velocity_limit[dof] > 0.0:
+                    if (
+                        has_velocity_limit_rows
+                        and joint_velocity_limit is not None
+                        and 0.0 < joint_velocity_limit[dof] < JOINT_VELOCITY_LIMIT_UNSET
+                    ):
                         per_world[world] += 2
                     if has_friction_rows:
                         per_world[world] += 1
