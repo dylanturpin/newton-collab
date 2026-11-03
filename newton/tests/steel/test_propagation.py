@@ -3911,5 +3911,192 @@ def _capture_device_stdout():
             captured.text = sink.read().decode("utf-8", errors="replace")
 
 
+def _build_ball_tree_model(device: str) -> newton.Model:
+    """Contact-free fixed-base trees with ball joints past the root, ``N_WORLDS`` copies.
+
+    A world-rooted revolute link carries two ball-joint chains (a branch: one parent, two children) and
+    a fixed leaf, so the tree is neither single-DOF nor free-root and takes the multi-DOF warp kernels.
+    """
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        builder = newton.ModelBuilder()
+        no_collision = builder.default_shape_cfg.copy()
+        no_collision.has_shape_collision = False
+        no_collision.collision_group = 0
+        hub = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()))
+        builder.add_shape_box(hub, hx=0.1, hy=0.1, hz=0.1, cfg=no_collision)
+        joints = [
+            builder.add_joint_revolute(
+                parent=-1,
+                child=hub,
+                axis=wp.vec3(0.0, 0.0, 1.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()),
+            )
+        ]
+        for side in (-1.0, 1.0):
+            prev = hub
+            for i in range(3):
+                link = builder.add_link()
+                builder.add_shape_capsule(link, radius=0.03, half_height=0.1, cfg=no_collision)
+                joints.append(
+                    builder.add_joint_ball(
+                        parent=prev,
+                        child=link,
+                        parent_xform=wp.transform(
+                            wp.vec3(0.0, 0.12 * side if i == 0 else 0.0, -0.12), wp.quat_identity()
+                        ),
+                        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
+                    )
+                )
+                prev = link
+        tip = builder.add_link()
+        builder.add_shape_box(tip, hx=0.05, hy=0.05, hz=0.05, cfg=no_collision)
+        joints.append(builder.add_joint_fixed(parent=prev, child=tip))
+        builder.add_articulation(joints)
+        scene.add_world(builder)
+    return scene.finalize(device=device)
+
+
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+class TestPropagationMultiDofWarp(unittest.TestCase):
+    """Ball joints past the root take the multi-DOF warp propagate and refresh kernels."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda:0"
+        cls.model = _build_ball_tree_model(cls.device)
+
+    def _size(self, solver):
+        sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
+        self.assertEqual(len(sizes), 1)
+        return sizes[0]
+
+    def test_multidof_shape_detected(self):
+        solver = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
+        size = self._size(solver)
+        self.assertFalse(solver._propagation_tree_single_dof_by_size[size])
+        self.assertFalse(solver._propagation_tree_free_root_by_size[size])
+        self.assertTrue(solver._propagation_tree_multidof_by_size[size])
+        self.assertIn(size, solver._propagation_tree_multidof_warp_sizes)
+        for name in _WARP_KERNEL_DICTS:
+            self.assertIsNotNone(getattr(solver, name)[size], f"{name}[{size}] should hold a warp variant")
+
+    def test_multidof_switch_off_keeps_serial(self):
+        with patch.dict(os.environ, {"STEEL_TREE_MULTIDOF_WARP": "0"}):
+            solver = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
+        size = self._size(solver)
+        self.assertNotIn(size, solver._propagation_tree_multidof_warp_sizes)
+        self.assertIsNone(solver._propagate_tree_warp_kernels_by_size[size])
+
+    def _paired_solvers(self, n_steps):
+        solver_w = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
+        solver_s = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
+        _force_serial_fallback(solver_s)
+        state_w = _step_n(self.model, solver_w, n_steps)
+        state_s = _step_n(self.model, solver_s, n_steps)
+        # contact-free: the tree kernels cannot steer the trajectory, so the factors come from identical states
+        np.testing.assert_array_equal(state_w.joint_q.numpy(), state_s.joint_q.numpy())
+        return solver_w, solver_s
+
+    def test_propagate_matches_serial(self):
+        model = self.model
+        rng = np.random.default_rng(4321)
+        solver_w, solver_s = self._paired_solvers(20)
+        bodies_per_world = model.body_count // N_WORLDS
+        patterns = [rng.normal(scale=0.5, size=(model.body_count, 6)).astype(np.float32)]
+        for body in (0, 2, bodies_per_world - 1):  # hub, mid-chain ball link, fixed tip
+            p = np.zeros((model.body_count, 6), dtype=np.float32)
+            p[body] = rng.normal(scale=1.0, size=6)
+            patterns.append(p)
+        for pi, imps in enumerate(patterns):
+            with self.subTest(pattern=pi):
+                v0 = rng.normal(scale=0.1, size=solver_w._v_out.shape).astype(np.float32)
+                for s in (solver_w, solver_s):
+                    s._propagation_body_impulses.assign(imps)
+                    s._v_out.assign(v0)
+                    s._propagation_body_qd.zero_()
+                solver_w._propagate_response()
+                solver_s._propagate_response()
+                wp.synchronize()
+                dv = solver_w._v_out.numpy() - solver_s._v_out.numpy()
+                dqd = solver_w._propagation_body_qd.numpy() - solver_s._propagation_body_qd.numpy()
+                scale = max(1.0, float(np.max(np.abs(solver_s._v_out.numpy()))))
+                self.assertGreater(float(np.max(np.abs(solver_w._v_out.numpy() - v0))), 0.0)
+                self.assertLess(float(np.max(np.abs(dv))), 1e-5 * scale)
+                self.assertLess(float(np.max(np.abs(dqd))), 1e-5 * scale)
+                self.assertEqual(float(np.max(np.abs(solver_w._propagation_body_impulses.numpy()))), 0.0)
+
+    def test_propagate_matches_numpy_reference(self):
+        model = self.model
+        rng = np.random.default_rng(7)
+        solver_w, _ = self._paired_solvers(20)
+        ti = _tree_inputs(model, solver_w, art=0)
+        bodies_per_world = model.body_count // N_WORLDS
+        imps = np.zeros((model.body_count, 6), dtype=np.float32)
+        imps[:bodies_per_world] = rng.normal(scale=0.5, size=(bodies_per_world, 6))
+        v0 = rng.normal(scale=0.1, size=solver_w._v_out.shape).astype(np.float32)
+        solver_w._propagation_body_impulses.assign(imps)
+        solver_w._v_out.assign(v0)
+        solver_w._propagate_response()
+        wp.synchronize()
+        imp_by_body = {b: imps[b].astype(np.float64) for b in range(bodies_per_world)}
+        v_ref, body_qd_ref = _ref_propagate(ti, imp_by_body, v0.astype(np.float64).copy())
+        d1 = int(ti["qd_start"][ti["j1"]])
+        np.testing.assert_allclose(solver_w._v_out.numpy()[:d1], v_ref[:d1], rtol=1e-4, atol=1e-4)
+        body_qd = solver_w._propagation_body_qd.numpy()
+        for body, twist in body_qd_ref.items():
+            np.testing.assert_allclose(body_qd[body], twist, rtol=1e-4, atol=1e-4)
+
+    def test_refresh_matches_serial(self):
+        rng = np.random.default_rng(11)
+        solver_w, solver_s = self._paired_solvers(10)
+        v0 = rng.normal(scale=0.2, size=solver_w._v_out.shape).astype(np.float32)
+        for s in (solver_w, solver_s):
+            s._v_out.assign(v0)
+            s._propagation_body_qd.zero_()
+            s._refresh_propagation_body_qd_from_vout(force=True)
+        wp.synchronize()
+        np.testing.assert_allclose(
+            solver_w._propagation_body_qd.numpy(), solver_s._propagation_body_qd.numpy(), rtol=1e-5, atol=1e-5
+        )
+
+    def test_factor_matches_serial(self):
+        model = self.model
+        qd_start = model.joint_qd_start.numpy()
+        for n_steps in (1, 12):
+            with self.subTest(n_steps=n_steps):
+                solver_w, solver_s = self._paired_solvers(n_steps)
+                arrays = ("_propagation_tree_U", "_propagation_tree_D_chol", "_propagation_tree_D_inv")
+                U_w, Dc_w, Di_w = (getattr(solver_w, a).numpy() for a in arrays)
+                U_s, Dc_s, Di_s = (getattr(solver_s, a).numpy() for a in arrays)
+                multi_dof_joints = 0
+                for j in range(model.joint_count):
+                    dc = int(qd_start[j + 1] - qd_start[j])
+                    if dc == 0:
+                        continue
+                    multi_dof_joints += dc > 1
+                    d0 = int(qd_start[j])
+                    pairs = (
+                        (U_w[d0 : d0 + dc], U_s[d0 : d0 + dc]),
+                        (Dc_w[j, :dc, :dc], Dc_s[j, :dc, :dc]),
+                        (Di_w[j, :dc, :dc], Di_s[j, :dc, :dc]),
+                    )
+                    for w, s in pairs:
+                        scale = max(1.0, float(np.max(np.abs(s))))
+                        self.assertLess(float(np.max(np.abs(w - s))), 1e-5 * scale, f"joint {j}")
+                self.assertGreater(multi_dof_joints, 0)
+
+    def test_response_matches_numpy_reference(self):
+        """Every link's 6x6 response from the warp kernel equals the float64 tree solve on the same factors."""
+        model = self.model
+        solver_w, _ = self._paired_solvers(20)
+        ti = _tree_inputs(model, solver_w, art=0)
+        resp = solver_w._propagation_body_response.numpy()
+        for body in range(model.body_count // N_WORLDS):
+            ref = _ref_body_response(ti, body)
+            scale = max(1.0, float(np.max(np.abs(ref))))
+            self.assertLess(float(np.max(np.abs(resp[body] - ref))), 1e-4 * scale, f"body {body} response mismatch")
+
+
 if __name__ == "__main__":
     unittest.main()

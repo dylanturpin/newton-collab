@@ -14,6 +14,80 @@ from .types import GeoType
 _CERTIFICATE_TILT = wp.constant(0.035)
 
 
+# Warp-cooperative box-mesh SAT: every lane of a warp holds the same pair and the lanes split the mesh
+# triangles. On CPU a "warp" is one lane, so the helpers reduce to the serial loop.
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return threadIdx.x & 31;
+#else
+return 0;
+#endif
+""")
+def _coop_lane() -> int: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return 32;
+#else
+return 1;
+#endif
+""")
+def _coop_width() -> int: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+float v = x;
+for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+return v;
+#else
+return x;
+#endif
+""")
+def _coop_sum(x: float) -> float: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+float v = x;
+for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+return v;
+#else
+return x;
+#endif
+""")
+def _coop_max(x: float) -> float: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+float v = x;
+for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
+// the lowest lane holding the minimum wins, so every lane agrees
+return __ffs(__ballot_sync(0xffffffffu, x == v)) - 1;
+#else
+return 0;
+#endif
+""")
+def _coop_argmin_lane(x: float) -> int: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return __shfl_sync(0xffffffffu, x, lane);
+#else
+return x;
+#endif
+""")
+def _coop_broadcast(x: float, lane: int) -> float: ...
+
+
+@wp.func
+def _coop_broadcast_vec3(v: wp.vec3, lane: int) -> wp.vec3:
+    return wp.vec3(_coop_broadcast(v[0], lane), _coop_broadcast(v[1], lane), _coop_broadcast(v[2], lane))
+
+
 @wp.func
 def box_polyhedron_pair(a: Any, b: Any) -> bool:
     """Select box pairs whose portal normal needs a minimum-depth certificate."""
@@ -134,8 +208,13 @@ def _box_box_depth(half_a: wp.vec3, half_b: wp.vec3, rotation: wp.quat, position
     return normal, depth
 
 
-def create_solve_box_penetration(support: Any):
+def create_solve_box_penetration(support: Any, cooperative: bool = False):
     """Find minimum depth for a box against a box, triangle, or convex mesh.
+
+    ``cooperative`` builds the variant for kernels in which all 32 lanes of a warp solve the same pair
+    (the split narrow phase's overlap refinement): the lanes split the convex-mesh triangle stream and
+    share the running minimum after every 32 triangles, so one box-hull pair costs about one triangle in
+    32 per lane instead of the whole stream on one thread. Every lane returns the same normal and depth.
 
     Box and triangle pairs use the closed-form separating-axis test. For
     convex meshes, cheap certificates come first: a box plus a triangle of
@@ -198,6 +277,94 @@ def create_solve_box_penetration(support: Any):
         return best_normal, best_depth, best_vertex, recent_vertex
 
     @wp.func
+    def triangle_axes(
+        a: Any,
+        b: Any,
+        rotation: wp.quat,
+        position: wp.vec3,
+        provider: Any,
+        points: Any,
+        indices: Any,
+        mesh_scale: wp.vec3,
+        mesh_rotation: wp.quat,
+        box_axes: wp.mat33,
+        half: wp.vec3,
+        offset: wp.vec3,
+        side: float,
+        center: wp.vec3,
+        tolerance: float,
+        triangle: int,
+        normal: wp.vec3,
+        depth: float,
+        best_vertex: wp.vec3,
+        recent_vertex: wp.vec3,
+    ) -> tuple[wp.vec3, float, wp.vec3, wp.vec3]:
+        """Test one mesh triangle's face normal and its edge x box-axis normals (see ``solve_box_mesh``)."""
+        p0 = wp.cw_mul(points[indices[3 * triangle]], mesh_scale)
+        p1 = wp.cw_mul(points[indices[3 * triangle + 1]], mesh_scale)
+        p2 = wp.cw_mul(points[indices[3 * triangle + 2]], mesh_scale)
+        face = wp.cross(p1 - p0, p2 - p0)
+        length = wp.length(face)
+        if length > 0.0:
+            face /= length
+            for orientation in range(2):
+                m = face if orientation == 0 else -face
+                # Skip inward normals; a flat hull keeps both.
+                if wp.dot(m, p0 - center) >= -tolerance:
+                    lower = wp.dot(m, p0 + offset) + wp.dot(wp.abs(box_axes * m), half)
+                    if lower < depth:
+                        normal, depth, best_vertex, recent_vertex = test_direction(
+                            a,
+                            b,
+                            rotation,
+                            position,
+                            provider,
+                            side * wp.quat_rotate(mesh_rotation, m),
+                            normal,
+                            depth,
+                            best_vertex,
+                            recent_vertex,
+                        )
+        for corner in range(3):
+            start = p0
+            end = p1
+            opposite = p2
+            if corner == 1:
+                start = p1
+                end = p2
+                opposite = p0
+            elif corner == 2:
+                start = p2
+                end = p0
+                opposite = p1
+            for axis in range(3):
+                m = wp.cross(box_axes[axis], end - start)
+                length = wp.length(m)
+                if length > 0.0:
+                    m /= length
+                    reach = wp.dot(m, opposite - start)
+                    for _orientation in range(2):
+                        # A supporting edge has its triangle behind it.
+                        if reach <= tolerance:
+                            lower = wp.dot(m, start + offset) + wp.dot(wp.abs(box_axes * m), half)
+                            if lower < depth:
+                                normal, depth, best_vertex, recent_vertex = test_direction(
+                                    a,
+                                    b,
+                                    rotation,
+                                    position,
+                                    provider,
+                                    side * wp.quat_rotate(mesh_rotation, m),
+                                    normal,
+                                    depth,
+                                    best_vertex,
+                                    recent_vertex,
+                                )
+                        m = -m
+                        reach = -reach
+        return normal, depth, best_vertex, recent_vertex
+
+    @wp.func
     def solve_box_mesh(
         a: Any,
         b: Any,
@@ -238,78 +405,81 @@ def create_solve_box_penetration(support: Any):
         # Rows are the box axes in the mesh frame.
         box_axes = wp.quat_to_matrix(to_box)
         mesh = wp.mesh_get(unpack_mesh_ptr(mesh_ptr))
+        n_points = mesh.points.shape[0]
+        n_triangles = mesh.indices.shape[0] / 3
         # Any vertex average is interior and orients the triangles.
         center = wp.vec3(0.0)
         extent = float(0.0)
-        for i in range(mesh.points.shape[0]):
+        lane = int(0)
+        width = int(1)
+        if wp.static(cooperative):
+            lane = _coop_lane()
+            width = _coop_width()
+        for i in range(lane, n_points, width):
             point = wp.cw_mul(mesh.points[i], mesh_scale)
             center += point
             extent = wp.max(extent, wp.max(wp.abs(point[0]), wp.max(wp.abs(point[1]), wp.abs(point[2]))))
-        center /= float(mesh.points.shape[0])
+        if wp.static(cooperative):
+            center = wp.vec3(_coop_sum(center[0]), _coop_sum(center[1]), _coop_sum(center[2]))
+            extent = _coop_max(extent)
+        center /= float(n_points)
         tolerance = 1.0e-6 * extent
-        for triangle in range(mesh.indices.shape[0] / 3):
-            p0 = wp.cw_mul(mesh.points[mesh.indices[3 * triangle]], mesh_scale)
-            p1 = wp.cw_mul(mesh.points[mesh.indices[3 * triangle + 1]], mesh_scale)
-            p2 = wp.cw_mul(mesh.points[mesh.indices[3 * triangle + 2]], mesh_scale)
-            face = wp.cross(p1 - p0, p2 - p0)
-            length = wp.length(face)
-            if length > 0.0:
-                face /= length
-                for orientation in range(2):
-                    m = face if orientation == 0 else -face
-                    # Skip inward normals; a flat hull keeps both.
-                    if wp.dot(m, p0 - center) >= -tolerance:
-                        lower = wp.dot(m, p0 + offset) + wp.dot(wp.abs(box_axes * m), half)
-                        if lower < depth:
-                            normal, depth, best_vertex, recent_vertex = test_direction(
-                                a,
-                                b,
-                                rotation,
-                                position,
-                                provider,
-                                side * wp.quat_rotate(mesh_rotation, m),
-                                normal,
-                                depth,
-                                best_vertex,
-                                recent_vertex,
-                            )
-            for corner in range(3):
-                start = p0
-                end = p1
-                opposite = p2
-                if corner == 1:
-                    start = p1
-                    end = p2
-                    opposite = p0
-                elif corner == 2:
-                    start = p2
-                    end = p0
-                    opposite = p1
-                for axis in range(3):
-                    m = wp.cross(box_axes[axis], end - start)
-                    length = wp.length(m)
-                    if length > 0.0:
-                        m /= length
-                        reach = wp.dot(m, opposite - start)
-                        for _orientation in range(2):
-                            # A supporting edge has its triangle behind it.
-                            if reach <= tolerance:
-                                lower = wp.dot(m, start + offset) + wp.dot(wp.abs(box_axes * m), half)
-                                if lower < depth:
-                                    normal, depth, best_vertex, recent_vertex = test_direction(
-                                        a,
-                                        b,
-                                        rotation,
-                                        position,
-                                        provider,
-                                        side * wp.quat_rotate(mesh_rotation, m),
-                                        normal,
-                                        depth,
-                                        best_vertex,
-                                        recent_vertex,
-                                    )
-                            m = -m
-                            reach = -reach
+        if wp.static(cooperative):
+            # Every lane runs the same number of rounds, so the shuffles below see the whole warp.
+            for base in range(0, n_triangles, 32):
+                triangle = base + lane
+                if triangle < n_triangles:
+                    normal, depth, best_vertex, recent_vertex = triangle_axes(
+                        a,
+                        b,
+                        rotation,
+                        position,
+                        provider,
+                        mesh.points,
+                        mesh.indices,
+                        mesh_scale,
+                        mesh_rotation,
+                        box_axes,
+                        half,
+                        offset,
+                        side,
+                        center,
+                        tolerance,
+                        triangle,
+                        normal,
+                        depth,
+                        best_vertex,
+                        recent_vertex,
+                    )
+                # Share the running minimum so every lane prunes against the best axis found so far.
+                winner = _coop_argmin_lane(depth)
+                depth = _coop_broadcast(depth, winner)
+                normal = _coop_broadcast_vec3(normal, winner)
+                best_vertex = _coop_broadcast_vec3(best_vertex, winner)
+        else:
+            for triangle in range(n_triangles):
+                normal, depth, best_vertex, recent_vertex = triangle_axes(
+                    a,
+                    b,
+                    rotation,
+                    position,
+                    provider,
+                    mesh.points,
+                    mesh.indices,
+                    mesh_scale,
+                    mesh_rotation,
+                    box_axes,
+                    half,
+                    offset,
+                    side,
+                    center,
+                    tolerance,
+                    triangle,
+                    normal,
+                    depth,
+                    best_vertex,
+                    recent_vertex,
+                )
         # Box faces are the remaining Minkowski facet normals.
         for axis in range(3):
             normal, depth, best_vertex, recent_vertex = test_axis(
@@ -324,6 +494,10 @@ def create_solve_box_penetration(support: Any):
                 best_vertex,
                 recent_vertex,
             )
+        if wp.static(cooperative):
+            # Lanes kept their own pruning hints; hand every lane lane 0's answer.
+            depth = _coop_broadcast(depth, 0)
+            normal = _coop_broadcast_vec3(normal, 0)
         return normal, depth
 
     @wp.func

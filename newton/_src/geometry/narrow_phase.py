@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import warp as wp
@@ -1450,6 +1451,15 @@ def create_narrow_phase_kernels_gjk_mpr_split(
 
     support_funcs = create_support_map_function(support_func, use_precomputed_center=True)
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
+    # Overlap refinement runs one pair per warp: a box against a detailed convex hull streams every hull
+    # triangle through the separating-axis certificate, which on one thread is the narrow phase's long tail.
+    # Internal test switch: 0 keeps one pair per thread.
+    cooperative_refine = os.environ.get("NEWTON_COOPERATIVE_REFINE", "1") != "0"
+    solve_mpr_refine = (
+        create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
+        if cooperative_refine
+        else solve_mpr
+    )
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
@@ -1582,7 +1592,12 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     def create_distance_kernel(refine_overlap: bool):
         # Compile refinement separately: its retries and raycast would raise
         # register pressure for every ordinary separated GJK query.
-        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}")
+        # Refinement runs one pair per warp: all lanes take the same pair, split the box-mesh certificate's
+        # triangle stream, and lane 0 writes the result.
+        per_warp = refine_overlap and cooperative_refine
+        lanes = 32 if per_warp else 1
+
+        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}_w{lanes}")
         def narrow_phase_gjk_kernel(
             candidate_pair: wp.array[wp.vec2i],
             shape_types: wp.array[int],
@@ -1607,13 +1622,14 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             manifold_work_count: wp.array[int],
         ):
             tid = wp.tid()
+            lane = tid % wp.static(lanes)
             # Separated queries fill the front of the queue and overlap
             # refinements the back.
             num_distance = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
             num_work_items = num_distance
             if wp.static(refine_overlap):
                 num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
-            for work_index in range(tid, num_work_items, total_num_threads):
+            for work_index in range(tid // wp.static(lanes), num_work_items, total_num_threads // wp.static(lanes)):
                 pair_index = gjk_work_items[work_index]
                 witnesses_valid = False
                 if wp.static(refine_overlap):
@@ -1668,7 +1684,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                         seed = pending.point_a
                         if witnesses_valid:
                             seed = wp.vec3(0.0)
-                        point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr.refine_core)(
+                        point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr_refine.refine_core)(
                             query.geom_a,
                             query.geom_b,
                             query.relative_orientation_b,
@@ -1696,7 +1712,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                             0.0,
                             provider,
                         )
-                    if resolved and signed_distance <= query.contact_threshold:
+                    if resolved and signed_distance <= query.contact_threshold and lane == 0:
                         result = ConvexQueryResult()
                         result.point_a = point_a
                         result.point_b = point_b
