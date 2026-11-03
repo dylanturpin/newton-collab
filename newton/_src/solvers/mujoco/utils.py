@@ -147,11 +147,36 @@ def mjc_add_equality_loop_joint(
     enabled: bool,
     custom_attrs: dict[str, Any],
 ) -> tuple[int, int]:
-    """Add a Newton loop joint and its authoritative MuJoCo equality row."""
-    parent, child, parent_xform, child_xform = mjc_loop_joint_xforms(
-        builder, body1, body2, anchor, relpose, weld=eq_type == EqType.WELD
-    )
-    add_joint = builder.add_joint_ball if eq_type == EqType.CONNECT else builder.add_joint_fixed
+    """Add a Newton loop joint and its authoritative MuJoCo equality row.
+
+    A CONNECT becomes a BALL loop joint. A WELD becomes a FIXED loop joint, except that ``torquescale == 0`` (which
+    MuJoCo enforces as a point constraint with rotation free) becomes a BALL loop joint on the weld's anchor. Solvers
+    that enforce Newton loop joints, such as :class:`~newton.solvers.SolverSteel`, hold them as hard constraints:
+    ``torquescale`` only selects BALL or FIXED, and ``solref``/``solimp`` are not used. SolverMuJoCo enforces the
+    original equality row, so it keeps all of them.
+    """
+    weld = eq_type == EqType.WELD
+    parent, child, parent_xform, child_xform = mjc_loop_joint_xforms(builder, body1, body2, anchor, relpose, weld=weld)
+    add_joint = builder.add_joint_fixed if weld else builder.add_joint_ball
+    if weld and torquescale == 0.0:
+        # The weld frames put the anchor on body2 and its held position (relpose) on body1, which is the point
+        # MuJoCo's weld residual pins; a BALL joint on those frames pins it the same way and leaves rotation free.
+        add_joint = builder.add_joint_ball
+        warnings.warn(
+            f"MuJoCo weld {label!r} has torquescale=0, which MuJoCo enforces as a point constraint with rotation "
+            "free; it is converted to a BALL loop joint (rotation free) instead of a FIXED one. SolverMuJoCo "
+            "enforces the original weld row.",
+            UserWarning,
+            stacklevel=3,
+        )
+    elif weld and torquescale != 1.0:
+        warnings.warn(
+            f"MuJoCo weld {label!r} has torquescale={torquescale:g}; it is converted to a FIXED loop joint, which "
+            "solvers that enforce loop joints (such as SolverSteel) hold as a hard weld: torquescale, solref and "
+            "solimp are not used. SolverMuJoCo enforces the original weld row.",
+            UserWarning,
+            stacklevel=3,
+        )
     joint_idx = add_joint(
         parent=parent,
         child=child,
@@ -160,8 +185,8 @@ def mjc_add_equality_loop_joint(
         label=label,
         enabled=enabled,
     )
-    # For WELD, torquescale (and the solref/solimp softness) remain on the equality row only;
-    # the loop joint's frames carry the anchor and relpose for Newton's other solvers.
+    # For WELD, torquescale (beyond choosing BALL or FIXED) and the solref/solimp softness remain on the
+    # equality row only; the loop joint's frames carry the anchor and relpose for Newton's other solvers.
     eq_idx = _add_equality_constraint(
         builder,
         constraint_type=eq_type,

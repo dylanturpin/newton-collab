@@ -1323,3 +1323,39 @@ The same structure can be authored in an asset:
   primary with a ``PhysicsFixedJoint`` whose
   ``physics:excludeFromArticulation`` is ``true``. Put both branches under one
   prim with ``PhysicsArticulationRootAPI``.
+
+Link-break welds and MuJoCo welds
+"""""""""""""""""""""""""""""""""
+
+A link-break weld is a hard, topological loop closure. It plays the role of the
+weld that `Drake's SpanningForest
+<https://github.com/RobotLocomotion/drake/tree/master/multibody/topology>`_
+adds between a split link's primary and shadow, which Drake's
+``MultibodyPlant`` enforces as a hard weld constraint. It is not a model of
+MuJoCo's soft ``<weld>`` equality, but the MJCF and USD importers convert MuJoCo
+welds (``<weld>``, ``MjcEqualityWeldAPI``) to the same loop joints:
+
+- ``torquescale`` 0, which MuJoCo enforces as a point constraint with rotation
+  free, becomes a BALL loop joint on the weld's anchor, with a warning.
+- Any other ``torquescale`` becomes a FIXED loop joint. A value other than 1
+  warns, because the weld is then enforced in full.
+- :class:`~newton.solvers.SolverSteel` solves loop closures as hard
+  constraints and does not support ``solref`` or ``solimp`` (time constant,
+  damping ratio, impedance) on them. :class:`~newton.solvers.SolverMuJoCo`
+  enforces the original equality row and keeps all of these parameters.
+
+A link-break MJCF also runs in MuJoCo itself, where the weld is soft. To keep it
+close to a hard closure there:
+
+- Set the weld's ``solref`` time constant to twice ``timestep`` with a damping
+  ratio of 1, for example ``solref="0.002 1"`` with ``timestep="0.001"``.
+  MuJoCo raises smaller time constants to twice the timestep. With the default
+  ``solref`` (0.02 s), the weld of a four-bar's coupler opens by about 1 mm
+  and 0.6 degrees.
+- Set ``solimp="0.99 0.999 0.001"`` to raise the constraint impedance.
+- Keep ``torquescale`` at its default of 1, and leave ``relpose`` unset so the
+  weld holds the authored pose.
+- Leave the shadow without geoms, or exclude its contacts with the primary
+  (``<contact><exclude body1="coupler" body2="coupler_shadow"/></contact>``):
+  MuJoCo skips collisions only between a parent and its child.
+- For accuracy, use a smaller ``timestep`` or ``integrator="RK4"``.

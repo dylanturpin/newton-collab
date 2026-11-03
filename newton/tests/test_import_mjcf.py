@@ -5777,6 +5777,61 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         self.assertEqual((parent, child), (-1, b))
         assert_same_pose(wp.transform_multiply(x_p, wp.transform_inverse(x_c)), wp.transform_inverse(relpose))
 
+    def test_converted_weld_torquescale_selects_the_loop_joint(self):
+        """torquescale 0 converts a weld to a BALL loop joint on its anchor, other values to FIXED; both warn unless 1."""
+        mjcf = """<?xml version="1.0" ?>
+<mujoco model="weld_ts">
+    <worldbody>
+        <body name="a" pos="0.1 0 0.5" euler="0 30 0">
+            <joint type="hinge" axis="0 1 0"/>
+            <geom type="sphere" size="0.05"/>
+            <body name="b" pos="0.3 0 0" euler="20 0 10">
+                <joint type="hinge" axis="1 0 0"/>
+                <geom type="sphere" size="0.05"/>
+            </body>
+        </body>
+    </worldbody>
+    <equality>
+        <weld name="point" body1="a" body2="b" anchor="0.05 0.02 0" torquescale="0"/>
+        <weld name="scaled" body1="a" body2="b" torquescale="0.5"/>
+        <weld name="full" body1="a" body2="b"/>
+    </equality>
+</mujoco>
+"""
+        builder = newton.ModelBuilder()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            builder.add_mjcf(mjcf)
+        torquescale_warnings = [str(w.message) for w in caught if "torquescale" in str(w.message)]
+        self.assertEqual(len(torquescale_warnings), 2, torquescale_warnings)
+        self.assertIn("'weld_ts/point' has torquescale=0", torquescale_warnings[0])
+        self.assertIn("'weld_ts/scaled' has torquescale=0.5", torquescale_warnings[1])
+
+        def joint(label):
+            return builder.joint_label.index(f"weld_ts/{label}")
+
+        self.assertEqual(builder.joint_type[joint("point")], newton.JointType.BALL)
+        self.assertEqual(builder.joint_type[joint("scaled")], newton.JointType.FIXED)
+        self.assertEqual(builder.joint_type[joint("full")], newton.JointType.FIXED)
+
+        # The BALL joint pins body2's anchor where it is at the reference pose.
+        j = joint("point")
+        p, c = builder.joint_parent[j], builder.joint_child[j]
+        world_p = wp.transform_point(builder.body_q[p], builder.joint_X_p[j].p)
+        world_c = wp.transform_point(builder.body_q[c], builder.joint_X_c[j].p)
+        np.testing.assert_allclose(np.array(world_p), np.array(world_c), atol=1e-6)
+        np.testing.assert_allclose(
+            np.array(world_c), np.array(wp.transform_point(builder.body_q[c], wp.vec3(0.05, 0.02, 0.0))), atol=1e-6
+        )
+
+        # SolverMuJoCo keeps all three as weld rows with their torquescale.
+        model = builder.finalize()
+        np.testing.assert_allclose(model.mujoco.equality_constraint_torquescale.numpy(), [0.0, 0.5, 1.0])
+        mujoco = SolverMuJoCo.import_mujoco()[0]
+        mj_model = SolverMuJoCo(model).mj_model
+        np.testing.assert_array_equal(mj_model.eq_type, [int(mujoco.mjtEq.mjEQ_WELD)] * 3)
+        np.testing.assert_allclose(mj_model.eq_data[:, 10], [0.0, 0.5, 1.0])
+
     def test_parse_mjcf_registers_converted_equality_attributes(self):
         """Direct parse_mjcf() calls register MuJoCo preservation attributes."""
         mjcf = """<?xml version="1.0" ?>
