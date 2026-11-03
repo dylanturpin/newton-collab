@@ -1288,10 +1288,10 @@ coupler that joins them:
 
 When building a link-break loop:
 
-- The primary and the shadow start at the same pose, and their masses and
-  inertias add up to the real body's (an even split is the usual choice). The
-  weld's two frames must coincide at the authored pose; identity frames do when
-  the two bodies share a pose.
+- The primary and the shadow start at the same pose and keep the real body's
+  center of mass, and their masses and inertias add up to the real body's (an
+  even split is the usual choice). The weld's two frames must coincide at the
+  authored pose; identity frames do when the two bodies share a pose.
 - All tree joints of the loop, from both branches, go into **one**
   articulation, and the weld stays out of it. Steel ignores a weld between two
   articulations with a warning.
@@ -1312,7 +1312,8 @@ The same structure can be authored in an asset:
 
 - **MJCF:** nest the shadow body (no geoms) inside the body that is the
   closing joint's parent and give it the closing joint; give the primary and
-  the shadow ``<inertial>`` elements with half of the mass and inertia each;
+  the shadow ``<inertial>`` elements with the same ``pos`` and half of the mass
+  and inertia each;
   and close the loop with ``<weld body1="coupler" body2="coupler_shadow"/>``.
   Each top-level body of ``<worldbody>`` imports as its own articulation, so
   both branches must hang from one body there; for a loop on the ground, use a

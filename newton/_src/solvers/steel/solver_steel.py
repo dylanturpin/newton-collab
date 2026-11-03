@@ -5121,8 +5121,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._connect_count and np.any(self._connect_rows_np == 6):
             warnings.warn(
                 "SolverSteel: enable_bilateral_preelimination does not support FIXED (weld) loop "
-                "closures, such as the welds of a link-break model, yet; falling back to iterative "
-                "mimic/connect rows.",
+                "closures, such as the welds of a link-break model, yet: pre-eliminating six-row "
+                "welds has not been validated across link-break mechanisms; falling back to "
+                "iterative mimic/connect rows.",
                 stacklevel=2,
             )
             return
