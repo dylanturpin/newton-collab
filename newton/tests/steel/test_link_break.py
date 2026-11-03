@@ -510,6 +510,40 @@ def test_link_break_preelimination_falls_back(test, device):
     test.assertTrue(any("FIXED (weld) loop closures" in str(w.message) for w in caught))
 
 
+def test_weld_to_world_returns_the_short_way(test, device):
+    """A free body welded to the world 170 deg off about an oblique axis returns along the short way.
+
+    The planar four-bars leave the x/z rotation rows and the y point row of a weld inert; this loads all six rows. The
+    weld anchor is off the COM and the inertia is anisotropic, so the point and rotation rows are coupled.
+    """
+    axis = wp.normalize(wp.vec3(1.0, 2.0, 3.0))
+    pos, anchor = wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.1, 0.05, -0.02)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(
+        xform=wp.transform(pos, wp.quat_from_axis_angle(axis, float(np.radians(170.0)))),
+        mass=1.0,
+        inertia=_rod_inertia(1.0, 0.3, (1.0, 0.0, 0.0)),
+    )
+    builder.add_articulation([builder.add_joint_free(child=body)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the weld parallels the free joint on purpose
+        builder.add_joint_fixed(
+            parent=-1,
+            child=body,
+            parent_xform=wp.transform(pos + anchor, wp.quat_identity()),
+            child_xform=wp.transform(anchor, wp.quat_identity()),
+        )
+    model = builder.finalize(device=device)
+    _, body_q, _ = _simulate(model, 100, 1.0e-3, history=True)
+    xyz, w = body_q[:, 0, 3:6], body_q[:, 0, 6]
+    angle = np.degrees(2.0 * np.arctan2(np.linalg.norm(xyz, axis=1), np.abs(w)))
+    # The short way shrinks the angle from 170 deg about the same axis; the long way would first pass 180 deg.
+    test.assertTrue(np.all(np.diff(angle) < 1.0e-3), f"angle {angle[:5]} ... does not shrink monotonically")
+    test.assertGreater(float(np.dot(xyz[0] * np.sign(w[0]), np.array(axis))), 0.0)
+    test.assertLess(angle[-1], 0.01)
+    test.assertLess(float(np.linalg.norm(body_q[-1, 0, :3] - np.array(pos))), 1.0e-5)
+
+
 class TestSteelLinkBreak(unittest.TestCase):
     def test_collapse_fixed_joints_warns_on_a_weld_closure(self):
         """Collapsing fixed joints opens a link-break loop, so it warns; a joint-break loop collapses quietly."""
@@ -533,6 +567,7 @@ for _name in (
     "test_link_break_floating_loop_conserves_momentum",
     "test_link_break_drives_the_loop_closing_joint",
     "test_link_break_preelimination_falls_back",
+    "test_weld_to_world_returns_the_short_way",
 ):
     add_function_test(TestSteelLinkBreak, _name, globals()[_name], devices=get_cuda_test_devices())
 if USD_AVAILABLE:
