@@ -18,8 +18,10 @@
 Use :class:`~newton.solvers.SolverSteel` as the canonical public solver class.
 """
 
-from .differentiable import SmoothContactLaw
+from .differentiable import DifferentiableDiagnostics, DifferentiableOptions, SmoothContactLaw
 
 __all__ = [
+    "DifferentiableDiagnostics",
+    "DifferentiableOptions",
     "SmoothContactLaw",
 ]

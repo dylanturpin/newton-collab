@@ -19,5 +19,9 @@ Use :class:`~newton.solvers.SolverSteel` as the canonical public solver class.
 
 .. rubric:: Classes
 
+.. autoclass:: DifferentiableDiagnostics
+
+.. autoclass:: DifferentiableOptions
+
 .. autoclass:: SmoothContactLaw
 

@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.solvers import SolverSteel
+from newton.solvers import SolverSteel, steel
 from newton.tests.steel.test_differentiable import (
     _CONTACT_OPTIONS,
     _DT,
@@ -23,15 +23,22 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 _FRICTION_OPTIONS = {**_CONTACT_OPTIONS, "contact_friction_gap_max": None}
 
 
-def _contact_gradients(model, inputs, steps, *, iterations, adjoint, options, perturb=None, **flags):
+def _contact_gradients(
+    model, inputs, steps, *, iterations, adjoint, options, perturb=None, tiled_sweeps=True, regularization=1.0e-6
+):
     """Loss and input gradients of a contact rollout with the PGS solve differentiated by ``adjoint``."""
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
-    solver = SolverSteel(model, differentiable=True, iterations=iterations, **options)
+    solver = SolverSteel(
+        model,
+        differentiable=True,
+        iterations=iterations,
+        differentiable_options=steel.DifferentiableOptions(
+            pgs_adjoint=adjoint, truncated_sweeps=iterations, implicit_regularization=regularization
+        ),
+        **options,
+    )
     plan = solver._differentiable_step
-    plan.pgs_adjoint = adjoint
-    plan.implicit_regularization = 1.0e-6
-    for name, value in flags.items():
-        setattr(plan, name, value)
+    plan._tiled_sweeps = tiled_sweeps
     values = dict(inputs)
     if perturb is not None:
         key, delta = perturb
@@ -161,12 +168,27 @@ def test_tiled_implicit_matches_serial(test, device):
         "joint_f": (0.5 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
     }
     _, serial, _ = _contact_gradients(
-        model, inputs, 4, iterations=48, adjoint="implicit", options=_CONTACT_OPTIONS, tiled_pgs=False
+        model, inputs, 4, iterations=48, adjoint="implicit", options=_CONTACT_OPTIONS, tiled_sweeps=False
     )
     _, tiled, _ = _contact_gradients(
-        model, inputs, 4, iterations=48, adjoint="implicit", options=_CONTACT_OPTIONS, tiled_pgs=True
+        model, inputs, 4, iterations=48, adjoint="implicit", options=_CONTACT_OPTIONS, tiled_sweeps=True
     )
     _assert_gradients_close(test, tiled, serial, 1.0e-3)
+
+
+def test_truncated_over_every_sweep_matches_unrolled(test, device):
+    """Truncating at the iteration count differentiates every sweep, exactly as the unrolled adjoint."""
+    model = _build_box_chain_on_plane(device)
+    rng = np.random.default_rng(2)
+    inputs = {
+        "joint_q": model.joint_q.numpy().copy(),
+        "joint_qd": (0.05 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+        "joint_f": (0.5 * rng.normal(size=model.joint_dof_count)).astype(np.float32),
+    }
+    _, unrolled, _ = _contact_gradients(model, inputs, 3, iterations=16, adjoint="unrolled", options=_CONTACT_OPTIONS)
+    _, truncated, _ = _contact_gradients(model, inputs, 3, iterations=16, adjoint="truncated", options=_CONTACT_OPTIONS)
+    # Equal up to the run-to-run rounding of the backward's atomic adds.
+    _assert_gradients_close(test, truncated, unrolled, 1.0e-5)
 
 
 def test_parallel_cholesky_adjoint_matches_serial(test, device):
@@ -175,7 +197,7 @@ def test_parallel_cholesky_adjoint_matches_serial(test, device):
     gradients = {}
     for parallel in (False, True):
         solver = SolverSteel(model, differentiable=True)
-        solver._differentiable_step.parallel_cholesky_adjoint = parallel
+        solver._differentiable_step._parallel_cholesky_adjoint = parallel
         tape = wp.Tape()
         final, initial, control = _rollout(model, solver, inputs, 6, tape=tape)
         loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
@@ -207,6 +229,7 @@ for _device in get_test_devices():
         test_implicit_sliding_gradient_matches_finite_difference,
         test_implicit_rejects_unlinearized_laws,
         test_tiled_implicit_matches_serial,
+        test_truncated_over_every_sweep_matches_unrolled,
         test_parallel_cholesky_adjoint_matches_serial,
     ):
         add_function_test(TestSteelDifferentiableImplicit, _test.__name__, _test, devices=[_device])

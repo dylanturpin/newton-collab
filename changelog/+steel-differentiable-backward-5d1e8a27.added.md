@@ -1,0 +1,1 @@
+Add experimental `newton.solvers.steel.DifferentiableOptions` for `SolverSteel(differentiable=True)`: truncated and implicit PGS adjoints, and per-world backward diagnostics (`SolverSteel.differentiable_diagnostics`) with optional zeroing of non-finite world adjoints.

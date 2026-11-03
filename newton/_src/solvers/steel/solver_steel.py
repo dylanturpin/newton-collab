@@ -79,6 +79,8 @@ from .contact_torsion import (
     validate_torsion_step,
 )
 from .differentiable import (
+    DifferentiableDiagnostics,
+    DifferentiableOptions,
     DifferentiableStep,
     SmoothContactLaw,
     validate_differentiable_model,
@@ -2034,6 +2036,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         nesterov_momentum: bool = False,
         differentiable: bool = False,
         smooth_contact: SmoothContactLaw | None = None,
+        differentiable_options: DifferentiableOptions | None = None,
     ):
         """
         Args:
@@ -2054,8 +2057,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 friction, and, in ``"matrix_free"``, contact regularization and worlds that mix free bodies
                 with articulations. The contact set, its row layout and friction-patch history are held fixed
                 for the derivative. Contact points and normals come from the given buffers and are
-                stop-gradient, while the gap and Jacobians are recomputed from the step's poses. Every PGS
-                sweep is differentiated as executed. Each friction pair solve is differentiated in closed form
+                stop-gradient, while the gap and Jacobians are recomputed from the step's poses. By default every
+                PGS sweep is differentiated as executed; ``differentiable_options`` selects a truncated or implicit
+                PGS adjoint instead. Each friction pair solve is differentiated in closed form
                 at its computed root, rather than through its root-finding iterates: the sticking
                 (pseudo-)inverse, or the implicit derivative of the sliding root. A rank-one tangent block, as
                 on low-DOF articulations, is differentiated along rank-preserving changes. Where the solve
@@ -2067,6 +2071,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 and agreement with the default step excludes overflowing steps. Joint position and velocity
                 limits, rigid-body velocity limits and ``drive_mode="rows"`` (``"matrix_free"``), and kinematic
                 bodies are supported.
+                Moving mesh surfaces (``Contacts.rigid_contact_surface_velocity``) set the friction-row targets
+                and are stop-gradient.
                 Both ``contact_torsion_device`` settings are accepted, but contact torsion groups contacts on
                 the host and requires eager stepping: capturing a contact step with torsion enabled in a CUDA
                 graph raises ``RuntimeError``.
@@ -2079,9 +2085,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 particles, mimic or loop-closing joints, and the solver uses immediate response,
                 ``row_schedule="interleaved"``, ``friction_mode="fixed_normal"``,
                 ``update_mass_matrix_interval=1``, no joint friction, warm start, compliance, articulated
-                torsional and rolling friction, velocity iterations, fused drive velocity limits or
-                ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"`` dense PGS kernel.
-                Defaults to False.
+                torsional and rolling friction, velocity iterations, fused drive velocity limits,
+                ``nesterov_momentum`` or ``parallel_tree``, and in ``"split"`` the ``"loop"`` or ``"tiled_row"``
+                dense PGS kernel. Defaults to False.
 
                 .. experimental::
 
@@ -2092,6 +2098,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 against that normal impulse. It is a surrogate model, not Steel contact parity. Requires
                 ``enable_restitution=False``. See :class:`~newton.solvers.steel.SmoothContactLaw`.
                 Defaults to None.
+            differentiable_options: Backward settings for ``differentiable=True``: the PGS adjoint mode and
+                per-world backward diagnostics. See :class:`~newton.solvers.steel.DifferentiableOptions`.
+                Defaults to None, which uses ``DifferentiableOptions()``.
             deterministic: Reserve constraint rows in a fixed order, not in the order GPU threads reach the
                 per-world atomic counters, and sum split-mode right-hand sides in a fixed order. Given identical
                 contact inputs in an identical order, repeated runs are bitwise identical on the same GPU model,
@@ -2646,6 +2655,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if differentiable_options is not None and not differentiable:
+            raise ValueError("differentiable_options requires differentiable=True")
         if smooth_contact is not None and (not differentiable or enable_restitution):
             raise ValueError("smooth_contact requires differentiable=True and enable_restitution=False")
         if differentiable:
@@ -3873,7 +3884,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._differentiable_step = None
         if differentiable:
             validate_differentiable_model(self)
-            self._differentiable_step = DifferentiableStep(self, smooth_contact)
+            self._differentiable_step = DifferentiableStep(self, smooth_contact, differentiable_options)
         # Last, so a failed construction leaves the model's reduction keys untouched.
         reduction_key = free_rigid_reduction_material_key(self)
         if reduction_key is not None:
@@ -10827,6 +10838,23 @@ class SolverSteel(SolverBase, CouplingInterface):
             wp.copy(snapshot["torsion"], self._device_torsion.work.status)
         self._status_snapshot_event = wp.get_stream(device).record_event() if device.is_cuda else None
         self._status_snapshot_taken = True
+
+    def differentiable_diagnostics(self, state_out: State) -> DifferentiableDiagnostics:
+        """Return the per-world backward diagnostics of the step that wrote ``state_out``.
+
+        Requires ``differentiable_options=DifferentiableOptions(world_diagnostics=True)``.
+
+        .. experimental::
+
+            The diagnostics may change without prior notice.
+        """
+        step = self._differentiable_step
+        if step is None or not step.world_diagnostics:
+            raise ValueError("differentiable_diagnostics requires DifferentiableOptions(world_diagnostics=True)")
+        buffers = getattr(state_out, "_steel_differentiable_buffers", None)
+        if buffers is None or buffers.owner is not step:
+            raise ValueError("state_out was not written by this solver's differentiable step")
+        return buffers.diagnostics()
 
     def check_constraint_capacity(self, *, snapshot: bool = False) -> None:
         """Raise for worlds invalidated by contact or constraint capacity exhaustion.

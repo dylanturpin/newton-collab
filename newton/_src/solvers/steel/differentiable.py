@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
@@ -29,7 +29,6 @@ from .differentiable_implicit import (
     cholesky_adjoint_scatter,
     pgs_implicit_adjoint,
     pgs_implicit_adjoint_tiled,
-    tiled_factor_kernel,
 )
 from .friction_patches import (
     FrictionPatches,
@@ -211,13 +210,94 @@ class SmoothContactLaw:
             raise ValueError(f"SmoothContactLaw needs finite k > 0, c >= 0, s > 0; got {self}")
 
 
+_NONFINITE_STATE = wp.constant(1)
+_NONFINITE_ADJOINT = wp.constant(2)
+
+
+@dataclass(frozen=True)
+class DifferentiableOptions:
+    """Backward settings for ``SolverSteel(differentiable=True)``.
+
+    .. experimental::
+
+        The adjoint modes and diagnostics may change without prior notice.
+    """
+
+    pgs_adjoint: Literal["unrolled", "truncated", "implicit"] = "unrolled"
+    """How the PGS solve is differentiated. ``"unrolled"`` differentiates every sweep as executed.
+    ``"truncated"`` differentiates only the last :attr:`truncated_sweeps` sweeps and treats the impulses entering
+    them as constant. ``"implicit"`` differentiates the complementarity conditions at the final impulses with one
+    dense solve per world, so its cost does not grow with the iteration count; it assumes a converged solve, treats
+    friction coefficients as constant, and requires no contact regularization, friction patches
+    (``friction_anchor_beta=0``), PhysX drive rows, contact torsion or joint velocity limits. A world whose rows it
+    cannot linearize, or whose system is singular, gets NaN input adjoints."""
+    truncated_sweeps: int = 1
+    """Sweeps differentiated by ``pgs_adjoint="truncated"``."""
+    implicit_regularization: float = 1.0e-2
+    """Damping ``eps * C_ii`` added to the active rows of the implicit backward system only (the forward solve is
+    unchanged). It bounds the adjoint of redundant contacts; smaller values follow the exact fixed-point
+    derivative more closely and let rare worlds' adjoints grow by orders of magnitude."""
+    deterministic_adjoint: bool = True
+    """With ``deterministic=True``, also reduce the backward's atomic adds in a fixed order, so repeated backward
+    passes are bitwise identical. False keeps the fixed row order of the forward and uses plain atomics in the
+    backward, which avoids the scratch Warp's ordered reductions allocate per launch."""
+    world_diagnostics: bool = False
+    """Record per-world adjoint norms and non-finite flags for every step; read them with
+    :meth:`SolverSteel.differentiable_diagnostics`."""
+    zero_nonfinite_adjoints: bool = False
+    """Zero a world's non-finite input-state and control adjoints when the backward leaves each step, so one
+    diverged world cannot spread NaN to the batch. Requires :attr:`world_diagnostics`."""
+
+    def __post_init__(self):
+        if self.pgs_adjoint not in ("unrolled", "truncated", "implicit"):
+            raise ValueError(f"unknown pgs_adjoint {self.pgs_adjoint!r}")
+        if self.truncated_sweeps < 1:
+            raise ValueError(f"truncated_sweeps must be at least 1, got {self.truncated_sweeps}")
+        if not (math.isfinite(self.implicit_regularization) and self.implicit_regularization >= 0.0):
+            raise ValueError(f"implicit_regularization must be finite and >= 0, got {self.implicit_regularization}")
+        if self.zero_nonfinite_adjoints and not self.world_diagnostics:
+            raise ValueError("zero_nonfinite_adjoints requires world_diagnostics=True")
+
+
+@dataclass(frozen=True)
+class DifferentiableDiagnostics:
+    """Per-world backward diagnostics of one differentiable step, each array of shape ``[world_count]``.
+
+    The arrays belong to the step's output state and are rewritten when a step writes that state again or a
+    backward pass runs through the step.
+    """
+
+    NONFINITE_STATE = int(_NONFINITE_STATE)
+    """Flag bit: the step's output joint coordinates or velocities are not finite."""
+    NONFINITE_ADJOINT = int(_NONFINITE_ADJOINT)
+    """Flag bit: the backward left a non-finite adjoint on the step's input state or the control."""
+
+    adjoint_out: wp.array
+    """Norm of the world's adjoints of the output state's joint and body coordinates and velocities when the
+    backward enters the step."""
+    adjoint_in: wp.array
+    """Norm of the world's adjoints of the input state's joint coordinates and velocities and body forces when the
+    backward leaves the step (before any zeroing). ``adjoint_in / adjoint_out`` is the step's backward growth."""
+    flags: wp.array
+    """Bitwise OR of :attr:`NONFINITE_STATE` and :attr:`NONFINITE_ADJOINT`, int32."""
+
+
 class DifferentiableStep:
     """Fixed-selection Steel step whose intermediates are owned by the output state."""
 
-    def __init__(self, solver: SolverSteel, smooth_contact: SmoothContactLaw | None = None):
+    def __init__(
+        self,
+        solver: SolverSteel,
+        smooth_contact: SmoothContactLaw | None = None,
+        options: DifferentiableOptions | None = None,
+    ):
+        options = DifferentiableOptions() if options is None else options
         self.solver = solver
         self.smooth_contact = smooth_contact
-        self._ordered_kernels = _ordered_kernel_set(solver) if solver._deterministic else {}
+        self.options = options
+        self._ordered_kernels = (
+            _ordered_kernel_set(solver) if solver._deterministic and options.deterministic_adjoint else {}
+        )
         model = solver.model
         device = model.device
         joint_parent = model.joint_parent.numpy()
@@ -290,23 +370,21 @@ class DifferentiableStep:
         worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
-        # PGS gradient: "unrolled" tapes every sweep, "truncated" only the last pgs_truncate sweeps, and "implicit"
-        # differentiates the converged complementarity conditions with one dense solve per world. Implicit treats
-        # friction coefficients as constant, and a world whose rows it cannot linearize gets NaN gradients.
-        self.pgs_adjoint = "unrolled"
-        self.pgs_truncate = 1
-        self.implicit_regularization = 1.0e-4
+        self.pgs_adjoint = options.pgs_adjoint
+        self.pgs_truncate = options.truncated_sweeps
+        self.implicit_regularization = options.implicit_regularization
         self.implicit_slide_tolerance = 1.0e-3
         self._implicit_scratch = None
-        # The factorization's adjoint as four parallel kernels instead of one serial thread per articulation.
-        self.parallel_cholesky_adjoint = True
-        # Untaped PGS sweeps (all of them under pgs_adjoint="implicit") run one warp per world.
-        self.tiled_pgs = True
-        # The mass-matrix factorization as one tile Cholesky per articulation (needs parallel_cholesky_adjoint).
-        # Opt-in: it changes the forward's summation order.
-        self.tiled_factor = False
-        # Cumulative [unsupported rows, singular pivots] seen by the implicit adjoint; callers reset it.
+        # Test switches: the serial factorization adjoint, and serial untaped sweeps on CUDA.
+        self._parallel_cholesky_adjoint = True
+        self._tiled_sweeps = True
+        # Cumulative [unsupported rows, singular pivots] seen by the implicit adjoint.
         self.implicit_status = wp.zeros(2, dtype=wp.int32, device=device)
+        self.world_diagnostics = options.world_diagnostics
+        self.zero_nonfinite_adjoints = options.zero_nonfinite_adjoints
+        if self.world_diagnostics:
+            self._world_joints = _world_index(model.joint_world, model.joint_count, model.world_count, device)
+            self._world_bodies = _world_index(model.body_world, model.body_count, model.world_count, device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
         """The copy of ``kernel`` whose atomics, its adjoint's included, reduce in a fixed order under deterministic=True."""
@@ -356,6 +434,8 @@ class DifferentiableStep:
             solver._step += 1
             return state_out
         b = self.buffers(state_out)
+        if self.world_diagnostics:
+            self._record_world_adjoint(b, state_in, control, leaving=True)
         # The wrench recursion accumulates into body_ft_s; buffers are reused when a state is stepped into again.
         b.body_ft_s.zero_()
         if unarticulated.size:
@@ -528,26 +608,15 @@ class DifferentiableStep:
                 outputs=[b.H[size]],
                 device=device,
             )
-            if self.tiled_factor and self.parallel_cholesky_adjoint and wp.get_device(device).is_cuda:
-                wp.launch_tiled(
-                    tiled_factor_kernel(size),
-                    dim=n_arts,
-                    inputs=[b.H[size], solver._R_by_size[size]],
-                    outputs=[b.L[size]],
-                    block_dim=64,
-                    device=device,
-                    record_tape=False,
-                )
-            else:
-                wp.launch(
-                    _factor_dense,
-                    dim=n_arts,
-                    inputs=[b.H[size], solver._R_by_size[size], size, b.factor_tmp[size]],
-                    outputs=[b.L[size]],
-                    device=device,
-                    record_tape=not self.parallel_cholesky_adjoint,
-                )
-            if self.parallel_cholesky_adjoint:
+            wp.launch(
+                _factor_dense,
+                dim=n_arts,
+                inputs=[b.H[size], solver._R_by_size[size], size, b.factor_tmp[size]],
+                outputs=[b.L[size]],
+                device=device,
+                record_tape=not self._parallel_cholesky_adjoint,
+            )
+            if self._parallel_cholesky_adjoint:
                 self._record_cholesky_adjoint(b.H[size], b.L[size], b.factor_tmp[size], size, n_arts)
             wp.launch(
                 _solve_dense,
@@ -667,8 +736,70 @@ class DifferentiableStep:
         eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
         self._publish_observables(b, state_in, state_out, contacts, dt, observables, stage_qd)
         self.finish_friction_patches(b, state_out, contacts, dt)
+        if self.world_diagnostics:
+            diagnostics = b.diagnostics()
+            wp.launch(
+                _flag_nonfinite_worlds,
+                dim=diagnostics.flags.shape[0],
+                inputs=[
+                    self._world_joints[0],
+                    self._world_joints[1],
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    state_out.joint_q,
+                    state_out.joint_qd,
+                ],
+                outputs=[diagnostics.flags],
+                device=device,
+                record_tape=False,
+            )
+            self._record_world_adjoint(b, state_out, None, leaving=False)
         solver._step += 1
         return state_out
+
+    def _record_world_adjoint(self, b: _StepBuffers, state: State, control: Control | None, leaving: bool) -> None:
+        """Record a callback that measures, flags and optionally zeroes the world adjoints of ``state``.
+
+        Recorded first, it runs after the step's adjoint (``leaving``); recorded last, before it.
+        """
+        tape = wp._src.context.runtime.tape
+        if tape is None:
+            return
+        model = self.solver.model
+        diagnostics = b.diagnostics()
+        joints, bodies = self._world_joints, self._world_bodies
+
+        def grad(array):
+            return None if array is None else array.grad
+
+        def backward():
+            wp.launch(
+                _world_adjoint_norm,
+                dim=diagnostics.flags.shape[0],
+                inputs=[
+                    joints[0],
+                    joints[1],
+                    bodies[0],
+                    bodies[1],
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_target_q_start,
+                    grad(state.joint_q),
+                    grad(state.joint_qd),
+                    None if leaving else grad(state.body_q),
+                    None if leaving else grad(state.body_qd),
+                    grad(state.body_f) if leaving else None,
+                    None if control is None else grad(control.joint_f),
+                    None if control is None else grad(control.joint_target_q),
+                    None if control is None else grad(control.joint_target_qd),
+                    int(leaving and self.zero_nonfinite_adjoints),
+                    int(leaving),
+                ],
+                outputs=[diagnostics.adjoint_in if leaving else diagnostics.adjoint_out, diagnostics.flags],
+                device=model.device,
+            )
+
+        tape.record_func(backward, [])
 
     def validate_contacts(self) -> None:
         """Raise for contact configurations the differentiable step does not reproduce yet."""
@@ -1205,7 +1336,7 @@ class DifferentiableStep:
             # each pass writing the next one's input.
             torsion_out = c.velocity_limit_input[k] if velocity_limits else c.impulses[k + 1]
             sweep_out = c.torsion_input[k] if torsion else torsion_out
-            tiled = self.tiled_pgs and not record and is_cuda
+            tiled = self._tiled_sweeps and not record and is_cuda
             wp.launch(
                 _dense_pgs_sweep_tiled if tiled else _dense_pgs_sweep,
                 dim=(solver._world_count, TILE_LANES) if tiled else solver._world_count,
@@ -1348,7 +1479,7 @@ class DifferentiableStep:
         regularization, tolerance = self.implicit_regularization, self.implicit_slide_tolerance
 
         def backward():
-            tiled = self.tiled_pgs and wp.get_device(solver.model.device).is_cuda
+            tiled = self._tiled_sweeps and wp.get_device(solver.model.device).is_cuda
             wp.launch(
                 pgs_implicit_adjoint_tiled if tiled else pgs_implicit_adjoint,
                 dim=(worlds, TILE_LANES) if tiled else worlds,
@@ -2145,6 +2276,7 @@ class _StepBuffers:
         self.gyro_iterates = zeros((max(solver._free_root_joint_count, 1), _GYRO_MAX_MICROSTEPS + 1), wp.vec3)
         self.contacts = None
         self.observables = None
+        self._diagnostics = None
         self.H = {}
         self.L = {}
         self.factor_tmp = {}
@@ -2153,6 +2285,17 @@ class _StepBuffers:
             self.H[size] = zeros((n_arts, size, size))
             self.L[size] = zeros((n_arts, size, size))
             self.factor_tmp[size] = zeros((n_arts, 2, size, size))
+
+    def diagnostics(self) -> DifferentiableDiagnostics:
+        if self._diagnostics is None:
+            model = self.owner.solver.model
+            worlds = max(model.world_count, 1)
+            self._diagnostics = DifferentiableDiagnostics(
+                adjoint_out=wp.zeros(worlds, dtype=wp.float32, device=model.device),
+                adjoint_in=wp.zeros(worlds, dtype=wp.float32, device=model.device),
+                flags=wp.zeros(worlds, dtype=wp.int32, device=model.device),
+            )
+        return self._diagnostics
 
     def observable_buffers(self) -> _ObservableBuffers:
         if self.observables is None:
@@ -4583,3 +4726,142 @@ def _contact_force_inputs(c: _ContactBuffers) -> list:
         c.row_type,
         c.row_parent,
     ]
+
+
+def _world_index(item_world: wp.array | None, count: int, worlds: int, device) -> tuple[wp.array, wp.array]:
+    """CSR of the items (joints or bodies) of each world, in index order; global items are left out."""
+    owner = item_world.numpy() if item_world is not None and count else np.zeros(0, dtype=np.int32)
+    worlds = max(worlds, 1)
+    items = np.flatnonzero((owner >= 0) & (owner < worlds))
+    order = items[np.argsort(owner[items], kind="stable")]
+    start = np.zeros(worlds + 1, dtype=np.int32)
+    np.cumsum(np.bincount(owner[items], minlength=worlds), out=start[1:])
+    return (
+        wp.array(start, dtype=wp.int32, device=device),
+        wp.array(
+            np.asarray(order, dtype=np.int32) if order.size else np.zeros(1, np.int32), dtype=wp.int32, device=device
+        ),
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _flag_nonfinite_worlds(
+    world_joint_start: wp.array[int],
+    world_joints: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    flags: wp.array[int],
+):
+    """Set NONFINITE_STATE for worlds whose output state is not finite; clear the backward bits."""
+    world = wp.tid()
+    bad = int(0)
+    for k in range(world_joint_start[world], world_joint_start[world + 1]):
+        joint = world_joints[k]
+        for i in range(joint_q_start[joint], joint_q_start[joint + 1]):
+            if not wp.isfinite(joint_q[i]):
+                bad = _NONFINITE_STATE
+        for i in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+            if not wp.isfinite(joint_qd[i]):
+                bad = _NONFINITE_STATE
+    flags[world] = bad
+
+
+@wp.func
+def _adjoint_square(x: float, total: wp.float64, bad: int) -> tuple[wp.float64, int]:
+    if not wp.isfinite(x):
+        return total, 1
+    return total + wp.float64(x) * wp.float64(x), bad
+
+
+@wp.kernel(enable_backward=False)
+def _world_adjoint_norm(
+    world_joint_start: wp.array[int],
+    world_joints: wp.array[int],
+    world_body_start: wp.array[int],
+    world_bodies: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_f: wp.array[wp.spatial_vector],
+    control_joint_f: wp.array[float],
+    control_target_q: wp.array[float],
+    control_target_qd: wp.array[float],
+    zero_nonfinite: int,
+    flag_nonfinite: int,
+    norm: wp.array[float],
+    flags: wp.array[int],
+):
+    """One world: the norm of its adjoints, the NONFINITE_ADJOINT flag, and optionally zeroing them."""
+    world = wp.tid()
+    total = wp.float64(0.0)
+    bad = int(0)
+    for k in range(world_joint_start[world], world_joint_start[world + 1]):
+        joint = world_joints[k]
+        if joint_q:
+            for i in range(joint_q_start[joint], joint_q_start[joint + 1]):
+                total, bad = _adjoint_square(joint_q[i], total, bad)
+        if joint_qd:
+            for i in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+                total, bad = _adjoint_square(joint_qd[i], total, bad)
+        if control_joint_f:
+            for i in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+                if not wp.isfinite(control_joint_f[i]):
+                    bad = 1
+        if control_target_qd:
+            for i in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+                if not wp.isfinite(control_target_qd[i]):
+                    bad = 1
+        if control_target_q:
+            for i in range(joint_target_q_start[joint], joint_target_q_start[joint + 1]):
+                if not wp.isfinite(control_target_q[i]):
+                    bad = 1
+    for k in range(world_body_start[world], world_body_start[world + 1]):
+        body = world_bodies[k]
+        if body_q:
+            p = wp.transform_get_translation(body_q[body])
+            r = wp.transform_get_rotation(body_q[body])
+            for i in range(3):
+                total, bad = _adjoint_square(p[i], total, bad)
+            for i in range(4):
+                total, bad = _adjoint_square(r[i], total, bad)
+        if body_qd:
+            for i in range(6):
+                total, bad = _adjoint_square(body_qd[body][i], total, bad)
+        if body_f:
+            for i in range(6):
+                total, bad = _adjoint_square(body_f[body][i], total, bad)
+    if bad != 0:
+        norm[world] = wp.inf
+    else:
+        norm[world] = float(wp.sqrt(total))
+    if flag_nonfinite != 0:
+        flags[world] = (flags[world] & _NONFINITE_STATE) | bad * _NONFINITE_ADJOINT
+    if zero_nonfinite == 0 or bad == 0:
+        return
+    for k in range(world_joint_start[world], world_joint_start[world + 1]):
+        joint = world_joints[k]
+        for i in range(joint_q_start[joint], joint_q_start[joint + 1]):
+            if joint_q:
+                joint_q[i] = 0.0
+        for i in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
+            if joint_qd:
+                joint_qd[i] = 0.0
+            if control_joint_f:
+                if not wp.isfinite(control_joint_f[i]):
+                    control_joint_f[i] = 0.0
+            if control_target_qd:
+                if not wp.isfinite(control_target_qd[i]):
+                    control_target_qd[i] = 0.0
+        if control_target_q:
+            for i in range(joint_target_q_start[joint], joint_target_q_start[joint + 1]):
+                if not wp.isfinite(control_target_q[i]):
+                    control_target_q[i] = 0.0
+    for k in range(world_body_start[world], world_body_start[world + 1]):
+        if body_f:
+            body_f[world_bodies[k]] = wp.spatial_vector()
