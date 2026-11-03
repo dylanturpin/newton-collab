@@ -2265,8 +2265,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 responses become ``Y' = Y - Y_B S^-1 (J_B Y)`` and the predictor velocity is
                 projected onto the bilateral constraint manifold once per step, replacing the
                 iterative enforcement. Requires ``solve_mode='matrix_free'`` with
-                ``velocity_iterations == 0``, no FIXED (weld) loop closure (so no link-break
-                model) and at most 8 bilateral rows per articulation; unsupported
+                ``velocity_iterations == 0`` and at most 8 bilateral rows per articulation
+                (a FIXED (weld) loop closure, such as a link-break weld, takes 6); unsupported
                 configurations warn and fall back to iterative rows. Defaults to False.
             bilateral_preelimination_include_mimics (bool, optional): Include mimic rows
                 in the pre-eliminated bilateral block. When False, only connect rows are
@@ -5118,16 +5118,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 "SolverSteel: enable_bilateral_preelimination does not support closures "
                 "with a prescribed (kinematic or world) parent yet; falling back to iterative "
                 "mimic/connect rows.",
-                stacklevel=2,
-            )
-            return
-
-        if self._connect_count and np.any(self._connect_rows_np == 6):
-            warnings.warn(
-                "SolverSteel: enable_bilateral_preelimination does not support FIXED (weld) loop "
-                "closures, such as the welds of a link-break model, yet: pre-eliminating six-row "
-                "welds has not been validated across link-break mechanisms; falling back to "
-                "iterative mimic/connect rows.",
                 stacklevel=2,
             )
             return

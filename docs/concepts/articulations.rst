@@ -1298,9 +1298,10 @@ When building a link-break loop:
 - Cut on the far side of the loop from the articulation root so both branches
   stay short. Welding a long chain back onto its own root is valid but, in
   Steel, leaks more momentum.
-- With :class:`~newton.solvers.SolverSteel`, ``enable_bilateral_preelimination``
-  does not support weld closures yet; it warns and falls back to iterative
-  rows.
+- With :class:`~newton.solvers.SolverSteel`, iterative weld rows converge
+  slowly on spatial loops at low iteration counts. ``enable_bilateral_preelimination``
+  solves a weld exactly when the articulation's loop rows fit its capacity
+  (8 rows, so one weld); larger models warn and fall back to iterative rows.
 - Do not collapse fixed joints in a link-break model: build and import it with
   ``collapse_fixed_joints=False`` and do not call
   :meth:`~newton.ModelBuilder.collapse_fixed_joints` afterwards. Collapsing

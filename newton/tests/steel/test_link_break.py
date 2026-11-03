@@ -500,14 +500,28 @@ def test_link_break_drives_the_loop_closing_joint(test, device):
 
 
 def test_link_break_preelimination_falls_back(test, device):
-    """Pre-elimination does not handle weld closures: asking for it on a link-break model warns and keeps iterative rows."""
-    builder, _body, _com, _hinges, _ = _four_bar("link")
+    """Pre-elimination takes one weld (6 rows); a second weld in the articulation exceeds its 8 rows and falls back."""
+    builder, body, com, hinges, _ = _four_bar("link")
+    model = builder.finalize(device=device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        solver = SolverSteel(model, solve_mode="matrix_free", iterations=2, enable_bilateral_preelimination=True)
+    test.assertTrue(solver._preelim_active)
+    s0, s1, control = model.state(), model.state(), model.control()
+    for _ in range(50):
+        solver.step(s0, s1, control, None, 1.0e-3)
+        s0, s1 = s1, s0
+    test.assertLess(max(_anchor_gaps(s0.body_q.numpy(), body, com, hinges)), 1.0e-5)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the second weld parallels the first
+        builder.add_joint_fixed(parent=body["coupler"], child=body["coupler_shadow"], label="second_weld")
     model = builder.finalize(device=device)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         solver = SolverSteel(model, solve_mode="matrix_free", iterations=16, enable_bilateral_preelimination=True)
     test.assertFalse(solver._preelim_active)
-    test.assertTrue(any("FIXED (weld) loop closures" in str(w.message) for w in caught))
+    test.assertTrue(any("pre-elimination capacity" in str(w.message) for w in caught))
 
 
 def test_weld_to_world_returns_the_short_way(test, device):
