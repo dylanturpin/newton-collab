@@ -21,7 +21,7 @@ from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 # Row families a torsion group can live in: dense rows appended per world, or propagation rows hosted in a
-# reserved spare after the group's highest-index member.
+# reserved spare after the group's highest-index member (on the colored response, its member in the highest row).
 _DENSE = 0
 _PROPAGATION = 1
 
@@ -347,6 +347,7 @@ def _emit_patches(
     world_count: int,
     row_capacity: int,
     row_count: wp.array[int],
+    host_last_row: int,
     work: _Workspace,
     torsion_head: wp.array[int],
     torsion_first: wp.array2d[int],
@@ -372,7 +373,9 @@ def _emit_patches(
                 requested += 1
                 row = _append_group(work, rep, world, row, row_capacity)
             else:
-                spin = _link_propagation_group(work, rep, world, spin, torsion_head, torsion_first, torsion_next)
+                spin = _link_propagation_group(
+                    work, rep, world, spin, host_last_row, torsion_head, torsion_first, torsion_next
+                )
     if family == _DENSE:
         _finish_dense_rows(work, world, row_count[world], requested, row, row_capacity, overflow, warn)
 
@@ -433,12 +436,24 @@ def _link_propagation_group(
     representative: int,
     world: int,
     previous_spin: int,
+    host_last_row: int,
     torsion_head: wp.array[int],
     torsion_first: wp.array2d[int],
     torsion_next: wp.array2d[int],
 ):
-    """Host a propagation group in its last member's spare and append it and its members to the world's lists."""
-    spin = work.spare[work.tail[representative]]
+    """Host a propagation group in its last member's spare and append it and its members to the world's lists.
+
+    The last member is the highest-index one, or with ``host_last_row`` the one in the highest row.
+    """
+    host = work.tail[representative]
+    if host_last_row != 0:
+        # The colored sweep solves a world's units in row order, so this unit runs after every member's.
+        member = representative
+        while member >= 0:
+            if work.slot[member] > work.slot[host]:
+                host = member
+            member = work.next_member[member]
+    spin = work.spare[host]
     work.spin_row[representative] = spin
     if previous_spin < 0:
         torsion_head[world] = spin
@@ -468,6 +483,7 @@ def _group_world(
     mu: wp.array2d[float],
     propagation_mu: wp.array2d[float],
     shape_radius: wp.array[float],
+    host_last_row: int,
     work: _Workspace,
     torsion_head: wp.array[int],
     torsion_first: wp.array2d[int],
@@ -559,7 +575,7 @@ def _group_world(
                         row = _append_group(work, cluster, world, row, row_capacity)
                     else:
                         spin = _link_propagation_group(
-                            work, cluster, world, spin, torsion_head, torsion_first, torsion_next
+                            work, cluster, world, spin, host_last_row, torsion_head, torsion_first, torsion_next
                         )
     if family == _DENSE:
         _finish_dense_rows(work, world, row_count[world], requested, row, row_capacity, overflow, warn)
@@ -766,6 +782,7 @@ class DeviceTorsionPreparation:
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
         # Propagation torsion groups exist only when plain propagation hosts them in reserved spares.
         self.propagation = bool(solver._propagation_torsion_rows)
+        self.host_last_row = int(self.propagation and solver._propagation_colored)
         propagation_shape = (solver._world_count, solver._propagation_max_constraints) if self.propagation else (1, 1)
         w.propagation_row_contact = wp.full(propagation_shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver._world_count, dtype=int, device=device)
@@ -959,6 +976,7 @@ class DeviceTorsionPreparation:
                     s._world_count,
                     s._articulation_constraint_max,
                     s._constraint_count,
+                    self.host_last_row,
                     w,
                     *self._torsion_lists(),
                     s.constraint_overflow,
@@ -979,6 +997,7 @@ class DeviceTorsionPreparation:
                     s._row_mu,
                     *self._propagation_rows("_propagation_row_mu"),
                     s._contact_torsion_shape_radius,
+                    self.host_last_row,
                     w,
                     *self._torsion_lists(),
                     s.constraint_overflow,

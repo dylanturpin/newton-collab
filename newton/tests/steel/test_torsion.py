@@ -2941,6 +2941,43 @@ class TestColoredPropagationTorsion(unittest.TestCase):
                     self.assertEqual(body_a[row], -1)
                     self.assertEqual(int(solver._propagation_row_parent.numpy()[0, row]), -1)
 
+    def test_longest_first_hosts_the_group_in_its_last_unit(self):
+        """Host a patch group whose highest-index member carries the friction rows in the member colored last."""
+
+        def far_end_carrier(contacts):
+            # The axial extremes of this footprint are contacts 0 and 3, which carry the patch's friction rows.
+            for name in ("rigid_contact_point0", "rigid_contact_point1"):
+                points = getattr(contacts, name).numpy()
+                points[:4, :2] = [(-0.02, -0.015), (-0.02, 0.015), (0.01, 0.0), (0.02, 0.0)]
+                getattr(contacts, name).assign(points)
+
+        for order in ("contact", "longest_first"):
+            with self.subTest(order=order):
+                solvers = []
+                sweeps = _record_propagation_sweeps(
+                    0.01,
+                    on_solver=solvers.append,
+                    response=_COLORED_TORSION,
+                    edit_contacts=far_end_carrier,
+                    spin=1.0,
+                    propagation_color_order=order,
+                    **PATCH_OPTIONS,
+                )
+                (solver,) = solvers
+                needed = solver._contact_slots_needed.numpy()[:4]
+                np.testing.assert_array_equal(needed, [4, 2, 2, 4])
+                slots = solver._contact_slot.numpy()[:4]
+                colors = _contact_colors(solver)
+                ((spin, members),) = _propagation_torsion_rows(solver).items()
+                self.assertEqual(sorted(members), sorted(int(slot) for slot in slots))
+                host = int(np.argmax(slots))
+                self.assertEqual(spin, int(slots[host] + needed[host] - 1))
+                self.assertEqual(colors[host], max(colors.values()))
+                if order == "longest_first":
+                    # The friction-carrying members color first, so the highest-index member is not the last unit.
+                    self.assertLess(colors[3], colors[host])
+                _assert_torsion_budgets(self, sweeps, group_slack=_GROUP_SLACK)
+
     def test_budget_holds_after_every_sweep(self):
         """Keep each torsion impulse within its group's residual sliding budget after every sweep of each colored body."""
         for variant in COLORED_VARIANTS:
@@ -3398,16 +3435,19 @@ def _spare_rows(solver, count):
     return {c: int(slots[c] + needed[c] - 1) for c in range(count) if slots[c] >= 0}
 
 
-def _record_propagation_sweeps(radius, on_solver=None, response=None, **options):
+def _record_propagation_sweeps(radius, on_solver=None, response=None, edit_contacts=None, **options):
     """Record world 0's propagation impulses after every sweep of one pad-fixture step.
 
-    ``response`` holds the solver's response options, plain propagation by default.
+    ``response`` holds the solver's response options, plain propagation by default; ``edit_contacts`` gets the
+    contacts before the step.
     """
     sweeps = []
     response = _PROPAGATION_TORSION if response is None else response
     _, solver, model, state, contacts = fixture(radius, step=False, **options, **response)
     if on_solver is not None:
         on_solver(solver)
+    if edit_contacts is not None:
+        edit_contacts(contacts)
     sweep_once = solver._propagation_pgs_solve_one_iteration
 
     def sweep(**kwargs):
