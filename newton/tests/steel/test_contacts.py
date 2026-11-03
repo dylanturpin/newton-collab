@@ -4185,10 +4185,11 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
 
 
 def _momentum_solves(model, **options):
-    """Settle a scene, then return a one-step solver at a chosen sweep count and its velocity error.
+    """Settle a scene; return the velocity error and the free-body momentum imbalance of one solve.
 
     The error is the mass-weighted body velocity distance from an 8000-sweep plain Gauss-Seidel
-    solve, in units of one step of gravity.
+    solve; the imbalance is the largest gap between a free body's linear momentum change and gravity
+    plus its reported contact impulses. Both are in units of one step of gravity.
     """
     dt = 1.0 / 60.0
     options = {"solve_mode": "matrix_free", **options}
@@ -4204,12 +4205,14 @@ def _momentum_solves(model, **options):
         state, output = output, state
     pipeline.collide(state, contacts)
     start = model.state()
+    observables = None
 
     def solve(iterations, momentum):
+        nonlocal observables
         start.assign(state)
-        SolverSteel(model, iterations=iterations, nesterov_momentum=momentum, **options).step(
-            start, output, control, contacts, dt
-        )
+        solver = SolverSteel(model, iterations=iterations, nesterov_momentum=momentum, **options)
+        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+        solver.step(start, output, control, contacts, dt, observables=observables)
         return output.body_qd.numpy()
 
     mass = model.body_mass.numpy()
@@ -4221,7 +4224,21 @@ def _momentum_solves(model, **options):
         energy = np.sum(mass * np.sum(delta[:, :3] ** 2, 1)) + np.sum(inertia * np.sum(delta[:, 3:] ** 2, 1))
         return np.sqrt(energy) / (np.sqrt(mass.sum()) * 9.81 * dt)
 
-    return error
+    def imbalance(iterations, momentum):
+        change = mass[:, None] * (solve(iterations, momentum)[:, :3] - state.body_qd.numpy()[:, :3])
+        change[:, 2] += mass * 9.81 * dt
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        impulse = observables.contact_f.numpy()[:count, :3] * dt
+        owners = model.shape_body.numpy()
+        for body, sign in (
+            (owners[contacts.rigid_contact_shape0.numpy()[:count]], 1.0),
+            (owners[contacts.rigid_contact_shape1.numpy()[:count]], -1.0),
+        ):
+            live = body >= 0
+            np.add.at(change, body[live], -sign * impulse[live])
+        return np.max(np.abs(change)) / (mass.max() * 9.81 * dt)
+
+    return error, imbalance
 
 
 def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
@@ -4236,9 +4253,11 @@ def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
     builder.add_ground_plane()
     model = builder.finalize(device=device)
-    error = _momentum_solves(model)
+    error, imbalance = _momentum_solves(model)
 
     test.assertLess(error(2000, True), 0.05)
+    # Velocity must keep representing the reported impulses over a long solve.
+    test.assertLess(imbalance(2000, True), 1.0e-3)
     plain, accelerated = error(24, False), error(24, True)
     test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.3f}, momentum {accelerated:.3f}")
 
@@ -4284,7 +4303,7 @@ def test_nesterov_momentum_on_articulated_rows(test, device):
         test.assertFalse(getattr(general, name), name)
     test.assertIsNone(general._sparse_mass_matrix_size)
 
-    error = _momentum_solves(
+    error, _ = _momentum_solves(
         model, articulation_constraint_max=128, enable_joint_limits=True, enable_joint_velocity_limits=True
     )
     test.assertLess(error(2000, True), 1.0e-4)
