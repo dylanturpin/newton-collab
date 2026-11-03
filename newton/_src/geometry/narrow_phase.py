@@ -1451,9 +1451,9 @@ def create_narrow_phase_kernels_gjk_mpr_split(
 
     support_funcs = create_support_map_function(support_func, use_precomputed_center=True)
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
-    # Overlap refinement runs one pair per warp: a box against a detailed convex hull streams every hull
+    # Overlap refinement can run one pair per warp: a box against a detailed convex hull streams every hull
     # triangle through the separating-axis certificate, which on one thread is the narrow phase's long tail.
-    # Internal test switch: 0 keeps one pair per thread.
+    # Internal test switch: 0 always keeps one pair per thread.
     cooperative_refine = os.environ.get("NEWTON_COOPERATIVE_REFINE", "1") != "0"
     solve_mpr_refine = (
         create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
@@ -1592,12 +1592,12 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     def create_distance_kernel(refine_overlap: bool):
         # Compile refinement separately: its retries and raycast would raise
         # register pressure for every ordinary separated GJK query.
-        # Refinement runs one pair per warp: all lanes take the same pair, split the box-mesh certificate's
-        # triangle stream, and lane 0 writes the result.
+        # Refinement runs one pair per warp when the queue fits (all lanes take the same pair, split the
+        # box-mesh certificate's triangle stream, and lane 0 writes the result), and one pair per thread
+        # when it does not, so long queues of cheap pairs keep the full grid's parallelism.
         per_warp = refine_overlap and cooperative_refine
-        lanes = 32 if per_warp else 1
 
-        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}_w{lanes}")
+        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}_w{int(per_warp)}")
         def narrow_phase_gjk_kernel(
             candidate_pair: wp.array[wp.vec2i],
             shape_types: wp.array[int],
@@ -1622,14 +1622,19 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             manifold_work_count: wp.array[int],
         ):
             tid = wp.tid()
-            lane = tid % wp.static(lanes)
             # Separated queries fill the front of the queue and overlap
             # refinements the back.
             num_distance = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
             num_work_items = num_distance
             if wp.static(refine_overlap):
                 num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
-            for work_index in range(tid // wp.static(lanes), num_work_items, total_num_threads // wp.static(lanes)):
+            # Uniform across the launch: every thread reads the same count.
+            lanes = int(1)
+            if wp.static(per_warp):
+                if num_work_items * 32 <= total_num_threads:
+                    lanes = 32
+            lane = tid % lanes
+            for work_index in range(tid // lanes, num_work_items, total_num_threads // lanes):
                 pair_index = gjk_work_items[work_index]
                 witnesses_valid = False
                 if wp.static(refine_overlap):
@@ -1655,6 +1660,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 if valid:
                     provider = provider_type()
                     provider.shape_support_data = shape_support_data
+                    provider.warp_cooperative = int(lanes == 32)
                     if query.type_a != GeoType.PLANE and query.type_b != GeoType.PLANE:
                         query.geom_a.bounds_half = _penetration_bounds_half(
                             query.shape_a,

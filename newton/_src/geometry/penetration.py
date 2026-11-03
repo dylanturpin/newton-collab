@@ -211,10 +211,11 @@ def _box_box_depth(half_a: wp.vec3, half_b: wp.vec3, rotation: wp.quat, position
 def create_solve_box_penetration(support: Any, cooperative: bool = False):
     """Find minimum depth for a box against a box, triangle, or convex mesh.
 
-    ``cooperative`` builds the variant for kernels in which all 32 lanes of a warp solve the same pair
-    (the split narrow phase's overlap refinement): the lanes split the convex-mesh triangle stream and
-    share the running minimum after every 32 triangles, so one box-hull pair costs about one triangle in
-    32 per lane instead of the whole stream on one thread. Every lane returns the same normal and depth.
+    ``cooperative`` builds the variant for kernels that may run all 32 lanes of a warp on the same pair
+    (the split narrow phase's overlap refinement). When the provider's ``warp_cooperative`` is set, the
+    lanes split the convex-mesh triangle stream and share the running minimum after every 32 triangles,
+    so one box-hull pair costs about one triangle in 32 per lane instead of the whole stream on one
+    thread, and every lane returns the same normal and depth. Unset, it is the serial loop.
 
     Box and triangle pairs use the closed-form separating-axis test. For
     convex meshes, cheap certificates come first: a box plus a triangle of
@@ -412,19 +413,22 @@ def create_solve_box_penetration(support: Any, cooperative: bool = False):
         extent = float(0.0)
         lane = int(0)
         width = int(1)
+        warp_mode = False
         if wp.static(cooperative):
+            warp_mode = provider.warp_cooperative != 0
+        if warp_mode:
             lane = _coop_lane()
             width = _coop_width()
         for i in range(lane, n_points, width):
             point = wp.cw_mul(mesh.points[i], mesh_scale)
             center += point
             extent = wp.max(extent, wp.max(wp.abs(point[0]), wp.max(wp.abs(point[1]), wp.abs(point[2]))))
-        if wp.static(cooperative):
+        if warp_mode:
             center = wp.vec3(_coop_sum(center[0]), _coop_sum(center[1]), _coop_sum(center[2]))
             extent = _coop_max(extent)
         center /= float(n_points)
         tolerance = 1.0e-6 * extent
-        if wp.static(cooperative):
+        if warp_mode:
             # Every lane runs the same number of rounds, so the shuffles below see the whole warp.
             for base in range(0, n_triangles, 32):
                 triangle = base + lane
@@ -494,7 +498,7 @@ def create_solve_box_penetration(support: Any, cooperative: bool = False):
                 best_vertex,
                 recent_vertex,
             )
-        if wp.static(cooperative):
+        if warp_mode:
             # Lanes kept their own pruning hints; hand every lane lane 0's answer.
             depth = _coop_broadcast(depth, 0)
             normal = _coop_broadcast_vec3(normal, 0)

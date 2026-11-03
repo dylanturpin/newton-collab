@@ -16,7 +16,7 @@ from newton.tests.test_convex_contact_witness import (
     _failed_distance_query,
     _unconverged_distance_query,
 )
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
 def _contacts(
@@ -289,6 +289,73 @@ def test_refinement_resting_box_stack(test, device):
                 test.assertAlmostEqual(float(np.dot(pb - pa, normals[i])), 0.0, delta=1.0e-4)
 
 
+def _rounded_box_hull(half, radius, samples=15):
+    """A box with rounded corners as a convex hull, the shape of the crane hulls in Steel's wrecking ball."""
+    from newton._src.geometry.utils import remesh_convex_hull  # noqa: PLC0415
+
+    rng = np.random.default_rng(3)
+    points = []
+    for signs in product((-1.0, 1.0), repeat=3):
+        corner = np.asarray(half) - radius
+        for _ in range(samples):
+            d = np.abs(rng.normal(size=3)) * signs
+            points.append(corner * signs + radius * d / np.linalg.norm(d))
+    vertices, faces = remesh_convex_hull(np.asarray(points, dtype=np.float32))
+    return newton.Mesh(vertices, np.asarray(faces, dtype=np.int32).ravel(), compute_inertia=False)
+
+
+def test_refinement_cooperative_matches_serial(test, device):
+    """One-pair-per-warp overlap refinement returns the per-thread kernel's contacts.
+
+    Boxes overlap a rounded-box convex hull at its faces, edges and corners, where the box-mesh
+    certificate's cheap bounds do not settle the depth and it streams every hull triangle (the work the
+    warp splits). The short refine queue takes the cooperative path; a pipeline built with
+    ``NEWTON_COOPERATIVE_REFINE=0`` refines the same pairs one per thread.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.ShapeConfig(gap=1.0e-3, density=0.0)
+    half = np.array([0.12, 0.08, 0.06])
+    builder.add_shape_convex_hull(-1, mesh=_rounded_box_hull(half, 0.005), cfg=cfg)
+    rng = np.random.default_rng(5)
+    poses = [wp.transform(wp.vec3(0.0, 0.0, -0.105), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.02))]
+    for _ in range(15):
+        # a point on the hull's surface near an edge or corner, with a small random overlap
+        target = half * rng.choice((-1.0, 1.0), size=3) * rng.uniform(0.6, 1.0, size=3)
+        axis = wp.normalize(wp.vec3(*rng.normal(size=3)))
+        poses.append(wp.transform(wp.vec3(*target), wp.quat_from_axis_angle(axis, float(rng.uniform(0.0, np.pi)))))
+    for i, pose in enumerate(poses):
+        body = builder.add_body(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3)))
+        size = (0.2, 0.15, 0.05) if i == 0 else (0.05, 0.04, 0.03)
+        builder.add_shape_box(body, hx=size[0], hy=size[1], hz=size[2], cfg=cfg)
+    model = builder.finalize(device)
+    results = {}
+    for mode in ("1", "0"):
+        with (
+            patch.dict("os.environ", {"NEWTON_COOPERATIVE_REFINE": mode}),
+            patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0),
+        ):
+            pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+        test.assertTrue(pipeline.narrow_phase.split_gjk_mpr)
+        test.assertIn(f"_True_w{int(mode == '1')}", pipeline.narrow_phase.narrow_phase_refine_kernel.module.name)
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        test.assertGreater(int(pipeline.narrow_phase.split_gjk_work_count.numpy()[1]), 0, "no pair reached refinement")
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        rows = np.column_stack(
+            (
+                contacts.rigid_contact_shape0.numpy()[:count],
+                contacts.rigid_contact_shape1.numpy()[:count],
+                contacts.rigid_contact_normal.numpy()[:count],
+                contacts.rigid_contact_point0.numpy()[:count],
+                contacts.rigid_contact_point1.numpy()[:count],
+            )
+        )
+        results[mode] = rows[np.lexsort(rows.T[::-1])]
+    test.assertGreater(len(results["1"]), 0)
+    test.assertEqual(results["1"].shape, results["0"].shape)
+    np.testing.assert_allclose(results["1"], results["0"], rtol=0.0, atol=1.0e-6)
+
+
 class TestConvexRefinementRegressions(unittest.TestCase):
     pass
 
@@ -302,6 +369,13 @@ for function in (
     test_refinement_resting_box_stack,
 ):
     add_function_test(TestConvexRefinementRegressions, function.__name__, function, devices=get_test_devices())
+# The split narrow phase, and with it cooperative refinement, runs on CUDA only.
+add_function_test(
+    TestConvexRefinementRegressions,
+    test_refinement_cooperative_matches_serial.__name__,
+    test_refinement_cooperative_matches_serial,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":
