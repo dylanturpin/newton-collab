@@ -7426,6 +7426,29 @@ class ModelBuilder:
         """
         joints_to_keep = set(joints_to_keep or ())
 
+        # A FIXED joint outside every articulation whose child also has an articulated joint closes a loop (for
+        # example the weld of a link-break loop). The traversal below either merges across it or drops it, which
+        # opens the loop, so warn instead of failing silently.
+        incoming = {}
+        for j in range(self.joint_count):
+            incoming.setdefault(self.joint_child[j], []).append(j)
+        loop_welds = [
+            j
+            for j in range(self.joint_count)
+            if self.joint_type[j] == JointType.FIXED
+            and self.joint_articulation[j] < 0
+            and any(k != j and self.joint_articulation[k] >= 0 for k in incoming[self.joint_child[j]])
+        ]
+        if loop_welds:
+            labels = ", ".join(repr(self.joint_label[j]) for j in loop_welds)
+            warnings.warn(
+                f"collapse_fixed_joints() does not preserve FIXED loop-closing joints ({labels}): they are merged "
+                "or dropped, which opens their loops. Build or import link-break models without collapsing fixed "
+                "joints (collapse_fixed_joints=False).",
+                UserWarning,
+                stacklevel=2,
+            )
+
         body_data = {}
         body_children = {-1: []}
         visited = {}

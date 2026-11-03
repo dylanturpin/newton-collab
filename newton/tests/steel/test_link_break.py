@@ -511,7 +511,19 @@ def test_link_break_preelimination_falls_back(test, device):
 
 
 class TestSteelLinkBreak(unittest.TestCase):
-    pass
+    def test_collapse_fixed_joints_warns_on_a_weld_closure(self):
+        """Collapsing fixed joints opens a link-break loop, so it warns; a joint-break loop collapses quietly."""
+        builder, *_ = _four_bar("link")
+        with self.assertWarnsRegex(UserWarning, r"does not preserve FIXED loop-closing joints \('coupler_weld'\)"):
+            builder.collapse_fixed_joints()
+        builder, *_ = _four_bar("joint")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            builder.collapse_fixed_joints()
+        if USD_AVAILABLE:
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            with self.assertWarnsRegex(UserWarning, r"does not preserve FIXED loop-closing joints"):
+                builder.add_usd(_four_bar_link_break_stage(), collapse_fixed_joints=True)
 
 
 for _name in (

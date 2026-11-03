@@ -1301,6 +1301,12 @@ When building a link-break loop:
 - With :class:`~newton.solvers.SolverSteel`, ``enable_bilateral_preelimination``
   does not support weld closures yet; it warns and falls back to iterative
   rows.
+- Do not collapse fixed joints in a link-break model: build and import it with
+  ``collapse_fixed_joints=False`` and do not call
+  :meth:`~newton.ModelBuilder.collapse_fixed_joints` afterwards. Collapsing
+  merges the shadow into its primary or drops the weld, either of which opens
+  the loop; :meth:`~newton.ModelBuilder.collapse_fixed_joints` warns when it
+  finds a weld closure.
 
 The same structure can be authored in an asset:
 
