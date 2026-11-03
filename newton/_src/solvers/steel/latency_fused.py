@@ -12,7 +12,8 @@ own world's data, so one block per world can run the whole loop in a single laun
 The block's warps take fixed roles and call the existing device functions (each factory exposes its
 ``kernel.native``), so the math is the same code:
 
-* warp 0: row phases (3, 4, then 5), the cache snapshot, the colored sweep, and the GEMV;
+* warp 0: row phases (3, 4, then 5), the cache snapshot, and the GEMV; every warp the colored sweep
+  (a color wider than one warp spreads over the block);
 * warp 1 + i: tree variant ``i`` (a size group's warp kernels), refresh and impulse propagation for the
   world's articulations of that group, one after another;
 * the last warp: free-rigid body velocity refresh and flush.
@@ -219,12 +220,11 @@ def get_fused_iteration_kernel(
     tree_natives: tuple[tuple[Any, Any], ...],
     has_phase3: bool,
     has_phase5: bool,
-    colored_block: bool = False,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
-    ``colored_block``: ``colored_native`` is the block-wide variant (built with ``block_threads`` equal to
-    the launch's block size), which every warp calls so wide colors use the whole block.
+    ``colored_native`` is the block-wide variant (built with ``block_threads`` equal to the launch's block
+    size), which every warp calls so wide colors use the whole block.
     ``tree_natives`` holds ``(propagate, refresh)`` device functions per tree variant (at most
     :data:`MAX_TREE_SLOTS`); ``gemv_native`` is ``None`` without cached responses. Launch it with
     ``wp.launch_tiled(dim=[world_count], block_dim=32 * warp_count(len(tree_natives)))``.
@@ -340,16 +340,16 @@ def get_fused_iteration_kernel(
             if warp_id == 0:
                 if wp.static(has_cache):
                     _cache_snapshot(world, lane, cache, cache_max_bodies, colored.body_list, body_qd)
-            if wp.static(colored_block) or warp_id == 0:
-                wp.static(colored_native)(
-                    world, world_count, colored.constraint_count, colored.body_a, colored.body_b, colored.MiJt_a,
-                    colored.MiJt_b, colored.J_a, colored.J_b, colored.eff_mass_inv, colored.rhs, colored.row_w,
-                    colored.row_type, colored.row_parent, colored.row_mu, colored.compliance_gamma,
-                    colored.torsion_first, colored.torsion_next, colored.torsion_row_radius, colored.row_order,
-                    colored.color_offsets, colored.body_list, colored.body_count, colored.body_local_slot,
-                    colored.unit_meta, colored.unit_friction_setup, colored.unit_payload, colored.ring_overflow, omega,
-                    colored_regularize, friction_start_iteration, g, colored.impulses, body_qd, body_impulses,
-                )  # fmt: skip
+            # every warp: a color wider than one warp spreads over the block
+            wp.static(colored_native)(
+                world, world_count, colored.constraint_count, colored.body_a, colored.body_b, colored.MiJt_a,
+                colored.MiJt_b, colored.J_a, colored.J_b, colored.eff_mass_inv, colored.rhs, colored.row_w,
+                colored.row_type, colored.row_parent, colored.row_mu, colored.compliance_gamma,
+                colored.torsion_first, colored.torsion_next, colored.torsion_row_radius, colored.row_order,
+                colored.color_offsets, colored.body_list, colored.body_count, colored.body_local_slot,
+                colored.unit_meta, colored.unit_friction_setup, colored.unit_payload, colored.ring_overflow, omega,
+                colored_regularize, friction_start_iteration, g, colored.impulses, body_qd, body_impulses,
+            )  # fmt: skip
             _block_sync()
             # push the deferred impulses into generalized velocities: GEMV, trees and free bodies own
             # disjoint DOFs, bodies and impulses, so they run side by side

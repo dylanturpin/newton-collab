@@ -1181,13 +1181,6 @@ def _mfgs_resident_metadata_bytes(max_constraints: int, *, has_drive_rows: bool,
     return 4 * max_constraints * (4 + 4 * int(has_drive_rows) + int(fuse_vel_limits))
 
 
-# Latency mode (SolverSteel._setup_latency_fused): "auto" when the worlds fit one block per SM. Tests and
-# benchmarks patch "on" / "off" to compare with the per-pass launches; it is not a user setting.
-_LATENCY_MODE = "auto"
-# Wide colors take the whole latency block; tests patch False for the warp-0 sweep.
-_LATENCY_COLORED_BLOCK = True
-# Multi-DOF trees take the one-warp tree kernels; tests patch False for the serial reference.
-_TREE_MULTIDOF_WARP = True
 # Latency mode runs a tree group's articulations one after another on one warp; past this many per world
 # the per-pass kernels (a warp per articulation) are faster.
 _LATENCY_MAX_ARTS_PER_GROUP = 4
@@ -7868,7 +7861,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._refresh_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._propagation_tree_multidof_warp_sizes: set[int] = set()
-        multidof_warp = _TREE_MULTIDOF_WARP
         self._propagation_joint_parent_slot = None
         if model.device.is_cuda and self._propagation_contacts_enabled():
             self._propagation_joint_parent_slot = self._build_propagation_joint_parent_slot(model)
@@ -7913,7 +7905,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                     )
                 elif (
                     size > 0
-                    and multidof_warp
                     and self._propagation_tree_has_non_free_by_size.get(size_i, True)
                     and self._propagation_tree_multidof_by_size.get(size_i, False)
                     and _propagate_tree_impulses_multidof_shared_bytes(group_max_joints[size_i])
@@ -8021,9 +8012,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         """
         self._latency_fused_kernel = None
         self._latency_fused = False
-        mode = _LATENCY_MODE
-        if mode == "off":
-            return
         if not (
             model.device.is_cuda
             and self._solve_mode == "matrix_free"
@@ -8037,7 +8025,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             and getattr(self, "_pgs_solve_mf_gs_kernel_for_phase", None) is not None
         ):
             return
-        if mode == "auto" and self._world_count > int(getattr(model.device, "sm_count", 0) or 0):
+        # one block per world: past one world per SM the per-pass grids fill the GPU better
+        if self._world_count > int(getattr(model.device, "sm_count", 0) or 0):
             return
         # every articulated size group needs the one-warp tree kernels; one warp role per group
         slots = []
@@ -8075,11 +8064,9 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_latency_fused_kernel(self, device_arch: int, slots):
         """Compile the fused loop, keeping matrix-free impulses in global memory if shared memory runs out."""
         mb, colored_options = self._colored_latency_build
-        # Wide colors take the whole block.
-        colored_block = _LATENCY_COLORED_BLOCK
         colored = _get_pgs_solve_propagation_colored_warp_kernel(
             self._propagation_max_constraints, PROPAGATION_COLOR_TAIL + 2, mb, 1, 1, device_arch, staged=False,
-            block_threads=32 * latency_fused.warp_count(len(slots)) if colored_block else 0, **colored_options,
+            block_threads=32 * latency_fused.warp_count(len(slots)), **colored_options,
         )  # fmt: skip
         gemv = None
         if self._propagation_cached_response_active and self._propagation_cached_gemv_kernel is not None:
@@ -8102,7 +8089,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 tuple((propagate.native, refresh.native) for _size, propagate, refresh in slots),
                 has_phase3=self._split_matrix_free_row_phase_may_have_work(3),
                 has_phase5=self._split_matrix_free_row_phase_may_have_work(5),
-                colored_block=colored_block,
             )
             try:
                 # compile now: a kernel over the static shared-memory limit is rejected here, not mid-step;

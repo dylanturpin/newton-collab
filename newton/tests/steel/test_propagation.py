@@ -3981,13 +3981,6 @@ class TestPropagationMultiDofWarp(unittest.TestCase):
         for name in _WARP_KERNEL_DICTS:
             self.assertIsNotNone(getattr(solver, name)[size], f"{name}[{size}] should hold a warp variant")
 
-    def test_multidof_switch_off_keeps_serial(self):
-        with patch("newton._src.solvers.steel.solver_steel._TREE_MULTIDOF_WARP", False):
-            solver = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
-        size = self._size(solver)
-        self.assertNotIn(size, solver._propagation_tree_multidof_warp_sizes)
-        self.assertIsNone(solver._propagate_tree_warp_kernels_by_size[size])
-
     def _paired_solvers(self, n_steps):
         solver_w = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
         solver_s = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
@@ -4179,10 +4172,9 @@ class TestLatencyFusedLoop(unittest.TestCase):
 
     def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
         """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
-        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "on"):
-            solver = SolverSteel(
-                model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", **solver_options
-            )
+        solver = SolverSteel(
+            model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", **solver_options
+        )
         self.assertTrue(solver._latency_fused)
         wide = [0]
         loop = type(solver)._launch_matrix_free_gs_solve_propagation_tree
@@ -4259,14 +4251,24 @@ class TestLatencyFusedLoop(unittest.TestCase):
             builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
         )
 
-    def test_mode_switch(self):
-        model = _build_latency_scene("cuda:0")
-        # auto: on while the worlds fit one block per SM
-        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "auto"):
-            solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_colored")
+    def test_on_for_few_worlds_only(self):
+        # one block per world: on while the worlds fit one block per SM, off past it
+        solver = SolverSteel(
+            _build_latency_scene("cuda:0"), solve_mode="matrix_free", articulated_contact_response="propagation_colored"
+        )
         self.assertEqual(solver._latency_fused, N_WORLDS <= wp.get_device("cuda:0").sm_count)
-        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "off"):
-            solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_colored")
+        scene = newton.ModelBuilder()
+        for _ in range(wp.get_device("cuda:0").sm_count + 1):
+            world = newton.ModelBuilder()
+            box = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+            world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+            scene.add_world(world)
+        scene.add_ground_plane()
+        solver = SolverSteel(
+            scene.finalize(device="cuda:0"),
+            solve_mode="matrix_free",
+            articulated_contact_response="propagation_colored",
+        )
         self.assertFalse(solver._latency_fused)
 
 

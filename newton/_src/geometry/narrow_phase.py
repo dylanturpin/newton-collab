@@ -101,11 +101,6 @@ def _reserve_compacted_slot(predicate: int, work_count: wp.array[int]) -> int:
     return wp.atomic_add(work_count, 0, 1)
 
 
-# Refine short overlap queues one pair per warp (see create_narrow_phase_kernels_gjk_mpr_split). Tests patch it
-# to False for the one-pair-per-thread reference.
-_COOPERATIVE_REFINE = True
-
-
 @wp.func
 def _append_work_index_compacted(
     predicate: bool,
@@ -1457,12 +1452,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
     # Overlap refinement can run one pair per warp: a box against a detailed convex hull streams every hull
     # triangle through the separating-axis certificate, which on one thread is the narrow phase's long tail.
-    cooperative_refine = _COOPERATIVE_REFINE
-    solve_mpr_refine = (
-        create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
-        if cooperative_refine
-        else solve_mpr
-    )
+    solve_mpr_refine = create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
@@ -1598,7 +1588,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
         # Refinement runs one pair per warp when the queue fits (all lanes take the same pair, split the
         # box-mesh certificate's triangle stream, and lane 0 writes the result), and one pair per thread
         # when it does not, so long queues of cheap pairs keep the full grid's parallelism.
-        per_warp = refine_overlap and cooperative_refine
+        per_warp = refine_overlap
 
         @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}_w{int(per_warp)}")
         def narrow_phase_gjk_kernel(

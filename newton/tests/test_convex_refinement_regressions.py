@@ -305,12 +305,12 @@ def _rounded_box_hull(half, radius, samples=15):
 
 
 def test_refinement_cooperative_matches_serial(test, device):
-    """One-pair-per-warp overlap refinement returns the per-thread kernel's contacts.
+    """One-pair-per-warp overlap refinement returns what one pair per thread returns.
 
     Boxes overlap a rounded-box convex hull at its faces, edges and corners, where the box-mesh
     certificate's cheap bounds do not settle the depth and it streams every hull triangle (the work the
-    warp splits). The short refine queue takes the cooperative path; a pipeline built with
-    the cooperative path patched off refines the same pairs one per thread.
+    warp splits). The captured refine launch is replayed with enough threads for one pair per warp and
+    with too few, which the kernel then refines one pair per thread.
     """
     builder = newton.ModelBuilder()
     cfg = builder.ShapeConfig(gap=1.0e-3, density=0.0)
@@ -328,32 +328,48 @@ def test_refinement_cooperative_matches_serial(test, device):
         size = (0.2, 0.15, 0.05) if i == 0 else (0.05, 0.04, 0.03)
         builder.add_shape_box(body, hx=size[0], hy=size[1], hz=size[2], cfg=cfg)
     model = builder.finalize(device)
-    results = {}
-    for mode in ("1", "0"):
-        with (
-            patch("newton._src.geometry.narrow_phase._COOPERATIVE_REFINE", mode == "1"),
-            patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0),
-        ):
-            pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
-        test.assertTrue(pipeline.narrow_phase.split_gjk_mpr)
-        test.assertIn(f"_True_w{int(mode == '1')}", pipeline.narrow_phase.narrow_phase_refine_kernel.module.name)
-        contacts = pipeline.contacts()
+    with patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0):
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    narrow = pipeline.narrow_phase
+    test.assertTrue(narrow.split_gjk_mpr)
+    captured = {}
+    launch = wp.launch
+
+    def record(kernel, *args, **kwargs):
+        if kernel is narrow.narrow_phase_refine_kernel:
+            captured.update(kwargs)
+        return launch(kernel, *args, **kwargs)
+
+    contacts = pipeline.contacts()
+    with patch("warp.launch", record):
         pipeline.collide(model.state(), contacts)
-        test.assertGreater(int(pipeline.narrow_phase.split_gjk_work_count.numpy()[1]), 0, "no pair reached refinement")
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        rows = np.column_stack(
-            (
-                contacts.rigid_contact_shape0.numpy()[:count],
-                contacts.rigid_contact_shape1.numpy()[:count],
-                contacts.rigid_contact_normal.numpy()[:count],
-                contacts.rigid_contact_point0.numpy()[:count],
-                contacts.rigid_contact_point1.numpy()[:count],
-            )
-        )
-        results[mode] = rows[np.lexsort(rows.T[::-1])]
-    test.assertGreater(len(results["1"]), 0)
-    test.assertEqual(results["1"].shape, results["0"].shape)
-    np.testing.assert_allclose(results["1"], results["0"], rtol=0.0, atol=1.0e-6)
+    wp.synchronize_device()
+    pairs = int(narrow.split_gjk_work_count.numpy()[1])
+    test.assertGreater(pairs, 1, "no pair reached refinement")
+    # The kernel refines one pair per warp when every pair gets one (pairs * 32 <= threads) and one per
+    # thread otherwise: replay the captured launch both ways from the same inputs.
+    inputs = list(captured["inputs"])
+    threads_at = next(k for k, v in enumerate(inputs) if isinstance(v, int) and v == captured["dim"])
+    # after the thread count: query results, refine queue, its count, manifold queue, manifold count
+    results, queue, count = inputs[threads_at + 1], inputs[threads_at + 4], inputs[threads_at + 5]
+    start = (results.numpy().copy(), count.numpy().copy())
+    block = captured["block_dim"]
+    out = {}
+    for mode, threads in (("warp", -(-pairs * 32 // block) * block), ("thread", -(-pairs // block) * block)):
+        test.assertEqual(pairs * 32 <= threads, mode == "warp")
+        results.assign(start[0])
+        count.assign(start[1])
+        inputs[threads_at] = threads
+        launch(narrow.narrow_phase_refine_kernel, dim=threads, inputs=inputs, block_dim=block, device=device)
+        wp.synchronize_device()
+        appended = queue.numpy()[int(start[1][0]) : int(count.numpy()[0])]
+        out[mode] = (results.numpy(), sorted(appended.tolist()))
+    test.assertEqual(out["warp"][1], out["thread"][1])
+    test.assertGreater(len(out["warp"][1]), 0)
+    np.testing.assert_array_equal(
+        out["warp"][0].view(np.uint8).reshape(len(out["warp"][0]), -1),
+        out["thread"][0].view(np.uint8).reshape(len(out["thread"][0]), -1),
+    )
 
 
 class TestConvexRefinementRegressions(unittest.TestCase):
