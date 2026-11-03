@@ -187,6 +187,7 @@ from .kernels import (
     copy_unarticulated_body_state,
     count_propagation_joint_split,
     crba_fill_par_dof,
+    damp_free_root_linear_velocity,
     delassus_par_row_col,
     diag_from_JY_par_art,
     diag_from_JY_world,
@@ -1782,6 +1783,9 @@ class SolverSteel(SolverBase, CouplingInterface):
           floating bases as ``w *= 1 - d dt`` each step (``physxRigidBody:angularDamping``,
           default 0.05, as :class:`~newton.solvers.SolverFeatherstone`); joints with a parent
           body are not damped. Fill the attribute for one value on every body.
+        - ``steel:rigid_body_linear_damping`` [1/s] damps the COM velocity of the same bodies as
+          ``v *= 1 - d dt`` each step (``physxRigidBody:linearDamping``, default 0). Keep it
+          nonnegative with ``d dt < 1``.
         - ``steel:rigid_body_max_linear_velocity`` [m/s] and ``steel:rigid_body_max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
@@ -1854,6 +1858,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dtype=wp.float32,
                 default=_DEFAULT_ANGULAR_DAMPING,
                 usd_attribute_name="physxRigidBody:angularDamping",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rigid_body_linear_damping",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                usd_attribute_name="physxRigidBody:linearDamping",
             )
         )
         builder.add_custom_attribute(
@@ -1956,6 +1971,11 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _rigid_body_angular_damping(self) -> wp.array:
         attribute = self._namespaced_attribute("rigid_body_angular_damping")
         return self._default_angular_damping if attribute is None else attribute
+
+    @property
+    def _rigid_body_linear_damping(self) -> wp.array:
+        attribute = self._namespaced_attribute("rigid_body_linear_damping")
+        return self._default_linear_damping if attribute is None else attribute
 
     @property
     def _rigid_body_max_linear_velocity(self) -> wp.array | None:
@@ -2640,6 +2660,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._default_angular_damping = wp.full(
             max(model.body_count, 1), _DEFAULT_ANGULAR_DAMPING, dtype=wp.float32, device=model.device
         )
+        self._default_linear_damping = wp.zeros(max(model.body_count, 1), dtype=wp.float32, device=model.device)
         self._update_mass_matrix_interval = update_mass_matrix_interval
         self._contact_friction_gap_max = None if contact_friction_gap_max is None else float(contact_friction_gap_max)
         if self._contact_friction_gap_max is not None and np.isnan(self._contact_friction_gap_max):
@@ -15120,6 +15141,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     state_aug._joint_qdd,
                     dt,
                     self._rigid_body_angular_damping,
+                    self._rigid_body_linear_damping,
                     self._dynamics_joint_active,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
@@ -15171,6 +15193,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     state_aug._joint_qdd,
                     dt,
                     self._rigid_body_angular_damping,
+                    self._rigid_body_linear_damping,
                     self._dynamics_joint_active,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
@@ -15195,6 +15218,23 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self._v_out)
+            if self._free_root_joint_count:
+                # The velocity post-pass replaces the integrated velocity; reapply linear damping to it.
+                wp.launch(
+                    damp_free_root_linear_velocity,
+                    dim=self._free_root_joint_count,
+                    inputs=[
+                        self._free_root_joint_indices,
+                        model.joint_child,
+                        model.joint_qd_start,
+                        self._kinematic_joint_mask,
+                        self._dynamics_joint_active,
+                        self._rigid_body_linear_damping,
+                        dt,
+                    ],
+                    outputs=[state_out.joint_qd],
+                    device=model.device,
+                )
             self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 

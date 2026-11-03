@@ -1,0 +1,1 @@
+Add ``steel:rigid_body_linear_damping`` to ``SolverSteel``, imported from ``physxRigidBody:linearDamping`` (default 0). It scales the COM velocity of free bodies and floating bases by ``1 - d dt`` each step, after the constraint solve and on both the ordinary and the velocity post-pass routes. Keep ``d dt < 1``.
