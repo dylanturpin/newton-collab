@@ -214,7 +214,7 @@ _NONFINITE_STATE = wp.constant(1)
 _NONFINITE_ADJOINT = wp.constant(2)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class DifferentiableOptions:
     """Backward settings for ``SolverSteel(differentiable=True)``.
 
@@ -263,8 +263,10 @@ class DifferentiableOptions:
 class DifferentiableDiagnostics:
     """Per-world backward diagnostics of one differentiable step, each array of shape ``[world_count]``.
 
-    The arrays belong to the step's output state and are rewritten when a step writes that state again or a
-    backward pass runs through the step.
+    The arrays belong to the step's output state. Each forward step into that state clears the norms and sets
+    :attr:`NONFINITE_STATE`; a backward pass through the step writes the norms and :attr:`NONFINITE_ADJOINT`, so the
+    norms are zero until one does. Joints and bodies outside every world (world -1) count toward world 0, where Steel
+    solves them.
     """
 
     NONFINITE_STATE = int(_NONFINITE_STATE)
@@ -272,13 +274,14 @@ class DifferentiableDiagnostics:
     NONFINITE_ADJOINT = int(_NONFINITE_ADJOINT)
     """Flag bit: the backward left a non-finite adjoint on the step's input state or the control."""
 
-    adjoint_out: wp.array
+    adjoint_out: wp.array[wp.float32]
     """Norm of the world's adjoints of the output state's joint and body coordinates and velocities when the
     backward enters the step."""
-    adjoint_in: wp.array
+    adjoint_in: wp.array[wp.float32]
     """Norm of the world's adjoints of the input state's joint coordinates and velocities and body forces when the
-    backward leaves the step (before any zeroing). ``adjoint_in / adjoint_out`` is the step's backward growth."""
-    flags: wp.array
+    backward leaves the step (before any zeroing). When nothing else on the tape adds to those adjoints, such as a
+    loss on the input state, ``adjoint_in / adjoint_out`` is the step's backward growth."""
+    flags: wp.array[wp.int32]
     """Bitwise OR of :attr:`NONFINITE_STATE` and :attr:`NONFINITE_ADJOINT`, int32."""
 
 
@@ -371,6 +374,8 @@ class DifferentiableStep:
         self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
         self.pgs_adjoint = options.pgs_adjoint
+        if self.pgs_adjoint == "implicit":
+            self._validate_implicit(solver._friction_anchors_enabled, solver._drive_mode == "rows")
         self.pgs_truncate = options.truncated_sweeps
         self.implicit_regularization = options.implicit_regularization
         self.implicit_slide_tolerance = 1.0e-3
@@ -431,6 +436,10 @@ class DifferentiableStep:
                 record_tape=False,
             )
         if not model.joint_count:
+            if self.world_diagnostics:
+                diagnostics = self.buffers(state_out).diagnostics()
+                for array in (diagnostics.adjoint_out, diagnostics.adjoint_in, diagnostics.flags):
+                    array.zero_()
             solver._step += 1
             return state_out
         b = self.buffers(state_out)
@@ -749,7 +758,7 @@ class DifferentiableStep:
                     state_out.joint_q,
                     state_out.joint_qd,
                 ],
-                outputs=[diagnostics.flags],
+                outputs=[diagnostics.adjoint_out, diagnostics.adjoint_in, diagnostics.flags],
                 device=device,
                 record_tape=False,
             )
@@ -4729,10 +4738,12 @@ def _contact_force_inputs(c: _ContactBuffers) -> list:
 
 
 def _world_index(item_world: wp.array | None, count: int, worlds: int, device) -> tuple[wp.array, wp.array]:
-    """CSR of the items (joints or bodies) of each world, in index order; global items are left out."""
-    owner = item_world.numpy() if item_world is not None and count else np.zeros(0, dtype=np.int32)
+    """CSR of the items (joints or bodies) of each world, in index order; global items count toward world 0."""
+    owner = item_world.numpy().copy() if item_world is not None and count else np.zeros(0, dtype=np.int32)
     worlds = max(worlds, 1)
-    items = np.flatnonzero((owner >= 0) & (owner < worlds))
+    # Steel solves global articulations with world 0's rows.
+    owner[owner < 0] = 0
+    items = np.flatnonzero(owner < worlds)
     order = items[np.argsort(owner[items], kind="stable")]
     start = np.zeros(worlds + 1, dtype=np.int32)
     np.cumsum(np.bincount(owner[items], minlength=worlds), out=start[1:])
@@ -4752,10 +4763,14 @@ def _flag_nonfinite_worlds(
     joint_qd_start: wp.array[int],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
+    adjoint_out: wp.array[float],
+    adjoint_in: wp.array[float],
     flags: wp.array[int],
 ):
-    """Set NONFINITE_STATE for worlds whose output state is not finite; clear the backward bits."""
+    """Set NONFINITE_STATE for worlds whose output state is not finite; clear the backward norms and bits."""
     world = wp.tid()
+    adjoint_out[world] = 0.0
+    adjoint_in[world] = 0.0
     bad = int(0)
     for k in range(world_joint_start[world], world_joint_start[world + 1]):
         joint = world_joints[k]

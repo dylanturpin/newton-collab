@@ -150,13 +150,17 @@ def test_implicit_sliding_gradient_matches_finite_difference(test, device):
 
 def test_implicit_rejects_unlinearized_laws(test, device):
     model = _build_slider_on_plane(device)
-    inputs = _slider_inputs(2.0)
     for name, options in (
         ("friction patches", {**_FRICTION_OPTIONS, "friction_anchor_beta": None}),
         ("joint velocity limits", {**_FRICTION_OPTIONS, "enable_joint_velocity_limits": True}),
     ):
         with test.subTest(case=name), test.assertRaises(NotImplementedError):
-            _contact_gradients(model, inputs, 1, iterations=8, adjoint="implicit", options=options)
+            SolverSteel(
+                model,
+                differentiable=True,
+                differentiable_options=steel.DifferentiableOptions(pgs_adjoint="implicit"),
+                **options,
+            )
 
 
 def test_tiled_implicit_matches_serial(test, device):

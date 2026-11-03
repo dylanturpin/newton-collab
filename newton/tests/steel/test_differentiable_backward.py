@@ -215,6 +215,51 @@ def test_nonfinite_state_is_flagged_per_world(test, device):
             )
 
 
+def test_single_world_model_is_diagnosed(test, device):
+    """A model built without worlds (world -1) is diagnosed and contained as world 0."""
+    model = _build_chain(device)
+    solver = SolverSteel(
+        model,
+        differentiable=True,
+        differentiable_options=steel.DifferentiableOptions(world_diagnostics=True, zero_nonfinite_adjoints=True),
+    )
+    states = [model.state(requires_grad=True) for _ in range(2)]
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    tape = wp.Tape()
+    with tape:
+        solver.step(states[0], states[1], None, None, 1.0 / 120.0)
+    seed = np.full(model.joint_coord_count, math.nan, dtype=np.float32)
+    tape.backward(grads={states[1].joint_q: wp.array(seed, dtype=float, device=device)})
+    diagnostics = solver.differentiable_diagnostics(states[1])
+    test.assertEqual(int(diagnostics.flags.numpy()[0]), steel.DifferentiableDiagnostics.NONFINITE_ADJOINT)
+    test.assertEqual(float(diagnostics.adjoint_out.numpy()[0]), math.inf)
+    np.testing.assert_array_equal(states[0].joint_q.grad.numpy(), 0.0)
+    np.testing.assert_array_equal(states[0].joint_qd.grad.numpy(), 0.0)
+
+
+def test_forward_clears_backward_norms(test, device):
+    """Stepping into a state again clears the norms its previous backward pass wrote."""
+    model = _build_worlds(device, worlds=2)
+    options = steel.DifferentiableOptions(world_diagnostics=True)
+    solver, tape, states, control = _taped_rollout(model, options, 1)
+    seed_q, seed_qd = _seed(model)
+    tape.backward(
+        grads={
+            states[1].joint_q: wp.array(seed_q, dtype=float, device=device),
+            states[1].joint_qd: wp.array(seed_qd, dtype=float, device=device),
+        }
+    )
+    diagnostics = solver.differentiable_diagnostics(states[1])
+    test.assertTrue((diagnostics.adjoint_in.numpy() > 0.0).all())
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
+    contacts = pipeline.contacts()
+    pipeline.collide(states[0], contacts)
+    solver.step(states[0], states[1], control, contacts, _DT)
+    np.testing.assert_array_equal(diagnostics.adjoint_in.numpy(), 0.0)
+    np.testing.assert_array_equal(diagnostics.adjoint_out.numpy(), 0.0)
+    np.testing.assert_array_equal(diagnostics.flags.numpy(), 0)
+
+
 def test_recomputed_steps_match_one_tape(test, device):
     """Replaying each step on its own tape from saved states reproduces the one-tape gradient bitwise.
 
@@ -335,6 +380,8 @@ for _device in get_test_devices():
         test_world_diagnostics_measure_adjoint_norms,
         test_nonfinite_world_is_flagged_and_contained,
         test_nonfinite_state_is_flagged_per_world,
+        test_single_world_model_is_diagnosed,
+        test_forward_clears_backward_norms,
         test_recomputed_steps_match_one_tape,
         test_plain_atomics_adjoint_matches_ordered,
     ):
