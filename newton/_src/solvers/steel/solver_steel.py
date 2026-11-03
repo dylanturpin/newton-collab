@@ -51,6 +51,7 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
+from . import latency_fused
 from ._testing import current_kernel_overrides
 from .contact_angular_friction import (
     angular_friction_gs_sources,
@@ -7709,6 +7710,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 friction_mode=self._friction_mode,
             )
             self._pgs_solve_propagation_colored_warp_kernel = None
+            self._colored_latency_build = None
             mb = int(getattr(self, "_max_propagation_bodies", 0))
             self._propagation_colored_prefetch = os.environ.get("STEEL_COLORED_PREFETCH", "1") != "0"
             # Internal test switch: 0 solves every unit with the generic row loop.
@@ -7738,6 +7740,16 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_colored_worlds_per_block = wpb
             # per-warp staging: 48B/body/world; keep total static shared under ~44KB
             if lanes in (1, 2, 4, 8, 16, 32) and wpb >= 1 and mb * wpb * 48 <= 45056:
+                colored_options = {
+                    "prefetch": self._propagation_colored_prefetch,
+                    "packed": packed,
+                    "straight_line": self._propagation_colored_straight_line,
+                    "free_rigid_angular": self._free_rigid_angular_rows,
+                    "contact_torsion": self._propagation_torsion_rows,
+                    "articulated_angular": self._propagation_angular_friction,
+                    "contact_compliance": self._contact_compliance,
+                    "friction_mode": self._friction_mode,
+                }
                 self._pgs_solve_propagation_colored_warp_kernel = _get_pgs_solve_propagation_colored_warp_kernel(
                     self._propagation_max_constraints,
                     PROPAGATION_COLOR_TAIL + 2,
@@ -7745,16 +7757,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     lanes,
                     wpb,
                     device_arch,
-                    prefetch=self._propagation_colored_prefetch,
                     staged=staged,
-                    packed=packed,
-                    straight_line=self._propagation_colored_straight_line,
-                    free_rigid_angular=self._free_rigid_angular_rows,
-                    contact_torsion=self._propagation_torsion_rows,
-                    articulated_angular=self._propagation_angular_friction,
-                    contact_compliance=self._contact_compliance,
-                    friction_mode=self._friction_mode,
+                    **colored_options,
                 )
+                # one world per block, unstaged: the build the fused latency loop calls on its warp 0
+                if lanes == 1 and not staged:
+                    self._colored_latency_build = (mb, colored_options)
             # The coloring keeps a world's used-color masks (16 words per body) in shared
             # memory when its unit bodies span few enough indices. Size that span from the
             # bodies a world can touch (its own and the global ones), capped at 256.
@@ -7938,6 +7946,275 @@ class SolverSteel(SolverBase, CouplingInterface):
                         continue
                     art_eligible[(art_size_np == size_i) & (is_free_np == 0)] = 1
                 self._propagation_cache_art_eligible.assign(art_eligible)
+        self._setup_latency_fused(model, device_arch)
+
+    def _setup_latency_fused(self, model, device_arch: int) -> None:
+        """Build the one-launch propagation PGS loop (latency mode) when this configuration supports it.
+
+        Few worlds leave each of the loop's dozen kernels per iteration a handful of warps, so the loop
+        is a chain of small launches. :mod:`.latency_fused` runs it as one block per world instead,
+        calling the same device functions in the same order. ``STEEL_LATENCY_FUSED``: ``auto``
+        (default) enables it when the worlds fit one block per SM, ``1`` whenever supported, ``0``
+        never. Configurations it does not cover keep the per-pass launches.
+        """
+        self._latency_fused_kernel = None
+        self._latency_fused = False
+        mode = os.environ.get("STEEL_LATENCY_FUSED", "auto").strip().lower()
+        if mode in ("0", "off", "false", "no"):
+            return
+        if not (
+            model.device.is_cuda
+            and self._solve_mode == "matrix_free"
+            and self._propagation_colored
+            and self._propagation_contacts_enabled()
+            and self._row_schedule in ("interleaved", "phased")
+            and getattr(self, "_colored_latency_build", None) is not None
+            and self._sparse_mass_matrix_size is None
+            and getattr(self, "_paired_factor_solve_kernel", None) is None
+            and not bool(getattr(self, "_local_internal_fast_path", False))
+            and getattr(self, "_pgs_solve_mf_gs_kernel_for_phase", None) is not None
+        ):
+            return
+        if mode == "auto" and self._world_count > int(getattr(model.device, "sm_count", 0) or 0):
+            return
+        # every articulated size group needs the one-warp tree kernels; one warp role per group
+        slots = []
+        for size in self._size_groups:
+            size_i = int(size)
+            if self._n_arts_by_size[size] <= 0 or size_i <= 0:
+                continue
+            if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
+                continue
+            propagate = self._propagate_tree_warp_kernels_by_size.get(size_i)
+            refresh = self._refresh_tree_warp_kernels_by_size.get(size_i)
+            if propagate is None or refresh is None:
+                return
+            slots.append((size, propagate, refresh))
+        if not slots or len(slots) > latency_fused.MAX_TREE_SLOTS:
+            return
+        # a world's tree and free-body passes touch only its own articulations: no global (world -1) ones
+        art_world = self._art_to_world.numpy() if self._art_to_world is not None else np.zeros(0, np.int32)
+        if np.any(art_world < 0):
+            return
+        body_world = model.body_world.numpy().copy()
+
+        mb, colored_options = self._colored_latency_build
+        colored = _get_pgs_solve_propagation_colored_warp_kernel(
+            self._propagation_max_constraints, PROPAGATION_COLOR_TAIL + 2, mb, 1, 1, device_arch, staged=False,
+            **colored_options,
+        )  # fmt: skip
+        rows = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=None)
+        gemv = None
+        if self._propagation_cached_response_active and self._propagation_cached_gemv_kernel is not None:
+            gemv = _get_propagation_cached_gemv_kernel(
+                self._propagation_cache_max_bodies,
+                self._propagation_response_max_dofs,
+                self._max_propagation_bodies,
+                1,
+                device_arch,
+            )
+        kernel = latency_fused.get_fused_iteration_kernel(
+            colored.native,
+            rows.native,
+            gemv.native if gemv is not None else None,
+            tuple((propagate.native, refresh.native) for _size, propagate, refresh in slots),
+            has_phase3=self._split_matrix_free_row_phase_may_have_work(3),
+            has_phase5=self._split_matrix_free_row_phase_may_have_work(5),
+        )
+        try:
+            # compile now: a fused kernel over the static shared-memory limit is rejected here, not mid-step
+            kernel.module.load(model.device)
+        except Exception as error:
+            warnings.warn(f"SolverSteel: latency mode unavailable ({error}); using per-pass launches", stacklevel=2)
+            return
+
+        device = model.device
+        world_count = self._world_count
+        tree_slots = []
+        for size, _propagate, _refresh in slots:
+            group_to_art = self._group_to_art[size].numpy()
+            worlds = art_world[group_to_art]
+            order = np.argsort(worlds, kind="stable")
+            offsets = np.searchsorted(worlds[order], np.arange(world_count + 1)).astype(np.int32)
+            slot = latency_fused.TreeSlot()
+            slot.group_to_art = self._group_to_art[size]
+            slot.guard_flag = self._propagation_cache_guard_flag(size)
+            slot.world_offsets = wp.array(offsets, dtype=wp.int32, device=device)
+            slot.world_groups = wp.array(order.astype(np.int32), dtype=wp.int32, device=device)
+            tree_slots.append(slot)
+        tree_slots += [tree_slots[0]] * (latency_fused.MAX_TREE_SLOTS - len(tree_slots))
+
+        free = latency_fused.FreeArgs()
+        body_art = self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
+        free_np = self._is_free_rigid.numpy() if self._is_free_rigid is not None else None
+        root_dof_np = (
+            self._articulation_root_dof_start.numpy() if self._articulation_root_dof_start is not None else None
+        )
+        bodies = np.zeros(0, dtype=np.int32)
+        if body_art is not None and free_np is not None and root_dof_np is not None:
+            bodies = np.array(
+                [b for b in range(len(body_art)) if body_art[b] >= 0 and free_np[body_art[b]] != 0], dtype=np.int32
+            )
+        if np.any(body_world[bodies] < 0):
+            if world_count != 1:
+                return  # a global free body would need every world's block
+            body_world[bodies] = 0
+        bodies = bodies[np.argsort(body_world[bodies], kind="stable")]
+        free.world_offsets = wp.array(
+            np.searchsorted(body_world[bodies], np.arange(world_count + 1)).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+        free.bodies = wp.array(bodies, dtype=wp.int32, device=device)
+        free.root_dof = wp.array(
+            root_dof_np[body_art[bodies]].astype(np.int32) if len(bodies) else np.zeros(0, np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        tree = latency_fused.TreeArgs()
+        tree.art_to_world = self._art_to_world
+        tree.dense_contact_world_flag = self._dense_contact_world_flag
+        tree.articulation_start = model.articulation_start
+        tree.joint_parent = model.joint_parent
+        tree.joint_child = model.joint_child
+        tree.joint_qd_start = model.joint_qd_start
+        tree.joint_parent_slot = self._propagation_joint_parent_slot
+        tree.S_flat = self._propagation_joint_S_flat
+        tree.com_rel = self._propagation_body_com_rel
+        tree.U = self._propagation_tree_U
+        tree.D_inv = self._propagation_tree_D_inv
+
+        cache = latency_fused.CacheArgs()
+        if gemv is not None:
+            cache.world_flag = self._propagation_cache_world_flag
+            cache.body_count = self._propagation_cache_body_count
+            cache.art_eligible = self._propagation_cache_art_eligible
+            cache.R = self._propagation_cache_R
+            cache.B = self._propagation_cache_B
+            cache.qd_base = self._propagation_cache_qd_base
+
+        self._latency_fused_kernel = kernel
+        self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots))
+        self._latency_fused_tree = tree
+        self._latency_fused_slots = tree_slots
+        self._latency_fused_free = free
+        self._latency_fused_cache = cache
+        self._latency_fused = True
+
+    def _launch_latency_fused(
+        self,
+        *,
+        dense_rhs: wp.array,
+        propagation_rhs: wp.array,
+        mf_meta: wp.array,
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: bool,
+        soft_relax: bool,
+    ) -> None:
+        """One launch for ``_launch_matrix_free_gs_solve_propagation_tree``'s whole iteration loop."""
+        body_a, body_b, color_rhs = self._prepare_colored_sweep(propagation_rhs)
+        compliance = self._compliance
+        colored = latency_fused.ColoredArgs()
+        colored.constraint_count = self._propagation_constraint_count
+        colored.body_a = body_a
+        colored.body_b = body_b
+        colored.MiJt_a = self._propagation_MiJt_a
+        colored.MiJt_b = self._propagation_MiJt_b
+        colored.J_a = self._propagation_J_a
+        colored.J_b = self._propagation_J_b
+        colored.eff_mass_inv = self._propagation_eff_mass_inv
+        colored.rhs = color_rhs
+        colored.row_w = self._propagation_row_w
+        colored.row_type = self._propagation_row_type
+        colored.row_parent = self._propagation_row_parent
+        colored.row_mu = self._propagation_row_mu
+        colored.compliance_gamma = self._compliance_off_gamma if compliance is None else compliance.propagation_gamma
+        colored.torsion_first = self._propagation_torsion_first
+        colored.torsion_next = self._propagation_torsion_next
+        colored.torsion_row_radius = self._propagation_torsion_row_radius
+        colored.row_order = self._color_world_row_order
+        colored.color_offsets = self._color_world_offsets
+        colored.body_list = self._propagation_body_list
+        colored.body_count = self._propagation_body_count
+        colored.body_local_slot = self._propagation_body_local_slot
+        colored.unit_meta = self._color_unit_meta
+        colored.unit_friction_setup = self._color_unit_friction_setup
+        colored.unit_payload = (
+            self._color_unit_payload if self._color_unit_payload is not None else self._color_unit_friction_setup
+        )
+        colored.ring_overflow = self._color_ring_overflow
+        colored.impulses = self._propagation_impulses
+
+        rows = latency_fused.RowArgs()
+        rows.constraint_count = self._constraint_count
+        rows.dense_phase_bounds = self._dense_phase_bounds
+        rows.local_solve_owner = self._local_solve_owner
+        rows.world_dof_indices = self._world_dof_indices
+        rows.rhs = dense_rhs
+        rows.diag = self._diag
+        rows.row_w = self._row_w
+        rows.impulses = self._impulses
+        rows.J_world = self._J_world
+        rows.Y_world = self._Y_world
+        rows.row_type = self._row_type
+        rows.row_parent = self._row_parent
+        rows.row_mu = self._row_mu
+        rows.torsion_group = self._contact_torsion_group
+        rows.torsion_row_radius = self._torsion_row_radius
+        rows.drive_target_vel_bias = self._drive_target_vel_bias
+        rows.drive_vel_multiplier = self._drive_vel_multiplier
+        rows.drive_impulse_multiplier = self._drive_impulse_multiplier
+        rows.drive_max_impulse = self._drive_max_impulse
+        rows.drive_vel_limit = self._drive_vel_limit
+        rows.mf_constraint_count = self._mf_constraint_count
+        rows.mf_contact_rows_end = self._mf_contact_rows_end
+        rows.mf_meta = mf_meta
+        rows.mf_impulses = self._mf_impulses
+        rows.mf_J_a = self._mf_J_a
+        rows.mf_J_b = self._mf_J_b
+        rows.mf_MiJt_a = self._mf_MiJt_a
+        rows.mf_MiJt_b = self._mf_MiJt_b
+        rows.mf_row_mu = self._mf_row_mu
+        rows.mf_row_w = self._mf_row_w
+        rows.dense_gamma = compliance.dense_gamma if compliance is not None else self._compliance_off_gamma
+        rows.mf_gamma = compliance.mf_gamma if compliance is not None else self._compliance_off_gamma
+
+        slots = self._latency_fused_slots
+        wp.launch_tiled(
+            self._latency_fused_kernel,
+            dim=[self._world_count],
+            inputs=[
+                self._world_count,
+                int(iterations),
+                int(iteration_offset),
+                int(friction_start_iteration),
+                omega,
+                int(not soft_relax and self._regularization_enabled),
+                int(self._regularization_enabled and not soft_relax),
+                int(freeze_drive_rows),
+                int(self._propagation_tree_refresh_forced()),
+                int(self._propagation_cache_max_bodies),
+                colored,
+                rows,
+                self._latency_fused_cache,
+                self._latency_fused_tree,
+                slots[0],
+                slots[1],
+                slots[2],
+                slots[3],
+                self._latency_fused_free,
+                self._body_to_articulation,
+                self._propagation_body_qd,
+                self._propagation_body_impulses,
+                self._v_out,
+            ],
+            block_dim=self._latency_fused_block_dim,
+            device=self.model.device,
+        )
 
     def _propagation_cache_guard_flag(self, size: int) -> wp.array:
         """Per-world skip flag for a size group's tree-walk propagate launch.
@@ -9113,38 +9390,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         regularize: bool = True,
     ) -> None:
         device = self.model.device
-        # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
-        # The fold reads the device prescribed mask, so a captured graph stays correct when that mask changes.
-        # A pass's right-hand side and the prescribed velocities are fixed within a step: fold once per pass.
-        if self._color_fold_rhs is not rhs:
-            self._color_fold_rhs = rhs
-            wp.launch(
-                fold_prescribed_propagation_sides,
-                dim=(self._world_count, self._propagation_max_constraints),
-                inputs=[
-                    self._propagation_constraint_count,
-                    self._propagation_body_a,
-                    self._propagation_body_b,
-                    self._propagation_J_a,
-                    self._propagation_J_b,
-                    self._body_prescribed,
-                    self._propagation_body_qd,
-                    rhs,
-                    self._propagation_max_constraints,
-                ],
-                outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
-                device=device,
-            )
-        body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
+        body_a, body_b, rhs = self._prepare_colored_sweep(rhs)
         compliance_gamma = (
             self._compliance_off_gamma if self._compliance is None else self._compliance.propagation_gamma
         )
         if self._pgs_solve_propagation_colored_warp_kernel is not None:
-            # The unit records depend only on this step's colored row layout, so they are
-            # gathered once per step, before its first sweep, and only for the prefetch body.
-            if self._color_unit_meta_stale and self._propagation_colored_prefetch:
-                self._color_unit_meta_stale = False
-                self._launch_gather_unit_meta(device, body_a, body_b)
             wpb = self._propagation_colored_worlds_per_block
             wp.launch_tiled(
                 self._pgs_solve_propagation_colored_warp_kernel,
@@ -9234,6 +9484,44 @@ class SolverSteel(SolverBase, CouplingInterface):
             block_dim=self._propagation_colored_block_dim,
             device=device,
         )
+
+    def _prepare_colored_sweep(self, rhs: wp.array) -> tuple[wp.array, wp.array, wp.array]:
+        """Fold prescribed sides and gather the unit records the colored sweep reads; once per pass and step.
+
+        Returns the sweep's body and right-hand-side arrays. The colored iteration calls it before every
+        sweep (later calls do nothing), and the fused latency loop before its launch.
+        """
+        device = self.model.device
+        # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
+        # The fold reads the device prescribed mask, so a captured graph stays correct when that mask changes.
+        # A pass's right-hand side and the prescribed velocities are fixed within a step: fold once per pass.
+        if self._color_fold_rhs is not rhs:
+            self._color_fold_rhs = rhs
+            wp.launch(
+                fold_prescribed_propagation_sides,
+                dim=(self._world_count, self._propagation_max_constraints),
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_J_a,
+                    self._propagation_J_b,
+                    self._body_prescribed,
+                    self._propagation_body_qd,
+                    rhs,
+                    self._propagation_max_constraints,
+                ],
+                outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
+                device=device,
+            )
+        body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
+        if self._pgs_solve_propagation_colored_warp_kernel is not None:
+            # The unit records depend only on this step's colored row layout, so they are
+            # gathered once per step, before its first sweep, and only for the prefetch body.
+            if self._color_unit_meta_stale and self._propagation_colored_prefetch:
+                self._color_unit_meta_stale = False
+                self._launch_gather_unit_meta(device, body_a, body_b)
+        return body_a, body_b, rhs
 
     def _compute_propagation_rhs_bias(
         self,
@@ -9510,6 +9798,19 @@ class SolverSteel(SolverBase, CouplingInterface):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
+        if getattr(self, "_latency_fused", False) and self._row_schedule in ("interleaved", "phased"):
+            self._launch_latency_fused(
+                dense_rhs=dense_rhs,
+                propagation_rhs=propagation_rhs,
+                mf_meta=mf_meta,
+                iterations=iterations,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+                freeze_drive_rows=freeze_drive_rows,
+                soft_relax=soft_relax,
+            )
+            return
 
         def launch_existing(row_phase: int, global_iter: int) -> None:
             if not self._split_matrix_free_row_phase_may_have_work(row_phase):
@@ -20486,7 +20787,9 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     )
     pgs_solve_propagation_colored_warp_template.__name__ = name
     pgs_solve_propagation_colored_warp_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_warp_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_warp_template)
+    kernel.native = pgs_solve_propagation_colored_warp_native  # the device function, for the fused latency kernel
+    return kernel
 
 
 @cache
@@ -22576,7 +22879,9 @@ def _get_propagate_tree_impulses_revolute_kernel(
         name += "_fr"
     propagate_tree_impulses_revolute_template.__name__ = name
     propagate_tree_impulses_revolute_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
+    kernel.native = propagate_tree_impulses_revolute_native  # the device function, for the fused latency kernel
+    return kernel
 
 
 # Static shared memory a one-warp tree kernel may take (the 48 KB static limit, with headroom).
@@ -22862,7 +23167,9 @@ def _get_propagate_tree_impulses_multidof_kernel(size: int, max_joints: int, dev
     name = f"propagate_tree_impulses_multidof_{size}_j{joints_cap}"
     propagate_tree_impulses_multidof_template.__name__ = name
     propagate_tree_impulses_multidof_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_multidof_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_multidof_template)
+    kernel.native = propagate_tree_impulses_multidof_native  # the device function, for the fused latency kernel
+    return kernel
 
 
 def _cached_response_extraction_warps(max_joints: int, cache_max_bodies: int, *, has_free_root: bool) -> int:
@@ -23461,7 +23768,9 @@ def _get_propagation_cached_gemv_kernel(
     name = f"propagation_cached_gemv_c{C}_d{MAXD}_w{W}"
     propagation_cached_gemv_template.__name__ = name
     propagation_cached_gemv_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(propagation_cached_gemv_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(propagation_cached_gemv_template)
+    kernel.native = propagation_cached_gemv_native  # the device function, for the fused latency kernel
+    return kernel
 
 
 @cache
@@ -23615,7 +23924,9 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
     name = f"refresh_propagation_tree_body_qd_warp_{size}_j{joints_cap}"
     refresh_propagation_tree_body_qd_warp_template.__name__ = name
     refresh_propagation_tree_body_qd_warp_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(refresh_propagation_tree_body_qd_warp_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(refresh_propagation_tree_body_qd_warp_template)
+    kernel.native = refresh_propagation_tree_body_qd_warp_native  # the device function, for the fused latency kernel
+    return kernel
 
 
 @cache
@@ -27470,4 +27781,6 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_free_rigid_angular"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    kernel.native = pgs_solve_mf_gs_native  # the device function, for the fused latency kernel
+    return kernel
