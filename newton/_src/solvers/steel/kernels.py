@@ -17,6 +17,7 @@ from functools import cache
 
 import warp as wp
 
+from ...core.types import MAXVAL
 from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
@@ -2851,14 +2852,14 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.isfinite(lower) and q <= lower + activation_gap:
+            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.isfinite(upper) and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:
@@ -4148,11 +4149,11 @@ def build_joint_limit_rows_for_size(
             for side in range(2):
                 sign = 1.0
                 phi = q_val - lower
-                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
+                active = wp.abs(lower) < MAXVAL and q_val <= lower + joint_limit_activation_gap
                 if side == 1:
                     sign = -1.0
                     phi = upper - q_val
-                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
+                    active = wp.abs(upper) < MAXVAL and q_val >= upper - joint_limit_activation_gap
                 if not active:
                     continue
 

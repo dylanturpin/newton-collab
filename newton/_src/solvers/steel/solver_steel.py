@@ -2310,8 +2310,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
-                ``q >= upper - gap``. ``inf`` preserves the historical behavior of allocating all
-                finite limit rows every step. Must be non-negative and not NaN. Defaults to ``inf``.
+                ``q >= upper - gap``. ``inf`` allocates every limit row every step. A bound at or
+                beyond ``MAXVAL`` (the builder's unlimited default) has no row. Must be non-negative
+                and not NaN. Defaults to ``inf``.
             enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
                 (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
                 PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
@@ -5517,9 +5518,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                         and joint_limit_lower is not None
                         and joint_limit_upper is not None
                     ):
-                        if np.isfinite(joint_limit_lower[dof]):
+                        if abs(joint_limit_lower[dof]) < MAXVAL:
                             per_world[world] += 1
-                        if np.isfinite(joint_limit_upper[dof]):
+                        if abs(joint_limit_upper[dof]) < MAXVAL:
                             per_world[world] += 1
                     if has_velocity_limit_rows and joint_velocity_limit is not None and joint_velocity_limit[dof] > 0.0:
                         per_world[world] += 2
@@ -15346,7 +15347,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const float q = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             phi_value = side == 0 ? q - bound : bound - q;
-            active = isfinite(bound) && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
+            active = fabsf(bound) < {MAXVAL:.1e}f && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
         }}
 
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
