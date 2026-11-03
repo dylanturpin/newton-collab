@@ -218,17 +218,21 @@ def get_fused_iteration_kernel(
     tree_natives: tuple[tuple[Any, Any], ...],
     has_phase3: bool,
     has_phase5: bool,
+    colored_block: bool = False,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
+    ``colored_block``: ``colored_native`` is the block-wide variant (built with ``block_threads`` equal to
+    the launch's block size), which every warp calls so wide colors use the whole block.
     ``tree_natives`` holds ``(propagate, refresh)`` device functions per tree variant (at most
     :data:`MAX_TREE_SLOTS`); ``gemv_native`` is ``None`` without cached responses. Launch it with
     ``wp.launch_tiled(dim=[world_count], block_dim=32 * warp_count(len(tree_natives)))``.
     """
     n_slots = len(tree_natives)
-    assert 1 <= n_slots <= MAX_TREE_SLOTS
-    # unused slots repeat slot 0; their branches compile out
-    natives = list(tree_natives) + [tree_natives[0]] * (MAX_TREE_SLOTS - n_slots)
+    assert 0 <= n_slots <= MAX_TREE_SLOTS
+    # unused slots get placeholders; their branches compile out
+    filler = tree_natives[0] if n_slots else (_free_refresh, _free_refresh)
+    natives = list(tree_natives) + [filler] * (MAX_TREE_SLOTS - n_slots)
     has_cache = gemv_native is not None
     if gemv_native is None:
         gemv_native = colored_native  # placeholder; the GEMV branch compiles out
@@ -330,10 +334,12 @@ def get_fused_iteration_kernel(
             if warp_id == wp.static(free_warp):
                 _free_refresh(world, lane, free, v_out, body_qd)
             _block_sync()
-            # colored contact sweep (with the pre-sweep snapshot the GEMV rebuilds from)
+            # colored contact sweep (with the pre-sweep snapshot the GEMV rebuilds from; the snapshot only
+            # reads the twists the sweep stages)
             if warp_id == 0:
                 if wp.static(has_cache):
                     _cache_snapshot(world, lane, cache, cache_max_bodies, colored.body_list, body_qd)
+            if wp.static(colored_block) or warp_id == 0:
                 wp.static(colored_native)(
                     world, world_count, colored.constraint_count, colored.body_a, colored.body_b, colored.MiJt_a,
                     colored.MiJt_b, colored.J_a, colored.J_b, colored.eff_mass_inv, colored.rhs, colored.row_w,

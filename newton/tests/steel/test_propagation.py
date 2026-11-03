@@ -4177,26 +4177,29 @@ def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
 class TestLatencyFusedLoop(unittest.TestCase):
     """The one-launch propagation PGS loop writes exactly what the per-pass launches write."""
 
-    def test_fused_loop_matches_per_pass_launches(self):
-        model = _build_latency_scene("cuda:0")
+    def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
+        """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
         with patch.dict(os.environ, {"STEEL_LATENCY_FUSED": "1"}):
             solver = SolverSteel(
-                model,
-                solve_mode="matrix_free",
-                articulated_contact_response="propagation_colored",
-                iterations=8,
-                enable_joint_limits=True,
+                model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", **solver_options
             )
         self.assertTrue(solver._latency_fused)
+        wide = [0]
         loop = type(solver)._launch_matrix_free_gs_solve_propagation_tree
         checked = []
 
         calls = [0]
 
+        def widest() -> int:
+            offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, -1)
+            return int(np.diff(offsets, axis=1)[:, :-1].max())
+
         def compare(self_, **kwargs):
             calls[0] += 1
             if len(checked) >= 3 or calls[0] < 20 or int(solver._propagation_constraint_count.numpy().max()) == 0:
                 return loop(self_, **kwargs)
+            if min_wide_colors and widest() <= 32:
+                return loop(self_, **kwargs)  # compare only calls whose colors exercise the block-wide sweep
             wp.synchronize_device()
             before = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
             names = {k for k, v in vars(self_).items() if isinstance(v, wp.array)}
@@ -4221,6 +4224,9 @@ class TestLatencyFusedLoop(unittest.TestCase):
                 )
                 self.assertTrue(same, f"{k} differs after the fused loop")
             checked.append(sum(not np.array_equal(chain[k], before[k]) for k in chain if k in before))
+            offsets = self_._color_world_offsets.numpy()
+            sizes = np.diff(offsets.reshape(self_._world_count, -1), axis=1)[:, :-1]
+            wide[0] = max(wide[0], int((sizes > 32).sum()))
             return None
 
         with patch.object(type(solver), "_launch_matrix_free_gs_solve_propagation_tree", compare):
@@ -4235,6 +4241,23 @@ class TestLatencyFusedLoop(unittest.TestCase):
         self.assertEqual(len(checked), 3, "the scene never reached the loop with contacts")
         # the comparison covered real work: the loop changed velocities and impulses
         self.assertTrue(all(n >= 3 for n in checked), checked)
+        self.assertGreaterEqual(wide[0], min_wide_colors, "the scene never had a color wider than one warp")
+
+    def test_fused_loop_matches_per_pass_launches(self):
+        # trees (revolute arm with limits, ball chain) and free boxes in every role of the block
+        self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
+
+    def test_fused_loop_wide_colors_match(self):
+        # one world of free boxes on the ground: colors wider than a warp take the whole block
+        builder = newton.ModelBuilder()
+        for i in range(10):
+            for j in range(10):
+                body = builder.add_body(xform=wp.transform(wp.vec3(0.12 * i, 0.12 * j, 0.048), wp.quat_identity()))
+                builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        builder.add_ground_plane()
+        self._check_fused_matches(
+            builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
+        )
 
     def test_mode_switch(self):
         model = _build_latency_scene("cuda:0")
