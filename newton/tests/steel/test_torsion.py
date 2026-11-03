@@ -2471,6 +2471,7 @@ def _link_launch(kernel, inputs, friction_start):
             friction_start,
             0,
             0,
+            zeros((1, 1)),
         ],
         outputs=[v_out],
         block_dim=32,
