@@ -239,8 +239,9 @@ class DifferentiableOptions:
     derivative more closely and let rare worlds' adjoints grow by orders of magnitude."""
     deterministic_adjoint: bool = True
     """With ``deterministic=True``, also reduce the backward's atomic adds in a fixed order, so repeated backward
-    passes are bitwise identical. False keeps the fixed row order of the forward and uses plain atomics in the
-    backward, which avoids the scratch Warp's ordered reductions allocate per launch."""
+    passes are bitwise identical. Warp's ordered reductions keep a record per atomic add, which grows with the
+    world count and the row capacity and can exceed device memory or Warp's array size limit at a few hundred worlds.
+    False keeps the fixed row order of the forward and uses plain atomics in the backward."""
     world_diagnostics: bool = False
     """Record per-world adjoint norms and non-finite flags for every step; read them with
     :meth:`~newton.solvers.SolverSteel.differentiable_diagnostics`."""
