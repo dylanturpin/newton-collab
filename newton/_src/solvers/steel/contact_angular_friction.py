@@ -212,7 +212,7 @@ def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads
             solver.model.shape_body,
             state_aug._body_v_s,
             solver._prescribed_articulation,
-            int(solver._has_prescribed_response),
+            int(solver._has_contact_target_velocity),
             solver._free_rigid_mu_torsional,
             solver._free_rigid_mu_rolling,
         ],

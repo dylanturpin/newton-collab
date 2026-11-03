@@ -95,6 +95,7 @@ from .kernels import (
     rhs_accum_world_par_row,
     scan_world_row_requests,
     subtract_arrays,
+    surface_contact_target,
     update_qdd_from_velocity,
     zero_unattached_parent_wrenches,
 )
@@ -148,6 +149,7 @@ def validate_differentiable_options(model: Model, options: dict) -> None:
         (options["friction_mode"] != "fixed_normal", 'friction_mode="fixed_normal"'),
         (options["velocity_iterations"] != 0, "velocity_iterations=0"),
         (options["parallel_tree"], "parallel_tree=False"),
+        (options["nesterov_momentum"], "nesterov_momentum=False"),
     )
     for unsupported, requirement in checks:
         if unsupported:
@@ -756,7 +758,7 @@ class DifferentiableStep:
             self._reserve_velocity_limit_rows(c, v_hat)
         patches = solver._friction_anchors_enabled and has_contacts
         if patches:
-            self._build_friction_patches(b, c, contacts)
+            self._build_friction_patches(b, c, contacts, dt)
         wp.launch(
             allocate_world_contact_slots,
             dim=threads,
@@ -916,6 +918,7 @@ class DifferentiableStep:
                 model.shape_body,
                 b.body_q,
                 b.body_v_s,
+                None if contacts is None else contacts.rigid_contact_surface_velocity,
                 solver._prescribed_articulation,
                 b.articulation_origin,
                 solver._shape_mu,
@@ -1577,7 +1580,7 @@ class DifferentiableStep:
                 record_tape=False,
             )
 
-    def _build_friction_patches(self, b: _StepBuffers, c: _ContactBuffers, contacts: Contacts) -> None:
+    def _build_friction_patches(self, b: _StepBuffers, c: _ContactBuffers, contacts: Contacts, dt: float) -> None:
         """Build this step's friction patches with the default's builder, off the tape.
 
         The anchors' body-frame points and the patch history are frozen; the rows follow the anchors with the
@@ -1603,6 +1606,7 @@ class DifferentiableStep:
             angular_mu=(solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling, solver._free_rigid_route_body)
             if solver._free_rigid_angular_rows
             else None,
+            dt=dt,
             record_tape=False,
         )
         view = solver._friction_patches.view
@@ -1836,6 +1840,7 @@ class DifferentiableStep:
                     state_out.body_q,
                     state_out.body_qd,
                     model.body_com,
+                    contacts.rigid_contact_surface_velocity,
                     c.world,
                     c.slot,
                     c.path,
@@ -2815,6 +2820,7 @@ def _dense_contact_rows(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
@@ -2969,7 +2975,7 @@ def _dense_contact_rows(
                         prescribed_articulation,
                         articulation_origin,
                         body_v_s,
-                    )
+                    ) + surface_contact_target(contact_surface_velocity, c, tangent)
                 # build_mf_angular_friction_rows: free-rigid rolling pair and spin rows after the sliding pair.
                 torsional, rolling = free_rigid_angular_friction_coefficients(
                     shape0[c], shape1[c], free_rigid_mu_torsional, free_rigid_mu_rolling

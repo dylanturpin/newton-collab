@@ -1,0 +1,1 @@
+Speed up `SolverSteel`'s fused matrix-free Gauss-Seidel solve by compiling each schedule row phase into its own kernel and summing warp dot products with xor butterflies; results are bitwise unchanged.

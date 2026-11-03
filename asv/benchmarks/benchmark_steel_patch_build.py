@@ -93,7 +93,7 @@ def run(data, device, iterations, history):
     model = SimpleNamespace(device=wp.get_device(device), body_count=len(data["body_q"]))
     for name, dtype in MODEL_DTYPES.items():
         setattr(model, name, wp.array(data["model_" + name], dtype=dtype, device=device))
-    contacts = SimpleNamespace()
+    contacts = SimpleNamespace(rigid_contact_surface_velocity=None)
     for name, dtype in CONTACT_DTYPES.items():
         setattr(contacts, name, wp.array(data["contacts_" + name], dtype=dtype, device=device))
     state = SimpleNamespace(body_q=wp.array(data["body_q"], dtype=wp.transform, device=device))

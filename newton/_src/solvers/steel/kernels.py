@@ -1198,7 +1198,7 @@ def compute_link_velocity(
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
-def eval_rigid_fk_kinematics(
+def eval_rigid_fk_poses(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
     joint_type: wp.array[int],
@@ -1207,26 +1207,29 @@ def eval_rigid_fk_kinematics(
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_q: wp.array[float],
-    joint_qd: wp.array[float],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
     body_X_com: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
+    reuse_cached: int,
+    fk_id_cache_valid: wp.array[int],
+    gate_on_active: int,
     articulation_active: wp.array[int],
     # outputs
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     articulation_origin: wp.array[wp.vec3],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    fk_id_cache_valid: wp.array[int],
 ):
-    """Propagate articulation poses, motion subspaces, velocities, and accelerations."""
+    """Propagate articulation poses for the step-start and step-end FK passes.
+
+    Both passes share this kernel, so a cached step-end pose matches a fresh step-start pose bitwise.
+    """
     index = wp.tid()
-    if articulation_active[index] == 0:
+    if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
+        return
+    if gate_on_active != 0 and articulation_active[index] == 0:
         return
     start = articulation_start[index]
     end = articulation_joint_end[index]
@@ -1255,6 +1258,42 @@ def eval_rigid_fk_kinematics(
         if root_body >= 0:
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     articulation_origin[index] = origin
+
+
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
+def eval_rigid_fk_kinematics(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    articulation_active: wp.array[int],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    articulation_origin: wp.array[wp.vec3],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    fk_id_cache_valid: wp.array[int],
+):
+    """Propagate motion subspaces, velocities, and accelerations from the poses of eval_rigid_fk_poses."""
+    index = wp.tid()
+    if articulation_active[index] == 0:
+        return
+    start = articulation_start[index]
+    end = articulation_joint_end[index]
+    origin = articulation_origin[index]
 
     cached_child = int(-1)
     cached_v_s = wp.spatial_vector()
@@ -1418,37 +1457,13 @@ def eval_rigid_fk_id(
     body_a_s: wp.array[wp.spatial_vector],
     fk_id_cache_valid: wp.array[int],
 ):
-    """Evaluate and cache articulation poses and inverse dynamics."""
+    """Evaluate and cache inverse dynamics from the poses of eval_rigid_fk_poses."""
     index = wp.tid()
     if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
         return
     start = articulation_start[index]
     end = articulation_joint_end[index]
-
-    for i in range(start, end):
-        compute_link_transform(
-            i,
-            joint_type,
-            joint_parent,
-            joint_child,
-            joint_q_start,
-            joint_qd_start,
-            joint_q,
-            joint_X_p,
-            joint_X_c,
-            body_X_com,
-            joint_axis,
-            joint_dof_dim,
-            body_q,
-            body_q_com,
-        )
-
-    origin = wp.vec3()
-    if start < articulation_start[index + 1]:
-        root_body = joint_child[start]
-        if root_body >= 0:
-            origin = wp.transform_point(body_q[root_body], body_com[root_body])
-    articulation_origin[index] = origin
+    origin = articulation_origin[index]
 
     write_body_inertia = materialize_all_body_inertia
     if is_free_rigid[index] != 0:
@@ -5703,6 +5718,15 @@ def prescribed_relative_contact_target(
     return -known_jv
 
 
+@wp.func
+def surface_contact_target(contact_surface_velocity: wp.array[wp.vec3], c: int, direction: wp.vec3):
+    """Return the friction-row target velocity of contact ``c``'s moving shape surfaces."""
+    value = float(0.0)
+    if contact_surface_velocity:
+        value = wp.dot(direction, contact_surface_velocity[c])
+    return value
+
+
 @wp.kernel
 def prepare_world_contact_rows(
     contact_count: wp.array[int],
@@ -5723,6 +5747,7 @@ def prepare_world_contact_rows(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
@@ -5840,7 +5865,7 @@ def prepare_world_contact_rows(
             prescribed_articulation,
             articulation_origin,
             body_v_s,
-        )
+        ) + surface_contact_target(contact_surface_velocity, c, tangent0)
         friction1_target = prescribed_relative_contact_target(
             body_a,
             art_a,
@@ -5852,7 +5877,7 @@ def prepare_world_contact_rows(
             prescribed_articulation,
             articulation_origin,
             body_v_s,
-        )
+        ) + surface_contact_target(contact_surface_velocity, c, tangent1)
 
         world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
         world_row_parent[world, slot] = -1
@@ -6426,6 +6451,7 @@ def _populate_world_J_for_size_contact(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
@@ -6567,7 +6593,7 @@ def _populate_world_J_for_size_contact(
         prescribed_articulation,
         articulation_origin,
         body_v_s,
-    )
+    ) + surface_contact_target(contact_surface_velocity, c, t0)
     friction1_target = prescribed_relative_contact_target(
         body_a,
         art_a,
@@ -6579,7 +6605,7 @@ def _populate_world_J_for_size_contact(
         prescribed_articulation,
         articulation_origin,
         body_v_s,
-    )
+    ) + surface_contact_target(contact_surface_velocity, c, t1)
 
     # Handle articulation A if it matches target size
     if art_a >= 0 and articulation_response_dof_count[art_a] == target_size:
@@ -6812,6 +6838,7 @@ def populate_world_J_for_size(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
@@ -6866,6 +6893,7 @@ def populate_world_J_for_size(
             shape_body,
             body_q,
             body_v_s,
+            contact_surface_velocity,
             prescribed_articulation,
             shape_material_mu,
             shape_material_restitution,
@@ -7666,6 +7694,7 @@ def _build_mf_contact_row(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
@@ -7848,7 +7877,7 @@ def _build_mf_contact_row(
         else:
             mf_row_mu[world, row_idx] = friction_mu
         if has_target_velocity != 0:
-            mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
+            target = prescribed_relative_contact_target(
                 body_a,
                 contact_art_a[c],
                 body_b,
@@ -7860,6 +7889,9 @@ def _build_mf_contact_row(
                 articulation_origin,
                 body_v_s,
             )
+            if row_offset > 0:
+                target += surface_contact_target(contact_surface_velocity, c, d)
+            mf_target_velocity[world, row_idx] = target
 
 
 @wp.kernel
@@ -7883,6 +7915,7 @@ def build_mf_contact_rows(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
     prescribed_articulation: wp.array[int],
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
@@ -7930,6 +7963,7 @@ def build_mf_contact_rows(
             shape_body,
             body_q,
             body_v_s,
+            contact_surface_velocity,
             prescribed_articulation,
             has_target_velocity,
             shape_material_mu,
@@ -8294,6 +8328,8 @@ def build_propagation_contact_rows(
     body_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
     body_v_s: wp.array[wp.spatial_vector],
+    contact_surface_velocity: wp.array[wp.vec3],
+    has_target_velocity: int,
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     contact_friction_shared_anchor: int,
@@ -8318,6 +8354,7 @@ def build_propagation_contact_rows(
     propagation_row_mu: wp.array2d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_rebound_velocity: wp.array2d[float],
+    propagation_target_velocity: wp.array2d[float],
 ):
     """Build fixed-size body-space rows for contacts touching non-free articulations.
 
@@ -8478,6 +8515,11 @@ def build_propagation_contact_rows(
                 propagation_phi[world, row_idx] = friction_anchor_beta * friction_patches.phi[c][1]
             propagation_row_mu[world, row_idx] = friction_mu
             propagation_row_rebound_velocity[world, row_idx] = 0.0
+        if has_target_velocity != 0:
+            target = float(0.0)
+            if row_offset > 0:
+                target = surface_contact_target(contact_surface_velocity, c, d)
+            propagation_target_velocity[world, row_idx] = target
 
 
 @wp.func
@@ -9689,6 +9731,8 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_rebound_velocity: wp.array2d[float],
+    propagation_target_velocity: wp.array2d[float],
+    has_target_velocity: int,
     propagation_body_qd: wp.array2d[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
@@ -9784,6 +9828,8 @@ def compute_propagation_effective_mass_and_rhs(
                 row_w = 1.0
     if row_type == PGS_CONSTRAINT_TYPE_FRICTION:
         bias = propagation_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
+        if has_target_velocity != 0:
+            bias -= propagation_target_velocity[world, i]
     propagation_rhs[world, i] = bias
     propagation_restitution_target[world, i] = restitution_target
     if contact_w < 1.0:
@@ -9803,6 +9849,8 @@ def compute_propagation_rhs_bias(
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_restitution_target: wp.array2d[float],
+    propagation_target_velocity: wp.array2d[float],
+    has_target_velocity: int,
     dt: float,
     position_body_qd: wp.array2d[float],
     propagation_max_constraints: int,
@@ -9844,6 +9892,8 @@ def compute_propagation_rhs_bias(
             bias = -restitution_target
         elif reached != 0:
             bias -= restitution_target
+    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION and has_target_velocity != 0:
+        bias = -propagation_target_velocity[world, i]
     propagation_rhs[world, i] = bias
 
 

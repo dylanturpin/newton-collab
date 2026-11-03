@@ -1,0 +1,1 @@
+Prebuild the fused matrix-free Gauss-Seidel kernels for the row phases `SolverSteel` launches under the propagation contact responses, instead of an unused interleaved-phase kernel and kernels created during the first step.

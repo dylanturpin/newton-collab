@@ -193,6 +193,7 @@ def test_rejects_unsupported_configs(test, device):
         {"row_schedule": "phased"},
         {"friction_mode": "bisection"},
         {"velocity_iterations": 2},
+        {"nesterov_momentum": True},
     ):
         with test.subTest(**kwargs), test.assertRaisesRegex(ValueError, "differentiable=True requires"):
             SolverSteel(model, differentiable=True, **kwargs)
@@ -2842,6 +2843,51 @@ def test_kinematic_bodies_match_default(test, device):
             np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
 
 
+def _build_surface_belt(device, *, requires_grad=True):
+    """A free box on a static mesh belt whose surface moves at 0.5 m/s along x."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.0, restitution=0.0, density=500.0)
+    belt = newton.Mesh.create_box(2.0, 2.0, 0.05, compute_inertia=False)
+    belt.enable_surface_velocity = True
+    builder.add_shape_mesh(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), mesh=belt, cfg=cfg)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+    model = builder.finalize(device=device, requires_grad=requires_grad)
+    belt.mesh.velocities.fill_(wp.vec3(0.5, 0.0, 0.0))
+    return model
+
+
+def test_surface_velocity_matches_default(test, device):
+    """A moving mesh surface drives the friction rows and anchor history as in the default step.
+
+    Mesh contacts come in thread order, so both steps use deterministic collision and row order.
+    """
+    for solve_mode, beta in (("split", 0.0), ("split", 0.2), ("matrix_free", 0.0), ("matrix_free", 0.2)):
+        velocities = []
+        for differentiable in (False, True):
+            model = _build_surface_belt(device, requires_grad=differentiable)
+            solver = SolverSteel(
+                model,
+                differentiable=differentiable,
+                friction_anchor_beta=beta,
+                solve_mode=solve_mode,
+                iterations=32,
+                articulation_constraint_max=64,
+                deterministic=True,
+            )
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+            contacts = pipeline.contacts()
+            states = [model.state(requires_grad=differentiable) for _ in range(61)]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            for k in range(60):
+                pipeline.collide(states[k], contacts)
+                solver.step(states[k], states[k + 1], None, contacts, 1.0 / 240.0)
+            velocities.append(states[-1].joint_qd.numpy())
+        with test.subTest(solve_mode=solve_mode, friction_anchor_beta=beta):
+            test.assertAlmostEqual(float(velocities[0][0]), 0.5, delta=5.0e-3)
+            np.testing.assert_allclose(velocities[1], velocities[0], rtol=0.0, atol=2.0e-5)
+
+
 def test_kinematic_velocity_gradient_matches_finite_difference(test, device):
     """Tape against central differences of the box's and the kinematic belt's initial velocities.
 
@@ -3140,6 +3186,7 @@ for _device in get_test_devices():
             test_deterministic_gradients_repeat,
             test_drive_rows_match_default,
             test_drive_rows_gradient_matches_finite_difference,
+            test_surface_velocity_matches_default,
         ):
             add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
 
