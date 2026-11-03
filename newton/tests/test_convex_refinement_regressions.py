@@ -310,7 +310,7 @@ def test_refinement_cooperative_matches_serial(test, device):
     Boxes overlap a rounded-box convex hull at its faces, edges and corners, where the box-mesh
     certificate's cheap bounds do not settle the depth and it streams every hull triangle (the work the
     warp splits). The short refine queue takes the cooperative path; a pipeline built with
-    ``NEWTON_COOPERATIVE_REFINE=0`` refines the same pairs one per thread.
+    the cooperative path patched off refines the same pairs one per thread.
     """
     builder = newton.ModelBuilder()
     cfg = builder.ShapeConfig(gap=1.0e-3, density=0.0)
@@ -331,7 +331,7 @@ def test_refinement_cooperative_matches_serial(test, device):
     results = {}
     for mode in ("1", "0"):
         with (
-            patch.dict("os.environ", {"NEWTON_COOPERATIVE_REFINE": mode}),
+            patch("newton._src.geometry.narrow_phase._COOPERATIVE_REFINE", mode == "1"),
             patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0),
         ):
             pipeline = newton.CollisionPipeline(model, broad_phase="explicit")

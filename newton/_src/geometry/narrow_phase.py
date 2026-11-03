@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import warp as wp
@@ -100,6 +99,11 @@ def _reserve_compacted_slot(predicate: int, work_count: wp.array[int]) -> int:
     if predicate == 0:
         return -1
     return wp.atomic_add(work_count, 0, 1)
+
+
+# Refine short overlap queues one pair per warp (see create_narrow_phase_kernels_gjk_mpr_split). Tests patch it
+# to False for the one-pair-per-thread reference.
+_COOPERATIVE_REFINE = True
 
 
 @wp.func
@@ -1453,8 +1457,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
     # Overlap refinement can run one pair per warp: a box against a detailed convex hull streams every hull
     # triangle through the separating-axis certificate, which on one thread is the narrow phase's long tail.
-    # Internal test switch: 0 always keeps one pair per thread.
-    cooperative_refine = os.environ.get("NEWTON_COOPERATIVE_REFINE", "1") != "0"
+    cooperative_refine = _COOPERATIVE_REFINE
     solve_mpr_refine = (
         create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
         if cooperative_refine

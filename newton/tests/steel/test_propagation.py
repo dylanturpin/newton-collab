@@ -3982,7 +3982,7 @@ class TestPropagationMultiDofWarp(unittest.TestCase):
             self.assertIsNotNone(getattr(solver, name)[size], f"{name}[{size}] should hold a warp variant")
 
     def test_multidof_switch_off_keeps_serial(self):
-        with patch.dict(os.environ, {"STEEL_TREE_MULTIDOF_WARP": "0"}):
+        with patch("newton._src.solvers.steel.solver_steel._TREE_MULTIDOF_WARP", False):
             solver = _make_solver_propagation_free_root_warp(self.model, "propagation_colored")
         size = self._size(solver)
         self.assertNotIn(size, solver._propagation_tree_multidof_warp_sizes)
@@ -4179,7 +4179,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
 
     def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
         """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
-        with patch.dict(os.environ, {"STEEL_LATENCY_FUSED": "1"}):
+        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "on"):
             solver = SolverSteel(
                 model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", **solver_options
             )
@@ -4262,10 +4262,10 @@ class TestLatencyFusedLoop(unittest.TestCase):
     def test_mode_switch(self):
         model = _build_latency_scene("cuda:0")
         # auto: on while the worlds fit one block per SM
-        with patch.dict(os.environ, {"STEEL_LATENCY_FUSED": "auto"}):
+        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "auto"):
             solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_colored")
         self.assertEqual(solver._latency_fused, N_WORLDS <= wp.get_device("cuda:0").sm_count)
-        with patch.dict(os.environ, {"STEEL_LATENCY_FUSED": "0"}):
+        with patch("newton._src.solvers.steel.solver_steel._LATENCY_MODE", "off"):
             solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation_colored")
         self.assertFalse(solver._latency_fused)
 

@@ -1181,6 +1181,13 @@ def _mfgs_resident_metadata_bytes(max_constraints: int, *, has_drive_rows: bool,
     return 4 * max_constraints * (4 + 4 * int(has_drive_rows) + int(fuse_vel_limits))
 
 
+# Latency mode (SolverSteel._setup_latency_fused): "auto" when the worlds fit one block per SM. Tests and
+# benchmarks patch "on" / "off" to compare with the per-pass launches; it is not a user setting.
+_LATENCY_MODE = "auto"
+# Wide colors take the whole latency block; tests patch False for the warp-0 sweep.
+_LATENCY_COLORED_BLOCK = True
+# Multi-DOF trees take the one-warp tree kernels; tests patch False for the serial reference.
+_TREE_MULTIDOF_WARP = True
 # Latency mode runs a tree group's articulations one after another on one warp; past this many per world
 # the per-pass kernels (a warp per articulation) are faster.
 _LATENCY_MAX_ARTS_PER_GROUP = 4
@@ -7861,8 +7868,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._refresh_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._propagation_tree_multidof_warp_sizes: set[int] = set()
-        # Internal test switch: 0 keeps multi-DOF trees on the serial propagate/refresh kernels.
-        multidof_warp = os.environ.get("STEEL_TREE_MULTIDOF_WARP", "1") != "0"
+        multidof_warp = _TREE_MULTIDOF_WARP
         self._propagation_joint_parent_slot = None
         if model.device.is_cuda and self._propagation_contacts_enabled():
             self._propagation_joint_parent_slot = self._build_propagation_joint_parent_slot(model)
@@ -8010,14 +8016,13 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         Few worlds leave each of the loop's dozen kernels per iteration a handful of warps, so the loop
         is a chain of small launches. :mod:`.latency_fused` runs it as one block per world instead,
-        calling the same device functions in the same order. ``STEEL_LATENCY_FUSED``: ``auto``
-        (default) enables it when the worlds fit one block per SM, ``1`` whenever supported, ``0``
-        never. Configurations it does not cover keep the per-pass launches.
+        calling the same device functions in the same order. It is on when the configuration is covered
+        and the worlds fit one block per SM; otherwise the per-pass launches run.
         """
         self._latency_fused_kernel = None
         self._latency_fused = False
-        mode = os.environ.get("STEEL_LATENCY_FUSED", "auto").strip().lower()
-        if mode in ("0", "off", "false", "no"):
+        mode = _LATENCY_MODE
+        if mode == "off":
             return
         if not (
             model.device.is_cuda
@@ -8070,8 +8075,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_latency_fused_kernel(self, device_arch: int, slots):
         """Compile the fused loop, keeping matrix-free impulses in global memory if shared memory runs out."""
         mb, colored_options = self._colored_latency_build
-        # Wide colors take the whole block; internal test switch: 0 keeps the sweep on warp 0.
-        colored_block = os.environ.get("STEEL_LATENCY_COLORED_BLOCK", "1") != "0"
+        # Wide colors take the whole block.
+        colored_block = _LATENCY_COLORED_BLOCK
         colored = _get_pgs_solve_propagation_colored_warp_kernel(
             self._propagation_max_constraints, PROPAGATION_COLOR_TAIL + 2, mb, 1, 1, device_arch, staged=False,
             block_threads=32 * latency_fused.warp_count(len(slots)) if colored_block else 0, **colored_options,
