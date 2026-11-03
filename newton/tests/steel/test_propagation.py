@@ -2357,7 +2357,7 @@ def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False, links=6):
     no_collision = world.default_shape_cfg.copy()
     no_collision.has_shape_collision = False
     no_collision.collision_group = 0
-    limits = {"limit_lower": -0.15, "limit_upper": 0.15} if tight_limits else {}
+    limits = {"limit_lower": -0.15, "limit_upper": 0.15, "velocity_limit": 4.0} if tight_limits else {}
     prev, joints = -1, []
     for i in range(links):
         link = world.add_link()
