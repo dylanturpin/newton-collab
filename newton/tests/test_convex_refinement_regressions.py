@@ -305,12 +305,10 @@ def _rounded_box_hull(half, radius, samples=15):
 
 
 def test_refinement_cooperative_matches_serial(test, device):
-    """One-pair-per-warp overlap refinement returns what one pair per thread returns.
+    """One-pair-per-warp overlap refinement returns exactly what one pair per thread returns.
 
-    Boxes overlap a rounded-box convex hull at its faces, edges and corners, where the box-mesh
-    certificate's cheap bounds do not settle the depth and it streams every hull triangle (the work the
-    warp splits). The captured refine launch is replayed with enough threads for one pair per warp and
-    with too few, which the kernel then refines one pair per thread.
+    Boxes overlap a rounded-box hull at faces, edges and corners, where the box-mesh certificate streams
+    every hull triangle. The captured refine launch is replayed with thread counts for both modes.
     """
     builder = newton.ModelBuilder()
     cfg = builder.ShapeConfig(gap=1.0e-3, density=0.0)
@@ -346,13 +344,12 @@ def test_refinement_cooperative_matches_serial(test, device):
     wp.synchronize_device()
     pairs = int(narrow.split_gjk_work_count.numpy()[1])
     test.assertGreater(pairs, 1, "no pair reached refinement")
-    # The kernel refines one pair per warp when every pair gets one (pairs * 32 <= threads) and one per
-    # thread otherwise: replay the captured launch both ways from the same inputs.
     inputs = list(captured["inputs"])
-    threads_at = next(k for k, v in enumerate(inputs) if isinstance(v, int) and v == captured["dim"])
-    # after the thread count: query results, refine queue, its count, manifold queue, manifold count
-    results, queue, count = inputs[threads_at + 1], inputs[threads_at + 4], inputs[threads_at + 5]
-    start = (results.numpy().copy(), count.numpy().copy())
+    names = [arg.label for arg in narrow.narrow_phase_refine_kernel.adj.args]
+    args = dict(zip(names, inputs, strict=True))
+    results, queue, count = args["query_results"], args["manifold_work_items"], args["manifold_work_count"]
+    threads_at = names.index("total_num_threads")
+    start = (results.numpy(), count.numpy())
     block = captured["block_dim"]
     out = {}
     for mode, threads in (("warp", -(-pairs * 32 // block) * block), ("thread", -(-pairs // block) * block)):

@@ -4033,14 +4033,14 @@ def _build_latency_scene(device: str) -> newton.Model:
 
 
 def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
-    """Every non-empty CUDA array reachable from ``obj`` through attributes, dicts and lists."""
+    """Every non-empty CUDA value array (not struct arrays of handles) reachable through attributes, dicts, lists."""
     seen = set() if seen is None else seen
     out = {} if out is None else out
     if id(obj) in seen or depth > 3:
         return out
     seen.add(id(obj))
     if isinstance(obj, wp.array):
-        if obj.size > 0 and obj.device.is_cuda:
+        if obj.size > 0 and obj.device.is_cuda and not wp.types.type_is_struct(obj.dtype):
             out.setdefault(prefix, obj)
         return out
     if isinstance(obj, dict):
@@ -4073,15 +4073,13 @@ class TestLatencyFusedLoop(unittest.TestCase):
 
         calls = [0]
 
-        def widest() -> int:
-            offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, -1)
-            return int(np.diff(offsets, axis=1)[:, :-1].max())
-
         def compare(self_, **kwargs):
             calls[0] += 1
             if len(checked) >= 3 or calls[0] < 20 or int(solver._propagation_constraint_count.numpy().max()) == 0:
                 return loop(self_, **kwargs)
-            if min_wide_colors and widest() <= 32:
+            offsets = self_._color_world_offsets.numpy().reshape(self_._world_count, -1)
+            sizes = np.diff(offsets, axis=1)[:, :-1]
+            if min_wide_colors and sizes.max() <= 32:
                 return loop(self_, **kwargs)  # compare only calls whose colors exercise the block-wide sweep
             wp.synchronize_device()
             before = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
@@ -4107,8 +4105,6 @@ class TestLatencyFusedLoop(unittest.TestCase):
                 )
                 self.assertTrue(same, f"{k} differs after the fused loop")
             checked.append(sum(not np.array_equal(chain[k], before[k]) for k in chain if k in before))
-            offsets = self_._color_world_offsets.numpy()
-            sizes = np.diff(offsets.reshape(self_._world_count, -1), axis=1)[:, :-1]
             wide[0] = max(wide[0], int((sizes > 32).sum()))
             return None
 
@@ -4142,12 +4138,8 @@ class TestLatencyFusedLoop(unittest.TestCase):
             builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
         )
 
-    def test_on_for_few_worlds_only(self):
-        # one block per world: on while the worlds fit one block per SM, off past it
-        solver = SolverSteel(
-            _build_latency_scene("cuda:0"), solve_mode="matrix_free", articulated_contact_response="propagation_colored"
-        )
-        self.assertEqual(solver._latency_fused, N_WORLDS <= wp.get_device("cuda:0").sm_count)
+    def test_off_past_one_world_per_sm(self):
+        # one block per world: off once the worlds no longer fit one block per SM
         scene = newton.ModelBuilder()
         for _ in range(wp.get_device("cuda:0").sm_count + 1):
             world = newton.ModelBuilder()

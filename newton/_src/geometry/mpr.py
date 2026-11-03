@@ -172,9 +172,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None, cooperative:
             :func:`create_support_map_function`. When provided, these are reused
             instead of creating new ones, allowing multiple solvers to share
             compiled support code.
-        cooperative: Build ``refine_core`` for kernels in which all 32 lanes of a warp refine the same
-            pair; the box-convex-mesh certificate then splits its triangle stream across the lanes (see
-            :func:`~newton._src.geometry.penetration.create_solve_box_penetration`).
+        cooperative: Build ``refine_core`` for kernels that may refine one pair with all 32 lanes of a warp
+            (see :func:`~newton._src.geometry.penetration.create_solve_box_penetration`).
 
     Returns:
         ``solve_mpr`` wrapper function.  The core function is available as
