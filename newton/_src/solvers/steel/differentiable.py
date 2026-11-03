@@ -243,7 +243,7 @@ class DifferentiableOptions:
     backward, which avoids the scratch Warp's ordered reductions allocate per launch."""
     world_diagnostics: bool = False
     """Record per-world adjoint norms and non-finite flags for every step; read them with
-    :meth:`SolverSteel.differentiable_diagnostics`."""
+    :meth:`~newton.solvers.SolverSteel.differentiable_diagnostics`."""
     zero_nonfinite_adjoints: bool = False
     """Zero a world's non-finite input-state and control adjoints when the backward leaves each step, so one
     diverged world cannot spread NaN to the batch. Requires :attr:`world_diagnostics`."""
