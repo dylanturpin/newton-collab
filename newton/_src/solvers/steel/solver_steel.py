@@ -2050,8 +2050,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 O'Donoghue-Candes gradient restart, as in MuJoCo's PGS solver. Each sweep starts from the
                 impulses extrapolated along the previous sweep's change, applied to the velocity through each
                 row's response; momentum restarts when a sweep's correction opposes the extrapolation.
-                Converges to the same solution in fewer iterations on stacks, mass ratios and long chains;
-                gains appear above a few iterations. The ``velocity_iterations`` post-pass runs the same
+                Converges in fewer iterations on stacks, mass ratios and long chains; gains appear above a
+                few iterations. The ``velocity_iterations`` post-pass runs the same
                 sweep. Every world then runs the general sweep, bypassing the specialized sparse, local and
                 paired-factor solves, and keeps ``8 * (articulation_constraint_max +
                 free_body_constraint_max)`` bytes of sweep history per world. Requires
