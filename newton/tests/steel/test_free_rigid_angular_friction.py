@@ -1283,6 +1283,8 @@ def _sweep_box(on_solver=None, before_sweep=None, response=None):
     def record(solver):
         if on_solver is not None:
             on_solver(solver)
+        # observe the per-pass launches; latency mode runs the same loop as one kernel (TestLatencyFusedLoop)
+        solver._latency_fused = False
         sweep_once = solver._propagation_pgs_solve_one_iteration
 
         def sweep(**kwargs):
