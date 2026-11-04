@@ -358,8 +358,7 @@ repository examples spend tuning effort, not a shared solver API.
        rows, free bodies included, share one family of ``free_body_constraint_max +
        articulation_constraint_max`` rows per world, or of ``propagation_constraint_max`` rows
        when that is set. Contacts between two links of one articulation stay dense rows of
-       ``articulation_constraint_max`` unless ``propagation_same_articulation_rows`` is set,
-       which only ``"propagation"`` accepts.
+       ``articulation_constraint_max`` unless ``propagation_same_articulation_rows`` is set.
        Setting ``propagation_constraint_max`` lets ``free_body_constraint_max`` shrink to the
        free-body velocity-limit rows, the only free-body rows these responses keep.
        ``"propagation_colored"`` sweeps the propagation rows in parallel batches of contacts
@@ -370,15 +369,16 @@ repository examples spend tuning effort, not a shared solver API.
        shortens the ``"propagation_colored"`` sweep when one body carries contacts with
        different row counts. The saving shrinks as the world count grows, and the changed
        order can converge more slowly on stacks at a fixed iteration count, so measure the
-       full step at the target world count before switching. ``"propagation"`` solves contact
-       torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``;
-       ``"propagation_colored"`` rejects it. ``"propagation"`` rejects contact compliance and
-       ``"propagation_colored"`` accepts it without contact torsion. The propagation responses
-       reject sleeping and loop-closing joints, and fall back from bilateral pre-elimination to
-       iterative mimic rows with a warning.
-       ``"propagation_colored"`` supports the ``friction_mode`` values other than
-       ``"fixed_normal"`` and applies them to the articulated contacts on its propagation rows
-       as well. ``"propagation"`` requires ``"fixed_normal"``.
+       full step at the target world count before switching. ``"propagation"`` and
+       ``"propagation_colored"`` solve contact torsion with ``contact_torsion_device=True`` and
+       ``velocity_iterations=0``. ``"propagation"`` rejects contact compliance and
+       ``"propagation_colored"`` accepts it without contact torsion, which rejects the
+       hydroelastic contacts that compliance needs. The propagation responses reject
+       loop-closing joints, and fall back from bilateral pre-elimination to iterative mimic rows
+       with a warning.
+       ``"propagation_colored"`` supports sleeping and the ``friction_mode`` values other than
+       ``"fixed_normal"``, which it applies to the articulated contacts on its propagation rows
+       as well. ``"propagation"`` rejects sleeping and requires ``"fixed_normal"``.
        ``use_parallel_streams`` overlaps the work of articulation-size groups and
        ``double_buffer`` clears a step's buffers on a side stream, without changing
        results; measure the full step before relying on them.

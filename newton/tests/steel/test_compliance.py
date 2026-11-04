@@ -1288,7 +1288,7 @@ def test_colored_incompatible_options_rejected(test, device):
     with test.assertRaisesRegex(NotImplementedError, "enable_sleeping=True"):
         SolverSteel(model, **base, **_COLORED, enable_sleeping=True)
     set_torsion_radius(model, 0.01)
-    with test.assertRaisesRegex(NotImplementedError, "^contact torsion is not supported"):
+    with test.assertRaisesRegex(NotImplementedError, "^contact torsion with contact_compliance=True is not supported"):
         SolverSteel(model, **base, **_COLORED, contact_torsion_device=True)
 
 
