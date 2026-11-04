@@ -504,6 +504,8 @@ def _launch_dense_contact_builders(
             patches,
             *anchors,
             0.5,  # restitution_velocity_threshold
+            0,  # friction_combine
+            0,  # restitution_combine
         ],
         outputs=list(metadata.values()),
         device=device,

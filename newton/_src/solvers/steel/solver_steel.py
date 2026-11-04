@@ -48,6 +48,10 @@ from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_p
 from .kernels import (
     CONTACT_GENERATION_NONE,
     CONTACT_ROW_FAMILIES,
+    MATERIAL_COMBINE_AVERAGE,
+    MATERIAL_COMBINE_MAX,
+    MATERIAL_COMBINE_MIN,
+    MATERIAL_COMBINE_MULTIPLY,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -242,6 +246,13 @@ _SERIAL_KERNEL_BLOCK_DIM = 256
 # PhysX's default rigid-body angular damping [1/s].
 _DEFAULT_ANGULAR_DAMPING = 0.05
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
+# ``friction_combine``/``restitution_combine`` names and their kernel ids, in PhysX's combine-mode order.
+_MATERIAL_COMBINE_MODES = {
+    "average": int(MATERIAL_COMBINE_AVERAGE),
+    "min": int(MATERIAL_COMBINE_MIN),
+    "multiply": int(MATERIAL_COMBINE_MULTIPLY),
+    "max": int(MATERIAL_COMBINE_MAX),
+}
 _ATTRIBUTE_NAMESPACE = "steel"
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
@@ -1589,6 +1600,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_cached_response = _ConstructionOption()
     propagation_cached_response_body_max = _ConstructionOption()
     propagation_color_order = _ConstructionOption()
+    friction_combine = _ConstructionOption()
+    restitution_combine = _ConstructionOption()
     free_rigid_torsional_friction = _ConstructionOption()
     free_rigid_rolling_friction = _ConstructionOption()
     deterministic = _ConstructionOption()
@@ -1818,6 +1831,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
         propagation_color_order: Literal["contact", "longest_first"] = "contact",
+        friction_combine: Literal["average", "min", "multiply", "max"] = "average",
+        restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
         free_rigid_torsional_friction: float | None = None,
         free_rigid_rolling_friction: float | None = None,
         deterministic: wp.DeterministicMode | None = None,
@@ -2097,8 +2112,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 coefficients, and lets the split solve and ``contact_compliance`` accept shapes
                 with positive restitution.
             restitution_velocity_threshold: Minimum closing speed [m/s] of a contact at the
-                start of the step for a rebound. Contacts bounce with the arithmetic mean of the
-                two shapes' restitution coefficients
+                start of the step for a rebound. Contacts bounce with the two shapes' restitution
+                coefficients combined by ``restitution_combine``
                 (:attr:`~newton.ModelBuilder.ShapeConfig.restitution`, clamped to ``[0, 1]``;
                 zero gives no rebound): an impacting contact replaces its position bias by the
                 rebound target ``-e * u_start``, where ``u_start`` is its relative normal
@@ -2305,6 +2320,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 sweep where one body carries many contacts with different row counts; on some
                 stacked scenes it converges more slowly at a fixed iteration count. Other
                 responses ignore it.
+            friction_combine: How a contact combines its two shapes' friction coefficients:
+                ``"average"``, ``"min"``, ``"multiply"`` or ``"max"``, as PhysX's material combine modes. It applies
+                to sliding friction (:attr:`~newton.Model.shape_material_mu`); the free-body angular rows keep the
+                larger coefficient of the pair under every mode. A contact with one shape keeps that shape's
+                coefficient. Construction-only.
+            restitution_combine: How a contact combines its two shapes' restitution coefficients, with the
+                same modes as ``friction_combine``, after each coefficient is clamped to ``[0, 1]``.
+                Construction-only.
             free_rigid_torsional_friction: Experimental torsional coefficient [m] for every free-body
                 contact, replacing the shapes' ``steel:condim`` gate and
                 :attr:`~newton.Model.shape_material_mu_torsional` for that coefficient only; ``None`` keeps the
@@ -2561,6 +2584,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 f"got {articulated_contact_response!r}"
             )
         self._articulated_contact_response = articulated_contact_response
+        for name, value in (("friction_combine", friction_combine), ("restitution_combine", restitution_combine)):
+            if value not in _MATERIAL_COMBINE_MODES:
+                raise ValueError(f"{name} must be one of {tuple(_MATERIAL_COMBINE_MODES)}, got {value!r}")
+        self._friction_combine = friction_combine
+        self._restitution_combine = restitution_combine
+        self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
+        self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
         configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
         inherited = deterministic is None
         if inherited:
@@ -10253,6 +10283,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._friction_patches.view,
                     *self._contact_anchor_args,
                     self._rebound_velocity_threshold,
+                    self._friction_combine_id,
+                    self._restitution_combine_id,
                 ],
                 outputs=[
                     self._row_type,
@@ -10406,6 +10438,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_anchor_beta,
                         *self._contact_anchor_args,
                         self._rebound_velocity_threshold,
+                        self._friction_combine_id,
+                        self._restitution_combine_id,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -11474,6 +11508,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._friction_patches.view,
                 self._friction_anchor_beta,
                 self._rebound_velocity_threshold,
+                self._friction_combine_id,
+                self._restitution_combine_id,
             ],
             outputs=[
                 self._propagation_body_a,
