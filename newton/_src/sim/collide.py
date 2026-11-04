@@ -61,6 +61,7 @@ from ..sim.model import Model
 from ..sim.shape_contact_pairs import (
     _shape_contact_pair_count_for_mask,
     _shape_contact_pair_counts,
+    _shape_contact_pair_override,
 )
 from ..sim.state import State
 
@@ -789,8 +790,8 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     list and the sum is a provable worst case. For dense pair graphs the sum is
     capped by a spatial-locality estimate (see the inline comment); where that
     cap binds, capacity is physically motivated rather than provable, matching
-    the pre-pair-aware behavior. Crucially, shapes that participate in no
-    contact pair (e.g. visual-only meshes) contribute nothing to either term.
+    the pre-pair-aware behavior. Shapes outside every pair add nothing to the pair
+    sum; the locality term budgets every colliding non-plane shape, or every endpoint of a supplied pair array.
     The per-pair caps assume contact reduction is enabled (the default for
     mesh/hydroelastic paths); with ``reduce_contacts=False`` no static bound
     exists and overflow remains detectable via ``contact_count > contact_max``.
@@ -874,7 +875,15 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
             plane_pair_contacts = pair_contacts - nonplane_pair_contacts
             nonplane_locality = 0
             if nonplane_pairs > 0:
-                active = colliding_mask & ~plane_shape
+                supplied, supplied_pairs = _shape_contact_pair_override(model)
+                if supplied and supplied_pairs is not None:
+                    # A supplied pair array is authoritative even for shapes whose collision flags are off.
+                    pairs = supplied_pairs.numpy().reshape(-1, 2)
+                    pairs = pairs[~(plane_shape[pairs[:, 0]] | plane_shape[pairs[:, 1]])]
+                    active = np.zeros(len(shape_types), dtype=bool)
+                    active[pairs.ravel()] = True
+                else:
+                    active = colliding_mask & ~plane_shape
                 shape_cap = np.full(int(np.count_nonzero(active)), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
                 shape_cap[mesh_mask[active]] = _MESH_PAIR_MAX_CONTACTS
                 shape_cap[hydro_mask[active]] = _HYDRO_PAIR_MAX_CONTACTS

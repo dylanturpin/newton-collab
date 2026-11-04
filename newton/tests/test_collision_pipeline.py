@@ -62,6 +62,7 @@ from newton._src.sim.collide import (
     _estimate_rigid_contact_max,
     write_contact,
 )
+from newton._src.solvers.coupled.model_view import ModelView
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
 from newton.geometry import BroadPhaseAllPairs, BroadPhaseExplicit, NarrowPhase
@@ -2717,6 +2718,25 @@ class TestParticleShapeContacts(unittest.TestCase):
 
 
 class TestContactCountEstimator(unittest.TestCase):
+    def test_supplied_pairs_keep_their_locality_budget_without_collision_flags(self):
+        """Budget every endpoint of a supplied pair array, also on shapes whose collision flags are off."""
+        builder = newton.ModelBuilder()
+        no_collision = builder.ShapeConfig(has_shape_collision=False)
+        for i in range(60):
+            body = builder.add_body(xform=wp.transform(wp.vec3(i * 0.001, 0.0, 0.0), wp.quat_identity()))
+            builder.add_shape_sphere(body, radius=0.1, cfg=no_collision)
+        model = builder.finalize(device="cpu")
+        model.shape_contact_pairs = wp.array(list(itertools.combinations(range(60), 2)), dtype=wp.vec2i, device="cpu")
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, 1000)
+        self.assertGreaterEqual(contacts.rigid_contact_max, count)
+        for source in (model, ModelView(model, "explicit")):
+            with self.subTest(source=type(source).__name__):
+                self.assertGreaterEqual(_estimate_rigid_contact_max(source), count)
+
     @staticmethod
     def _make_single_box_model():
         """Build a minimal model that exercises automatic contact sizing."""
