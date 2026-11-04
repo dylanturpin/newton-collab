@@ -351,7 +351,8 @@ repository examples spend tuning effort, not a shared solver API.
        contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
        ``enable_torsional_rolling_friction``, and ``deterministic=True``
        (``"propagation_colored"`` without ``contact_warmstart``); ``"propagation_colored"``
-       also supports sleeping and the ``friction_mode`` values other than ``"fixed_normal"``,
+       also supports sleeping, leaving sleeping articulations out of its trees, and the
+       ``friction_mode`` values other than ``"fixed_normal"``,
        which it applies to articulated contacts as well; ``enable_torsional_rolling_friction``
        requires ``"fixed_normal"`` and no contact compliance on every response.
        ``use_parallel_streams`` and ``double_buffer`` overlap the work of
