@@ -311,6 +311,8 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
+# Velocity-limit unit-row table: entries of the velocity-limit segment whose J*v is one s_v read.
+_MFGS_VELOCITY_LIMIT_UNIT_CAPACITY = 256
 # Conservative portable bound for static __shared__ arrays; some architectures accept more.
 _STATIC_SHARED_MEMORY_MAX_BYTES = 48 * 1024
 # Headroom for the static shared storage Warp adds to a kernel beyond the solver's own arrays.
@@ -1097,6 +1099,7 @@ def _use_resident_mfgs_metadata(
     *,
     has_drive_rows: bool,
     fuse_vel_limits: bool,
+    velocity_limit_units: bool = False,
 ) -> bool:
     """Select resident MF-GS metadata for compact solver shapes.
 
@@ -1108,7 +1111,12 @@ def _use_resident_mfgs_metadata(
         max_constraints, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits
     )
     total_shared_bytes = _estimate_mfgs_shared_memory(
-        max_constraints, mf_max_constraints, max_world_dofs, metadata_bytes=metadata_bytes, torsion_links=False
+        max_constraints,
+        mf_max_constraints,
+        max_world_dofs,
+        metadata_bytes=metadata_bytes,
+        torsion_links=False,
+        velocity_limit_units=velocity_limit_units,
     )
     return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
 
@@ -1122,6 +1130,7 @@ def _use_mfgs_torsion_links(
     shared_metadata: bool,
     has_drive_rows: bool,
     fuse_vel_limits: bool,
+    velocity_limit_units: bool = False,
 ) -> bool:
     """Select the linked contact-torsion sweep when its row lists fit the portable static shared-memory bound.
 
@@ -1133,7 +1142,12 @@ def _use_mfgs_torsion_links(
         else 0
     )
     total_shared_bytes = _estimate_mfgs_shared_memory(
-        max_constraints, mf_max_constraints, max_world_dofs, metadata_bytes=metadata_bytes, torsion_links=True
+        max_constraints,
+        mf_max_constraints,
+        max_world_dofs,
+        metadata_bytes=metadata_bytes,
+        torsion_links=True,
+        velocity_limit_units=velocity_limit_units,
     )
     return total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES <= min(
         _STATIC_SHARED_MEMORY_MAX_BYTES, max_shared_memory
@@ -1158,12 +1172,20 @@ def _estimate_mfgs_shared_memory(
     metadata_bytes: int,
     torsion_links: bool,
     pair_cache: bool = False,
+    velocity_limit_units: bool = False,
 ) -> int:
     """Estimate the MF-GS kernel's static shared-memory footprint [B]."""
     base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
+    if velocity_limit_units:
+        base_shared_bytes += 4 * _mfgs_velocity_limit_unit_capacity(max_world_dofs)
     links_bytes = torque_links_shared_bytes(max_constraints) if torsion_links else 0
     pair_bytes = _mfgs_pair_cache_bytes(max_constraints) if pair_cache else 0
     return _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes + links_bytes + pair_bytes
+
+
+def _mfgs_velocity_limit_unit_capacity(max_world_dofs: int) -> int:
+    """Return the velocity-limit rows per world whose unit DOF the MF-GS kernel stages (two per DOF, capped)."""
+    return min(2 * max_world_dofs, _MFGS_VELOCITY_LIMIT_UNIT_CAPACITY)
 
 
 def _mfgs_pair_cache_capacity(max_constraints: int) -> int:
@@ -1188,6 +1210,7 @@ def _use_mfgs_pair_cache(
     fuse_vel_limits: bool,
     world_count: int,
     sm_count: int,
+    velocity_limit_units: bool = False,
 ) -> bool:
     """Select the per-launch friction-pair operator cache when it fits and a shared-memory estimate keeps all worlds resident.
 
@@ -1205,6 +1228,7 @@ def _use_mfgs_pair_cache(
         metadata_bytes=metadata_bytes,
         torsion_links=torsion_links,
         pair_cache=True,
+        velocity_limit_units=velocity_limit_units,
     )
     block_bytes = total_shared_bytes + _WARP_STATIC_SHARED_RESERVE_BYTES
     # Heuristic: shared memory per SM approximated by the per-block maximum.
@@ -7485,6 +7509,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(getattr(model.device, "max_shared_memory_per_block", 0)),
                 has_drive_rows=has_drive_rows,
                 fuse_vel_limits=self._velocity_limits_fused,
+                velocity_limit_units=bool(self._enable_joint_velocity_limits),
             )
             self._mfgs_torsion_links = self._contact_torsion_enabled and _use_mfgs_torsion_links(
                 self._articulation_constraint_max,
@@ -7494,6 +7519,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shared_metadata=shared_metadata,
                 has_drive_rows=has_drive_rows,
                 fuse_vel_limits=self._velocity_limits_fused,
+                velocity_limit_units=bool(self._enable_joint_velocity_limits),
             )
             self._mfgs_pair_cache = (
                 self._friction_mode == "fixed_normal"
@@ -7507,6 +7533,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     torsion_links=self._mfgs_torsion_links,
                     has_drive_rows=has_drive_rows,
                     fuse_vel_limits=self._velocity_limits_fused,
+                    velocity_limit_units=bool(self._enable_joint_velocity_limits),
                     world_count=self._world_count,
                     sm_count=int(getattr(model.device, "sm_count", 0)),
                 )
@@ -7996,6 +8023,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         rows.rhs = dense_rhs
         rows.mf_meta = mf_meta
         rows.torsion_group = self._contact_torsion_group
+        rows.velocity_limit_slot, rows.velocity_limit_sign = self._mf_gs_velocity_limit_unit_args()
         rows.dense_gamma = compliance.dense_gamma if compliance is not None else off_gamma
         rows.mf_gamma = compliance.mf_gamma if compliance is not None else off_gamma
 
@@ -8151,6 +8179,18 @@ class SolverSteel(SolverBase, CouplingInterface):
             block_dim=32,
             device=self.model.device,
         )
+
+    def _mf_gs_velocity_limit_unit_args(self) -> tuple[wp.array, wp.array]:
+        """Per-DOF velocity-limit slots and signs for the MF-GS unit-row path, or dummies without them."""
+        if self._velocity_limit_slot is None:
+            if getattr(self, "_velocity_limit_unit_dummies", None) is None:
+                device = self.model.device
+                self._velocity_limit_unit_dummies = (
+                    wp.full((2,), -1, dtype=wp.int32, device=device),
+                    wp.zeros((2,), dtype=wp.float32, device=device),
+                )
+            return self._velocity_limit_unit_dummies
+        return self._velocity_limit_slot, self._velocity_limit_sign
 
     def _launch_cpu_matrix_free_gs(
         self,
@@ -8663,6 +8703,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         # (1, 1) dummy when the fused clamp is off; the kernel
                         # only reads it when built with fuse_vel_limits.
                         self._drive_vel_limit,
+                        *self._mf_gs_velocity_limit_unit_args(),
                         self._mf_constraint_count,
                         self._mf_contact_rows_end,
                         mf_meta,
@@ -24015,6 +24056,7 @@ def _get_pgs_solve_mf_gs_kernel(
     M_D = max_constraints
     M_MF = mf_max_constraints
     D = max_world_dofs
+    U = _mfgs_velocity_limit_unit_capacity(D)
 
     def dense_j_read(base: str, dof: str) -> str:
         return f"J_world.data[{base} + {dof}]"
@@ -24081,6 +24123,87 @@ def _get_pgs_solve_mf_gs_kernel(
                 s_v[{d_expr}] += cur_dY_{k} * delta_impulse;
             }}""")
     dense_v_update_code = "\n".join(dense_v_update_parts)
+
+    # Row phase 5 visits only joint velocity-limit rows. Each is a stateless projection that applies
+    # nothing while satisfied, so the scan below settles every satisfied row before the first one
+    # that acts lane-parallel, from the unit DOF staged at load, instead of loading its J and Y rows
+    # and reducing J*v. The acting row runs the generic loop's type-4 update with the same loads,
+    # sums and stores, so results are bit-identical.
+    phase5_serial_load = "\n".join(
+        f"""
+                    if ({d}) {{
+                        cur_dJ_{k} = {dense_j_read("p5_jy_base", d.split(" < ")[0])};
+                        cur_dY_{k} = Y_world.data[p5_jy_base + {d.split(" < ")[0]}];
+                    }}"""
+        for k, d in enumerate((f"lane + {k * 32} < {D}" if k > 0 else f"lane < {D}") for k in range(ELEMS_PER_LANE))
+    )
+    dense_phase5_scan = (
+        f"""
+        int dense_generic_hi = dense_hi;
+        if (row_phase == 5) {{
+            dense_generic_hi = dense_lo;
+            int p5_base = dense_lo;
+            while (p5_base < dense_hi) {{
+                int p5_serial = 0;
+                int p5_satisfied = 0;
+                {{
+                    const int i = p5_base + lane;
+                    if (i < dense_hi && (s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} && s_diag_dense[i] > 0.0f) {{
+                        const int unit_p5 = i - dense_lo < {U} ? s_vlim_unit[i - dense_lo] : 0;
+                        if (unit_p5 > 0) {{
+                            const float v_unit = s_v[(unit_p5 - 1) >> 1];
+                            const float jv_unit = ((unit_p5 - 1) & 1) ? -v_unit : v_unit;
+                            if (jv_unit + s_rhs_dense[i] < 0.0f) p5_serial = 1;
+                            else p5_satisfied = 1;
+                        }} else {{
+                            p5_serial = 1;
+                        }}
+                    }}
+                }}
+                const unsigned p5_mask = __ballot_sync(MASK, p5_serial);
+                const int p5_first = p5_mask != 0u ? __ffs(p5_mask) - 1 : 32;
+                if (p5_satisfied && lane < p5_first) s_lam_dense[p5_base + lane] = 0.0f;
+                __syncwarp();
+                if (p5_first == 32) {{
+                    p5_base += 32;
+                    continue;
+                }}
+                {{
+                    const int i = p5_base + p5_first;
+                    const int p5_jy_base = jy_world_base + i * {D};
+{"".join(f"                    float cur_dJ_{k} = 0.0f, cur_dY_{k} = 0.0f;" + chr(10) for k in range(ELEMS_PER_LANE))}{phase5_serial_load}
+                    float denom = s_diag_dense[i];
+                    {dense_dot_code}
+                    my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                    float jv = __shfl_sync(MASK, my_sum, 0);
+                    float old_impulse = s_lam_dense[i];
+                    float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
+                    float residual = jv + s_rhs_dense[i];
+                    float delta = denom > 0.0f ? -residual / denom * w - (1.0f - w) * old_impulse : 0.0f;
+                    float new_impulse = 0.0f;
+                    float delta_impulse = 0.0f;
+                    if (residual < 0.0f) {{
+                        delta_impulse = delta;
+                        new_impulse = delta_impulse;
+                    }}
+                    __syncwarp();
+                    s_lam_dense[i] = new_impulse;
+                    if (delta_impulse != 0.0f) {{
+                        iteration_changed = 1;
+                        {dense_v_update_code}
+                    }}
+                }}
+                p5_base += p5_first + 1;
+                __syncwarp();
+            }}
+        }}"""
+        if has_dense_velocity_limit_rows
+        else "\n        const int dense_generic_hi = dense_hi;"
+    )
 
     # Dense sibling v update — NOT pipelined (random sib index)
     dense_sib_v_parts = []
@@ -25008,35 +25131,72 @@ def _get_pgs_solve_mf_gs_kernel(
             // Velocity-limit rows occupy the [bounds[0], bounds[1]) slot segment.
             const int vlim_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
             const int vlim_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-            for (int i = vlim_lo; i < vlim_hi; i++) {{
-                if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
-                float denom = s_diag_dense[i];
-                if (denom <= 0.0f) continue;
-
-                float my_sum_vlim = 0.0f;
-                int row_base_vlim = jy_world_base + i * {D};
-                for (int d = lane; d < {D}; d += 32) {{
-                    my_sum_vlim += J_world.data[row_base_vlim + d] * s_v[d];
-                }}
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 16);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 8);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 4);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 2);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 1);
-                float jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
-
-                float residual_vlim = jv_vlim + s_rhs_dense[i];
-                float delta_vlim = -residual_vlim / denom;
-                float delta_impulse_vlim = 0.0f;
-                if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
-                if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
-
-                if (delta_impulse_vlim != 0.0f) {{
-                    iteration_changed = 1;
-                    for (int d = lane; d < {D}; d += 32) {{
-                        s_v[d] += Y_world.data[row_base_vlim + d] * delta_impulse_vlim;
+            int vlim_base = vlim_lo;
+            while (vlim_base < vlim_hi) {{
+                // Decide the next 32 rows lane-parallel. A unit row (J = sign * e_d, recorded in
+                // s_vlim_unit at load) whose residual is non-negative applies no impulse and leaves
+                // s_v unchanged, so every such row before the first one that acts is settled at once,
+                // in Gauss-Seidel order. That row, or a row outside the unit table, runs serially.
+                int vlim_serial = 0;
+                int vlim_satisfied = 0;
+                {{
+                    const int i = vlim_base + lane;
+                    if (i < vlim_hi && (s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)} && s_diag_dense[i] > 0.0f) {{
+                        const int unit_vlim = i - vlim_lo < {U} ? s_vlim_unit[i - vlim_lo] : 0;
+                        if (unit_vlim > 0) {{
+                            const float v_unit = s_v[(unit_vlim - 1) >> 1];
+                            const float jv_vlim = ((unit_vlim - 1) & 1) ? -v_unit : v_unit;
+                            if (jv_vlim + s_rhs_dense[i] < 0.0f) vlim_serial = 1;
+                            else vlim_satisfied = 1;
+                        }} else {{
+                            vlim_serial = 1;
+                        }}
                     }}
                 }}
+                const unsigned vlim_serial_mask = __ballot_sync(MASK, vlim_serial);
+                const int vlim_first = vlim_serial_mask != 0u ? __ffs(vlim_serial_mask) - 1 : 32;
+                if (vlim_satisfied && lane < vlim_first) s_lam_dense[vlim_base + lane] = 0.0f;
+                __syncwarp();
+                if (vlim_first == 32) {{
+                    vlim_base += 32;
+                    continue;
+                }}
+                {{
+                    const int i = vlim_base + vlim_first;
+                    float denom = s_diag_dense[i];
+                    int row_base_vlim = jy_world_base + i * {D};
+                    const int unit_vlim = i - vlim_lo < {U} ? s_vlim_unit[i - vlim_lo] : 0;
+                    float jv_vlim;
+                    if (unit_vlim > 0) {{
+                        const float v_unit = s_v[(unit_vlim - 1) >> 1];
+                        jv_vlim = ((unit_vlim - 1) & 1) ? -v_unit : v_unit;
+                    }} else {{
+                        float my_sum_vlim = 0.0f;
+                        for (int d = lane; d < {D}; d += 32) {{
+                            my_sum_vlim += J_world.data[row_base_vlim + d] * s_v[d];
+                        }}
+                        my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 16);
+                        my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 8);
+                        my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 4);
+                        my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 2);
+                        my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 1);
+                        jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
+                    }}
+
+                    float residual_vlim = jv_vlim + s_rhs_dense[i];
+                    float delta_vlim = -residual_vlim / denom;
+                    float delta_impulse_vlim = 0.0f;
+                    if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
+                    if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
+
+                    if (delta_impulse_vlim != 0.0f) {{
+                        iteration_changed = 1;
+                        for (int d = lane; d < {D}; d += 32) {{
+                            s_v[d] += Y_world.data[row_base_vlim + d] * delta_impulse_vlim;
+                        }}
+                    }}
+                }}
+                vlim_base += vlim_first + 1;
                 __syncwarp();
             }}
         }}"""
@@ -25099,6 +25259,33 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
+
+    # Velocity-limit rows are ``sign * e_d`` selectors. Record ``(d << 1 | sign < 0) + 1`` per row of
+    # the velocity-limit segment (at most two rows per world DOF) so that phase reads J*v from s_v.
+    dense_velocity_limit_unit_pack = (
+        f"""    __shared__ int s_vlim_unit[{U}];
+    if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
+        const int unit_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+        const int unit_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+        for (int k = lane; k < {U}; k += 32) s_vlim_unit[k] = 0;
+        __syncwarp();
+        for (int d = lane; d < {D}; d += 32) {{
+            const int global_dof = world_dof_indices.data[dof_map_base + d];
+            if (global_dof < 0) continue;
+            for (int side = 0; side < 2; side++) {{
+                const int slot = velocity_limit_slot.data[2 * global_dof + side];
+                if (slot < unit_lo || slot >= unit_hi || slot - unit_lo >= {U}) continue;
+                const int negative = velocity_limit_sign.data[2 * global_dof + side] < 0.0f ? 1 : 0;
+                s_vlim_unit[slot - unit_lo] = ((d << 1) | negative) + 1;
+            }}
+        }}
+        __syncwarp();
+    }}
+"""
+        if has_dense_velocity_limit_rows
+        else ""
+    )
+
     torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
     torsion_sweep = torque_sweep_source(D, linked=torsion_links) if contact_torsion else ""
     torsion_link_build = torque_links_source(M_D) if contact_torsion and torsion_links else ""
@@ -25322,7 +25509,7 @@ def _get_pgs_solve_mf_gs_kernel(
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
     __syncwarp();
-
+{dense_velocity_limit_unit_pack}
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
     // ═══════════════════════════════════════════════════════
@@ -25334,14 +25521,15 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 {momentum_sweep}
+{dense_phase5_scan}
         // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
 
         // Prefetch the first constraint of this phase's dense range
-        if (dense_hi > dense_lo) {{
+        if (dense_generic_hi > dense_lo) {{
             {dense_prefetch_init_code}
         }}
 
-        for (int i = dense_lo; i < dense_hi; i++) {{
+        for (int i = dense_lo; i < dense_generic_hi; i++) {{
             // Consume prefetched J/Y for constraint i
             {dense_consume_code}
 
@@ -25814,6 +26002,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
         world_drive_vel_limit: wp.array2d[float],
+        velocity_limit_slot: wp.array[int],
+        velocity_limit_sign: wp.array[float],
         # MF
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
@@ -25866,6 +26056,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
         world_drive_vel_limit: wp.array2d[float],
+        velocity_limit_slot: wp.array[int],
+        velocity_limit_sign: wp.array[float],
         # MF
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
@@ -25922,6 +26114,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 world_drive_impulse_multiplier,
                 world_drive_max_impulse,
                 world_drive_vel_limit,
+                velocity_limit_slot,
+                velocity_limit_sign,
                 mf_constraint_count,
                 mf_contact_rows_end,
                 mf_meta,

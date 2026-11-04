@@ -94,6 +94,8 @@ class RowArgs:
     drive_impulse_multiplier: wp.array2d(dtype=float)
     drive_max_impulse: wp.array2d(dtype=float)
     drive_vel_limit: wp.array2d(dtype=float)
+    velocity_limit_slot: wp.array(dtype=int)
+    velocity_limit_sign: wp.array(dtype=float)
     mf_constraint_count: wp.array(dtype=int)
     mf_contact_rows_end: wp.array(dtype=int)
     mf_meta: wp.array2d(dtype=int)
@@ -244,6 +246,7 @@ def get_fused_iteration_kernel(
             rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.torsion_group,
             rows.torsion_row_radius, rows.drive_target_vel_bias, rows.drive_vel_multiplier,
             rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
+            rows.velocity_limit_slot, rows.velocity_limit_sign,
             rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses,
             rows.mf_J_a, rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.mf_row_w,
             rows.dense_gamma, rows.mf_gamma, 1, omega, regularize, phase, friction_start_iteration, g,

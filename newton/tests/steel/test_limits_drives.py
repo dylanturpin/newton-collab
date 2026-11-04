@@ -560,6 +560,66 @@ def test_default_gap_holds_a_fast_joint_like_always_allocate(test, device):
     np.testing.assert_allclose(default_q, always_q, rtol=0.0, atol=1.0e-5)
 
 
+def _build_spinning_velocity_limited_chain(device):
+    """Build a three-link revolute chain spinning past its 1 rad/s velocity limits under gravity."""
+    builder = newton.ModelBuilder()
+    parent, joints = -1, []
+    for k in range(3):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05))
+        builder.add_shape_box(link, hx=0.05, hy=0.05, hz=0.2)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.X,
+                parent_xform=wp.transform((0.0, 0.0, -0.4 if k else 1.0), wp.quat_identity()),
+                child_xform=wp.transform((0.0, 0.0, 0.2), wp.quat_identity()),
+                velocity_limit=1.0,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.joint_qd[:] = [3.0, -2.0, 4.0]
+    return builder.finalize(device=device)
+
+
+def _velocity_limited_trajectory(model, *, unit_rows: bool, **solver_options):
+    solver = SolverSteel(model, enable_joint_velocity_limits=True, iterations=8, **solver_options)
+    if not unit_rows:
+        # All-unset slot tables leave every velocity-limit row on the D-wide J*v reduction.
+        dummies = (
+            wp.full((2,), -1, dtype=wp.int32, device=model.device),
+            wp.zeros((2,), dtype=wp.float32, device=model.device),
+        )
+        solver._mf_gs_velocity_limit_unit_args = lambda: dummies
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    qd, vlim_rows = [], 0
+    for _ in range(10):
+        solver.step(state_0, state_1, model.control(), None, 0.01)
+        count = int(solver._constraint_count.numpy()[0])
+        vlim_rows = max(
+            vlim_rows, int(np.sum(solver._row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))
+        )
+        qd.append(state_1.joint_qd.numpy().copy())
+        state_0, state_1 = state_1, state_0
+    return np.array(qd), vlim_rows
+
+
+def test_velocity_limit_unit_rows_match_the_reduction(test, device):
+    """Reading a velocity-limit row's J*v from its unit DOF matches the D-wide reduction bit for bit."""
+    model = _build_spinning_velocity_limited_chain(device)
+    colored = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    # 512 rows stream the MF-GS row metadata from global memory instead of keeping it resident.
+    for options in ({}, colored, {"articulation_constraint_max": 512}, {**colored, "articulation_constraint_max": 512}):
+        with test.subTest(**options):
+            unit_qd, unit_rows = _velocity_limited_trajectory(model, unit_rows=True, **options)
+            reduced_qd, _ = _velocity_limited_trajectory(model, unit_rows=False, **options)
+            test.assertEqual(unit_rows, 6)
+            np.testing.assert_array_equal(unit_qd, reduced_qd)
+            test.assertLessEqual(float(np.abs(unit_qd[-1]).max()), 1.0 + 1.0e-4)
+
+
 class TestSteelJointLimitActivationGapUpstream(unittest.TestCase):
     pass
 
@@ -581,6 +641,7 @@ for _name, _func in (
         "test_default_gap_holds_a_fast_joint_like_always_allocate",
         test_default_gap_holds_a_fast_joint_like_always_allocate,
     ),
+    ("test_velocity_limit_unit_rows_match_the_reduction", test_velocity_limit_unit_rows_match_the_reduction),
 ):
     add_function_test(TestSteelJointLimitActivationGapUpstream, _name, _func, devices=devices)
 

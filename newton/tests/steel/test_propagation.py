@@ -2507,6 +2507,8 @@ class TestSteelColoredDeterministic(unittest.TestCase):
                 model,
                 enable_joint_velocity_limits=True,
                 velocity_limit_activation_fraction=0.0,
+                # Allocate every limit row so the dense family overflows.
+                joint_limit_activation_gap=float("inf"),
                 free_body_constraint_max=160,
                 articulation_constraint_max=24,
             )
@@ -4043,9 +4045,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
 
     def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
         """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", **solver_options
-        )
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", **solver_options)
         self.assertTrue(solver._latency_fused)
         wide = [0]
         loop = type(solver)._launch_matrix_free_gs_solve_propagation_tree
@@ -4117,9 +4117,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
     def test_debug_hooks_take_the_per_pass_launches(self):
         # stage timing and kernel capture observe the per-pass launches, so latency mode steps aside for them
         model = _build_latency_scene("cuda:0")
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", iterations=4
-        )
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", iterations=4)
         self.assertTrue(solver._latency_fused)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
