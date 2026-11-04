@@ -1899,15 +1899,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             joint_limit_activation_gap: Distance from a finite position limit [m or rad] at
                 which its row is created, when ``enable_joint_limits`` is set. ``inf`` creates
                 the rows of every finite limit each step; a smaller gap creates a row only when
-                ``q <= lower + gap`` or ``q >= upper - gap``. Every finite bound is enforced,
-                however large: the builder's default limits (``+/-1e10``) are finite, so with
-                ``inf`` each such DOF uses two rows of ``articulation_constraint_max`` in every step.
-                Use a finite gap or unbounded (``+/-inf``) limits to avoid these rows; the
-                constructor warns when the finite limits alone exceed the capacity. The value
-                is validated even when joint limits are disabled.
+                ``q <= lower + gap`` or ``q >= upper - gap``. A bound at or beyond ``MAXVAL``, the
+                builder's unlimited default (``+/-1e10``), has no row. The constructor warns when the
+                finite limits alone exceed the capacity. The value is validated even when joint limits
+                are disabled.
             enable_joint_velocity_limits: Enforce :attr:`~newton.Model.joint_velocity_limit`
                 of PRISMATIC, REVOLUTE and D6 DOFs with one row pair per limited DOF, after
-                scaling articulation velocities that already exceed a limit. The free-body limits of
+                scaling articulation velocities that already exceed a limit. A DOF at the builder's
+                default limit (``1e6``) or above has no rows. The free-body limits of
                 :meth:`register_custom_attributes` are enforced whenever those attributes are
                 registered, independently of this option.
             velocity_limit_activation_fraction: Create the velocity-limit rows of a DOF only
@@ -3838,8 +3837,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         With ``enable_joint_limits`` and ``joint_limit_activation_gap=inf`` each finite
         position limit of a responding PRISMATIC, REVOLUTE or D6 DOF is a row in every step,
-        mirroring the joint-limit row builder. Large finite bounds, such as the builder's
-        default ``+/-1e10``, count like any other finite bound. With ``enable_joint_friction``
+        mirroring the joint-limit row builder; a bound at or beyond the builder's unlimited default
+        ``MAXVAL`` has no row. With ``enable_joint_friction``
         each responding, non-kinematic DOF with positive friction is one row in every step.
         """
         limit_rows = np.zeros(max(self._world_count, 1), dtype=np.int64)
@@ -3848,7 +3847,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             limit_q_index = self._joint_limit_q_index.numpy()
             lower = model.joint_limit_lower.numpy()
             upper = model.joint_limit_upper.numpy()
-            per_dof = np.where(limit_q_index >= 0, np.isfinite(lower).astype(np.int64) + np.isfinite(upper), 0)
+            per_dof = np.where(
+                limit_q_index >= 0, (np.abs(lower) < MAXVAL).astype(np.int64) + (np.abs(upper) < MAXVAL), 0
+            )
             self._add_articulation_rows(limit_rows, per_dof, self._joint_limit_sizes)
         if self._joint_friction_warp_kernels:
             friction = model.joint_friction.numpy()
@@ -10520,6 +10521,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_tree_art_count: dict[int, int] = {}
         self._propagation_native_tree: dict[int, bool] = {}
         self._propagation_free_root_tree: dict[int, bool] = {}
+        self._propagation_multidof_tree: dict[int, bool] = {}
         self._propagation_max_joints: dict[int, int] = {}
         self._propagation_needs_body_map = False
         self._max_propagation_bodies = 1
@@ -10550,6 +10552,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_tree_art_count[int(size)] = int(arts.size)
             single_dof = True
             free_root = True
+            multidof = True
             max_joints = 0
             for art in arts:
                 joint_start = int(articulation_start[art])
@@ -10559,32 +10562,44 @@ class SolverSteel(SolverBase, CouplingInterface):
                 parents = joint_parent[joint_start:joint_end]
                 if np.any(dof_counts > 1):
                     single_dof = False
-                # Free-root shape: the first joint is the only world-rooted joint (up to 6 DOFs),
-                # every other joint has at most one DOF and a parent earlier in joint order.
-                if (
-                    joint_end <= joint_start
-                    or int(parents[0]) != -1
-                    or int(dof_counts[0]) > 6
-                    or np.any(parents[1:] < 0)
-                    or np.any(dof_counts[1:] > 1)
-                ):
-                    free_root = False
-                else:
-                    child_to_slot = {int(joint_child[j]): j - joint_start for j in range(joint_start, joint_end)}
-                    for j in range(joint_start + 1, joint_end):
-                        parent_slot = child_to_slot.get(int(joint_parent[j]), -1)
-                        if parent_slot < 0 or parent_slot >= j - joint_start:
-                            free_root = False
-                            break
+                # Multi-DOF shape: joints of at most 6 DOFs in parent-before-child order, every non-world
+                # parent inside the articulation. Free-root shape: additionally the first joint is the only
+                # world-rooted joint and every other joint has at most one DOF.
+                child_to_slot = {int(joint_child[j]): j - joint_start for j in range(joint_start, joint_end)}
+                tree_ordered = (
+                    joint_end > joint_start
+                    and not np.any(dof_counts > 6)
+                    and all(
+                        0 <= child_to_slot.get(int(parent), -1) < slot
+                        for slot, parent in enumerate(parents)
+                        if parent >= 0
+                    )
+                )
+                multidof = multidof and tree_ordered
+                free_root = (
+                    free_root
+                    and tree_ordered
+                    and int(parents[0]) == -1
+                    and not np.any(parents[1:] < 0)
+                    and not np.any(dof_counts[1:] > 1)
+                )
             self._propagation_max_joints[int(size)] = max_joints
+            multidof_only = not (single_dof or free_root)
             native = (
                 model.device.is_cuda
                 and tree_kernel == "auto"
-                and (single_dof or free_root)
                 and _propagation_tree_kernel_fits(max_joints)
+                and (
+                    not multidof_only
+                    or (
+                        multidof
+                        and _propagate_tree_impulses_multidof_shared_bytes(max_joints) <= _PROPAGATION_TREE_SHARED_BYTES
+                    )
+                )
             )
             self._propagation_native_tree[int(size)] = native
-            self._propagation_free_root_tree[int(size)] = native and not single_dof
+            self._propagation_free_root_tree[int(size)] = native and free_root and not single_dof
+            self._propagation_multidof_tree[int(size)] = native and multidof_only
             if not native:
                 self._propagation_needs_body_map = True
 
@@ -10604,7 +10619,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._propagation_cached_response and model.device.is_cuda:
             cache_bodies = min(self._max_propagation_bodies, self._propagation_cached_response_body_max)
             for size in self._propagation_tree_sizes:
-                if not self._propagation_native_tree[size]:
+                # The cached-response setup kernel covers 0/1-DOF and free-root trees only.
+                if not self._propagation_native_tree[size] or self._propagation_multidof_tree[size]:
                     continue
                 warps = _cached_response_extraction_warps(
                     self._propagation_max_joints[size],
@@ -10790,16 +10806,21 @@ class SolverSteel(SolverBase, CouplingInterface):
         for size in self._propagation_tree_sizes:
             if not self._propagation_native_tree[size]:
                 continue
-            free_root = self._propagation_free_root_tree[size]
+            # A single-DOF group takes the plain variants; a free-root group compiles a multi-DOF root
+            # special case; any other native group stages multi-DOF blocks for every joint.
+            flavour = {
+                "has_free_root": self._propagation_free_root_tree[size],
+                "multidof": self._propagation_multidof_tree[size],
+            }
             max_joints = self._propagation_max_joints[size]
             self._propagation_factor_kernels[size] = _get_factor_propagation_tree_revolute_kernel(
-                size, device_arch, has_free_root=free_root
+                size, device_arch, **flavour
             )
             self._propagation_response_kernels[size] = _get_propagation_tree_body_response_revolute_kernel(
-                size, device_arch, has_free_root=free_root
+                size, device_arch, **flavour
             )
             self._propagation_propagate_kernels[size] = _get_propagate_tree_impulses_revolute_kernel(
-                size, max_joints, device_arch, has_free_root=free_root
+                size, max_joints, device_arch, **flavour
             )
             self._propagation_refresh_kernels[size] = _get_refresh_propagation_tree_body_qd_warp_kernel(
                 size, max_joints, device_arch
@@ -12125,7 +12146,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const float q = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             phi_value = side == 0 ? q - bound : bound - q;
-            active = isfinite(bound) && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
+            active = fabsf(bound) < {MAXVAL:.1e}f && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
         }}
 
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
@@ -16076,6 +16097,13 @@ def _propagation_tree_kernel_fits(max_joints: int) -> bool:
     return 4 * _PROPAGATION_TREE_WORDS_PER_JOINT * max(int(max_joints), 1) <= _PROPAGATION_TREE_SHARED_BYTES
 
 
+def _propagate_tree_impulses_multidof_shared_bytes(max_joints: int) -> int:
+    """Static shared memory of the ``multidof`` :func:`_get_propagate_tree_impulses_revolute_kernel`."""
+    joints_cap = max(int(max_joints), 1)
+    # per joint: pA, bd, u, qdd (6 each), U, S, D_inv (36 each), COM edge (3) floats; four ints
+    return joints_cap * ((4 * 6 + 3 * 36 + 3) * 4 + 4 * 4)
+
+
 @cache
 def _get_color_propagation_prebuild_kernel(
     propagation_max_constraints: int,
@@ -19174,7 +19202,7 @@ _PROPAGATION_APPLY_ROW_CUDA = """
 
 @cache
 def _get_factor_propagation_tree_revolute_kernel(
-    size: int, device_arch: str, *, has_free_root: bool = False
+    size: int, device_arch: str, *, has_free_root: bool = False, multidof: bool = False
 ) -> "wp.Kernel":
     """Build a one-warp propagation tree factor kernel for 0/1-DOF joint trees.
 
@@ -19188,6 +19216,11 @@ def _get_factor_propagation_tree_revolute_kernel(
     parent, so it never reduces into a parent inertia. Eligibility (root
     joint first, topological joint order) is verified host-side at solver
     build time.
+
+    ``multidof`` runs that multi-DOF block for every joint with more than one DOF (ball joints anywhere
+    in the tree, a floating base) and then reduces the child into its parent like a 1-DOF joint, so
+    any topologically ordered tree with in-articulation parents takes this kernel
+    (``_propagation_tree_multidof_by_size``).
     """
     snippet = """
 #if defined(__CUDA_ARCH__)
@@ -19276,6 +19309,7 @@ def _get_factor_propagation_tree_revolute_kernel(
             propagation_tree_Ia.data[child * 36 + elem] = reduced;
         }
         __syncwarp(mask);
+//ONE_DOF_CLOSE
 
         if (parent >= 0) {
             const float ex = propagation_body_com_rel.data[child * 3 + 0]
@@ -19374,13 +19408,13 @@ def _get_factor_propagation_tree_revolute_kernel(
 #endif
 """
 
-    if has_free_root:
+    if has_free_root or multidof:
         root_decl = """
     __shared__ float s_D_root[36];
     __shared__ float s_Dinv_root[36];
 """
         root_factor = """
-        if (joint == joint_start) {
+        if (//ROOT_CONDITION) {
             const int dc = dof_end - dof_start;
             // U rows for all root DOFs: U_a = Ia(child) S_a.
             for (int elem = lane; elem < dc * 6; elem += 32) {
@@ -19483,12 +19517,23 @@ def _get_factor_propagation_tree_revolute_kernel(
                 propagation_tree_Ia.data[child * 36 + elem] = reduced;
             }
             __syncwarp(mask);
-            continue;
-        }
+//ROOT_EXIT
 """
+        if multidof:
+            # every multi-DOF joint takes the block, then falls through to its parent reduction
+            root_factor = root_factor.replace("//ROOT_CONDITION", "dof_end - dof_start > 1").replace(
+                "//ROOT_EXIT", "        } else {"
+            )
+            snippet = snippet.replace("//ONE_DOF_CLOSE\n", "        }\n")
+        else:
+            # the root (no parent) takes the block and skips the rest of the joint
+            root_factor = root_factor.replace("//ROOT_CONDITION", "joint == joint_start").replace(
+                "//ROOT_EXIT", "            continue;\n        }"
+            )
         snippet = snippet.replace("//FREE_ROOT_DECL", root_decl).replace("//FREE_ROOT_FACTOR", root_factor)
     else:
         snippet = snippet.replace("//FREE_ROOT_DECL", "").replace("//FREE_ROOT_FACTOR", "")
+    snippet = snippet.replace("//ONE_DOF_CLOSE\n", "")
 
     @wp.func_native(snippet)
     def factor_propagation_tree_revolute_native(
@@ -19557,7 +19602,9 @@ def _get_factor_propagation_tree_revolute_kernel(
         )
 
     name = f"factor_propagation_tree_revolute_{size}"
-    if has_free_root:
+    if multidof:
+        name += "_md"
+    elif has_free_root:
         name += "_fr"
     factor_propagation_tree_revolute_template.__name__ = name
     factor_propagation_tree_revolute_template.__qualname__ = name
@@ -19566,9 +19613,64 @@ def _get_factor_propagation_tree_revolute_kernel(
     )
 
 
+# Multi-DOF joint terms of the warp body-response kernel (see its ``multidof`` option), each placed
+# ahead of the 1-DOF block it generalizes: ``p = e - U D^-1 S^T e`` and ``S D^-1 (S^T e - U^T delta)``.
+_MULTIDOF_RESPONSE_P = """
+            const int dc = dof_end - dof_start;
+            float sdf[6];
+            if (dc > 1) {
+                // unit test wrench e_col at the child: s = S^T e, c = D^-1 s
+                float coeff[6];
+                for (int b = 0; b < dc; ++b) {
+                    sdf[b] = propagation_joint_S_flat.data[(dof_start + b) * 6 + col];
+                }
+                for (int a = 0; a < dc; ++a) {
+                    float v = 0.0f;
+                    for (int b = 0; b < dc; ++b) {
+                        v += propagation_tree_D_inv.data[joint * 36 + a * 6 + b] * sdf[b];
+                    }
+                    coeff[a] = v;
+                }
+                for (int a = 0; a < dc; ++a) {
+                    p0 -= propagation_tree_U.data[(dof_start + a) * 6 + 0] * coeff[a];
+                    p1 -= propagation_tree_U.data[(dof_start + a) * 6 + 1] * coeff[a];
+                    p2 -= propagation_tree_U.data[(dof_start + a) * 6 + 2] * coeff[a];
+                    p3 -= propagation_tree_U.data[(dof_start + a) * 6 + 3] * coeff[a];
+                    p4 -= propagation_tree_U.data[(dof_start + a) * 6 + 4] * coeff[a];
+                    p5 -= propagation_tree_U.data[(dof_start + a) * 6 + 5] * coeff[a];
+                }
+            } else
+"""
+_MULTIDOF_RESPONSE_VALUE = """
+            if (dc > 1) {
+                float pd[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                float ps[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                for (int b = 0; b < dc; ++b) {
+                    for (int r = 0; r < 6; ++r) {
+                        pd[b] += propagation_tree_U.data[(dof_start + b) * 6 + r] * parent_delta[r];
+                        ps[b] += propagation_tree_U.data[(dof_start + b) * 6 + r] * parent_split[r];
+                    }
+                }
+                const float weight = (float)max(propagation_joint_split.data[joint], 1);
+                for (int a = 0; a < dc; ++a) {
+                    float qa = 0.0f;
+                    float qs = 0.0f;
+                    for (int b = 0; b < dc; ++b) {
+                        const float dinv = propagation_tree_D_inv.data[joint * 36 + a * 6 + b];
+                        qa += dinv * (sdf[b] - pd[b]);
+                        qs += dinv * (weight * sdf[b] - ps[b]);
+                    }
+                    const float s_row = propagation_joint_S_flat.data[(dof_start + a) * 6 + row];
+                    value += s_row * qa;
+                    split_value += s_row * qs;
+                }
+            } else
+"""
+
+
 @cache
 def _get_propagation_tree_body_response_revolute_kernel(
-    size: int, device_arch: str, *, has_free_root: bool = False
+    size: int, device_arch: str, *, has_free_root: bool = False, multidof: bool = False
 ) -> "wp.Kernel":
     """Build a one-warp body response kernel for 0/1-DOF joint trees.
 
@@ -19587,6 +19689,11 @@ def _get_propagation_tree_body_response_revolute_kernel(
     (``compute_propagation_tree_body_response_for_size``), which fills only
     contact-active bodies — a subset of what this kernel writes, with equal
     values.
+
+    ``multidof`` handles every joint with more than one DOF, rooted or not: a unit wrench at the child
+    leaves ``p = e - U D^-1 S^T e`` to the parent, and the child's response adds
+    ``S D^-1 (S^T e - U^T delta_parent)`` to the parent's (the same recursion as a 1-DOF joint, with the
+    scalar ``1/d`` replaced by the joint's ``D^-1`` block; without a parent it is ``S D^-1 S^T``).
     """
     snippet = """
 #if defined(__CUDA_ARCH__)
@@ -19646,6 +19753,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
             float p3 = b3;
             float p4 = b4;
             float p5 = b5;
+//MULTIDOF_P
             if (has_dof) {
                 const float scale = inv_d * s_dot_f;
                 p0 -= propagation_tree_U.data[gdof * 6 + 0] * scale;
@@ -19680,6 +19788,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
 
             float value = parent_delta[row];
             float split_value = parent_split[row];
+//MULTIDOF_VALUE
             if (has_dof) {
                 float parent_dot = 0.0f;
                 float split_dot = 0.0f;
@@ -19732,6 +19841,9 @@ def _get_propagation_tree_body_response_revolute_kernel(
         snippet = snippet.replace("//FREE_ROOT_RESPONSE", root_response)
     else:
         snippet = snippet.replace("//FREE_ROOT_RESPONSE", "")
+    md = multidof and not has_free_root
+    snippet = snippet.replace("//MULTIDOF_P\n", _MULTIDOF_RESPONSE_P if md else "")
+    snippet = snippet.replace("//MULTIDOF_VALUE\n", _MULTIDOF_RESPONSE_VALUE if md else "")
 
     @wp.func_native(snippet)
     def propagation_tree_body_response_revolute_native(
@@ -19788,6 +19900,8 @@ def _get_propagation_tree_body_response_revolute_kernel(
         )
 
     name = f"propagation_tree_body_response_revolute_{size}"
+    if multidof:
+        name += "_md"
     if has_free_root:
         name += "_fr"
     propagation_tree_body_response_revolute_template.__name__ = name
@@ -19799,7 +19913,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
 
 @cache
 def _get_propagate_tree_impulses_revolute_kernel(
-    size: int, max_joints: int, device_arch: str, *, has_free_root: bool = False
+    size: int, max_joints: int, device_arch: str, *, has_free_root: bool = False, multidof: bool = False
 ) -> "wp.Kernel":
     """Build a one-warp propagation tree propagation kernel for 0/1-DOF joint trees.
 
@@ -19819,6 +19933,14 @@ def _get_propagate_tree_impulses_revolute_kernel(
     never participates in the upward/downward parent propagation. Eligibility
     (root joint first, topological joint order) is verified host-side at
     solver build time.
+
+    ``multidof`` stages every joint's S, U and D_inv blocks (up to 6 rows) in
+    shared memory, so ball joints anywhere in the tree take the on-chip path:
+    per joint, lanes ``a < dof_count`` own the joint-space terms and lanes
+    ``r < 6`` the spatial ones, the serial kernel's per-DOF loops unrolled
+    across lanes. Registered for topologically ordered trees with
+    in-articulation parents (``_propagation_tree_multidof_by_size``); its
+    static shared footprint is :func:`_propagate_tree_impulses_multidof_shared_bytes`.
     """
     joints_cap = max(int(max_joints), 1)
     if has_free_root:
@@ -19904,6 +20026,181 @@ def _get_propagate_tree_impulses_revolute_kernel(
         root_backward = ""
         root_forward = ""
         root_recompute = ""
+    if multidof:
+        root_decl = f"""
+    __shared__ float s_qdd[{joints_cap} * 6];
+    __shared__ int s_dc[{joints_cap}];
+"""
+        joint_meta = """
+        s_gdof[j] = dof_start;
+        s_dc[j] = joint_qd_start.data[joint + 1] - dof_start;
+"""
+        root_preload = """
+    for (int idx = lane; idx < n_joints * 36; idx += 32) {
+        const int j = idx / 36;
+        const int k = idx - j * 36;
+        const int a = k / 6;
+        const int comp = k - a * 6;
+        const int dc = s_dc[j];
+        const int gdof = s_gdof[j];
+        s_U[idx] = (a < dc) ? propagation_tree_U.data[(gdof + a) * 6 + comp] : 0.0f;
+        s_S[idx] = (a < dc) ? propagation_joint_S_flat.data[(gdof + a) * 6 + comp] : 0.0f;
+        s_dinv[idx] = (a < dc && comp < dc) ? propagation_tree_D_inv.data[(joint_start + j) * 36 + k] : 0.0f;
+    }
+"""
+        subspace_preload = ""
+        # u_a = -S_a . pA; the parent gains pA + sum_a U_a (D^-1 u)_a, moved to its COM.
+        backward = """
+            const int dc = s_dc[j];
+            if (lane < dc) {
+                float u = 0.0f;
+                for (int r = 0; r < 6; ++r) {
+                    u -= s_S[j * 36 + lane * 6 + r] * s_pA[j * 6 + r];
+                }
+                s_u[j * 6 + lane] = u;
+            }
+            __syncwarp(mask);
+            if (parent_slot >= 0) {
+                // s_bd is free until the forward pass: stage the child-frame wrench there
+                if (lane < 6) {
+                    float p = s_pA[j * 6 + lane];
+                    for (int a = 0; a < dc; ++a) {
+                        float coeff = 0.0f;
+                        for (int b = 0; b < dc; ++b) {
+                            coeff += s_dinv[j * 36 + a * 6 + b] * s_u[j * 6 + b];
+                        }
+                        p += s_U[j * 36 + a * 6 + lane] * coeff;
+                    }
+                    s_bd[j * 6 + lane] = p;
+                }
+                __syncwarp(mask);
+                if (lane < 6) {
+                    float propagated = s_bd[j * 6 + lane];
+                    if (lane >= 3) {
+                        const float ex = s_e[j * 3 + 0];
+                        const float ey = s_e[j * 3 + 1];
+                        const float ez = s_e[j * 3 + 2];
+                        const float px = s_bd[j * 6 + 0];
+                        const float py = s_bd[j * 6 + 1];
+                        const float pz = s_bd[j * 6 + 2];
+                        if (lane == 3) propagated += ey * pz - ez * py;
+                        else if (lane == 4) propagated += ez * px - ex * pz;
+                        else propagated += ex * py - ey * px;
+                    }
+                    s_pA[parent_slot * 6 + lane] += propagated;
+                }
+            }
+"""
+        # qdd = D^-1 (u - U^T delta_parent), delta = delta_parent + S qdd; s_pA (dead after the backward
+        # pass) holds the joint's translated parent twist for the dof lanes.
+        forward = """
+            const int dc = s_dc[j];
+            if (lane < 6) {
+                s_pA[j * 6 + lane] = parent_delta;
+            }
+            __syncwarp(mask);
+            if (lane < dc) {
+                float qdd = 0.0f;
+                for (int b = 0; b < dc; ++b) {
+                    float parent_term = 0.0f;
+                    if (parent_slot >= 0) {
+                        for (int r = 0; r < 6; ++r) {
+                            parent_term += s_U[j * 36 + b * 6 + r] * s_pA[j * 6 + r];
+                        }
+                    }
+                    qdd += s_dinv[j * 36 + lane * 6 + b] * (s_u[j * 6 + b] - parent_term);
+                }
+                s_qdd[j * 6 + lane] = qdd;
+                v_out.data[gdof + lane] += qdd;
+            }
+            __syncwarp(mask);
+            if (lane < 6) {
+                float value = s_pA[j * 6 + lane];
+                for (int a = 0; a < dc; ++a) {
+                    value += s_S[j * 36 + a * 6 + lane] * s_qdd[j * 6 + a];
+                }
+                s_bd[j * 6 + lane] = value;
+            }
+"""
+        recompute = """
+                const int dc = s_dc[j];
+                for (int a = 0; a < dc; ++a) {
+                    value += s_S[j * 36 + a * 6 + lane] * v_out.data[gdof + a];
+                }
+"""
+    else:
+        joint_meta = f"""
+        const int has_dof = (dof_start < joint_qd_start.data[joint + 1]);
+        s_gdof[j] = (has_dof{root_gdof_guard}) ? dof_start : -1;
+        s_dinv[j] = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
+        s_u[j] = 0.0f;
+"""
+        subspace_preload = """
+        const int gdof = s_gdof[j];
+        s_U[idx] = (gdof >= 0) ? propagation_tree_U.data[gdof * 6 + comp] : 0.0f;
+        s_S[idx] = (gdof >= 0) ? propagation_joint_S_flat.data[gdof * 6 + comp] : 0.0f;
+"""
+        backward = """
+            const int has_dof = (s_gdof[j] >= 0);
+
+            float u = 0.0f;
+            if (has_dof && lane < 6) {
+                u = -s_S[j * 6 + lane] * s_pA[j * 6 + lane];
+            }
+            for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                u += __shfl_down_sync(mask, u, shfl);
+            }
+            u = __shfl_sync(mask, u, 0);
+            if (has_dof && lane == 0) {
+                s_u[j] = u;
+            }
+
+            if (parent_slot >= 0 && lane < 6) {
+                const float inv_du = has_dof ? s_dinv[j] * u : 0.0f;
+                float propagated = s_pA[j * 6 + lane] + s_U[j * 6 + lane] * inv_du;
+                if (lane >= 3) {
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    const float px = s_pA[j * 6 + 0] + s_U[j * 6 + 0] * inv_du;
+                    const float py = s_pA[j * 6 + 1] + s_U[j * 6 + 1] * inv_du;
+                    const float pz = s_pA[j * 6 + 2] + s_U[j * 6 + 2] * inv_du;
+                    if (lane == 3) propagated += ey * pz - ez * py;
+                    else if (lane == 4) propagated += ez * px - ex * pz;
+                    else propagated += ex * py - ey * px;
+                }
+                s_pA[parent_slot * 6 + lane] += propagated;
+            }
+"""
+        forward = """
+            const int has_dof = (gdof >= 0);
+            float qdd = 0.0f;
+            if (has_dof) {
+                float parent_term = 0.0f;
+                if (parent_slot >= 0 && lane < 6) {
+                    parent_term = s_U[j * 6 + lane] * parent_delta;
+                }
+                for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                    parent_term += __shfl_down_sync(mask, parent_term, shfl);
+                }
+                parent_term = __shfl_sync(mask, parent_term, 0);
+                qdd = s_dinv[j] * (s_u[j] - parent_term);
+                if (lane == 0) {
+                    v_out.data[gdof] += qdd;
+                }
+                qdd = __shfl_sync(mask, qdd, 0);
+            }
+
+            if (lane < 6) {
+                s_bd[j * 6 + lane] = parent_delta + (has_dof ? s_S[j * 6 + lane] * qdd : 0.0f);
+            }
+"""
+        recompute = """
+                if (gdof >= 0) {
+                    value += s_S[j * 6 + lane] * v_out.data[gdof];
+                }
+"""
+    rows = 6 if multidof else 1  # joint-space rows staged per joint
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
@@ -19918,25 +20215,21 @@ def _get_propagate_tree_impulses_revolute_kernel(
 
     __shared__ float s_pA[{joints_cap} * 6];
     __shared__ float s_bd[{joints_cap} * 6];
-    __shared__ float s_u[{joints_cap}];
-    __shared__ float s_U[{joints_cap} * 6];
-    __shared__ float s_S[{joints_cap} * 6];
+    __shared__ float s_u[{joints_cap * rows}];
+    __shared__ float s_U[{joints_cap * rows} * 6];
+    __shared__ float s_S[{joints_cap * rows} * 6];
     __shared__ float s_e[{joints_cap} * 3];
-    __shared__ float s_dinv[{joints_cap}];
+    __shared__ float s_dinv[{joints_cap * rows * rows}];
     __shared__ int s_child[{joints_cap}];
     __shared__ int s_pslot[{joints_cap}];
     __shared__ int s_gdof[{joints_cap}];
 {root_decl}
     for (int j = lane; j < n_joints; j += 32) {{
         const int joint = joint_start + j;
-        const int child = joint_child.data[joint];
         const int dof_start = joint_qd_start.data[joint];
-        const int has_dof = (dof_start < joint_qd_start.data[joint + 1]);
-        s_child[j] = child;
+        s_child[j] = joint_child.data[joint];
         s_pslot[j] = joint_parent_slot.data[joint];
-        s_gdof[j] = (has_dof{root_gdof_guard}) ? dof_start : -1;
-        s_dinv[j] = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
-        s_u[j] = 0.0f;
+{joint_meta}
     }}
     __syncwarp(mask);
 
@@ -19944,9 +20237,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
     for (int idx = lane; idx < n_joints * 6; idx += 32) {{
         const int j = idx / 6;
         const int comp = idx - j * 6;
-        const int gdof = s_gdof[j];
-        s_U[idx] = (gdof >= 0) ? propagation_tree_U.data[gdof * 6 + comp] : 0.0f;
-        s_S[idx] = (gdof >= 0) ? propagation_joint_S_flat.data[gdof * 6 + comp] : 0.0f;
+{subspace_preload}
         const float imp = propagation_body_impulses.data[s_child[j] * 6 + comp];
         s_pA[idx] = -imp;
         if (imp != 0.0f) any_impulse = 1;
@@ -19971,36 +20262,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
             const int j = n_joints - 1 - offset;
 {root_backward}
             const int parent_slot = s_pslot[j];
-            const int has_dof = (s_gdof[j] >= 0);
-
-            float u = 0.0f;
-            if (has_dof && lane < 6) {{
-                u = -s_S[j * 6 + lane] * s_pA[j * 6 + lane];
-            }}
-            for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                u += __shfl_down_sync(mask, u, shfl);
-            }}
-            u = __shfl_sync(mask, u, 0);
-            if (has_dof && lane == 0) {{
-                s_u[j] = u;
-            }}
-
-            if (parent_slot >= 0 && lane < 6) {{
-                const float inv_du = has_dof ? s_dinv[j] * u : 0.0f;
-                float propagated = s_pA[j * 6 + lane] + s_U[j * 6 + lane] * inv_du;
-                if (lane >= 3) {{
-                    const float ex = s_e[j * 3 + 0];
-                    const float ey = s_e[j * 3 + 1];
-                    const float ez = s_e[j * 3 + 2];
-                    const float px = s_pA[j * 6 + 0] + s_U[j * 6 + 0] * inv_du;
-                    const float py = s_pA[j * 6 + 1] + s_U[j * 6 + 1] * inv_du;
-                    const float pz = s_pA[j * 6 + 2] + s_U[j * 6 + 2] * inv_du;
-                    if (lane == 3) propagated += ey * pz - ez * py;
-                    else if (lane == 4) propagated += ez * px - ex * pz;
-                    else propagated += ex * py - ey * px;
-                }}
-                s_pA[parent_slot * 6 + lane] += propagated;
-            }}
+{backward}
             __syncwarp(mask);
         }}
 
@@ -20008,7 +20270,6 @@ def _get_propagate_tree_impulses_revolute_kernel(
 {root_forward}
             const int parent_slot = s_pslot[j];
             const int gdof = s_gdof[j];
-            const int has_dof = (gdof >= 0);
 
             float parent_delta = 0.0f;
             if (parent_slot >= 0 && lane < 6) {{
@@ -20023,27 +20284,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
                 else if (lane == 1) parent_delta += wz * ex - wx * ez;
                 else if (lane == 2) parent_delta += wx * ey - wy * ex;
             }}
-
-            float qdd = 0.0f;
-            if (has_dof) {{
-                float parent_term = 0.0f;
-                if (parent_slot >= 0 && lane < 6) {{
-                    parent_term = s_U[j * 6 + lane] * parent_delta;
-                }}
-                for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                    parent_term += __shfl_down_sync(mask, parent_term, shfl);
-                }}
-                parent_term = __shfl_sync(mask, parent_term, 0);
-                qdd = s_dinv[j] * (s_u[j] - parent_term);
-                if (lane == 0) {{
-                    v_out.data[gdof] += qdd;
-                }}
-                qdd = __shfl_sync(mask, qdd, 0);
-            }}
-
-            if (lane < 6) {{
-                s_bd[j * 6 + lane] = parent_delta + (has_dof ? s_S[j * 6 + lane] * qdd : 0.0f);
-            }}
+{forward}
             __syncwarp(mask);
         }}
 
@@ -20073,9 +20314,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
                     else if (lane == 1) value += wz * ex - wx * ez;
                     else if (lane == 2) value += wx * ey - wy * ex;
                 }}
-                if (gdof >= 0) {{
-                    value += s_S[j * 6 + lane] * v_out.data[gdof];
-                }}
+{recompute}
                 s_pA[j * 6 + lane] = value;
                 propagation_body_qd.data[child * 6 + lane] = value;
                 propagation_body_impulses.data[child * 6 + lane] = 0.0f;
@@ -20144,6 +20383,8 @@ def _get_propagate_tree_impulses_revolute_kernel(
         )
 
     name = f"propagate_tree_impulses_revolute_{size}_j{joints_cap}"
+    if multidof:
+        name += "_md"
     if has_free_root:
         name += "_fr"
     propagate_tree_impulses_revolute_template.__name__ = name

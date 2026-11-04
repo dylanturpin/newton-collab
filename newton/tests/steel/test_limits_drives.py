@@ -250,24 +250,33 @@ def test_disabled_joint_limits_are_not_enforced(test, device):
     test.assertAlmostEqual(position, 1.0, delta=2.0e-3)
 
 
-def _build_default_limit_chain(device, count: int):
-    """Build ``count`` independent revolute links with the builder's default (+/-1e10) limits."""
+def _build_default_limit_chain(device, count: int, limit: float | None = None):
+    """Build ``count`` independent revolute links with ``+/-limit``, or the builder's default (+/-1e10) limits."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     joints = []
+    limits = {} if limit is None else {"limit_lower": -limit, "limit_upper": limit}
     for _ in range(count):
         link = builder.add_link()
         builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
-        joints.append(builder.add_joint_revolute(-1, link, axis=newton.Axis.Z))
+        joints.append(builder.add_joint_revolute(-1, link, axis=newton.Axis.Z, **limits))
     builder.add_articulation(joints)
     return builder.finalize(device=device)
 
 
 def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
-    """Keep the rows of the builder's large finite default limits and warn when they exceed the capacity."""
+    """Warn when the rows of finite limits exceed the capacity; the builder's unlimited defaults have no rows."""
+    model = _build_default_limit_chain(device, 17)
+    test.assertEqual(float(model.joint_limit_upper.numpy()[0]), MAXVAL)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = SolverSteel(model, enable_joint_limits=True, warn_constraint_overflow=False)
+    test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
+    solver.step(model.state(), model.state(), model.control(), None, 0.01)
+    test.assertEqual(int(solver._constraint_count.numpy()[0]), 0)
+
     for count, expect_warning in ((16, False), (17, True)):
         with test.subTest(dofs=count):
-            model = _build_default_limit_chain(device, count)
-            test.assertEqual(float(model.joint_limit_upper.numpy()[0]), MAXVAL)
+            model = _build_default_limit_chain(device, count, limit=1.0)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 solver = SolverSteel(model, enable_joint_limits=True, warn_constraint_overflow=False)
@@ -277,12 +286,11 @@ def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
                 test.assertIn("at least 34 dense rows", messages[0])
                 test.assertIn("articulation_constraint_max=32", messages[0])
             solver.step(model.state(), model.state(), model.control(), None, 0.01)
-            # Large finite bounds are not reclassified as unlimited: two rows per DOF, up to
-            # the capacity.
+            # Two rows per DOF, up to the capacity.
             test.assertEqual(int(solver._constraint_count.numpy()[0]), min(2 * count, 32))
             test.assertEqual(bool(solver.constraint_overflow.numpy()[0]), expect_warning)
 
-    model = _build_default_limit_chain(device, 17)
+    model = _build_default_limit_chain(device, 17, limit=1.0)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         SolverSteel(model, enable_joint_limits=True, articulation_constraint_max=34)
@@ -295,14 +303,14 @@ def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
 
 def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     """Build no limit rows and use no capacity for finite limits when joint limits are disabled."""
-    model = _build_default_limit_chain(device, 17)
+    model = _build_default_limit_chain(device, 17, limit=1.0)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         solvers = (
             SolverSteel(model, **mode_kwargs),
             SolverSteel(model, enable_joint_limits=False, **mode_kwargs),
         )
-    # The 34 rows of the +/-1e10 defaults would exceed the default capacity of 32 if limits were enabled.
+    # The 34 rows of these limits would exceed the default capacity of 32 if limits were enabled.
     test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
     for solver in solvers:
         test.assertFalse(solver.enable_joint_limits)
@@ -2619,6 +2627,50 @@ def _arm_and_box_model():
     box = builder.add_body(xform=wp.transform((0.6, 0.0, 0.1), wp.quat_identity()))
     builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
     return builder.finalize()
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
+class TestSteelUnlimitedAxisRows(unittest.TestCase):
+    """Only finite limits below the builder's unlimited defaults create limit rows."""
+
+    def test_unlimited_axes_have_no_limit_rows(self):
+        """Give the builder's default position and velocity limits no rows, beside a limited root."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent, joints = -1, []
+        for i in range(3):
+            link = builder.add_link()
+            builder.add_shape_box(link, hx=0.1, hy=0.02, hz=0.02)
+            limits = {"limit_lower": -0.1, "limit_upper": 0.1, "velocity_limit": 0.25} if i == 0 else {}
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=link,
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    parent_xform=wp.transform(wp.vec3(0.2 * (i > 0), 0.0, 1.0 * (i == 0)), wp.quat_identity()),
+                    **limits,
+                )
+            )
+            parent = link
+        builder.add_articulation(joints)
+        builder.joint_q[0] = 0.2
+        model = builder.finalize(device="cuda:0")
+        lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        self.assertTrue(np.all(np.abs(lower[1:]) >= MAXVAL) and np.all(np.abs(upper[1:]) >= MAXVAL))
+        self.assertTrue(np.all(model.joint_velocity_limit.numpy()[1:] >= 1.0e6))
+        solver = SolverSteel(
+            model,
+            enable_joint_limits=True,
+            enable_joint_velocity_limits=True,
+            articulation_constraint_max=32,
+        )
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+        count = int(solver._constraint_count.numpy()[0])
+        types = solver._row_type.numpy()[0, :count]
+        # The root's lower/upper pair of each family; the infinite default activation gap keeps both sides.
+        self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 2)
+        self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 2)
 
 
 if __name__ == "__main__":

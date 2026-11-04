@@ -5,6 +5,7 @@ from functools import cache
 
 import warp as wp
 
+from ...core.types import MAXVAL
 from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
@@ -37,6 +38,8 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # Joint velocity-limit row: a per-DOF velocity clamp with one unilateral row per
 # bound and no position bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
+# The builder's default joint velocity limit [rad/s or m/s]; at or above it a DOF has no limit rows.
+JOINT_VELOCITY_LIMIT_UNSET = 1.0e6
 # Mimic row: the bilateral equality ``q_follower - coef1 * q_leader - coef0 = 0`` between
 # two DOFs of one articulation, with an unbounded impulse.
 PGS_CONSTRAINT_TYPE_MIMIC = 5
@@ -4107,10 +4110,8 @@ def allocate_joint_velocity_limit_slots(
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
 
-            # Guard against degenerate limits. PhysX pins ``recipResponse``
-            # off for ``unitResponse <= 0``; here we drop the row entirely if
-            # the stored limit is non-positive (treated as "unlimited").
-            if qdot_max <= 0.0:
+            # Non-positive limits and the builder default are "unlimited": no rows.
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             # Fused clamp: driven DOFs are limited inside the solve.
@@ -4190,7 +4191,7 @@ def populate_joint_velocity_limit_J_for_size(
         for axis in range(axis_count):
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0:
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             local_dof = dof - dof_start
@@ -8147,12 +8148,12 @@ def build_joint_limit_rows(
         for side in range(2):
             bound = joint_limit_lower[dof]
             phi = q - bound
-            active = wp.isfinite(bound) and q <= bound + activation_gap
+            active = wp.abs(bound) < MAXVAL and q <= bound + activation_gap
             sign = 1.0
             if side == 1:
                 bound = joint_limit_upper[dof]
                 phi = bound - q
-                active = wp.isfinite(bound) and q >= bound - activation_gap
+                active = wp.abs(bound) < MAXVAL and q >= bound - activation_gap
                 sign = -1.0
             if not active:
                 continue
@@ -10154,14 +10155,14 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.isfinite(lower) and q <= lower + activation_gap:
+            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.isfinite(upper) and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:

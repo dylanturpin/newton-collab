@@ -1,0 +1,1 @@
+Run `SolverSteel` propagation trees with BALL or other multi-DOF joints past the root on the one-warp tree kernels when the joints are topologically ordered, instead of the one-thread-per-articulation kernels.

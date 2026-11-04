@@ -3800,6 +3800,8 @@ def test_revolute_loop_dof_gets_no_drive_or_velocity_limit_rows(test, device):
         # velocity prescale would apply to the whole tree.
         for tree_joint in range(1, joint):
             builder.joint_qd[builder.joint_qd_start[tree_joint]] = 0.5
+            # below the unset default, so the tree hinges keep their velocity-limit rows
+            builder.joint_velocity_limit[builder.joint_qd_start[tree_joint]] = 10.0
         builder.joint_qd[loop_dof] = 2.0
         builder.joint_velocity_limit[loop_dof] = 0.1
         if gain:

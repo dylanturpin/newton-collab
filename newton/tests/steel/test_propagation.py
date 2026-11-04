@@ -140,6 +140,7 @@ def test_contact_effective_mass_matches_dense_response(test, device):
         ("revolute", "generic"),
         ("floating", "auto"),
         ("floating", "generic"),
+        ("ball", "auto"),
         ("ball", "generic"),
     )
     for kind, tree_kernel in cases:
@@ -192,8 +193,11 @@ def test_contact_effective_mass_matches_dense_response(test, device):
 
 
 def test_native_tree_kernels_match_generic(test, device):
-    """Step identically with the native one-warp tree kernels and the generic per-articulation kernels."""
-    for kind in ("revolute", "floating"):
+    """Step identically with the native one-warp tree kernels and the generic per-articulation kernels.
+
+    The ball chain takes the multi-DOF native kernels.
+    """
+    for kind in ("revolute", "floating", "ball"):
         for response in RESPONSES:
             with test.subTest(scene=kind, response=response):
                 results = []
@@ -203,9 +207,13 @@ def test_native_tree_kernels_match_generic(test, device):
                         solver = SolverSteel(
                             model, iterations=8, articulation_constraint_max=64, **steel_mode_options(response)
                         )
+                    size = solver._propagation_tree_sizes[0]
+                    test.assertEqual(solver._propagation_multidof_tree[size], kind == "ball" and tree_kernel == "auto")
                     state, _ = _step(model, solver)
                     results.append(state.joint_qd.numpy())
-                np.testing.assert_allclose(results[0], results[1], rtol=1.0e-4, atol=1.0e-5)
+                # Near-zero components carry the float32 rounding of the largest joint velocity.
+                atol = 1.0e-5 * max(1.0, float(np.abs(results[1]).max()))
+                np.testing.assert_allclose(results[0], results[1], rtol=1.0e-4, atol=atol)
 
 
 def test_propagation_row_overflow_is_flagged_and_reset(test, device):
