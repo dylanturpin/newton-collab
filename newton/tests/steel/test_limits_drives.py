@@ -41,7 +41,9 @@ from newton.solvers import SolverBase, SolverSteel
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
-def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0):
+def _built_rows(
+    q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, qd: float = 0.0, speed_scale: float = 0.0
+):
     device = "cpu"
     max_constraints = 8
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
@@ -68,6 +70,9 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
             wp.array([upper], dtype=wp.float32, device=device),
             wp.array([q], dtype=wp.float32, device=device),
             gap,
+            wp.array([qd], dtype=wp.float32, device=device),
+            speed_scale,
+            0.01,
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             max_constraints,
@@ -312,6 +317,20 @@ class TestSteelJointLimitActivationGap(unittest.TestCase):
     def test_finite_gap_does_not_activate_unlimited_sentinel_limits(self):
         self.assertEqual(_built_rows(0.0, gap=0.2, lower=-MAXVAL, upper=MAXVAL), ([], []))
 
+    def test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step(self):
+        # gap 0.05 + 2 * dt (0.01) * |qd|: at rest a joint 1 rad from both bounds builds no row.
+        self.assertEqual(_built_rows(0.0, gap=0.05, speed_scale=2.0), ([], []))
+        # 30 rad/s reaches 0.65 rad: still short of both bounds.
+        self.assertEqual(_built_rows(0.0, gap=0.05, qd=30.0, speed_scale=2.0), ([], []))
+        # 60 rad/s widens the gap to 1.25 rad, past both bounds; the gate ignores the direction.
+        jacobian, phi = _built_rows(0.0, gap=0.05, qd=-60.0, speed_scale=2.0)
+        self.assertEqual(jacobian, [1.0, -1.0])
+        self.assertEqual(phi, [1.0, 1.0])
+
+    def test_zero_speed_scale_ignores_the_speed(self):
+        self.assertEqual(_built_rows(0.0, gap=0.2, qd=1.0e6), ([], []))
+        self.assertEqual(_built_rows(0.0, gap=0.2, qd=float("nan")), ([], []))
+
     def test_infinite_gap_preserves_historical_always_allocate_behavior(self):
         jacobian, phi = _built_rows(0.0, gap=float("inf"))
 
@@ -499,6 +518,48 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     test.assertAlmostEqual(float(state_1.joint_q.numpy()[0]), 0.2, places=6)
 
 
+def _build_spinning_limited_link(device, qd: float):
+    """Build one revolute link at q=0 between +/-0.5 rad limits, spinning at ``qd`` without gravity."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    joint = builder.add_joint_revolute(-1, link, axis=newton.Axis.Z, limit_lower=-0.5, limit_upper=0.5)
+    builder.add_articulation([joint])
+    builder.joint_qd[0] = qd
+    return builder.finalize(device=device)
+
+
+def _limit_rows_and_trajectory(model, steps: int, **solver_options):
+    solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
+    state_0, state_1 = model.state(), model.state()
+    row_counts, q = [], []
+    for _ in range(steps):
+        solver.step(state_0, state_1, model.control(), None, 0.01)
+        row_counts.append(int(solver._constraint_count.numpy()[0]))
+        q.append(float(state_1.joint_q.numpy()[0]))
+        state_0, state_1 = state_1, state_0
+    return row_counts, np.array(q)
+
+
+def test_default_gap_skips_distant_limit_rows(test, device):
+    """The default gate builds no row for a resting joint far from its bounds; ``inf`` builds both."""
+    model = _build_spinning_limited_link(device, 0.0)
+    default_rows, _ = _limit_rows_and_trajectory(model, 1)
+    always_rows, _ = _limit_rows_and_trajectory(model, 1, joint_limit_activation_gap=float("inf"))
+    test.assertEqual(default_rows, [0])
+    test.assertEqual(always_rows, [2])
+
+
+def test_default_gap_holds_a_fast_joint_like_always_allocate(test, device):
+    """A joint crossing 0.4 rad per step, past the 0.05 rad base gap, stops at its bound as with ``inf``."""
+    model = _build_spinning_limited_link(device, 40.0)
+    default_rows, default_q = _limit_rows_and_trajectory(model, 6)
+    _, always_q = _limit_rows_and_trajectory(model, 6, joint_limit_activation_gap=float("inf"))
+    # The speed term builds the upper row from the first step, before the joint is within 0.05 rad.
+    test.assertGreater(default_rows[0], 0)
+    test.assertLessEqual(float(default_q.max()), 0.5 + 1.0e-4)
+    np.testing.assert_allclose(default_q, always_q, rtol=0.0, atol=1.0e-5)
+
+
 class TestSteelJointLimitActivationGapUpstream(unittest.TestCase):
     pass
 
@@ -515,6 +576,11 @@ for _name, _func in (
     ("test_limit_holds_a_driven_joint", test_limit_holds_a_driven_joint),
     ("test_disabled_joint_limits_are_not_enforced", test_disabled_joint_limits_are_not_enforced),
     ("test_disabled_joint_limits_build_no_rows", test_disabled_joint_limits_build_no_rows),
+    ("test_default_gap_skips_distant_limit_rows", test_default_gap_skips_distant_limit_rows),
+    (
+        "test_default_gap_holds_a_fast_joint_like_always_allocate",
+        test_default_gap_holds_a_fast_joint_like_always_allocate,
+    ),
 ):
     add_function_test(TestSteelJointLimitActivationGapUpstream, _name, _func, devices=devices)
 
@@ -552,6 +618,8 @@ class TestSteelJointLimitWarp(unittest.TestCase):
         lower = wp.array(np.full(dof_count, -1.0, dtype=np.float32), dtype=wp.float32, device=device)
         upper = wp.array(np.full(dof_count, 1.0, dtype=np.float32), dtype=wp.float32, device=device)
         joint_q = wp.array(rng.uniform(-1.2, 1.2, dof_count).astype(np.float32), dtype=wp.float32, device=device)
+        # Speeds that widen some gaps past their bound and leave others short of it.
+        joint_qd = wp.array(rng.uniform(-40.0, 40.0, dof_count).astype(np.float32), dtype=wp.float32, device=device)
         art_to_world = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
         group_to_art = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
         scalar = _outputs(articulation_count, max_constraints, size, device)
@@ -569,7 +637,10 @@ class TestSteelJointLimitWarp(unittest.TestCase):
                 lower,
                 upper,
                 joint_q,
-                0.25,
+                0.05,
+                joint_qd,
+                2.0,
+                0.01,
                 art_to_world,
                 group_to_art,
                 max_constraints,
@@ -595,7 +666,10 @@ class TestSteelJointLimitWarp(unittest.TestCase):
                 lower,
                 upper,
                 joint_q,
-                0.25,
+                0.05,
+                joint_qd,
+                2.0,
+                0.01,
                 max_constraints,
                 0.2,
                 1.0e-6,
@@ -1275,7 +1349,13 @@ def test_pgs_drive_bounds_complete_reaction_under_external_load(test, device):
 def test_drive_rows_precede_limit_rows_and_count_against_capacity(test, device):
     """Allocate drive rows first in each world and flag the world when they do not fit."""
     model = _build_driven_chain(device, num_links=3, num_worlds=2)
-    solver = SolverSteel(model, drive_mode="rows", enable_joint_limits=True, warn_constraint_overflow=False)
+    solver = SolverSteel(
+        model,
+        drive_mode="rows",
+        enable_joint_limits=True,
+        joint_limit_activation_gap=float("inf"),
+        warn_constraint_overflow=False,
+    )
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
     counts = solver._constraint_count.numpy()
@@ -1290,6 +1370,7 @@ def test_drive_rows_precede_limit_rows_and_count_against_capacity(test, device):
         model,
         drive_mode="rows",
         enable_joint_limits=True,
+        joint_limit_activation_gap=float("inf"),
         articulation_constraint_max=2,
         warn_constraint_overflow=False,
     )
@@ -1352,7 +1433,9 @@ def test_drive_rows_use_the_exact_unit_response(test, device):
     model = _build_driven_chain(device, num_links=3, num_worlds=1)
     diags = {}
     for cfm in (0.0, 0.5):
-        solver = SolverSteel(model, drive_mode="rows", enable_joint_limits=True, cfm=cfm)
+        solver = SolverSteel(
+            model, drive_mode="rows", enable_joint_limits=True, joint_limit_activation_gap=float("inf"), cfm=cfm
+        )
         solver.step(model.state(), model.state(), model.control(), None, DT)
         diags[cfm] = solver._diag.numpy()[0, : int(solver._constraint_count.numpy()[0])]
     test.assertEqual(diags[0.0].size, 9)  # 3 drive rows + 2 position-limit rows per DOF
@@ -2753,6 +2836,7 @@ class TestSteelUnlimitedAxisRows(unittest.TestCase):
         solver = SolverSteel(
             model,
             enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
             enable_joint_velocity_limits=True,
             articulation_constraint_max=32,
         )

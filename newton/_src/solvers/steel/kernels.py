@@ -2827,6 +2827,8 @@ def prepare_fused_diagonal_joint_limits(
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
     activation_gap: float,
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
     pgs_beta: float,
     dt: float,
     # outputs
@@ -2850,14 +2852,15 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
+            gap = joint_limit_effective_gap(activation_gap, activation_speed_scale, dt, joint_qd[global_dof])
+            if wp.abs(lower) < MAXVAL and q <= lower + gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:
@@ -4092,6 +4095,19 @@ def build_mass_update_mask(
 # =============================================================================
 
 
+@wp.func
+def joint_limit_effective_gap(activation_gap: float, speed_scale: float, dt: float, qd: float) -> float:
+    """Return the activation gap of one limit DOF, widened by the distance it can travel this step.
+
+    A speculative limit row applies no impulse while the joint cannot reach its bound within the step,
+    so rows farther than ``activation_gap + speed_scale * dt * |qd|`` are skipped. ``speed_scale == 0``
+    returns ``activation_gap`` unchanged (the fixed-gap behavior, ``inf`` included).
+    """
+    if speed_scale > 0.0:
+        return activation_gap + speed_scale * dt * wp.abs(qd)
+    return activation_gap
+
+
 @wp.kernel
 def build_joint_limit_rows_for_size(
     articulation_start: wp.array[int],
@@ -4104,6 +4120,9 @@ def build_joint_limit_rows_for_size(
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
     joint_limit_activation_gap: float,
+    joint_qd: wp.array[float],
+    joint_limit_activation_speed_scale: float,
+    dt: float,
     art_to_world: wp.array[int],
     group_to_art: wp.array[int],
     max_constraints: int,
@@ -4143,15 +4162,18 @@ def build_joint_limit_rows_for_size(
             upper = joint_limit_upper[dof]
 
             local_dof = dof - dof_start
+            gap = joint_limit_effective_gap(
+                joint_limit_activation_gap, joint_limit_activation_speed_scale, dt, joint_qd[dof]
+            )
 
             for side in range(2):
                 sign = 1.0
                 phi = q_val - lower
-                active = wp.abs(lower) < MAXVAL and q_val <= lower + joint_limit_activation_gap
+                active = wp.abs(lower) < MAXVAL and q_val <= lower + gap
                 if side == 1:
                     sign = -1.0
                     phi = upper - q_val
-                    active = wp.abs(upper) < MAXVAL and q_val >= upper - joint_limit_activation_gap
+                    active = wp.abs(upper) < MAXVAL and q_val >= upper - gap
                 if not active:
                     continue
 

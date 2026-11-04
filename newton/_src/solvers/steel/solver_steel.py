@@ -1378,6 +1378,12 @@ def _velocity_drive_mode(name: str, value) -> str:
     return value
 
 
+# Default (``joint_limit_activation_gap=None``) limit-row gate: a row is built when the joint is within
+# this distance [m or rad] of a finite bound, widened by the distance it can travel at its current speed
+# over ``_AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE`` steps.
+_AUTO_JOINT_LIMIT_ACTIVATION_GAP = 0.05
+_AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE = 2.0
+
 _DEPRECATED_SOLVE_MODE_SPELLINGS = {
     "matrix_free": "solve_mode='matrix_free' is deprecated in Newton 1.8; use solve_mode='serial' (the default)",
     "split": (
@@ -1979,7 +1985,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
-        joint_limit_activation_gap: float = float("inf"),
+        joint_limit_activation_gap: float | None = None,
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
         fuse_joint_velocity_limits: bool = True,
@@ -2289,12 +2295,20 @@ class SolverSteel(SolverBase, CouplingInterface):
                 pre-eliminated and mimic rows remain in the iterative sweep. This avoids
                 making the Schur block singular when a mimic row is nearly dependent on
                 the loop-closure rows. Defaults to True.
-            joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
-                position limit at which a joint-limit PGS row becomes active. A lower row is
-                allocated when ``q <= lower + gap``; an upper row is allocated when
-                ``q >= upper - gap``. ``inf`` allocates every limit row every step. A bound at or
-                beyond ``MAXVAL`` (the builder's unlimited default) has no row. Must be non-negative
-                and not NaN. Defaults to ``inf``.
+            joint_limit_activation_gap (float | None, optional): Distance [m or rad] from a finite
+                lower or upper position limit at which a joint-limit PGS row becomes active. A lower
+                row is allocated when ``q <= lower + gap``; an upper row is allocated when
+                ``q >= upper - gap``. ``inf`` allocates every limit row every step. ``None`` uses a
+                speed-aware gap of ``0.05 + 2 * dt * |qd|`` per DOF: limit rows are speculative and
+                apply no impulse while the joint cannot reach its bound within the step, so this
+                skips only rows that are no-ops unless the solve itself accelerates the joint by
+                more than the margin in one step. A violated limit always has its row. A bound at or
+                beyond ``MAXVAL`` (the builder's unlimited default) has no row. Must be ``None`` or
+                non-negative and not NaN. Defaults to ``None``.
+
+                .. versionchanged:: 1.8
+                    The default changed from ``inf`` to ``None``. Pass ``inf`` to allocate every
+                    limit row every step as before.
             enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
                 (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
                 PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
@@ -2341,9 +2355,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 limited joint DOF and free-rigid-body axis each step, preserving the historical
                 behavior exactly. A positive fraction allocates a pair only when the current
                 speed satisfies ``|qd| >= fraction * limit``, skipping rows that would be exact
-                no-op clamps. Because the gate samples the pre-solve velocity, a DOF crossing the
-                threshold between steps is clamped one step late. Must be non-negative and not
-                NaN. Defaults to ``0.0``.
+                no-op clamps. Because the gate samples the pre-solve velocity, a DOF that goes from
+                below ``fraction * limit`` to above ``limit`` within one step is clamped one step
+                late, so an impact can overshoot the limit for one step. Must be in ``[0, 1]`` or
+                ``inf`` (never allocate). Defaults to ``0.0``.
             fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
                 *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
                 stateless clamp instead of two dedicated dense rows per DOF. This mirrors
@@ -2692,12 +2707,20 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._enable_joint_limits = enable_joint_limits
         self._enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self._bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
-        try:
-            self._joint_limit_activation_gap = float(joint_limit_activation_gap)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("joint_limit_activation_gap must be non-negative or inf") from exc
-        if np.isnan(self._joint_limit_activation_gap) or self._joint_limit_activation_gap < 0.0:
-            raise ValueError("joint_limit_activation_gap must be non-negative or inf")
+        if joint_limit_activation_gap is None:
+            # Speed-aware gate: rows that cannot reach their bound this step apply no impulse.
+            self._joint_limit_activation_gap = None
+            self._joint_limit_gap_base = _AUTO_JOINT_LIMIT_ACTIVATION_GAP
+            self._joint_limit_activation_speed_scale = _AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE
+        else:
+            try:
+                self._joint_limit_activation_gap = float(joint_limit_activation_gap)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("joint_limit_activation_gap must be None, non-negative or inf") from exc
+            if np.isnan(self._joint_limit_activation_gap) or self._joint_limit_activation_gap < 0.0:
+                raise ValueError("joint_limit_activation_gap must be None, non-negative or inf")
+            self._joint_limit_gap_base = self._joint_limit_activation_gap
+            self._joint_limit_activation_speed_scale = 0.0
         self._enable_joint_velocity_limits = enable_joint_velocity_limits
         self._enable_joint_friction = bool(enable_joint_friction)
         self._joint_friction_warp_kernels: dict[int, wp.Kernel] = {}
@@ -12377,7 +12400,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_limit_lower,
                     model.joint_limit_upper,
                     state_in.joint_q,
-                    self._joint_limit_activation_gap,
+                    self._joint_limit_gap_base,
+                    state_in.joint_qd,
+                    self._joint_limit_activation_speed_scale,
                     self._baumgarte,
                     dt,
                 ],
@@ -12417,7 +12442,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_activation_gap,
+                                self._joint_limit_gap_base,
+                                state_in.joint_qd,
+                                self._joint_limit_activation_speed_scale,
+                                dt,
                                 self._baumgarte,
                                 self._cfm,
                                 indices.ancestor_mask,
@@ -12462,7 +12490,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_activation_gap,
+                                self._joint_limit_gap_base,
+                                state_in.joint_qd,
+                                self._joint_limit_activation_speed_scale,
+                                dt,
                                 max_constraints,
                                 self._baumgarte,
                                 self._cfm,
@@ -12497,7 +12528,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_activation_gap,
+                                self._joint_limit_gap_base,
+                                state_in.joint_qd,
+                                self._joint_limit_activation_speed_scale,
+                                dt,
                                 self._art_to_world,
                                 self._group_to_art[size],
                                 max_constraints,
@@ -14797,7 +14831,9 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const float q = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             phi_value = side == 0 ? q - bound : bound - q;
-            active = fabsf(bound) < {MAXVAL:.1e}f && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
+            float act_gap = activation_gap;
+            if (activation_speed_scale > 0.0f) act_gap += activation_speed_scale * dt * fabsf(joint_qd.data[dof]);
+            active = fabsf(bound) < {MAXVAL:.1e}f && (side == 0 ? q <= bound + act_gap : q >= bound - act_gap);
         }}
 
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
@@ -14845,6 +14881,9 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         joint_limit_upper: wp.array[float],
         joint_q: wp.array[float],
         activation_gap: float,
+        joint_qd: wp.array[float],
+        activation_speed_scale: float,
+        dt: float,
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
@@ -14871,6 +14910,9 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         joint_limit_upper: wp.array[float],
         joint_q: wp.array[float],
         activation_gap: float,
+        joint_qd: wp.array[float],
+        activation_speed_scale: float,
+        dt: float,
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
@@ -14898,6 +14940,9 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             joint_limit_upper,
             joint_q,
             activation_gap,
+            joint_qd,
+            activation_speed_scale,
+            dt,
             max_constraints,
             pgs_beta,
             pgs_cfm,

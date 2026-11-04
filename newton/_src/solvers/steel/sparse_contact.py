@@ -435,9 +435,11 @@ def _get_sparse_contact_response_kernel(
             const float position = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             gap = side == 0 ? position - bound : bound - position;
+            float act_gap = activation_gap;
+            if (activation_speed_scale > 0.0f) act_gap += activation_speed_scale * dt * fabsf(joint_qd.data[dof]);
             // |bound| >= MAXVAL (1e10) is the builder's unlimited axis: no row.
             active = fabsf(bound) < 1.0e10f
-                && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
+                && (side == 0 ? position <= bound + act_gap : position >= bound - act_gap);
         }
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
         const int active_count = __popc(active_mask);
@@ -515,6 +517,9 @@ def _build_sparse_joint_limit_rows(
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
     activation_gap: float,
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     pgs_beta: float,
     pgs_cfm: float,
     dof_mask: wp.array[wp.uint64],
@@ -550,6 +555,9 @@ def build_sparse_joint_limit_rows(
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
     activation_gap: float,
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     pgs_beta: float,
     pgs_cfm: float,
     dof_mask: wp.array[wp.uint64],
@@ -589,6 +597,9 @@ def build_sparse_joint_limit_rows(
         joint_limit_upper,
         joint_q,
         activation_gap,
+        joint_qd,
+        activation_speed_scale,
+        dt,
         pgs_beta,
         pgs_cfm,
         dof_mask,
