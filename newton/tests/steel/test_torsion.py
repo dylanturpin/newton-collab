@@ -2447,6 +2447,8 @@ def _link_launch(kernel, inputs, friction_start):
             zeros(dense),
             zeros(dense),
             zeros((1, 1)),
+            arr([-1, -1], int),
+            zeros(2),
             zeros(worlds, int),
             zeros(worlds, int),
             zeros((worlds, 4), int),
