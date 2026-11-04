@@ -619,11 +619,15 @@ def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
 
 
 def test_puck_rocking_drops(test, device):
-    """Check that the patch cuts the rocking of a puck whose rough bottom has no flat face to under a quarter."""
+    """Check that the patch cuts the rocking of a puck whose rough bottom has no flat face.
+
+    The patched puck need not sleep: some poses keep a limit cycle near 0.1 rad/s on some GPUs.
+    """
     for yaw in (0.0, 37.0):
         _, rock_off = _puck_motion(device, False, yaw)
         spin, rock = _puck_motion(device, True, yaw)
         test.assertGreater(rock_off, 0.3, f"yaw {yaw}: the flag-off puck no longer rocks ({rock_off:.3f} rad/s)")
+        test.assertLess(rock, 0.15, f"yaw {yaw}: puck rocks at {rock:.3f} rad/s")
         test.assertLess(rock, 0.25 * rock_off, f"yaw {yaw}: puck rocks at {rock:.3f} rad/s vs {rock_off:.3f} off")
         test.assertLess(spin, 0.05, f"yaw {yaw}: puck spins at {spin:.3f} rad/s")
 
