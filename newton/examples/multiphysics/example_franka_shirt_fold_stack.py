@@ -276,7 +276,7 @@ class Example:
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         builder.rigid_gap = template.rigid_gap
-        builder.replicate(template, world_count=self.world_count)
+        builder.replicate(template, copy_count=self.world_count)
         builder.add_ground_plane()
         # Tables are global like the ground so every entry's view keeps them.
         table_cfg = newton.ModelBuilder.ShapeConfig(ke=GRASP_KE, kd=GRASP_KD, mu=1.0)

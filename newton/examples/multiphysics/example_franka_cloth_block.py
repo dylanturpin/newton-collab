@@ -218,7 +218,7 @@ class Example:
         joints_per_world = template.joint_count
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        builder.replicate(template, world_count=self.world_count)
+        builder.replicate(template, copy_count=self.world_count)
         builder.add_ground_plane()
         # The table is global like the ground so every entry's view keeps it.
         builder.add_shape_box(
@@ -260,7 +260,7 @@ class Example:
                     solve_mode="matrix_free",
                     iterations=24,
                     enable_joint_limits=True,
-                    articulation_constraint_max=256,
+                    articulation_constraint_max=320,
                 )
 
         else:
