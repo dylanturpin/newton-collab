@@ -72,7 +72,7 @@ def _quat_from_euler_deg(rx, ry, rz):
 
 
 def _rotate(q, points):
-    return np.array([np.array(wp.quat_rotate(q, wp.vec3(*p))) for p in points])
+    return np.asarray(points, dtype=np.float64) @ np.array(wp.quat_to_matrix(q), dtype=np.float64).reshape(3, 3).T
 
 
 def _witness_cases():
@@ -150,12 +150,19 @@ _GLOBAL_ROTATIONS = (
 def _build_pair(device, body_hull, body_rotation, penetration, support_hull, global_rotation, swap, scale):
     """Place a body hull ``penetration`` [m] into a static support hull whose top is at z = 0 before rotation."""
     builder = newton.ModelBuilder()
+    _add_pair(builder, body_hull, body_rotation, penetration, support_hull, global_rotation, swap, scale)
+    return builder.finalize(device=device)
+
+
+def _add_pair(builder, body_hull, body_rotation, penetration, support_hull, global_rotation, swap, scale):
+    """Add one witness-matrix pair and return its two shape indices."""
     cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, gap=SHAPE_GAP)
     support_vertices, support_indices = support_hull
     body_vertices, body_indices = body_hull
     scale = np.asarray(scale, dtype=np.float32)
     support_xform = wp.transform(
-        wp.quat_rotate(global_rotation, wp.vec3(0.0, 0.0, -float(support_vertices[:, 2].max()))), global_rotation
+        wp.quat_rotate(global_rotation, wp.vec3(0.0, 0.0, -float(support_vertices[:, 2].max()))),
+        global_rotation,
     )
     lowest = _rotate(body_rotation, body_vertices)[:, 2].min()
     body_xform = wp.transform(
@@ -166,12 +173,12 @@ def _build_pair(device, body_hull, body_rotation, penetration, support_hull, glo
     body_mesh = newton.Mesh(body_vertices / scale, body_indices, compute_inertia=False)
     support_mesh = newton.Mesh(support_vertices, support_indices, compute_inertia=False)
     if swap:
-        builder.add_shape_convex_hull(body, mesh=body_mesh, scale=tuple(scale.tolist()), cfg=cfg)
-        builder.add_shape_convex_hull(-1, xform=support_xform, mesh=support_mesh, cfg=cfg)
+        body_shape = builder.add_shape_convex_hull(body, mesh=body_mesh, scale=tuple(scale.tolist()), cfg=cfg)
+        support_shape = builder.add_shape_convex_hull(-1, xform=support_xform, mesh=support_mesh, cfg=cfg)
     else:
-        builder.add_shape_convex_hull(-1, xform=support_xform, mesh=support_mesh, cfg=cfg)
-        builder.add_shape_convex_hull(body, mesh=body_mesh, scale=tuple(scale.tolist()), cfg=cfg)
-    return builder.finalize(device=device)
+        support_shape = builder.add_shape_convex_hull(-1, xform=support_xform, mesh=support_mesh, cfg=cfg)
+        body_shape = builder.add_shape_convex_hull(body, mesh=body_mesh, scale=tuple(scale.tolist()), cfg=cfg)
+    return support_shape, body_shape
 
 
 def _collide(model, convex_mesh_patch, convex_face_clip=False):
@@ -226,11 +233,17 @@ def _surface_error(vertices, indices, point):
     return abs(float(np.max(np.sum(normals * (point - triangles[:, 0]), axis=1))))
 
 
-def _witness_report(model, state, contacts):
-    """Return per-contact witness surface errors [m], signed distances [m] and world witnesses on shape 1."""
+def _witness_report(model, state, contacts, shapes=None):
+    """Return per-contact witness surface errors [m], signed distances [m] and world witnesses on shape 1.
+
+    ``shapes`` restricts the report to the contacts between that pair of shape indices.
+    """
     shape0, shape1, point0, point1, normal = _contact_arrays(contacts)
+    if shapes is not None:
+        keep = (np.minimum(shape0, shape1) == min(shapes)) & (np.maximum(shape0, shape1) == max(shapes))
+        shape0, shape1, point0, point1, normal = shape0[keep], shape1[keep], point0[keep], point1[keep], normal[keep]
     hulls = {}
-    for shape in range(model.shape_count):
+    for shape in set(shape0.tolist()) | set(shape1.tolist()):
         mesh = model.shape_source[shape]
         q, t = _shape_world(model, state, shape)
         scaled = np.asarray(mesh.vertices, dtype=np.float64) * model.shape_scale.numpy()[shape]
@@ -254,21 +267,28 @@ def _witness_report(model, state, contacts):
 
 
 def _check_witness_matrix(test, device, swap, scale):
+    # Each pair is its own world of one model, so one pipeline collides them all.
+    builder = newton.ModelBuilder()
+    pairs = []
     for label, body_hull, body_rotation, penetration, support_hull in _witness_cases():
         for g, global_rotation in enumerate(_GLOBAL_ROTATIONS):
-            name = f"{label} g{g} swap={swap} scale={scale}"
-            model = _build_pair(
-                device, body_hull, body_rotation, penetration, support_hull, global_rotation, swap, scale
+            builder.begin_world()
+            shapes = _add_pair(
+                builder, body_hull, body_rotation, penetration, support_hull, global_rotation, swap, scale
             )
-            state, contacts = _collide(model, True)
-            errors, distances, _ = _witness_report(model, state, contacts)
-            test.assertGreater(len(errors), 0, name)
-            test.assertLessEqual(len(errors), 8, name)
-            test.assertLess(errors.max(), SURFACE_TOLERANCE, f"{name}: witness {errors.max():.3e} m off its hull")
-            # No contact is deeper than the prescribed placement.
-            test.assertGreater(distances.min(), -penetration - 1.0e-6, name)
-            if label not in _POINT_OR_LINE_CASES:
-                test.assertGreaterEqual(len(errors), 3, f"{name}: patch kept {len(errors)} contacts")
+            builder.end_world()
+            pairs.append((f"{label} g{g} swap={swap} scale={scale}", label, penetration, shapes))
+    model = builder.finalize(device=device)
+    state, contacts = _collide(model, True)
+    for name, label, penetration, shapes in pairs:
+        errors, distances, _ = _witness_report(model, state, contacts, shapes)
+        test.assertGreater(len(errors), 0, name)
+        test.assertLessEqual(len(errors), 8, name)
+        test.assertLess(errors.max(), SURFACE_TOLERANCE, f"{name}: witness {errors.max():.3e} m off its hull")
+        # No contact is deeper than the prescribed placement.
+        test.assertGreater(distances.min(), -penetration - 1.0e-6, name)
+        if label not in _POINT_OR_LINE_CASES:
+            test.assertGreaterEqual(len(errors), 3, f"{name}: patch kept {len(errors)} contacts")
 
 
 def test_witnesses_on_hull_surfaces(test, device):
@@ -570,17 +590,31 @@ def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
         enable_sleeping=True,
     )
     state_0, state_1, control = model.state(), model.state(), model.control()
+
+    def tick():
+        # Contacts are refreshed once per 4 substeps; an even substep count leaves state_0 current.
+        nonlocal state_0, state_1
+        pipeline.collide(state_0, contacts)
+        for _ in range(4):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, 0.00125)
+            state_0, state_1 = state_1, state_0
+
+    tick()
+    graph = None
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device) as capture:
+            tick()
+        graph = capture.graph
     rates = []
-    for step in range(steps):
-        # Contacts are refreshed once per 4 substeps.
-        if step % 4 == 0:
-            pipeline.collide(state_0, contacts)
-        state_0.clear_forces()
-        solver.step(state_0, state_1, control, contacts, 0.00125)
-        state_0, state_1 = state_1, state_0
-        if step % 4 == 3:
+    for k in range(steps // 4 - 2):
+        if graph is None:
+            tick()
+        else:
+            wp.capture_launch(graph)
+        if k >= steps // 8:
             rates.append(state_0.body_qd.numpy()[0, 3:].copy())
-    late = np.asarray(rates[len(rates) // 2 :])
+    late = np.asarray(rates)
     return float(np.abs(late[:, 2]).mean()), float(np.sqrt(np.mean(np.sum(late[:, :2] ** 2, axis=1))))
 
 
