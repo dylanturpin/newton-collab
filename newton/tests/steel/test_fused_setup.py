@@ -25,6 +25,7 @@ _PAIRS = {
     "_link_patch_rows": "_link_patch_rows_per_route",
     "_finish_patch_impulses": "_finish_patch_impulses_per_route",
     "_accumulate_row_watermarks_fused": "_accumulate_row_watermarks",
+    "_update_qdd_and_integrate_joints": "_update_qdd_then_integrate_joints",
 }
 
 

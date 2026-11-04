@@ -3260,6 +3260,29 @@ def apply_free_root_velocity_corrections(
         v_hat[d + 3 + k] = corrected[k]
 
 
+@wp.func
+def _remove_root_transport(
+    root_index: int,
+    free_root_joint_indices: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_qd: wp.array[float],
+    joint_active: wp.array[int],
+    joint_qdd: wp.array[float],
+):
+    if joint_active[free_root_joint_indices[root_index]] == 0:
+        return
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
+    if d < 0:
+        return
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    c = wp.cross(w, v)
+    joint_qdd[d + 0] = joint_qdd[d + 0] - c[0]
+    joint_qdd[d + 1] = joint_qdd[d + 1] - c[1]
+    joint_qdd[d + 2] = joint_qdd[d + 2] - c[2]
+
+
 @wp.kernel
 def remove_free_root_transport_from_qdd(
     free_root_joint_indices: wp.array[int],
@@ -3277,22 +3300,14 @@ def remove_free_root_transport_from_qdd(
     ``v_out + dt * (omega x v)``. Subtracting the term here closes the loop, and
     in the contact-free case recovers the dynamics' own ``qdd`` bit for bit.
     """
-    root_index = wp.tid()
-    if joint_active[free_root_joint_indices[root_index]] == 0:
-        return
-    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
-    if d < 0:
-        return
-    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
-    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
-    c = wp.cross(w, v)
-    joint_qdd[d + 0] = joint_qdd[d + 0] - c[0]
-    joint_qdd[d + 1] = joint_qdd[d + 1] - c[1]
-    joint_qdd[d + 2] = joint_qdd[d + 2] - c[2]
+    _remove_root_transport(
+        wp.tid(), free_root_joint_indices, joint_qd_start, kinematic_joint_mask, joint_qd, joint_active, joint_qdd
+    )
 
 
-@wp.kernel
-def integrate_generalized_joints(
+@wp.func
+def _integrate_joint(
+    index: int,
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -3309,12 +3324,9 @@ def integrate_generalized_joints(
     body_angular_damping: wp.array[float],
     body_linear_damping: wp.array[float],
     joint_active: wp.array[int],
-    # outputs
     joint_q_new: wp.array[float],
     joint_qd_new: wp.array[float],
 ):
-    # one thread per-articulation
-    index = wp.tid()
     if joint_active[index] == 0:
         return
 
@@ -3352,6 +3364,82 @@ def integrate_generalized_joints(
         joint_q_new,
         joint_qd_new,
     )
+
+
+@wp.kernel
+def integrate_generalized_joints(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    dt: float,
+    body_angular_damping: wp.array[float],
+    body_linear_damping: wp.array[float],
+    joint_active: wp.array[int],
+    # outputs
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+):
+    # one thread per joint
+    _integrate_joint(
+        wp.tid(), joint_type, joint_parent, joint_child, joint_q_start, joint_qd_start, kinematic_joint_mask, joint_dof_dim, body_com, joint_X_c, joint_q, joint_qd, joint_qdd, dt, body_angular_damping, body_linear_damping, joint_active, joint_q_new, joint_qd_new,
+    )  # fmt: skip
+
+
+@wp.kernel(enable_backward=False)
+def update_qdd_and_integrate_joints(
+    free_root_slot: wp.array[int],
+    free_root_joint_indices: wp.array[int],
+    kinematic_dof_mask: wp.array[int],
+    inv_dt: float,
+    dof_active: wp.array[int],
+    v_new: wp.array[float],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    dt: float,
+    body_angular_damping: wp.array[float],
+    body_linear_damping: wp.array[float],
+    joint_active: wp.array[int],
+    # outputs
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+):
+    """:func:`update_qdd_from_velocity`, :func:`remove_free_root_transport_from_qdd` and
+    :func:`integrate_generalized_joints` in one launch, a thread per joint.
+
+    Each pass reads and writes only one joint's coordinates and DOFs, so running the three for a joint in
+    a row writes what the three launches write. ``free_root_slot[j]`` is joint ``j``'s index in
+    ``free_root_joint_indices``, or -1.
+    """
+    index = wp.tid()
+    for dof in range(joint_qd_start[index], joint_qd_start[index + 1]):
+        _update_dof_qdd(dof, joint_qd, kinematic_dof_mask, inv_dt, dof_active, v_new, joint_qdd)
+    root = free_root_slot[index]
+    if root >= 0:
+        _remove_root_transport(
+            root, free_root_joint_indices, joint_qd_start, kinematic_joint_mask, joint_qd, joint_active, joint_qdd
+        )
+    _integrate_joint(
+        index, joint_type, joint_parent, joint_child, joint_q_start, joint_qd_start, kinematic_joint_mask, joint_dof_dim, body_com, joint_X_c, joint_q, joint_qd, joint_qdd, dt, body_angular_damping, body_linear_damping, joint_active, joint_q_new, joint_qd_new,
+    )  # fmt: skip
 
 
 @wp.kernel
@@ -3398,6 +3486,25 @@ def compute_velocity_predictor(
     v_hat[tid] = joint_qd[tid] + joint_qdd[tid] * dt
 
 
+@wp.func
+def _update_dof_qdd(
+    tid: int,
+    joint_qd: wp.array[float],
+    kinematic_dof_mask: wp.array[int],
+    inv_dt: float,
+    dof_active: wp.array[int],
+    v_new: wp.array[float],
+    joint_qdd: wp.array[float],
+):
+    if dof_active[tid] == 0:
+        return
+    if kinematic_dof_mask[tid] != 0:
+        v_new[tid] = joint_qd[tid]
+        joint_qdd[tid] = 0.0
+    else:
+        joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
+
+
 @wp.kernel
 def update_qdd_from_velocity(
     joint_qd: wp.array[float],
@@ -3409,14 +3516,7 @@ def update_qdd_from_velocity(
     # output
     joint_qdd: wp.array[float],
 ):
-    tid = wp.tid()
-    if dof_active[tid] == 0:
-        return
-    if kinematic_dof_mask[tid] != 0:
-        v_new[tid] = joint_qd[tid]
-        joint_qdd[tid] = 0.0
-    else:
-        joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
+    _update_dof_qdd(wp.tid(), joint_qd, kinematic_dof_mask, inv_dt, dof_active, v_new, joint_qdd)
 
 
 @wp.kernel

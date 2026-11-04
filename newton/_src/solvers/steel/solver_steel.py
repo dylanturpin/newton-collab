@@ -281,6 +281,7 @@ from .kernels import (
     subtract_arrays,
     trisolve_loop,
     update_body_qd_from_featherstone,
+    update_qdd_and_integrate_joints,
     update_qdd_from_velocity,
     warmstart_dt_scale,
     zero_unattached_parent_wrenches,
@@ -3661,6 +3662,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._fused_setup_enabled = not model.requires_grad
         # Size groups that can hold velocity-limit rows: their articulations have a prismatic, revolute or D6
         # joint (topology is fixed for the solver's lifetime).
+        # Each joint's index in _free_root_joint_indices, or -1 (the merged integration launch reads it).
+        free_root_slot = np.full(max(model.joint_count, 1), -1, dtype=np.int32)
+        if self._free_root_joint_count:
+            free_root_slot[self._free_root_joint_indices.numpy()] = np.arange(self._free_root_joint_count)
+        self._free_root_slot_by_joint = wp.array(free_root_slot, dtype=wp.int32, device=model.device)
         self._velocity_limit_row_sizes = []
         if model.joint_count:
             joint_type = model.joint_type.numpy()
@@ -10682,8 +10688,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
-                self._stage6_update_qdd(state_in, state_aug, dt)
-                self._stage6_integrate(state_in, state_aug, state_out, dt)
+                merged = self._fused_setup_active()
+                if not merged:
+                    self._stage6_update_qdd(state_in, state_aug, dt)
+                self._stage6_integrate(state_in, state_aug, state_out, dt, merged)
 
         if self._sleeping is not None:
             self._sleeping.finish(state_in, state_out, state_aug, dt)
@@ -14788,35 +14796,77 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._remove_free_root_transport(state_in, state_aug)
 
-    def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
+    def _integrate_joints_args(self, state_in: State, state_aug: State, state_out: State, dt: float) -> list:
+        model = self.model
+        return [
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            self._kinematic_joint_mask,
+            model.joint_dof_dim,
+            model.body_com,
+            model.joint_X_c,
+            state_in.joint_q,
+            state_in.joint_qd,
+            state_aug._joint_qdd,
+            dt,
+            self._rigid_body_angular_damping,
+            self._rigid_body_linear_damping,
+            self._dynamics_joint_active,
+            state_out.joint_q,
+            state_out.joint_qd,
+        ]
+
+    def _update_qdd_then_integrate_joints(self, state_in: State, state_aug: State, state_out: State, dt: float):
+        """Turn the solved velocity into ``joint_qdd`` and integrate the joints, a launch per pass."""
+        self._stage6_update_qdd(state_in, state_aug, dt)
+        if self.model.joint_count:
+            wp.launch(
+                kernel=integrate_generalized_joints,
+                dim=self.model.joint_count,
+                inputs=self._integrate_joints_args(state_in, state_aug, state_out, dt),
+                device=self.model.device,
+            )
+
+    def _update_qdd_and_integrate_joints(self, state_in: State, state_aug: State, state_out: State, dt: float):
+        """Write what :meth:`_update_qdd_then_integrate_joints` writes in one launch, a thread per joint."""
+        model = self.model
+        wp.launch(
+            update_qdd_and_integrate_joints,
+            dim=model.joint_count,
+            inputs=[
+                self._free_root_slot_by_joint,
+                self._free_root_joint_indices if self._free_root_joint_count else self._empty_int,
+                self._kinematic_dof_mask,
+                1.0 / dt,
+                self._dynamics_dof_active,
+                self._v_out,
+                *self._integrate_joints_args(state_in, state_aug, state_out, dt),
+            ],
+            device=model.device,
+        )
+
+    def _stage6_integrate(
+        self, state_in: State, state_aug: State, state_out: State, dt: float, update_qdd: bool = False
+    ):
+        """Integrate the joints from ``joint_qdd``, then publish kinematics and integrate particles.
+
+        With ``update_qdd``, :meth:`_stage6_update_qdd` runs first, merged into the integration launch.
+        """
         model = self.model
 
         if model.joint_count:
-            wp.launch(
-                kernel=integrate_generalized_joints,
-                dim=model.joint_count,
-                inputs=[
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    model.joint_dof_dim,
-                    model.body_com,
-                    model.joint_X_c,
-                    state_in.joint_q,
-                    state_in.joint_qd,
-                    state_aug._joint_qdd,
-                    dt,
-                    self._rigid_body_angular_damping,
-                    self._rigid_body_linear_damping,
-                    self._dynamics_joint_active,
-                ],
-                outputs=[state_out.joint_q, state_out.joint_qd],
-                device=model.device,
-            )
-
+            if update_qdd:
+                self._update_qdd_and_integrate_joints(state_in, state_aug, state_out, dt)
+            else:
+                wp.launch(
+                    kernel=integrate_generalized_joints,
+                    dim=model.joint_count,
+                    inputs=self._integrate_joints_args(state_in, state_aug, state_out, dt),
+                    device=model.device,
+                )
             self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
