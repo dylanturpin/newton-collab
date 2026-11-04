@@ -10147,14 +10147,6 @@ def compute_propagation_cache_world_flag(
 
 
 @wp.kernel
-def flag_any_nonzero(values: wp.array[int], flag: wp.array[int]):
-    """Set ``flag[0]`` to one when any entry of ``values`` is nonzero."""
-    i = wp.tid()
-    if values[i] != 0:
-        flag[0] = 1
-
-
-@wp.kernel
 def snapshot_propagation_cache_qd_base(
     propagation_cache_world_flag: wp.array[int],
     propagation_body_count: wp.array[int],

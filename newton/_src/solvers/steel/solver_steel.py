@@ -204,7 +204,6 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     find_contact_world_segments,
-    flag_any_nonzero,
     flag_invalid_joint_friction,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
@@ -3051,6 +3050,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._dynamics_body_active = wp.ones(model.body_count, dtype=wp.int32, device=model.device)
         # Articulations whose velocity-limit rows are allocated; row-free sleeping islands have none.
         self._constraint_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
+        # Set by sleeping when any articulation steps its dynamics; captured steps gate propagation work on it.
         self._propagation_dynamics_active = wp.zeros(1, dtype=wp.int32, device=model.device)
 
         self._model_plan: _SteelModelPlan | None = None
@@ -8609,26 +8609,13 @@ class SolverSteel(SolverBase, CouplingInterface):
 
     @property
     def _propagation_tree_activity(self) -> wp.array | None:
-        """Per-articulation activity the propagation trees skip on, or ``None`` when every articulation is active."""
+        """Per-articulation activity the propagation trees skip on, or ``None`` when sleeping does not skip dynamics."""
         return self._dynamics_art_active if self._sleep_skips_dynamics else None
 
     def _propagation_capture_gated(self) -> bool:
         """Whether this step is captured with sleeping, so its propagation work can branch on the device."""
         device = self.model.device
         return self._sleep_skips_dynamics and device.is_capturing and wp.is_conditional_graph_supported()
-
-    def _flag_propagation_dynamics(self) -> None:
-        """Set the propagation gate of a captured step when any articulation steps its dynamics."""
-        if not self._propagation_capture_gated():
-            return
-        self._propagation_dynamics_active.zero_()
-        wp.launch(
-            flag_any_nonzero,
-            dim=self.model.articulation_count,
-            inputs=[self._dynamics_art_active],
-            outputs=[self._propagation_dynamics_active],
-            device=self.model.device,
-        )
 
     def _run_propagation(self, work) -> None:
         """Run ``work``; a step captured with sleeping runs it only while some articulation is awake.
@@ -10275,7 +10262,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._propagation_contacts_enabled():
                 with wp.ScopedTimer("S4_Propagation_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
                     with self._sync_timed("s4_propagation_setup"):
-                        self._flag_propagation_dynamics()
                         self._run_propagation(functools.partial(self._propagation_pgs_setup, state_in, state_aug, dt))
 
         else:
