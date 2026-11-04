@@ -2939,6 +2939,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._dummy_mf_slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._init_ordered_rows(model)
+        # Per-step dynamics buffers: a graph that allocated them would free them when it is released.
+        self._allocate_state_aux_vars(model, self)
 
         # Capacity status is allocated before any CUDA graph capture.
         self._row_overflow_warning_emitted = wp.zeros(5, dtype=wp.int32, device=model.device)
@@ -8709,7 +8711,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         ]
 
     def _prepare_augmented_state(self, state_in: State) -> "SolverSteel":
-        """Allocate the solver-owned per-step dynamics buffers on first use."""
+        """Allocate the solver-owned per-step dynamics buffers if construction did not."""
         if not getattr(self, "_featherstone_augmented", False):
             self._allocate_state_aux_vars(self.model, self)
         return self
