@@ -119,6 +119,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
+    PRESCALE_WARP_THREADS,
     PROPAGATION_COLOR_TAIL,
     PROPAGATION_UNIT_META,
     PROPAGATION_UNIT_RING,
@@ -252,6 +253,7 @@ from .kernels import (
     prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
+    prescale_joint_velocity_limits_warp,
     propagate_tree_impulses_for_size,
     rank_propagation_body_map,
     record_warmstart_dt,
@@ -11238,24 +11240,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             state_aug._body_f_s.zero_()
         if self._enable_joint_velocity_limits:
             wp.copy(self._qd_work, state_in.joint_qd)
-            wp.launch(
-                prescale_joint_velocity_limits,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    model.joint_type,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    model.joint_velocity_limit,
-                    model.body_flags,
-                    self._vel_limit_drive_slot_arg,
-                    self._vel_limit_skip_driven,
-                    self._dynamics_art_active,
-                ],
-                outputs=[self._qd_work],
-                device=model.device,
-            )
+            if self._fused_setup_active():
+                self._prescale_joint_velocities_warp()
+            else:
+                self._prescale_joint_velocities()
             stage3_qd = self._qd_work
         else:
             stage3_qd = state_in.joint_qd
@@ -11344,6 +11332,42 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         return global_inertia_ready, stage3_qd
+
+    def _prescale_joint_velocity_inputs(self) -> list:
+        model = self.model
+        return [
+            model.articulation_start,
+            model.joint_type,
+            model.joint_child,
+            model.joint_qd_start,
+            model.joint_dof_dim,
+            model.joint_velocity_limit,
+            model.body_flags,
+            self._vel_limit_drive_slot_arg,
+            self._vel_limit_skip_driven,
+            self._dynamics_art_active,
+        ]
+
+    def _prescale_joint_velocities(self) -> None:
+        """Scale ``_qd_work`` by each articulation's PhysX velocity-limit ratio, a thread per articulation."""
+        wp.launch(
+            prescale_joint_velocity_limits,
+            dim=self.model.articulation_count,
+            inputs=self._prescale_joint_velocity_inputs(),
+            outputs=[self._qd_work],
+            device=self.model.device,
+        )
+
+    def _prescale_joint_velocities_warp(self) -> None:
+        """Write what :meth:`_prescale_joint_velocities` writes with a warp per articulation."""
+        wp.launch_tiled(
+            prescale_joint_velocity_limits_warp,
+            dim=[self.model.articulation_count],
+            inputs=self._prescale_joint_velocity_inputs(),
+            outputs=[self._qd_work],
+            block_dim=PRESCALE_WARP_THREADS,
+            device=self.model.device,
+        )
 
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float

@@ -414,6 +414,79 @@ def clamp_free_root_velocity_limits(
             qd[ds + 5] = ang[2] * scale
 
 
+@wp.func
+def _prescale_joint_ratio(
+    j: int,
+    ratio: float,
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    body_flags: wp.array[wp.int32],
+    drive_slot: wp.array[int],
+    skip_driven: int,
+    joint_qd: wp.array[float],
+):
+    """Lower ``ratio`` to joint ``j``'s smallest ``limit / |qd|`` (see :func:`prescale_joint_velocity_limits`)."""
+    if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
+        return ratio
+    jtype = joint_type[j]
+    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        return ratio
+
+    lin_count = joint_dof_dim[j, 0]
+    ang_count = joint_dof_dim[j, 1]
+    axis_count = lin_count + ang_count
+    qd_start = joint_qd_start[j]
+
+    for axis in range(axis_count):
+        dof = qd_start + axis
+        if skip_driven != 0:
+            if drive_slot[dof] >= 0:
+                continue
+        limit = joint_velocity_limit[dof]
+        qd_abs = wp.abs(joint_qd[dof])
+        if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
+            scale = limit / qd_abs
+            if scale < ratio:
+                ratio = scale
+    return ratio
+
+
+@wp.func
+def _prescale_joint_apply(
+    j: int,
+    ratio: float,
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_flags: wp.array[wp.int32],
+    drive_slot: wp.array[int],
+    skip_driven: int,
+    joint_qd: wp.array[float],
+):
+    """Scale joint ``j``'s prescaled DOFs by the articulation ``ratio``."""
+    if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
+        return
+    jtype = joint_type[j]
+    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        return
+
+    lin_count = joint_dof_dim[j, 0]
+    ang_count = joint_dof_dim[j, 1]
+    axis_count = lin_count + ang_count
+    qd_start = joint_qd_start[j]
+
+    for axis in range(axis_count):
+        dof = qd_start + axis
+        if skip_driven != 0:
+            if drive_slot[dof] >= 0:
+                continue
+        joint_qd[dof] = joint_qd[dof] * ratio
+
+
 @wp.kernel
 def prescale_joint_velocity_limits(
     articulation_start: wp.array[int],
@@ -453,50 +526,67 @@ def prescale_joint_velocity_limits(
 
     ratio = float(1.0)
     for j in range(joint_start, joint_end):
-        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
-            continue
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
-            limit = joint_velocity_limit[dof]
-            qd_abs = wp.abs(joint_qd[dof])
-            if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
-                scale = limit / qd_abs
-                if scale < ratio:
-                    ratio = scale
+        ratio = _prescale_joint_ratio(
+            j, ratio, joint_type, joint_child, joint_qd_start, joint_dof_dim, joint_velocity_limit, body_flags,
+            drive_slot, skip_driven, joint_qd,
+        )  # fmt: skip
 
     if ratio >= 1.0:
         return
 
     for j in range(joint_start, joint_end):
-        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
-            continue
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
+        _prescale_joint_apply(
+            j, ratio, joint_type, joint_child, joint_qd_start, joint_dof_dim, body_flags, drive_slot, skip_driven,
+            joint_qd,
+        )  # fmt: skip
 
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
 
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
-            joint_qd[dof] = joint_qd[dof] * ratio
+PRESCALE_WARP_THREADS = 32
+"""Threads per articulation of :func:`prescale_joint_velocity_limits_warp` (one warp)."""
+
+
+@wp.kernel(enable_backward=False)
+def prescale_joint_velocity_limits_warp(
+    articulation_start: wp.array[int],
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    body_flags: wp.array[wp.int32],
+    drive_slot: wp.array[int],
+    skip_driven: int,
+    articulation_active: wp.array[int],
+    # in/out
+    joint_qd: wp.array[float],
+):
+    """:func:`prescale_joint_velocity_limits` with one warp per articulation (launch tiled, block of 32).
+
+    Each lane takes every 32nd joint; the ratio is a minimum, which is exact in any order, so the result
+    matches the serial kernel bit for bit.
+    """
+    art, lane = wp.tid()
+    if articulation_active[art] == 0:
+        return
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    ratio = float(1.0)
+    for j in range(joint_start + lane, joint_end, PRESCALE_WARP_THREADS):
+        ratio = _prescale_joint_ratio(
+            j, ratio, joint_type, joint_child, joint_qd_start, joint_dof_dim, joint_velocity_limit, body_flags,
+            drive_slot, skip_driven, joint_qd,
+        )  # fmt: skip
+    ratio = wp.tile_min(wp.tile(ratio))[0]
+
+    if ratio >= 1.0:
+        return
+
+    for j in range(joint_start + lane, joint_end, PRESCALE_WARP_THREADS):
+        _prescale_joint_apply(
+            j, ratio, joint_type, joint_child, joint_qd_start, joint_dof_dim, body_flags, drive_slot, skip_driven,
+            joint_qd,
+        )  # fmt: skip
 
 
 @wp.func

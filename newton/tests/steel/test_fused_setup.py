@@ -19,6 +19,7 @@ from newton.tests.steel.test_propagation import DT, _build_latency_scene
 _PAIRS = {
     "_clear_step_row_state": "_clear_step_row_state_per_array",
     "_snapshot_stage3": "_snapshot_stage3_per_array",
+    "_prescale_joint_velocities_warp": "_prescale_joint_velocities",
     "_link_patch_rows": "_link_patch_rows_per_route",
     "_finish_patch_impulses": "_finish_patch_impulses_per_route",
     "_accumulate_row_watermarks_fused": "_accumulate_row_watermarks",
