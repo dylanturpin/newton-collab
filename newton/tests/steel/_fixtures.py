@@ -15,12 +15,18 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.friction_patches import (
     _FrictionPatchState,
 )
 from newton._src.solvers.steel.solver_steel import _get_pgs_solve_propagation_colored_block_kernel
 from newton.solvers import SolverBase, SolverSteel
+
+
+def steel_mode_options(mode: str) -> dict[str, str]:
+    """Solver options of a test mode label: ``"immediate"`` or ``"propagation"`` (serial), or ``"colored"``."""
+    if mode == "colored":
+        return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    return {"articulated_contact_response": mode}
 
 
 def _build_four_bar():
@@ -160,7 +166,6 @@ def make_fixture(
         options = dict(
             # Isolate the normal material law from positional patch friction.
             friction_anchor_beta=0.0,
-            solve_mode="matrix_free",
             row_schedule="interleaved",
             articulated_contact_response="immediate",
             enable_restitution=False,
@@ -660,7 +665,7 @@ def fixture(
         # Keep this material-law control on the same point-friction baseline
         # whether the optional spin radius is zero or positive.
         "friction_anchor_beta": 0.0,
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "articulated_contact_response": "immediate",
         "iterations": 128,
         "velocity_iterations": 0,
@@ -680,9 +685,7 @@ def fixture(
     if radius is not None:
         set_torsion_radius(model, radius, None if admit_none else torsion_shapes)
     kwargs.update(solver_overrides)
-    tuning = {key: kwargs.pop(key) for key in ("pgs_kernel",) if key in kwargs}
-    with kernel_overrides(tuning):
-        solver = SolverSteel(model, **kwargs)
+    solver = SolverSteel(model, **kwargs)
     solver._rigid_body_angular_damping.zero_()
     if row_limit is not None:
         solver._articulation_constraint_max = row_limit

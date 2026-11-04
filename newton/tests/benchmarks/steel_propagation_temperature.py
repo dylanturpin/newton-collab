@@ -62,7 +62,7 @@ from steel_articulation_row_scaling import (
 import newton
 from newton.solvers import SolverSteel
 
-MODES = ("mf_immediate", "propagation", "propagation_colored")
+MODES = ("mf_immediate", "propagation", "colored")
 CONTACT_ROW_TYPE = 0
 
 
@@ -124,8 +124,8 @@ def _make_solver(model: newton.Model, case: TempCase, mode: str, iterations: int
     with scalar_hinv_jt():
         return SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="immediate" if mode not in PROPAGATION_PATHS else mode,
+            solve_mode="colored" if mode == "colored" else "serial",
+            articulated_contact_response="propagation" if mode in PROPAGATION_PATHS else "immediate",
             iterations=iterations,
             velocity_iterations=0,
             contact_friction_position_iterations=-1,

@@ -76,7 +76,6 @@ def _step_d6_contact_case(
 
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         articulated_contact_response=mode,
         iterations=iterations,
         velocity_iterations=0,
@@ -116,16 +115,24 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
         self.assertGreater(rows_immediate[0], 0)
         self.assertEqual(rows_immediate[2], 0)
 
-        for response in ("propagation", "propagation_colored"):
-            with self.subTest(response=response):
-                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, response)
+        for name, options in (
+            ("propagation", {}),
+            ("colored", {"solve_mode": "colored"}),
+        ):
+            with self.subTest(response=name):
+                qd_propagation, rows_propagation = _step_d6_contact_case(model, contacts, "propagation", **options)
                 self.assertEqual(rows_propagation[0], 0)
                 self.assertGreater(rows_propagation[2], 0)
                 np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
         # Longest-first sweeps the 3-row units first, unlike the immediate row order, so it is compared once converged.
         qd_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
         qd_longest_first = _step_d6_contact_case(
-            model, contacts, "propagation_colored", iterations=32, propagation_color_order="longest_first"
+            model,
+            contacts,
+            "propagation",
+            iterations=32,
+            solve_mode="colored",
+            propagation_color_order="longest_first",
         )[0]
         np.testing.assert_allclose(qd_longest_first, qd_converged, rtol=1.0e-5, atol=1.0e-5)
 
@@ -153,7 +160,6 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
 
         solver = module.SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             iterations=2,
             velocity_iterations=0,
@@ -201,7 +207,7 @@ class TestSteelArticulationRowScalingBench(unittest.TestCase):
             self.assertTrue((out_dir / "results.csv").is_file())
             results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
         paths = {row["path"] for row in results}
-        self.assertEqual(paths, {"mf_immediate", "propagation", "propagation_colored"})
+        self.assertEqual(paths, {"mf_immediate", "propagation", "colored"})
         self.assertFalse(
             paths
             & {

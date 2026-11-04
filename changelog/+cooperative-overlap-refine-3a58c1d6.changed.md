@@ -1,0 +1,1 @@
+Run the split narrow phase's overlap refinement one pair per warp when the refine queue is short, splitting a box-mesh pair's triangle stream across the warp's lanes; long queues keep one pair per thread. Both paths produce the same contacts.

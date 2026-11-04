@@ -17,6 +17,7 @@ from functools import cache
 
 import warp as wp
 
+from ...core.types import MAXVAL
 from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
@@ -25,8 +26,7 @@ from ...sim.articulation import (
 )
 from ...sim.contacts import GENERATION_SENTINEL
 from ..featherstone.kernels import jcalc_motion
-from .friction import friction_pair_candidate
-from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
+from .friction_patches import FrictionPatches, contact_tangent_basis
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
 wp.set_module_options({"enable_backward": False})
@@ -40,6 +40,8 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
+# The builder's default joint velocity limit [rad/s or m/s]; at or above it a DOF has no limit rows.
+JOINT_VELOCITY_LIMIT_UNSET = 1.0e6
 # Mimic (joint coupling) row: the bilateral equality
 # ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
 # same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
@@ -2848,14 +2850,14 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.isfinite(lower) and q <= lower + activation_gap:
+            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.isfinite(upper) and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:
@@ -4145,11 +4147,11 @@ def build_joint_limit_rows_for_size(
             for side in range(2):
                 sign = 1.0
                 phi = q_val - lower
-                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
+                active = wp.abs(lower) < MAXVAL and q_val <= lower + joint_limit_activation_gap
                 if side == 1:
                     sign = -1.0
                     phi = upper - q_val
-                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
+                    active = wp.abs(upper) < MAXVAL and q_val >= upper - joint_limit_activation_gap
                 if not active:
                     continue
 
@@ -4978,7 +4980,7 @@ def allocate_joint_velocity_limit_slots(
     """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
 
     For each non-locked DOF of a PRISMATIC / REVOLUTE / D6 joint
-    with ``joint_velocity_limit[i] > 0``, two slots are reserved in the
+    with ``0 < joint_velocity_limit[i] < JOINT_VELOCITY_LIMIT_UNSET``, two slots are reserved in the
     per-world counter. The sign encodes which side of the bilateral box
     ``[-qdot_max, +qdot_max]`` each row enforces:
 
@@ -5045,10 +5047,8 @@ def allocate_joint_velocity_limit_slots(
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
 
-            # Guard against degenerate limits. PhysX pins ``recipResponse``
-            # off for ``unitResponse <= 0``; here we drop the row entirely if
-            # the stored limit is non-positive (treated as "unlimited").
-            if qdot_max <= 0.0:
+            # Non-positive limits and the builder default are "unlimited": no rows.
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             # Fused path: driven DOFs are clamped at the end of each iteration.
@@ -5138,7 +5138,7 @@ def populate_joint_velocity_limit_J_for_size(
         for axis in range(axis_count):
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0:
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             local_dof = dof - dof_start
@@ -7344,7 +7344,7 @@ def compute_world_contact_bias(
         # PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: no phi-based bias. The
         # constraint is an instantaneous velocity-space projection; the only
         # RHS contribution is ``-target_vel`` (already set above) plus the
-        # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
+        # ``J*v`` term the solver evaluates every iteration.
 
         world_rhs[world, i] = rhs
         if contact_w < 1.0:
@@ -7392,46 +7392,6 @@ def apply_world_contact_restitution_matrix_free(
     if contact_restitution_fires(phi, relative_incident, dt):
         # Matrix-free GS adds live J*v itself, so store only the target as the row bias.
         world_rhs[world, i] = -target_vel - rebound_velocity
-        if write_row_w != 0:
-            world_row_w[world, i] = 1.0
-
-
-@wp.kernel
-def apply_world_contact_restitution_accumulated(
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    world_phi: wp.array2d[float],
-    world_row_beta: wp.array2d[float],
-    world_row_type: wp.array2d[int],
-    world_row_rebound_velocity: wp.array2d[float],
-    dt: float,
-    contact_speculative_scale: float,
-    write_row_w: int,
-    # in/out
-    world_rhs: wp.array2d[float],
-    world_row_w: wp.array2d[float],
-):
-    """Replace an accumulated impulse-space contact RHS with restitution."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
-        return
-    if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-
-    rebound_velocity = world_row_rebound_velocity[world, i]
-    if rebound_velocity <= 0.0:
-        return
-
-    phi = world_phi[world, i]
-    geometric_bias = contact_speculative_scale * phi / dt
-    if phi < 0.0:
-        geometric_bias = world_row_beta[world, i] * phi / dt
-    relative_incident = world_rhs[world, i] - geometric_bias
-    if contact_restitution_fires(phi, relative_incident, dt):
-        # Impulse-space RHS contains u_incident already; the rebound replaces the geometric bias.
-        world_rhs[world, i] = relative_incident - rebound_velocity
         if write_row_w != 0:
             world_row_w[world, i] = 1.0
 
@@ -7494,70 +7454,6 @@ def compute_world_contact_velocity_bias(
         rhs = 0.0
 
     world_rhs[world, i] = rhs
-
-
-@wp.kernel
-def rhs_accum_world_par_art(
-    world_constraint_count: wp.array[int],
-    art_to_world: wp.array[int],
-    art_dof_start: wp.array[int],
-    v_hat: wp.array[float],
-    group_to_art: wp.array[int],
-    J_group: wp.array3d[float],
-    n_dofs: int,
-    # outputs
-    world_rhs: wp.array2d[float],
-):
-    """
-    Accumulate J*v_hat into world RHS for a single size group.
-
-    RHS = J*v + stabilization (already includes stabilization from compute_world_contact_bias)
-    This kernel is launched once per size group to accumulate velocity contributions.
-    """
-    idx = wp.tid()
-    art = group_to_art[idx]
-    world = art_to_world[art]
-    n_constraints = world_constraint_count[world]
-
-    if n_constraints == 0:
-        return
-
-    dof_start = art_dof_start[art]
-
-    for c in range(n_constraints):
-        jv = float(0.0)
-        for d in range(n_dofs):
-            jv += J_group[idx, c, d] * v_hat[dof_start + d]
-        wp.atomic_add(world_rhs, world, c, jv)  # Add J*v (positive)
-
-
-@wp.kernel
-def rhs_accum_world_par_row(
-    world_constraint_count: wp.array[int],
-    world_group_start: wp.array[int],
-    world_groups: wp.array[int],
-    group_to_art: wp.array[int],
-    art_dof_start: wp.array[int],
-    v_hat: wp.array[float],
-    J_group: wp.array3d[float],
-    n_dofs: int,
-    max_constraints: int,
-    # outputs
-    world_rhs: wp.array2d[float],
-):
-    """Accumulate J*v into the world RHS for one size group, summing a world's articulations in a fixed order."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    c = tid - world * max_constraints
-    if c >= world_constraint_count[world]:
-        return
-    jv = float(0.0)
-    for i in range(world_group_start[world], world_group_start[world + 1]):
-        group_idx = world_groups[i]
-        dof_start = art_dof_start[group_to_art[group_idx]]
-        for d in range(n_dofs):
-            jv += J_group[group_idx, c, d] * v_hat[dof_start + d]
-    world_rhs[world, c] = world_rhs[world, c] + jv
 
 
 @wp.kernel
@@ -11275,214 +11171,6 @@ def propagate_tree_impulses_for_size(
                 propagation_body_impulses[child, r] = 0.0
 
 
-@wp.func
-def friction_step_current(
-    world: int,
-    i: int,
-    omega: float,
-    mf_eff_mass_inv: wp.array2d[float],
-    mf_rhs: wp.array2d[float],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    mf_row_parent: wp.array2d[int],
-    mf_row_mu: wp.array2d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    mf_impulses: wp.array2d[float],
-    v_out: wp.array[float],
-):
-    """Solve the tangent pair at the current patch or point normal load.
-
-    The caller applies the first tangent's velocity change; this function
-    applies the second and makes its subsequent row visit a no-op.
-    """
-    parent_idx = mf_row_parent[world, i]
-    if i != parent_idx + 1:
-        return mf_impulses[world, i]
-    sib = parent_idx + 2
-    lambda_n = patch_normal_load(mf_row_parent, mf_impulses, world, parent_idx)
-    radius = wp.max(mf_row_mu[world, i] * lambda_n, 0.0)
-    residual = wp.vec2(mf_rhs[world, i], mf_rhs[world, sib])
-    ba = mf_body_a[world, i]
-    bb = mf_body_b[world, i]
-    cross = float(0.0)
-    for k in range(6):
-        if ba >= 0:
-            ds = art_dof_start[body_to_articulation[ba]]
-            residual[0] += mf_J_a[world, i, k] * v_out[ds + k]
-            residual[1] += mf_J_a[world, sib, k] * v_out[ds + k]
-            cross += mf_J_a[world, i, k] * mf_MiJt_a[world, sib, k]
-        if bb >= 0:
-            ds = art_dof_start[body_to_articulation[bb]]
-            residual[0] += mf_J_b[world, i, k] * v_out[ds + k]
-            residual[1] += mf_J_b[world, sib, k] * v_out[ds + k]
-            cross += mf_J_b[world, i, k] * mf_MiJt_b[world, sib, k]
-    inv0 = mf_eff_mass_inv[world, i]
-    inv1 = mf_eff_mass_inv[world, sib]
-    sibling_diag = float(0.0)
-    if inv1 > 0.0:
-        sibling_diag = 1.0 / inv1
-    first_diag = float(0.0)
-    if inv0 > 0.0:
-        first_diag = 1.0 / inv0
-    trial = friction_pair_candidate(
-        first_diag,
-        cross,
-        sibling_diag,
-        residual,
-        wp.vec2(mf_impulses[world, i], mf_impulses[world, sib]),
-        radius,
-        omega,
-    )
-    magnitude = wp.length(trial)
-    if magnitude > radius:
-        trial *= radius / magnitude
-    sibling_delta = trial[1] - mf_impulses[world, sib]
-    mf_impulses[world, sib] = trial[1]
-    for k in range(6):
-        if ba >= 0:
-            ds = art_dof_start[body_to_articulation[ba]]
-            v_out[ds + k] += mf_MiJt_a[world, sib, k] * sibling_delta
-        if bb >= 0:
-            ds = art_dof_start[body_to_articulation[bb]]
-            v_out[ds + k] += mf_MiJt_b[world, sib, k] * sibling_delta
-    return trial[0]
-
-
-@wp.kernel
-def pgs_solve_mf_loop(
-    mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_eff_mass_inv: wp.array2d[float],
-    mf_rhs: wp.array2d[float],
-    mf_row_type: wp.array2d[int],
-    mf_row_parent: wp.array2d[int],
-    mf_row_mu: wp.array2d[float],
-    mf_row_w: wp.array2d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    iterations: int,
-    omega: float,
-    regularize: int,
-    friction_start_iteration: int,
-    iteration_offset: int,
-    # in/out
-    mf_impulses: wp.array2d[float],
-    v_out: wp.array[float],
-):
-    """Matrix-free PGS solver for free rigid body contacts.
-
-    Operates directly on body velocities stored in v_out (generalized coordinates).
-    Each iteration recomputes J*v from v_out and applies velocity corrections
-    immediately (Gauss-Seidel style).
-
-    Friction rows use :func:`friction_step_current`; the alternate friction
-    modes are matrix-free (CUDA) only.
-    """
-    world = wp.tid()
-    m_count = mf_constraint_count[world]
-    if m_count == 0:
-        return
-
-    for it in range(iterations):
-        for i in range(m_count):
-            row_type = mf_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
-                mf_impulses[world, i] = 0.0
-                continue
-
-            eff_inv = mf_eff_mass_inv[world, i]
-            if eff_inv <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
-                continue
-
-            ba = mf_body_a[world, i]
-            bb = mf_body_b[world, i]
-
-            # Compute current J * v
-            jv = float(0.0)
-            if ba >= 0:
-                art_a = body_to_articulation[ba]
-                ds_a = art_dof_start[art_a]
-                for k in range(6):
-                    jv += mf_J_a[world, i, k] * v_out[ds_a + k]
-            if bb >= 0:
-                art_b = body_to_articulation[bb]
-                ds_b = art_dof_start[art_b]
-                for k in range(6):
-                    jv += mf_J_b[world, i, k] * v_out[ds_b + k]
-
-            # PGS update: delta = -(J*v_current + bias) / d_ii
-            residual = jv + mf_rhs[world, i]
-            old_impulse = mf_impulses[world, i]
-            delta = -residual * eff_inv
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                # Proximal regularization in w-form (w = 1/(1+g)): identical
-                # algebra, but no g*lambda product that could overflow for
-                # extreme finite g; w = 1 (g = 0) is the exact hard update.
-                w = float(1.0)
-                if regularize != 0:
-                    w = mf_row_w[world, i]
-                delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
-            new_impulse = old_impulse + omega * delta
-            delta_impulse = float(0.0)
-
-            # Project
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-            elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                if residual < 0.0:
-                    delta_impulse = delta
-                    new_impulse = delta
-                else:
-                    new_impulse = 0.0
-            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                new_impulse = friction_step_current(
-                    world,
-                    i,
-                    omega,
-                    mf_eff_mass_inv,
-                    mf_rhs,
-                    mf_J_a,
-                    mf_J_b,
-                    mf_body_a,
-                    mf_body_b,
-                    mf_MiJt_a,
-                    mf_MiJt_b,
-                    mf_row_parent,
-                    mf_row_mu,
-                    body_to_articulation,
-                    art_dof_start,
-                    mf_impulses,
-                    v_out,
-                )
-
-            if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                delta_impulse = new_impulse - old_impulse
-            mf_impulses[world, i] = new_impulse
-
-            # Apply velocity correction: v += M_inv * J^T * delta_impulse
-            if ba >= 0:
-                art_a2 = body_to_articulation[ba]
-                ds_a2 = art_dof_start[art_a2]
-                for k in range(6):
-                    v_out[ds_a2 + k] = v_out[ds_a2 + k] + mf_MiJt_a[world, i, k] * delta_impulse
-            if bb >= 0:
-                art_b2 = body_to_articulation[bb]
-                ds_b2 = art_dof_start[art_b2]
-                for k in range(6):
-                    v_out[ds_b2 + k] = v_out[ds_b2 + k] + mf_MiJt_b[world, i, k] * delta_impulse
-
-
 @wp.kernel
 def finalize_mf_constraint_counts(
     mf_slot_counter: wp.array[int],
@@ -11610,111 +11298,6 @@ def compute_mf_world_dof_offsets(
 
 
 @wp.kernel
-def pgs_solve_loop(
-    world_constraint_count: wp.array[int],
-    world_diag: wp.array2d[float],
-    world_C: wp.array3d[float],
-    world_rhs: wp.array2d[float],
-    world_impulses: wp.array2d[float],
-    iterations: int,
-    omega: float,
-    world_row_type: wp.array2d[int],
-    world_row_parent: wp.array2d[int],
-    world_row_mu: wp.array2d[float],
-    friction_start_iteration: int,
-    iteration_offset: int,
-):
-    """
-    World-level Projected Gauss-Seidel solver.
-
-    Similar to pgs_solve_contacts but operates on 2D world-indexed arrays.
-    """
-    world = wp.tid()
-    m = world_constraint_count[world]
-
-    if m == 0:
-        return
-
-    for it in range(iterations):
-        for i in range(m):
-            row_type = world_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
-                world_impulses[world, i] = 0.0
-                continue
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and i != world_row_parent[world, i] + 1:
-                continue
-
-            # Compute residual: w = rhs_i + sum_j C_ij * lambda_j
-            w = world_rhs[world, i]
-            for j in range(m):
-                w += world_C[world, i, j] * world_impulses[world, j]
-
-            denom = world_diag[world, i]
-            if denom <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
-                continue
-
-            delta = float(0.0)
-            if denom > 0.0:
-                delta = -w / denom
-            new_impulse = world_impulses[world, i] + omega * delta
-
-            # --- Normal contact, joint limit, or joint velocity limit:
-            #     lambda_n >= 0. The velocity-limit row uses a signed Jacobian
-            #     so the unilateral projector handles both sides of the
-            #     bilateral ``[-qdot_max, +qdot_max]`` box.
-            if (
-                row_type == PGS_CONSTRAINT_TYPE_CONTACT
-                or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-                or row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-            ):
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-                world_impulses[world, i] = new_impulse
-
-            # --- Friction: isotropic Coulomb ---
-            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                parent_idx = world_row_parent[world, i]
-                lambda_n = patch_normal_load(world_row_parent, world_impulses, world, parent_idx)
-                mu = world_row_mu[world, i]
-                radius = wp.max(mu * lambda_n, 0.0)
-
-                if radius <= 0.0:
-                    world_impulses[world, i] = 0.0
-                    world_impulses[world, i + 1] = 0.0
-                    continue
-
-                if i != parent_idx + 1:
-                    continue
-                sib = parent_idx + 2
-                sibling_residual = world_rhs[world, sib]
-                for j in range(m):
-                    sibling_residual += world_C[world, sib, j] * world_impulses[world, j]
-
-                trial = friction_pair_candidate(
-                    denom,
-                    world_C[world, i, sib],
-                    world_diag[world, sib],
-                    wp.vec2(w, sibling_residual),
-                    wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
-                    radius,
-                    omega,
-                )
-                a = trial[0]
-                b = trial[1]
-
-                mag = wp.sqrt(a * a + b * b)
-                if mag > radius:
-                    scale = radius / mag
-                    a *= scale
-                    b *= scale
-                world_impulses[world, i] = a
-                world_impulses[world, sib] = b
-
-            else:
-                world_impulses[world, i] = new_impulse
-
-
-@wp.kernel
 def apply_impulses_world_par_dof(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
@@ -11816,33 +11399,6 @@ def finalize_world_diag_cfm(
 
     for i in range(m):
         world_diag[world, i] += world_row_cfm[world, i]
-
-
-@wp.kernel
-def apply_contact_regularization(
-    world_constraint_count: wp.array[int],
-    world_row_type: wp.array2d[int],
-    world_row_w: wp.array2d[float],
-    # in/out
-    world_diag: wp.array2d[float],
-    world_C: wp.array3d[float],
-):
-    """Fold the per-row weight of dense contact rows into the assembled Delassus system.
-
-    Adding ``reg = (1/w - 1) * d`` to the matrix diagonal and the divisor is the
-    w-form update ``delta = -w*r/d - (1-w)*lambda`` used by every other route.
-    Only the split mode, which solves with the assembled matrix, needs this; the
-    fused velocity-residual routes read ``world_row_w`` directly.
-    """
-    world = wp.tid()
-    m = world_constraint_count[world]
-    for i in range(m):
-        if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            w = world_row_w[world, i]
-            if w < 1.0:
-                reg = (1.0 / w - 1.0) * world_diag[world, i]
-                world_diag[world, i] += reg
-                world_C[world, i, i] += reg
 
 
 # =============================================================================
@@ -12185,67 +11741,6 @@ def clear_local_solve_diag(
         world_diag[world, row] = 0.0
 
 
-@wp.kernel
-def delassus_par_row_col(
-    # Size-grouped arrays
-    J_group: wp.array3d[float],  # [n_arts_of_size, max_constraints, n_dofs]
-    Y_group: wp.array3d[float],  # [n_arts_of_size, max_constraints, n_dofs]
-    # Indirection arrays
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    world_constraint_count: wp.array[int],
-    # Size parameters
-    n_dofs: int,
-    max_constraints: int,
-    n_arts: int,
-    # Output: Delassus matrix C and diagonal (accumulated via atomics)
-    world_C: wp.array3d[float],  # [world_count, max_constraints, max_constraints]
-    world_diag: wp.array2d[float],  # [world_count, max_constraints]
-):
-    """
-    Accumulate Delassus matrix contribution C += J * Y^T from one size group.
-
-    PARALLELIZED VERSION: Each thread handles one (articulation, i, j) triplet.
-
-    The Delassus matrix is: C = sum_art J_art * H_art^-1 * J_art^T = sum_art J_art * Y_art^T
-
-    Since Y is stored as [constraint, dof], we compute:
-        C[i,j] = sum_k J[i,k] * Y[j,k]
-
-    Thread dimension: n_arts_of_size * max_constraints * max_constraints
-    """
-    tid = wp.tid()
-
-    # Decode thread index
-    j = tid % max_constraints
-    i = (tid // max_constraints) % max_constraints
-    idx = tid // (max_constraints * max_constraints)
-
-    # Bounds check for articulation
-    if idx >= n_arts:
-        return
-
-    art = group_to_art[idx]
-    world = art_to_world[art]
-    n_constraints = world_constraint_count[world]
-
-    # Early exit if this (i, j) is beyond the actual constraint count
-    if i >= n_constraints or j >= n_constraints:
-        return
-
-    # Compute C[i,j] = sum_k J[i,k] * Y[j,k]
-    val = float(0.0)
-    for k in range(n_dofs):
-        val += J_group[idx, i, k] * Y_group[idx, j, k]
-
-    if val != 0.0:
-        wp.atomic_add(world_C, world, i, j, val)
-
-    # Also accumulate diagonal separately (only when i == j)
-    if i == j and val != 0.0:
-        wp.atomic_add(world_diag, world, i, val)
-
-
 # =============================================================================
 # Tiled kernels for homogenous multi-articulation support
 # =============================================================================
@@ -12455,29 +11950,9 @@ def scatter_qdd_from_groups(
         joint_qdd[dof_start + i] = qdd_group[idx, i, 0]
 
 
-@wp.kernel
-def vector_add_inplace(a: wp.array[float], b: wp.array[float]):
-    """a[i] += b[i]"""
-    i = wp.tid()
-    a[i] = a[i] + b[i]
-
-
-@wp.kernel
-def compute_delta_and_accumulate(
-    v_out: wp.array[float],
-    v_snap: wp.array[float],
-    v_accum: wp.array[float],
-):
-    """delta = v_out - v_snap; v_accum += delta; v_snap = delta (reuse buffer for rhs_accum input)"""
-    i = wp.tid()
-    delta = v_out[i] - v_snap[i]
-    v_accum[i] = v_accum[i] + delta
-    v_snap[i] = delta
-
-
 # ---------------------------------------------------------------------------
-# Graph coloring for propagation rows (articulated_contact_response=
-# "propagation_colored").
+# Graph coloring for propagation rows (solve_mode="colored",
+# articulated_contact_response="propagation").
 #
 # Two propagation rows conflict iff they share a dynamic body (their velocity
 # writes and deferred-impulse accumulations overlap). Rows of one color are

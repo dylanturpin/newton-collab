@@ -1,0 +1,1 @@
+Let `SolverSteel` colored contact rows share any kinematic articulation root, not only kinematic free bodies, so contacts on a kinematic conveyor belt or turntable no longer serialize into one color each.

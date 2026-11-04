@@ -153,7 +153,6 @@ def _make_solver(
     with kernel_overrides(overrides):
         return SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
             iterations=0,
             velocity_iterations=0,

@@ -435,7 +435,8 @@ def _get_sparse_contact_response_kernel(
             const float position = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             gap = side == 0 ? position - bound : bound - position;
-            active = wp::isfinite(bound)
+            // |bound| >= MAXVAL (1e10) is the builder's unlimited axis: no row.
+            active = fabsf(bound) < 1.0e10f
                 && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
         }
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
