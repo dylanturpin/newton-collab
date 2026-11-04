@@ -449,7 +449,7 @@ class Example:
         else:
             self.simulate()
         if self.solver_type == "steel":
-            self.solver.validate_contact_compliance()
+            self.solver.check_constraint_capacity()
 
         self.sim_time += self.frame_dt
 
