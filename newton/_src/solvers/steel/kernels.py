@@ -9307,10 +9307,15 @@ def gather_propagation_unit_meta(
                 walk = row_parent[world, walk]
             overflow = offset | (count << 20)
     unit_meta[base + 7 + PROPAGATION_UNIT_RING] = overflow
-    # Rows of the unit: its first row and the friction rows following it, then its contact torsion row.
+    # Rows of the unit: its first row and the friction and free-body angular rows following it, then its contact
+    # torsion row.
     m = wp.min(constraint_count[world], int(row_type.shape[1]))
     rows = int(1)
-    while slot + rows < m and row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_FRICTION:
+    while slot + rows < m and (
+        row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_FRICTION
+        or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+        or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
+    ):
         rows += 1
     torsion = int(0)
     if slot + rows < m and row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_TORSION:

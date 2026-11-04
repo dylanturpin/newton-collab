@@ -52,10 +52,6 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
         name
         for name, requested in (
             (f"solve_mode={solver._solve_mode!r}", solver._solve_mode != "matrix_free"),
-            (
-                f"articulated_contact_response={solver._articulated_contact_response!r}",
-                solver._articulated_contact_response == "propagation_colored",
-            ),
             (f"row_schedule={solver._row_schedule!r}", solver._row_schedule != "interleaved"),
             (f"friction_mode={solver._friction_mode!r}", solver._friction_mode != "fixed_normal"),
             ("contact_compliance=True", solver._contact_compliance),

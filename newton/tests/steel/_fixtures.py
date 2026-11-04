@@ -304,12 +304,14 @@ def select_colored_variant(test, solver, variant):
             contact_compliance=solver._contact_compliance,
             friction_mode=solver._friction_mode,
             contact_torsion=solver._propagation_torsion_rows,
+            free_rigid_angular=solver._free_rigid_angular_rows,
         )
         solver._pgs_solve_propagation_colored_warp_kernel = None
     warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
     kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
     test.assertIn(COLORED_VARIANTS[variant][1], kernel.key)
     test.assertEqual("_cc" in kernel.key, solver._contact_compliance, kernel.key)
+    test.assertEqual("_fra" in kernel.key, solver._free_rigid_angular_rows, kernel.key)
     mode = solver._friction_mode
     test.assertEqual(kernel.key.endswith(mode), mode != "fixed_normal", kernel.key)
 

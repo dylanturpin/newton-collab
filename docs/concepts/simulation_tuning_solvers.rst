@@ -305,8 +305,8 @@ repository examples spend tuning effort, not a shared solver API.
        Free-body contacts get experimental spin and rolling friction rows
        from shapes whose ``steel:condim`` is 4 (spin, bounded by
        ``mu_torsional`` times the normal load) or 6 (also rolling, bounded by
-       ``mu_rolling`` times the normal load), under the ``"immediate"`` and
-       ``"propagation"`` responses.
+       ``mu_rolling`` times the normal load), under every
+       ``articulated_contact_response``.
        The experimental ``contact_compliance`` option solves hydroelastic
        contacts with positive stiffness as implicit spring-dampers instead; it
        uses point friction and prepares its rows on the device, so a compliant
