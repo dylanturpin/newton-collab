@@ -1,0 +1,1 @@
+Skip `SolverSteel` joint-limit rows for axes at the builder's unlimited bounds (`|limit| >= MAXVAL`) and joint velocity-limit rows for limits at or above the builder default of 1e6, which could never apply an impulse but still cost a row pair per DOF every substep. A velocity limit at or above 1e6 is no longer enforced; set a lower `joint_velocity_limit` to keep one.

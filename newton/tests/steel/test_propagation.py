@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import io
 import os
 import sys
 import tempfile
@@ -4081,7 +4082,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
                 return loop(self_, **kwargs)  # compare only calls whose colors exercise the block-wide sweep
             wp.synchronize_device()
             before = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
-            names = {k for k, v in vars(self_).items() if isinstance(v, wp.array)}
+            refs = {k: v for k, v in vars(self_).items() if isinstance(v, wp.array)}
             scalars = {k: v for k, v in vars(self_).items() if not isinstance(v, (wp.array, dict, list, set))}
             self_._latency_fused = False
             loop(self_, **kwargs)
@@ -4089,8 +4090,10 @@ class TestLatencyFusedLoop(unittest.TestCase):
             for k, v in _solver_arrays(self_).items():
                 if k in before:
                     v.assign(before[k])
-            for k in {k for k, v in vars(self_).items() if isinstance(v, wp.array)} - names:
+            for k in {k for k, v in vars(self_).items() if isinstance(v, wp.array)} - refs.keys():
                 delattr(self_, k)  # created lazily during the call; the second run recreates it
+            for k, v in refs.items():
+                setattr(self_, k, v)  # rebound during the call (e.g. _color_fold_rhs, which gates the fold)
             for k, v in scalars.items():
                 setattr(self_, k, v)
             self_._latency_fused = True
@@ -4123,6 +4126,31 @@ class TestLatencyFusedLoop(unittest.TestCase):
     def test_fused_loop_matches_per_pass_launches(self):
         # trees (revolute arm with limits, ball chain) and free boxes in every role of the block
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
+
+    def test_fused_loop_velocity_passes_match(self):
+        # velocity_iterations > 0 runs the soft_relax pass, which folds a second right-hand side
+        self._check_fused_matches(
+            _build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True, velocity_iterations=2
+        )
+
+    def test_debug_hooks_take_the_per_pass_launches(self):
+        # stage timing and kernel capture observe the per-pass launches, so latency mode steps aside for them
+        model = _build_latency_scene("cuda:0")
+        solver = SolverSteel(
+            model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", iterations=4
+        )
+        self.assertTrue(solver._latency_fused)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        with (
+            patch.object(solver, "_sync_timing_active", return_value=True),
+            patch.object(solver, "_launch_latency_fused") as fused,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, DT)
+        fused.assert_not_called()
 
     def test_fused_loop_wide_colors_match(self):
         # one world of free boxes on the ground: colors wider than a warp take the whole block

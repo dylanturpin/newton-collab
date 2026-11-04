@@ -9778,7 +9778,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        if self._latency_fused:
+        # Latency mode runs the loop as one launch; the per-pass chain serves the stage timers and kernel capture.
+        if self._latency_fused and not _STEEL_CAPTURE and not self._sync_timing_active():
             self._launch_latency_fused(
                 dense_rhs, propagation_rhs, mf_meta, iterations, omega, friction_start_iteration, iteration_offset,
                 freeze_drive_rows, soft_relax,
