@@ -436,6 +436,26 @@ def _copy_three(
     c_out[i] = c[i]
 
 
+@wp.kernel(enable_backward=False)
+def _clear_stage1_state(
+    body_f_s: wp.array[wp.spatial_vector],
+    body_ft_s: wp.array[wp.spatial_vector],
+    joint_qd: wp.array[float],
+    qd_work: wp.array[float],
+    joint_qdd: wp.array[float],
+):
+    """One launch for the dynamics stages' clears and the velocity copy; an empty array is skipped."""
+    i = wp.tid()
+    if i < body_f_s.shape[0]:
+        body_f_s[i] = wp.spatial_vector()
+    if i < body_ft_s.shape[0]:
+        body_ft_s[i] = wp.spatial_vector()
+    if i < qd_work.shape[0]:
+        qd_work[i] = joint_qd[i]
+    if i < joint_qdd.shape[0]:
+        joint_qdd[i] = 0.0
+
+
 @wp.func
 def _fill_int(values: wp.array[int], i: int, value: int):
     if i < values.shape[0]:
@@ -3670,6 +3690,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._empty_float = wp.empty(0, dtype=wp.float32, device=model.device)
         self._empty_int_2d = wp.empty((0, 0), dtype=wp.int32, device=model.device)
         self._empty_float_2d = wp.empty((0, 0), dtype=wp.float32, device=model.device)
+        self._empty_spatial = wp.empty(0, dtype=wp.spatial_vector, device=model.device)
+        # ids of arrays a merged clear wrote this step; their first-use clears skip (see _take_pre_cleared)
+        self._pre_cleared: set[int] = set()
         # Latency mode merges the setup launches outside the PGS loop; see _fused_setup_active.
         self._fused_setup_enabled = not model.requires_grad
         # Size groups that can hold velocity-limit rows: their articulations have a prismatic, revolute or D6
@@ -10359,6 +10382,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
+            self._pre_cleared.clear()
+            if self._fused_setup_active():
+                self._clear_stage1_state(state_in, state_aug)
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
@@ -11273,9 +11299,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state_in
         else:
-            state_aug._body_f_s.zero_()
+            self._zero_at_first_use(state_aug._body_f_s)
         if self._enable_joint_velocity_limits:
-            wp.copy(self._qd_work, state_in.joint_qd)
+            self._copy_at_first_use(self._qd_work, state_in.joint_qd)
             if self._fused_setup_active():
                 self._prescale_joint_velocities_warp()
             else:
@@ -11478,7 +11504,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
-        state_aug._body_ft_s.zero_()
+        self._zero_at_first_use(state_aug._body_ft_s)
         tau_inputs = [
             model.articulation_start,
             self._articulation_joint_end,
@@ -11623,7 +11649,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if model.articulation_count:
             if self._drive_mode == "augmented" and self._articulation_max_dofs > 0:
                 body_f = state_in.body_f if state_in.body_count else None
-                state_aug._body_ft_s.zero_()
+                self._zero_at_first_use(state_aug._body_ft_s)
                 wp.launch(
                     eval_rigid_tau_and_augmented_drives,
                     dim=model.articulation_count,
@@ -12040,7 +12066,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
     def _stage3_zero_qdd(self, state_aug: State):
-        state_aug._joint_qdd.zero_()
+        self._zero_at_first_use(state_aug._joint_qdd)
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a diagonal generalized inertia inverse to joint forces."""
@@ -12286,12 +12312,59 @@ class SolverSteel(SolverBase, CouplingInterface):
             floats += [self._mf_rhs, self._mf_eff_mass_inv]  # compute_mf_effective_mass_and_rhs
         return ints, floats
 
+    def _take_pre_cleared(self, array: wp.array) -> bool:
+        """Whether a merged clear this step already wrote ``array``'s first-use value; consumes the mark."""
+        if id(array) in self._pre_cleared:
+            self._pre_cleared.discard(id(array))
+            return True
+        return False
+
     def _zero_at_first_use(self, *arrays: wp.array) -> None:
-        """Zero arrays before their first use this step, unless the merged row-build clear already did."""
-        if self._fused_setup_active():
-            return
+        """Zero arrays before their first use this step, unless a merged clear already did."""
         for array in arrays:
-            array.zero_()
+            if not self._take_pre_cleared(array):
+                array.zero_()
+
+    def _copy_at_first_use(self, dest: wp.array, src: wp.array) -> None:
+        """Copy ``src`` to ``dest`` before its first use this step, unless a merged clear already did."""
+        if not self._take_pre_cleared(dest):
+            wp.copy(dest, src)
+
+    def _stage1_cleared_arrays(self, state_in: State, state_aug: State) -> tuple:
+        """The (body_f_s, body_ft_s, qd_work, joint_qdd) arrays stages 1 to 3 clear or copy, ``None`` if not this step."""
+        model = self.model
+        body_f_s = None if self._fk_id_cache_enabled else state_aug._body_f_s  # _stage1_fk_id
+        body_ft_s = state_aug._body_ft_s if model.articulation_count else None  # inverse dynamics
+        qd_work = self._qd_work if self._enable_joint_velocity_limits else None  # prescale input
+        return body_f_s, body_ft_s, qd_work, state_aug._joint_qdd  # _stage3_zero_qdd
+
+    def _clear_stage1_state_per_array(self, state_in: State, state_aug: State) -> None:
+        """Clear and copy what :meth:`_stage1_cleared_arrays` names, array by array."""
+        body_f_s, body_ft_s, qd_work, joint_qdd = self._stage1_cleared_arrays(state_in, state_aug)
+        for array in (body_f_s, body_ft_s, joint_qdd):
+            if array is not None:
+                array.zero_()
+        if qd_work is not None:
+            wp.copy(qd_work, state_in.joint_qd)
+
+    def _clear_stage1_state(self, state_in: State, state_aug: State) -> None:
+        """Write what :meth:`_clear_stage1_state_per_array` writes in one launch; the first uses then skip it."""
+        arrays = self._stage1_cleared_arrays(state_in, state_aug)
+        body_f_s, body_ft_s, qd_work, joint_qdd = (
+            array if array is not None else empty
+            for array, empty in zip(
+                arrays,
+                (self._empty_spatial, self._empty_spatial, self._empty_float, self._empty_float),
+                strict=True,
+            )
+        )
+        wp.launch(
+            _clear_stage1_state,
+            dim=max(array.shape[0] for array in (body_f_s, body_ft_s, qd_work, joint_qdd)),
+            inputs=[body_f_s, body_ft_s, state_in.joint_qd, qd_work, joint_qdd],
+            device=self.model.device,
+        )
+        self._pre_cleared.update(id(array) for array in arrays if array is not None)
 
     def _clear_step_row_state_per_array(
         self, mf_active: bool, propagation_active: bool, colored_contacts: bool = False
@@ -12372,6 +12445,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         moved_ints, moved_floats = self._moved_clear_arrays(mf_active, propagation_active, colored_contacts)
         moved_ints += [None] * (3 - len(moved_ints))
         moved_floats += [None] * (2 - len(moved_floats))
+        self._pre_cleared.update(id(a) for a in moved_ints + moved_floats if a is not None)
         arrays += [ints(a, a is not None) for a in moved_ints] + [floats(a, a is not None) for a in moved_floats]
         wp.launch(
             _clear_step_row_state,

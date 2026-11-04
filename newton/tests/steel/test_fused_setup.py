@@ -27,6 +27,7 @@ def _clear_then_zero_moved(solver, mf_active, propagation_active, colored_contac
 # merged launch -> the launches it replaces (a method name or a function), called with the same arguments
 _PAIRS = {
     "_clear_step_row_state": _clear_then_zero_moved,
+    "_clear_stage1_state": "_clear_stage1_state_per_array",
     "_snapshot_stage3": "_snapshot_stage3_per_array",
     "_prescale_joint_velocities_warp": "_prescale_joint_velocities",
     "_allocate_velocity_limit_slots_warp": "_allocate_velocity_limit_slots",
@@ -195,16 +196,24 @@ class TestFusedSetup(unittest.TestCase):
         patches = [patch.object(SolverSteel, f, make(f, pairs[f])) for f in pairs]
         skipped = [0]
         zero_at_first_use = SolverSteel._zero_at_first_use
+        copy_at_first_use = SolverSteel._copy_at_first_use
 
-        def check_skip(self_, *arrays):
-            # a memset latency mode skips would write nothing: the merged clear left the arrays zero
-            if self_._fused_setup_active():
-                for array in arrays:
+        def check_zero(self_, *arrays):
+            # a first-use memset a merged clear replaced would write nothing: the array is still zero
+            for array in arrays:
+                if id(array) in self_._pre_cleared:
                     test.assertFalse(np.any(array.numpy()), "a skipped first-use memset had work")
-                skipped[0] += 1
+                    skipped[0] += 1
             zero_at_first_use(self_, *arrays)
 
-        patches.append(patch.object(SolverSteel, "_zero_at_first_use", check_skip))
+        def check_copy(self_, dest, src):
+            if id(dest) in self_._pre_cleared:
+                test.assertTrue(_bitwise_equal(dest.numpy(), src.numpy()), "a skipped first-use copy had work")
+                skipped[0] += 1
+            copy_at_first_use(self_, dest, src)
+
+        patches.append(patch.object(SolverSteel, "_zero_at_first_use", check_zero))
+        patches.append(patch.object(SolverSteel, "_copy_at_first_use", check_copy))
         for p in patches:
             p.start()
         max_mf_rows = 0
@@ -221,7 +230,7 @@ class TestFusedSetup(unittest.TestCase):
         finally:
             for p in patches:
                 p.stop()
-        if "_clear_step_row_state" in pairs:
+        if "_clear_step_row_state" in pairs or "_clear_stage1_state" in pairs:
             self.assertGreater(skipped[0], 0, "no first-use memset was skipped")
         for name in pairs:
             self.assertGreater(compared[name], 0, f"{name} never ran")
