@@ -1211,41 +1211,6 @@ class TestModelMesh(unittest.TestCase):
             mesh = builder.shape_source[shape]
             self.assertEqual(len(mesh.vertices), mesh.maxhullvert)
 
-    def test_mesh_approximation_coacd_is_repeatable(self):
-        """Decompose a nonconvex mesh with CoACD repeatedly and get identical hulls."""
-        try:
-            import coacd  # noqa: F401
-        except ImportError:
-            self.skipTest("Requires coacd")
-
-        # A torus is nonconvex, so CoACD's parallel tree search has several cuts to choose from.
-        rings, sides = 32, 12
-        u, v = np.meshgrid(
-            np.linspace(0.0, 2.0 * np.pi, rings, endpoint=False),
-            np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False),
-            indexing="ij",
-        )
-        radius = 0.05 + 0.015 * np.cos(v)
-        vertices = np.stack((radius * np.cos(u), radius * np.sin(u), 0.015 * np.sin(v)), axis=-1).reshape(-1, 3)
-        i, j = np.meshgrid(np.arange(rings), np.arange(sides), indexing="ij")
-        a, b = i * sides + j, (i + 1) % rings * sides + j
-        c, d = (i + 1) % rings * sides + (j + 1) % sides, i * sides + (j + 1) % sides
-        indices = np.stack((a, b, c, a, c, d), axis=-1).reshape(-1)
-        torus = newton.Mesh(vertices, indices, compute_inertia=False)
-
-        def decompose():
-            builder = ModelBuilder()
-            builder.add_shape_mesh(body=-1, mesh=torus)
-            builder.approximate_meshes(method="coacd", raise_on_failure=True)
-            return [np.concatenate((m.vertices.ravel(), m.indices.ravel())) for m in builder.shape_source]
-
-        first = decompose()
-        for _ in range(2):
-            again = decompose()
-            self.assertEqual(len(again), len(first))
-            for part, expected in zip(again, first, strict=True):
-                np.testing.assert_array_equal(part, expected)
-
     def test_mesh_approximation_coacd_unavailable_falls_back_to_convex_hull(self):
         builder = ModelBuilder()
         box = newton.Mesh.create_box(

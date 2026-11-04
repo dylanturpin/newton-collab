@@ -3596,7 +3596,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._friction_patches.reserve_history_snapshot()
 
     @override
-    @override
     def coupling_eval_gravity_acceleration(
         self,
         out_body_acceleration: "wp.array[wp.vec3] | None",
@@ -3615,6 +3614,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=model.device,
         )
 
+    @override
     def coupling_effective_mass_refresh_flags(self) -> int:
         """Return the model flags after which the articulated effective masses change."""
         return int(
