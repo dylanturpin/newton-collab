@@ -168,6 +168,7 @@ from .kernels import (
     flag_invalid_joint_friction,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
+    fold_prescribed_propagation_sides,
     gather_contact_warmstart,
     gather_free_root_anchors,
     gather_group_armature,
@@ -2707,6 +2708,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self._joint_armature_device = wp.zeros(max(model.joint_dof_count, 1), dtype=wp.float32, device=model.device)
+        self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
         self._update_kinematic_state()
         # Fully kinematic free bodies are removed from the response mapping; their
         # prescribed motion enters the contact targets of the rows that touch them.
@@ -2715,6 +2717,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
+        self._refresh_body_prescribed()
         # A body variant row can take a surface-velocity mesh after construction.
         self._has_surface_velocity = any(
             properties is not None and bool(np.any(properties.numpy() & int(MeshProperties.SURFACE_VELOCITY)))
@@ -3107,6 +3110,24 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
+        self._refresh_body_prescribed()
+
+    def _refresh_body_prescribed(self) -> None:
+        """Mark the kinematic articulation roots, whose contacts the colored sweep treats as prescribed.
+
+        A kinematic root's joint DOFs carry the large-armature fallback, so contacts cannot change its
+        velocity, and rows sharing one may share a color. A dynamic child link keeps its own response.
+        """
+        model = self.model
+        # Construction refreshes the kinematic state before the model plan exists.
+        if self._model_plan is None:
+            return
+        prescribed = np.zeros(max(model.body_count, 1), dtype=np.int32)
+        if model.joint_count and model.body_count:
+            kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+            child = model.joint_child.numpy()
+            prescribed[child[kinematic[child] & (model.joint_parent.numpy() < 0)]] = 1
+        self._body_prescribed.assign(prescribed)
 
     def _update_effective_armature(self) -> None:
         """Rebuild the effective joint armature and its size-grouped copies on the device."""
@@ -10788,6 +10809,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Allocated with the packed sweep.
         self._color_unit_payload = None
         self._color_unit_meta_stale = True
+        # The rows with their prescribed sides removed and that side's constant velocity term folded into the rhs.
+        self._color_body_a = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
+        self._color_body_b = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
+        self._color_rhs = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
 
     def _init_propagation_kernels(self, model) -> None:
         """Resolve the size-specialized propagation kernels."""
@@ -10973,6 +10998,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_art_b,
                     self._articulation_response_dof_count,
                     model.shape_body,
+                    self._body_prescribed,
                     self._contact_slots_needed,
                     self._propagation_max_constraints,
                 ],
@@ -11798,6 +11824,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if iterations <= 0:
             return
         model = self.model
+        if self._propagation_colored:
+            colored_rows = self._prepare_colored_sweep(propagation_rhs)
         has_internal_rows, has_velocity_limits = self._internal_row_phases()
         contact_then_internal = self._row_schedule == "contact_then_internal"
         refresh_forced = contact_then_internal or has_internal_rows or has_velocity_limits
@@ -11817,7 +11845,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._snapshot_propagation_cache_twists()
             if self._propagation_colored:
                 self._launch_colored_sweep(
-                    propagation_rhs,
+                    *colored_rows,
                     regularize=regularize,
                     friction_start_iteration=friction_start_iteration,
                     global_iter=iteration,
@@ -11894,16 +11922,58 @@ class SolverSteel(SolverBase, CouplingInterface):
         if contact_then_internal and (has_internal_rows or has_velocity_limits):
             phase(2, iterations, iteration_offset=iteration_offset)
 
+    def _prepare_colored_sweep(self, propagation_rhs: wp.array) -> tuple[wp.array, wp.array, wp.array]:
+        """Fold the prescribed sides out of the rows and gather the step's unit records; once per pass.
+
+        Returns the body and right-hand-side arrays the pass's sweeps read.
+        """
+        device = self.model.device
+        # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it. The
+        # fold reads the device mask, so a captured graph follows a change of the kinematic flags.
+        wp.launch(
+            fold_prescribed_propagation_sides,
+            dim=(self._world_count, self._propagation_max_constraints),
+            inputs=[
+                self._propagation_constraint_count,
+                self._propagation_body_a,
+                self._propagation_body_b,
+                self._propagation_J_a,
+                self._propagation_J_b,
+                self._body_prescribed,
+                self._propagation_body_qd,
+                propagation_rhs,
+                self._propagation_max_constraints,
+            ],
+            outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
+            device=device,
+        )
+        # The unit records follow the step's rows, so the first pass of a step gathers them.
+        if (
+            self._pgs_solve_propagation_colored_warp_kernel is not None
+            and self._color_unit_meta_stale
+            and self._colored_prefetch
+        ):
+            self._color_unit_meta_stale = False
+            self._launch_gather_unit_meta(self._color_body_a, self._color_body_b)
+        return self._color_body_a, self._color_body_b, self._color_rhs
+
     def _launch_colored_sweep(
-        self, propagation_rhs: wp.array, *, regularize: bool, friction_start_iteration: int = 0, global_iter: int = 0
+        self,
+        body_a: wp.array,
+        body_b: wp.array,
+        propagation_rhs: wp.array,
+        *,
+        regularize: bool,
+        friction_start_iteration: int = 0,
+        global_iter: int = 0,
     ) -> None:
         """Sweep the propagation rows once, one color of units after the other."""
         device = self.model.device
         inputs = [
             self._world_count,
             self._propagation_constraint_count,
-            self._propagation_body_a,
-            self._propagation_body_b,
+            body_a,
+            body_b,
             self._propagation_MiJt_a,
             self._propagation_MiJt_b,
             self._propagation_J_a,
@@ -11935,10 +12005,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=device,
             )
             return
-        # The unit records follow the step's rows, so the first sweep of a step gathers them.
-        if self._color_unit_meta_stale and self._colored_prefetch:
-            self._color_unit_meta_stale = False
-            self._launch_gather_unit_meta()
         wpb = self._colored_worlds_per_block
         wp.launch_tiled(
             self._pgs_solve_propagation_colored_warp_kernel,
@@ -11959,7 +12025,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=device,
         )
 
-    def _launch_gather_unit_meta(self) -> None:
+    def _launch_gather_unit_meta(self, body_a: wp.array, body_b: wp.array) -> None:
         """Pack the unit records, the friction-pair setups and, when packed, the row payloads of the colored units."""
         device = self.model.device
         rows = self._propagation_max_constraints
@@ -11975,8 +12041,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._color_world_row_order,
                 self._propagation_row_type,
                 self._propagation_row_parent,
-                self._propagation_body_a,
-                self._propagation_body_b,
+                body_a,
+                body_b,
                 self._propagation_body_local_slot,
                 self._propagation_constraint_count,
                 self._color_ring_overflow_cursor,
@@ -11993,8 +12059,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_constraint_count,
                 self._color_unit_meta,
                 self._propagation_eff_mass_inv,
-                self._propagation_body_a,
-                self._propagation_body_b,
+                body_a,
+                body_b,
                 self._propagation_body_local_slot,
                 self._propagation_J_a,
                 self._propagation_J_b,
@@ -12014,8 +12080,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._color_unit_meta,
                     self._propagation_row_type,
                     self._propagation_eff_mass_inv,
-                    self._propagation_body_a,
-                    self._propagation_body_b,
+                    body_a,
+                    body_b,
                     self._propagation_row_w,
                     int(self._regularization_enabled),
                     self._propagation_row_mu,

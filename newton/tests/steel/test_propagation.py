@@ -3326,6 +3326,114 @@ def test_captured_schedules_match_eager(test, device):
             np.testing.assert_allclose(finals[1], finals[0], rtol=0.0, atol=1.0e-5)
 
 
+def _turntable(device, spin=0.0, boxes=6):
+    """Build ``boxes`` free boxes resting on a kinematic turntable, a revolute articulation root spun at ``spin``."""
+    builder = newton.ModelBuilder()
+    table = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(table, hx=0.6, hy=0.6, hz=0.05)
+    joint = builder.add_joint_revolute(
+        parent=-1,
+        child=table,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+    )
+    builder.add_articulation([joint])
+    builder.joint_qd[builder.joint_qd_start[joint]] = spin
+    for k in range(boxes):
+        angle = 2.0 * np.pi * k / boxes
+        position = wp.vec3(0.35 * np.cos(angle), 0.35 * np.sin(angle), 0.149)
+        box = builder.add_body(xform=wp.transform(position, wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = CONTACT_MAX
+    return model, table
+
+
+def test_prescribed_mask_marks_kinematic_roots(test, device):
+    """Mark kinematic articulation roots, free or jointed, and leave dynamic links below them unmarked."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    free_kinematic = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(free_kinematic, hx=0.1, hy=0.1, hz=0.1)
+    free_dynamic = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(free_dynamic, hx=0.1, hy=0.1, hz=0.1)
+    # add_link, not add_body: add_body wraps each body in its own free-joint articulation.
+    root = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
+    j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
+    link = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.8), wp.quat_identity()))
+    builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+    j_link = builder.add_joint_revolute(
+        parent=root,
+        child=link,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
+    )
+    builder.add_articulation([j_root, j_link])
+    solver = _colored_solver(builder.finalize(device=device))
+    prescribed = solver._body_prescribed.numpy()
+    test.assertEqual(int(prescribed[free_kinematic]), 1)
+    test.assertEqual(int(prescribed[free_dynamic]), 0)
+    test.assertEqual(int(prescribed[root]), 1)
+    test.assertEqual(int(prescribed[link]), 0)
+
+
+def test_kinematic_root_contacts_share_colors(test, device):
+    """Color contacts on a kinematic articulation root by their dynamic bodies only.
+
+    Every box's contacts would otherwise conflict on the turntable and take a color each.
+    """
+    model, _ = _turntable(device)
+    solver = _colored_solver(model)
+    _, contact_count = _settle(model, solver, steps=2)
+    counts, tail = _color_counts(solver)
+    test.assertGreaterEqual(contact_count, 12)
+    test.assertEqual(int(counts.sum()), contact_count)
+    test.assertEqual(tail, 0)
+    # Only a box's own contacts conflict.
+    test.assertLessEqual(int(np.count_nonzero(counts)), contact_count // 6)
+
+
+def test_kinematic_root_velocity_drives_the_colored_rows(test, device):
+    """Carry boxes along a spinning kinematic turntable, its velocity folded into the colored rows.
+
+    The table keeps its prescribed spin, and the colored sweep moves the boxes as the serial sweep does.
+    """
+    spin = 1.5
+    twists = {}
+    for mode in ("propagation", "colored"):
+        model, table = _turntable(device, spin=spin)
+        solver = SolverSteel(
+            model,
+            **steel_mode_options(mode),
+            iterations=6,
+            free_body_constraint_max=CONTACT_MAX,
+            articulation_constraint_max=64,
+        )
+        state, _ = _settle(model, solver, steps=120)
+        test.assertAlmostEqual(float(state.joint_qd.numpy()[0]), spin, places=4)
+        boxes = [body for body in range(model.body_count) if body != table]
+        body_q = state.body_q.numpy()[boxes]
+        twists[mode] = state.body_qd.numpy()[boxes]
+        # Newton body twists are (linear, angular): each box moves along the table's rotation.
+        tangent = np.stack([-body_q[:, 1], body_q[:, 0]], axis=1) * spin
+        along = np.sum(twists[mode][:, :2] * tangent, axis=1) / np.sum(tangent * tangent, axis=1)
+        np.testing.assert_array_less(0.5, along)
+    np.testing.assert_allclose(twists["colored"], twists["propagation"], atol=1.0e-2 * spin * 0.35)
+
+
+class TestSteelColoredKinematicRoots(unittest.TestCase):
+    pass
+
+
+for _fn in (
+    test_prescribed_mask_marks_kinematic_roots,
+    test_kinematic_root_contacts_share_colors,
+    test_kinematic_root_velocity_drives_the_colored_rows,
+):
+    add_function_test(TestSteelColoredKinematicRoots, _fn.__name__, _fn, devices=get_cuda_test_devices())
+
+
 class TestSteelSchedule(unittest.TestCase):
     pass
 

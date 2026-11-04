@@ -8812,6 +8812,7 @@ def collect_propagation_units(
     contact_art_b: wp.array[int],
     articulation_response_dof_count: wp.array[int],
     shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
     contact_slots_needed: wp.array[int],
     propagation_max_constraints: int,
     # in/out
@@ -8824,8 +8825,8 @@ def collect_propagation_units(
 ):
     """Gather the propagation contacts into per-world unit lists for the coloring.
 
-    A side without response DOFs (ground or a prescribed kinematic body) is recorded as ``-1``,
-    as in the rows, so it never conflicts.
+    A side without response DOFs (ground or an elided kinematic body) is recorded as ``-1``, as in
+    the rows, and so is a prescribed body (``body_prescribed``), whose side the sweep folds away; neither conflicts.
     """
     c = wp.tid()
     if c >= contact_count[0]:
@@ -8845,8 +8846,12 @@ def collect_propagation_units(
     shape_b = contact_shape1[c]
     if shape_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
         body_a = shape_body[shape_a]
+        if body_prescribed[body_a] != 0:
+            body_a = -1
     if shape_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
         body_b = shape_body[shape_b]
+        if body_prescribed[body_b] != 0:
+            body_b = -1
     unit_contact[base + idx] = c
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b
@@ -8866,6 +8871,7 @@ def collect_propagation_units_ordered(
     contact_art_b: wp.array[int],
     articulation_response_dof_count: wp.array[int],
     shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
     contact_slots_needed: wp.array[int],
     propagation_max_constraints: int,
     # in/out
@@ -8901,13 +8907,58 @@ def collect_propagation_units_ordered(
     shape_b = contact_shape1[c]
     if shape_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
         body_a = shape_body[shape_a]
+        if body_prescribed[body_a] != 0:
+            body_a = -1
     if shape_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
         body_b = shape_body[shape_b]
+        if body_prescribed[body_b] != 0:
+            body_b = -1
     unit_contact[base + idx] = c
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b
     unit_len[base + idx] = contact_slots_needed[c]
     wp.atomic_max(world_unit_cursor, world, idx + 1)
+
+
+@wp.kernel(enable_backward=False)
+def fold_prescribed_propagation_sides(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    body_prescribed: wp.array[int],
+    propagation_body_qd: wp.array2d[float],
+    rhs: wp.array2d[float],
+    propagation_max_constraints: int,
+    # outputs
+    colored_body_a: wp.array2d[int],
+    colored_body_b: wp.array2d[int],
+    colored_rhs: wp.array2d[float],
+):
+    """Drop each row's prescribed side and move its constant ``J v`` term into the row's right-hand side.
+
+    A prescribed body has no response, so its velocity is fixed for the whole sweep.
+    """
+    world, i = wp.tid()
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    body_a = propagation_body_a[world, i]
+    body_b = propagation_body_b[world, i]
+    r = rhs[world, i]
+    if body_a >= 0:
+        if body_prescribed[body_a] != 0:
+            for k in range(6):
+                r += propagation_J_a[world, i, k] * propagation_body_qd[body_a, k]
+            body_a = -1
+    if body_b >= 0:
+        if body_prescribed[body_b] != 0:
+            for k in range(6):
+                r += propagation_J_b[world, i, k] * propagation_body_qd[body_b, k]
+            body_b = -1
+    colored_body_a[world, i] = body_a
+    colored_body_b[world, i] = body_b
+    colored_rhs[world, i] = r
 
 
 @wp.kernel(enable_backward=False)
