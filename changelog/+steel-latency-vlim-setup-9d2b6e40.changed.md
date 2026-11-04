@@ -1,0 +1,1 @@
+Speed up single-world `SolverSteel` latency mode: joint velocity-limit rows that are within their limit are settled 32 at a time instead of one row at a time, and the per-substep setup issues about 70 fewer kernel launches per step. Results are bitwise identical.
