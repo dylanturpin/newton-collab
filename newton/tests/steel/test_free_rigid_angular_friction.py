@@ -1059,16 +1059,15 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
 
 
 def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
-    """Roll a free sphere beside a box on a prismatic joint whose contacts take torsion rows; return the sphere travel.
+    """Roll a free sphere beside an articulated spinning top whose contact takes a torsion row; return the travel.
 
-    Checks every step that the box's contacts carry a torsion spare and the sphere's contact its angular rows.
+    Checks every step that the top's contact carries its torsion row and the sphere's contact its angular rows.
     """
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     SolverSteel.register_custom_attributes(builder)
     table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
     builder.add_shape_box(table, hx=2.0, hy=2.0, hz=0.05)
     sphere_inertia = wp.mat33(*(np.eye(3, dtype=np.float32) * 0.4 * _MASS * _RADIUS**2).ravel())
-    box_inertia = wp.mat33(*(np.eye(3, dtype=np.float32) * _MASS * (2.0 * _RADIUS) ** 2 / 6.0).ravel())
     sphere = builder.add_body(
         xform=wp.transform((0.0, 0.0, _RADIUS), wp.quat_identity()),
         mass=_MASS,
@@ -1076,21 +1075,23 @@ def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
         lock_inertia=True,
     )
     builder.add_shape_sphere(sphere, radius=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
-    box = builder.add_link(
+    top = builder.add_link(
         xform=wp.transform((0.5, 0.0, _RADIUS + 1.0e-3), wp.quat_identity()),
         mass=_MASS,
-        inertia=box_inertia,
+        inertia=sphere_inertia,
         lock_inertia=True,
     )
-    box_shape = builder.add_shape_box(
-        box, hx=_RADIUS, hy=_RADIUS, hz=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0)
-    )
-    joint = builder.add_joint_prismatic(
-        -1, box, axis=newton.Axis.Z, parent_xform=wp.transform((0.5, 0.0, _RADIUS + 1.0e-3))
+    top_shape = builder.add_shape_sphere(top, radius=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+    joint = builder.add_joint_d6(
+        -1,
+        top,
+        linear_axes=[newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z)],
+        angular_axes=[newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z)],
+        parent_xform=wp.transform((0.5, 0.0, _RADIUS + 1.0e-3)),
     )
     builder.add_articulation([joint])
     model = builder.finalize()
-    set_torsion_radius(model, 0.01, shapes=[box_shape])
+    set_torsion_radius(model, 0.01, shapes=[top_shape])
     options = {
         "solve_mode": "matrix_free",
         "iterations": 32,
@@ -1107,12 +1108,15 @@ def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
     sphere_dof = int(model.joint_qd_start.numpy()[int(np.flatnonzero(model.joint_child.numpy() == sphere)[0])])
     qd[sphere_dof : sphere_dof + 3] = _ROLLING["linear"]
     qd[sphere_dof + 3 : sphere_dof + 6] = _ROLLING["angular"]
+    top_dof = int(model.joint_qd_start.numpy()[joint])
+    qd[top_dof + 1] = 6.0
     state_0.joint_qd.assign(qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     control = model.control()
     start = state_0.body_q.numpy()[sphere][:2].copy()
     shape_body = model.shape_body.numpy()
     seen = set()
+    torsion_impulse = 0.0
     for _ in range(int(seconds / _DT)):
         state_0.clear_forces()
         pipeline.collide(state_0, contacts)
@@ -1128,14 +1132,17 @@ def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
             }
             if slot < 0:
                 continue
-            if box in bodies and needed == 4:
+            if top in bodies and needed == 4:
                 test.assertEqual(types[slot + 3], PGS_CONSTRAINT_TYPE_TORSION)
                 seen.add("torsion")
+                torsion_impulse = max(torsion_impulse, abs(float(solver._propagation_impulses.numpy()[0, slot + 3])))
             elif sphere in bodies:
                 test.assertEqual(int(needed), 5)
                 test.assertEqual(types[slot + 3 : slot + 5].tolist(), [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * 2)
                 seen.add("rolling")
     test.assertEqual(seen, {"torsion", "rolling"})
+    test.assertGreater(torsion_impulse, 0.0)
+    test.assertLess(abs(float(state_0.joint_qd.numpy()[top_dof + 1])), 6.0)
     test.assertTrue(np.all(np.isfinite(state_0.body_qd.numpy())))
     return float(np.linalg.norm(state_0.body_q.numpy()[sphere][:2] - start))
 
