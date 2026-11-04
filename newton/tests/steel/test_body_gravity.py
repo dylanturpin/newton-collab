@@ -4,6 +4,7 @@
 """SolverSteel per-body gravity exclusion (``Model.body_disable_gravity``)."""
 
 import unittest
+from itertools import pairwise
 
 import numpy as np
 import warp as wp

@@ -799,6 +799,7 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
             ints(-1),
             floats(0.0, dtype=wp.transform),
             floats(0.0, dtype=wp.spatial_vector),
+            None,  # contact_surface_velocity
             ints(0),
             0,
             floats(0.5),
