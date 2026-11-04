@@ -10017,6 +10017,7 @@ class ModelBuilder:
                                 warnings.warn(
                                     f"Shape {shape} has more disconnected components than its convex hull budget of "
                                     f"{hull_budget}; merging the nearest hulls across the gaps.",
+                                    NewtonWarning,
                                     stacklevel=2,
                                 )
                                 vertex_limit = settings.get("max_ch_vertex", 0) if settings.get("decimate") else 0
