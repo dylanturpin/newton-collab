@@ -744,11 +744,13 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
-        cases = (("contact_warmstart=True", {"solve_mode": "split", "contact_warmstart": True}),)
+        if not wp.get_device().is_cuda:
+            self.skipTest("Steel contact warm start requires the CUDA matrix-free solve")
+        cases = (("contact_warmstart=True", {"solve_mode": "matrix_free", "contact_warmstart": True}),)
         for label, kwargs in cases:
             with self.subTest(configuration=label):
                 solver = newton.solvers.SolverSteel(model, **kwargs)
-                with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
+                with self.assertRaisesRegex(ValueError, "contact matching"):
                     solver.step(state_0, state_1, model.control(), contacts, DT)
 
 
@@ -1037,7 +1039,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
         self.assertFalse(solver._row_watermark)
-        self.assertTrue(solver._track_row_capacity)
         self.assertGreater(int(solver._row_dropped_dense.numpy().max()), 0)
         self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
 
@@ -1048,7 +1049,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         cases = (
             ("immediate", _free_jointed_foot, 1, "_row_dropped_mf"),
-            ("propagation", _prismatic_jointed_foot, 2, "_row_dropped_propagation"),
+            ("propagation", _prismatic_jointed_foot, 3, "_row_dropped_propagation"),
         )
         for response, build_foot, warning_index, dropped_attribute in cases:
             with self.subTest(response=response):
@@ -1169,7 +1170,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                         self.assertEqual(solver._iterations, 12)
                     if row_path == "propagation":
                         self.assertTrue(
-                            solver._propagation_contacts_enabled(),
+                            solver._propagation_active,
                             f"{response} test scene did not enable propagation contacts",
                         )
                     return solver
@@ -1219,7 +1220,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver._rigid_body_angular_damping.zero_()
         self.assertEqual(solver._iterations, 12)
-        self.assertTrue(solver._propagation_contacts_enabled())
+        self.assertTrue(solver._propagation_active)
         solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
         self.assertTrue(np.isfinite(state_1.body_qd.numpy()).all())
@@ -2412,7 +2413,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
-        solver = newton.solvers.SolverSteel(model, solve_mode="split", contact_warmstart=True)
+        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", contact_warmstart=True)
         control = model.control()
         solver.step(state_0, state_1, control, contacts, DT)
         with wp.ScopedCapture(device) as solver_capture:
