@@ -130,6 +130,10 @@ class TreeArgs:
     joint_child: wp.array(dtype=int)
     joint_qd_start: wp.array(dtype=int)
     joint_parent_slot: wp.array(dtype=int)
+    # depth-level joint order, read by the level-walk refresh variants
+    level_joint: wp.array(dtype=int)
+    level_offsets: wp.array(dtype=int)
+    level_art_start: wp.array(dtype=int)
     S_flat: wp.array2d(dtype=float)
     com_rel: wp.array2d(dtype=float)
     U: wp.array2d(dtype=float)
@@ -214,15 +218,15 @@ def get_fused_iteration_kernel(
     colored_native: Any,
     row_native: Any,
     gemv_native: Any | None,
-    tree_natives: tuple[tuple[Any, Any], ...],
+    tree_natives: tuple[tuple[Any, Any, bool], ...],
     has_phase3: bool,
     has_phase5: bool,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
     ``colored_native`` is the block-wide variant (built with ``block_threads`` equal to the launch's block
-    size). ``tree_natives`` holds ``(propagate, refresh)`` per tree variant, matching the ``slots`` launch
-    argument; ``gemv_native`` is ``None`` without cached responses. Launch it with
+    size). ``tree_natives`` holds ``(propagate, refresh, refresh_takes_levels)`` per tree variant,
+    matching the ``slots`` launch argument (a level-walk refresh also reads ``TreeArgs``' level order); ``gemv_native`` is ``None`` without cached responses. Launch it with
     ``wp.launch_tiled(dim=[world_count], block_dim=32 * warp_count(len(tree_natives)))``.
     """
     n_slots = len(tree_natives)
@@ -290,12 +294,21 @@ def get_fused_iteration_kernel(
                 if warp_id == 1 + s:
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
-                        wp.static(tree_natives[s][1])(
-                            slot.world_groups[k], slot.group_to_art, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start,
-                            tree.joint_parent, tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot,
-                            tree.S_flat, tree.com_rel, v_out, body_qd,
-                        )  # fmt: skip
+                        if wp.static(tree_natives[s][2]):
+                            wp.static(tree_natives[s][1])(
+                                slot.world_groups[k], slot.group_to_art, tree.art_to_world,
+                                tree.dense_contact_world_flag, force_refresh, tree.articulation_start,
+                                tree.joint_parent, tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot,
+                                tree.level_joint, tree.level_offsets, tree.level_art_start, tree.S_flat,
+                                tree.com_rel, v_out, body_qd,
+                            )  # fmt: skip
+                        else:
+                            wp.static(tree_natives[s][1])(
+                                slot.world_groups[k], slot.group_to_art, tree.art_to_world,
+                                tree.dense_contact_world_flag, force_refresh, tree.articulation_start,
+                                tree.joint_parent, tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot,
+                                tree.S_flat, tree.com_rel, v_out, body_qd,
+                            )  # fmt: skip
             if warp_id == wp.static(free_warp):
                 _free_refresh(world, lane, free, v_out, body_qd)
             _block_sync()
