@@ -15,9 +15,18 @@ import newton
 from newton.solvers import SolverSteel
 from newton.tests.steel.test_propagation import DT, _build_latency_scene
 
-# merged launch -> the launches it replaces; both are methods with the same signature
+
+def _clear_then_zero_moved(solver, mf_active, propagation_active, colored_contacts):
+    """The per-array clears plus the first-use memsets latency mode moves into the merged clear."""
+    solver._clear_step_row_state_per_array(mf_active, propagation_active, colored_contacts)
+    moved_ints, moved_floats = solver._moved_clear_arrays(mf_active, propagation_active, colored_contacts)
+    for array in moved_ints + moved_floats:
+        array.zero_()
+
+
+# merged launch -> the launches it replaces (a method name or a function), called with the same arguments
 _PAIRS = {
-    "_clear_step_row_state": "_clear_step_row_state_per_array",
+    "_clear_step_row_state": _clear_then_zero_moved,
     "_snapshot_stage3": "_snapshot_stage3_per_array",
     "_prescale_joint_velocities_warp": "_prescale_joint_velocities",
     "_allocate_velocity_limit_slots_warp": "_allocate_velocity_limit_slots",
@@ -97,6 +106,33 @@ def _long_chain_scene(device) -> newton.Model:
     return _with_tight_velocity_limits(builder.finalize(device=device))
 
 
+def _rigid_limit_scene(device) -> newton.Model:
+    """Falling free boxes with tight rigid-body velocity limits (matrix-free rows) next to a revolute arm."""
+    builder = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(builder)
+    link = builder.add_link()
+    builder.add_shape_capsule(link, radius=0.04, half_height=0.12)
+    joint = builder.add_joint_revolute(
+        parent=-1,
+        child=link,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.5, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
+    )
+    builder.add_articulation([joint])
+    for k in range(3):
+        box = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.06 + 0.15 * k), wp.quat_identity()),
+            custom_attributes={
+                "steel:rigid_body_max_linear_velocity": 0.05,
+                "steel:rigid_body_max_angular_velocity": 0.05,
+            },
+        )
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
 def _with_tight_velocity_limits(model: newton.Model) -> newton.Model:
     # tight velocity limits on the revolute arms so the PhysX prescale ratio drops below one
     limits = model.joint_velocity_limit.numpy()
@@ -136,7 +172,7 @@ class TestFusedSetup(unittest.TestCase):
 
         def make(fused_name, reference_name):
             fused = getattr(SolverSteel, fused_name)
-            reference = getattr(SolverSteel, reference_name)
+            reference = getattr(SolverSteel, reference_name) if isinstance(reference_name, str) else reference_name
 
             def compare(self_, *args):
                 objs = {"solver": self_, "args": args}
@@ -157,8 +193,21 @@ class TestFusedSetup(unittest.TestCase):
             return compare
 
         patches = [patch.object(SolverSteel, f, make(f, pairs[f])) for f in pairs]
+        skipped = [0]
+        zero_at_first_use = SolverSteel._zero_at_first_use
+
+        def check_skip(self_, *arrays):
+            # a memset latency mode skips would write nothing: the merged clear left the arrays zero
+            if self_._fused_setup_active():
+                for array in arrays:
+                    test.assertFalse(np.any(array.numpy()), "a skipped first-use memset had work")
+                skipped[0] += 1
+            zero_at_first_use(self_, *arrays)
+
+        patches.append(patch.object(SolverSteel, "_zero_at_first_use", check_skip))
         for p in patches:
             p.start()
+        max_mf_rows = 0
         try:
             pipeline = newton.CollisionPipeline(model, contact_matching="latest")
             contacts = pipeline.contacts()
@@ -168,13 +217,17 @@ class TestFusedSetup(unittest.TestCase):
                 pipeline.collide(state_0, contacts)
                 solver.step(state_0, state_1, control, contacts, DT)
                 state_0, state_1 = state_1, state_0
+                max_mf_rows = max(max_mf_rows, int(solver._mf_constraint_count.numpy().max()))
         finally:
             for p in patches:
                 p.stop()
+        if "_clear_step_row_state" in pairs:
+            self.assertGreater(skipped[0], 0, "no first-use memset was skipped")
         for name in pairs:
             self.assertGreater(compared[name], 0, f"{name} never ran")
             # the comparison covered real work: the launches changed the state they started from
             self.assertGreater(changed[name], 0, f"{name} never changed anything")
+        return max_mf_rows
 
     def test_merged_launches_match_per_pass_launches(self):
         self._run()
@@ -200,6 +253,13 @@ class TestFusedSetup(unittest.TestCase):
         for options in ({}, {"deterministic": True, "velocity_limit_activation_fraction": 0.5}):
             with self.subTest(**options):
                 self._run(_long_chain_scene("cuda:0"), pairs, articulation_constraint_max=512, **options)
+
+    def test_moved_clears_with_matrix_free_rows(self):
+        # rigid-body velocity limits put rows on the matrix-free family, whose rhs and inverse effective mass
+        # the merged clear zeros ahead of their first use
+        pairs = {name: _PAIRS[name] for name in ("_clear_step_row_state", "_update_qdd_and_integrate_joints")}
+        max_mf_rows = self._run(_rigid_limit_scene("cuda:0"), pairs)
+        self.assertGreater(max_mf_rows, 0, "the scene never built a matrix-free row")
 
     def test_velocity_limit_rows_skip_free_body_groups(self):
         # free bodies have no prismatic, revolute or D6 joint, so their size group never holds velocity-limit rows

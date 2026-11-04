@@ -470,11 +470,18 @@ def _clear_step_row_state(
     propagation_MiJt_a: wp.array[float],
     propagation_MiJt_b: wp.array[float],
     propagation_body_impulses: wp.array[float],
+    moved_int_0: wp.array[int],
+    moved_int_1: wp.array[int],
+    moved_int_2: wp.array[int],
+    moved_float_0: wp.array[float],
+    moved_float_1: wp.array[float],
     unbounded: int,
 ):
     """One launch for the row-build prologue's clears; every array is a flat view, empty when its family is off.
 
-    Writes the values the per-array memsets and fills write, so the result is bitwise the same.
+    Writes the values the per-array memsets and fills write, so the result is bitwise the same. The
+    ``moved_*`` arrays are zeroed later in the step by the per-pass path; see
+    ``SolverSteel._moved_clear_arrays``.
     """
     i = wp.tid()
     _fill_int(slot_counter, i, 0)
@@ -497,6 +504,11 @@ def _clear_step_row_state(
     _fill_float(propagation_MiJt_a, i, 0.0)
     _fill_float(propagation_MiJt_b, i, 0.0)
     _fill_float(propagation_body_impulses, i, 0.0)
+    _fill_int(moved_int_0, i, 0)
+    _fill_int(moved_int_1, i, 0)
+    _fill_int(moved_int_2, i, 0)
+    _fill_float(moved_float_0, i, 0.0)
+    _fill_float(moved_float_1, i, 0.0)
 
 
 @wp.kernel
@@ -9005,8 +9017,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
         with self._sync_timed("prop_setup_joint_split"):
             # The rows are built, so the split response can weight each joint by the row-bearing bodies it carries.
-            self._propagation_body_split_seen.zero_()
-            self._propagation_joint_split.zero_()
+            self._zero_at_first_use(self._propagation_body_split_seen, self._propagation_joint_split)
             wp.launch(
                 count_propagation_joint_split,
                 dim=self._world_count * self._propagation_max_constraints,
@@ -12260,7 +12271,31 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _clear_step_row_state_per_array(self, mf_active: bool, propagation_active: bool) -> None:
+    def _moved_clear_arrays(self, mf_active: bool, propagation_active: bool, colored_contacts: bool) -> list:
+        """Arrays the per-pass path zeros right before their first use later in the step, as (ints, floats).
+
+        Nothing reads or writes them between the row-build clear and those uses, so latency mode zeros them
+        in the merged clear instead and their own memsets (:meth:`_zero_at_first_use`) skip.
+        """
+        ints, floats = [], []
+        if colored_contacts:
+            ints.append(self._color_world_unit_cursor)  # collect_propagation_units
+        if propagation_active:
+            ints += [self._propagation_body_split_seen, self._propagation_joint_split]  # count_propagation_joint_split
+        if mf_active:
+            floats += [self._mf_rhs, self._mf_eff_mass_inv]  # compute_mf_effective_mass_and_rhs
+        return ints, floats
+
+    def _zero_at_first_use(self, *arrays: wp.array) -> None:
+        """Zero arrays before their first use this step, unless the merged row-build clear already did."""
+        if self._fused_setup_active():
+            return
+        for array in arrays:
+            array.zero_()
+
+    def _clear_step_row_state_per_array(
+        self, mf_active: bool, propagation_active: bool, colored_contacts: bool = False
+    ) -> None:
         """Clear the row-allocation state, counters and accumulators the row build starts from, array by array."""
         model = self.model
         if self._has_contact_target_velocity:
@@ -12302,8 +12337,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_body_count.zero_()
             self._propagation_body_seen.zero_()
 
-    def _clear_step_row_state(self, mf_active: bool, propagation_active: bool) -> None:
-        """Write what :meth:`_clear_step_row_state_per_array` writes in one launch."""
+    def _clear_step_row_state(self, mf_active: bool, propagation_active: bool, colored_contacts: bool) -> None:
+        """Write what :meth:`_clear_step_row_state_per_array` writes, and zero :meth:`_moved_clear_arrays`, in one launch."""
 
         def ints(array, active=True):
             return array.flatten() if active else self._empty_int
@@ -12334,6 +12369,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             floats(self._propagation_MiJt_b, propagation),
             floats(self._propagation_body_impulses, propagation),
         ]
+        moved_ints, moved_floats = self._moved_clear_arrays(mf_active, propagation_active, colored_contacts)
+        moved_ints += [None] * (3 - len(moved_ints))
+        moved_floats += [None] * (2 - len(moved_floats))
+        arrays += [ints(a, a is not None) for a in moved_ints] + [floats(a, a is not None) for a in moved_floats]
         wp.launch(
             _clear_step_row_state,
             dim=max(array.shape[0] for array in arrays),
@@ -12549,10 +12588,17 @@ class SolverSteel(SolverBase, CouplingInterface):
         max_constraints = self._articulation_constraint_max
         mf_active = self._has_free_rigid_bodies
         propagation_active = self._propagation_contacts_enabled()
+        colored_contacts = bool(
+            propagation_active
+            and self._propagation_colored
+            and contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+        )
         if self._fused_setup_active():
-            self._clear_step_row_state(mf_active, propagation_active)
+            self._clear_step_row_state(mf_active, propagation_active, colored_contacts)
         else:
-            self._clear_step_row_state_per_array(mf_active, propagation_active)
+            self._clear_step_row_state_per_array(mf_active, propagation_active, colored_contacts)
 
         has_free_rigid_flag = 1 if mf_active else 0
         propagation_flag = 1 if propagation_active else 0
@@ -13500,7 +13546,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 # per-world unit lists, color them, and rewrite contact_slot
                 # in color-sorted order so the row builder below writes every
                 # color segment into contiguous row memory.
-                self._color_world_unit_cursor.zero_()
+                self._zero_at_first_use(self._color_world_unit_cursor)
                 wp.launch(
                     collect_propagation_units,
                     dim=contacts.rigid_contact_max,
@@ -14693,8 +14739,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
 
         # Compute effective mass and RHS
-        self._mf_rhs.zero_()
-        self._mf_eff_mass_inv.zero_()
+        self._zero_at_first_use(self._mf_rhs, self._mf_eff_mass_inv)
         wp.launch(
             compute_mf_effective_mass_and_rhs,
             dim=self._world_count * self._free_body_constraint_max,
