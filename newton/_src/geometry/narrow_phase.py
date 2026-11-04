@@ -1450,6 +1450,8 @@ def create_narrow_phase_kernels_gjk_mpr_split(
 
     support_funcs = create_support_map_function(support_func, use_precomputed_center=True)
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
+    # Overlap refinement can run one pair per warp: a box against a detailed hull streams every hull triangle.
+    solve_mpr_refine = create_solve_mpr(support_func, _support_funcs=support_funcs, cooperative=True)
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
@@ -1613,7 +1615,14 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             num_work_items = num_distance
             if wp.static(refine_overlap):
                 num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
-            for work_index in range(tid, num_work_items, total_num_threads):
+            # One pair per warp when the queue fits (lane 0 writes the result), else one per thread so long
+            # queues of cheap pairs keep the grid's parallelism; every thread reads the same count.
+            lanes = int(1)
+            if wp.static(refine_overlap):
+                if num_work_items * 32 <= total_num_threads:
+                    lanes = 32
+            lane = tid % lanes
+            for work_index in range(tid // lanes, num_work_items, total_num_threads // lanes):
                 pair_index = gjk_work_items[work_index]
                 witnesses_valid = False
                 if wp.static(refine_overlap):
@@ -1639,6 +1648,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 if valid:
                     provider = provider_type()
                     provider.shape_support_data = shape_support_data
+                    provider.warp_cooperative = int(lanes == 32)
                     if query.type_a != GeoType.PLANE and query.type_b != GeoType.PLANE:
                         query.geom_a.bounds_half = _penetration_bounds_half(
                             query.shape_a,
@@ -1668,7 +1678,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                         seed = pending.point_a
                         if witnesses_valid:
                             seed = wp.vec3(0.0)
-                        point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr.refine_core)(
+                        point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr_refine.refine_core)(
                             query.geom_a,
                             query.geom_b,
                             query.relative_orientation_b,
@@ -1696,7 +1706,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                             0.0,
                             provider,
                         )
-                    if resolved and signed_distance <= query.contact_threshold:
+                    if resolved and signed_distance <= query.contact_threshold and lane == 0:
                         result = ConvexQueryResult()
                         result.point_a = point_a
                         result.point_b = point_b

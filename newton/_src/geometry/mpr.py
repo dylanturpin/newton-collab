@@ -162,7 +162,7 @@ def create_support_map_function(support_func: Any, use_precomputed_center: bool 
     return support_map_b, minkowski_support, geometric_center
 
 
-def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
+def create_solve_mpr(support_func: Any, _support_funcs: Any = None, cooperative: bool = False):
     """
     Factory function to create MPR solver with specific support and center functions.
 
@@ -172,6 +172,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             :func:`create_support_map_function`. When provided, these are reused
             instead of creating new ones, allowing multiple solvers to share
             compiled support code.
+        cooperative: Build ``refine_core`` for kernels that may refine one pair with all 32 lanes of a warp
+            (see :func:`~newton._src.geometry.penetration.create_solve_box_penetration`).
 
     Returns:
         ``solve_mpr`` wrapper function.  The core function is available as
@@ -212,7 +214,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             query_b.shape_index = -1
         return _minkowski_support(query_a, query_b, direction, rotation, position, extend, provider)
 
-    solve_sat = create_solve_box_penetration(certificate_support)
+    solve_sat = create_solve_box_penetration(certificate_support, cooperative=cooperative)
 
     @wp.func
     def portal_retry_seed(v0: Any, v1: Vert, v2: Vert, v3: Vert, normal: wp.vec3, seed: wp.vec3) -> wp.vec3:

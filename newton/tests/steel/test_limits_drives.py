@@ -2721,5 +2721,50 @@ def _arm_and_box_model():
     return builder.finalize()
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
+class TestSteelUnlimitedAxisRows(unittest.TestCase):
+    """Only finite limits below the builder's unlimited defaults create limit rows."""
+
+    def test_unlimited_axes_have_no_limit_rows(self):
+        # three revolute links: the root has a real position and velocity limit, the other two keep the builder's
+        # defaults (+-MAXVAL position bounds, a 1e6 velocity limit), which never get rows
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent, joints = -1, []
+        for i in range(3):
+            link = builder.add_link()
+            builder.add_shape_box(link, hx=0.1, hy=0.02, hz=0.02)
+            limits = {"limit_lower": -0.1, "limit_upper": 0.1, "velocity_limit": 0.25} if i == 0 else {}
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=link,
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    parent_xform=wp.transform(wp.vec3(0.2 * (i > 0), 0.0, 1.0 * (i == 0)), wp.quat_identity()),
+                    **limits,
+                )
+            )
+            parent = link
+        builder.add_articulation(joints)
+        builder.joint_q[0] = 0.2
+        model = builder.finalize(device="cuda:0")
+        lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        self.assertTrue(np.all(np.abs(lower[1:]) >= MAXVAL) and np.all(np.abs(upper[1:]) >= MAXVAL))
+        self.assertTrue(np.all(model.joint_velocity_limit.numpy()[1:] >= 1.0e6))
+        solver = SolverSteel(
+            model,
+            enable_joint_limits=True,
+            enable_joint_velocity_limits=True,
+            articulation_constraint_max=32,
+        )
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+        count = int(solver._constraint_count.numpy()[0])
+        types = solver._row_type.numpy()[0, :count]
+        # the root's lower/upper pair of each family (the infinite default activation gap keeps both sides)
+        self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 2)
+        self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

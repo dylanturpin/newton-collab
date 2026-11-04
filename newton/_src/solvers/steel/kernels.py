@@ -17,6 +17,7 @@ from functools import cache
 
 import warp as wp
 
+from ...core.types import MAXVAL
 from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
@@ -39,6 +40,8 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
+# The builder's default joint velocity limit [rad/s or m/s]; at or above it a DOF has no limit rows.
+JOINT_VELOCITY_LIMIT_UNSET = 1.0e6
 # Mimic (joint coupling) row: the bilateral equality
 # ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
 # same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
@@ -2847,14 +2850,14 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.isfinite(lower) and q <= lower + activation_gap:
+            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.isfinite(upper) and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:
@@ -4144,11 +4147,11 @@ def build_joint_limit_rows_for_size(
             for side in range(2):
                 sign = 1.0
                 phi = q_val - lower
-                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
+                active = wp.abs(lower) < MAXVAL and q_val <= lower + joint_limit_activation_gap
                 if side == 1:
                     sign = -1.0
                     phi = upper - q_val
-                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
+                    active = wp.abs(upper) < MAXVAL and q_val >= upper - joint_limit_activation_gap
                 if not active:
                     continue
 
@@ -4977,7 +4980,7 @@ def allocate_joint_velocity_limit_slots(
     """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
 
     For each non-locked DOF of a PRISMATIC / REVOLUTE / D6 joint
-    with ``joint_velocity_limit[i] > 0``, two slots are reserved in the
+    with ``0 < joint_velocity_limit[i] < JOINT_VELOCITY_LIMIT_UNSET``, two slots are reserved in the
     per-world counter. The sign encodes which side of the bilateral box
     ``[-qdot_max, +qdot_max]`` each row enforces:
 
@@ -5044,10 +5047,8 @@ def allocate_joint_velocity_limit_slots(
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
 
-            # Guard against degenerate limits. PhysX pins ``recipResponse``
-            # off for ``unitResponse <= 0``; here we drop the row entirely if
-            # the stored limit is non-positive (treated as "unlimited").
-            if qdot_max <= 0.0:
+            # Non-positive limits and the builder default are "unlimited": no rows.
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             # Fused path: driven DOFs are clamped at the end of each iteration.
@@ -5137,7 +5138,7 @@ def populate_joint_velocity_limit_J_for_size(
         for axis in range(axis_count):
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0:
+            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
                 continue
 
             local_dof = dof - dof_start

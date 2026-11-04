@@ -1529,6 +1529,8 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         )
         calls = []
         in_velocity_pass = {"on": False}
+        # observe the per-pass launches; latency mode runs the same loop as one kernel (TestLatencyFusedLoop)
+        solver._latency_fused = False
         launch = solver._launch_matrix_free_gs_solve
         post = solver._run_matrix_free_velocity_post_solve
 
