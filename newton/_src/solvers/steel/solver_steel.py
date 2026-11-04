@@ -1371,19 +1371,36 @@ def _velocity_drive_mode(name: str, value) -> str:
     return value
 
 
+_DEPRECATED_SOLVE_MODE_SPELLINGS = {
+    "matrix_free": "solve_mode='matrix_free' is deprecated in Newton 1.8; use solve_mode='serial' (the default)",
+    "split": (
+        "solve_mode='split' is deprecated in Newton 1.8 and now runs solve_mode='serial': the dense split solve "
+        "was removed, so results differ from earlier releases; omit solve_mode"
+    ),
+}
+
+
+def _normalize_solve_mode(solve_mode, articulated_contact_response) -> tuple[str, str]:
+    """Map the pre-1.8 spellings onto ``(solve_mode, articulated_contact_response)``, warning for each one used."""
+    message = _DEPRECATED_SOLVE_MODE_SPELLINGS.get(solve_mode)
+    if message is not None:
+        warnings.warn(f"SolverSteel: {message}.", DeprecationWarning, stacklevel=3)
+        solve_mode = "serial"
+    if articulated_contact_response == "propagation_colored":
+        warnings.warn(
+            "SolverSteel: articulated_contact_response='propagation_colored' is deprecated in Newton 1.8; use "
+            "solve_mode='colored' with articulated_contact_response='propagation'.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        solve_mode, articulated_contact_response = "colored", "propagation"
+    return solve_mode, articulated_contact_response
+
+
 def _validate_solve_mode(solve_mode, articulated_contact_response) -> None:
     """Raise :class:`ValueError` unless the solve mode and contact response form a supported pair."""
-    if solve_mode == "split":
-        raise ValueError("solve_mode='split' was removed; use the default solve_mode='serial'")
-    if solve_mode == "matrix_free":
-        raise ValueError("solve_mode='matrix_free' was renamed; use solve_mode='serial'")
     if solve_mode not in ("serial", "colored"):
         raise ValueError(f"solve_mode must be 'serial' or 'colored', got {solve_mode!r}")
-    if articulated_contact_response == "propagation_colored":
-        raise ValueError(
-            "articulated_contact_response='propagation_colored' was removed; use solve_mode='colored' "
-            "with articulated_contact_response='propagation'"
-        )
     if articulated_contact_response not in ("immediate", "propagation"):
         raise ValueError(
             f"articulated_contact_response must be 'immediate' or 'propagation', got {articulated_contact_response!r}"
@@ -2048,6 +2065,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Construction raises ``ValueError`` unless ``articulated_contact_response`` is ``"immediate"``
                 or ``solve_mode`` is ``"colored"``, the model has at least one articulation and no particles, and
                 warmstarting, contact compliance and velocity post-passes (``velocity_iterations``) are off.
+                Sleeping with ``solve_mode="colored"`` requires CUDA and raises ``NotImplementedError`` on CPU.
                 With ``solve_mode="colored"`` and ``sleep_skip_constraints``, sleeping islands' contacts are left out of
                 the coloring and the colored sweep; a step that overflows the propagation rows keeps that world awake.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
@@ -2424,6 +2442,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 torsion, torsional/rolling and free-rigid angular friction, compliance,
                 ``nesterov_momentum``, non-default ``friction_mode``, joint friction) raise
                 :class:`NotImplementedError` there. Defaults to ``"serial"``.
+
+                .. deprecated:: 1.8
+                    ``"matrix_free"`` maps to ``"serial"`` and ``"split"`` (the removed dense solve) runs
+                    ``"serial"``, each with a :class:`DeprecationWarning`.
             articulated_contact_response (str, optional): Contact response for articulated rows.
                 ``"immediate"`` is the existing D-wide row path. ``"propagation"`` routes contacts
                 touching non-free articulations to fixed-size body-space rows, computes body response
@@ -2432,6 +2454,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 included) on the propagation family — the row math is identical for free bodies
                 (spatial inverse inertia response), only the scheduling changes. Velocity-limit rows
                 stay on the matrix-free family with either response. Defaults to ``"immediate"``.
+
+                .. deprecated:: 1.8
+                    ``"propagation_colored"`` maps to ``solve_mode="colored"`` with ``"propagation"`` and
+                    emits a :class:`DeprecationWarning`.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -2556,6 +2582,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        solve_mode, articulated_contact_response = _normalize_solve_mode(solve_mode, articulated_contact_response)
         _validate_solve_mode(solve_mode, articulated_contact_response)
         if contact_compliance:
             _contact_compliance.validate_configuration(

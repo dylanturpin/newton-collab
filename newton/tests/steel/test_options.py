@@ -458,23 +458,29 @@ class TestSteelPrivateApiUpstream(unittest.TestCase):
 @unittest.skipUnless(wp.is_cuda_available(), "SolverSteel requires CUDA")
 class TestSteelSolveModeOptions(unittest.TestCase):
     def test_solve_mode_and_response_spellings(self):
-        """Reject removed spellings with a pointer to the new one and expose the validated pair."""
+        """Map the deprecated spellings with a warning, reject an unsupported pair and expose the normalized pair."""
         model = _floor_model("cuda:0", "static")
-        removed = (
-            ({"solve_mode": "split"}, "solve_mode='serial'"),
-            ({"solve_mode": "matrix_free"}, "solve_mode='serial'"),
+        deprecated = (
+            ({"solve_mode": "split"}, "solve_mode='serial'", ("serial", "immediate")),
+            ({"solve_mode": "matrix_free"}, "solve_mode='serial'", ("serial", "immediate")),
             (
                 {"articulated_contact_response": "propagation_colored"},
                 "solve_mode='colored' with articulated_contact_response='propagation'",
+                ("colored", "propagation"),
             ),
             (
-                {"solve_mode": "colored", "articulated_contact_response": "immediate"},
-                "requires articulated_contact_response='propagation'",
+                {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
+                "solve_mode='serial'",
+                ("serial", "propagation"),
             ),
         )
-        for kwargs, message in removed:
-            with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, re.escape(message)):
-                SolverSteel(model, **kwargs)
+        for kwargs, message, expected in deprecated:
+            with self.subTest(**kwargs), self.assertWarnsRegex(DeprecationWarning, re.escape(message)):
+                solver = SolverSteel(model, **kwargs)
+            self.assertEqual((solver.solve_mode, solver.articulated_contact_response), expected)
+
+        with self.assertRaisesRegex(ValueError, re.escape("requires articulated_contact_response='propagation'")):
+            SolverSteel(model, solve_mode="colored", articulated_contact_response="immediate")
 
         solver = SolverSteel(model)
         self.assertEqual(solver.solve_mode, "serial")
@@ -482,6 +488,12 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
         self.assertEqual(solver.solve_mode, "colored")
         self.assertEqual(solver.articulated_contact_response, "propagation")
+
+    def test_colored_sleeping_requires_cuda(self):
+        """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
+        model = _floor_model("cpu", "static")
+        with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
+            SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
 
 
 if __name__ == "__main__":

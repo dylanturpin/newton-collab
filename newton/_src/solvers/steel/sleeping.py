@@ -18,6 +18,11 @@ class _SleepState:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("Sleeping thresholds and quiet time must be finite and positive")
         model = solver.model
+        if solver._solve_mode == "colored" and not solver._propagation_colored:
+            raise NotImplementedError(
+                "Experimental sleeping with solve_mode='colored' requires CUDA: on CPU the colored mode runs the "
+                "serial propagation sweep, which sleeping does not support"
+            )
         if (
             model.requires_grad
             or model.particle_count

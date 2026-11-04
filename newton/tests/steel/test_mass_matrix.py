@@ -1429,7 +1429,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Refresh the effective armature and its size groups exactly as a host rebuild would."""
         device = wp.get_device()
         model = _build_model_notify_device(device)
-        options = {"enable_joint_friction": True}
+        options = {"enable_joint_friction": True} if device.is_cuda else {}
         solver = SolverSteel(model, **options)
         rng = np.random.default_rng(0)
         model.joint_armature.assign(rng.uniform(0.0, 0.5, model.joint_dof_count).astype(np.float32))
