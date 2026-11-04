@@ -125,7 +125,7 @@ class TabletopDemo:
             self.model,
             solve_mode="matrix_free",
             articulated_contact_response=args.contact_response,
-            deterministic=deterministic,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else wp.DeterministicMode.NOT_GUARANTEED,
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
