@@ -21,9 +21,9 @@ directly from ``newton._src.geometry.utils`` — consistent with how
 
 from __future__ import annotations
 
+import itertools
 import unittest
 import warnings
-from unittest.mock import patch
 
 import numpy as np
 
@@ -44,21 +44,29 @@ def _assert_mesh_shape(test: unittest.TestCase, verts: np.ndarray, faces: np.nda
     test.assertTrue(np.all(faces < verts.shape[0]))
 
 
-def _has_outward_winding(verts: np.ndarray, faces: np.ndarray) -> bool:
-    """Return True if every triangle's normal points away from the mesh centroid.
+def _signed_volume(verts: np.ndarray, faces: np.ndarray) -> float:
+    """Return the divergence-theorem volume enclosed by the triangles, positive when they wind outward."""
+    v = verts.astype(np.float64)
+    v -= v.mean(axis=0)
+    return float(np.einsum("ij,ij->i", v[faces[:, 0]], np.cross(v[faces[:, 1]], v[faces[:, 2]])).sum() / 6.0)
 
-    Uses the same criterion the implementation uses to flip windings. Triangles
-    with zero-area normals are ignored (they're degenerate but not wrongly wound).
-    """
-    centre = verts.mean(axis=0)
-    for tri in faces:
-        a, b, c = verts[tri]
-        normal = np.cross(b - a, c - a)
-        if np.linalg.norm(normal) < 1e-12:
-            continue
-        if np.dot(normal, a - centre) < 0:
-            return False
-    return True
+
+def _assert_closed_outward_hull(test: unittest.TestCase, verts: np.ndarray, faces: np.ndarray) -> None:
+    """Assert faces point outward, edges pair up as a closed manifold, and the volume matches Qhull's."""
+    from scipy.spatial import ConvexHull
+
+    np.testing.assert_array_equal(np.unique(faces), np.arange(verts.shape[0]))
+    v = verts.astype(np.float64)
+    a, b, c = v[faces[:, 0]], v[faces[:, 1]], v[faces[:, 2]]
+    normal = np.cross(b - a, c - a)
+    # The mean of a full-rank hull's vertices lies strictly inside it.
+    alignment = np.einsum("ij,ij->i", normal, a - v.mean(axis=0))
+    test.assertTrue(np.all(alignment > 0.0), "a face points inward")
+    edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    test.assertEqual(np.unique(edges, axis=0).shape[0], edges.shape[0], "a directed edge appears twice")
+    np.testing.assert_array_equal(np.unique(edges, axis=0), np.unique(edges[:, ::-1], axis=0))
+    test.assertGreater(_signed_volume(verts, faces), 0.0)
+    np.testing.assert_allclose(_signed_volume(verts, faces), ConvexHull(v).volume, rtol=1e-6)
 
 
 class TestRemeshConvexHullFull3D(unittest.TestCase):
@@ -85,7 +93,7 @@ class TestRemeshConvexHullFull3D(unittest.TestCase):
         # A cube's convex hull: 8 unique corner vertices, 12 triangles.
         self.assertEqual(verts.shape[0], 8)
         self.assertEqual(faces.shape[0], 12)
-        self.assertTrue(_has_outward_winding(verts, faces), "cube must have outward-facing normals")
+        _assert_closed_outward_hull(self, verts, faces)
 
         # Every returned vertex must be one of the inputs.
         for v in verts:
@@ -107,7 +115,7 @@ class TestRemeshConvexHullFull3D(unittest.TestCase):
         _assert_mesh_shape(self, verts, faces)
         self.assertEqual(verts.shape[0], 4)
         self.assertEqual(faces.shape[0], 4)
-        self.assertTrue(_has_outward_winding(verts, faces))
+        _assert_closed_outward_hull(self, verts, faces)
 
     def test_interior_points_are_trimmed(self):
         # Cube corners plus an interior point. The interior point must be
@@ -145,51 +153,38 @@ class TestRemeshConvexHullFull3D(unittest.TestCase):
 
         self.assertGreater(verts_unlimited.shape[0], 16)
         self.assertLessEqual(verts_limited.shape[0], 16)
-        self.assertTrue(_has_outward_winding(verts_limited, faces_limited))
+        _assert_closed_outward_hull(self, verts_limited, faces_limited)
 
-    def test_matches_per_face_reference(self):
-        """Faces and vertices equal a per-face scalar ``np.dot`` winding of the same Qhull hull, bit for bit."""
-        from scipy.spatial import ConvexHull
+    def test_capped_cube_is_closed_and_outward(self):
+        """Verify that a cube capped below its 8 corners still yields a closed, outward hull of the right volume."""
+        cube = np.array(list(itertools.product((0.0, 1.0), repeat=3)))
+        for offset in (0.0, -0.5, 10.0):
+            for maxhullvert in (4, 5, 6, 7, 0):
+                verts, faces = remesh_convex_hull(cube + offset, maxhullvert=maxhullvert)
+                _assert_mesh_shape(self, verts, faces)
+                _assert_closed_outward_hull(self, verts, faces)
+        verts, faces = remesh_convex_hull(cube, maxhullvert=4)
+        self.assertEqual(verts.shape[0], 4)
+        self.assertAlmostEqual(_signed_volume(verts, faces), 1.0 / 6.0, places=6)
 
+    def test_random_clouds_are_closed_and_outward(self):
+        """Verify that capped and uncapped hulls of random clouds are closed, outward and of the right volume."""
         rng = np.random.default_rng(7)
-        clouds = []
         for trial in range(60):
             pts = rng.standard_normal((int(rng.integers(4, 300)), 3)) * rng.uniform(1e-3, 1e3, 3)
-            clouds.append((pts, {"maxhullvert": (0, 16, 64)[trial % 3]}))
-        # Rotated near-flat clouds put face normals almost orthogonal to the centroid offset, where the
-        # summation order of the dot product decides the sign; generator 262 cloud 53 flips with eps=1e-12.
-        thin_rng = np.random.default_rng(262)
-        for _ in range(120):
-            pts = thin_rng.normal(size=(int(thin_rng.integers(4, 80)), 3))
-            pts[:, 2] *= 10 ** thin_rng.uniform(-7, -3)
-            rotation, _ = np.linalg.qr(thin_rng.normal(size=(3, 3)))
-            pts = (pts @ rotation).astype(np.float32)
-            clouds += [(pts, {}), (pts, {"eps": 1e-12})]
-        hulls = []
-
-        class RecordingHull(ConvexHull):
-            def __init__(self, points, *args, **kw):
-                super().__init__(points, *args, **kw)
-                hulls.append((np.asarray(points), self))
-
-        for pts, kwargs in clouds:
-            hulls.clear()
-            with patch("scipy.spatial.ConvexHull", RecordingHull):
-                verts, faces = remesh_convex_hull(pts, **kwargs)
-            points, hull = hulls[-1]
-            if points.shape[1] != 3:
-                continue
-            ref_verts = points.astype(np.float32)
-            ref_faces = hull.simplices.astype(np.int32)
-            centre = ref_verts.mean(0)
-            for i, tri in enumerate(ref_faces):
-                a, b, c = ref_verts[tri]
-                if np.dot(np.cross(b - a, c - a), a - centre) < 0:
-                    ref_faces[i] = tri[[0, 2, 1]]
-            used = np.unique(ref_faces)
-            np.testing.assert_array_equal(verts, ref_verts[used])
-            np.testing.assert_array_equal(faces, np.searchsorted(used, ref_faces).astype(np.int32))
-            self.assertEqual(faces.dtype, np.int32)
+            pts += rng.uniform(-1e3, 1e3, 3)
+            maxhullvert = (0, 4, 5, 8, 16, 64)[trial % 6]
+            verts, faces = remesh_convex_hull(pts, maxhullvert=maxhullvert)
+            _assert_mesh_shape(self, verts, faces)
+            _assert_closed_outward_hull(self, verts, faces)
+        # Rotated slabs with a tight eps give faces almost orthogonal to the slab's offset from its centre.
+        for trial in range(20):
+            pts = rng.normal(size=(int(rng.integers(4, 80)), 3))
+            pts[:, 2] *= 10 ** rng.uniform(-3, -1)
+            rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+            verts, faces = remesh_convex_hull(pts @ rotation, maxhullvert=(0, 6)[trial % 2], eps=1e-12)
+            _assert_mesh_shape(self, verts, faces)
+            _assert_closed_outward_hull(self, verts, faces)
 
 
 class TestRemeshConvexHullDegenerate(unittest.TestCase):

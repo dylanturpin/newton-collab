@@ -1,9 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Solve the tangential friction block at a fixed normal load."""
+"""Coulomb friction helpers: the contact tangent basis and the coupled tangent-pair solve.
+
+:func:`friction_pair_candidate` (Warp, used by the CPU kernels) and ``FRICTION_PAIR_CUDA`` (a
+CUDA snippet spliced into the native Gauss-Seidel kernels) implement the same solve. It
+minimizes the two-tangent quadratic of one contact on the Coulomb disk of the current
+normal impulse: sticking uses the block inverse, sliding solves ``(A + alpha I) x = b`` with
+``|x| = radius`` by safeguarded Newton with a bisection fallback, and feasible sliding
+impulses that already satisfy the KKT conditions to a relative accuracy of 2e-7 are kept
+to avoid round-off cycles.
+"""
 
 import warp as wp
+
+
+@wp.func
+def contact_tangent_basis(n: wp.vec3):
+    """Return the deterministic tangent pair every Steel friction row uses for ``n``."""
+    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
+    if wp.length_sq(tangent0) < 1.0e-12:
+        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
+    tangent0 = wp.normalize(tangent0)
+    tangent1 = wp.normalize(wp.cross(n, tangent0))
+    return tangent0, tangent1
 
 
 @wp.func
@@ -218,7 +238,7 @@ FRICTION_PAIR_CUDA = """
 _COUPLED_CONTACT_HEAD = """
     // One contact's normal and sliding pair solved together on its 3x3 Delassus block G, from the
     // velocities u (impulses old included), the normal target velocity, and the coefficient mu.
-    const auto contact_block_solve = [](
+    const auto contact_block_solve = [&](
         float u_n, float u_t1, float u_t2,
         float G_nn, float G_nt1, float G_nt2, float G_t1t1, float G_t1t2, float G_t2t2,
         float target_vel_n, float mu, float old_lambda_n, float old_lambda_t1, float old_lambda_t2,
@@ -226,8 +246,26 @@ _COUPLED_CONTACT_HEAD = """
         new_lambda_n = old_lambda_n;
         new_lambda_t1 = old_lambda_t1;
         new_lambda_t2 = old_lambda_t2;
+        // A singular block (a link with fewer than two tangential mobilities) keeps the normal
+        // impulse its contact row just solved and takes the fixed_normal pair on that disk.
+        // Rounding leaves a locked tangent a tiny response, so the test is relative to the trace.
+        const auto fixed_normal_pair = [&]() {
+            const float radius = fmaxf(mu * old_lambda_n, 0.0f);
+            const float2 pair = friction_pair_candidate(
+                G_t1t1, G_t1t2, G_t2t2, u_t1, u_t2, old_lambda_t1, old_lambda_t2, radius, 1.0f);
+            const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
+            const float scale = mag > radius ? radius / mag : 1.0f;
+            new_lambda_t1 = pair.x * scale;
+            new_lambda_t2 = pair.y * scale;
+        };
+        const float tangent_trace = G_t1t1 + G_t2t2;
+        if (G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2 <= 1.0e-6f * tangent_trace * tangent_trace) {
+            fixed_normal_pair();
+            return;
+        }
 """
 
+# Repeats the arithmetic of _MF_BISECTION_FRICTION_SOURCE in solver_steel.py; change both together.
 _COUPLED_CONTACT_BISECTION = """
         if (G_nn < 1.0e-20f) return;
         // At zero load the cone also zeroes the sliding pair.
@@ -291,6 +329,7 @@ _COUPLED_CONTACT_BISECTION = """
     };
 """
 
+# Repeats the arithmetic of _MF_COULOMB_NEWTON_FRICTION_SOURCE in solver_steel.py; change both together.
 _COUPLED_CONTACT_COULOMB_NEWTON = """
         if (G_nn < 1.0e-20f) return;
         float u_free_n = u_n - (G_nn * old_lambda_n + G_nt1 * old_lambda_t1 + G_nt2 * old_lambda_t2);
@@ -312,6 +351,10 @@ _COUPLED_CONTACT_COULOMB_NEWTON = """
         float AT01 = G_t1t2 - (wNT0 * wNT1) / WN;
         float AT10 = G_t1t2 - (wNT1 * wNT0) / WN;
         float AT11 = G_t2t2 - (wNT1 * wNT1) / WN;
+        if (AT00 * AT11 - AT01 * AT10 <= 1.0e-6f * tangent_trace * tangent_trace) {
+            fixed_normal_pair();
+            return;
+        }
         float cT0 = bT0 - (bN / WN) * wNT0;
         float cT1 = bT1 - (bN / WN) * wNT1;
         float inv_det0 = 1.0f / (AT00 * AT11 - AT01 * AT10);
@@ -368,6 +411,14 @@ _COUPLED_CONTACT_COULOMB_NEWTON = """
         new_lambda_n = -(wNT0 * rT0 + wNT1 * rT1 + bN) / WN;
         new_lambda_t1 = rT0;
         new_lambda_t2 = rT1;
+        // The root search stops within a tolerance and leaves a residual tangent at mu = 0.
+        const float flimit = fmaxf(mu * new_lambda_n, 0.0f);
+        const float tmag = sqrtf(new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2);
+        if (tmag > flimit) {
+            const float sc = flimit / tmag;
+            new_lambda_t1 *= sc;
+            new_lambda_t2 *= sc;
+        }
     };
 """
 

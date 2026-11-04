@@ -1,15 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Helpers shared by the SolverSteel test modules."""
+"""Scenes, solver settings and helpers shared by the SolverSteel test modules."""
 
-from __future__ import annotations
-
-import contextlib
-import os
-import unittest
+import warnings
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -19,8 +14,58 @@ from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.friction_patches import (
     _FrictionPatchState,
 )
+from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
+)
 from newton._src.solvers.steel.solver_steel import _get_pgs_solve_propagation_colored_block_kernel
 from newton.solvers import SolverBase, SolverSteel
+
+CONTACT_MAX = 8192
+
+
+def _heap(device, nx=6, ny=6, nz=3, pitch=0.042, half=0.02, kinematic_tray=False):
+    """A dense heap of touching boxes on the ground, optionally on one kinematic tray."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.rigid_gap = 0.002
+    builder.add_ground_plane()
+    if kinematic_tray:
+        # Every box of the bottom layer rests on the tray, a hub of their contact units.
+        tray = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.01), wp.quat_identity()), is_kinematic=True)
+        builder.add_shape_box(tray, hx=nx * pitch, hy=ny * pitch, hz=0.01)
+    z0 = 0.04 if kinematic_tray else 0.021
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                body = builder.add_body(
+                    xform=wp.transform(
+                        wp.vec3((ix - nx / 2) * pitch, (iy - ny / 2) * pitch, z0 + iz * (2 * half + 0.001)),
+                        wp.quat_identity(),
+                    )
+                )
+                builder.add_shape_box(body, hx=half, hy=half, hz=half)
+    model = builder.finalize(device=device)
+    # Sizes the solver's contact scratch, so it is set before the solver is built.
+    model.rigid_contact_max = CONTACT_MAX
+    return model
+
+
+def _parent_wrench_scene(device):
+    """Two free boxes resting on the ground, each carrying a smaller box welded on top."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for x in (0.0, 0.5):
+        base = builder.add_link(xform=wp.transform(wp.vec3(x, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1)
+        top = builder.add_link(xform=wp.transform(wp.vec3(x, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_box(top, hx=0.05, hy=0.05, hz=0.05)
+        free = builder.add_joint_free(base)
+        weld = builder.add_joint_fixed(
+            base, top, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.15), wp.quat_identity())
+        )
+        builder.add_articulation([free, weld])
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    return model, pipeline
 
 
 def _build_four_bar():
@@ -98,28 +143,73 @@ def _loop_anchor_gap(model, state) -> float:
     return float(np.linalg.norm(anchor(int(jp[j]), Xp[j]) - anchor(int(jc[j]), Xc[j])))
 
 
-def make_fixture(
+_CHILD_ANCHORS = ((0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (0.0, 0.05, 0.0))
+
+
+_REL_P = np.array([0.0, 0.0, -0.2])
+
+
+def _build_carried_load(*, enabled: bool = True, world_parent: bool = False):
+    """A kinematic carrier holding a dynamic box through three BALL loop joints.
+
+    Three non-collinear point closures pin all six relative degrees of freedom, so the
+    load must follow the carrier as if welded at ``_REL_P`` below it. With
+    ``world_parent`` the carrier is the world and the anchors are world points.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    carrier_p = np.array([0.0, 0.0, 1.0])
+    carrier = -1
+    if not world_parent:
+        carrier = b.add_body(xform=wp.transform(wp.vec3(*carrier_p), wp.quat_identity()), is_kinematic=True)
+        b.add_shape_box(carrier, hx=0.03, hy=0.03, hz=0.03)
+    load = b.add_body(xform=wp.transform(wp.vec3(*(carrier_p + _REL_P)), wp.quat_identity()))
+    b.add_shape_box(load, hx=0.04, hy=0.04, hz=0.04, cfg=newton.ModelBuilder.ShapeConfig(density=500.0))
+    joints = []
+    # The closures intentionally parallel the load's free joint and each other.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=r".*another joint already connects these bodies", category=UserWarning
+        )
+        for c in _CHILD_ANCHORS:
+            p = (_REL_P if not world_parent else carrier_p + _REL_P) + np.array(c)
+            joints.append(
+                b.add_joint_ball(
+                    parent=carrier,
+                    child=load,
+                    parent_xform=wp.transform(wp.vec3(*p), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(*c), wp.quat_identity()),
+                    enabled=enabled,
+                )
+            )
+    return b, carrier, load, joints
+
+
+def run_fixture(
     *,
+    device,
     articulated,
     enabled,
+    steps=200,
+    dt=0.005,
     iterations=8,
     stock=False,
+    lateral_force=0.0,
+    friction_scale=1.0,
+    stiffness=3000.0,
     height=0.05,
     kinematic=False,
-    world_count=1,
+    restitution=0.0,
     solver_options=None,
 ):
-    """Build actual Newton sphere/plane contacts, one sphere per world."""
-    device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
+    """Run sphere/plane contacts with prescribed material arrays, one physical step per tick."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.rigid_gap = 0.005
-        if world_count == 1:
-            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
         xform = wp.transform(wp.vec3(0, 0, height), wp.quat_identity())
         if articulated:
             body = builder.add_link(xform=xform)
-            if solver_options and solver_options.pop("_d6", False):
+            if lateral_force:
                 joint = builder.add_joint_d6(
                     parent=-1,
                     child=body,
@@ -135,35 +225,26 @@ def make_fixture(
         else:
             body = builder.add_body(xform=xform)
         builder.add_shape_sphere(
-            body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5)
+            body,
+            radius=0.05,
+            cfg=newton.ModelBuilder.ShapeConfig(
+                density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5, restitution=restitution
+            ),
         )
-        if world_count == 1:
-            model = builder.finalize()
-        else:
-            scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
-            scene.rigid_gap = 0.005
-            scene.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
-            scene.replicate(builder, world_count)
-            model = scene.finalize()
-        bodies = [body + world * builder.body_count for world in range(world_count)]
+        model = builder.finalize()
         if kinematic:
             flags = model.body_flags.numpy()
-            flags[bodies] |= int(newton.BodyFlags.KINEMATIC)
+            flags[body] |= int(newton.BodyFlags.KINEMATIC)
             model.body_flags.assign(flags)
-        capacity = 32 * world_count
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=capacity)
-        model.rigid_contact_max = capacity
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+        model.rigid_contact_max = 32
         contacts = pipeline.contacts()
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
-            setattr(contacts, name, wp.zeros(capacity, dtype=float))
+            setattr(contacts, name, wp.zeros(32, dtype=float))
         extra = {} if stock else {"contact_compliance": enabled}
         options = dict(
             # Isolate the normal material law from positional patch friction.
             friction_anchor_beta=0.0,
-            solve_mode="matrix_free",
-            row_schedule="interleaved",
-            articulated_contact_response="immediate",
-            enable_restitution=False,
             iterations=iterations,
             velocity_iterations=0,
             articulation_constraint_max=32,
@@ -172,48 +253,7 @@ def make_fixture(
             **extra,
         )
         options.update(solver_options or {})
-        solver = SolverSteel(model, **options)
-        return SimpleNamespace(
-            model=model, pipeline=pipeline, contacts=contacts, solver=solver, body=body, bodies=bodies, device=device
-        )
-
-
-def run_fixture(
-    *,
-    articulated,
-    enabled,
-    steps=200,
-    dt=0.005,
-    iterations=8,
-    stock=False,
-    lateral_force=0.0,
-    friction_scale=1.0,
-    stiffness=3000.0,
-    height=0.05,
-    kinematic=False,
-    solver_options=None,
-):
-    """Run actual Newton sphere/plane contacts through one physical step per tick."""
-    options = dict(solver_options or {})
-    if lateral_force:
-        options["_d6"] = True
-    fixture = make_fixture(
-        articulated=articulated,
-        enabled=enabled,
-        iterations=iterations,
-        stock=stock,
-        height=height,
-        kinematic=kinematic,
-        solver_options=options,
-    )
-    model, pipeline, contacts, solver, body = (
-        fixture.model,
-        fixture.pipeline,
-        fixture.contacts,
-        fixture.solver,
-        fixture.body,
-    )
-    with wp.ScopedDevice(fixture.device):
+        solver = SolverSteel(model, solve_mode="matrix_free", **options)
         state, next_state = model.state(), model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         trace = []
@@ -235,8 +275,273 @@ def run_fixture(
         return np.asarray(trace), seen_paths, solver, float(model.body_mass.numpy()[body])
 
 
+# Persistent friction patches (the default friction law).
+PATCH_OPTIONS = {"friction_anchor_beta": 0.2}
+
+# Each colored sweep variant: its kernel overrides and a tag of the kernel it must build.
+COLORED_VARIANTS = {
+    "packed": ({"colored_packed": True}, "_pf1_st0_pk1"),
+    "prefetch": ({"colored_packed": False}, "_pf1_st0_pk0"),
+    "staged": ({"colored_staged": True}, "_pf1_st1"),
+    "reference": ({"colored_prefetch": False}, "_pf0_st0_pk0_sl1"),
+    "row loop": ({"colored_prefetch": False, "colored_straight_line": False}, "_sl0"),
+    "block": ({}, "_sb"),
+    "block global": ({}, "_gb"),
+}
+
+
+def select_colored_variant(test, solver, variant):
+    """Give ``solver`` the block sweeps of ``variant`` and check the kernel it runs."""
+    if variant.startswith("block"):
+        # More bodies than the staging cap keep the twists in global memory.
+        bodies = 385 if variant == "block global" else solver._max_propagation_bodies
+        solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
+            solver._propagation_max_constraints,
+            solver._color_world_offsets.shape[0] // solver._world_count,
+            64,
+            bodies,
+            solver.model.device.arch,
+            contact_compliance=solver._contact_compliance,
+            friction_mode=solver._friction_mode,
+        )
+        solver._pgs_solve_propagation_colored_warp_kernel = None
+    warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
+    kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
+    test.assertIn(COLORED_VARIANTS[variant][1], kernel.key)
+    test.assertEqual("_cc" in kernel.key, solver._contact_compliance, kernel.key)
+    mode = solver._friction_mode
+    test.assertEqual(kernel.key.endswith(mode), mode != "fixed_normal", kernel.key)
+
+
+def set_torsion_radius(model, radius, shapes=None):
+    """Set ``steel:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
+
+    ``radius`` may also be one value per selected shape.
+    """
+    radii = np.zeros(model.shape_count, dtype=np.float32)
+    radii[slice(None) if shapes is None else list(shapes)] = radius
+    namespace = getattr(model, "steel", None)
+    if namespace is not None and getattr(namespace, "min_torsional_patch_radius", None) is not None:
+        namespace.min_torsional_patch_radius.assign(radii)
+    else:
+        model.add_attribute(
+            "min_torsional_patch_radius",
+            wp.array(radii, dtype=wp.float32, device=model.device),
+            frequency=newton.Model.AttributeFrequency.SHAPE,
+            namespace="steel",
+        )
+
+
+def fixture(
+    radius=None,
+    *,
+    device="cuda:0",
+    mu=0.5,
+    closing=0.1,
+    spin=1.0,
+    sliding=0.0,
+    sat=False,
+    separation=0.0,
+    center_only=False,
+    center_count=1,
+    restitution=0.0,
+    dt=0.0025,
+    row_limit=None,
+    model_arrays=None,
+    step=True,
+    torsion_shapes=None,
+    **solver_overrides,
+):
+    """Solve two equal articulated rectangular pads touching face to face.
+
+    ``model_arrays`` maps model attribute names to values assigned before the solver is built.
+    ``radius`` is the torsion radius of ``torsion_shapes`` (both pads for ``None``); ``()`` builds the
+    torsion solver and then clears every radius, so no contact is admitted. With ``step=False`` the solver is returned before its first step, without a result.
+    """
+    b = newton.ModelBuilder(gravity=(0, 0, 0))
+    for side in (-1, 1):
+        pose = wp.transform(wp.vec3(0, 0, side * (0.025 + separation / 2)), wp.quat_identity())
+        body = b.add_link(
+            xform=pose, mass=0.3, inertia=wp.mat33(np.diag([0.00012, 0.00012, 0.00008]).astype(np.float32))
+        )
+        axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+        joint = b.add_joint_d6(-1, body, parent_xform=pose, linear_axes=axes, angular_axes=axes)
+        b.add_articulation([joint])
+        b.add_shape_box(
+            body,
+            hx=0.02,
+            hy=0.015,
+            hz=0.025,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=restitution),
+        )
+    model = b.finalize(device=device)
+    for name, values in (model_arrays or {}).items():
+        getattr(model, name).assign(values)
+    a, z = model.state(), model.state()
+    a.joint_qd.assign(np.array([sliding, 0, closing, 0, 0, spin, -sliding, 0, -closing, 0, 0, -spin], np.float32))
+    newton.eval_fk(model, a.joint_q, a.joint_qd, a)
+    pipeline_options = {"box_box_sat": True} if sat else {}
+    pipeline = newton.CollisionPipeline(
+        model,
+        contact_matching="latest",
+        reduce_contacts=False,
+        broad_phase="nxn",
+        rigid_contact_max=64,
+        **pipeline_options,
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(a, contacts)
+    if center_only and int(contacts.rigid_contact_count.numpy()[0]) > 0:
+        # Deliberately represent the known planar disk by one central witness:
+        # this isolates the new material spin law from native point lever arms.
+        shapes = [contacts.rigid_contact_shape0.numpy()[0], contacts.rigid_contact_shape1.numpy()[0]]
+        poses = a.body_q.numpy()
+        for side, name in enumerate(("rigid_contact_point0", "rigid_contact_point1")):
+            values = getattr(contacts, name).numpy()
+            body = model.shape_body.numpy()[shapes[side]]
+            values[:center_count] = -poses[body, :3]
+            values[:center_count, 2] += np.sign(poses[body, 2]) * separation / 2
+            getattr(contacts, name).assign(values)
+        contacts.rigid_contact_count.assign(np.array([center_count], np.int32))
+    kwargs = {
+        # Keep this material-law control on the same point-friction baseline
+        # whether the optional spin radius is zero or positive.
+        "friction_anchor_beta": 0.0,
+        "iterations": 128,
+        "velocity_iterations": 0,
+        "baumgarte": 0.05,
+        "cfm": 0,
+        "contact_regularization": 0,
+        "enable_joint_velocity_limits": True,
+        "contact_warmstart": False,
+        "articulation_constraint_max": 64,
+        "free_body_constraint_max": 16,
+    }
+    admit_none = torsion_shapes == ()
+    if radius is not None:
+        set_torsion_radius(model, radius, None if admit_none else torsion_shapes)
+    kwargs.update(solver_overrides)
+    if kwargs["friction_anchor_beta"] is None:
+        # Use the constructor default (persistent friction patches).
+        del kwargs["friction_anchor_beta"]
+    solver = SolverSteel(model, solve_mode="matrix_free", **kwargs)
+    solver._rigid_body_angular_damping.zero_()
+    if row_limit is not None:
+        solver._articulation_constraint_max = row_limit
+    if admit_none:
+        # Torsion stays enabled, but no shape pair has a radius left to admit.
+        set_torsion_radius(model, 0.0)
+    if not step:
+        return None, solver, model, a, contacts
+    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    solver.step(a, z, model.control(), contacts, dt, observables=observables)
+    result = {name: getattr(z, name).numpy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
+    result["contact_f"] = observables.contact_f.numpy()
+    result.update(
+        {
+            name: getattr(solver, f"_{name}").numpy()
+            for name in ("impulses", "row_type", "row_parent", "row_mu", "J_world", "Y_world", "v_hat", "v_out")
+        }
+    )
+    result["count"] = solver._constraint_count.numpy()
+    return result, solver, model, a, contacts
+
+
+_MU_JAW, _MU_BOX = 5.0, 0.5
+
+
+_BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
+
+
+def _build_v_jaws(tilt_deg: float, geometry: str = "box", device=None):
+    """Fixed base and two independently driven prismatic jaws pinching a free 0.1 kg object.
+
+    Both jaws are driven toward the object with equal gains and mirrored targets. Their
+    faces tilt toward +z by ``tilt_deg``, so the two normal rows' depenetration biases
+    share a +z tangential component: the geometry that leaks tangential drift through
+    velocity-only friction rows.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    b.rigid_gap = 0.005
+    base = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), label="base")
+    b.add_shape_box(
+        base,
+        hx=0.05,
+        hy=0.05,
+        hz=0.005,
+        cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, has_shape_collision=False),
+    )
+    root = b.add_joint_fixed(-1, base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+    jaw_cfg = newton.ModelBuilder.ShapeConfig(density=2000.0, mu=_MU_JAW)
+    x0 = _BOX_HALF + _JAW_HALF_T + _GAP0
+    jaws, joints = [], []
+    for name, sign in (("jaw_L", -1.0), ("jaw_R", 1.0)):
+        body = b.add_link(xform=wp.transform(wp.vec3(sign * x0, 0.0, 0.5), wp.quat_identity()), label=name)
+        rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), float(-sign * np.radians(tilt_deg)))
+        b.add_shape_box(body, hx=_JAW_HALF_T, hy=0.02, hz=0.02, xform=wp.transform(wp.vec3(0.0), rot), cfg=jaw_cfg)
+        joints.append(
+            b.add_joint_prismatic(
+                base,
+                body,
+                parent_xform=wp.transform(wp.vec3(sign * x0, 0.0, 0.0), wp.quat_identity()),
+                axis=newton.Axis.X,
+                limit_lower=-0.05,
+                limit_upper=0.05,
+                target_q=-0.01 * sign,
+                target_ke=100.0,
+                target_kd=10.0,
+            )
+        )
+        jaws.append(body)
+    b.add_articulation([root, *joints], label="gripper")
+    for dof in range(len(b.joint_effort_limit)):
+        b.joint_effort_limit[dof] = 10.0
+    box = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), label="box")
+    if geometry == "sphere":
+        b.add_shape_sphere(
+            box,
+            radius=_BOX_HALF,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.1 / (4.0 / 3.0 * np.pi * _BOX_HALF**3), mu=_MU_BOX),
+        )
+    elif geometry == "capsule":
+        b.add_shape_capsule(
+            box,
+            radius=_BOX_HALF,
+            half_height=_BOX_HALF,
+            xform=wp.transform(wp.vec3(0), wp.quat_from_axis_angle(wp.vec3(1, 0, 0), np.pi / 2)),
+            cfg=newton.ModelBuilder.ShapeConfig(
+                density=0.1 / (np.pi * _BOX_HALF**2 * 2 * _BOX_HALF + 4.0 / 3.0 * np.pi * _BOX_HALF**3), mu=_MU_BOX
+            ),
+        )
+    else:
+        b.add_shape_box(
+            box,
+            hx=_BOX_HALF,
+            hy=_BOX_HALF,
+            hz=_BOX_HALF,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.1 / (2 * _BOX_HALF) ** 3, mu=_MU_BOX),
+        )
+    return b.finalize(device=device), jaws, box
+
+
+# Few iterations and a soft normal law leave the velocity-only point friction rows
+# under-converged, so the tilted pinch leaks drift unless anchors correct it.
+_SQUEEZE_SOLVER = {
+    "iterations": 8,
+    "velocity_iterations": 0,
+    "baumgarte": 0.05,
+    "contact_regularization": 0.1,
+    "contact_friction_gap_max": 0.001,
+    "articulation_constraint_max": 64,
+}
+
+
+# Steel and its patch kernels are exercised on CUDA, the solver's only device.
+_DEVICE = "cuda:0"
+
+
 def _patch_fixture(
-    points, *, shape0=None, normals=None, materials=(0.5, 0.5, 0.5), shape_bodies=(0, 1, 0), device="cpu"
+    points, *, shape0=None, normals=None, materials=(0.5, 0.5, 0.5), shape_bodies=(0, 1, 0), device=_DEVICE
 ):
     """Construct patch geometry without a collision matcher or a solver step."""
     n = len(points)
@@ -271,66 +576,362 @@ def _patch_fixture(
         rigid_contact_surface_velocity=None,
     )
     patches = _FrictionPatchState(model, max(n, 8), True, wp.zeros(max(n, 8), dtype=wp.vec2, device=device))
-    patches.build(model, state, contacts)
+    patches.build(model, state, contacts, shape_material_mu=model.shape_material_mu)
     return model, state, contacts, patches
 
 
-def _build_sparse_contact_friction_model(num_branches=16, num_worlds=2, *, device=None):
-    """Build the sparse pair model with tilted sliding branches resting on a static ground plane.
+def _tree(device, links, *, branched=False, worlds=2, loop=False):
+    """Driven revolute chains (or a two-branch tree) hanging above the ground."""
+    template = newton.ModelBuilder()
+    joints = []
+    bodies = []
+    for i in range(links):
+        parent = -1 if i == 0 else bodies[(i - 1) // 2 if branched else i - 1]
+        link = template.add_link(mass=1.0 + 0.1 * i, inertia=wp.mat33(np.eye(3) * (0.01 + 0.002 * i)))
+        template.add_shape_capsule(link, radius=0.03, half_height=0.08)
+        side = 1.0 if i % 2 else -1.0
+        offset = wp.vec3(0.0, 0.0, 1.5) if parent < 0 else wp.vec3(0.05 * side if branched else 0.0, 0.0, -0.2)
+        joints.append(
+            template.add_joint_revolute(
+                parent,
+                link,
+                axis=wp.vec3(0.0, 1.0, 0.0) if i % 3 else wp.vec3(1.0, 0.0, 0.0),
+                parent_xform=wp.transform(offset, wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                target_ke=20.0 + i,
+                target_kd=1.0,
+                target_q=0.2,
+                armature=0.01,
+            )
+        )
+        bodies.append(link)
+    template.add_articulation(joints)
+    if loop:
+        template.add_joint_ball(
+            bodies[0], bodies[-1], child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity())
+        )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds)
+    return builder.finalize(device=device)
 
-    Each branch slides along ``(1, 0, 1) / sqrt(2)`` and carries a small box that touches the ground, so every
-    contact normal and tangent row acts on that branch's single coordinate and friction is active.
-    """
-    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    scene.default_shape_cfg.ke = 1.0e5
-    scene.default_shape_cfg.kd = 1.0e3
-    scene.default_shape_cfg.mu = 0.8
-    scene.default_shape_cfg.margin = 0.0
-    scene.default_shape_cfg.gap = 0.0
+
+def _trajectory(model, steps=40, **solver_kwargs):
+    solver = SolverSteel(model, **solver_kwargs)
+    state_0, state_1 = model.state(), model.state()
+    qd = np.linspace(-0.5, 0.5, model.joint_dof_count).astype(np.float32)
+    state_0.joint_qd.assign(qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0.joint_q.numpy(), state_0.joint_qd.numpy()
+
+
+DT = 1.0 / 240.0
+
+
+def _build_contact_scene(device, *, mu=0.6, restitution=0.0, worlds=2):
+    """Build a sliding articulated box with a driven arm and two sliding free boxes per world."""
+    scene = newton.ModelBuilder()
+    scene.default_shape_cfg.mu = mu
+    scene.default_shape_cfg.restitution = restitution
     scene.add_ground_plane()
-    base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    star_joints = [
-        scene.add_joint_fixed(
-            parent=-1, child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity())
+    for i in range(2):
+        body = scene.add_body(xform=wp.transform(wp.vec3(0.4 * i, 0.6, 0.099), wp.quat_rpy(0.0, 0.0, 0.2 * i)))
+        scene.add_shape_box(body, hx=0.1, hy=0.08, hz=0.1)
+    xform = wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity())
+    base = scene.add_link(xform=xform)
+    scene.add_shape_box(base, hx=0.15, hy=0.1, hz=0.05)
+    arm = scene.add_link()
+    scene.add_shape_capsule(arm, radius=0.03, half_height=0.08)
+    axis = newton.ModelBuilder.JointDofConfig
+    scene.add_articulation(
+        [
+            scene.add_joint_d6(
+                parent=-1,
+                child=base,
+                parent_xform=xform,
+                linear_axes=[axis(axis=newton.Axis.X), axis(axis=newton.Axis.Z)],
+            ),
+            scene.add_joint_revolute(
+                base,
+                arm,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.12), wp.quat_identity()),
+                target_ke=20.0,
+                target_kd=1.0,
+                target_q=0.4,
+            ),
+        ]
+    )
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds)
+    return builder.finalize(device=device)
+
+
+def _set_box_velocities(model, state, speed=1.5):
+    """Give every free box and articulated box a horizontal velocity so friction does work."""
+    joint_qd = state.joint_qd.numpy()
+    starts = model.joint_qd_start.numpy()
+    for joint, joint_type in enumerate(model.joint_type.numpy()):
+        if joint_type in (int(newton.JointType.FREE), int(newton.JointType.D6)):
+            joint_qd[starts[joint]] = speed
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+
+def _friction_impulses(solver):
+    """Return every friction row impulse of the dense, free-body and propagation row families."""
+    values = []
+    families = [
+        (solver._constraint_count, solver._row_type, solver._impulses),
+        (solver._mf_constraint_count, solver._mf_row_type, solver._mf_impulses),
+    ]
+    if solver._propagation_active:
+        families.append(
+            (solver._propagation_constraint_count, solver._propagation_row_type, solver._propagation_impulses)
+        )
+    for count_array, type_array, impulse_array in families:
+        row_type = type_array.numpy()
+        impulses = impulse_array.numpy()
+        for world, rows in enumerate(count_array.numpy()):
+            friction = row_type[world, :rows] == PGS_CONSTRAINT_TYPE_FRICTION
+            values.append(impulses[world, :rows][friction])
+    return np.concatenate(values) if values else np.zeros(0)
+
+
+def _run(model, *, steps=12, init=None, overrides=None, capture=False, before_step=None, **options):
+    """Step ``model`` and return the solver, the final joint state and each step's friction impulses.
+
+    ``before_step(model, index)`` runs on the host before each eager step or graph replay.
+    """
+    with kernel_overrides(overrides or {}):
+        solver = SolverSteel(model, **options)
+    state_in, state_out = model.state(), model.state()
+    if init is not None:
+        init(model, state_in)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    contacts = pipeline.contacts()
+    control = model.control()
+    friction = []
+
+    def step():
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, DT)
+        for src, dst in (
+            (state_out.joint_q, state_in.joint_q),
+            (state_out.joint_qd, state_in.joint_qd),
+            (state_out.body_q, state_in.body_q),
+            (state_out.body_qd, state_in.body_qd),
+        ):
+            wp.copy(dst, src)
+
+    if capture:
+        if before_step is not None:
+            before_step(model, 0)
+        step()
+        friction.append(_friction_impulses(solver))
+        with wp.ScopedCapture(model.device) as graph:
+            step()
+        for index in range(1, steps):
+            if before_step is not None:
+                before_step(model, index)
+            wp.capture_launch(graph.graph)
+            friction.append(_friction_impulses(solver))
+    else:
+        for index in range(steps):
+            if before_step is not None:
+                before_step(model, index)
+            step()
+            friction.append(_friction_impulses(solver))
+    return solver, state_in.joint_q.numpy(), state_in.joint_qd.numpy(), friction
+
+
+POISON = -123.25
+
+
+def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
+    """Build a tree of prismatic leaves with nontrivial anchors and COMs, plus unrelated moving bodies."""
+    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+
+    def body(index):
+        return builder.add_link(
+            mass=0.5 + 0.1 * index,
+            com=wp.vec3(0.07, -0.03, 0.02),
+            inertia=wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5),
+        )
+
+    base = body(0)
+    root_kwargs = {
+        "parent": -1,
+        "child": base,
+        "parent_xform": wp.transform(wp.vec3(2.0, -1.0, 0.6), wp.quat_rpy(0.3, -0.2, 0.4)),
+        "child_xform": wp.transform(wp.vec3(0.2, -0.1, 0.05), wp.quat_rpy(-0.1, 0.2, 0.0)),
+    }
+    root = builder.add_joint_d6(**root_kwargs) if locked_d6 else builder.add_joint_fixed(**root_kwargs)
+    joints = [root]
+    leaf_bodies = []
+    for index in range(leaves):
+        child = body(index + 1)
+        leaf_bodies.append(child)
+        joints.append(
+            builder.add_joint_prismatic(
+                parent=(base if index == 0 else leaf_bodies[index - 1]) if chain else base,
+                child=child,
+                axis=wp.vec3(0.2 + 0.1 * index, 0.5, 0.9),
+                parent_xform=wp.transform(wp.vec3(0.1 * index, -0.05, 0.13), wp.quat_rpy(0.2, -0.1 * index, 0.3)),
+                child_xform=wp.transform(wp.vec3(-0.09, 0.04, 0.08), wp.quat_rpy(0.4, 0.2, -0.1)),
+                target_ke=3.0,
+                target_kd=0.2,
+                limit_lower=-0.5,
+                limit_upper=0.5,
+            )
+        )
+    builder.add_articulation(joints)
+    arm = body(leaves + 1)
+    hinge = builder.add_joint_revolute(
+        parent=-1,
+        child=arm,
+        axis=newton.Axis.Y,
+        parent_xform=wp.transform(wp.vec3(-0.8, 0.1, 1.0), wp.quat_identity()),
+    )
+    builder.add_articulation([hinge])
+    free = body(leaves + 2)
+    builder.add_articulation([builder.add_joint_free(free)])
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 1
+    q = model.joint_q.numpy()
+    q[: leaves + 1] = np.linspace(-0.31, 0.27, leaves + 1)
+    model.joint_q.assign(q)
+    model.joint_qd.assign(np.linspace(-0.7, 0.8, model.joint_dof_count, dtype=np.float32))
+    # Joint axes need not be unit length.
+    axes = model.joint_axis.numpy()
+    axes[0] *= 1.4
+    model.joint_axis.assign(axes)
+    return model, joints, leaf_bodies
+
+
+def _build_branched_model(device="cpu", *, floating_root=False):
+    """Interleave terminal joints and internal parents with nonzero parent motion."""
+    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+    bodies = [
+        builder.add_link(
+            mass=0.7 + 0.1 * index,
+            com=wp.vec3(0.03, -0.04, 0.02),
+            inertia=wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5),
+        )
+        for index in range(7)
+    ]
+    root_args = {"parent": -1, "child": bodies[0]}
+    root = builder.add_joint_free(**root_args) if floating_root else builder.add_joint_revolute(**root_args)
+    joints = [root]
+    # Joint 1 is terminal although it precedes the internal joint 2; later leaves use both moving parents.
+    for index, kind in enumerate(("revolute", "revolute", "prismatic", "ball", "d6", "fixed"), start=1):
+        args = {
+            "parent": bodies[2] if index in (4, 5) else bodies[0],
+            "child": bodies[index],
+            "parent_xform": wp.transform(wp.vec3(0.1 * index, -0.07, 0.13), wp.quat_rpy(0.2, -0.1, 0.3)),
+            "child_xform": wp.transform(wp.vec3(-0.03, 0.04, 0.02), wp.quat_rpy(-0.1, 0.2, 0.1)),
+        }
+        if kind in ("revolute", "prismatic"):
+            args["axis"] = wp.vec3(0.2, 0.5, 0.9)
+        if kind == "d6":
+            args["linear_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X)]
+            args["angular_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Y)]
+        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    q = model.joint_q.numpy()
+    starts = model.joint_q_start.numpy()
+    for joint in (1, 2, 3, 5):
+        q[starts[joint] : starts[joint + 1]] = 0.07 * joint
+    if floating_root:
+        q[:7] = (0.4, -0.2, 0.6, *wp.quat_rpy(0.3, -0.2, 0.1))
+    else:
+        q[0] = 0.31
+    model.joint_q.assign(q)
+    model.joint_qd.assign(np.linspace(-0.9, 0.8, model.joint_dof_count, dtype=np.float32))
+    return model, joints, bodies
+
+
+def _build_contact_model(device):
+    """Load three terminal joints against the ground under a moving root."""
+    builder = newton.ModelBuilder()
+    root = builder.add_link(mass=1.0, inertia=wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1))
+    joints = [
+        builder.add_joint_revolute(
+            parent=-1,
+            child=root,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.185), wp.quat_identity()),
         )
     ]
-    for branch in range(num_branches):
-        child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
-        # Four boxes keep the four-point patches within the dense row capacity of the test solvers.
-        if branch % 4 == 0:
-            scene.add_shape_box(child, hx=0.01, hy=0.01, hz=0.01)
-        star_joints.append(
-            scene.add_joint_prismatic(
-                parent=base,
-                child=child,
-                axis=wp.normalize(wp.vec3(1.0, 0.0, 1.0)),
-                parent_xform=wp.transform(wp.vec3(0.05 * branch, 0.0, -0.4905), wp.quat_identity()),
-                limit_lower=-0.1,
-                limit_upper=0.1,
-            )
-        )
-    scene.add_articulation(star_joints)
+    for index, kind in enumerate(("revolute", "prismatic", "ball")):
+        child = builder.add_link(mass=0.5, inertia=wp.mat33(0.03, 0.0, 0.0, 0.0, 0.03, 0.0, 0.0, 0.0, 0.03))
+        args = {
+            "parent": root,
+            "child": child,
+            "parent_xform": wp.transform(wp.vec3(0.5 * (index - 1), 0.3, 0.0), wp.quat_identity()),
+        }
+        if kind != "ball":
+            args["axis"] = newton.Axis.Y if kind == "revolute" else newton.Axis.Z
+        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
+        builder.add_shape_sphere(child, radius=0.2)
+    builder.add_articulation(joints)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    model.joint_qd.assign(np.linspace(-0.1, 0.15, model.joint_dof_count, dtype=np.float32))
+    return model
 
-    chain_joints = []
-    parent = -1
-    for _link_index in range(3):
-        child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-        chain_joints.append(
-            scene.add_joint_revolute(
-                parent=parent,
-                child=child,
-                axis=newton.Axis.Y,
-                parent_xform=wp.transform(wp.vec3(0.0, 1.0, 1.0), wp.quat_identity()),
-                limit_lower=-0.2,
-                limit_upper=0.2,
-            )
-        )
-        parent = child
-    scene.add_articulation(chain_joints)
 
-    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    replicated.replicate(scene, num_worlds, spacing=(3.0, 3.0, 0.0))
-    return replicated.finalize(device=device)
+def _solver(model, *, enabled, velocity_limits=False, **options):
+    """Build a solver with serial (``enabled=False``) or parallel tree traversal."""
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        iterations=8,
+        update_mass_matrix_interval=2,
+        enable_joint_limits=True,
+        enable_joint_velocity_limits=velocity_limits,
+        parallel_tree=enabled,
+        **options,
+    )
+    if enabled:
+        assert solver._tree_plan is not None
+    else:
+        assert solver._tree_plan is None
+        assert solver._tree_net_wrenches == ()
+    solver._prepare_augmented_state(model.state())
+    return solver
+
+
+def _dynamics_fields(solver, state):
+    """Arrays written by the forward pass of stage 1."""
+    return {
+        "body_q": state.body_q,
+        "body_q_com": solver._body_q_com,
+        "origin": solver._articulation_origin,
+        "S": solver._joint_S_s,
+        "v": solver._body_v_s,
+        "a": solver._body_a_s,
+        "I": solver._body_I_s,
+        "f": solver._body_f_s,
+    }
+
+
+def _poison(fields, keep=()):
+    for name, array in fields.items():
+        if name not in keep:
+            array.fill_(POISON)
+
+
+def _run_stage1(solver, state, following):
+    """Run stage 1 forward and backward passes; return the predictor input velocity."""
+    qd = solver._stage1_fk_id(state, solver, following)
+    solver._stage1_joint_tau(state, solver, following, solver.model.control(), 1.0 / 240.0)
+    return qd
 
 
 def _build_mixed_response_model(
@@ -427,10 +1028,47 @@ def _build_mixed_response_model(
     return replicated.finalize(device=device)
 
 
-N_WORLDS = 4
+def _build_two_revolute_chain(coef0: float, coef1: float, legacy: bool = False):
+    """Build a fixed-base chain of two revolute Z-joints with a mimic between them.
+
+    The leader joint is position-driven; the follower joint has no drive and no spring,
+    so any tracking it does comes from the mimic row alone.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    # add_link (not add_body): add_body wraps each body in its own free-joint articulation.
+    link_a = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 0.5), wp.quat_identity()))
+    b.add_shape_box(link_a, hx=0.1, hy=0.02, hz=0.02)
+    j_leader = b.add_joint_revolute(
+        parent=-1,
+        child=link_a,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    link_b = b.add_link(xform=wp.transform(wp.vec3(0.6, 0.0, 0.5), wp.quat_identity()))
+    b.add_shape_box(link_b, hx=0.1, hy=0.02, hz=0.02)
+    j_follower = b.add_joint_revolute(
+        parent=link_a,
+        child=link_b,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    b.add_articulation([j_leader, j_follower], label="mimic_chain")
+    b.joint_target_ke[0] = 50.0
+    b.joint_target_kd[0] = 5.0
+    b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
+    # follower: q_follower = coef0 + coef1 * q_leader
+    if legacy:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            b.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=coef0, coef1=coef1)
+    else:
+        b.set_joint_mimic(j_follower, j_leader, coeffs=(coef0, coef1))
+    return b, j_leader, j_follower
 
 
-def _build_scissor_model(device: str) -> newton.Model:
+def _build_scissor_model(device):
     """One articulation: base link + two sibling links whose boxes overlap.
 
     The siblings are not directly jointed, so collision produces a
@@ -471,300 +1109,211 @@ def _build_scissor_model(device: str) -> newton.Model:
     return builder.finalize(device=device)
 
 
-def _contact_rows(solver: SolverSteel, path_id: int, contact_count: int | None = None) -> dict[int, int]:
-    """contact index -> row slot for contacts routed to the given path."""
-    contact_path = solver._contact_path.numpy().astype(np.int32)
-    contact_slot = solver._contact_slot.numpy().astype(np.int32)
-    contact_world = solver._contact_world.numpy().astype(np.int32)
-    out = {}
-    if contact_count is None:
-        contact_count = solver._test_live_contact_count
-    for c in range(contact_count):
-        if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
-            out[c] = int(contact_slot[c])
-    return out
+RADIUS = 0.05
 
 
-N_LINKS = 6
+CONTACT_GAP = 0.1
 
 
-def _make_floating_chain_world(*, base_z: float, contact_sphere: str | None) -> newton.ModelBuilder:
-    """A floating box base (free joint) trailing N_LINKS revolute links.
-
-    ``contact_sphere`` places a single collision sphere on the base or on the
-    deepest link; all other shapes carry no collision geometry so each world
-    produces at most one contact point (keeps the contact pipeline
-    deterministic for the end-to-end comparison). ``None`` builds density-only
-    box shapes with collision enabled (used for the contact-free tests).
-    """
-    builder = newton.ModelBuilder()
-    builder.default_shape_cfg.density = 1000.0
-    builder.default_shape_cfg.mu = 0.7
-
-    no_collision = builder.default_shape_cfg.copy()
-    no_collision.has_shape_collision = False
-    no_collision.collision_group = 0
-
-    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()))
-    cfg = builder.default_shape_cfg if contact_sphere is None else no_collision
-    builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
-    if contact_sphere == "base":
-        builder.add_shape_sphere(base, radius=0.1)
-    joints = [builder.add_joint_free(base)]
-    prev = base
-    for i in range(N_LINKS):
-        link = builder.add_link()
-        builder.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=cfg)
-        if contact_sphere == "deep" and i == N_LINKS - 1:
-            builder.add_shape_sphere(link, radius=0.05)
-        offset = 0.22 if i == 0 else 0.12
-        joints.append(
-            builder.add_joint_revolute(
-                parent=prev,
-                child=link,
-                axis=wp.vec3(0.0, 1.0, 0.0),
-                parent_xform=wp.transform(wp.vec3(offset, 0.0, 0.0), wp.quat_identity()),
-                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
-            )
-        )
-        prev = link
-    builder.add_articulation(joints)
-    return builder
+def _diagonal_inertia(value):
+    """Return an isotropic inertia tensor."""
+    return wp.mat33(value, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, value)
 
 
-def _build_free_root_chain_model(
-    device: str, *, base_z: float, contact_sphere: str | None, ground: bool
-) -> newton.Model:
-    scene = newton.ModelBuilder()
-    for _ in range(N_WORLDS):
-        scene.add_world(_make_floating_chain_world(base_z=base_z, contact_sphere=contact_sphere))
-    if ground:
-        scene.add_ground_plane()
-    return scene.finalize(device=device)
+def _sphere_inertia(mass):
+    """Return the inertia of a solid sphere about its centre."""
+    return _diagonal_inertia(0.4 * mass * RADIUS * RADIUS)
 
 
-def _sphere_on_ground(device, armature, dense, com=(0.0, 0.0, 0.0), mu=0.0):
-    """A 1 kg sphere on a free joint, optionally with a massless fixed child that routes it to dense rows."""
-    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    body = builder.add_link(
-        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity()),
-        mass=1.0,
-        com=wp.vec3(com),
-        inertia=wp.mat33(np.eye(3) * 0.01),
+def _shape_cfg(restitution):
+    """Return an inertialess, frictionless test material."""
+    return newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=0.0,
+        restitution=restitution,
+        margin=0.0,
+        gap=CONTACT_GAP,
     )
-    joints = [builder.add_joint_free(body)]
-    if dense:
-        child = builder.add_link(mass=0.0, inertia=wp.mat33(0.0))
-        joints.append(builder.add_joint_fixed(body, child))
-    builder.add_articulation(joints)
-    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=mu)
-    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
-    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
-    model = builder.finalize(device=device)
-    joint_armature = model.joint_armature.numpy()
-    joint_armature[:6] = armature
-    model.joint_armature.assign(joint_armature)
-    return model
 
 
-def set_torsion_radius(model, radius, shapes=None):
-    """Set ``steel:min_torsional_patch_radius`` [m] of ``shapes`` (every shape for ``None``), zero elsewhere.
-
-    ``radius`` may also be one value per selected shape.
-    """
-    radii = np.zeros(model.shape_count, dtype=np.float32)
-    radii[slice(None) if shapes is None else list(shapes)] = radius
-    namespace = getattr(model, "steel", None)
-    if namespace is not None and getattr(namespace, "min_torsional_patch_radius", None) is not None:
-        namespace.min_torsional_patch_radius.assign(radii)
-    else:
-        model.add_attribute(
-            "min_torsional_patch_radius",
-            wp.array(radii, dtype=wp.float32, device=model.device),
-            frequency=newton.Model.AttributeFrequency.SHAPE,
-            namespace="steel",
-        )
-
-
-def fixture(
-    radius=None,
+def _build_plane_model(
+    device,
     *,
-    mu=0.5,
-    closing=0.1,
-    spin=1.0,
-    sliding=0.0,
-    sat=False,
-    separation=0.0,
-    center_only=False,
-    center_count=1,
-    restitution=0.0,
-    dt=0.0025,
-    row_limit=None,
-    model_arrays=None,
-    step=True,
-    torsion_shapes=None,
-    **solver_overrides,
+    separation,
+    restitution,
+    plane_restitution=None,
+    mass=1.0,
+    gravity=(0.0, 0.0, 0.0),
+    scene="free",
 ):
-    """Solve two equal articulated rectangular pads touching face to face.
-
-    ``model_arrays`` maps model attribute names to values assigned before the solver is built.
-    ``radius`` is the torsion radius of ``torsion_shapes`` (both pads for ``None``); ``()`` builds the
-    torsion solver and then clears every radius, so no contact is admitted. With ``step=False`` the
-    solver is returned before its first step, without a result.
-    """
-    b = newton.ModelBuilder(gravity=(0, 0, 0))
-    for side in (-1, 1):
-        pose = wp.transform(wp.vec3(0, 0, side * (0.025 + separation / 2)), wp.quat_identity())
-        body = b.add_link(
-            xform=pose, mass=0.3, inertia=wp.mat33(np.diag([0.00012, 0.00012, 0.00008]).astype(np.float32))
+    """Build one sphere above a plane, optionally as a two-link articulation."""
+    builder = newton.ModelBuilder(gravity=gravity)
+    xform = wp.transform(wp.vec3(0.0, 0.0, RADIUS + separation), wp.quat_identity())
+    if scene == "free":
+        body = builder.add_body(
+            xform=xform,
+            mass=mass,
+            inertia=_sphere_inertia(mass),
+            lock_inertia=True,
         )
-        axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
-        joint = b.add_joint_d6(-1, body, parent_xform=pose, linear_axes=axes, angular_axes=axes)
-        b.add_articulation([joint])
-        b.add_shape_box(
-            body,
-            hx=0.02,
-            hy=0.015,
-            hz=0.025,
-            cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=restitution),
+    elif scene == "articulated":
+        # A concentric, shape-free fixed child makes this a real floating
+        # articulation without adding a second contact or a changing contact
+        # point velocity to the analytical one-row problem.
+        body = builder.add_link(
+            xform=xform,
+            mass=mass,
+            inertia=_sphere_inertia(mass),
+            lock_inertia=True,
         )
-    model = b.finalize(device="cuda:0")
-    for name, values in (model_arrays or {}).items():
-        getattr(model, name).assign(values)
-    a, z = model.state(), model.state()
-    a.joint_qd.assign(np.array([sliding, 0, closing, 0, 0, spin, -sliding, 0, -closing, 0, 0, -spin], np.float32))
-    newton.eval_fk(model, a.joint_q, a.joint_qd, a)
-    pipeline = newton.CollisionPipeline(
-        model,
-        contact_matching="latest",
-        reduce_contacts=False,
-        broad_phase="nxn",
-        rigid_contact_max=64,
-        box_box_sat=sat,
-    )
-    contacts = pipeline.contacts()
-    pipeline.collide(a, contacts)
-    if center_only and int(contacts.rigid_contact_count.numpy()[0]) > 0:
-        # Deliberately represent the known planar disk by one central witness:
-        # this isolates the new material spin law from native point lever arms.
-        shapes = [contacts.rigid_contact_shape0.numpy()[0], contacts.rigid_contact_shape1.numpy()[0]]
-        poses = a.body_q.numpy()
-        for side, name in enumerate(("rigid_contact_point0", "rigid_contact_point1")):
-            values = getattr(contacts, name).numpy()
-            body = model.shape_body.numpy()[shapes[side]]
-            values[:center_count] = -poses[body, :3]
-            values[:center_count, 2] += np.sign(poses[body, 2]) * separation / 2
-            getattr(contacts, name).assign(values)
-        contacts.rigid_contact_count.assign(np.array([center_count], np.int32))
-    kwargs = {
-        # Keep this material-law control on the same point-friction baseline
-        # whether the optional spin radius is zero or positive.
-        "friction_anchor_beta": 0.0,
-        "solve_mode": "matrix_free",
-        "articulated_contact_response": "immediate",
-        "iterations": 128,
-        "velocity_iterations": 0,
-        "baumgarte": 0.05,
-        "cfm": 0,
-        "contact_regularization": 0,
-        "contact_friction_position_iterations": -1,
-        "contact_shared_anchor": True,
-        "contact_friction_shared_anchor": True,
-        "enable_joint_velocity_limits": True,
-        "contact_warmstart": False,
-        "articulation_constraint_max": 64,
-        "free_body_constraint_max": 16,
-        "row_watermark": True,
-    }
-    admit_none = torsion_shapes == ()
-    if radius is not None:
-        set_torsion_radius(model, radius, None if admit_none else torsion_shapes)
-    kwargs.update(solver_overrides)
-    tuning = {key: kwargs.pop(key) for key in ("pgs_kernel",) if key in kwargs}
-    with kernel_overrides(tuning):
-        solver = SolverSteel(model, **kwargs)
-    solver._rigid_body_angular_damping.zero_()
-    if row_limit is not None:
-        solver._articulation_constraint_max = row_limit
-    if admit_none:
-        # Torsion stays enabled, but no shape pair has a radius left to admit.
-        set_torsion_radius(model, 0.0)
-    if not step:
-        return None, solver, model, a, contacts
-    observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
-    solver.step(a, z, model.control(), contacts, dt, observables=observables)
-    result = {name: getattr(z, name).numpy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
-    result["contact_f"] = observables.contact_f.numpy()
-    result.update(
-        {
-            name: getattr(solver, f"_{name}").numpy()
-            for name in ("impulses", "row_type", "row_parent", "row_mu", "J_world", "Y_world", "v_hat", "v_out")
-        }
-    )
-    result["count"] = solver._constraint_count.numpy()
-    return result, solver, model, a, contacts
+        child_mass = 0.25 * mass
+        child = builder.add_link(
+            xform=xform,
+            mass=child_mass,
+            inertia=_sphere_inertia(child_mass),
+            lock_inertia=True,
+        )
+        root_joint = builder.add_joint_free(child=body)
+        fixed_joint = builder.add_joint_fixed(parent=body, child=child)
+        builder.add_articulation([root_joint, fixed_joint])
+    else:
+        raise ValueError(f"unknown scene {scene!r}")
+
+    builder.add_shape_sphere(body, radius=RADIUS, cfg=_shape_cfg(restitution))
+    builder.add_ground_plane(cfg=_shape_cfg(restitution if plane_restitution is None else plane_restitution))
+    return builder.finalize(device=device), body
 
 
-_COLORED_SWITCHES = (
-    "STEEL_COLORED_PREFETCH",
-    "STEEL_COLORED_STAGED",
-    "STEEL_COLORED_PACKED",
-    "STEEL_COLORED_STRAIGHT_LINE",
-    "STEEL_COLORED_LANES",
-)
-# Each colored solve body, selected by its kernel switches, with a tag of the kernel it must build.
-COLORED_VARIANTS = {
-    "packed": ({"STEEL_COLORED_PACKED": "1"}, "_pf1_st0_pk1"),
-    "prefetch": ({"STEEL_COLORED_PACKED": "0"}, "_pf1_st0_pk0"),
-    "staged": ({"STEEL_COLORED_STAGED": "1"}, "_pf1_st1"),
-    "reference": ({"STEEL_COLORED_PREFETCH": "0"}, "_pf0_st0_pk0_sl1"),
-    "row loop": ({"STEEL_COLORED_PREFETCH": "0", "STEEL_COLORED_STRAIGHT_LINE": "0"}, "_sl0"),
-    "two lanes": ({"STEEL_COLORED_LANES": "2"}, "_r2_"),
-    "four lanes": ({"STEEL_COLORED_LANES": "4"}, "_r4_"),
-    "block": ({"STEEL_COLORED_LANES": "3"}, "_sb"),
-    "block global": ({"STEEL_COLORED_LANES": "3"}, "_gb"),
+def _reset_state(model, state, vertical_velocity):
+    """Restore the authored pose and set a free root's world-z velocity."""
+    wp.copy(state.joint_q, model.joint_q)
+    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    joint_qd[2] = vertical_velocity
+    state.joint_qd.assign(joint_qd)
+    state.clear_forces()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+
+# A manipulation profile without contact torsion; the torsion variant is in test_sleeping.
+PROFILE = {
+    "iterations": 32,
+    "contact_regularization": 0.01,
+    "friction_anchor_beta": 0.2,
+    "contact_friction_gap_max": 0.001,
+    "articulation_constraint_max": 512,
+    "free_body_constraint_max": 512,
+    "enable_sleeping": True,
+    "sleep_quiet_time": 0.1,
 }
 
 
-@contextlib.contextmanager
-def colored_variant_switches(name):
-    """Set only colored variant ``name``'s kernel switches while solvers are built."""
-    env, _ = COLORED_VARIANTS[name]
-    with mock.patch.dict(os.environ, env):
-        for key in _COLORED_SWITCHES:
-            if key not in env:
-                os.environ.pop(key, None)
-        yield
+def _articulations(device, tiles=False, profile=None, torsion_radius=None):
+    """Two undriven two-link articulations resting on the ground, which route contacts to dense rows.
 
-
-def select_colored_variant(solver, name):
-    """Give ``solver`` colored variant ``name``'s solve kernel and check that it built that kernel.
-
-    Build the solver inside :func:`colored_variant_switches`. Raises ``SkipTest`` where staging is unsupported.
+    With ``tiles``, each base is a grid of small boxes so its ground pair exceeds the warp-flood threshold.
     """
-    if name == "block global":
-        # Bodies past the staging cap keep the twists in global memory; the body list is unused then.
-        solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
-            solver._propagation_max_constraints,
-            solver._color_world_offsets.shape[0] // solver._world_count,
-            solver._propagation_colored_block_dim,
-            385,
-            str(solver.model.device.arch),
-            free_rigid_angular=solver._free_rigid_angular_rows,
-            contact_torsion=solver._propagation_torsion_rows,
-            articulated_angular=solver._propagation_angular_friction,
-            contact_compliance=solver._contact_compliance,
-            friction_mode=solver._friction_mode,
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for x in (0.0, 1.0):
+        base = builder.add_link(xform=wp.transform((x, 0.0, 0.1), wp.quat_identity()))
+        if tiles:
+            for i in range(4):
+                for j in range(3):
+                    offset = wp.transform((-0.15 + 0.1 * i, -0.067 + 0.067 * j, 0.0), wp.quat_identity())
+                    builder.add_shape_box(base, xform=offset, hx=0.05, hy=0.033, hz=0.1)
+        else:
+            builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1)
+        tip = builder.add_link(xform=wp.transform((x + 0.3, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(tip, hx=0.1, hy=0.1, hz=0.1)
+        hinge = wp.transform((0.3, 0.0, 0.0), wp.quat_identity())
+        builder.add_articulation(
+            [
+                builder.add_joint_free(child=base),
+                builder.add_joint_revolute(parent=base, child=tip, parent_xform=hinge, axis=(0.0, 1.0, 0.0)),
+            ]
         )
-    warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
-    kernel = solver._pgs_solve_propagation_colored_block_kernel if warp_kernel is None else warp_kernel
-    if name == "staged" and warp_kernel is not None and "_pf1_st1" not in kernel.key:
-        raise unittest.SkipTest("shared-memory staging needs cp.async")
-    tag = COLORED_VARIANTS[name][1]
-    assert tag in kernel.key, f"{name} built {kernel.key}"
-    assert ("_fra" in kernel.key) == bool(solver._free_rigid_angular_rows), kernel.key
-    assert ("_tor" in kernel.key) == bool(solver._propagation_torsion_rows), kernel.key
-    assert ("_aaf_" in kernel.key) == (solver._propagation_angular_friction is not None), kernel.key
-    assert ("_cc" in kernel.key) == bool(solver._contact_compliance), kernel.key
-    modes = [mode for mode in ("bisection_desaxce", "bisection", "coulomb_newton") if f"_{mode}" in kernel.key]
-    assert modes[:1] == ([] if solver._friction_mode == "fixed_normal" else [solver._friction_mode]), kernel.key
+    model = builder.finalize(device=device)
+    if torsion_radius is not None:
+        set_torsion_radius(model, torsion_radius)
+    # Deterministic contact order, as in production, so A/B trajectories compare bitwise.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
+    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", **(profile or PROFILE))
+    return model, pipeline, solver, [model.state(), model.state()], model.control()
+
+
+def _advance(pipeline, solver, states, control, steps, *, clear=True, contacts=None):
+    contacts = contacts or pipeline.contacts()
+    for _ in range(steps):
+        if clear:
+            states[0].clear_forces()
+        pipeline.collide(states[0], contacts)
+        solver.step(states[0], states[1], control, contacts, 0.005)
+        states.reverse()
+
+
+def _build_sparse_contact_friction_model(num_branches=16, num_worlds=2, *, device=None):
+    """Build the sparse pair model with tilted sliding branches resting on a static ground plane.
+
+    Each branch slides along ``(1, 0, 1) / sqrt(2)`` and carries a small box that touches the ground, so every
+    contact normal and tangent row acts on that branch's single coordinate and friction is active.
+    """
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    scene.default_shape_cfg.ke = 1.0e5
+    scene.default_shape_cfg.kd = 1.0e3
+    scene.default_shape_cfg.mu = 0.8
+    scene.default_shape_cfg.margin = 0.0
+    scene.default_shape_cfg.gap = 0.0
+    scene.add_ground_plane()
+    base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    star_joints = [
+        scene.add_joint_fixed(
+            parent=-1, child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity())
+        )
+    ]
+    for branch in range(num_branches):
+        child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        # Four boxes keep the four-point patches within the dense row capacity of the test solvers.
+        if branch % 4 == 0:
+            scene.add_shape_box(child, hx=0.01, hy=0.01, hz=0.01)
+        star_joints.append(
+            scene.add_joint_prismatic(
+                parent=base,
+                child=child,
+                axis=wp.normalize(wp.vec3(1.0, 0.0, 1.0)),
+                parent_xform=wp.transform(wp.vec3(0.05 * branch, 0.0, -0.4905), wp.quat_identity()),
+                limit_lower=-0.1,
+                limit_upper=0.1,
+            )
+        )
+    scene.add_articulation(star_joints)
+
+    chain_joints = []
+    parent = -1
+    for _link_index in range(3):
+        child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        chain_joints.append(
+            scene.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 1.0, 1.0), wp.quat_identity()),
+                limit_lower=-0.2,
+                limit_upper=0.2,
+            )
+        )
+        parent = child
+    scene.add_articulation(chain_joints)
+
+    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    replicated.replicate(scene, num_worlds, spacing=(3.0, 3.0, 0.0))
+    return replicated.finalize(device=device)
+
+
+def _assert_budget(test, result, solver):
+    """Check the shared final-load budget and nonnegative normal impulses."""
+    for group in solver._torsion_stats["groups"]:
+        impulse = result["impulses"][group["world"]]
+        normal = sum(max(float(impulse[n]), 0.0) for n in group["normal_rows"])
+        sliding = sum(float(np.linalg.norm(impulse[n + 1 : n + 3])) for n in group["anchor_rows"])
+        spin = abs(float(impulse[group["row"]])) / group["effective_radius_m"]
+        test.assertLessEqual(sliding + spin, group["mu"] * normal + 3e-6)

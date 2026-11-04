@@ -3,134 +3,121 @@
 
 """Experimental implicit unilateral material contacts for Steel.
 
-For signed separation phi, separating velocity u and impulse lambda:
-F = max(0, -k*phi_next - c*u_next), gamma = 1/(h*(h*k+c)),
-bias = k*phi/(h*k+c), residual = u_next + bias + gamma*lambda.
-Native hydro stiffness is already area/pressure weighted [N/m], not shape
-bulk stiffness [N/m^3]. Friction weighting is applied once to the existing
-pair coefficient, with the cone bounded by the compliant normal impulse.
+For signed separation ``phi``, separating velocity ``u`` and impulse ``lambda``:
+``F = max(0, -k*phi_next - c*u_next)``, ``gamma = 1/(h*(h*k+c))``,
+``bias = k*phi/(h*k+c)``, ``residual = u_next + bias + gamma*lambda``.
+Hydroelastic contact stiffness is already area/pressure weighted [N/m], not shape
+bulk stiffness [N/m^3]. Friction weighting is applied once to the existing pair
+coefficient, with the cone bounded by the compliant normal impulse.
 
-Row coefficients are prepared on the device in persistent buffers, and the
-solve kernels add ``gamma * lambda`` to compliant normal residuals in every
-sweep, so a step needs no host synchronization and can be graph captured.
-Eager steps read a latched status word once per step and raise; captured
-replay requires :meth:`SolverSteel.validate_contact_compliance`.
+Row coefficients are prepared on the device in persistent buffers, and the solve
+kernels add ``gamma * lambda`` to compliant normal residuals in every sweep, so the
+step can be graph captured. Errors latch in device status words: an eager step reads its
+own word back to the host and raises, and captured steps latch into a word that
+:meth:`SolverSteel.check_constraint_capacity` reports until :meth:`SolverSteel.reset`.
 """
 
 import math
 
 import warp as wp
 
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, WARP_DETERMINISM_OFF
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
-wp.set_module_options({"enable_backward": False})
-
-# Match the float64 host arithmetic of the coefficient law.
-wp.set_module_options({"fuse_fp": False})
+# Unfused arithmetic keeps the float64 coefficient law equal to the host law.
+wp.set_module_options({"enable_backward": False, "fuse_fp": False, **WARP_DETERMINISM_OFF})
 
 # Status codes, in the order the per-contact checks run.
 _INPUT_OVERFLOW = 0
 _ROW_OVERFLOW = 1
-_INVALID_STIFFNESS = 2
-_UNMAPPED = 3
-_BEYOND_ROWS = 4
-_DUPLICATE = 5
-_INVALID_MATERIAL = 6
-_FLOAT32_RANGE = 7
-_DENSE_TYPE = 8
-_MF_TYPE = 9
-_INVALID_SEPARATION = 10
-_PROPAGATION_TYPE = 11
-_STATUS_CODES = 12
+_RESTITUTION = 2
+_INVALID_STIFFNESS = 3
+_UNMAPPED = 4
+_BEYOND_ROWS = 5
+_DUPLICATE = 6
+_INVALID_MATERIAL = 7
+_FLOAT32_RANGE = 8
+_DENSE_TYPE = 9
+_MF_TYPE = 10
+_INVALID_SEPARATION = 11
+_PROPAGATION_TYPE = 12
+_STATUS_CODES = 13
 # status[_STATUS_CODES] holds the smallest (contact + 1) * 16 + code; global errors use contact = -1.
 _NO_ERROR = 2147483647
 
 _ERRORS = {
     _INPUT_OVERFLOW: (RuntimeError, "contact_compliance rejects overflowing contact input"),
     _ROW_OVERFLOW: (RuntimeError, "contact_compliance rejects overflowing solver rows"),
-    _INVALID_STIFFNESS: (ValueError, "Invalid exported contact stiffness"),
+    _RESTITUTION: (ValueError, "contact_compliance requires zero shape restitution"),
+    _INVALID_STIFFNESS: (ValueError, "Invalid contact stiffness"),
     _UNMAPPED: (RuntimeError, "Compliant contact was dropped or routed to an unsupported path"),
     _BEYOND_ROWS: (RuntimeError, "Compliant contact was dropped or mapped beyond active solver rows"),
     _DUPLICATE: (RuntimeError, "Compliant contacts must map one-to-one to normal rows"),
     _INVALID_MATERIAL: (
         ValueError,
-        "Require finite positive hydro stiffness and non-negative material coefficients",
+        "Require finite positive hydroelastic stiffness and non-negative material coefficients",
     ),
     _FLOAT32_RANGE: (ValueError, "Contact compliance coefficients exceed float32 range"),
     _DENSE_TYPE: (RuntimeError, "Contact map no longer points to a dense normal row"),
-    _MF_TYPE: (RuntimeError, "Contact map no longer points to an effective MF normal row"),
+    _MF_TYPE: (RuntimeError, "Contact map no longer points to an effective free-body normal row"),
     _INVALID_SEPARATION: (ValueError, "separation must be finite"),
     _PROPAGATION_TYPE: (RuntimeError, "Contact map no longer points to a propagation normal row"),
 }
 
 
 def material_coefficients(stiffness, damping, friction_scale, *, shape_friction=0.0):
-    """Resolve one hydro contact's material fields with explicit SI semantics.
+    """Resolve one hydroelastic contact's material fields with explicit SI semantics.
 
-    Positive exported stiffness is required [N/m]. Damping is the exported
-    contact coefficient [N s/m]; zero stays zero, without copying a shape
-    damping coefficient to every quadrature sample. Zero/unset friction scale means 1, NOT
-    frictionless. The returned friction coefficient is pair-mixed shape mu
-    times that scale, applied once (stiffness already includes quadrature).
-    No critical-damping or real-rubber calibration is silently invented.
+    Positive stiffness is required [N/m]. Damping is the contact coefficient [N s/m];
+    zero stays zero. A zero friction scale means 1, not frictionless. The returned
+    friction coefficient is the pair friction times that scale, applied once (the
+    stiffness already includes the quadrature weight).
     """
     values = (stiffness, damping, friction_scale, shape_friction)
     if any(not math.isfinite(x) or x < 0 for x in values) or stiffness == 0:
-        raise ValueError("Require finite positive hydro stiffness and non-negative material coefficients")
+        raise ValueError("Require finite positive hydroelastic stiffness and non-negative material coefficients")
     return stiffness, damping, shape_friction * (friction_scale or 1.0)
 
 
 def normal_coefficients(stiffness, damping, separation, *, dt):
-    """Return impulse-space compliance [1/kg] and velocity bias [m/s]."""
+    """Return the impulse-space compliance [1/kg] and the velocity bias [m/s] of one row."""
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("dt must be finite and positive")
     k, c, _ = material_coefficients(stiffness, damping, 0.0)
     if not math.isfinite(separation):
         raise ValueError("separation must be finite")
-    # A dashpot must not act across an open gap. At a speculative contact,
-    # use the spring-only implicit law until penetration has begun.
+    # A dashpot must not act across an open gap: a speculative contact uses the
+    # spring-only implicit law until penetration has begun.
     denominator = dt * k + (c if separation <= 0.0 else 0.0)
     return 1.0 / (dt * denominator), k * separation / denominator
 
 
-def validate_configuration(model, settings):
-    """Reject combinations without a defined and tested compliant row update."""
-    if settings["articulated_contact_response"] not in ("immediate", "propagation_colored"):
-        raise ValueError(
-            "contact_compliance requires articulated_contact_response 'immediate' or 'propagation_colored'; "
-            f"got {settings['articulated_contact_response']!r}"
-        )
+def validate_configuration(settings):
+    """Reject constructor combinations without a defined and tested compliant row update."""
     required = {
-        "solve_mode": "matrix_free",
-        "row_schedule": "interleaved",
         "velocity_iterations": 0,
         "contact_warmstart": False,
-        "enable_restitution": False,
         "contact_regularization": 0.0,
-        "contact_friction_position_iterations": -1,
-        "friction_mode": "fixed_normal",
-        "contact_friction_shared_anchor": False,
         "contact_shared_anchor": False,
+        "contact_friction_shared_anchor": False,
+        "friction_mode": "fixed_normal",
+        "contact_friction_position_iterations": -1,
     }
     for key, expected in required.items():
         if settings[key] != expected:
             raise ValueError(f"contact_compliance requires {key}={expected!r}; got {settings[key]!r}")
     if settings["iterations"] <= 0:
         raise ValueError("contact_compliance requires positive iterations")
-    if not model.device.is_cuda:
-        raise ValueError("contact_compliance currently requires CUDA")
 
 
 def validate_step(solver):
-    """Reject unqualified combinations before any contact preprocessing."""
-    # The persistent-patch implementation allocates a dummy buffer even when OFF.
+    """Reject unsupported combinations before any contact preprocessing."""
     if getattr(solver, "_friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
         raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
 
 
 def start_step(solver, contacts, dt):
-    """Check host-side step inputs; capture-safe because it reads no device data."""
+    """Check the step's host-side inputs; reads no device data, so it is capture-safe."""
     validate_step(solver)
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("contact_compliance requires a finite positive dt")
@@ -138,11 +125,15 @@ def start_step(solver, contacts, dt):
         getattr(contacts, key, None) is None
         for key in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction")
     ):
-        raise ValueError("contact_compliance requires native per-contact material arrays")
+        raise ValueError("contact_compliance requires per-contact hydroelastic material arrays")
+    # The row kernels index these arrays by contact, up to rigid_contact_max.
+    for key in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+        if getattr(contacts, key).shape != (contacts.rigid_contact_max,):
+            raise ValueError(f"contact_compliance requires {key} of shape ({contacts.rigid_contact_max},)")
 
 
 class ComplianceBuffers:
-    """Persistent per-solver storage for compliant row coefficients and latched status."""
+    """Persistent per-solver storage for compliant row coefficients and the latched status."""
 
     def __init__(self, solver):
         device = solver.model.device
@@ -151,58 +142,57 @@ class ComplianceBuffers:
         self.mf_gamma = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
         self.dense_weight = wp.zeros(solver._diag.shape, dtype=float, device=device)
         self.mf_weight = wp.zeros(solver._mf_eff_mass_inv.shape, dtype=float, device=device)
-        # The colored response puts every contact on propagation rows; other responses route none there.
-        propagation_shape = (
-            (1, 1) if solver._propagation_eff_mass_inv is None else solver._propagation_eff_mass_inv.shape
-        )
+        # Only an active propagation response routes contacts to propagation rows.
+        propagation_shape = solver._propagation_eff_mass_inv.shape if solver._propagation_active else (1, 1)
         self.propagation_gamma = wp.zeros(propagation_shape, dtype=float, device=device)
         self.propagation_weight = wp.zeros(propagation_shape, dtype=float, device=device)
         # [active, skipped] for the latest prepared step.
         self.counts = wp.zeros(2, dtype=wp.int32, device=device)
+        # Captured steps latch into ``status``; eager steps check and clear ``eager_status``.
         self.status = wp.empty(_STATUS_CODES + 1, dtype=wp.int32, device=device)
-        _clear_status(self)
+        self.eager_status = wp.empty(_STATUS_CODES + 1, dtype=wp.int32, device=device)
+        clear_status(self)
         self.dummy_target = wp.zeros((1, 1), dtype=float, device=device)
+        self.dummy_row_type = wp.zeros((1, 1), dtype=int, device=device)
 
 
-def _clear_status(buffers):
-    wp.launch(_reset_status, dim=1, inputs=[buffers.status], device=buffers.status.device)
+def clear_status(buffers):
+    """Clear both latched status words."""
+    for status in (buffers.status, buffers.eager_status):
+        wp.launch(_reset_status, dim=1, inputs=[status], device=status.device)
 
 
 def begin_rows(solver):
-    """Clear step-local coefficients before row construction (memsets only)."""
+    """Clear the step-local coefficients before row construction."""
     buffers = solver._compliance
     buffers.dense_gamma.zero_()
     buffers.mf_gamma.zero_()
     buffers.propagation_gamma.zero_()
     buffers.counts.zero_()
-    # The allocator writes slots_needed only after intentional skip gates.
-    # Clear prior-step requests so an excluded contact cannot look overflowed.
+    # The allocator writes slots_needed only after its skip gates, so a stale request
+    # from an earlier step could make an excluded contact look overflowed.
     solver._contact_slots_needed.zero_()
 
 
 def prepare_rows(solver, contacts, dt):
-    """Replace CFM and bias of compliant normal rows on the device, then weight their friction rows."""
+    """Replace the bias and CFM of compliant normal rows on the device, then weight their friction rows."""
     buffers = solver._compliance
     device = solver.model.device
-    propagation = solver._propagation_eff_mass_inv is not None
+    capturing = wp.get_stream(device).is_capturing
+    status = buffers.status if capturing else buffers.eager_status
+    propagation = solver._propagation_active
     if propagation:
-        propagation_rows = (
-            solver._propagation_constraint_count,
-            solver._propagation_row_type,
-            solver._propagation_phi,
-            solver._propagation_eff_mass_inv,
-            solver._propagation_rhs,
-        )
+        propagation_type = solver._propagation_row_type
+        propagation_phi = solver._propagation_phi
+        propagation_target = solver._propagation_target_velocity
+        propagation_inv = solver._propagation_eff_mass_inv
+        propagation_rhs = solver._propagation_rhs
     else:
-        propagation_rows = (
-            buffers.counts,
-            solver._dummy_contact_row_type,
-            buffers.propagation_gamma,
-            buffers.propagation_weight,
-            buffers.propagation_weight,
-        )
+        # Placeholders of the right types; no contact routes to the propagation rows.
+        propagation_type = buffers.dummy_row_type
+        propagation_phi = propagation_target = propagation_inv = propagation_rhs = buffers.propagation_weight
     wp.launch(
-        _check_capacity,
+        _check_inputs,
         dim=max(solver._world_count, 1),
         inputs=[
             contacts.rigid_contact_count,
@@ -211,13 +201,20 @@ def prepare_rows(solver, contacts, dt):
             solver._articulation_constraint_max,
             solver._mf_constraint_count,
             solver._free_body_constraint_max,
-            propagation_rows[0],
-            solver._propagation_max_constraints if propagation else 2147483647,
+            solver._propagation_constraint_count,
+            solver._propagation_max_constraints,
             solver._row_dropped_all,
-            buffers.status,
+            status,
         ],
         device=device,
     )
+    if solver._enable_restitution:
+        wp.launch(
+            _check_restitution,
+            dim=solver._shape_restitution.shape[0],
+            inputs=[solver._shape_restitution, status],
+            device=device,
+        )
     has_target = bool(solver._has_contact_target_velocity)
     wp.launch(
         _prepare_contacts,
@@ -235,25 +232,26 @@ def prepare_rows(solver, contacts, dt):
             solver._constraint_count,
             solver._row_type,
             solver._phi,
-            solver._row_cfm,
             solver._target_velocity,
             solver._mf_constraint_count,
             solver._mf_row_type,
             solver._mf_phi,
             solver._mf_target_velocity if has_target else buffers.dummy_target,
             int(has_target),
-            propagation_rows[0],
-            propagation_rows[1],
-            propagation_rows[2],
+            solver._propagation_constraint_count,
+            propagation_type,
+            propagation_phi,
+            propagation_target,
             float(solver._cfm),
+            wp.float64(solver._cfm),
         ],
         outputs=[
             solver._diag,
             solver._rhs,
             solver._mf_eff_mass_inv,
             solver._mf_rhs,
-            propagation_rows[3],
-            propagation_rows[4],
+            propagation_inv,
+            propagation_rhs,
             buffers.dense_gamma,
             buffers.mf_gamma,
             buffers.propagation_gamma,
@@ -261,7 +259,7 @@ def prepare_rows(solver, contacts, dt):
             buffers.mf_weight,
             buffers.propagation_weight,
             buffers.counts,
-            buffers.status,
+            status,
         ],
         device=device,
     )
@@ -306,29 +304,31 @@ def prepare_rows(solver, contacts, dt):
             outputs=[solver._propagation_row_mu],
             device=device,
         )
-    if not wp.get_stream(device).is_capturing:
-        validate(solver)
+    if not capturing:
+        # An eager step raises at once; the next step starts from a clear status.
+        validate(status, clear=True)
 
 
-def validate(solver):
-    """Raise and clear the first latched compliance error; one small synchronous readback."""
-    buffers = solver._compliance
-    status = buffers.status.numpy()
-    if not status[:_STATUS_CODES].any():
+def validate(status, *, clear):
+    """Raise the first error latched in ``status`` with one small synchronous readback, optionally clearing it."""
+    values = status.numpy()
+    if not values[:_STATUS_CODES].any():
         return
-    first = int(status[_STATUS_CODES])
-    _clear_status(buffers)
+    first = int(values[_STATUS_CODES])
+    if clear:
+        wp.launch(_reset_status, dim=1, inputs=[status], device=status.device)
     error, message = _ERRORS[first & 15]
-    raise error(message)
+    contact = first // 16 - 1
+    raise error(message if contact < 0 else f"{message} (contact {contact})")
 
 
 def counts(solver):
-    """Return (active, skipped) contact counts of the latest prepared step."""
+    """Return the (active, skipped) contact counts of the latest prepared step."""
     active, skipped = solver._compliance.counts.numpy()
     return int(active), int(skipped)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def _reset_status(status: wp.array[wp.int32]):
     for code in range(_STATUS_CODES):
         status[code] = 0
@@ -341,8 +341,8 @@ def _latch(status: wp.array[wp.int32], code: int, contact: int):
     wp.atomic_min(status, _STATUS_CODES, (contact + 1) * 16 + code)
 
 
-@wp.kernel(enable_backward=False)
-def _check_capacity(
+@wp.kernel
+def _check_inputs(
     contact_count: wp.array[int],
     contact_capacity: int,
     dense_count: wp.array[int],
@@ -357,8 +357,7 @@ def _check_capacity(
     world = wp.tid()
     if world == 0 and (contact_count[0] < 0 or contact_count[0] > contact_capacity):
         _latch(status, _INPUT_OVERFLOW, -1)
-    # Failed contact reservations roll back the live row count. Check loss counters
-    # even when warning output and watermark diagnostics are disabled.
+    # Failed reservations roll back the live row count, so check the loss counters too.
     lost = int(0)
     for family in range(dropped.shape[0]):
         if world < dropped.shape[1]:
@@ -373,19 +372,14 @@ def _check_capacity(
         _latch(status, _ROW_OVERFLOW, -1)
 
 
-@wp.func_native("""
-return __ddiv_rn(1.0, __dmul_rn(dt, __dadd_rn(__dmul_rn(dt, k), c)));
-""")
-def _implicit_gamma(k: wp.float64, c: wp.float64, dt: wp.float64) -> wp.float64: ...
+@wp.kernel
+def _check_restitution(shape_restitution: wp.array[float], status: wp.array[wp.int32]):
+    # The compliant law replaces the position bias; a rebound target has no defined composition with it.
+    if shape_restitution[wp.tid()] > 0.0:
+        _latch(status, _RESTITUTION, -1)
 
 
-@wp.func_native("""
-return __ddiv_rn(__dmul_rn(k, phi), __dadd_rn(__dmul_rn(dt, k), c));
-""")
-def _implicit_bias(k: wp.float64, c: wp.float64, phi: wp.float64, dt: wp.float64) -> wp.float64: ...
-
-
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def _prepare_contacts(
     contact_count: wp.array[int],
     stiffness: wp.array[float],
@@ -399,7 +393,6 @@ def _prepare_contacts(
     dense_count: wp.array[int],
     dense_type: wp.array2d[int],
     dense_phi: wp.array2d[float],
-    dense_cfm: wp.array2d[float],
     dense_target: wp.array2d[float],
     mf_count: wp.array[int],
     mf_type: wp.array2d[int],
@@ -409,7 +402,9 @@ def _prepare_contacts(
     propagation_count: wp.array[int],
     propagation_type: wp.array2d[int],
     propagation_phi: wp.array2d[float],
+    propagation_target: wp.array2d[float],
     pgs_cfm: float,
+    pgs_cfm64: wp.float64,
     diag: wp.array2d[float],
     rhs: wp.array2d[float],
     mf_inv: wp.array2d[float],
@@ -438,7 +433,7 @@ def _prepare_contacts(
     slot = slots[contact]
     world = worlds[contact]
     # No capacity request means the allocator intentionally excluded this pair
-    # (nonresponding bodies, world filtering, or a positive-gap gate).
+    # (non-responding bodies, world filtering or a positive-gap gate).
     if path == -1 and slot == -1 and slots_needed[contact] == 0:
         wp.atomic_add(counts, 1, 1)
         return
@@ -469,7 +464,7 @@ def _prepare_contacts(
     weight = scale
     if scale == 0.0:
         weight = 1.0
-    # Index only the separation array of the validated route; dense and MF capacities differ.
+    # Read only the separation array of the validated route; the row capacities differ.
     phi = float(0.0)
     if path == 0:
         phi = dense_phi[world, slot]
@@ -484,13 +479,15 @@ def _prepare_contacts(
     c64 = wp.float64(0.0)
     if phi <= 0.0:
         c64 = wp.float64(c)
-    gamma = _implicit_gamma(k64, c64, dt)
-    bias = _implicit_bias(k64, c64, wp.float64(phi), dt)
+    denominator = dt * k64 + c64
+    gamma = wp.float64(1.0) / (dt * denominator)
+    bias = k64 * wp.float64(phi) / denominator
     limit = wp.float64(3.4028234663852886e38)
     if wp.abs(gamma) > limit or wp.abs(bias) > limit:
         _latch(status, _FLOAT32_RANGE, contact)
         return
-    gamma32 = float(gamma)
+    # A positive gamma stays nonzero in float32: zero marks a row without compliance.
+    gamma32 = wp.max(float(gamma), 1.17549435e-38)
     bias32 = float(bias)
     if path == 0:
         if dense_type[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT:
@@ -501,7 +498,8 @@ def _prepare_contacts(
             return
         dense_weight[world, slot] = weight
         rhs[world, slot] = bias32 - dense_target[world, slot]
-        diag[world, slot] = diag[world, slot] + (gamma32 - dense_cfm[world, slot])
+        # The compliance replaces the row's constraint force mixing, rounded once from float64.
+        diag[world, slot] = diag[world, slot] + float(gamma - pgs_cfm64)
     elif path == 2:
         inv = propagation_inv[world, slot]
         if propagation_type[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT or inv <= 0.0:
@@ -511,8 +509,7 @@ def _prepare_contacts(
             _latch(status, _DUPLICATE, contact)
             return
         propagation_weight[world, slot] = weight
-        # The colored sweep folds a prescribed side's velocity into this rhs itself.
-        propagation_rhs[world, slot] = bias32
+        propagation_rhs[world, slot] = bias32 - propagation_target[world, slot]
         propagation_inv[world, slot] = 1.0 / (1.0 / inv - pgs_cfm + gamma32)
     else:
         inv = mf_inv[world, slot]
@@ -531,7 +528,7 @@ def _prepare_contacts(
     wp.atomic_add(counts, 0, 1)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def _weight_friction_rows(
     row_count: wp.array[int],
     row_type: wp.array2d[int],

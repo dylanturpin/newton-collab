@@ -1,12 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Joint limits, velocity limits, joint drives and joint friction of SolverSteel."""
-
-from __future__ import annotations
+"""Joint limits, velocity limits, joint friction and joint drives of SolverSteel."""
 
 import inspect
-import itertools
 import unittest
 import warnings
 
@@ -23,314 +20,75 @@ from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     ROW_SLOTS_ATOMIC,
+    ROW_SLOTS_COUNT,
+    ROW_SLOTS_WRITE,
     allocate_joint_velocity_limit_slots,
+    allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
-    build_joint_limit_rows_for_size,
-    eval_rigid_tau,
-    eval_rigid_tau_add,
-    eval_rigid_tau_and_augmented_drives,
-    prepare_augmented_joint_drives,
+    build_joint_limit_rows,
     prescale_joint_velocity_limits,
 )
-from newton._src.solvers.steel.solver_steel import (
-    _get_joint_limit_warp_kernel,
-    _prepare_augmented_joint_drives_by_dof,
-    _use_resident_mfgs_metadata,
-)
+from newton._src.solvers.steel.solver_steel import _get_joint_limit_warp_kernel, _use_resident_mfgs_metadata
 from newton.solvers import SolverBase, SolverSteel
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_cuda_test_devices, get_test_devices
 
 
-def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0):
-    device = "cpu"
+def _built_rows(device, q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, scalar_builder=False):
+    """Build the joint-limit rows of one single-DOF articulation and return ``(J, phi)``.
+
+    ``scalar_builder`` selects the one-thread-per-articulation Warp builder of the CPU path
+    instead of the one-warp-per-articulation CUDA builder.
+    """
     max_constraints = 8
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
     J_group = wp.zeros((1, max_constraints, 1), dtype=wp.float32, device=device)
-    world_row_type = wp.zeros((1, max_constraints), dtype=wp.int32, device=device)
-    world_row_parent = wp.zeros((1, max_constraints), dtype=wp.int32, device=device)
-    world_row_mu = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_row_beta = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_row_cfm = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
     world_phi = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_target_velocity = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-
-    wp.launch(
-        build_joint_limit_rows_for_size,
-        dim=1,
-        inputs=[
-            wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([int(JointType.REVOLUTE)], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([[0, 1]], dtype=wp.int32, device=device),
-            wp.array([lower], dtype=wp.float32, device=device),
-            wp.array([upper], dtype=wp.float32, device=device),
-            wp.array([q], dtype=wp.float32, device=device),
-            gap,
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            max_constraints,
-            0.2,
-            0.0,
-        ],
-        outputs=[
-            world_slot_counter,
-            J_group,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            world_row_beta,
-            world_row_cfm,
-            world_phi,
-            world_target_velocity,
-            ROW_SLOTS_ATOMIC,
-            wp.zeros(1, dtype=wp.int32, device=device),
-        ],
-        device=device,
-    )
-    wp.synchronize()
+    index = wp.array([0], dtype=wp.int32, device=device)
+    inputs = [
+        index,
+        index,
+        index,
+        index,
+        wp.array([lower], dtype=wp.float32, device=device),
+        wp.array([upper], dtype=wp.float32, device=device),
+        wp.array([q], dtype=wp.float32, device=device),
+        gap,
+        max_constraints,
+    ]
+    outputs = [
+        world_slot_counter,
+        J_group,
+        wp.zeros((1, max_constraints), dtype=wp.int32, device=device),
+        wp.zeros((1, max_constraints), dtype=wp.int32, device=device),
+        wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
+        world_phi,
+        wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
+    ]
+    if scalar_builder:
+        wp.launch(
+            build_joint_limit_rows,
+            dim=1,
+            inputs=[*inputs, 1],
+            outputs=[*outputs, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
+            device=device,
+        )
+    else:
+        kernel = _get_joint_limit_warp_kernel(1, wp.get_device(device).arch, 1)
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[1, *inputs],
+            outputs=[*outputs, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
+            block_dim=32,
+            device=device,
+        )
     count = int(world_slot_counter.numpy()[0])
     return J_group.numpy()[0, :count, 0].tolist(), world_phi.numpy()[0, :count].tolist()
 
 
-def _make_phase_layout_run(
-    device,
-    solve_mode,
-    *,
-    iterations=0,
-    row_schedule="interleaved",
-    response="immediate",
-    enable_joint_velocity_limits=True,
+def _make_layout_scene(
+    device, *, enable_joint_velocity_limits=True, solve_mode="matrix_free", response="immediate", iterations=0
 ):
-    """Build a deterministic scene containing every phase-bounded row family."""
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    SolverSteel.register_custom_attributes(builder)
-    builder.default_shape_cfg.density = 1000.0
-    builder.default_shape_cfg.mu = 0.5
-    builder.default_shape_cfg.margin = 0.0
-    builder.default_shape_cfg.gap = 0.0
-
-    link = builder.add_link()
-    builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
-    joint = builder.add_joint_revolute(
-        parent=-1,
-        child=link,
-        axis=wp.vec3(0.0, 1.0, 0.0),
-        parent_xform=wp.transform(wp.vec3(-1.0, 0.0, 0.05), wp.quat_identity()),
-        limit_lower=-0.1,
-        limit_upper=0.1,
-    )
-    builder.add_articulation([joint])
-    builder.joint_q[0] = 0.2
-
-    free_body = builder.add_body(
-        xform=wp.transform(wp.vec3(1.0, 0.0, 0.05), wp.quat_identity()),
-        custom_attributes={
-            "steel:rigid_body_max_linear_velocity": 1.0,
-            "steel:rigid_body_max_angular_velocity": 1.0,
-        },
-    )
-    builder.add_shape_box(free_body, hx=0.1, hy=0.1, hz=0.1)
-    builder.add_ground_plane()
-
-    model = builder.finalize(device=device)
-    velocity_limits = np.full(model.joint_dof_count, np.inf, dtype=np.float32)
-    velocity_limits[0] = 0.25
-    model.joint_velocity_limit.assign(velocity_limits)
-    solver = SolverSteel(
-        model,
-        solve_mode=solve_mode,
-        row_schedule=row_schedule,
-        articulated_contact_response=response,
-        enable_joint_limits=True,
-        enable_joint_velocity_limits=enable_joint_velocity_limits,
-        velocity_limit_activation_fraction=0.5,
-        articulation_constraint_max=64,
-        free_body_constraint_max=64,
-        iterations=iterations,
-        contact_warmstart=False,
-    )
-    state_0, state_1 = model.state(), model.state()
-    joint_qd = state_0.joint_qd.numpy()
-    joint_qd[0] = 0.5
-    free_joint = int(np.flatnonzero(model.joint_type.numpy() == int(JointType.FREE))[0])
-    free_dof = int(model.joint_qd_start.numpy()[free_joint])
-    joint_qd[free_dof] = 1.5
-    joint_qd[free_dof + 3] = 1.5
-    state_0.joint_qd.assign(joint_qd)
-    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    pipeline = newton.CollisionPipeline(model)
-    return model, solver, state_0, state_1, model.control(), pipeline, pipeline.contacts()
-
-
-def _step_once(run):
-    """Build all constraint rows for one deterministic step."""
-    _model, solver, state_0, state_1, control, pipeline, contacts = run
-    state_0.clear_forces()
-    pipeline.collide(state_0, contacts)
-    solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
-    return solver
-
-
-def _assert_dense_phase_layout(
-    test_case: unittest.TestCase, solver: SolverSteel, *, expect_joint_velocity_limits: bool = True
-):
-    """Assert the three dense row-family partitions are ordered and populated."""
-    dense_count = int(solver._constraint_count.numpy()[0])
-    dense_types = solver._row_type.numpy()[0, :dense_count]
-    phase_zero_end, phase_one_end = solver._dense_phase_bounds.numpy()[0]
-    limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
-    velocity_limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-    contact_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_CONTACT)
-    friction_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_FRICTION)
-
-    test_case.assertGreater(limit_rows.size, 0, "expected an active joint position-limit row")
-    if expect_joint_velocity_limits:
-        test_case.assertGreater(velocity_limit_rows.size, 0, "expected active joint velocity-limit rows")
-    else:
-        test_case.assertEqual(velocity_limit_rows.size, 0)
-    test_case.assertGreater(contact_rows.size, 0, "expected dense contact rows")
-    test_case.assertGreater(friction_rows.size, 0, "expected dense friction rows")
-    test_case.assertTrue(np.all(limit_rows < phase_zero_end), (limit_rows, phase_zero_end))
-    if expect_joint_velocity_limits:
-        test_case.assertTrue(
-            np.all((phase_zero_end <= velocity_limit_rows) & (velocity_limit_rows < phase_one_end)),
-            (velocity_limit_rows, phase_zero_end, phase_one_end),
-        )
-    test_case.assertTrue(np.all(contact_rows >= phase_one_end), (contact_rows, phase_one_end))
-    test_case.assertTrue(np.all(friction_rows >= phase_one_end), (friction_rows, phase_one_end))
-
-
-def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverSteel):
-    """Assert MF contacts precede the populated rigid velocity-limit tail."""
-    mf_count = int(solver._mf_constraint_count.numpy()[0])
-    mf_types = solver._mf_row_type.numpy()[0, :mf_count]
-    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
-    contact_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_CONTACT)
-    friction_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_FRICTION)
-    velocity_limit_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-
-    test_case.assertGreater(contact_rows.size, 0, "expected matrix-free contact rows")
-    test_case.assertGreater(friction_rows.size, 0, "expected matrix-free friction rows")
-    test_case.assertGreater(velocity_limit_rows.size, 0, "expected active rigid-body velocity-limit rows")
-    test_case.assertTrue(np.all(contact_rows < mf_contact_end), (contact_rows, mf_contact_end))
-    test_case.assertTrue(np.all(friction_rows < mf_contact_end), (friction_rows, mf_contact_end))
-    test_case.assertTrue(np.all(velocity_limit_rows >= mf_contact_end), (velocity_limit_rows, mf_contact_end))
-    test_case.assertLess(mf_contact_end, mf_count)
-
-
-def _run_joint_limit_trajectory(use_warp_builder: bool):
-    """Run a short PhysX-grasp propagation trajectory with one row builder."""
-    _model, solver, state_in, state_out, control, pipeline, contacts = _make_phase_layout_run(
-        "cuda:0",
-        "matrix_free",
-        iterations=8,
-        row_schedule="phased",
-        response="propagation",
-    )
-    if not use_warp_builder:
-        solver._joint_limit_warp_kernels.clear()
-
-    samples = []
-    for _ in range(4):
-        state_in.clear_forces()
-        pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-        dense_count = int(solver._constraint_count.numpy()[0])
-        mf_count = int(solver._mf_constraint_count.numpy()[0])
-        propagation_count = int(solver._propagation_constraint_count.numpy()[0])
-        samples.append(
-            {
-                "counts": (dense_count, mf_count, propagation_count),
-                "bounds": solver._dense_phase_bounds.numpy().copy(),
-                "row_type": solver._row_type.numpy()[0, :dense_count].copy(),
-                "mf_row_type": solver._mf_row_type.numpy()[0, :mf_count].copy(),
-                "propagation_row_type": solver._propagation_row_type.numpy()[0, :propagation_count].copy(),
-                "impulses": solver._impulses.numpy()[0, :dense_count].copy(),
-                "mf_impulses": solver._mf_impulses.numpy()[0, :mf_count].copy(),
-                "propagation_impulses": solver._propagation_impulses.numpy()[0, :propagation_count].copy(),
-                "joint_q": state_out.joint_q.numpy().copy(),
-                "joint_qd": state_out.joint_qd.numpy().copy(),
-            }
-        )
-        state_in, state_out = state_out, state_in
-    return solver, samples
-
-
-class TestSteelJointLimitActivationGap(unittest.TestCase):
-    def test_dense_row_families_respect_phase_bounds(self):
-        """Keep active position limits before the CPU dense phase-0 bound."""
-        solver = _step_once(_make_phase_layout_run("cpu", "split", enable_joint_velocity_limits=False))
-        _assert_dense_phase_layout(self, solver, expect_joint_velocity_limits=False)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free row-family layout requires CUDA")
-    def test_combined_row_families_respect_phase_bounds(self):
-        """Keep dense and matrix-free row families inside their phase ranges."""
-        solver = _step_once(_make_phase_layout_run("cuda:0", "matrix_free"))
-        _assert_dense_phase_layout(self, solver)
-        _assert_mf_phase_layout(self, solver)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "joint-limit trajectory parity requires CUDA")
-    def test_warp_builder_matches_physx_grasp_propagation_trajectory(self):
-        """Match scalar joint-limit assembly under PhysX-grasp propagation."""
-        reference_solver, reference = _run_joint_limit_trajectory(use_warp_builder=False)
-        warp_solver, actual = _run_joint_limit_trajectory(use_warp_builder=True)
-
-        self.assertFalse(reference_solver._joint_limit_warp_kernels)
-        self.assertTrue(any(kernel is not None for kernel in warp_solver._joint_limit_warp_kernels.values()))
-        self.assertEqual(reference_solver._row_schedule, "phased")
-        self.assertEqual(reference_solver._articulated_contact_response, "propagation")
-        self.assertEqual(len(reference), len(actual))
-        for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
-            self.assertEqual(observed["counts"], expected["counts"], f"row counts differed at step {step}")
-            for label in ("bounds", "row_type", "mf_row_type", "propagation_row_type"):
-                np.testing.assert_array_equal(
-                    observed[label], expected[label], err_msg=f"{label} differed at step {step}"
-                )
-            for label in ("impulses", "mf_impulses", "propagation_impulses", "joint_q", "joint_qd"):
-                np.testing.assert_allclose(
-                    observed[label],
-                    expected[label],
-                    rtol=1.0e-5,
-                    atol=2.0e-6,
-                    err_msg=f"{label} differed at step {step}",
-                )
-
-        limit_rows = np.flatnonzero(reference[0]["row_type"] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
-        self.assertGreater(limit_rows.size, 0)
-        self.assertGreater(float(np.max(np.abs(reference[0]["impulses"][limit_rows]))), 0.0)
-
-    def test_solver_rejects_invalid_joint_limit_activation_gap(self):
-        model = newton.ModelBuilder().finalize()
-
-        for value in (-0.1, float("nan")):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "joint_limit_activation_gap"):
-                    SolverSteel(model, joint_limit_activation_gap=value)
-
-    def test_finite_gap_builds_only_near_limit_rows(self):
-        self.assertEqual(_built_rows(0.0, gap=0.2), ([], []))
-
-        jacobian, phi = _built_rows(-0.85, gap=0.2)
-        self.assertEqual(jacobian, [1.0])
-        self.assertAlmostEqual(phi[0], 0.15, places=6)
-
-        jacobian, phi = _built_rows(0.85, gap=0.2)
-        self.assertEqual(jacobian, [-1.0])
-        self.assertAlmostEqual(phi[0], 0.15, places=6)
-
-    def test_finite_gap_does_not_activate_unlimited_sentinel_limits(self):
-        self.assertEqual(_built_rows(0.0, gap=0.2, lower=-MAXVAL, upper=MAXVAL), ([], []))
-
-    def test_infinite_gap_preserves_historical_always_allocate_behavior(self):
-        jacobian, phi = _built_rows(0.0, gap=float("inf"))
-
-        self.assertEqual(jacobian, [1.0, -1.0])
-        self.assertEqual(phi, [1.0, 1.0])
-
-
-def _make_layout_scene(device, *, enable_joint_velocity_limits=True, solve_mode="matrix_free"):
     """Build a scene that produces every row family: limits, velocity limits and contacts."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     SolverSteel.register_custom_attributes(builder)
@@ -374,7 +132,8 @@ def _make_layout_scene(device, *, enable_joint_velocity_limits=True, solve_mode=
         velocity_limit_activation_fraction=0.5,
         articulation_constraint_max=64,
         free_body_constraint_max=64,
-        iterations=0,
+        iterations=iterations,
+        articulated_contact_response=response,
     )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy()
@@ -426,6 +185,31 @@ def test_combined_row_families_follow_the_documented_layout(test, device):
     test.assertTrue(np.all(mf_velocity_limits >= mf_contact_end))
 
 
+def test_dense_row_families_respect_phase_bounds(test, device):
+    """Lay out split-mode dense rows as limits, contacts; free-body rows as contacts, velocity limits."""
+    solver = _make_layout_run(device, enable_joint_velocity_limits=False, solve_mode="split")
+    dense_count = int(solver._constraint_count.numpy()[0])
+    dense_types = solver._row_type.numpy()[0, :dense_count]
+    limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+    contact_rows = np.flatnonzero(
+        (dense_types == PGS_CONSTRAINT_TYPE_CONTACT) | (dense_types == PGS_CONSTRAINT_TYPE_FRICTION)
+    )
+    test.assertGreater(limit_rows.size, 0)
+    test.assertGreater(contact_rows.size, 0)
+    test.assertEqual(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 0)
+    test.assertLess(limit_rows.max(), contact_rows.min())
+
+    mf_count = int(solver._mf_constraint_count.numpy()[0])
+    mf_types = solver._mf_row_type.numpy()[0, :mf_count]
+    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
+    mf_contacts = np.flatnonzero((mf_types == PGS_CONSTRAINT_TYPE_CONTACT) | (mf_types == PGS_CONSTRAINT_TYPE_FRICTION))
+    mf_velocity_limits = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    test.assertGreater(mf_contacts.size, 0)
+    test.assertGreater(mf_velocity_limits.size, 0)
+    test.assertTrue(np.all(mf_contacts < mf_contact_end))
+    test.assertTrue(np.all(mf_velocity_limits >= mf_contact_end))
+
+
 def test_velocity_limit_rows_require_the_option(test, device):
     """Build no joint velocity-limit rows unless velocity limits are enabled."""
     solver = _make_layout_run(device, enable_joint_velocity_limits=False)
@@ -433,6 +217,31 @@ def test_velocity_limit_rows_require_the_option(test, device):
     dense_types = solver._row_type.numpy()[0, :dense_count]
     test.assertEqual(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 0)
     test.assertGreater(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 0)
+
+
+def test_finite_gap_builds_only_near_limit_rows(test, device, scalar_builder=False):
+    """Create a limit row only within the activation gap of that limit."""
+    test.assertEqual(_built_rows(device, 0.0, gap=0.2, scalar_builder=scalar_builder), ([], []))
+    jacobian, phi = _built_rows(device, -0.85, gap=0.2, scalar_builder=scalar_builder)
+    test.assertEqual(jacobian, [1.0])
+    test.assertAlmostEqual(phi[0], 0.15, places=6)
+    jacobian, phi = _built_rows(device, 0.85, gap=0.2, scalar_builder=scalar_builder)
+    test.assertEqual(jacobian, [-1.0])
+    test.assertAlmostEqual(phi[0], 0.15, places=6)
+
+
+def test_finite_gap_does_not_activate_unlimited_sentinel_limits(test, device, scalar_builder=False):
+    """Treat the builder's unlimited sentinel as no limit."""
+    test.assertEqual(
+        _built_rows(device, 0.0, gap=0.2, lower=-MAXVAL, upper=MAXVAL, scalar_builder=scalar_builder), ([], [])
+    )
+
+
+def test_infinite_gap_allocates_every_finite_limit(test, device, scalar_builder=False):
+    """Create both rows of every finite limit with the default infinite gap."""
+    jacobian, phi = _built_rows(device, 0.0, gap=float("inf"), scalar_builder=scalar_builder)
+    test.assertEqual(jacobian, [1.0, -1.0])
+    test.assertEqual(phi, [1.0, 1.0])
 
 
 def _driven_limited_joint_position(device, **solver_kwargs) -> float:
@@ -479,6 +288,37 @@ def _build_default_limit_chain(device, count: int):
     return builder.finalize(device=device)
 
 
+def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
+    """Keep the rows of the builder's large finite default limits and warn when they exceed the capacity."""
+    for count, expect_warning in ((16, False), (17, True)):
+        with test.subTest(dofs=count):
+            model = _build_default_limit_chain(device, count)
+            test.assertEqual(float(model.joint_limit_upper.numpy()[0]), MAXVAL)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                solver = SolverSteel(model, enable_joint_limits=True, warn_constraint_overflow=False)
+            messages = [str(w.message) for w in caught if "joint position limits" in str(w.message)]
+            test.assertEqual(len(messages), int(expect_warning), messages)
+            if expect_warning:
+                test.assertIn("at least 34 dense rows", messages[0])
+                test.assertIn("articulation_constraint_max=32", messages[0])
+            solver.step(model.state(), model.state(), model.control(), None, 0.01)
+            # Large finite bounds are not reclassified as unlimited: two rows per DOF, up to
+            # the capacity.
+            test.assertEqual(int(solver._constraint_count.numpy()[0]), min(2 * count, 32))
+            test.assertEqual(bool(solver.constraint_overflow.numpy()[0]), expect_warning)
+
+    model = _build_default_limit_chain(device, 17)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        SolverSteel(model, enable_joint_limits=True, articulation_constraint_max=34)
+        gap_solver = SolverSteel(model, enable_joint_limits=True, joint_limit_activation_gap=0.5)
+    test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
+    gap_solver.step(model.state(), model.state(), model.control(), None, 0.01)
+    test.assertEqual(int(gap_solver._constraint_count.numpy()[0]), 0)
+    test.assertFalse(bool(gap_solver.constraint_overflow.numpy()[0]))
+
+
 def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     """Build no limit rows and use no capacity for finite limits when joint limits are disabled."""
     model = _build_default_limit_chain(device, 17)
@@ -491,7 +331,7 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     # The 34 rows of the +/-1e10 defaults would exceed the default capacity of 32 if limits were enabled.
     test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
     for solver in solvers:
-        test.assertFalse(solver._enable_joint_limits)
+        test.assertFalse(solver.enable_joint_limits)
         solver.step(model.state(), model.state(), model.control(), None, 0.01)
         test.assertEqual(int(solver._constraint_count.numpy()[0]), 0)
         test.assertFalse(bool(solver.constraint_overflow.numpy()[0]))
@@ -510,7 +350,73 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     test.assertAlmostEqual(float(state_1.joint_q.numpy()[0]), 0.2, places=6)
 
 
-class TestSteelJointLimitActivationGapUpstream(unittest.TestCase):
+def _run_layout_trajectory(device, response, iterations):
+    """Step the layout scene four times; record each step's row families, impulses and joint state."""
+    model, solver, state_0, state_1, pipeline = _make_layout_scene(device, response=response, iterations=iterations)
+    contacts = pipeline.contacts()
+    control = model.control()
+    samples = []
+    for _ in range(4):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        dense_count = int(solver._constraint_count.numpy()[0])
+        mf_count = int(solver._mf_constraint_count.numpy()[0])
+        propagation_count = int(solver._propagation_constraint_count.numpy()[0])
+        samples.append(
+            {
+                "dense_count": dense_count,
+                "row_type": solver._row_type.numpy()[0, :dense_count].copy(),
+                "impulses": solver._impulses.numpy()[0, :dense_count].copy(),
+                "mf_row_type": solver._mf_row_type.numpy()[0, :mf_count].copy(),
+                "mf_impulses": solver._mf_impulses.numpy()[0, :mf_count].copy(),
+                "propagation_count": propagation_count,
+                "propagation_impulses": solver._propagation_impulses.numpy()[0, :propagation_count].copy(),
+                "joint_q": state_1.joint_q.numpy().copy(),
+                "joint_qd": state_1.joint_qd.numpy().copy(),
+            }
+        )
+        state_0, state_1 = state_1, state_0
+    return samples
+
+
+def test_propagation_solves_every_row_family(test, device):
+    """Solve every row family in the propagation schedule and route every contact to propagation rows.
+
+    Each propagation iteration solves the dense joint-limit rows, the contact rows, the
+    propagation rows and their tree propagation, then the velocity-limit rows. The scene's
+    articulated link sits on its limit against the ground and its free body has velocity limits.
+    """
+    for response in ("propagation", "propagation_colored"):
+        for iterations in (1, 8):
+            with test.subTest(response=response, iterations=iterations):
+                samples = _run_layout_trajectory(device, response, iterations)
+                for step, sample in enumerate(samples):
+                    types = sample["row_type"]
+                    # Dense rows hold only the joint rows; every contact touching the link is a propagation row.
+                    test.assertGreater(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 0, f"step {step}")
+                    test.assertTrue(
+                        np.all(
+                            (types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+                            | (types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+                        )
+                    )
+                    test.assertGreater(sample["propagation_count"], 0)
+                    test.assertGreater(
+                        int(np.sum(sample["mf_row_type"] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 0
+                    )
+                    # The free body's contacts are propagation rows too.
+                    test.assertEqual(int(np.sum(sample["mf_row_type"] == PGS_CONSTRAINT_TYPE_CONTACT)), 0)
+                limit_rows = np.flatnonzero(samples[0]["row_type"] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+                test.assertGreater(float(np.max(np.abs(samples[0]["impulses"][limit_rows]))), 0.0)
+                # The propagation and velocity-limit solves apply impulses too.
+                test.assertGreater(max(float(np.max(np.abs(s["propagation_impulses"]))) for s in samples), 0.0)
+                velocity_limit_impulses = [
+                    s["mf_impulses"][s["mf_row_type"] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT] for s in samples
+                ]
+                test.assertGreater(max(float(np.max(np.abs(i))) for i in velocity_limit_impulses), 0.0)
+
+
+class TestSteelJointLimitActivationGap(unittest.TestCase):
     pass
 
 
@@ -523,14 +429,33 @@ for _name, _func in (
         test_combined_row_families_follow_the_documented_layout,
     ),
     ("test_velocity_limit_rows_require_the_option", test_velocity_limit_rows_require_the_option),
+    ("test_finite_gap_builds_only_near_limit_rows", test_finite_gap_builds_only_near_limit_rows),
+    (
+        "test_finite_gap_does_not_activate_unlimited_sentinel_limits",
+        test_finite_gap_does_not_activate_unlimited_sentinel_limits,
+    ),
+    ("test_infinite_gap_allocates_every_finite_limit", test_infinite_gap_allocates_every_finite_limit),
     ("test_limit_holds_a_driven_joint", test_limit_holds_a_driven_joint),
     ("test_disabled_joint_limits_are_not_enforced", test_disabled_joint_limits_are_not_enforced),
     ("test_disabled_joint_limits_build_no_rows", test_disabled_joint_limits_build_no_rows),
+    (
+        "test_default_finite_limits_keep_rows_and_warn_at_capacity",
+        test_default_finite_limits_keep_rows_and_warn_at_capacity,
+    ),
+    ("test_propagation_solves_every_row_family", test_propagation_solves_every_row_family),
 ):
-    add_function_test(TestSteelJointLimitActivationGapUpstream, _name, _func, devices=devices)
+    add_function_test(TestSteelJointLimitActivationGap, _name, _func, devices=devices)
 
 
 split_devices = get_test_devices()
+
+
+add_function_test(
+    TestSteelJointLimitActivationGap,
+    "test_dense_row_families_respect_phase_bounds",
+    test_dense_row_families_respect_phase_bounds,
+    devices=split_devices,
+)
 
 
 for _name, _func in (
@@ -539,7 +464,7 @@ for _name, _func in (
     ("test_disabled_joint_limits_build_no_rows", test_disabled_joint_limits_build_no_rows),
 ):
     add_function_test(
-        TestSteelJointLimitActivationGapUpstream,
+        TestSteelJointLimitActivationGap,
         f"{_name}_split",
         _func,
         devices=split_devices,
@@ -547,8 +472,39 @@ for _name, _func in (
     )
 
 
-def _outputs(articulation_count: int, max_constraints: int, size: int, device):
-    return (
+for _name, _func in (
+    ("test_finite_gap_builds_only_near_limit_rows", test_finite_gap_builds_only_near_limit_rows),
+    (
+        "test_finite_gap_does_not_activate_unlimited_sentinel_limits",
+        test_finite_gap_does_not_activate_unlimited_sentinel_limits,
+    ),
+    ("test_infinite_gap_allocates_every_finite_limit", test_infinite_gap_allocates_every_finite_limit),
+):
+    add_function_test(
+        TestSteelJointLimitActivationGap,
+        f"{_name}_scalar_builder",
+        _func,
+        devices=split_devices,
+        scalar_builder=True,
+    )
+
+
+def test_warp_builder_matches_reference_row_order_and_values(test, device, scalar_builder=False):
+    """Emit active limit rows in DOF order with the lower row before the upper row of each DOF.
+
+    ``scalar_builder`` checks the one-thread-per-articulation builder of the CPU path instead.
+    """
+    articulation_count = 257
+    size = 6
+    max_constraints = 2 * size
+    dof_count = articulation_count * size
+    gap = 0.25
+    rng = np.random.default_rng(42)
+    q = rng.uniform(-1.2, 1.2, dof_count).astype(np.float32)
+    lower = np.full(dof_count, -1.0, dtype=np.float32)
+    upper = np.full(dof_count, 1.0, dtype=np.float32)
+
+    outputs = (
         wp.zeros(articulation_count, dtype=wp.int32, device=device),
         wp.zeros((articulation_count, max_constraints, size), dtype=wp.float32, device=device),
         wp.zeros((articulation_count, max_constraints), dtype=wp.int32, device=device),
@@ -556,243 +512,80 @@ def _outputs(articulation_count: int, max_constraints: int, size: int, device):
         wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
         wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
         wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
-        wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
-        wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
     )
-
-
-class TestSteelJointLimitWarp(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "warp-parallel joint-limit assembly requires CUDA")
-    def test_warp_builder_matches_scalar_row_order_and_values(self):
-        device = wp.get_cuda_device()
-        articulation_count = 257
-        size = 6
-        max_constraints = 2 * size
-        dof_count = articulation_count * size
-        rng = np.random.default_rng(42)
-
-        articulation_start = wp.array(np.arange(articulation_count + 1), dtype=wp.int32, device=device)
-        articulation_dof_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_type = wp.array(np.full(articulation_count, JointType.D6), dtype=wp.int32, device=device)
-        joint_q_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_qd_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_dof_dim = wp.array(np.tile([3, 3], (articulation_count, 1)), dtype=wp.int32, device=device)
-        lower = wp.array(np.full(dof_count, -1.0, dtype=np.float32), dtype=wp.float32, device=device)
-        upper = wp.array(np.full(dof_count, 1.0, dtype=np.float32), dtype=wp.float32, device=device)
-        joint_q = wp.array(rng.uniform(-1.2, 1.2, dof_count).astype(np.float32), dtype=wp.float32, device=device)
-        art_to_world = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
-        group_to_art = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
-        scalar = _outputs(articulation_count, max_constraints, size, device)
-
+    inputs = [
+        wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device),
+        wp.array(np.arange(articulation_count), dtype=wp.int32, device=device),
+        wp.array(np.arange(articulation_count), dtype=wp.int32, device=device),
+        wp.array(np.arange(dof_count), dtype=wp.int32, device=device),
+        wp.array(lower, dtype=wp.float32, device=device),
+        wp.array(upper, dtype=wp.float32, device=device),
+        wp.array(q, dtype=wp.float32, device=device),
+        gap,
+        max_constraints,
+    ]
+    if scalar_builder:
         wp.launch(
-            build_joint_limit_rows_for_size,
+            build_joint_limit_rows,
             dim=articulation_count,
-            inputs=[
-                articulation_start,
-                articulation_dof_start,
-                joint_type,
-                joint_q_start,
-                joint_qd_start,
-                joint_dof_dim,
-                lower,
-                upper,
-                joint_q,
-                0.25,
-                art_to_world,
-                group_to_art,
-                max_constraints,
-                0.2,
-                1.0e-6,
-            ],
-            outputs=[*scalar, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
+            inputs=[*inputs, size],
+            outputs=[*outputs, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
             device=device,
         )
-
-        parallel = _outputs(articulation_count, max_constraints, size, device)
+    else:
         warps_per_block = 4
-        kernel = _get_joint_limit_warp_kernel(size, device.arch, warps_per_block)
+        kernel = _get_joint_limit_warp_kernel(size, wp.get_device(device).arch, warps_per_block)
         wp.launch_tiled(
             kernel,
             dim=[(articulation_count + warps_per_block - 1) // warps_per_block],
-            inputs=[
-                articulation_count,
-                articulation_dof_start,
-                art_to_world,
-                group_to_art,
-                wp.array(np.arange(dof_count), dtype=wp.int32, device=device),
-                lower,
-                upper,
-                joint_q,
-                0.25,
-                max_constraints,
-                0.2,
-                1.0e-6,
-            ],
-            outputs=[*parallel, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
+            inputs=[articulation_count, *inputs],
+            outputs=[*outputs, ROW_SLOTS_ATOMIC, wp.zeros(1, dtype=wp.int32, device=device)],
             block_dim=32 * warps_per_block,
             device=device,
         )
-        wp.synchronize_device(device)
+    counter, J_group, row_type, row_parent, row_mu, phi, target = (array.numpy() for array in outputs)
 
-        for parallel_array, scalar_array in zip(parallel, scalar, strict=True):
-            np.testing.assert_array_equal(parallel_array.numpy(), scalar_array.numpy())
-
-
-def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: float = 1.0):
-    device = "cpu"
-    velocity_limit_slot = wp.full((2,), -1, dtype=wp.int32, device=device)
-    velocity_limit_sign = wp.zeros((2,), dtype=wp.float32, device=device)
-    world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
-
-    wp.launch(
-        allocate_joint_velocity_limit_slots,
-        dim=1,
-        inputs=[
-            wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([1], dtype=wp.int32, device=device),
-            wp.array([int(JointType.REVOLUTE)], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([[0, 1]], dtype=wp.int32, device=device),
-            wp.array([qdot_max], dtype=wp.float32, device=device),
-            wp.array([qd], dtype=wp.float32, device=device),
-            fraction,
-            wp.array([-1], dtype=wp.int32, device=device),  # drive_slot (unused: skip_driven=0)
-            0,  # skip_driven
-            wp.array([0], dtype=wp.int32, device=device),
-            8,
-            wp.ones(1, dtype=wp.int32, device=device),
-        ],
-        outputs=[
-            velocity_limit_slot,
-            velocity_limit_sign,
-            world_slot_counter,
-            ROW_SLOTS_ATOMIC,
-            wp.zeros(1, dtype=wp.int32, device=device),
-        ],
-        device=device,
-    )
-    return (
-        velocity_limit_slot.numpy().tolist(),
-        velocity_limit_sign.numpy().tolist(),
-        int(world_slot_counter.numpy()[0]),
-    )
+    for art in range(articulation_count):
+        expected_J = np.zeros((max_constraints, size), dtype=np.float32)
+        expected_phi = []
+        for local in range(size):
+            dof = art * size + local
+            for sign, value, active in (
+                (1.0, q[dof] - lower[dof], q[dof] <= lower[dof] + gap),
+                (-1.0, upper[dof] - q[dof], q[dof] >= upper[dof] - gap),
+            ):
+                if active:
+                    expected_J[len(expected_phi), local] = sign
+                    expected_phi.append(value)
+        count = len(expected_phi)
+        test.assertEqual(int(counter[art]), count)
+        np.testing.assert_array_equal(J_group[art], expected_J)
+        np.testing.assert_array_equal(row_type[art, :count], PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+        np.testing.assert_array_equal(row_parent[art, :count], -1)
+        np.testing.assert_array_equal(row_mu[art, :count], 0.0)
+        np.testing.assert_array_equal(target[art, :count], 0.0)
+        np.testing.assert_allclose(phi[art, :count], np.asarray(expected_phi, dtype=np.float32), rtol=0.0, atol=1.0e-7)
 
 
-def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0):
-    device = "cpu"
-    rigid_velocity_limit_slot = wp.full((12,), -1, dtype=wp.int32, device=device)
-    rigid_velocity_limit_sign = wp.zeros((12,), dtype=wp.float32, device=device)
-    mf_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
-
-    wp.launch(
-        allocate_rigid_velocity_limit_slots,
-        dim=1,
-        inputs=[
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([1], dtype=wp.int32, device=device),
-            wp.array([int(BodyFlags.DYNAMIC)], dtype=wp.int32, device=device),
-            wp.array([lin_limit], dtype=wp.float32, device=device),
-            wp.array([ang_limit], dtype=wp.float32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array(list(qd6), dtype=wp.float32, device=device),
-            wp.array([wp.quat_identity()], dtype=wp.quat, device=device),
-            fraction,
-            64,
-            wp.ones(1, dtype=wp.int32, device=device),
-        ],
-        outputs=[
-            rigid_velocity_limit_slot,
-            rigid_velocity_limit_sign,
-            mf_slot_counter,
-            ROW_SLOTS_ATOMIC,
-            wp.zeros(1, dtype=wp.int32, device=device),
-        ],
-        device=device,
-    )
-    return (
-        rigid_velocity_limit_slot.numpy().tolist(),
-        rigid_velocity_limit_sign.numpy().tolist(),
-        int(mf_slot_counter.numpy()[0]),
-    )
+class TestSteelJointLimitWarp(unittest.TestCase):
+    pass
 
 
-class TestSteelVelocityLimitActivationFraction(unittest.TestCase):
-    def test_solver_rejects_invalid_velocity_limit_activation_fraction(self):
-        model = newton.ModelBuilder().finalize()
+add_function_test(
+    TestSteelJointLimitWarp,
+    "test_warp_builder_matches_reference_row_order_and_values",
+    test_warp_builder_matches_reference_row_order_and_values,
+    devices=get_cuda_test_devices(),
+)
 
-        for value in (-0.1, float("nan")):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "velocity_limit_activation_fraction"):
-                    SolverSteel(model, velocity_limit_activation_fraction=value)
 
-    def test_solver_accepts_and_defaults_velocity_limit_activation_fraction(self):
-        model = newton.ModelBuilder().finalize()
-
-        self.assertEqual(SolverSteel(model).velocity_limit_activation_fraction, 0.0)
-        self.assertEqual(
-            SolverSteel(model, velocity_limit_activation_fraction=0.7).velocity_limit_activation_fraction,
-            0.7,
-        )
-
-    def test_fraction_zero_preserves_always_allocate_joint_rows(self):
-        # fraction == 0.0 must match the historical behavior exactly: both
-        # sides of every finitely limited DOF allocate, in the same order,
-        # regardless of the current joint velocity.
-        for qd in (0.0, 0.5, -2.0):
-            with self.subTest(qd=qd):
-                slots, signs, count = _allocated_joint_velocity_slots(qd, fraction=0.0)
-                self.assertEqual(slots, [0, 1])
-                self.assertEqual(signs, [1.0, -1.0])
-                self.assertEqual(count, 2)
-
-    def test_fraction_gates_static_joint_dof_to_zero_rows(self):
-        slots, signs, count = _allocated_joint_velocity_slots(0.0, fraction=0.9)
-        self.assertEqual(slots, [-1, -1])
-        self.assertEqual(signs, [0.0, 0.0])
-        self.assertEqual(count, 0)
-
-        slots, signs, count = _allocated_joint_velocity_slots(0.85, fraction=0.9)
-        self.assertEqual(slots, [-1, -1])
-        self.assertEqual(count, 0)
-
-    def test_joint_dof_past_threshold_allocates_rows_same_step(self):
-        # The gate reads the same-step joint_qd input, so a DOF driven past
-        # the threshold gets its row pair allocated in that very step.
-        for qd in (0.95, -0.95, 1.5):
-            with self.subTest(qd=qd):
-                slots, signs, count = _allocated_joint_velocity_slots(qd, fraction=0.9)
-                self.assertEqual(slots, [0, 1])
-                self.assertEqual(signs, [1.0, -1.0])
-                self.assertEqual(count, 2)
-
-    def test_fraction_zero_preserves_always_allocate_rigid_rows(self):
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0)
-        self.assertEqual(slots, list(range(12)))
-        self.assertEqual(signs, [1.0, -1.0] * 6)
-        self.assertEqual(count, 12)
-
-    def test_fraction_gates_static_rigid_body_to_zero_rows(self):
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.9)
-        self.assertEqual(slots, [-1] * 12)
-        self.assertEqual(signs, [0.0] * 12)
-        self.assertEqual(count, 0)
-
-    def test_rigid_axis_past_threshold_allocates_rows_same_step(self):
-        # Only the linear-z axis (axis 2 -> slot indices 4, 5) exceeds the
-        # 90% activation threshold; its pair allocates this step.
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0, 0.0, 0.95, 0.0, 0.0, 0.0], fraction=0.9)
-        expected_slots = [-1] * 12
-        expected_slots[4] = 0
-        expected_slots[5] = 1
-        expected_signs = [0.0] * 12
-        expected_signs[4] = 1.0
-        expected_signs[5] = -1.0
-        self.assertEqual(slots, expected_slots)
-        self.assertEqual(signs, expected_signs)
-        self.assertEqual(count, 2)
+add_function_test(
+    TestSteelJointLimitWarp,
+    "test_scalar_builder_matches_reference_row_order_and_values",
+    test_warp_builder_matches_reference_row_order_and_values,
+    devices=get_test_devices(),
+    scalar_builder=True,
+)
 
 
 QDOT_MAX = 0.5
@@ -802,9 +595,7 @@ QDOT_MAX = 0.5
 LIMIT_TOL = 1.05
 
 
-def _allocated_joint_velocity_slots_velocity_limit_activation_fraction_upstream(
-    device, qd: float, *, fraction: float, qdot_max: float = 1.0
-):
+def _allocated_joint_velocity_slots(device, qd: float, *, fraction: float, qdot_max: float = 1.0):
     velocity_limit_slot = wp.full((2,), -1, dtype=wp.int32, device=device)
     velocity_limit_sign = wp.zeros((2,), dtype=wp.float32, device=device)
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
@@ -813,6 +604,7 @@ def _allocated_joint_velocity_slots_velocity_limit_activation_fraction_upstream(
         dim=1,
         inputs=[
             wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([1], dtype=wp.int32, device=device),
             wp.array([int(JointType.REVOLUTE)], dtype=wp.int32, device=device),
@@ -843,9 +635,7 @@ def _allocated_joint_velocity_slots_velocity_limit_activation_fraction_upstream(
     )
 
 
-def _allocated_rigid_velocity_slots_velocity_limit_activation_fraction_upstream(
-    device, qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0
-):
+def _allocated_rigid_velocity_slots(device, qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0):
     rigid_velocity_limit_slot = wp.full((12,), -1, dtype=wp.int32, device=device)
     rigid_velocity_limit_sign = wp.zeros((12,), dtype=wp.float32, device=device)
     mf_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
@@ -883,13 +673,104 @@ def _allocated_rigid_velocity_slots_velocity_limit_activation_fraction_upstream(
     )
 
 
+def _build_arm_and_box_model(device) -> newton.Model:
+    """A driven revolute arm plus a heavy free box overlapping its tip, without gravity or friction."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.default_shape_cfg.density = 1000.0
+    builder.default_shape_cfg.mu = 0.0
+    builder.default_shape_cfg.margin = 0.0
+    builder.default_shape_cfg.gap = 0.0
+
+    # Arm spanning x in [0, 0.8] at z = 0.5, hinged at its left end about y.
+    arm = builder.add_link()
+    builder.add_shape_box(arm, hx=0.4, hy=0.05, hz=0.02)
+    j_arm = builder.add_joint_revolute(
+        parent=-1,
+        child=arm,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.4, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.add_articulation([j_arm])
+    # Heavy box, bottom face slightly penetrating the arm top near the tip.
+    box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+    return builder.finalize(device=device)
+
+
+def _max_arm_speed_over_impact(device, *, enable_joint_velocity_limits: bool) -> float:
+    model = _build_arm_and_box_model(device)
+    n = model.joint_dof_count
+    target_ke = np.zeros(n, dtype=np.float32)
+    target_kd = np.zeros(n, dtype=np.float32)
+    vel_limit = np.full(n, np.inf, dtype=np.float32)
+    target_ke[0] = 200.0
+    target_kd[0] = 5.0
+    vel_limit[0] = QDOT_MAX
+    model.joint_target_ke.assign(target_ke)
+    model.joint_target_kd.assign(target_kd)
+    model.joint_velocity_limit.assign(vel_limit)
+    # Deliberately under-converged: the velocity limit must still have the last word.
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        enable_joint_velocity_limits=enable_joint_velocity_limits,
+        iterations=8,
+        articulation_constraint_max=32,
+        free_body_constraint_max=32,
+    )
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    joint_qd = state_0.joint_qd.numpy()
+    joint_qd[3] = -3.0  # box linear z: slam into the arm tip
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    max_arm_speed = 0.0
+    for _ in range(20):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        max_arm_speed = max(max_arm_speed, float(abs(state_0.joint_qd.numpy()[0])))
+    return max_arm_speed
+
+
+def test_dedicated_rows_hold_limit_through_impact(test, device):
+    """Hold a driven joint's velocity limit through an impact that would exceed it several times over."""
+    unlimited = _max_arm_speed_over_impact(device, enable_joint_velocity_limits=False)
+    limited = _max_arm_speed_over_impact(device, enable_joint_velocity_limits=True)
+    test.assertGreater(unlimited, 2.0 * QDOT_MAX, "the impact must exceed the limit when it is not enforced")
+    test.assertLessEqual(limited, QDOT_MAX * LIMIT_TOL)
+
+
 def test_fraction_zero_allocates_every_joint_row(test, device):
     """Allocate both rows of every limited DOF regardless of its velocity when the fraction is zero."""
     for qd in (0.0, 0.5, -2.0):
         with test.subTest(qd=qd):
-            slots, signs, count = _allocated_joint_velocity_slots_velocity_limit_activation_fraction_upstream(
-                device, qd, fraction=0.0
-            )
+            slots, signs, count = _allocated_joint_velocity_slots(device, qd, fraction=0.0)
+            test.assertEqual(slots, [0, 1])
+            test.assertEqual(signs, [1.0, -1.0])
+            test.assertEqual(count, 2)
+
+
+def test_fraction_gates_static_joint_dof_to_zero_rows(test, device):
+    """Allocate no rows for a DOF below the activation fraction of its limit."""
+    slots, signs, count = _allocated_joint_velocity_slots(device, 0.0, fraction=0.9)
+    test.assertEqual(slots, [-1, -1])
+    test.assertEqual(signs, [0.0, 0.0])
+    test.assertEqual(count, 0)
+    slots, signs, count = _allocated_joint_velocity_slots(device, 0.85, fraction=0.9)
+    test.assertEqual(slots, [-1, -1])
+    test.assertEqual(count, 0)
+
+
+def test_joint_dof_past_threshold_allocates_rows_same_step(test, device):
+    """Allocate the row pair in the same step a DOF crosses the activation fraction."""
+    for qd in (0.95, -0.95, 1.5):
+        with test.subTest(qd=qd):
+            slots, signs, count = _allocated_joint_velocity_slots(device, qd, fraction=0.9)
             test.assertEqual(slots, [0, 1])
             test.assertEqual(signs, [1.0, -1.0])
             test.assertEqual(count, 2)
@@ -897,12 +778,32 @@ def test_fraction_zero_allocates_every_joint_row(test, device):
 
 def test_fraction_zero_allocates_every_rigid_row(test, device):
     """Allocate all twelve free-body velocity-limit rows when the fraction is zero."""
-    slots, signs, count = _allocated_rigid_velocity_slots_velocity_limit_activation_fraction_upstream(
-        device, [0.0] * 6, fraction=0.0
-    )
+    slots, signs, count = _allocated_rigid_velocity_slots(device, [0.0] * 6, fraction=0.0)
     test.assertEqual(slots, list(range(12)))
     test.assertEqual(signs, [1.0, -1.0] * 6)
     test.assertEqual(count, 12)
+
+
+def test_fraction_gates_static_rigid_body_to_zero_rows(test, device):
+    """Allocate no free-body rows for a body below the activation fraction."""
+    slots, signs, count = _allocated_rigid_velocity_slots(device, [0.0] * 6, fraction=0.9)
+    test.assertEqual(slots, [-1] * 12)
+    test.assertEqual(signs, [0.0] * 12)
+    test.assertEqual(count, 0)
+
+
+def test_rigid_axis_past_threshold_allocates_rows_same_step(test, device):
+    """Allocate only the row pair of the free-body axis past the activation fraction."""
+    slots, signs, count = _allocated_rigid_velocity_slots(device, [0.0, 0.0, 0.95, 0.0, 0.0, 0.0], fraction=0.9)
+    expected_slots = [-1] * 12
+    expected_slots[4] = 0
+    expected_slots[5] = 1
+    expected_signs = [0.0] * 12
+    expected_signs[4] = 1.0
+    expected_signs[5] = -1.0
+    test.assertEqual(slots, expected_slots)
+    test.assertEqual(signs, expected_signs)
+    test.assertEqual(count, 2)
 
 
 def test_free_body_velocity_limits_hold(test, device, solve_mode="matrix_free"):
@@ -930,33 +831,45 @@ def test_free_body_velocity_limits_hold(test, device, solve_mode="matrix_free"):
     test.assertLessEqual(float(np.max(np.abs(final[3:6]))), 1.0 * LIMIT_TOL)
 
 
-class TestSteelVelocityLimitActivationFractionUpstream(unittest.TestCase):
+class TestSteelVelocityLimitActivationFraction(unittest.TestCase):
     pass
 
 
 for _name, _func in (
+    ("test_dedicated_rows_hold_limit_through_impact", test_dedicated_rows_hold_limit_through_impact),
     ("test_fraction_zero_allocates_every_joint_row", test_fraction_zero_allocates_every_joint_row),
+    ("test_fraction_gates_static_joint_dof_to_zero_rows", test_fraction_gates_static_joint_dof_to_zero_rows),
+    ("test_joint_dof_past_threshold_allocates_rows_same_step", test_joint_dof_past_threshold_allocates_rows_same_step),
     ("test_fraction_zero_allocates_every_rigid_row", test_fraction_zero_allocates_every_rigid_row),
+    ("test_fraction_gates_static_rigid_body_to_zero_rows", test_fraction_gates_static_rigid_body_to_zero_rows),
+    (
+        "test_rigid_axis_past_threshold_allocates_rows_same_step",
+        test_rigid_axis_past_threshold_allocates_rows_same_step,
+    ),
     ("test_free_body_velocity_limits_hold", test_free_body_velocity_limits_hold),
 ):
-    add_function_test(TestSteelVelocityLimitActivationFractionUpstream, _name, _func, devices=devices)
+    add_function_test(TestSteelVelocityLimitActivationFraction, _name, _func, devices=devices)
 
 
 # The allocators are mode-independent kernels; free-body velocity limits are also rows in split mode.
 for _name, _func in (
     ("test_fraction_zero_allocates_every_joint_row", test_fraction_zero_allocates_every_joint_row),
+    ("test_fraction_gates_static_joint_dof_to_zero_rows", test_fraction_gates_static_joint_dof_to_zero_rows),
+    ("test_joint_dof_past_threshold_allocates_rows_same_step", test_joint_dof_past_threshold_allocates_rows_same_step),
     ("test_fraction_zero_allocates_every_rigid_row", test_fraction_zero_allocates_every_rigid_row),
+    ("test_fraction_gates_static_rigid_body_to_zero_rows", test_fraction_gates_static_rigid_body_to_zero_rows),
+    (
+        "test_rigid_axis_past_threshold_allocates_rows_same_step",
+        test_rigid_axis_past_threshold_allocates_rows_same_step,
+    ),
 ):
     add_function_test(
-        TestSteelVelocityLimitActivationFractionUpstream,
-        _name,
-        _func,
-        devices=[d for d in get_test_devices() if d.is_cpu],
+        TestSteelVelocityLimitActivationFraction, _name, _func, devices=[d for d in get_test_devices() if d.is_cpu]
     )
 
 
 add_function_test(
-    TestSteelVelocityLimitActivationFractionUpstream,
+    TestSteelVelocityLimitActivationFraction,
     "test_free_body_velocity_limits_hold_split",
     test_free_body_velocity_limits_hold,
     devices=get_test_devices(),
@@ -964,123 +877,75 @@ add_function_test(
 )
 
 
-# GS-convergence slack on the limit; the final clamp leaves the DOF at the
-# limit, later float noise stays well under 5%.
-LIMIT_TOL = 1.05
-
-
-def _build_arm_and_box_model(device) -> newton.Model:
-    """A driven revolute arm plus a heavy free box overlapping its tip.
-
-    Gravity is zero and the box carries a large downward velocity, so the
-    contact impulse into the arm tip is the only thing fighting the velocity
-    limit — fully deterministic.
-    """
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.default_shape_cfg.density = 1000.0
-    builder.default_shape_cfg.ke = 1.0e5
-    builder.default_shape_cfg.kd = 1.0e3
-    builder.default_shape_cfg.mu = 0.0
-    builder.default_shape_cfg.margin = 0.0
-    builder.default_shape_cfg.gap = 0.0
-
-    # Arm spanning x in [0, 0.8] at z = 0.5, hinged at its left end about y.
-    arm = builder.add_link()
-    builder.add_shape_box(arm, hx=0.4, hy=0.05, hz=0.02)
-    j_arm = builder.add_joint_revolute(
-        parent=-1,
-        child=arm,
-        axis=wp.vec3(0.0, 1.0, 0.0),
-        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
-        child_xform=wp.transform(wp.vec3(-0.4, 0.0, 0.0), wp.quat_identity()),
+def _max_arm_speed_and_fused_over_impact(
+    device, *, enable_joint_velocity_limits: bool, fuse: bool
+) -> tuple[float, int]:
+    model = _build_arm_and_box_model(device)
+    n = model.joint_dof_count
+    target_ke = np.zeros(n, dtype=np.float32)
+    target_kd = np.zeros(n, dtype=np.float32)
+    vel_limit = np.full(n, np.inf, dtype=np.float32)
+    target_ke[0] = 200.0
+    target_kd[0] = 5.0
+    vel_limit[0] = QDOT_MAX
+    model.joint_target_ke.assign(target_ke)
+    model.joint_target_kd.assign(target_kd)
+    model.joint_velocity_limit.assign(vel_limit)
+    # Deliberately under-converged: ordering only matters when the sweep does not converge.
+    # A clamp inside the drive-row visit lets this impact reach about 1.5x the limit at 8
+    # iterations; dedicated rows and the end-of-iteration clamp hold it.
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        drive_mode="rows",
+        enable_joint_velocity_limits=enable_joint_velocity_limits,
+        fuse_joint_velocity_limits=fuse,
+        iterations=8,
+        articulation_constraint_max=32,
+        free_body_constraint_max=32,
     )
-    builder.add_articulation([j_arm])
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    joint_qd = state_0.joint_qd.numpy()
+    joint_qd[3] = -3.0  # box linear z: slam into the arm tip
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    max_arm_speed = 0.0
+    for _ in range(20):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        max_arm_speed = max(max_arm_speed, float(abs(state_0.joint_qd.numpy()[0])))
+    return max_arm_speed, int(solver.velocity_limits_fused)
 
-    # Heavy box, bottom face slightly penetrating the arm top near the tip.
-    box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
-    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
-    builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
 
-    return builder.finalize(device=device)
+def test_dedicated_rows_hold_pgs_drive_limit_through_impact(test, device):
+    """Hold a PGS-driven joint's velocity limit through the impact with dedicated velocity-limit rows."""
+    unlimited, _ = _max_arm_speed_and_fused_over_impact(device, enable_joint_velocity_limits=False, fuse=False)
+    limited, fused = _max_arm_speed_and_fused_over_impact(device, enable_joint_velocity_limits=True, fuse=False)
+    test.assertFalse(fused)
+    test.assertGreater(unlimited, 2.0 * QDOT_MAX, "the impact must exceed the limit when it is not enforced")
+    test.assertLessEqual(limited, QDOT_MAX * LIMIT_TOL)
+
+
+def test_fused_clamp_holds_limit_through_impact(test, device):
+    """Hold the same limit with the fused end-of-iteration clamp that replaces the rows."""
+    speed, fused = _max_arm_speed_and_fused_over_impact(device, enable_joint_velocity_limits=True, fuse=True)
+    test.assertTrue(fused)
+    test.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
 
 class TestSteelFusedVelocityLimitOrdering(unittest.TestCase):
-    def _max_arm_speed_over_impact(self, fuse: bool, articulated_contact_response: str) -> float:
-        model = _build_arm_and_box_model(device="cuda:0")
+    pass
 
-        n = model.joint_dof_count
-        target_ke = np.zeros(n, dtype=np.float32)
-        target_kd = np.zeros(n, dtype=np.float32)
-        vel_limit = np.full(n, np.inf, dtype=np.float32)
-        target_ke[0] = 200.0
-        target_kd[0] = 5.0
-        vel_limit[0] = QDOT_MAX
-        model.joint_target_ke.assign(target_ke)
-        model.joint_target_kd.assign(target_kd)
-        model.joint_velocity_limit.assign(vel_limit)
 
-        solver = SolverSteel(
-            model,
-            solve_mode="matrix_free",
-            drive_mode="rows",
-            articulated_contact_response=articulated_contact_response,
-            enable_joint_velocity_limits=True,
-            fuse_joint_velocity_limits=fuse,
-            contact_friction_scale=0.0,
-            # Deliberately under-converged (franka-class training configs run
-            # 8): ordering only matters when the sweep does NOT converge — at
-            # convergence the last contact visits apply ~zero delta and any
-            # clamp placement passes. A drive-visit clamp lets this impact
-            # reach 1.53x the limit at 8 iterations (7.1x at 1); dedicated
-            # rows and the end-of-iteration clamp hold the limit exactly at
-            # every iteration count.
-            iterations=8,
-            articulation_constraint_max=32,
-            free_body_constraint_max=32,
-        )
-
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
-        joint_qd = state_0.joint_qd.numpy()
-        joint_qd[3] = -3.0  # box linear z: slam into the arm tip
-        state_0.joint_qd.assign(joint_qd)
-        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-
-        collision_pipeline = newton.CollisionPipeline(model)
-
-        contacts = collision_pipeline.contacts()
-        max_arm_speed = 0.0
-        for _ in range(20):
-            state_0.clear_forces()
-            collision_pipeline.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-            state_0, state_1 = state_1, state_0
-            max_arm_speed = max(max_arm_speed, float(abs(state_0.joint_qd.numpy()[0])))
-        wp.synchronize()
-        return max_arm_speed
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free Steel requires CUDA")
-    def test_dedicated_rows_hold_limit_through_impact(self):
-        # Reference behavior: dedicated velocity-limit rows run in the final
-        # phase of every iteration and hold the limit through the impact.
-        speed = self._max_arm_speed_over_impact(fuse=False, articulated_contact_response="immediate")
-        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free Steel requires CUDA")
-    def test_fused_clamp_holds_limit_through_impact(self):
-        # The fused clamp must match the dedicated rows it replaces: the
-        # contact impulse lands mid-iteration, so the clamp has to run after
-        # contacts to keep the limit at the end of the step.
-        speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="immediate")
-        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free Steel requires CUDA")
-    def test_fused_clamp_holds_limit_through_impact_propagation(self):
-        # Same invariant when the box-arm contact is solved in the propagation family.
-        for response in ("propagation", "propagation_colored"):
-            with self.subTest(response=response):
-                speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response=response)
-                self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
+for _name, _func in (
+    ("test_dedicated_rows_hold_limit_through_impact", test_dedicated_rows_hold_pgs_drive_limit_through_impact),
+    ("test_fused_clamp_holds_limit_through_impact", test_fused_clamp_holds_limit_through_impact),
+):
+    add_function_test(TestSteelFusedVelocityLimitOrdering, _name, _func, devices=devices)
 
 
 DT = 1.0 / 120.0
@@ -1113,8 +978,8 @@ def _build_slider(device, *, effort_limit=1.0e6):
         axis=newton.Axis.X,
         target_ke=KE,
         target_kd=KD,
-        target_pos=TARGET_POS,
-        target_vel=TARGET_VEL,
+        target_q=TARGET_POS,
+        target_qd=TARGET_VEL,
         armature=ARMATURE,
         effort_limit=effort_limit,
     )
@@ -1252,6 +1117,47 @@ def test_pgs_drive_impulse_is_clamped_to_the_effort_limit(test, device):
     test.assertGreater(float(np.max(np.abs(drive_force))), 0.99 * effort_limit)
 
 
+def test_count_pass_assigns_no_drive_slot_above_the_sentinel(test, device):
+    """Leave a drive slot unassigned on the COUNT pass even when the row capacity exceeds the pass's sentinel."""
+    max_constraints = (1 << 30) + 1
+
+    def ints(values):
+        return wp.array(values, dtype=wp.int32, device=device)
+
+    # (drive_slot, world_slot_counter, element_row_cursor) after one driven prismatic DOF.
+    expected = {
+        int(ROW_SLOTS_ATOMIC): ([0], [1], [0]),
+        int(ROW_SLOTS_COUNT): ([-1], [0], [1]),
+        int(ROW_SLOTS_WRITE): ([0], [0], [1]),
+    }
+    for mode, result in expected.items():
+        drive_slot, world_slot_counter, element_row_cursor = ints([-7]), ints([0]), ints([0])
+        wp.launch(
+            allocate_physx_drive_slots,
+            dim=1,
+            inputs=[
+                ints([0, 1]),
+                ints([1]),
+                ints([0]),
+                ints([1]),
+                ints([int(JointType.PRISMATIC)]),
+                ints([0]),
+                wp.array([[1, 0]], dtype=wp.int32, device=device),
+                wp.array([1.0], dtype=wp.float32, device=device),
+                wp.array([0.0], dtype=wp.float32, device=device),
+                ints([0]),
+                max_constraints,
+            ],
+            outputs=[drive_slot, world_slot_counter, mode, element_row_cursor],
+            device=device,
+        )
+        with test.subTest(mode=mode):
+            test.assertEqual(
+                (drive_slot.numpy().tolist(), world_slot_counter.numpy().tolist(), element_row_cursor.numpy().tolist()),
+                result,
+            )
+
+
 def test_saturated_pgs_drive_differs_from_the_augmented_drive(test, device):
     """Differ from the implicit drive when the effort limit saturates, at any iteration count.
 
@@ -1290,7 +1196,7 @@ def test_pgs_drive_bounds_complete_reaction_under_external_load(test, device):
                     axis=newton.Axis.X,
                     target_ke=10000.0,
                     target_kd=0.0,
-                    target_pos=0.0,
+                    target_q=0.0,
                     damping=0.0,
                     armature=0.0,
                     effort_limit=effort_limit,
@@ -1323,18 +1229,22 @@ def test_drive_rows_precede_limit_rows_and_count_against_capacity(test, device):
         test.assertTrue(np.all(row_type[world, 3:9] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
     test.assertFalse(np.any(solver.constraint_overflow.numpy()))
 
-    small = SolverSteel(
-        model,
-        solve_mode="matrix_free",
-        drive_mode="rows",
-        enable_joint_limits=True,
-        articulation_constraint_max=2,
-        warn_constraint_overflow=False,
-    )
+    with test.assertWarnsRegex(
+        newton.exceptions.NewtonWarning, r"need at least 6 dense rows .* articulation_constraint_max=2"
+    ) as caught:
+        small = SolverSteel(
+            model,
+            solve_mode="matrix_free",
+            drive_mode="rows",
+            enable_joint_limits=True,
+            articulation_constraint_max=2,
+            warn_constraint_overflow=False,
+        )
+    test.assertNotIn("friction", str(caught.warning))
     small.step(model.state(), model.state(), model.control(), None, DT)
     np.testing.assert_array_equal(small._constraint_count.numpy(), [2, 2])
     test.assertTrue(np.all(small._row_type.numpy()[:, :2] == PGS_CONSTRAINT_TYPE_JOINT_TARGET))
-    np.testing.assert_array_equal(small.constraint_overflow.numpy(), [True, True])
+    np.testing.assert_array_equal(small.constraint_overflow.numpy(), [True, True, False])
     with test.assertRaisesRegex(RuntimeError, "overflow|capacity"):
         small.check_constraint_capacity()
 
@@ -1364,6 +1274,7 @@ def test_prescale_skips_fused_driven_dofs(test, device):
             dim=1,
             inputs=[
                 wp.array([0, 2], dtype=wp.int32, device=device),
+                wp.array([2], dtype=wp.int32, device=device),
                 wp.array([int(JointType.REVOLUTE)] * 2, dtype=wp.int32, device=device),
                 wp.array([0, 1], dtype=wp.int32, device=device),
                 wp.array([0, 1], dtype=wp.int32, device=device),
@@ -1488,6 +1399,12 @@ for _name, _func in (
     ("test_streamed_drive_metadata_matches_resident", test_streamed_drive_metadata_matches_resident),
 ):
     add_function_test(TestSteelPGSDrives, _name, _func, devices=devices)
+add_function_test(
+    TestSteelPGSDrives,
+    "test_count_pass_assigns_no_drive_slot_above_the_sentinel",
+    test_count_pass_assigns_no_drive_slot_above_the_sentinel,
+    devices=split_devices,
+)
 
 
 _HAS_DRIVE_ROWS = "drive_mode" in inspect.signature(SolverSteel.__init__).parameters
@@ -1522,7 +1439,7 @@ def _driven_lever_on_ground(device):
         parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity()),
         target_ke=1000.0,
         target_kd=50.0,
-        target_pos=0.0,
+        target_q=0.0,
     )
     builder.add_articulation([joint])
     return builder.finalize(device=device)
@@ -1571,277 +1488,7 @@ add_function_test(
 )
 
 
-class TestSteelAugmentedDrives(unittest.TestCase):
-    def test_split_augmented_drive_pipeline_matches_combined_kernel(self):
-        """Match combined drive forces and clear articulations without active drives."""
-        device = wp.get_device()
-        articulation_start = wp.array([0, 2], dtype=wp.int32, device=device)
-        articulation_joint_end = wp.array([2], dtype=wp.int32, device=device)
-        articulation_dof_count = wp.array([2], dtype=wp.int32, device=device)
-        joint_type = wp.array([JointType.REVOLUTE, JointType.REVOLUTE], dtype=wp.int32, device=device)
-        joint_parent = wp.array([-1, 0], dtype=wp.int32, device=device)
-        joint_child = wp.array([0, 1], dtype=wp.int32, device=device)
-        joint_articulation = wp.zeros(2, dtype=wp.int32, device=device)
-        joint_start = wp.array([0, 1], dtype=wp.int32, device=device)
-        joint_dof_dim = wp.array([[0, 1], [0, 1]], dtype=wp.int32, device=device)
-        joint_f = wp.array([0.4, -0.2], dtype=wp.float32, device=device)
-        joint_q = wp.array([0.25, -0.35], dtype=wp.float32, device=device)
-        joint_qd = wp.array([0.1, -0.2], dtype=wp.float32, device=device)
-        spring_stiffness = wp.array([1.5, 0.75], dtype=wp.float32, device=device)
-        spring_ref = wp.array([0.0, 0.1], dtype=wp.float32, device=device)
-        damping = wp.array([0.2, 0.3], dtype=wp.float32, device=device)
-        joint_S_s = wp.array(
-            [wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)] * 2,
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_fb_s = wp.array(
-            [
-                wp.spatial_vector(0.1, 0.2, 0.3, 1.0, 1.5, -0.5),
-                wp.spatial_vector(-0.2, 0.4, -0.1, -0.5, 0.25, 0.75),
-            ],
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_f_ext = wp.array(
-            [
-                wp.spatial_vector(0.05, 0.0, -0.1, 0.0, 0.25, 0.0),
-                wp.spatial_vector(0.0, -0.05, 0.1, 0.15, 0.0, -0.2),
-            ],
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_flags = wp.zeros(2, dtype=wp.int32, device=device)
-        body_q = wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device)
-        body_com = wp.array([[0.1, 0.0, 0.0], [0.0, 0.2, 0.0]], dtype=wp.vec3, device=device)
-        articulation_origin = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
-        target_ke = wp.array([10.0, 20.0], dtype=wp.float32, device=device)
-        target_kd = wp.array([1.0, 2.0], dtype=wp.float32, device=device)
-        target_q = wp.array([0.1, -0.1], dtype=wp.float32, device=device)
-        target_qd = wp.array([0.0, 0.05], dtype=wp.float32, device=device)
-        effort_limit = wp.array([1.25, 2.5], dtype=wp.float32, device=device)
-
-        sequential_body_ft = wp.zeros(2, dtype=wp.spatial_vector, device=device)
-        sequential_tau = wp.zeros(2, dtype=wp.float32, device=device)
-        wp.launch(
-            eval_rigid_tau,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_joint_end,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
-                wp.ones(1, dtype=wp.int32, device=device),
-            ],
-            outputs=[sequential_body_ft, sequential_tau],
-            device=device,
-        )
-
-        combined_body_ft = wp.zeros_like(sequential_body_ft)
-        combined_tau = wp.zeros_like(sequential_tau)
-        combined_counts = wp.zeros(1, dtype=wp.int32, device=device)
-        combined_indices = wp.zeros(2, dtype=wp.int32, device=device)
-        combined_stiffness = wp.zeros(2, dtype=wp.float32, device=device)
-        wp.launch(
-            eval_rigid_tau_and_augmented_drives,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_joint_end,
-                articulation_dof_count,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
-                target_ke,
-                target_kd,
-                target_q,
-                joint_start,
-                target_qd,
-                effort_limit,
-                2,
-                0.1,
-                wp.ones(1, dtype=wp.int32, device=device),
-            ],
-            outputs=[
-                combined_body_ft,
-                combined_counts,
-                combined_indices,
-                combined_stiffness,
-                combined_tau,
-            ],
-            device=device,
-        )
-        np.testing.assert_array_equal(combined_body_ft.numpy(), sequential_body_ft.numpy())
-        expected_tau = sequential_tau.numpy() + np.array([-1.25, 2.5], dtype=np.float32)
-        np.testing.assert_allclose(combined_tau.numpy(), expected_tau, rtol=0.0, atol=1.0e-6)
-        np.testing.assert_array_equal(combined_counts.numpy(), [2])
-        np.testing.assert_array_equal(combined_indices.numpy(), [0, 1])
-        np.testing.assert_allclose(combined_stiffness.numpy(), [0.2, 0.4], rtol=0.0, atol=1.0e-7)
-
-        prepared_counts = wp.zeros_like(combined_counts)
-        prepared_indices = wp.zeros_like(combined_indices)
-        prepared_stiffness = wp.zeros_like(combined_stiffness)
-        prepared_tau = wp.zeros_like(combined_tau)
-        wp.launch(
-            prepare_augmented_joint_drives,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_dof_count,
-                joint_type,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_q,
-                joint_qd,
-                target_ke,
-                target_kd,
-                target_q,
-                joint_start,
-                target_qd,
-                effort_limit,
-                2,
-                0.1,
-                wp.ones(1, dtype=wp.int32, device=device),
-            ],
-            outputs=[prepared_counts, prepared_indices, prepared_stiffness, prepared_tau],
-            device=device,
-        )
-        np.testing.assert_array_equal(prepared_counts.numpy(), combined_counts.numpy())
-        np.testing.assert_array_equal(prepared_indices.numpy(), combined_indices.numpy())
-        np.testing.assert_array_equal(prepared_stiffness.numpy(), combined_stiffness.numpy())
-        np.testing.assert_allclose(prepared_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
-
-        topology_stiffness = wp.zeros_like(combined_stiffness)
-        topology_tau = wp.zeros_like(combined_tau)
-        wp.launch(
-            _prepare_augmented_joint_drives_by_dof,
-            dim=2,
-            inputs=[
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                joint_q,
-                joint_qd,
-                target_ke,
-                target_kd,
-                target_q,
-                target_qd,
-                effort_limit,
-                0.1,
-                wp.ones(2, dtype=wp.int32, device=device),
-            ],
-            outputs=[topology_stiffness, topology_tau],
-            device=device,
-        )
-        np.testing.assert_array_equal(topology_stiffness.numpy(), combined_stiffness.numpy())
-        np.testing.assert_allclose(topology_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
-
-        additive_body_ft = wp.zeros_like(combined_body_ft)
-        wp.launch(
-            eval_rigid_tau_add,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_joint_end,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
-                wp.ones(1, dtype=wp.int32, device=device),
-            ],
-            outputs=[additive_body_ft, prepared_tau],
-            device=device,
-        )
-        np.testing.assert_array_equal(additive_body_ft.numpy(), combined_body_ft.numpy())
-        np.testing.assert_allclose(prepared_tau.numpy(), combined_tau.numpy(), rtol=0.0, atol=1.0e-6)
-
-        passive_counts = wp.array([7], dtype=wp.int32, device=device)
-        passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
-        zero_target_ke = wp.zeros_like(target_ke)
-        zero_target_kd = wp.zeros_like(target_kd)
-        wp.launch(
-            prepare_augmented_joint_drives,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_dof_count,
-                joint_type,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_q,
-                joint_qd,
-                zero_target_ke,
-                zero_target_kd,
-                target_q,
-                joint_start,
-                target_qd,
-                effort_limit,
-                2,
-                0.1,
-                wp.ones(1, dtype=wp.int32, device=device),
-            ],
-            outputs=[passive_counts, prepared_indices, prepared_stiffness, passive_tau],
-            device=device,
-        )
-
-        np.testing.assert_array_equal(passive_counts.numpy(), [0])
-        np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
-
-
-def _build_slider_augmented_drives_upstream(device, *, effort_limit=1.0e6, damping=0.0):
+def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=MASS, inertia=wp.mat33(np.eye(3)))
     joint = builder.add_joint_prismatic(
@@ -1850,8 +1497,8 @@ def _build_slider_augmented_drives_upstream(device, *, effort_limit=1.0e6, dampi
         axis=newton.Axis.X,
         target_ke=KE,
         target_kd=KD,
-        target_pos=TARGET_POS,
-        target_vel=TARGET_VEL,
+        target_q=TARGET_POS,
+        target_qd=TARGET_VEL,
         armature=ARMATURE,
         effort_limit=effort_limit,
         damping=damping,
@@ -1891,7 +1538,7 @@ def _solver_trajectory(model, steps, solve_mode):
 def test_implicit_drive_matches_backward_euler_reference(test, device, solve_mode="matrix_free"):
     """Integrate the PD drive implicitly through the augmented mass matrix."""
     np.testing.assert_allclose(
-        _solver_trajectory(_build_slider_augmented_drives_upstream(device), 120, solve_mode),
+        _solver_trajectory(_build_slider_augmented_drives(device), 120, solve_mode),
         _reference_trajectory(120),
         rtol=1.0e-4,
         atol=1.0e-5,
@@ -1902,7 +1549,7 @@ def test_drive_force_is_clamped_to_the_effort_limit(test, device, solve_mode="ma
     """Clamp the explicit drive force to the joint effort limit before the implicit solve."""
     reference = _reference_trajectory(120, effort_limit=5.0)
     np.testing.assert_allclose(
-        _solver_trajectory(_build_slider_augmented_drives_upstream(device, effort_limit=5.0), 120, solve_mode),
+        _solver_trajectory(_build_slider_augmented_drives(device, effort_limit=5.0), 120, solve_mode),
         reference,
         rtol=1.0e-4,
         atol=1.0e-5,
@@ -1913,14 +1560,14 @@ def test_drive_force_is_clamped_to_the_effort_limit(test, device, solve_mode="ma
 def test_passive_joint_damping_is_applied(test, device, solve_mode="matrix_free"):
     """Apply Model.joint_damping as a passive joint force."""
     np.testing.assert_allclose(
-        _solver_trajectory(_build_slider_augmented_drives_upstream(device, damping=3.0), 120, solve_mode),
+        _solver_trajectory(_build_slider_augmented_drives(device, damping=3.0), 120, solve_mode),
         _reference_trajectory(120, damping=3.0),
         rtol=1.0e-4,
         atol=1.0e-5,
     )
 
 
-class TestSteelAugmentedDrivesUpstream(unittest.TestCase):
+class TestSteelAugmentedDrives(unittest.TestCase):
     pass
 
 
@@ -1929,13 +1576,11 @@ for _name, _func in (
     ("test_drive_force_is_clamped_to_the_effort_limit", test_drive_force_is_clamped_to_the_effort_limit),
     ("test_passive_joint_damping_is_applied", test_passive_joint_damping_is_applied),
 ):
-    add_function_test(TestSteelAugmentedDrivesUpstream, _name, _func, devices=devices)
-    add_function_test(
-        TestSteelAugmentedDrivesUpstream, f"{_name}_split", _func, devices=split_devices, solve_mode="split"
-    )
+    add_function_test(TestSteelAugmentedDrives, _name, _func, devices=devices)
+    add_function_test(TestSteelAugmentedDrives, f"{_name}_split", _func, devices=split_devices, solve_mode="split")
 
 
-DT_joint_friction = 0.01
+DT_JOINT_FRICTION = 0.01
 
 
 INERTIA = 0.5
@@ -1948,50 +1593,61 @@ FRICTION = 1.0
 class TestSteelJointFriction(unittest.TestCase):
     def test_sticks_below_breakaway_in_both_directions(self):
         """Hold hinge and slider DOFs at rest while the applied effort is below the friction."""
+        efforts = (0.6 * FRICTION, -0.6 * FRICTION, 0.999 * FRICTION)
         for joint in ("revolute", "prismatic"):
-            model = _single_dof_model(joint)
-            for effort in (0.6 * FRICTION, -0.6 * FRICTION, 0.999 * FRICTION):
-                with self.subTest(joint=joint, effort=effort):
-                    qd = _run(model, effort=effort, steps=50)
-                    np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
+            with self.subTest(joint=joint):
+                qd = _run_friction(_worlds_model(joint, len(efforts)), effort=efforts, steps=50, dofs=len(efforts))
+                np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
 
     def test_breakaway_accelerates_by_net_effort(self):
         """Accelerate at (effort - friction) / inertia once the effort exceeds the friction."""
         for joint, inertia in (("revolute", INERTIA), ("prismatic", 1.0)):
-            model = _single_dof_model(joint)
-            for effort in (2.5, -2.5):
-                with self.subTest(joint=joint, effort=effort):
-                    qd = _run(model, effort=effort, steps=20)
-                    expected = (
-                        np.sign(effort) * (abs(effort) - FRICTION) / inertia * DT_joint_friction * np.arange(1, 21)
-                    )
-                    np.testing.assert_allclose(qd, expected, rtol=1.0e-5, atol=1.0e-6)
+            with self.subTest(joint=joint):
+                qd = _run_friction(_worlds_model(joint, 2), effort=(2.5, -2.5), steps=20, dofs=2)
+                ramp = (2.5 - FRICTION) / inertia * DT_JOINT_FRICTION * np.arange(1, 21)
+                np.testing.assert_allclose(qd, np.stack((ramp, -ramp), axis=1), rtol=1.0e-5, atol=1.0e-6)
 
     def test_sliding_decelerates_and_stops_without_chatter(self):
         """Decelerate at friction / inertia, stop at the predicted step and stay at rest."""
-        model = _single_dof_model("revolute")
-        for qd0 in (1.0, -1.0):
-            with self.subTest(qd0=qd0):
-                qd = _run(model, qd0=qd0, steps=80)
-                stop_step = round(abs(qd0) * INERTIA / FRICTION / DT_joint_friction)
-                expected = np.sign(qd0) * np.maximum(
-                    abs(qd0) - FRICTION / INERTIA * DT_joint_friction * np.arange(1, 81), 0.0
-                )
-                np.testing.assert_allclose(qd, expected, atol=1.0e-5)
-                np.testing.assert_allclose(qd[stop_step:], 0.0, atol=1.0e-6)
-                moving = qd[np.abs(qd) > 1.0e-6]
-                self.assertTrue(np.all(np.sign(moving) == np.sign(qd0)))
+        qd = _run_friction(_worlds_model("revolute", 2), qd0=(1.0, -1.0), steps=80, dofs=2)
+        stop_step = round(INERTIA / FRICTION / DT_JOINT_FRICTION)
+        speed = np.maximum(1.0 - FRICTION / INERTIA * DT_JOINT_FRICTION * np.arange(1, 81), 0.0)
+        np.testing.assert_allclose(qd, np.stack((speed, -speed), axis=1), atol=1.0e-5)
+        np.testing.assert_allclose(qd[stop_step:], 0.0, atol=1.0e-6)
+        for world, sign in ((0, 1.0), (1, -1.0)):
+            moving = qd[:, world][np.abs(qd[:, world]) > 1.0e-6]
+            self.assertTrue(np.all(np.sign(moving) == sign))
+
+    def test_pendulum_dissipates_the_friction_work(self):
+        """Lose mechanical energy at the rate of the friction torque times the swept angle."""
+        mass, offset, inertia, friction, dt = 1.0, 0.3, 0.01, 0.1, 0.002
+        losses = {}
+        for enabled in (False, True):
+            model = _pendulum_model(friction=friction, mass=mass, offset=offset, inertia=inertia)
+            solver = _friction_solver(model, enable_joint_friction=enabled)
+            states, control = [model.state(), model.state()], model.control()
+            states[0].joint_q.assign([1.0])
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            q, qd = _advance_friction(solver, states, control, 300, dt)
+            q = np.concatenate(([1.0], q))
+            qd = np.concatenate(([0.0], qd))
+            # Height of the center of mass below the pivot for a hinge about +y with the COM on +x.
+            energy = 0.5 * (inertia + mass * offset**2) * qd**2 - mass * 9.81 * offset * np.sin(q)
+            self.assertGreater(float(np.ptp(q)), 1.0)
+            losses[enabled] = (float(energy[0] - energy[-1]), friction * float(np.sum(np.abs(np.diff(q)))))
+        self.assertLess(abs(losses[False][0]), 0.01 * losses[True][1])
+        np.testing.assert_allclose(losses[True][0], losses[True][1], rtol=0.05)
 
     def test_substeps_preserve_physical_result(self):
         """Scale the impulse bound with dt so substepping keeps the same physical trajectory."""
-        model = _single_dof_model("revolute")
+        model = _worlds_model("revolute", 2)
         for substeps in (1, 4):
             with self.subTest(substeps=substeps):
-                dt = DT_joint_friction / substeps
-                breakaway = _run(model, effort=2.5, steps=20 * substeps, dt=dt)
-                self.assertAlmostEqual(float(breakaway[-1]), 1.5 / INERTIA * 0.2, delta=1.0e-5)
-                slide = _run(model, qd0=1.0, steps=60 * substeps, dt=dt)
-                stop = int(np.argmax(np.abs(slide) < 1.0e-6)) + 1
+                dt = DT_JOINT_FRICTION / substeps
+                # World 0 breaks away under effort, world 1 slides to rest.
+                qd = _run_friction(model, effort=(2.5, 0.0), qd0=(0.0, 1.0), steps=60 * substeps, dt=dt, dofs=2)
+                self.assertAlmostEqual(float(qd[20 * substeps - 1, 0]), 1.5 / INERTIA * 0.2, delta=1.0e-5)
+                stop = int(np.argmax(np.abs(qd[:, 1]) < 1.0e-6)) + 1
                 self.assertAlmostEqual(stop * dt, 0.5, delta=0.5 * dt)
 
     def test_d6_axes_are_independent_boxes(self):
@@ -2007,17 +1663,39 @@ class TestSteelJointFriction(unittest.TestCase):
         )
         builder.add_articulation([joint])
         model = builder.finalize()
-        qd = _run(model, effort=(1.5, 1.5), steps=10, dofs=2)
-        np.testing.assert_allclose(qd[-1], [0.5 * DT_joint_friction * 10, 0.0], atol=1.0e-5)
+        qd = _run_friction(model, effort=(1.5, 1.5), steps=10, dofs=2)
+        np.testing.assert_allclose(qd[-1], [0.5 * DT_JOINT_FRICTION * 10, 0.0], atol=1.0e-5)
+
+    def test_ball_axes_match_mujoco_frictionloss(self):
+        """Box each BALL DOF separately, matching analytic sticking and SolverMuJoCo's frictionloss when sliding."""
+        efforts = np.array([[0.6, -0.5, 0.9], [2.5, 0.0, 0.0], [0.0, -2.5, 0.3], [2.0, 1.8, 0.0]], dtype=np.float32)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for _ in efforts:
+            builder.add_world(_root_joint_builder("ball", friction=FRICTION))
+        model = builder.finalize()
+        qd = _run_friction(model, effort=efforts.ravel(), steps=20, dofs=efforts.size).reshape(20, -1, 3)
+        sliding = np.abs(efforts) > FRICTION
+        np.testing.assert_allclose(qd[:, ~sliding], 0.0, atol=1.0e-6)
+        ramp = (2.5 - FRICTION) / INERTIA * DT_JOINT_FRICTION * np.arange(1, 21)
+        np.testing.assert_allclose(qd[:, 1, 0], ramp, atol=1.0e-5)
+        try:
+            reference = newton.solvers.SolverMuJoCo(model, iterations=100, ls_iterations=50, cone="pyramidal")
+        except ImportError as error:
+            self.skipTest(f"MuJoCo is not installed: {error}")
+        states, control = [model.state(), model.state()], model.control()
+        control.joint_f.assign(efforts.ravel())
+        qd_mujoco = _advance_friction(reference, states, control, 20)[1].reshape(20, -1, 3)
+        # MuJoCo's soft friction creeps below breakaway, so compare the sliding DOFs only.
+        np.testing.assert_allclose(qd[:, sliding], qd_mujoco[:, sliding], atol=1.0e-4)
 
     def test_locked_child_moves_with_composite_inertia(self):
         """Lock a stiff-friction child joint so the chain accelerates with its composite inertia."""
         length, mass = 0.4, 2.0
         model = _two_link_model(length=length, mass=mass, friction=(FRICTION, 50.0))
-        qd = _run(model, effort=(3.0, 0.0), steps=10, dofs=2)
+        qd = _run_friction(model, effort=(3.0, 0.0), steps=10, dofs=2)
         composite = 2.0 * INERTIA + mass * length**2
         np.testing.assert_allclose(
-            qd[:, 0], (3.0 - FRICTION) / composite * DT_joint_friction * np.arange(1, 11), rtol=1.0e-4
+            qd[:, 0], (3.0 - FRICTION) / composite * DT_JOINT_FRICTION * np.arange(1, 11), rtol=1.0e-4
         )
         np.testing.assert_allclose(qd[:, 1], 0.0, atol=1.0e-5)
 
@@ -2026,26 +1704,26 @@ class TestSteelJointFriction(unittest.TestCase):
         ke, kd, target = 10.0, 2.0, 1.0
         for drive_mode in ("augmented", "rows"):
             with self.subTest(drive_mode=drive_mode):
-                model = _single_dof_model("revolute", ke=ke, kd=kd, gravity=0.0)
-                solver = _solver(model, drive_mode=drive_mode, iterations=32)
+                model = _single_dof_model("revolute", ke=ke, kd=kd)
+                solver = _friction_solver(model, drive_mode=drive_mode, iterations=32)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_target_q.assign([target])
-                q, qd = _advance(solver, states, control, 400)
+                q, qd = _advance_friction(solver, states, control, 400)
                 self.assertLess(abs(float(qd[-1])), 1.0e-5)
                 self.assertLessEqual(abs(float(q[-1]) - target), FRICTION / ke + 1.0e-3)
                 self.assertGreater(abs(float(q[-1]) - target), 1.0e-2)
-                reference = _solver(model, drive_mode=drive_mode, iterations=32, enable_joint_friction=False)
+                reference = _friction_solver(model, drive_mode=drive_mode, iterations=32, enable_joint_friction=False)
                 states = [model.state(), model.state()]
-                q_free, _ = _advance(reference, states, control, 400)
+                q_free, _ = _advance_friction(reference, states, control, 400)
                 self.assertAlmostEqual(float(q_free[-1]), target, delta=1.0e-3)
 
     def test_slider_stops_at_position_limit(self):
         """Combine friction deceleration with a position limit without violating the limit."""
         model = _single_dof_model("prismatic", limit=(-1.0, 0.1))
-        solver = _solver(model, enable_joint_limits=True)
+        solver = _friction_solver(model, enable_joint_limits=True)
         states, control = [model.state(), model.state()], model.control()
         states[0].joint_qd.assign([2.0])
-        q, qd = _advance(solver, states, control, 60)
+        q, qd = _advance_friction(solver, states, control, 60)
         self.assertLess(float(np.max(q)), 0.1 + 1.0e-3)
         np.testing.assert_allclose(qd[-10:], 0.0, atol=1.0e-5)
 
@@ -2054,38 +1732,30 @@ class TestSteelJointFriction(unittest.TestCase):
         model = _single_dof_model("revolute", velocity_limit=1.0)
         for schedule in ("interleaved", "phased"):
             with self.subTest(schedule=schedule):
-                solver = _solver(model, enable_joint_velocity_limits=True, row_schedule=schedule)
+                solver = _friction_solver(model, enable_joint_velocity_limits=True, row_schedule=schedule)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_f.assign([10.0])
-                _, qd = _advance(solver, states, control, 20)
+                _, qd = _advance_friction(solver, states, control, 20)
                 self.assertLessEqual(float(np.max(qd)), 1.0 + 1.0e-5)
                 self.assertAlmostEqual(float(qd[-1]), 1.0, delta=1.0e-5)
 
     def test_friction_and_ground_contact(self):
-        """Hold a vertical slider against gravity, or let it fall onto the ground and rest, on both contact routes."""
-        mass, half = 1.0, 0.1
-        for response, (friction, falls) in itertools.product(
-            ("immediate", "propagation_colored"), ((15.0, False), (5.0, True))
-        ):
-            with self.subTest(response=response, friction=friction):
-                model = _vertical_slider_model(mass=mass, half=half, friction=friction)
+        """Hold a vertical slider against gravity, or let it fall onto the ground and rest."""
+        for friction, falls in ((15.0, False), (5.0, True)):
+            with self.subTest(friction=friction):
+                model = _vertical_slider_model(mass=1.0, half=0.1, friction=friction)
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
                 contacts = pipeline.contacts()
-                solver = _solver(model, friction_anchor_beta=0.0, iterations=24, articulated_contact_response=response)
+                solver = _friction_solver(model, friction_anchor_beta=0.0, iterations=24)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
                 for _ in range(150):
                     pipeline.collide(states[0], contacts)
-                    solver.step(states[0], states[1], control, contacts, DT_joint_friction)
+                    solver.step(states[0], states[1], control, contacts, DT_JOINT_FRICTION)
                     states.reverse()
                 z = float(states[0].joint_q.numpy()[0])
                 if falls:
                     self.assertAlmostEqual(z, -0.4, delta=5.0e-3)
-                    count = int(contacts.rigid_contact_count.numpy()[0])
-                    self.assertGreater(count, 0)
-                    # Dense rows (0) on the immediate route, propagation rows (2) on the colored route.
-                    expected_path = 0 if response == "immediate" else 2
-                    np.testing.assert_array_equal(solver._contact_path.numpy()[:count], expected_path)
                 else:
                     self.assertAlmostEqual(z, 0.0, delta=1.0e-5)
                 self.assertLess(abs(float(states[0].joint_qd.numpy()[0])), 1.0e-3)
@@ -2099,47 +1769,44 @@ class TestSteelJointFriction(unittest.TestCase):
         builder.add_world(_two_link_builder(length=0.4, mass=2.0, friction=(FRICTION, 0.2)))
         mixed = builder.finalize()
         effort = (2.5, 3.0, 0.1)
-        qd_mixed = _run(mixed, effort=effort, steps=20, dofs=3)
-        np.testing.assert_allclose(qd_mixed[:, 0], _run(single, effort=effort[0], steps=20), atol=1.0e-6)
-        np.testing.assert_allclose(qd_mixed[:, 1:], _run(chain, effort=effort[1:], steps=20, dofs=2), atol=1.0e-6)
+        qd_mixed = _run_friction(mixed, effort=effort, steps=20, dofs=3)
+        np.testing.assert_allclose(qd_mixed[:, 0], _run_friction(single, effort=effort[0], steps=20), atol=1.0e-6)
+        np.testing.assert_allclose(
+            qd_mixed[:, 1:], _run_friction(chain, effort=effort[1:], steps=20, dofs=2), atol=1.0e-6
+        )
 
-    def test_zero_friction_matches_disabled_bitwise(self):
-        """Keep zero-coefficient friction bit-identical to the disabled solver on the same route."""
-        model = _two_link_model(length=0.4, mass=2.0, friction=(0.0, 0.0), ke=20.0, kd=1.0)
+    def test_zero_or_disabled_friction_matches_disabled_bitwise(self):
+        """Keep zero coefficients, and disabled friction with nonzero coefficients, bit-identical to no friction."""
         trajectories = []
-        for enabled in (False, True):
-            solver = _solver(model, enable_joint_friction=enabled, enable_joint_limits=True)
+        for friction, enabled in (((0.0, 0.0), False), ((0.0, 0.0), True), ((FRICTION, FRICTION), False)):
+            model = _two_link_model(length=0.4, mass=2.0, friction=friction, ke=20.0, kd=1.0)
+            solver = _friction_solver(model, enable_joint_friction=enabled, enable_joint_limits=True)
             states, control = [model.state(), model.state()], model.control()
             states[0].joint_qd.assign([1.0, -2.0])
             control.joint_target_q.assign([0.3, -0.2])
-            trajectories.append(_advance(solver, states, control, 30))
-        np.testing.assert_array_equal(trajectories[0][0], trajectories[1][0])
-        np.testing.assert_array_equal(trajectories[0][1], trajectories[1][1])
-
-    def test_disabled_ignores_model_friction(self):
-        """Leave Model.joint_friction unused when the option is off."""
-        model = _single_dof_model("revolute")
-        qd = _run(model, effort=0.5, steps=10, enable_joint_friction=False)
-        np.testing.assert_allclose(qd[-1], 0.5 / INERTIA * DT_joint_friction * 10, rtol=1.0e-5)
+            trajectories.append(_advance_friction(solver, states, control, 30))
+        for trajectory in trajectories[1:]:
+            np.testing.assert_array_equal(trajectory[0], trajectories[0][0])
+            np.testing.assert_array_equal(trajectory[1], trajectories[0][1])
 
     def test_runtime_edits_take_effect(self):
         """Apply in-place edits and array replacement after notification."""
         model = _single_dof_model("revolute", friction=0.0)
-        solver = _solver(model)
+        solver = _friction_solver(model)
         states, control = [model.state(), model.state()], model.control()
         control.joint_f.assign([0.5])
-        _, qd = _advance(solver, states, control, 10)
+        _, qd = _advance_friction(solver, states, control, 10)
         self.assertAlmostEqual(float(qd[-1]), 0.5 / INERTIA * 0.1, delta=1.0e-5)
 
         model.joint_friction.assign([FRICTION])
         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        _, qd = _advance(solver, states, control, 20)
+        _, qd = _advance_friction(solver, states, control, 20)
         np.testing.assert_allclose(qd[-5:], 0.0, atol=1.0e-6)
 
         control.joint_f.assign([1.5])
         model.joint_friction = wp.array([2.0], dtype=wp.float32, device=model.device)
-        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        _, qd = _advance(solver, states, control, 5)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+        _, qd = _advance_friction(solver, states, control, 5)
         np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
 
     def test_strided_coefficients_are_read_by_stride(self):
@@ -2147,7 +1814,7 @@ class TestSteelJointFriction(unittest.TestCase):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         for _ in range(2):
             builder.add_world(_single_dof_builder("revolute", friction=0.0))
-        expected = np.array([1.5 / INERTIA * DT_joint_friction, 0.5 / INERTIA * DT_joint_friction], dtype=np.float32)
+        expected = np.array([1.5 / INERTIA * DT_JOINT_FRICTION, 0.5 / INERTIA * DT_JOINT_FRICTION], dtype=np.float32)
         for strided in (False, True):
             for when in ("construction", "replacement"):
                 with self.subTest(strided=strided, when=when):
@@ -2158,29 +1825,29 @@ class TestSteelJointFriction(unittest.TestCase):
                     )
                     if when == "construction":
                         model.joint_friction = coefficients
-                    solver = _solver(model)
+                    solver = _friction_solver(model)
                     if when == "replacement":
                         model.joint_friction = coefficients
                         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
                     states, control = [model.state(), model.state()], model.control()
                     control.joint_f.fill_(2.5)
-                    _, qd = _advance(solver, states, control, 1)
+                    _, qd = _advance_friction(solver, states, control, 1)
                     np.testing.assert_allclose(qd, expected, atol=1.0e-6)
 
     def test_graph_replay_matches_eager_and_reads_edits(self):
         """Replay captured steps bit-identically and read in-place coefficient edits."""
         model = _single_dof_model("revolute")
-        eager = _run(model, effort=2.5, steps=16)
+        eager = _run_friction(model, effort=2.5, steps=16)
 
-        solver = _solver(model)
+        solver = _friction_solver(model)
         states, control = [model.state(), model.state()], model.control()
         # Friction holds the hinge exactly at rest while warming up kernels outside capture.
-        _advance(solver, states, control, 2)
+        _advance_friction(solver, states, control, 2)
         control.joint_f.assign([2.5])
         with wp.ScopedCapture(device=model.device) as capture:
             for _ in range(2):
-                solver.step(states[0], states[1], control, None, DT_joint_friction)
-                solver.step(states[1], states[0], control, None, DT_joint_friction)
+                solver.step(states[0], states[1], control, None, DT_JOINT_FRICTION)
+                solver.step(states[1], states[0], control, None, DT_JOINT_FRICTION)
         replayed = []
         for _ in range(4):
             wp.capture_launch(capture.graph)
@@ -2191,26 +1858,28 @@ class TestSteelJointFriction(unittest.TestCase):
         before = float(states[0].joint_qd.numpy()[0])
         wp.capture_launch(capture.graph)
         self.assertAlmostEqual(
-            float(states[0].joint_qd.numpy()[0]), before - 0.5 / INERTIA * 4 * DT_joint_friction, delta=1.0e-5
+            float(states[0].joint_qd.numpy()[0]), before - 0.5 / INERTIA * 4 * DT_JOINT_FRICTION, delta=1.0e-5
         )
 
     def test_invalid_coefficients_build_no_rows(self):
-        """Step an invalid coefficient as frictionless."""
-        frictionless = _run(_single_dof_model("revolute", friction=0.0), effort=2.5, steps=5)
+        """Step an invalid coefficient written without a notification as frictionless and report it."""
+        frictionless = _run_friction(_single_dof_model("revolute", friction=0.0), effort=2.5, steps=5)
         for value in (float("inf"), float("nan"), -1.0):
             with self.subTest(value=value):
                 model = _single_dof_model("revolute", friction=0.0)
-                solver = _solver(model)
+                solver = _friction_solver(model)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_f.assign([2.5])
                 model.joint_friction.assign([value])
-                _, qd = _advance(solver, states, control, 5)
+                _, qd = _advance_friction(solver, states, control, 5)
                 np.testing.assert_array_equal(qd, frictionless)
+                with self.assertRaisesRegex(RuntimeError, r"joint_friction was invalid at a step in worlds \[-1\]"):
+                    solver.check_constraint_capacity()
 
     def test_finite_coefficient_with_unrepresentable_bound_still_sticks(self):
         """Keep the row of a finite coefficient whose impulse bound overflows to infinity."""
         model = _single_dof_model("revolute", friction=float(np.finfo(np.float32).max))
-        np.testing.assert_array_equal(_run(model, effort=2.5, steps=3, dt=2.0), 0.0)
+        np.testing.assert_array_equal(_run_friction(model, effort=2.5, steps=3, dt=2.0), 0.0)
 
     def test_captured_notify_replay_matches_eager(self):
         """Replay per-world friction writes, notify and steps bit-identically to the eager sequence."""
@@ -2222,17 +1891,17 @@ class TestSteelJointFriction(unittest.TestCase):
         runs = []
         for captured in (False, True):
             model = builder.finalize()
-            solver = _solver(model)
+            solver = _friction_solver(model)
             states, control = [model.state(), model.state()], model.control()
             control.joint_f.assign([2.0, -2.0])
             states[0].joint_qd.assign([0.5, -0.5])
-            _advance(solver, states, control, 2)
+            _advance_friction(solver, states, control, 2)
 
             def episode(solver=solver, states=states, control=control):
                 solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
                 for _ in range(2):
-                    solver.step(states[0], states[1], control, None, DT_joint_friction)
-                    solver.step(states[1], states[0], control, None, DT_joint_friction)
+                    solver.step(states[0], states[1], control, None, DT_JOINT_FRICTION)
+                    solver.step(states[1], states[0], control, None, DT_JOINT_FRICTION)
 
             if captured:
                 with wp.ScopedCapture(device=model.device) as capture:
@@ -2245,7 +1914,7 @@ class TestSteelJointFriction(unittest.TestCase):
                 else:
                     episode()
                 qd.append(states[0].joint_qd.numpy().copy())
-            self.assertFalse(solver.joint_friction_invalid.numpy().any())
+            solver.check_constraint_capacity()
             runs.append(np.array(qd))
         np.testing.assert_array_equal(runs[1], runs[0])
 
@@ -2255,49 +1924,63 @@ class TestSteelJointFriction(unittest.TestCase):
         for _ in range(2):
             builder.add_world(_single_dof_builder("revolute"))
         model = builder.finalize()
-        fresh = _run(model, qd0=(1.0, -1.0), effort=(0.2, -0.2), steps=20, dofs=2)
-        for mask in (None, [True, True]):
+        fresh = _run_friction(model, qd0=(1.0, -1.0), effort=(0.2, -0.2), steps=20, dofs=2)
+        for mask in (None, [True, True, False]):
             with self.subTest(mask=mask):
-                solver = _solver(model)
+                solver = _friction_solver(model)
                 states, control = [model.state(), model.state()], model.control()
                 control.joint_f.assign([0.2, -0.2])
                 states[0].joint_qd.assign([0.3, 0.7])
-                _advance(solver, states, control, 7)
+                _advance_friction(solver, states, control, 7)
                 states[0].joint_q.zero_()
                 states[0].joint_qd.assign([1.0, -1.0])
                 world_mask = None if mask is None else wp.array(mask, dtype=wp.bool, device=model.device)
                 solver.reset(states[0], world_mask=world_mask)
-                _, qd = _advance(solver, states, control, 20)
+                _, qd = _advance_friction(solver, states, control, 20)
                 np.testing.assert_array_equal(qd, fresh)
 
     def test_dense_row_overflow_is_reported(self):
-        """Flag worlds whose friction rows exceed the dense row capacity."""
+        """Warn at construction when friction rows exceed the capacity in every step, and flag the worlds."""
         model = _two_link_model(length=0.4, mass=2.0, friction=(FRICTION, FRICTION))
-        solver = _solver(model, articulation_constraint_max=1, warn_constraint_overflow=False)
+        with self.assertWarnsRegex(
+            newton.exceptions.NewtonWarning, r"need at least 2 dense rows .* friction"
+        ) as caught:
+            solver = _friction_solver(model, articulation_constraint_max=1, warn_constraint_overflow=False)
+        self.assertNotIn("limit", str(caught.warning))
+        # Limit and friction rows together name both causes and both remedies.
+        limited = _single_dof_model("revolute", limit=(-1.0, 1.0))
+        with self.assertWarnsRegex(
+            newton.exceptions.NewtonWarning,
+            r"3 dense rows .* position limits and positive joint friction .* joint_limit_activation_gap"
+            r".* set joint_friction to zero",
+        ):
+            _friction_solver(
+                limited, enable_joint_limits=True, articulation_constraint_max=2, warn_constraint_overflow=False
+            )
         states, control = [model.state(), model.state()], model.control()
-        _advance(solver, states, control, 1)
+        _advance_friction(solver, states, control, 1)
         self.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "dropped contacts or constraint rows"):
             solver.check_constraint_capacity()
 
     def test_sleeping_island_wakes_on_friction_edit(self):
         """Sleep a friction-held pendulum and wake it when its friction is lowered."""
-        model = _pendulum_model(friction=5.0)
-        solver = _solver(model, enable_sleeping=True, sleep_quiet_time=0.05)
+        model = _pendulum_model(friction=5.0, fixed_base=True)
+        solver = _friction_solver(model, enable_sleeping=True, sleep_quiet_time=0.05)
         states, control = [model.state(), model.state()], model.control()
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-        _advance(solver, states, control, 30)
+        _advance_friction(solver, states, control, 30)
         np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
         model.joint_friction.assign([0.0])
         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        _, qd = _advance(solver, states, control, 3)
+        _, qd = _advance_friction(solver, states, control, 3)
         np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
         self.assertGreater(abs(float(qd[-1])), 1.0e-2)
 
     def test_schedules_routes_and_velocity_pass_agree(self):
         """Give the same analytic result on every supported schedule and contact route."""
         model = _single_dof_model("revolute")
-        expected = (2.5 - FRICTION) / INERTIA * DT_joint_friction * 10
+        expected = (2.5 - FRICTION) / INERTIA * DT_JOINT_FRICTION * 10
         options = (
             {"row_schedule": "contact_then_internal"},
             {"row_schedule": "phased"},
@@ -2309,57 +1992,147 @@ class TestSteelJointFriction(unittest.TestCase):
         )
         for kwargs in options:
             with self.subTest(**kwargs):
-                route = _solver(model, **kwargs)
+                solver = _friction_solver(model, **kwargs)
                 if kwargs.get("articulated_contact_response") == "propagation_colored":
-                    self.assertTrue(route._propagation_colored)
-                stick = _run(model, effort=0.5, steps=10, **kwargs)
+                    self.assertTrue(solver._propagation_colored)
+                states, control = [model.state(), model.state()], model.control()
+                control.joint_f.assign([0.5])
+                _, stick = _advance_friction(solver, states, control, 10)
                 np.testing.assert_allclose(stick, 0.0, atol=1.0e-6)
-                slide = _run(model, effort=2.5, steps=10, **kwargs)
+                # Sticking leaves the hinge at rest, so the slide starts from the same state as a fresh run.
+                control.joint_f.assign([2.5])
+                _, slide = _advance_friction(solver, states, control, 10)
                 self.assertAlmostEqual(float(slide[-1]), expected, delta=1.0e-5)
 
-    def test_specialized_routes_are_not_selected(self):
-        """Keep enabled friction on the generic matrix-free route instead of row-limited fast paths."""
+    def test_local_internal_fast_path_is_not_selected(self):
+        """Keep enabled friction off the articulation-local solves.
+
+        The selection tests of the paired factor-coordinate, sparse-diagonal and sparse-factor solves cover the others.
+        """
         model = _arm_and_box_model()
-        disabled = _solver(model, enable_joint_friction=False)
-        enabled = _solver(model)
-        self.assertTrue(disabled._local_internal_fast_path)
-        for name in (
-            "_local_internal_fast_path",
-            "_paired_factor_coordinates",
-            "_fused_diagonal_joint_limits",
-            "_sparse_diagonal_contact_solve",
-        ):
-            self.assertFalse(getattr(enabled, name), name)
-        self.assertIsNone(enabled._sparse_mass_matrix_size)
+        self.assertTrue(_friction_solver(model, enable_joint_friction=False)._local_internal_fast_path)
+        self.assertFalse(_friction_solver(model)._local_internal_fast_path)
 
     def test_rejects_unsupported_configurations(self):
         """Raise for joint types, values and solver options the friction rows do not support."""
         with self.assertRaisesRegex(NotImplementedError, "matrix_free"):
-            SolverSteel(_single_dof_model("revolute"), enable_joint_friction=True)
-        with self.assertRaisesRegex(NotImplementedError, "pre-elimination"):
-            _solver(_single_dof_model("revolute"), enable_bilateral_preelimination=True)
+            SolverSteel(_single_dof_model("revolute"), solve_mode="split", enable_joint_friction=True)
+        # Point friction keeps contact_compliance from warning about friction patches first.
+        for option, extra in (
+            ("enable_bilateral_preelimination", {}),
+            ("contact_compliance", {"friction_anchor_beta": 0.0}),
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(NotImplementedError, option):
+                _friction_solver(_single_dof_model("revolute"), **{option: True}, **extra)
         for value in (-1.0, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and non-negative"):
-                _solver(_single_dof_model("revolute", friction=value))
-        for joint in ("ball", "free"):
-            with self.subTest(joint=joint), self.assertRaisesRegex(ValueError, "joint_friction is nonzero"):
-                _solver(_unsupported_joint_model(joint, friction=FRICTION))
+                _friction_solver(_single_dof_model("revolute", friction=value))
+        with self.assertRaisesRegex(ValueError, r"joint_friction is nonzero on joint 0 \(FREE\)"):
+            _friction_solver(_root_joint_model("free", friction=FRICTION))
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        links = [builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA)) for _ in range(2)]
+        builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Z) for link in links])
+        builder.add_joint_revolute(links[0], links[1], axis=newton.Axis.Z, friction=FRICTION)
+        with self.assertRaisesRegex(ValueError, r"joint_friction is nonzero on joint 2 \(loop-closing joint\)"):
+            _friction_solver(builder.finalize())
+        # Joint-friction rows take a fourth row-type bit: at most 2**27 - 1 rows, rejected before allocation.
+        with self.assertRaisesRegex(ValueError, "articulation_constraint_max must be at most 134217727"):
+            _friction_solver(_single_dof_model("revolute"), articulation_constraint_max=134_217_728)
 
-        model = _unsupported_joint_model("ball", friction=0.0)
-        solver = _solver(model)
+    def test_eager_notify_raises_after_applying_updates(self):
+        """Raise from an eager notify after the other updates, and accept the next valid notify."""
+        model = _root_joint_model("free", friction=0.0)
+        solver = _friction_solver(model)
+        model.joint_armature.fill_(0.3)
         model.joint_friction.fill_(FRICTION)
-        with self.assertRaisesRegex(ValueError, "BALL"):
+        with self.assertRaisesRegex(ValueError, "FREE"):
             solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        self.assertTrue(np.all(solver._joint_armature_device.numpy() == np.float32(0.3)))
+        model.joint_friction.zero_()
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
 
-    def test_rejects_differentiable_models(self):
-        """Raise for gradient-tracking models instead of silently differentiating through the box."""
-        builder = _single_dof_builder("revolute")
-        model = builder.finalize(requires_grad=True)
-        with self.assertRaisesRegex(NotImplementedError, "requires_grad"):
-            _solver(model)
+    def test_captured_steps_flag_invalid_coefficients_until_repaired_and_reset(self):
+        """Flag each invalid coefficient's world on replay, re-flag it after a reset until repaired, and reset per world."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_world(_single_dof_builder("revolute", friction=0.0))
+        builder.add_world(_root_joint_builder("free", friction=0.0))
+        builder.add_world(_single_dof_builder("revolute", friction=0.0))
+        model = builder.finalize()
+        solver = _friction_solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        _advance_friction(solver, states, control, 1)
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.step(states[0], states[1], control, None, DT_JOINT_FRICTION)
+        solver.check_constraint_capacity()
+        # DOF 0 is world 0's hinge, DOFs 1-6 world 1's free joint and DOF 7 world 2's hinge.
+        for dof, value, world in ((0, -1.0, 0), (7, float("nan"), 2), (1, 0.5, 1), (4, float("inf"), 1)):
+            with self.subTest(dof=dof, value=value):
+                friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+                friction[dof] = value
+                model.joint_friction.assign(friction)
+                wp.capture_launch(capture.graph)
+                message = rf"joint_friction was invalid at a step in worlds \[{world}\]"
+                with self.assertRaisesRegex(RuntimeError, message):
+                    solver.check_constraint_capacity()
+                # A reset clears the flag, and the next step flags the unrepaired coefficient again.
+                solver.reset(states[0])
+                solver.check_constraint_capacity()
+                wp.capture_launch(capture.graph)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    solver.check_constraint_capacity()
+                model.joint_friction.zero_()
+                wp.capture_launch(capture.graph)
+                other = wp.array(np.arange(4) == (world + 1) % 3, dtype=wp.bool, device=model.device)
+                solver.reset(states[0], world_mask=other)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    solver.check_constraint_capacity()
+                solver.reset(states[0])
+                solver.check_constraint_capacity()
+        with self.assertRaises(AttributeError):
+            solver.enable_joint_friction = False
+
+    def test_invalid_friction_flags_the_owning_world(self):
+        """Attribute loop-closing and global DOFs to their entry of the status layout."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for link_count in (3, 0, 2):
+            builder.begin_world()
+            if link_count == 0:
+                builder.add_shape_box(-1, hx=0.1, hy=0.1, hz=0.1)
+            else:
+                links = [builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3))) for _ in range(link_count)]
+                joints = [builder.add_joint_revolute(-1, link, axis=newton.Axis.Y) for link in links]
+                builder.add_articulation(joints)
+                loop = builder.add_joint_ball(links[0], links[-1])
+            builder.end_world()
+        global_link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_revolute(-1, global_link, axis=newton.Axis.Y)])
+        model = builder.finalize()
+        joint_qd_start = model.joint_qd_start.numpy()
+        dofs = {name: int(joint_qd_start[joint]) for name, joint in (("loop", loop), ("chain", joints[1]))}
+        dofs["global"] = int(joint_qd_start[model.joint_count - 1])
+        solver = _friction_solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        for name, value, world in (("loop", 0.5, 2), ("chain", -1.0, 2), ("global", -1.0, -1)):
+            with self.subTest(dof=name):
+                friction = np.zeros(model.joint_dof_count, dtype=np.float32)
+                friction[dofs[name]] = value
+                model.joint_friction.assign(friction)
+                _advance_friction(solver, states, control, 1)
+                with self.assertRaisesRegex(RuntimeError, rf"worlds \[{world}\]"):
+                    solver.check_constraint_capacity()
+                model.joint_friction.zero_()
+                solver.reset(states[0])
 
 
 LOAD_COEFFICIENT = 0.1
+
+
+INERTIA_LOAD = 0.01
+
+
+INVALID_LOAD_FRICTION = (
+    r"Model\.joint_friction or steel:joint_friction_load_coefficient was invalid at a step in worlds \[-1\]"
+)
 
 
 ARM_LENGTH = 0.3
@@ -2407,22 +2180,45 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
         builder.add_articulation([hinge, weld])
         model = builder.finalize()
         _load_coefficient(model).fill_(LOAD_COEFFICIENT)
-        solver = _solver(model)
+        solver = _friction_solver(model)
         _advance_hinge(solver, model, 0.0, 1)
         # The tip's weight adds to F and, through its 0.2 m offset, a moment about the link COM to T.
-        expected = (0.4 + 0.6) * GRAVITY + 0.6 * GRAVITY * 0.2
-        self.assertAlmostEqual(float(solver._joint_friction_load.numpy()[0]), expected, delta=1.0e-3)
+        expected = LOAD_COEFFICIENT * ((0.4 + 0.6) * GRAVITY + 0.6 * GRAVITY * 0.2)
+        self.assertAlmostEqual(float(solver._joint_friction_total.numpy()[0]), expected, delta=1.0e-4)
+
+    def test_ball_axes_use_the_shared_load(self):
+        """Give each BALL axis the bound of the joint's load: stick below it and slide above it."""
+        coefficient = LOAD_COEFFICIENT
+        weight = GRAVITY
+        for scale, sticks in ((0.5, True), (3.0, False)):
+            with self.subTest(scale=scale):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
+                SolverSteel.register_custom_attributes(builder)
+                body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA_LOAD))
+                builder.add_articulation([builder.add_joint_ball(-1, body)])
+                model = builder.finalize()
+                _load_coefficient(model).fill_(coefficient)
+                solver = _friction_solver(model)
+                effort = scale * coefficient * weight
+                _, qd = _advance_hinge(solver, model, effort, 5, dofs=3)
+                # The bound c (m g + |tau|) holds tau = 0.5 c m g per axis and lets 3 c m g slide.
+                if sticks:
+                    np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
+                else:
+                    bound = coefficient * (weight + np.sqrt(3.0) * effort)
+                    expected = (effort - bound) / INERTIA_LOAD * DT_JOINT_FRICTION * 5
+                    np.testing.assert_allclose(qd[-1], expected, rtol=1.0e-3)
 
     def test_moving_joint_with_a_weak_drive_is_stopped(self):
         """Decelerate a spinning hinge by c m g / I in one step, however weak its drive, as PhysX does."""
         for ke in (0.0, 1.0e-6):
             with self.subTest(ke=ke):
                 model = _lateral_hinge_model(1.0, ke=ke)
-                solver = _solver(model, drive_mode="rows")
+                solver = _friction_solver(model, drive_mode="rows")
                 states, control = [model.state(), model.state()], model.control()
                 states[0].joint_qd.fill_(1.0)
-                _, qd = _advance(solver, states, control, 2)
-                expected = 1.0 - LOAD_COEFFICIENT * GRAVITY / INERTIA_LOAD * DT_joint_friction
+                _, qd = _advance_friction(solver, states, control, 2)
+                expected = 1.0 - LOAD_COEFFICIENT * GRAVITY / INERTIA_LOAD * DT_JOINT_FRICTION
                 self.assertAlmostEqual(float(qd[0]), expected, delta=1.0e-4)
                 self.assertAlmostEqual(float(qd[1]), 0.0, delta=1.0e-4)
 
@@ -2431,7 +2227,7 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
         runs = []
         for registered in (False, True):
             model = _payload_hinge_model(2.0, coefficient=0.0 if registered else None, ground=True, boxes=3)
-            solver = _solver(model, deterministic=True)
+            solver = _friction_solver(model, deterministic=wp.DeterministicMode.RUN_TO_RUN)
             self.assertFalse(solver._joint_friction_load_active)
             observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F})
             pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=64)
@@ -2446,117 +2242,219 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
         runs = []
         for _ in range(2):
             model = _payload_hinge_model(2.0, ground=True, boxes=6)
-            solver = _solver(model, deterministic=True, articulation_constraint_max=64)
+            solver = _friction_solver(
+                model, deterministic=wp.DeterministicMode.RUN_TO_RUN, articulation_constraint_max=64
+            )
             pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=256)
             q, qd = _advance_hinge(solver, model, 0.5, 40, None, pipeline)
-            runs.append((q, qd, solver._joint_friction_load.numpy()))
+            runs.append((q, qd, solver._joint_friction_total.numpy()))
         self.assertGreater(float(runs[0][2][0]), 0.0)
         for first, second in zip(*runs, strict=True):
             np.testing.assert_array_equal(first, second)
 
     def test_graph_replay_matches_eager(self):
-        """Replay captured steps bit-identically to eager stepping."""
+        """Replay captured steps bit-identically to eager stepping, also after an in-place coefficient edit."""
         model = _lateral_hinge_model(1.0)
         effort = 2.0 * LOAD_COEFFICIENT * GRAVITY
-        _, eager = _advance_hinge(_solver(model), model, effort, 10)
-        solver = _solver(model)
+        flags = newton.ModelFlags.JOINT_DOF_PROPERTIES
+        solver = _friction_solver(model)
         states, control = [model.state(), model.state()], model.control()
         control.joint_f.fill_(effort)
-        _advance(solver, states, control, 2)
+        _, eager = _advance_friction(solver, states, control, 10)
+        # The larger coefficient makes the sliding hinge stick, so a replay that missed the edit diverges.
+        _load_coefficient(model).fill_(4.0 * LOAD_COEFFICIENT)
+        solver.notify_model_changed(flags)
+        _, eager_edited = _advance_friction(solver, states, control, 2)
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        solver = _friction_solver(model)
+        states, control = [model.state(), model.state()], model.control()
+        control.joint_f.fill_(effort)
+        _advance_friction(solver, states, control, 2)
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.step(states[0], states[1], control, None, DT_joint_friction)
-            solver.step(states[1], states[0], control, None, DT_joint_friction)
+            solver.step(states[0], states[1], control, None, DT_JOINT_FRICTION)
+            solver.step(states[1], states[0], control, None, DT_JOINT_FRICTION)
         replayed = []
         for _ in range(4):
             wp.capture_launch(capture.graph)
             replayed.append(states[0].joint_qd.numpy()[0])
-        np.testing.assert_array_equal(np.array(replayed, dtype=np.float32), eager[3::2])
+        _load_coefficient(model).fill_(4.0 * LOAD_COEFFICIENT)
+        solver.notify_model_changed(flags)
+        wp.capture_launch(capture.graph)
+        replayed.append(states[0].joint_qd.numpy()[0])
+        self.assertLess(abs(float(eager_edited[1])), abs(float(eager[-1])))
+        np.testing.assert_array_equal(np.array(replayed, dtype=np.float32), [*eager[3::2], eager_edited[1]])
 
     def test_coefficient_edits_apply_at_the_next_step(self):
         """Use the coefficient current at the step."""
         model = _lateral_hinge_model(1.0)
-        solver = _solver(model)
+        solver = _friction_solver(model)
         states, control = [model.state(), model.state()], model.control()
         effort = 0.5 * LOAD_COEFFICIENT * GRAVITY
         control.joint_f.fill_(effort)
-        _, qd = _advance(solver, states, control, 3)
+        _, qd = _advance_friction(solver, states, control, 3)
         np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
         _load_coefficient(model).zero_()
         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        _, qd = _advance(solver, states, control, 1)
-        self.assertAlmostEqual(float(qd), effort / INERTIA_LOAD * DT_joint_friction, delta=1.0e-5)
+        _, qd = _advance_friction(solver, states, control, 1)
+        self.assertAlmostEqual(float(qd), effort / INERTIA_LOAD * DT_JOINT_FRICTION, delta=1.0e-5)
 
     def test_rejects_invalid_coefficients(self):
-        """Raise for invalid coefficients and for enabling the mode after construction."""
-        for value in (-1.0, float("nan")):
+        """Raise for invalid coefficients, unsupported joints and enabling the mode after construction."""
+        for value in (-1.0, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and non-negative"):
-                _solver(_lateral_hinge_model(1.0, coefficient=value))
+                _friction_solver(_lateral_hinge_model(1.0, coefficient=value))
         model = _lateral_hinge_model(1.0, coefficient=0.0)
-        solver = _solver(model)
+        solver = _friction_solver(model)
         _load_coefficient(model).fill_(LOAD_COEFFICIENT)
         with self.assertRaisesRegex(ValueError, "zero at construction"):
             solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        with self.assertRaisesRegex(ValueError, "BALL"):
-            builder = newton.ModelBuilder()
-            SolverSteel.register_custom_attributes(builder)
-            body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA))
-            builder.add_articulation([builder.add_joint_ball(-1, body)])
-            ball = builder.finalize()
-            _load_coefficient(ball).fill_(LOAD_COEFFICIENT)
-            _solver(ball)
+        builder = newton.ModelBuilder()
+        SolverSteel.register_custom_attributes(builder)
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA))
+        builder.add_articulation([builder.add_joint_free(body)])
+        free = builder.finalize()
+        _load_coefficient(free).fill_(LOAD_COEFFICIENT)
+        with self.assertRaisesRegex(
+            ValueError, r"steel:joint_friction_load_coefficient is nonzero on joint 0 \(FREE\)"
+        ):
+            _friction_solver(free)
 
-    def test_rejects_wrong_shape_replacement_at_notify(self):
-        """Raise before any launch when a notified coefficient array is replaced with a wrong shape."""
+    def test_invalid_coefficient_edits_flag_the_world(self):
+        """Flag a step that reads an invalid coefficient, also when the mode was off at construction."""
+        for coefficient, edit in (
+            (LOAD_COEFFICIENT, float("nan")),
+            (LOAD_COEFFICIENT, float("inf")),
+            (0.0, LOAD_COEFFICIENT),
+        ):
+            with self.subTest(coefficient=coefficient, edit=edit):
+                model = _lateral_hinge_model(1.0, coefficient=coefficient)
+                solver = _friction_solver(model)
+                states, control = [model.state(), model.state()], model.control()
+                _advance_friction(solver, states, control, 1)
+                solver.check_constraint_capacity()
+                _load_coefficient(model).fill_(edit)
+                _advance_friction(solver, states, control, 1)
+                with self.assertRaisesRegex(RuntimeError, INVALID_LOAD_FRICTION):
+                    solver.check_constraint_capacity()
+
+    def test_overflowing_load_term_keeps_the_row(self):
+        """Saturate a finite coefficient whose load term overflows float32 instead of dropping its row."""
+        model = _lateral_hinge_model(1.0, coefficient=1.0e38)
+        solver = _friction_solver(model)
+        _, qd = _advance_hinge(solver, model, 1.0, 3)
+        np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
+        self.assertTrue(np.isfinite(solver._joint_friction_total.numpy()[0]))
+        solver.check_constraint_capacity()
+
+    def test_invalid_coefficient_leaves_the_constant_friction(self):
+        """Keep the constant friction row of a DOF whose load coefficient was edited to an invalid value."""
+        builder = _lateral_hinge_builder(1.0)
+        builder.joint_friction = [0.5 * GRAVITY * LOAD_COEFFICIENT]
+        model = builder.finalize()
+        _load_coefficient(model).fill_(LOAD_COEFFICIENT)
+        solver = _friction_solver(model)
+        effort = 0.3 * LOAD_COEFFICIENT * GRAVITY
+        for value in (float("inf"), float("nan"), -1.0):
+            with self.subTest(value=value):
+                _load_coefficient(model).fill_(value)
+                _, qd = _advance_hinge(solver, model, effort, 3)
+                np.testing.assert_allclose(qd, 0.0, atol=1.0e-6)
+
+    def test_invalid_friction_keeps_no_row_with_a_load_coefficient(self):
+        """Build no row for an infinite joint_friction even when a load coefficient applies."""
+        model = _lateral_hinge_model(1.0)
+        solver = _friction_solver(model)
+        model.joint_friction.fill_(float("inf"))
+        effort = 0.5 * LOAD_COEFFICIENT * GRAVITY
+        _, qd = _advance_hinge(solver, model, effort, 1)
+        self.assertAlmostEqual(float(qd), effort / INERTIA_LOAD * DT_JOINT_FRICTION, delta=1.0e-5)
+        self.assertEqual(float(solver._joint_friction_total.numpy()[0]), float("inf"))
+        with self.assertRaisesRegex(RuntimeError, INVALID_LOAD_FRICTION):
+            solver.check_constraint_capacity()
+
+    def test_rejects_wrong_shape_replacement(self):
+        """Raise before any launch when a coefficient array is replaced with a wrong shape."""
         flags = newton.ModelFlags.JOINT_DOF_PROPERTIES
-        for name in ("joint_friction", "joint_friction_load_coefficient"):
-            for count in (0, 2):
-                for captured in (False, True):
-                    with self.subTest(name=name, count=count, captured=captured):
-                        model = _lateral_hinge_model(1.0)
-                        solver = _solver(model)
+        for name, count, at_step in (
+            ("joint_friction", 0, False),
+            ("joint_friction", 2, True),
+            ("joint_friction_load_coefficient", 2, False),
+            ("joint_friction_load_coefficient", 0, True),
+        ):
+            label = name if name == "joint_friction" else f"steel:{name}"
+            with self.subTest(name=name, count=count, at_step=at_step):
+                model = _lateral_hinge_model(1.0)
+                solver = _friction_solver(model)
+                owner = model if name == "joint_friction" else model.steel
+                setattr(owner, name, wp.full(count, 0.5, dtype=wp.float32, device=model.device))
+                with self.assertRaisesRegex(ValueError, rf"{label} has shape \({count},\), expected \(1,\)"):
+                    if at_step:
+                        states, control = [model.state(), model.state()], model.control()
+                        _advance_friction(solver, states, control, 1)
+                    else:
                         solver.notify_model_changed(flags)
-                        owner = model if name == "joint_friction" else model.steel
-                        setattr(owner, name, wp.full(count, 0.5, dtype=wp.float32, device=model.device))
-                        with self.assertRaisesRegex(ValueError, rf"{name} has shape \({count},\), expected \(1,\)"):
-                            if captured:
-                                with wp.ScopedCapture(device=model.device):
-                                    solver.notify_model_changed(flags)
-                            else:
-                                solver.notify_model_changed(flags)
-                        self.assertFalse(wp.get_stream(model.device).is_capturing)
 
-    def test_unregistered_coefficient_notifies(self):
-        """Notify eagerly and under capture without the coefficient attribute."""
+    def test_unregistered_coefficient_notifies_and_steps(self):
+        """Notify eagerly and under capture, and step, without the coefficient attribute."""
         model = _payload_hinge_model(2.0, coefficient=None)
-        solver = _solver(model)
+        solver = _friction_solver(model)
         flags = newton.ModelFlags.JOINT_DOF_PROPERTIES
         solver.notify_model_changed(flags)
         with wp.ScopedCapture(device=model.device) as capture:
             solver.notify_model_changed(flags)
         wp.capture_launch(capture.graph)
-        solver.check_joint_friction()
+        _advance_hinge(solver, model, 0.2, 2)
+        solver.check_constraint_capacity()
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_usd_reads_only_the_steel_coefficient(self):
+        """Import the authored Steel coefficient and leave physxJoint:jointFriction unmapped."""
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        authored = (
+            ("steel", "newton:steel:jointFrictionLoadCoefficient", 0.3),
+            ("physx", "physxJoint:jointFriction", 0.5),
+        )
+        for i, (name, attribute, value) in enumerate(authored):
+            body = UsdGeom.Cube.Define(stage, f"/World/{name}")
+            body.AddTranslateOp().Set((2.0 * i, 0.0, 1.0))
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            mass = UsdPhysics.MassAPI.Apply(body.GetPrim())
+            mass.CreateMassAttr(1.0)
+            mass.CreateDiagonalInertiaAttr((0.1, 0.1, 0.1))
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/{name}_hinge")
+            joint.CreateBody1Rel().SetTargets([body.GetPath()])
+            joint.CreateAxisAttr("Y")
+            joint.CreateLocalPos0Attr((2.0 * i, 0.0, 1.0))
+            joint.GetPrim().CreateAttribute(attribute, Sdf.ValueTypeNames.Float).Set(value)
+        builder = newton.ModelBuilder()
+        SolverSteel.register_custom_attributes(builder)
+        builder.add_usd(stage)
+        model = builder.finalize()
+        coefficients = dict(zip(model.joint_label, _load_coefficient(model).numpy().tolist(), strict=True))
+        self.assertAlmostEqual(coefficients["/World/steel_hinge"], 0.3, places=6)
+        self.assertEqual(coefficients["/World/physx_hinge"], 0.0)
 
     def test_disabled_friction_ignores_coefficients(self):
         """Leave the coefficients unused when enable_joint_friction is off."""
         model = _lateral_hinge_model(1.0)
         effort = 0.5 * LOAD_COEFFICIENT * GRAVITY
-        _, qd = _advance_hinge(_solver(model, enable_joint_friction=False), model, effort, 5)
-        np.testing.assert_allclose(qd, effort / INERTIA_LOAD * DT_joint_friction * np.arange(1, 6), rtol=1.0e-4)
+        _, qd = _advance_hinge(_friction_solver(model, enable_joint_friction=False), model, effort, 5)
+        np.testing.assert_allclose(qd, effort / INERTIA_LOAD * DT_JOINT_FRICTION * np.arange(1, 6), rtol=1.0e-4)
 
 
-def _solver(model, **overrides):
-    options = {
-        "solve_mode": "matrix_free",
-        "enable_joint_friction": True,
-        "iterations": 16,
-    }
+def _friction_solver(model, **overrides):
+    options = {"enable_joint_friction": True, "iterations": 16}
     options.update(overrides)
     solver = SolverSteel(model, **options)
     solver._rigid_body_angular_damping.zero_()
     return solver
 
 
-def _advance(solver, states, control, steps, dt=DT_joint_friction):
+def _advance_friction(solver, states, control, steps, dt=DT_JOINT_FRICTION):
     q, qd = [], []
     for _ in range(steps):
         states[0].clear_forces()
@@ -2567,16 +2465,16 @@ def _advance(solver, states, control, steps, dt=DT_joint_friction):
     return np.squeeze(np.array(q)), np.squeeze(np.array(qd))
 
 
-def _run(model, *, effort=0.0, qd0=0.0, steps, dt=DT_joint_friction, dofs=1, **overrides):
-    solver = _solver(model, **overrides)
+def _run_friction(model, *, effort=0.0, qd0=0.0, steps, dt=DT_JOINT_FRICTION, dofs=1, **overrides):
+    solver = _friction_solver(model, **overrides)
     states, control = [model.state(), model.state()], model.control()
     states[0].joint_qd.assign(np.broadcast_to(np.asarray(qd0, dtype=np.float32), (dofs,)).copy())
     control.joint_f.assign(np.broadcast_to(np.asarray(effort, dtype=np.float32), (dofs,)).copy())
-    return _advance(solver, states, control, steps, dt)[1]
+    return _advance_friction(solver, states, control, steps, dt)[1]
 
 
-def _single_dof_builder(joint, *, friction=FRICTION, ke=0.0, kd=0.0, limit=None, velocity_limit=None, gravity=0.0):
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
+def _single_dof_builder(joint, *, friction=FRICTION, ke=0.0, kd=0.0, limit=None, velocity_limit=None):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA))
     kwargs = {"friction": friction, "armature": 0.0, "target_ke": ke, "target_kd": kd}
     if limit is not None:
@@ -2593,6 +2491,14 @@ def _single_dof_builder(joint, *, friction=FRICTION, ke=0.0, kd=0.0, limit=None,
 
 def _single_dof_model(joint, **kwargs):
     return _single_dof_builder(joint, **kwargs).finalize()
+
+
+def _worlds_model(joint, world_count, **kwargs):
+    """Replicate the single-DOF fixture so independent cases share one solver."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for _ in range(world_count):
+        builder.add_world(_single_dof_builder(joint, **kwargs))
+    return builder.finalize()
 
 
 def _two_link_builder(*, length, mass, friction, ke=0.0, kd=0.0):
@@ -2636,27 +2542,38 @@ def _vertical_slider_model(*, mass, half, friction):
     return builder.finalize()
 
 
-def _pendulum_model(*, friction):
+def _pendulum_model(*, friction, mass=1.0, offset=0.3, inertia=0.01, fixed_base=False):
+    """Hinge about +y with the center of mass on the link's +x axis, optionally below a fixed base link."""
     builder = newton.ModelBuilder()
-    # A fixed root anchors the island so it may sleep.
-    base = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
-    body = builder.add_link(mass=1.0, com=wp.vec3(0.3, 0.0, 0.0), inertia=wp.mat33(np.eye(3) * 0.01))
-    root = builder.add_joint_fixed(-1, base, parent_xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
-    joint = builder.add_joint_revolute(base, body, axis=(0.0, 1.0, 0.0), friction=friction, armature=0.0)
-    builder.add_articulation([root, joint])
+    pivot = wp.transform((0.0, 0.0, 1.0), wp.quat_identity())
+    joints = []
+    parent = -1
+    if fixed_base:
+        # A fixed root anchors the island so it may sleep.
+        parent = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+        joints.append(builder.add_joint_fixed(-1, parent, parent_xform=pivot))
+        pivot = wp.transform_identity()
+    body = builder.add_link(mass=mass, com=wp.vec3(offset, 0.0, 0.0), inertia=wp.mat33(np.eye(3) * inertia))
+    joints.append(
+        builder.add_joint_revolute(
+            parent, body, parent_xform=pivot, axis=(0.0, 1.0, 0.0), friction=friction, armature=0.0
+        )
+    )
+    builder.add_articulation(joints)
     return builder.finalize()
 
 
-def _unsupported_joint_model(joint, *, friction):
+def _root_joint_builder(joint, *, friction):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * INERTIA))
     index = builder.add_joint_ball(-1, body) if joint == "ball" else builder.add_joint_free(body)
     builder.add_articulation([index])
     builder.joint_friction = [friction] * len(builder.joint_friction)
-    return builder.finalize()
+    return builder
 
 
-INERTIA_LOAD = 0.01
+def _root_joint_model(joint, *, friction):
+    return _root_joint_builder(joint, friction=friction).finalize()
 
 
 def _lateral_hinge_builder(mass, *, axial_offset=0.0, inertia=INERTIA_LOAD, gravity=GRAVITY, ke=0.0, kd=0.0):
@@ -2687,9 +2604,9 @@ def _lateral_hinge_model(mass, *, coefficient=LOAD_COEFFICIENT, **kwargs):
 
 def _hinge_friction(model, effort, steps=20):
     """Return tau - I * alpha of a single hinge driven by a constant effort, from its late-step acceleration."""
-    _, qd = _advance_hinge(_solver(model), model, effort, steps)
+    _, qd = _advance_hinge(_friction_solver(model), model, effort, steps)
     axis_inertia = float(model.body_inertia.numpy()[0][1][1])
-    return effort - axis_inertia * float(qd[-1] - qd[-11]) / (10 * DT_joint_friction)
+    return effort - axis_inertia * float(qd[-1] - qd[-11]) / (10 * DT_JOINT_FRICTION)
 
 
 def _payload_hinge_builder(mass, *, ground=False, boxes=0, register=True):
@@ -2742,7 +2659,7 @@ def _advance_hinge(solver, model, effort, steps, observables=None, pipeline=None
         states[0].clear_forces()
         if pipeline is not None:
             pipeline.collide(states[0], contacts)
-        solver.step(states[0], states[1], control, contacts, DT_joint_friction, observables=observables)
+        solver.step(states[0], states[1], control, contacts, DT_JOINT_FRICTION, observables=observables)
         states.reverse()
         q.append(states[0].joint_q.numpy().copy())
         qd.append(states[0].joint_qd.numpy().copy())

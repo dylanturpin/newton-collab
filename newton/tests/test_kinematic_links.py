@@ -255,7 +255,13 @@ KINEMATIC_TEST_WRENCH = np.array([20.0, -15.0, 10.0, 0.5, -0.4, 0.3], dtype=np.f
 
 
 def _uses_maximal_coordinates(solver) -> bool:
-    return isinstance(solver, newton.solvers.SolverXPBD | newton.solvers.SolverSemiImplicit | newton.solvers.SolverVBD)
+    return isinstance(
+        solver,
+        newton.solvers.SolverKamino
+        | newton.solvers.SolverXPBD
+        | newton.solvers.SolverSemiImplicit
+        | newton.solvers.SolverVBD,
+    )
 
 
 def _create_contacts(model: newton.Model, solver):
@@ -879,25 +885,24 @@ def test_kinematic_prescribed_response_lifetime(
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 
-def _undamped(solver):
-    """Turn off the default angular damping of the free roots."""
-    solver._rigid_body_angular_damping.zero_()
-    return solver
-
-
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "steel_split": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="split")),
-    "steel_matrix_free": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="matrix_free")),
-    "steel_propagation": lambda model: _undamped(
-        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation")
+    "steel_matrix_free": lambda model: newton.solvers.SolverSteel(model, solve_mode="matrix_free"),
+    "steel_split": lambda model: newton.solvers.SolverSteel(model, solve_mode="split"),
+    "steel_propagation": lambda model: newton.solvers.SolverSteel(model, articulated_contact_response="propagation"),
+    "steel_propagation_colored": lambda model: newton.solvers.SolverSteel(
+        model, articulated_contact_response="propagation_colored"
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
     "semi_implicit": lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0),
     "vbd": lambda model: newton.solvers.SolverVBD(model, rigid_compliant_alm=True),
+    "lox": lambda model: newton.solvers.SolverKamino(
+        model,
+        config=newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox"),
+    ),
 }
 for device in devices:
     for solver_name, solver_fn in solvers.items():
@@ -907,9 +912,8 @@ for device in devices:
             "mujoco_warp",
             "steel_matrix_free",
             "steel_propagation",
+            "steel_propagation_colored",
         ):
-            continue
-        if device.is_cpu and solver_name == "steel_matrix_free":
             continue
 
         add_function_test(
@@ -920,15 +924,15 @@ for device in devices:
             solver_fn=solver_fn,
             check_reversed_order=solver_name == "steel_matrix_free",
         )
-        if solver_name == "steel_matrix_free":
-            # Steel elides prescribed free bodies only with the matrix-free immediate response.
+        if solver_name.startswith("steel"):
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_steel_matrix_free",
+                f"test_kinematic_prescribed_response_lifetime_{solver_name}",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
+        if solver_name == "steel_matrix_free":
             add_function_test(
                 TestKinematicLinksCanonical,
                 "test_kinematic_free_base_drives_dense_articulation_steel_matrix_free",
@@ -950,13 +954,15 @@ for device in devices:
             devices=[device],
             solver_fn=solver_fn,
         )
-        add_function_test(
-            TestKinematicLinksCanonical,
-            f"test_kinematic_runtime_toggle_{solver_name}",
-            test_kinematic_runtime_toggle,
-            devices=[device],
-            solver_fn=solver_fn,
-        )
+        # Kamino freezes body immovability when constructing the solver.
+        if solver_name != "lox":
+            add_function_test(
+                TestKinematicLinksCanonical,
+                f"test_kinematic_runtime_toggle_{solver_name}",
+                test_kinematic_runtime_toggle,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
 
 
 if __name__ == "__main__":
