@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import vec5
+from ...exceptions import NewtonWarning
 from .enums import EqType
 from .equality import (
     MJC_OBJ_BODY,
@@ -166,7 +167,7 @@ def mjc_add_equality_loop_joint(
             f"MuJoCo weld {label!r} has torquescale=0, which MuJoCo enforces as a point constraint with rotation "
             "free; it is converted to a BALL loop joint (rotation free) instead of a FIXED one. SolverMuJoCo "
             "enforces the original weld row.",
-            UserWarning,
+            NewtonWarning,
             stacklevel=3,
         )
     elif weld and torquescale != 1.0:
@@ -174,7 +175,7 @@ def mjc_add_equality_loop_joint(
             f"MuJoCo weld {label!r} has torquescale={torquescale:g}; it is converted to a FIXED loop joint, which "
             "solvers that enforce loop joints (such as SolverSteel) hold as a hard weld: torquescale, solref and "
             "solimp are not used. SolverMuJoCo enforces the original weld row.",
-            UserWarning,
+            NewtonWarning,
             stacklevel=3,
         )
     joint_idx = add_joint(

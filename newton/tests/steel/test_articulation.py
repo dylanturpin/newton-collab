@@ -783,7 +783,9 @@ def test_imported_weld_equality_holds_the_authored_pose(test, device):
     """
     b = newton.ModelBuilder()
     # The converted WELD becomes a FIXED loop joint parallel to the hinge.
-    _expect_one_warning(test, UserWarning, "another joint already connects these bodies", lambda: b.add_mjcf(mjcf))
+    _expect_one_warning(
+        test, newton.exceptions.NewtonWarning, "another joint already connects these bodies", lambda: b.add_mjcf(mjcf)
+    )
     model = b.finalize(device=device)
     solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
     test.assertEqual(solver._connect_count, 1)
@@ -813,7 +815,9 @@ def test_imported_weld_with_zero_torquescale_leaves_rotation_free(test, device):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         b.add_mjcf(mjcf)
-    test.assertTrue(any("torquescale=0" in str(w.message) for w in caught))
+    test.assertTrue(
+        any("torquescale=0" in str(w.message) and w.category is newton.exceptions.NewtonWarning for w in caught)
+    )
     model = b.finalize(device=device)
     solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
     test.assertEqual(solver._connect_count, 1)

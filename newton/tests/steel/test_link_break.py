@@ -548,7 +548,8 @@ def test_weld_to_world_returns_the_short_way(test, device):
             child_xform=wp.transform(anchor, wp.quat_identity()),
         )
     model = builder.finalize(device=device)
-    _, body_q, _ = _simulate(model, 100, 1.0e-3, history=True)
+    # The off-COM anchor couples the point and rotation rows; 16 iterations leave that coupling unresolved.
+    _, body_q, _ = _simulate(model, 100, 1.0e-3, iterations=64, history=True)
     xyz, w = body_q[:, 0, 3:6], body_q[:, 0, 6]
     angle = np.degrees(2.0 * np.arctan2(np.linalg.norm(xyz, axis=1), np.abs(w)))
     # The short way shrinks the angle from 170 deg about the same axis; the long way would first pass 180 deg.
@@ -562,7 +563,9 @@ class TestSteelLinkBreak(unittest.TestCase):
     def test_collapse_fixed_joints_warns_on_a_weld_closure(self):
         """Collapsing fixed joints opens a link-break loop, so it warns; a joint-break loop collapses quietly."""
         builder, *_ = _four_bar("link")
-        with self.assertWarnsRegex(UserWarning, r"does not preserve FIXED loop-closing joints \('coupler_weld'\)"):
+        with self.assertWarnsRegex(
+            newton.exceptions.NewtonWarning, r"does not preserve FIXED loop-closing joints \('coupler_weld'\)"
+        ):
             builder.collapse_fixed_joints()
         builder, *_ = _four_bar("joint")
         with warnings.catch_warnings():
@@ -570,7 +573,7 @@ class TestSteelLinkBreak(unittest.TestCase):
             builder.collapse_fixed_joints()
         if USD_AVAILABLE:
             builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-            with self.assertWarnsRegex(UserWarning, r"does not preserve FIXED loop-closing joints"):
+            with self.assertWarnsRegex(newton.exceptions.NewtonWarning, r"does not preserve FIXED loop-closing joints"):
                 builder.add_usd(_four_bar_link_break_stage(), collapse_fixed_joints=True)
 
 
