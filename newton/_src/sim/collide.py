@@ -61,7 +61,6 @@ from ..sim.model import Model
 from ..sim.shape_contact_pairs import (
     _shape_contact_pair_count_for_mask,
     _shape_contact_pair_counts,
-    _shape_contact_pairs_for_mask,
 )
 from ..sim.state import State
 
@@ -834,70 +833,66 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     # Pair-aware exact bound: sum of per-pair worst cases over the actual
     # precomputed contact pairs.
     # ------------------------------------------------------------------
-    pairs = np.empty((0, 2), dtype=np.int32)
-    if pair_count > 0:
-        # Enumerate the pairs on the host without caching model.shape_contact_pairs.
-        pairs = _shape_contact_pairs_for_mask(model, np.ones(len(shape_types), dtype=bool)).reshape(-1, 2)
-    if len(pairs) > 0:
-        # Mesh/heightfield-involved pairs go through contact reduction.
-        pair_is_mesh = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
-
-        # Pairs where both shapes are hydroelastic route to the SDF-SDF
-        # hydroelastic path, whose anchor export can exceed the reduction
-        # slots by one contact per normal bin.
+    if pair_count > 0 and int(getattr(model, "shape_count", 0) or 0) == len(shape_types):
+        # Pair totals by type through cached per-mask counts, without enumerating model.shape_contact_pairs.
+        everything = np.ones(len(shape_types), dtype=bool)
         shape_flags = getattr(model, "shape_flags", None)
-        if shape_flags is not None:
-            hydro_mask = (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
-            pair_is_hydro = hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
-        else:
-            pair_is_hydro = np.zeros(len(pairs), dtype=bool)
-        pair_is_mesh = pair_is_mesh & ~pair_is_hydro
-
-        pair_cap = np.full(len(pairs), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
-        pair_cap[pair_is_mesh] = _MESH_PAIR_MAX_CONTACTS
-        pair_cap[pair_is_hydro] = _HYDRO_PAIR_MAX_CONTACTS
-        pair_contacts = int(pair_cap.sum())
-
-        # The pair sum is the combinatorial worst case, but for dense pair
-        # graphs (e.g. thousands of mutually collidable shapes piled in one
-        # world) it explodes quadratically while only a bounded number of
-        # neighbors can touch a shape simultaneously. Cap it with a
-        # spatial-locality estimate, mirroring the pre-pair-aware behavior:
-        # plane-involved pairs keep their full per-pair budget (a ground plane
-        # really can contact every shape resting on it at once), and each
-        # non-plane shape is budgeted for at most MAX_NEIGHBORS_PER_SHAPE
-        # simultaneous neighbors at its own per-pair cap (halved to avoid
-        # double-counting both shapes of a pair). Where this cap binds the
-        # capacity is physically motivated rather than a provable bound -
-        # exactly as before this estimator existed; where the pair sum binds
-        # (typical multi-world robot scenes) it is a provable worst case.
-        plane_shape = shape_types == int(GeoType.PLANE)
-        pair_has_plane = plane_shape[pairs[:, 0]] | plane_shape[pairs[:, 1]]
-        plane_pair_contacts = int(pair_cap[pair_has_plane].sum())
-        nonplane_pairs = pairs[~pair_has_plane]
-        if len(nonplane_pairs) > 0:
-            active_shapes = np.unique(nonplane_pairs)
-            shape_cap = np.full(len(active_shapes), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
-            shape_cap[mesh_mask[active_shapes]] = _MESH_PAIR_MAX_CONTACTS
-            if shape_flags is not None:
-                shape_cap[hydro_mask[active_shapes]] = _HYDRO_PAIR_MAX_CONTACTS
-            nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
-        else:
-            nonplane_locality = 0
-        locality_cap = plane_pair_contacts + nonplane_locality
-
-        plane_count = int(np.count_nonzero(colliding_mask & plane_shape))
-        mesh_count = int(np.count_nonzero(mesh_mask))
-        return _RigidContactCountEstimate(
-            capacity=max(_RIGID_CONTACT_MIN_CAPACITY, min(pair_contacts, locality_cap)),
-            world_count=world_count,
-            primitive_count=int(np.count_nonzero(colliding_mask)) - plane_count - mesh_count,
-            mesh_count=mesh_count,
-            plane_count=plane_count,
-            pair_count=pair_count,
-            pair_estimate_contacts_per_pair=int(pair_contacts // max(len(pairs), 1)),
-            source="pair caps" if pair_contacts <= locality_cap else "pair locality",
+        hydro_mask = (
+            (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
+            if shape_flags is not None
+            else np.zeros(len(shape_types), dtype=bool)
         )
+
+        def count(mask):
+            return _shape_contact_pair_count_for_mask(model, mask)
+
+        def pair_caps(within):
+            """Return the per-pair worst-case contacts of the pairs whose two shapes are both in ``within``."""
+            pairs = count(within)
+            # Pairs where both shapes are hydroelastic route to the SDF-SDF hydroelastic path, whose anchor
+            # export can exceed the reduction slots by one contact per normal bin.
+            hydro = count(within & hydro_mask)
+            # Mesh/heightfield-involved pairs go through contact reduction.
+            mesh = pairs - count(within & ~mesh_mask) - (hydro - count(within & hydro_mask & ~mesh_mask))
+            convex = pairs - mesh - hydro
+            caps = convex * _CONVEX_PAIR_MAX_CONTACTS + mesh * _MESH_PAIR_MAX_CONTACTS
+            return pairs, caps + hydro * _HYDRO_PAIR_MAX_CONTACTS
+
+        total_pairs, pair_contacts = pair_caps(everything)
+        if total_pairs > 0:
+            # The pair sum is the combinatorial worst case, but for dense pair graphs (e.g. thousands of
+            # mutually collidable shapes piled in one world) it explodes quadratically while only a bounded
+            # number of neighbors can touch a shape simultaneously. Cap it with a spatial-locality estimate:
+            # plane-involved pairs keep their full per-pair budget (a ground plane really can contact every
+            # shape resting on it at once), and each colliding non-plane shape is budgeted for at most
+            # MAX_NEIGHBORS_PER_SHAPE simultaneous neighbors at its own per-pair cap (halved to avoid
+            # double-counting both shapes of a pair). Where this cap binds the capacity is physically motivated
+            # rather than a provable bound; where the pair sum binds (typical multi-world robot scenes) it is a
+            # provable worst case.
+            plane_shape = shape_types == int(GeoType.PLANE)
+            nonplane_pairs, nonplane_pair_contacts = pair_caps(~plane_shape)
+            plane_pair_contacts = pair_contacts - nonplane_pair_contacts
+            nonplane_locality = 0
+            if nonplane_pairs > 0:
+                active = colliding_mask & ~plane_shape
+                shape_cap = np.full(int(np.count_nonzero(active)), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+                shape_cap[mesh_mask[active]] = _MESH_PAIR_MAX_CONTACTS
+                shape_cap[hydro_mask[active]] = _HYDRO_PAIR_MAX_CONTACTS
+                nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
+            locality_cap = plane_pair_contacts + nonplane_locality
+
+            plane_count = int(np.count_nonzero(colliding_mask & plane_shape))
+            mesh_count = int(np.count_nonzero(mesh_mask))
+            return _RigidContactCountEstimate(
+                capacity=max(_RIGID_CONTACT_MIN_CAPACITY, min(pair_contacts, locality_cap)),
+                world_count=world_count,
+                primitive_count=int(np.count_nonzero(colliding_mask)) - plane_count - mesh_count,
+                mesh_count=mesh_count,
+                plane_count=plane_count,
+                pair_count=pair_count,
+                pair_estimate_contacts_per_pair=int(pair_contacts // max(total_pairs, 1)),
+                source="pair caps" if pair_contacts <= locality_cap else "pair locality",
+            )
 
     # ------------------------------------------------------------------
     # Fallback: neighbor-budget heuristic (no precomputed pairs available).
