@@ -1170,6 +1170,10 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         _friction_anchors_enabled=patches,
         _friction_patches=SimpleNamespace(current=SimpleNamespace(owner=arr(owner, int))),
         _contact_path=zero(capacity, int),
+        # Each body is its own articulation.
+        _contact_art_a=arr(shape_body[sa], int),
+        _contact_art_b=arr(shape_body[sb], int),
+        _is_free_rigid=zero(worlds * 2, int),
         _contact_slot=arr(slots, int),
         _contact_world=arr(world_ids, int),
         _contact_slots_needed=arr(anchors, int),
