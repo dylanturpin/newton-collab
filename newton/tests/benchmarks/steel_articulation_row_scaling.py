@@ -53,7 +53,7 @@ def scalar_hinv_jt():
         yield
 
 
-PROPAGATION_PATHS = ("propagation", "propagation_colored")
+PROPAGATION_PATHS = ("propagation", "colored")
 
 
 @dataclass(frozen=True)
@@ -554,14 +554,15 @@ def _run_case_path(
         # for both paths so the comparison focuses on dense D-wide contact rows
         # versus propagation contact rows.
         mf_capacity = 16
-    response_mode = path if path in PROPAGATION_PATHS else "immediate"
+    response_mode = "propagation" if path in PROPAGATION_PATHS else "immediate"
+    solve_mode = "colored" if path == "colored" else "serial"
     peak_gpu_mem_bytes = _gpu_used_bytes()
     process_gpu_mem_baseline_bytes, process_gpu_mem_source = _current_process_gpu_mem_bytes()
     process_peak_gpu_mem_bytes = process_gpu_mem_baseline_bytes
     with scalar_hinv_jt():
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
+            solve_mode=solve_mode,
             articulated_contact_response=response_mode,
             iterations=iterations,
             velocity_iterations=velocity_iterations,
@@ -601,9 +602,7 @@ def _run_case_path(
     else:
         propagation_counts = propagation_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
-    propagation_active = bool(
-        solver._articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
-    )
+    propagation_active = bool(solver._articulated_contact_response == "propagation" and np.sum(propagation_counts) > 0)
 
     result = RunResult(
         sweep=case.sweep,
@@ -995,7 +994,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("This report uses real `SolverSteel.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
     lines.append("- `propagation`: fixed-size articulated contact rows plus tree response/propagation.")
-    lines.append("- `propagation_colored`: same response model with graph-colored contact batches.")
+    lines.append('- `propagation_colored`: same response model with `solve_mode="colored"` contact batches.')
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
@@ -1175,7 +1174,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation_colored")
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "colored")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:

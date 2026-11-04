@@ -1,1 +1,1 @@
-Preserve one-row Steel propagation_colored contacts when mixed friction units exceed the shared coloring capacity.
+Preserve one-row Steel `solve_mode="colored"` contacts when mixed friction units exceed the shared coloring capacity.

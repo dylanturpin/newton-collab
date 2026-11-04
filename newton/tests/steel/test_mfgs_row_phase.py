@@ -50,7 +50,6 @@ def _build_chains_and_boxes(device):
 def _solver(model, **options):
     return SolverSteel(
         model,
-        solve_mode="matrix_free",
         iterations=12,
         enable_joint_limits=True,
         articulation_constraint_max=64,
@@ -119,7 +118,7 @@ for _name, _options in (
     ("contact_then_internal", {"row_schedule": "contact_then_internal"}),
     ("velocity_limits", {"enable_joint_velocity_limits": True, "velocity_limit_activation_fraction": 0.0}),
     ("propagation", {"articulated_contact_response": "propagation"}),
-    ("propagation_colored", {"articulated_contact_response": "propagation_colored"}),
+    ("colored", {"solve_mode": "colored", "articulated_contact_response": "propagation"}),
     (
         "propagation_velocity_limits",
         {

@@ -132,7 +132,7 @@ def test_full_reset_matches_fresh_solver(test, device):
 # Two floating ants dropped onto each other plus a stack of boxes in every world: articulation-articulation,
 # articulation-box and box-box contacts, joint limits, PhysX drives, joint velocity limits and joint friction.
 ROBOT_SOLVER_OPTIONS = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "drive_mode": "rows",
     "enable_joint_limits": True,
     "enable_joint_velocity_limits": True,
@@ -145,7 +145,15 @@ ROBOT_SOLVER_OPTIONS = {
 }
 
 
-COLORED_ROBOT_SOLVER_OPTIONS = {**ROBOT_SOLVER_OPTIONS, "articulated_contact_response": "propagation_colored"}
+# Joint friction rows are CUDA-only, so the CPU runs the same scene without them.
+CPU_ROBOT_SOLVER_OPTIONS = {**ROBOT_SOLVER_OPTIONS, "enable_joint_friction": False}
+
+
+COLORED_ROBOT_SOLVER_OPTIONS = {
+    **ROBOT_SOLVER_OPTIONS,
+    "solve_mode": "colored",
+    "articulated_contact_response": "propagation",
+}
 
 
 # Torsional and rolling rows ride on the robot options; their capacity fits, so no world overflows.
@@ -154,16 +162,6 @@ ANGULAR_FRICTION_SOLVER_OPTIONS = {
     "enable_torsional_rolling_friction": True,
     "friction_anchor_beta": 0.0,
     "articulation_constraint_max": 512,
-}
-
-
-SPLIT_SOLVER_OPTIONS = {
-    "solve_mode": "split",
-    "enable_joint_limits": True,
-    "articulation_constraint_max": 128,
-    "free_body_constraint_max": 256,
-    # Rows that do not fit are dropped deterministically too, so overflow stays in scope.
-    "warn_constraint_overflow": False,
 }
 
 
@@ -259,9 +257,7 @@ def _run_hashes(model, options, steps, graph=False, collision_options=None):
 def test_warm_started_full_reset_matches_fresh_solver(test, device):
     """After a full reset, warm-started deterministic steps replay a fresh solver's states and contact forces."""
     model = _build_contact_scene(device, worlds=2, boxes=3, ants=1)
-    configurations = {"split": SPLIT_SOLVER_OPTIONS}
-    if wp.get_device(device).is_cuda:
-        configurations["matrix_free"] = ROBOT_SOLVER_OPTIONS
+    configurations = {"serial": ROBOT_SOLVER_OPTIONS if wp.get_device(device).is_cuda else CPU_ROBOT_SOLVER_OPTIONS}
 
     def simulate(solver, steps):
         pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
@@ -329,8 +325,7 @@ def test_deterministic_launches_replay_identically(test, device):
     The native contact radix sort is outside this interception."""
     robot_model = _build_contact_scene(device, worlds=8)
     for name, model, options in (
-        ("matrix_free", robot_model, ROBOT_SOLVER_OPTIONS),
-        ("split", robot_model, SPLIT_SOLVER_OPTIONS),
+        ("serial", robot_model, ROBOT_SOLVER_OPTIONS),
         ("angular_friction", _build_angular_friction_scene(device, worlds=8), ANGULAR_FRICTION_SOLVER_OPTIONS),
     ):
         with test.subTest(name):
@@ -360,12 +355,14 @@ def test_deterministic_launches_replay_identically(test, device):
 def test_deterministic_runs_are_bitwise_identical(test, device):
     """Two runs produce identical finite states at every eager step and every two-step CUDA graph boundary."""
     robot_model = _build_contact_scene(device)
-    configurations = [("split", robot_model, SPLIT_SOLVER_OPTIONS, False)]
-    if wp.get_device(device).is_cuda:
+    if not wp.get_device(device).is_cuda:
+        # Graphs, colored rows, joint friction and angular friction rows are CUDA-only.
+        configurations = [("serial", robot_model, CPU_ROBOT_SOLVER_OPTIONS, False)]
+    else:
         angular_model = _build_angular_friction_scene(device)
-        configurations += [
-            ("matrix_free", robot_model, ROBOT_SOLVER_OPTIONS, False),
-            ("matrix_free_graph", robot_model, ROBOT_SOLVER_OPTIONS, True),
+        configurations = [
+            ("serial", robot_model, ROBOT_SOLVER_OPTIONS, False),
+            ("serial_graph", robot_model, ROBOT_SOLVER_OPTIONS, True),
             ("colored_graph", robot_model, COLORED_ROBOT_SOLVER_OPTIONS, True),
             ("angular_friction", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, False),
             ("angular_friction_graph", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, True),
@@ -405,7 +402,12 @@ def test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical(test,
     for name in ("shape_scale", "shape_collision_radius", "shape_collision_aabb_lower", "shape_collision_aabb_upper"):
         getattr(model, name).assign(getattr(rescaled, name))
     collision_options = {"dynamic_shape_scale": True}
-    options = {**SPLIT_SOLVER_OPTIONS, "free_body_constraint_max": 2048}
+    options = {
+        "enable_joint_limits": True,
+        "articulation_constraint_max": 128,
+        "free_body_constraint_max": 2048,
+        "warn_constraint_overflow": False,
+    }
     pipeline = newton.CollisionPipeline(model, deterministic=True, **collision_options)
     test.assertFalse(pipeline.narrow_phase.mesh_sdf_identity_scale_only)
     for graph in (False, True):
@@ -430,7 +432,6 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
         solver = SolverSteel(
             model,
             deterministic=True,
-            solve_mode="split",
             free_body_constraint_max=capacity,
             warn_constraint_overflow=False,
         )
@@ -473,7 +474,7 @@ def test_overflow_warning_names_deterministic_mode(test, device):
     )
     for deterministic in (False, True):
         with test.subTest(deterministic=deterministic):
-            solver = SolverSteel(model, deterministic=deterministic, solve_mode="split", free_body_constraint_max=24)
+            solver = SolverSteel(model, deterministic=deterministic, free_body_constraint_max=24)
             wp.synchronize_device(device)
             capture = StdOutCapture()
             capture.begin()
@@ -498,8 +499,8 @@ def test_deterministic_rejects_warm_started_colored(test, device):
         SolverSteel(
             model,
             deterministic=True,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             contact_warmstart=True,
         )
 
@@ -507,7 +508,7 @@ def test_deterministic_rejects_warm_started_colored(test, device):
 # A fixed-base three-link arm pressed into a 5x5x2 heap of boxes and spheres: every link and every heap body has
 # contacts, about 1.9k per world. Plain propagation carries all of them.
 PROPAGATION_SOLVER_OPTIONS = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "articulated_contact_response": "propagation",
     "iterations": 16,
     "articulation_constraint_max": 256,
@@ -832,7 +833,6 @@ def test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows(test
         solver = SolverSteel(
             model,
             deterministic=True,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             contact_torsion_device=True,
             friction_anchor_beta=0.0,
@@ -935,7 +935,6 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
     solver = SolverSteel(
         model,
         deterministic=True,
-        solve_mode="matrix_free",
         drive_mode="rows",
         enable_joint_limits=True,
         joint_limit_activation_gap=0.0,

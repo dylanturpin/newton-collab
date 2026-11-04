@@ -109,7 +109,6 @@ class Example:
             }
         self.solver = SolverSteel(
             self.model,
-            pgs_mode="matrix_free" if self.model.device.is_cuda else "split",
             articulated_contact_response="immediate",
             pgs_iterations=8,
             dense_max_constraints=1024,

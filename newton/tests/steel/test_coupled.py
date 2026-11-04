@@ -18,7 +18,7 @@ DT = 1.0 / 480.0
 
 
 def _steel(view, **kwargs):
-    return SolverSteel(view, solve_mode="matrix_free", **kwargs)
+    return SolverSteel(view, **kwargs)
 
 
 def _build_box_cloth(
@@ -373,7 +373,7 @@ def _undamped(solver):
 def test_articulated_graph_capture_matches_eager(test, device):
     """Graph replay of an articulated source matches eager stepping across proxy iterations and friction models."""
     options = {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "articulated_contact_response": "immediate",
         "iterations": 16,
         "articulation_constraint_max": 32,

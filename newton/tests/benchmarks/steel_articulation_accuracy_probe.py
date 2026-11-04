@@ -118,7 +118,6 @@ def _make_solver(
     with scalar_hinv_jt():
         return SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response=response_mode,
             iterations=iterations,
             velocity_iterations=velocity_iterations,
