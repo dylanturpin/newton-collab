@@ -1,1 +1,1 @@
-Honor per-body gravity exclusion in Steel and Featherstone, import PhysX body gravity flags, preserve them through replication and fixed-joint collapse, and apply each body's world gravity in Steel.
+Honor per-body gravity exclusion (`Model.body_disable_gravity`, `ModelBuilder.add_body(disable_gravity=...)`) in `SolverSteel`, `SolverFeatherstone` and `newton.eval_inverse_dynamics_passive()`, import `physxRigidBody:disableGravity` from USD, and preserve the flag through replication and fixed-joint collapse.

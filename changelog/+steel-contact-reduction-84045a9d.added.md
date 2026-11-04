@@ -1,1 +1,1 @@
-Support latest contact matching with body-pair contact reduction in Steel, retain reduced contact identity across frames, and size reduction tables for replicated material groups.
+Accept body-pair-reduced contacts (`CollisionPipeline.ContactReductionConfig(body_pairs=True)`) in `SolverSteel`, including with `contact_warmstart=True`; `contact_compliance=True` and the other solvers raise `ValueError` for such buffers.
