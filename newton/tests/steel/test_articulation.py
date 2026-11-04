@@ -1976,14 +1976,35 @@ def test_passive_damping_decays_velocity(test, device, solve_mode="matrix_free")
     test.assertLess(qd_damped, 0.2 * qd_undamped)
 
 
-def test_nonzero_spring_stiffness_is_ignored(test, device, solve_mode="matrix_free"):
-    """Accept unsupported core spring properties silently and apply no spring torque."""
-    model = _hinge_model(device, damping=0.0, spring_k=4.0, spring_ref=0.5)
-    solver = _construct(test, model, solve_mode=solve_mode)
-    np.testing.assert_array_equal(solver._passive_spring_stiffness.numpy(), [0.0])
-    state = _run_springs(model, solver, 240)
-    np.testing.assert_allclose(state.joint_q.numpy(), [0.0], atol=1.0e-6)
-    test.assertEqual(float(solver._joint_tau.numpy()[0]), 0.0)
+def test_spring_converges_to_rest_coordinate(test, device, solve_mode="matrix_free"):
+    """Settle an undriven joint at the passive spring's rest coordinate."""
+    model = _hinge_model(device, damping=0.05, spring_k=0.5, spring_ref=0.5)
+    state = _run_springs(model, _construct(test, model, solve_mode=solve_mode), 1200)
+    np.testing.assert_allclose(state.joint_q.numpy(), [0.5], atol=0.02)
+
+
+def test_rest_coordinate_beyond_the_limit_preloads_the_joint(test, device, solve_mode="matrix_free"):
+    """Press a joint against its upper limit with a rest coordinate it cannot reach (a preloaded spring link)."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(link, hx=0.1, hy=0.02, hz=0.02)
+    joint = builder.add_joint_revolute(
+        parent=-1,
+        child=link,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        damping=0.05,
+        stiffness=0.5,
+        rest_q=2.62,
+        limit_lower=-10.0,
+        limit_upper=0.3,
+    )
+    builder.add_articulation([joint])
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, solve_mode=solve_mode, iterations=8, enable_joint_limits=True)
+    state = _run_springs(model, solver, 1200)
+    np.testing.assert_allclose(state.joint_q.numpy(), [0.3], atol=0.03)
 
 
 def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, solve_mode="matrix_free"):
@@ -1993,7 +2014,7 @@ def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, solve_mode=
 
 
 def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve_mode="matrix_free"):
-    """Refresh damping on a JOINT_DOF_PROPERTIES notify while still applying no spring torque."""
+    """Refresh damping and spring stiffness on a JOINT_DOF_PROPERTIES notify."""
     model = _hinge_model(device, damping=0.0, spring_k=0.0, spring_ref=0.5)
     solver = _construct(test, model, solve_mode=solve_mode)
     model.joint_stiffness.assign([4.0])
@@ -2002,7 +2023,8 @@ def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve
     state_0, state_1 = model.state(), model.state()
     state_0.joint_qd.fill_(1.0)
     solver.step(state_0, state_1, model.control(), None, DT)
-    np.testing.assert_allclose(solver._joint_tau.numpy(), [-3.0], atol=1.0e-6)
+    # 4 * (0.5 - 0) spring torque against 3 * 1 damping torque.
+    np.testing.assert_allclose(solver._joint_tau.numpy(), [-1.0], atol=1.0e-6)
 
 
 def test_registration_adds_no_spring_attributes(test, device):
@@ -2025,7 +2047,11 @@ add_function_test(
     solve_mode="split",
 )
 for _name, _func in (
-    ("test_nonzero_spring_stiffness_is_ignored", test_nonzero_spring_stiffness_is_ignored),
+    ("test_spring_converges_to_rest_coordinate", test_spring_converges_to_rest_coordinate),
+    (
+        "test_rest_coordinate_beyond_the_limit_preloads_the_joint",
+        test_rest_coordinate_beyond_the_limit_preloads_the_joint,
+    ),
     ("test_zero_or_absent_spring_stiffness_does_not_warn", test_zero_or_absent_spring_stiffness_does_not_warn),
     (
         "test_spring_attribute_edits_leave_damping_refresh_intact",

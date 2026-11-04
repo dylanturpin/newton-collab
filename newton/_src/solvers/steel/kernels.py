@@ -688,7 +688,7 @@ def jcalc_tau(
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_spring_stiffness: wp.array[float],
-    joint_spring_ref: wp.array[float],
+    joint_rest_q: wp.array[float],
     joint_damping: wp.array[float],
     coord_start: int,
     dof_start: int,
@@ -728,8 +728,8 @@ def jcalc_tau(
             S_s = joint_S_s[j]
             # Passive spring/damping applied explicitly; the drive gains stay on the
             # implicit augmented path. These joint types have one coordinate per DOF,
-            # so coord_start + i addresses the axis position.
-            passive_f = joint_spring_stiffness[j] * (joint_spring_ref[j] - joint_q[coord_start + i])
+            # so coord_start + i addresses the axis position and its rest coordinate.
+            passive_f = joint_spring_stiffness[j] * (joint_rest_q[coord_start + i] - joint_q[coord_start + i])
             passive_f -= joint_damping[j] * joint_qd[j]
             # total torque / force on the joint (drive forces handled via augmented mass)
             value = -wp.dot(S_s, body_f_s) + joint_f[j] + passive_f

@@ -1301,7 +1301,7 @@ quaternions (xyzw) for default rotational rest configurations. Index it
 with :attr:`newton.Model.joint_q_start`. Scalar ``JointDofConfig.rest_q`` values cannot specify a
 quaternion; edit the joint's four entries in ``joint_rest_q`` instead.
 
-Featherstone and SemiImplicit apply springs only to REVOLUTE, PRISMATIC, and D6
+Featherstone, Steel and SemiImplicit apply springs only to REVOLUTE, PRISMATIC, and D6
 coordinates. MuJoCo
 also supports isotropic BALL springs and quaternion rest orientations.
 :class:`newton.solvers.SolverVBD` uses ``joint_rest_q`` for ROD structural rest;
@@ -1309,8 +1309,6 @@ its material stiffness and damping remain in ``joint_target_ke`` / ``joint_targe
 Other solvers do not consume these properties yet. As with other model
 features, unsupported springs do not produce automatic warnings; consult the
 :doc:`solver feature matrix </solvers/index>` when choosing a solver.
-Steel adoption remains a follow-up tracked in
-`issue #4516 <https://github.com/newton-physics/newton/issues/4516>`_.
 
 SemiImplicit derives angular coordinates from body orientations and does not
 track multi-turn winding. Its scalar angular springs use a principal angle in

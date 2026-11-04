@@ -3214,8 +3214,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         dof_force = ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
         if flags & dof_force:
             self._refresh_passive_joint_damping()
+            self._refresh_passive_joint_springs()
             # Augmented drive gains enter the factored mass-matrix diagonal.
             self._mass_update_requested.fill_(1)
+        if flags & ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES:
+            self._refresh_passive_joint_springs()
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_shape_materials()
             self._check_restitution_support()
@@ -4475,16 +4478,25 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
     def _setup_passive_joint_forces(self, model) -> None:
-        """Select the passive damping of the inverse-dynamics pass; its passive springs are zero.
+        """Allocate the passive damping and spring buffers of the inverse-dynamics pass and fill them from the model.
 
-        Passive joint springs are not applied yet (newton-physics/newton#4516);
-        their buffers stay zero.
+        Springs act on PRISMATIC, REVOLUTE and D6 DOFs as ``joint_stiffness * (joint_rest_q - q)``.
         """
         n_dofs = max(int(model.joint_dof_count), 1)
         self._passive_joint_damping = wp.zeros(n_dofs, dtype=wp.float32, device=model.device)
         self._refresh_passive_joint_damping()
         self._passive_spring_stiffness = wp.zeros(n_dofs, dtype=wp.float32, device=model.device)
-        self._passive_spring_ref = wp.zeros(n_dofs, dtype=wp.float32, device=model.device)
+        self._passive_spring_ref = wp.zeros(max(int(model.joint_coord_count), 1), dtype=wp.float32, device=model.device)
+        self._refresh_passive_joint_springs()
+
+    def _refresh_passive_joint_springs(self) -> None:
+        """Copy the model's passive spring stiffness and rest coordinates into the solver's fixed buffers."""
+        # Users may replace these model arrays; captured graphs keep the buffers' addresses.
+        model = self.model
+        if model.joint_stiffness is not None and model.joint_dof_count:
+            wp.copy(self._passive_spring_stiffness, model.joint_stiffness, count=model.joint_dof_count)
+        if model.joint_rest_q is not None and model.joint_coord_count:
+            wp.copy(self._passive_spring_ref, model.joint_rest_q, count=model.joint_coord_count)
 
     def _refresh_passive_joint_damping(self) -> None:
         """Copy the model's current joint damping into the solver's fixed damping buffer."""
