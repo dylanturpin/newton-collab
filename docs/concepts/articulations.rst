@@ -1300,7 +1300,7 @@ When building a link-break loop:
   Steel, leaks more momentum.
 - With :class:`~newton.solvers.SolverSteel`, iterative weld rows converge
   slowly on spatial loops at low iteration counts. ``enable_bilateral_preelimination``
-  solves a weld exactly when the articulation's loop rows fit its capacity
+  solves a weld directly when the articulation's loop rows fit its capacity
   (8 rows, so one weld); larger models warn and fall back to iterative rows.
 - Do not collapse fixed joints in a link-break model: build and import it with
   ``collapse_fixed_joints=False`` and do not call
