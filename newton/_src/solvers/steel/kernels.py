@@ -5044,6 +5044,67 @@ def preelim_project_velocity_for_size(
 # sides of the bilateral velocity box rather than waiting for a violation.
 
 
+@wp.func
+def _velocity_limit_rows_wanted(
+    dof: int,
+    joint_velocity_limit: wp.array[float],
+    joint_qd: wp.array[float],
+    velocity_limit_activation_fraction: float,
+    drive_slot: wp.array[int],
+    skip_driven: int,
+) -> bool:
+    """Whether :func:`allocate_joint_velocity_limit_slots` reserves the lower/upper row pair of ``dof``."""
+    qdot_max = joint_velocity_limit[dof]
+
+    # Non-positive limits and the builder default are "unlimited": no rows.
+    if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
+        return False
+
+    # Fused path: driven DOFs are clamped at the end of each iteration.
+    if skip_driven != 0:
+        if drive_slot[dof] >= 0:
+            return False
+
+    # Proximity gate: only reserve the row pair when the DOF speed is
+    # within ``fraction * qdot_max`` of the box edge. The fraction==0
+    # branch short-circuits before reading ``joint_qd`` so the default
+    # path allocates exactly as before (same slots, same order).
+    if velocity_limit_activation_fraction > 0.0:
+        if wp.abs(joint_qd[dof]) < velocity_limit_activation_fraction * qdot_max:
+            return False
+    return True
+
+
+@wp.func
+def _velocity_limit_joint_row_count(
+    j: int,
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    joint_qd: wp.array[float],
+    velocity_limit_activation_fraction: float,
+    drive_slot: wp.array[int],
+    skip_driven: int,
+) -> int:
+    """Rows joint ``j`` reserves in :func:`allocate_joint_velocity_limit_slots` (two per wanted DOF)."""
+    jtype = joint_type[j]
+    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        return 0
+    qd_start = joint_qd_start[j]
+    count = int(0)
+    for axis in range(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]):
+        if _velocity_limit_rows_wanted(
+            qd_start + axis, joint_velocity_limit, joint_qd, velocity_limit_activation_fraction, drive_slot, skip_driven
+        ):
+            count += 2
+    return count
+
+
+VELOCITY_LIMIT_WARP_THREADS = 32
+"""Threads per articulation of the warp velocity-limit row kernels (one warp)."""
+
+
 @wp.kernel
 def allocate_joint_velocity_limit_slots(
     articulation_start: wp.array[int],
@@ -5135,24 +5196,10 @@ def allocate_joint_velocity_limit_slots(
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            qdot_max = joint_velocity_limit[dof]
-
-            # Non-positive limits and the builder default are "unlimited": no rows.
-            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
+            if not _velocity_limit_rows_wanted(
+                dof, joint_velocity_limit, joint_qd, velocity_limit_activation_fraction, drive_slot, skip_driven
+            ):
                 continue
-
-            # Fused path: driven DOFs are clamped at the end of each iteration.
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
-
-            # Proximity gate: only reserve the row pair when the DOF speed is
-            # within ``fraction * qdot_max`` of the box edge. The fraction==0
-            # branch short-circuits before reading ``joint_qd`` so the default
-            # path allocates exactly as before (same slots, same order).
-            if velocity_limit_activation_fraction > 0.0:
-                if wp.abs(joint_qd[dof]) < velocity_limit_activation_fraction * qdot_max:
-                    continue
 
             lower_idx = 2 * dof
             upper_idx = lower_idx + 1
@@ -5166,6 +5213,75 @@ def allocate_joint_velocity_limit_slots(
             if upper_slot < max_constraints:
                 velocity_limit_slot[upper_idx] = upper_slot
                 velocity_limit_sign[upper_idx] = -1.0
+
+
+@wp.func
+def _populate_joint_velocity_limit_rows(
+    j: int,
+    group_idx: int,
+    world: int,
+    dof_start: int,
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    velocity_limit_slot: wp.array[int],
+    velocity_limit_sign: wp.array[float],
+    pgs_cfm: float,
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+):
+    """Write joint ``j``'s allocated velocity-limit rows (see :func:`populate_joint_velocity_limit_J_for_size`)."""
+    jtype = joint_type[j]
+    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        return
+
+    lin_count = joint_dof_dim[j, 0]
+    ang_count = joint_dof_dim[j, 1]
+    axis_count = lin_count + ang_count
+    qd_start = joint_qd_start[j]
+
+    for axis in range(axis_count):
+        dof = qd_start + axis
+        qdot_max = joint_velocity_limit[dof]
+        if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
+            continue
+
+        local_dof = dof - dof_start
+        lower_idx = 2 * dof
+
+        for side in range(2):
+            row_idx = lower_idx + side
+            slot = velocity_limit_slot[row_idx]
+            if slot < 0:
+                continue
+
+            sign = velocity_limit_sign[row_idx]
+
+            # Single signed ±1 entry at the local DOF column. The selector
+            # row on generalised velocity is ``J = sign * e_i``; the
+            # articulated-body response ``J M^-1 J^T`` is exactly PhysX's
+            # ``recipResponse`` on the same axis and is computed by the
+            # existing ``hinv_jt_par_row`` / ``diag_from_JY_par_art`` path.
+            J_group[group_idx, slot, local_dof] = sign
+
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            # No Baumgarte / ERP — matches PhysX vel-limit row (§4).
+            world_row_beta[world, slot] = 0.0
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = 0.0
+            # ``target_vel = -qdot_max`` for both signs: rhs = -target + J*v
+            # = qdot_max +/- qdot_i, which is negative exactly when the
+            # corresponding side of the box is violated.
+            world_target_velocity[world, slot] = -qdot_max
 
 
 @wp.kernel
@@ -5216,50 +5332,144 @@ def populate_joint_velocity_limit_J_for_size(
     joint_end = articulation_start[art + 1]
 
     for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        _populate_joint_velocity_limit_rows(
+            j, group_idx, world, dof_start, joint_type, joint_qd_start, joint_dof_dim, joint_velocity_limit,
+            velocity_limit_slot, velocity_limit_sign, pgs_cfm, J_group, world_row_type, world_row_parent, world_row_mu,
+            world_row_beta, world_row_cfm, world_phi, world_target_velocity,
+        )  # fmt: skip
+
+
+@wp.kernel(enable_backward=False)
+def allocate_joint_velocity_limit_slots_warp(
+    articulation_start: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    joint_qd: wp.array[float],
+    velocity_limit_activation_fraction: float,
+    drive_slot: wp.array[int],
+    skip_driven: int,
+    art_to_world: wp.array[int],
+    max_constraints: int,
+    articulation_rows_active: wp.array[int],
+    # outputs
+    velocity_limit_slot: wp.array[int],
+    velocity_limit_sign: wp.array[float],
+    world_slot_counter: wp.array[int],
+    row_slot_mode: int,
+    element_row_cursor: wp.array[int],
+):
+    """:func:`allocate_joint_velocity_limit_slots` with one warp per articulation (launch tiled, block of 32).
+
+    The articulation reserves all its rows at once and hands them out in the serial kernel's order
+    (joint, axis, lower then upper) through a prefix sum over each round of 32 joints. The serial kernel
+    reserves them one by one; with ``ROW_SLOTS_ATOMIC`` another articulation's reservations may land in
+    between, so this result is the serial one in which they happen not to (the only result when one
+    articulation per world reserves rows), and with the cursor modes it is the same.
+    """
+    art, lane = wp.tid()
+    world = art_to_world[art]
+
+    dof_base = articulation_dof_start[art]
+    dof_count = articulation_H_rows[art]
+    for d in range(lane, dof_count, VELOCITY_LIMIT_WARP_THREADS):
+        lower_idx = 2 * (dof_base + d)
+        upper_idx = lower_idx + 1
+        velocity_limit_slot[lower_idx] = -1
+        velocity_limit_slot[upper_idx] = -1
+        velocity_limit_sign[lower_idx] = 0.0
+        velocity_limit_sign[upper_idx] = 0.0
+    if articulation_rows_active[art] == 0:
+        return
+
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+    count = int(0)
+    for j in range(joint_start + lane, joint_end, VELOCITY_LIMIT_WARP_THREADS):
+        count += _velocity_limit_joint_row_count(
+            j, joint_type, joint_qd_start, joint_dof_dim, joint_velocity_limit, joint_qd,
+            velocity_limit_activation_fraction, drive_slot, skip_driven,
+        )  # fmt: skip
+    # the block barrier inside the reduction also orders the clears above before the slot writes below
+    total = wp.tile_sum(wp.tile(count))[0]
+    if total == 0:
+        return
+    first = int(0)
+    if lane == 0:
+        first = reserve_world_rows(row_slot_mode, world_slot_counter, world, total, element_row_cursor, art)
+    first = wp.tile_sum(wp.tile(first))[0]
+    if row_slot_mode == ROW_SLOTS_COUNT:
+        return
+
+    for round_start in range(joint_start, joint_end, VELOCITY_LIMIT_WARP_THREADS):
+        j = round_start + lane
+        rows = int(0)
+        if j < joint_end:
+            rows = _velocity_limit_joint_row_count(
+                j, joint_type, joint_qd_start, joint_dof_dim, joint_velocity_limit, joint_qd,
+                velocity_limit_activation_fraction, drive_slot, skip_driven,
+            )  # fmt: skip
+        rows_tile = wp.tile(rows)
+        slot = first + wp.untile(wp.tile_scan_exclusive(rows_tile))
+        first += wp.tile_sum(rows_tile)[0]
+        if rows == 0:
             continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
         qd_start = joint_qd_start[j]
-
-        for axis in range(axis_count):
+        for axis in range(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]):
             dof = qd_start + axis
-            qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0 or qdot_max >= JOINT_VELOCITY_LIMIT_UNSET:
+            if not _velocity_limit_rows_wanted(
+                dof, joint_velocity_limit, joint_qd, velocity_limit_activation_fraction, drive_slot, skip_driven
+            ):
                 continue
+            if slot < max_constraints:
+                velocity_limit_slot[2 * dof] = slot
+                velocity_limit_sign[2 * dof] = 1.0
+            if slot + 1 < max_constraints:
+                velocity_limit_slot[2 * dof + 1] = slot + 1
+                velocity_limit_sign[2 * dof + 1] = -1.0
+            slot += 2
 
-            local_dof = dof - dof_start
-            lower_idx = 2 * dof
 
-            for side in range(2):
-                row_idx = lower_idx + side
-                slot = velocity_limit_slot[row_idx]
-                if slot < 0:
-                    continue
+@wp.kernel(enable_backward=False)
+def populate_joint_velocity_limit_J_for_size_warp(
+    articulation_start: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_velocity_limit: wp.array[float],
+    art_to_world: wp.array[int],
+    velocity_limit_slot: wp.array[int],
+    velocity_limit_sign: wp.array[float],
+    group_to_art: wp.array[int],
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+):
+    """:func:`populate_joint_velocity_limit_J_for_size` with one warp per articulation (launch tiled).
 
-                sign = velocity_limit_sign[row_idx]
-
-                # Single signed ±1 entry at the local DOF column. The selector
-                # row on generalised velocity is ``J = sign * e_i``; the
-                # articulated-body response ``J M^-1 J^T`` is exactly PhysX's
-                # ``recipResponse`` on the same axis and is computed by the
-                # existing ``hinv_jt_par_row`` / ``diag_from_JY_par_art`` path.
-                J_group[group_idx, slot, local_dof] = sign
-
-                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-                world_row_parent[world, slot] = -1
-                world_row_mu[world, slot] = 0.0
-                # No Baumgarte / ERP — matches PhysX vel-limit row (§4).
-                world_row_beta[world, slot] = 0.0
-                world_row_cfm[world, slot] = pgs_cfm
-                world_phi[world, slot] = 0.0
-                # ``target_vel = -qdot_max`` for both signs: rhs = -target + J*v
-                # = qdot_max +/- qdot_i, which is negative exactly when the
-                # corresponding side of the box is violated.
-                world_target_velocity[world, slot] = -qdot_max
+    Every joint writes only its own rows, so lanes taking every 32nd joint write the same values.
+    """
+    group_idx, lane = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+    for j in range(articulation_start[art] + lane, articulation_start[art + 1], VELOCITY_LIMIT_WARP_THREADS):
+        _populate_joint_velocity_limit_rows(
+            j, group_idx, world, dof_start, joint_type, joint_qd_start, joint_dof_dim, joint_velocity_limit,
+            velocity_limit_slot, velocity_limit_sign, pgs_cfm, J_group, world_row_type, world_row_parent, world_row_mu,
+            world_row_beta, world_row_cfm, world_phi, world_target_velocity,
+        )  # fmt: skip
 
 
 # =============================================================================

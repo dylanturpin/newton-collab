@@ -128,6 +128,7 @@ from .kernels import (
     ROW_SLOTS_WRITE,
     ROW_WATERMARK_CONTACT_SLOT,
     ROW_WATERMARK_FAMILY_STRIDE,
+    VELOCITY_LIMIT_WARP_THREADS,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_all_row_watermarks,
@@ -145,6 +146,7 @@ from .kernels import (
     add_joint_friction_load,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
+    allocate_joint_velocity_limit_slots_warp,
     allocate_mimic_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
@@ -239,6 +241,7 @@ from .kernels import (
     mul_com_spatial_inertia,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
+    populate_joint_velocity_limit_J_for_size_warp,
     populate_mimic_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
@@ -3656,6 +3659,20 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._empty_float_2d = wp.empty((0, 0), dtype=wp.float32, device=model.device)
         # Latency mode merges the setup launches outside the PGS loop; see _fused_setup_active.
         self._fused_setup_enabled = not model.requires_grad
+        # Size groups that can hold velocity-limit rows: their articulations have a prismatic, revolute or D6
+        # joint (topology is fixed for the solver's lifetime).
+        self._velocity_limit_row_sizes = []
+        if model.joint_count:
+            joint_type = model.joint_type.numpy()
+            art_start = model.articulation_start.numpy()
+            limited = np.isin(
+                joint_type, (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
+            ).astype(np.int64)
+            limited_before = np.concatenate([[0], np.cumsum(limited)])
+            for size in self._size_groups:
+                arts = self._group_to_art[size].numpy()
+                if np.any(limited_before[art_start[arts + 1]] > limited_before[art_start[arts]]):
+                    self._velocity_limit_row_sizes.append(size)
         self._init_deterministic_rows(model)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
@@ -12316,6 +12333,114 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
+    def _velocity_limit_slot_args(self) -> tuple[list, list]:
+        model = self.model
+        inputs = [
+            model.articulation_start,
+            self._articulation_dof_start,
+            self._articulation_H_rows,
+            model.joint_type,
+            model.joint_qd_start,
+            model.joint_dof_dim,
+            model.joint_velocity_limit,
+            self._v_hat,
+            self._velocity_limit_activation_fraction,
+            self._vel_limit_drive_slot_arg,
+            self._vel_limit_skip_driven,
+            self._art_to_world,
+            self._articulation_constraint_max,
+            self._constraint_art_active,
+        ]
+        outputs = [self._velocity_limit_sign, self._slot_counter]
+        return inputs, [self._velocity_limit_slot, *outputs]
+
+    def _allocate_velocity_limit_slots(self) -> None:
+        """Reserve each velocity-limited DOF's lower/upper rows, a thread per articulation."""
+        inputs, outputs = self._velocity_limit_slot_args()
+
+        def launch(mode):
+            wp.launch(
+                allocate_joint_velocity_limit_slots,
+                dim=self.model.articulation_count,
+                inputs=inputs,
+                outputs=[*outputs, mode, self._row_cursor],
+                device=self.model.device,
+            )
+
+        self._reserve_rows(self._articulation_world_index, self._slot_counter, launch)
+
+    def _allocate_velocity_limit_slots_warp(self) -> None:
+        """Reserve what :meth:`_allocate_velocity_limit_slots` reserves with a warp per articulation."""
+        inputs, outputs = self._velocity_limit_slot_args()
+
+        def launch(mode):
+            wp.launch_tiled(
+                allocate_joint_velocity_limit_slots_warp,
+                dim=[self.model.articulation_count],
+                inputs=inputs,
+                outputs=[*outputs, mode, self._row_cursor],
+                block_dim=VELOCITY_LIMIT_WARP_THREADS,
+                device=self.model.device,
+            )
+
+        self._reserve_rows(self._articulation_world_index, self._slot_counter, launch)
+
+    def _populate_velocity_limit_args(self, size: int) -> tuple[list, list]:
+        model = self.model
+        inputs = [
+            model.articulation_start,
+            self._articulation_dof_start,
+            model.joint_type,
+            model.joint_qd_start,
+            model.joint_dof_dim,
+            model.joint_velocity_limit,
+            self._art_to_world,
+            self._velocity_limit_slot,
+            self._velocity_limit_sign,
+            self._group_to_art[size],
+            self._cfm,
+        ]
+        outputs = [
+            self._J_by_size[size],
+            self._row_type,
+            self._row_parent,
+            self._row_mu,
+            self._row_beta,
+            self._row_cfm,
+            self._phi,
+            self._target_velocity,
+        ]
+        return inputs, outputs
+
+    def _populate_velocity_limit_rows(self) -> None:
+        """Write the velocity-limit rows' Jacobian entries and metadata, a launch per size group."""
+        for size in self._size_groups:
+            inputs, outputs = self._populate_velocity_limit_args(size)
+            wp.launch(
+                populate_joint_velocity_limit_J_for_size,
+                dim=self._n_arts_by_size[size],
+                inputs=inputs,
+                outputs=outputs,
+                device=self.model.device,
+            )
+
+    def _populate_velocity_limit_rows_warp(self) -> None:
+        """Write what :meth:`_populate_velocity_limit_rows` writes with a warp per articulation.
+
+        Size groups without a prismatic, revolute or D6 joint (free bodies) have no velocity-limit rows,
+        so they get no launch.
+        """
+        for size in self._velocity_limit_row_sizes:
+            inputs, outputs = self._populate_velocity_limit_args(size)
+            wp.launch_tiled(
+                populate_joint_velocity_limit_J_for_size_warp,
+                dim=[self._n_arts_by_size[size]],
+                inputs=inputs,
+                outputs=outputs,
+                block_dim=VELOCITY_LIMIT_WARP_THREADS,
+                device=self.model.device,
+            )
+
     def _link_patch_rows_per_route(self, contacts: Contacts) -> None:
         """Link each route's friction-patch rows and share their Coulomb budgets, one launch per route."""
         for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
@@ -12895,38 +13020,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         # phase schedule, which visits velocity-limit rows in a dedicated
         # final pass regardless of slot order.
         if self._enable_joint_velocity_limits and self._velocity_limit_slot is not None:
-
-            def launch_velocity_limits(mode):
-                wp.launch(
-                    allocate_joint_velocity_limit_slots,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self._articulation_dof_start,
-                        self._articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_velocity_limit,
-                        self._v_hat,
-                        self._velocity_limit_activation_fraction,
-                        self._vel_limit_drive_slot_arg,
-                        self._vel_limit_skip_driven,
-                        self._art_to_world,
-                        max_constraints,
-                        self._constraint_art_active,
-                    ],
-                    outputs=[
-                        self._velocity_limit_slot,
-                        self._velocity_limit_sign,
-                        self._slot_counter,
-                        mode,
-                        self._row_cursor,
-                    ],
-                    device=model.device,
-                )
-
-            self._reserve_rows(self._articulation_world_index, self._slot_counter, launch_velocity_limits)
+            if self._fused_setup_active():
+                self._allocate_velocity_limit_slots_warp()
+            else:
+                self._allocate_velocity_limit_slots()
 
         # Unconditional phase-5 boundary snapshot; dense contact rows start here.
         wp.launch(
@@ -12951,36 +13048,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for size in self._size_groups:
                     self._J_by_size[size].zero_()
                 j_buffers_zeroed = True
-            for size in self._size_groups:
-                n_arts = self._n_arts_by_size[size]
-                wp.launch(
-                    populate_joint_velocity_limit_J_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        model.articulation_start,
-                        self._articulation_dof_start,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_velocity_limit,
-                        self._art_to_world,
-                        self._velocity_limit_slot,
-                        self._velocity_limit_sign,
-                        self._group_to_art[size],
-                        self._cfm,
-                    ],
-                    outputs=[
-                        self._J_by_size[size],
-                        self._row_type,
-                        self._row_parent,
-                        self._row_mu,
-                        self._row_beta,
-                        self._row_cfm,
-                        self._phi,
-                        self._target_velocity,
-                    ],
-                    device=model.device,
-                )
+            if self._fused_setup_active():
+                self._populate_velocity_limit_rows_warp()
+            else:
+                self._populate_velocity_limit_rows()
 
         if (
             contacts is not None
