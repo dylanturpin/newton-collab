@@ -951,7 +951,7 @@ def _articulation_activity(
         # Sleeping articulations keep stale FK/ID terms, which only their discarded dynamics read.
         fk_id_cache_valid[i] = 1 - active[i]
     if active[i] != 0:
-        any_active[0] = 1
+        wp.atomic_max(any_active, 0, 1)
 
 
 @wp.kernel(enable_backward=False)
