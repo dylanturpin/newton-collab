@@ -23,6 +23,7 @@ from ...geometry.flags import MeshProperties, ShapeFlags
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian, eval_mass_matrix
 from ..coupled.interface import CouplingInterface
+from ..coupled.model_view import ModelView
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
@@ -356,6 +357,9 @@ def _validate_supported_model(model: Model) -> None:
             if model.joint_articulation is not None:
                 # A disabled loop-closing joint is a released closure.
                 disabled &= model.joint_articulation.numpy() >= 0
+            if isinstance(model, ModelView):
+                # Another coupled entry or the coupling algorithm simulates these joints.
+                disabled[model.coupling_disabled_joints.numpy()] = False
             if np.any(disabled):
                 raise NotImplementedError(
                     "SolverSteel does not support disabled joints in an articulation tree (Model.joint_enabled)."
@@ -588,12 +592,19 @@ def _flag_disabled_tree_joints(
     joint_articulation: wp.array[int],
     joint_world: wp.array[int],
     world_count: int,
+    coupling_owned_joint: wp.array[wp.bool],
     disabled_tree_joint: wp.array[wp.bool],
 ):
-    """Flag the status entry of every world with a disabled joint in an articulation tree."""
+    """Flag the status entry of every world with a disabled joint in an articulation tree.
+
+    Joints another coupled entry or the coupling algorithm simulates (``coupling_owned_joint``) are exempt.
+    """
     j = wp.tid()
     if joint_enabled[j] or joint_articulation[j] < 0:
         return
+    if coupling_owned_joint:
+        if coupling_owned_joint[j]:
+            return
     world = joint_world[j]
     if world < 0:
         world = world_count
@@ -2946,6 +2957,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         them."""
         # Tree joints disabled after construction, which the solver does not simulate.
         self._disabled_tree_joint = wp.zeros(int(model.world_count) + 1, dtype=wp.bool, device=model.device)
+        self._coupling_owned_joint = None
+        if isinstance(model, ModelView) and model.coupling_disabled_joints.size:
+            owned = np.zeros(model.joint_count, dtype=bool)
+            owned[model.coupling_disabled_joints.numpy()] = True
+            self._coupling_owned_joint = wp.array(owned, dtype=wp.bool, device=model.device)
         self._cross_world_contacts = wp.zeros(self._world_count + 1, dtype=wp.int32, device=model.device)
         if self._model_plan is not None and model.articulation_count:
             self._has_responding_global = bool(
@@ -7081,7 +7097,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         wp.launch(
             _flag_disabled_tree_joints,
             dim=model.joint_count,
-            inputs=[model.joint_enabled, model.joint_articulation, model.joint_world, int(model.world_count)],
+            inputs=[
+                model.joint_enabled,
+                model.joint_articulation,
+                model.joint_world,
+                int(model.world_count),
+                self._coupling_owned_joint,
+            ],
             outputs=[self._disabled_tree_joint],
             device=model.device,
         )
