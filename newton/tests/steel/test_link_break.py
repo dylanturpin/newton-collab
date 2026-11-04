@@ -548,7 +548,7 @@ def test_weld_to_world_returns_the_short_way(test, device):
             child_xform=wp.transform(anchor, wp.quat_identity()),
         )
     model = builder.finalize(device=device)
-    # The off-COM anchor couples the point and rotation rows; 16 iterations leave that coupling unresolved.
+    # The off-COM anchor couples the point and rotation rows.
     _, body_q, _ = _simulate(model, 100, 1.0e-3, iterations=64, history=True)
     xyz, w = body_q[:, 0, 3:6], body_q[:, 0, 6]
     angle = np.degrees(2.0 * np.arctan2(np.linalg.norm(xyz, axis=1), np.abs(w)))
