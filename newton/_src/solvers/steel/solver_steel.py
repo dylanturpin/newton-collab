@@ -85,14 +85,7 @@ from .cpu_fallback import (
     reject_cpu_unsupported_matrix_free_features,
 )
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
-from .friction_patches import (
-    _FrictionPatchState,
-    finish_patch_impulses,
-    finish_patch_impulses_all_routes,
-    link_patch_rows,
-    link_patch_rows_all_routes,
-    seed_patch_impulses,
-)
+from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     ANGULAR_FRICTION_DENSE,
     ANGULAR_FRICTION_FREE_RIGID,
@@ -119,7 +112,6 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
-    PRESCALE_WARP_THREADS,
     PROPAGATION_COLOR_TAIL,
     PROPAGATION_UNIT_META,
     PROPAGATION_UNIT_RING,
@@ -128,10 +120,8 @@ from .kernels import (
     ROW_SLOTS_WRITE,
     ROW_WATERMARK_CONTACT_SLOT,
     ROW_WATERMARK_FAMILY_STRIDE,
-    VELOCITY_LIMIT_WARP_THREADS,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
-    accumulate_all_row_watermarks,
     accumulate_articulation_tau,
     accumulate_connect_wrenches_from_impulses,
     accumulate_contact_watermark,
@@ -146,7 +136,6 @@ from .kernels import (
     add_joint_friction_load,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
-    allocate_joint_velocity_limit_slots_warp,
     allocate_mimic_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
@@ -241,7 +230,6 @@ from .kernels import (
     mul_com_spatial_inertia,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
-    populate_joint_velocity_limit_J_for_size_warp,
     populate_mimic_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
@@ -256,7 +244,6 @@ from .kernels import (
     prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
-    prescale_joint_velocity_limits_warp,
     propagate_tree_impulses_for_size,
     rank_propagation_body_map,
     record_warmstart_dt,
@@ -281,7 +268,6 @@ from .kernels import (
     subtract_arrays,
     trisolve_loop,
     update_body_qd_from_featherstone,
-    update_qdd_and_integrate_joints,
     update_qdd_from_velocity,
     warmstart_dt_scale,
     zero_unattached_parent_wrenches,
@@ -420,117 +406,6 @@ def _clear_dense_row_state(slot_counter: wp.array[int], contact_world: wp.array[
     contact_world[world] = 0
     for family in range(3):
         dropped[family, world] = 0
-
-
-@wp.kernel(enable_backward=False)
-def _copy_three(
-    a: wp.array[float],
-    b: wp.array[float],
-    c: wp.array[float],
-    a_out: wp.array[float],
-    b_out: wp.array[float],
-    c_out: wp.array[float],
-):
-    """Copy three equally sized arrays in one launch."""
-    i = wp.tid()
-    a_out[i] = a[i]
-    b_out[i] = b[i]
-    c_out[i] = c[i]
-
-
-@wp.kernel(enable_backward=False)
-def _clear_stage1_state(
-    body_f_s: wp.array[wp.spatial_vector],
-    body_ft_s: wp.array[wp.spatial_vector],
-    joint_qd: wp.array[float],
-    qd_work: wp.array[float],
-    joint_qdd: wp.array[float],
-):
-    """One launch for the dynamics stages' clears and the velocity copy; an empty array is skipped."""
-    i = wp.tid()
-    if i < body_f_s.shape[0]:
-        body_f_s[i] = wp.spatial_vector()
-    if i < body_ft_s.shape[0]:
-        body_ft_s[i] = wp.spatial_vector()
-    if i < qd_work.shape[0]:
-        qd_work[i] = joint_qd[i]
-    if i < joint_qdd.shape[0]:
-        joint_qdd[i] = 0.0
-
-
-@wp.func
-def _fill_int(values: wp.array[int], i: int, value: int):
-    if i < values.shape[0]:
-        values[i] = value
-
-
-@wp.func
-def _fill_float(values: wp.array[float], i: int, value: float):
-    if i < values.shape[0]:
-        values[i] = value
-
-
-@wp.kernel(enable_backward=False)
-def _clear_step_row_state(
-    slot_counter: wp.array[int],
-    contact_world: wp.array[int],
-    dropped: wp.array[int],
-    dense_first_rejected: wp.array[int],
-    mf_slot_counter: wp.array[int],
-    mf_first_rejected: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    propagation_slot_counter: wp.array[int],
-    propagation_first_rejected: wp.array[int],
-    propagation_constraint_count: wp.array[int],
-    propagation_body_count: wp.array[int],
-    propagation_body_seen: wp.array[int],
-    mf_target_velocity: wp.array[float],
-    mf_impulses: wp.array[float],
-    propagation_impulses: wp.array[float],
-    propagation_J_a: wp.array[float],
-    propagation_J_b: wp.array[float],
-    propagation_MiJt_a: wp.array[float],
-    propagation_MiJt_b: wp.array[float],
-    propagation_body_impulses: wp.array[float],
-    moved_int_0: wp.array[int],
-    moved_int_1: wp.array[int],
-    moved_int_2: wp.array[int],
-    moved_float_0: wp.array[float],
-    moved_float_1: wp.array[float],
-    unbounded: int,
-):
-    """One launch for the row-build prologue's clears; every array is a flat view, empty when its family is off.
-
-    Writes the values the per-array memsets and fills write, so the result is bitwise the same. The
-    ``moved_*`` arrays are zeroed later in the step by the per-pass path; see
-    ``SolverSteel._moved_clear_arrays``.
-    """
-    i = wp.tid()
-    _fill_int(slot_counter, i, 0)
-    _fill_int(contact_world, i, 0)
-    _fill_int(dropped, i, 0)
-    _fill_int(dense_first_rejected, i, unbounded)
-    _fill_int(mf_slot_counter, i, 0)
-    _fill_int(mf_first_rejected, i, unbounded)
-    _fill_int(mf_constraint_count, i, 0)
-    _fill_int(propagation_slot_counter, i, 0)
-    _fill_int(propagation_first_rejected, i, unbounded)
-    _fill_int(propagation_constraint_count, i, 0)
-    _fill_int(propagation_body_count, i, 0)
-    _fill_int(propagation_body_seen, i, 0)
-    _fill_float(mf_target_velocity, i, 0.0)
-    _fill_float(mf_impulses, i, 0.0)
-    _fill_float(propagation_impulses, i, 0.0)
-    _fill_float(propagation_J_a, i, 0.0)
-    _fill_float(propagation_J_b, i, 0.0)
-    _fill_float(propagation_MiJt_a, i, 0.0)
-    _fill_float(propagation_MiJt_b, i, 0.0)
-    _fill_float(propagation_body_impulses, i, 0.0)
-    _fill_int(moved_int_0, i, 0)
-    _fill_int(moved_int_1, i, 0)
-    _fill_int(moved_int_2, i, 0)
-    _fill_float(moved_float_0, i, 0.0)
-    _fill_float(moved_float_1, i, 0.0)
 
 
 @wp.kernel
@@ -3732,35 +3607,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         self._dummy_is_free_rigid = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_mf_slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=model.device)
-        # Empty stand-ins for the arrays of families a merged setup launch skips.
-        self._empty_int = wp.empty(0, dtype=wp.int32, device=model.device)
-        self._empty_float = wp.empty(0, dtype=wp.float32, device=model.device)
-        self._empty_int_2d = wp.empty((0, 0), dtype=wp.int32, device=model.device)
-        self._empty_float_2d = wp.empty((0, 0), dtype=wp.float32, device=model.device)
-        self._empty_spatial = wp.empty(0, dtype=wp.spatial_vector, device=model.device)
-        # ids of arrays a merged clear wrote this step; their first-use clears skip (see _take_pre_cleared)
-        self._pre_cleared: set[int] = set()
-        # Latency mode merges the setup launches outside the PGS loop; see _fused_setup_active.
-        self._fused_setup_enabled = not model.requires_grad
-        # Size groups that can hold velocity-limit rows: their articulations have a prismatic, revolute or D6
-        # joint (topology is fixed for the solver's lifetime).
-        # Each joint's index in _free_root_joint_indices, or -1 (the merged integration launch reads it).
-        free_root_slot = np.full(max(model.joint_count, 1), -1, dtype=np.int32)
-        if self._free_root_joint_count:
-            free_root_slot[self._free_root_joint_indices.numpy()] = np.arange(self._free_root_joint_count)
-        self._free_root_slot_by_joint = wp.array(free_root_slot, dtype=wp.int32, device=model.device)
-        self._velocity_limit_row_sizes = []
-        if model.joint_count:
-            joint_type = model.joint_type.numpy()
-            art_start = model.articulation_start.numpy()
-            limited = np.isin(
-                joint_type, (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
-            ).astype(np.int64)
-            limited_before = np.concatenate([[0], np.cumsum(limited)])
-            for size in self._size_groups:
-                arts = self._group_to_art[size].numpy()
-                if np.any(limited_before[art_start[arts + 1]] > limited_before[art_start[arts]]):
-                    self._velocity_limit_row_sizes.append(size)
         self._init_deterministic_rows(model)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
@@ -9199,7 +9045,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
         with self._sync_timed("prop_setup_joint_split"):
             # The rows are built, so the split response can weight each joint by the row-bearing bodies it carries.
-            self._zero_at_first_use(self._propagation_body_split_seen, self._propagation_joint_split)
+            self._propagation_body_split_seen.zero_()
+            self._propagation_joint_split.zero_()
             wp.launch(
                 count_propagation_joint_split,
                 dim=self._world_count * self._propagation_max_constraints,
@@ -10547,9 +10394,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
-            self._pre_cleared.clear()
-            if self._fused_setup_active():
-                self._clear_stage1_state(state_in, state_aug)
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
@@ -10640,10 +10484,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._joint_friction_load_active:
                 self._compute_joint_friction_load(state_in, state_aug)
             self._clamp_rigid_velocity_limits(self._v_hat)
-            if self._fused_setup_active():
-                self._snapshot_stage3(stage3_qd, state_aug._joint_qdd)
-            else:
-                self._snapshot_stage3_per_array(stage3_qd, state_aug._joint_qdd)
+            wp.copy(self._debug_stage3_qd_work, stage3_qd)
+            wp.copy(self._debug_stage3_joint_qdd, state_aug._joint_qdd)
+            wp.copy(self._debug_stage3_v_hat, self._v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -10890,10 +10733,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
-                merged = self._fused_setup_active()
-                if not merged:
-                    self._stage6_update_qdd(state_in, state_aug, dt)
-                self._stage6_integrate(state_in, state_aug, state_out, dt, merged)
+                self._stage6_update_qdd(state_in, state_aug, dt)
+                self._stage6_integrate(state_in, state_aug, state_out, dt)
 
         if self._sleeping is not None:
             self._sleeping.finish(state_in, state_out, state_aug, dt)
@@ -10908,10 +10749,30 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._friction_anchors_enabled:
             with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if contacts is not None:
-                    if self._fused_setup_active():
-                        self._finish_patch_impulses(state_in, state_out, contacts, dt)
-                    else:
-                        self._finish_patch_impulses_per_route(state_in, state_out, contacts, dt)
+                    for route, parents, mu, impulses, _decay in self._patch_row_arrays():
+                        wp.launch(
+                            finish_patch_impulses,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                contacts.rigid_contact_count,
+                                self._friction_patches.current,
+                                state_in.body_q,
+                                state_out.body_q,
+                                state_out.body_qd,
+                                model.body_com,
+                                contacts.rigid_contact_surface_velocity,
+                                self._contact_world,
+                                self._contact_slot,
+                                self._contact_path,
+                                self._contact_slots_needed,
+                                route,
+                                parents,
+                                mu,
+                                impulses,
+                                dt,
+                            ],
+                            device=model.device,
+                        )
                     self._friction_patches.store(state_in)
                 else:
                     self._friction_patches.previous.valid.zero_()
@@ -10997,10 +10858,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._clear_double_buffer()
 
         if self._row_watermark:
-            if self._fused_setup_active():
-                self._accumulate_row_watermarks_fused(contacts)
-            else:
-                self._accumulate_row_watermarks(contacts)
+            self._accumulate_row_watermarks(contacts)
 
         if self._device_torsion is not None:
             self._device_torsion.end_step(state_out)
@@ -11184,8 +11042,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 " the scene (see the class documentation), and reset before accepting transitions."
             )
 
-    def _row_watermark_families(self) -> dict:
-        """Each live row family's (count, requested, dropped, capacity), keyed by family index."""
+    def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
+        """Fold this step's row counts into the high-water marks."""
         families = {
             0: (self._constraint_count, self._slot_counter, self._row_dropped_dense, self._articulation_constraint_max),
         }
@@ -11203,11 +11061,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._row_dropped_propagation,
                 self._propagation_max_constraints,
             )
-        return families
-
-    def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
-        """Fold this step's row counts into the high-water marks, one launch per family."""
-        for family, (count, requested, dropped, capacity) in self._row_watermark_families().items():
+        for family, (count, requested, dropped, capacity) in families.items():
             wp.launch(
                 accumulate_row_watermarks,
                 dim=self._world_count,
@@ -11223,25 +11077,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._row_watermarks],
                 device=self.model.device,
             )
-
-    def _accumulate_row_watermarks_fused(self, contacts: Contacts | None) -> None:
-        """Write what :meth:`_accumulate_row_watermarks` writes in one launch."""
-        enabled = [0, 0, 0]
-        args = [self._empty_int, self._empty_int, self._empty_int, 0] * 3
-        for family, family_args in self._row_watermark_families().items():
-            enabled[family] = 1
-            args[4 * family : 4 * family + 4] = family_args
-        wp.launch(
-            accumulate_all_row_watermarks,
-            dim=self._world_count,
-            inputs=[
-                wp.vec3i(*enabled),
-                *args,
-                contacts.rigid_contact_count if contacts is not None else self._empty_int,
-            ],
-            outputs=[self._row_watermarks],
-            device=self.model.device,
-        )
 
     def constraint_row_watermarks(self) -> dict[str, int]:
         """Return the row high-water marks accumulated since construction (``row_watermark`` only).
@@ -11464,13 +11299,27 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state_in
         else:
-            self._zero_at_first_use(state_aug._body_f_s)
+            state_aug._body_f_s.zero_()
         if self._enable_joint_velocity_limits:
-            self._copy_at_first_use(self._qd_work, state_in.joint_qd)
-            if self._fused_setup_active():
-                self._prescale_joint_velocities_warp()
-            else:
-                self._prescale_joint_velocities()
+            wp.copy(self._qd_work, state_in.joint_qd)
+            wp.launch(
+                prescale_joint_velocity_limits,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    model.joint_type,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_velocity_limit,
+                    model.body_flags,
+                    self._vel_limit_drive_slot_arg,
+                    self._vel_limit_skip_driven,
+                    self._dynamics_art_active,
+                ],
+                outputs=[self._qd_work],
+                device=model.device,
+            )
             stage3_qd = self._qd_work
         else:
             stage3_qd = state_in.joint_qd
@@ -11560,42 +11409,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         return global_inertia_ready, stage3_qd
 
-    def _prescale_joint_velocity_inputs(self) -> list:
-        model = self.model
-        return [
-            model.articulation_start,
-            model.joint_type,
-            model.joint_child,
-            model.joint_qd_start,
-            model.joint_dof_dim,
-            model.joint_velocity_limit,
-            model.body_flags,
-            self._vel_limit_drive_slot_arg,
-            self._vel_limit_skip_driven,
-            self._dynamics_art_active,
-        ]
-
-    def _prescale_joint_velocities(self) -> None:
-        """Scale ``_qd_work`` by each articulation's PhysX velocity-limit ratio, a thread per articulation."""
-        wp.launch(
-            prescale_joint_velocity_limits,
-            dim=self.model.articulation_count,
-            inputs=self._prescale_joint_velocity_inputs(),
-            outputs=[self._qd_work],
-            device=self.model.device,
-        )
-
-    def _prescale_joint_velocities_warp(self) -> None:
-        """Write what :meth:`_prescale_joint_velocities` writes with a warp per articulation."""
-        wp.launch_tiled(
-            prescale_joint_velocity_limits_warp,
-            dim=[self.model.articulation_count],
-            inputs=self._prescale_joint_velocity_inputs(),
-            outputs=[self._qd_work],
-            block_dim=PRESCALE_WARP_THREADS,
-            device=self.model.device,
-        )
-
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float
     ) -> wp.Event | None:
@@ -11669,7 +11482,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
-        self._zero_at_first_use(state_aug._body_ft_s)
+        state_aug._body_ft_s.zero_()
         tau_inputs = [
             model.articulation_start,
             self._articulation_joint_end,
@@ -11814,7 +11627,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if model.articulation_count:
             if self._drive_mode == "augmented" and self._articulation_max_dofs > 0:
                 body_f = state_in.body_f if state_in.body_count else None
-                self._zero_at_first_use(state_aug._body_ft_s)
+                state_aug._body_ft_s.zero_()
                 wp.launch(
                     eval_rigid_tau_and_augmented_drives,
                     dim=model.articulation_count,
@@ -12231,7 +12044,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
     def _stage3_zero_qdd(self, state_aug: State):
-        self._zero_at_first_use(state_aug._joint_qdd)
+        state_aug._joint_qdd.zero_()
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a diagonal generalized inertia inverse to joint forces."""
@@ -12432,110 +12245,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_warmstart_decay if self._contact_warmstart else 0.0,
             )
 
-    def _fused_setup_active(self) -> bool:
-        """Whether this step merges the per-step setup launches (latency mode only).
-
-        Latency mode (few worlds) leaves the setup work outside the PGS loop a chain of launches that each do
-        little work, so their launch latency dominates. The merged launches write the same values. Like the
-        fused loop, they step aside for the debug hooks that observe the per-pass launches.
-        """
-        return (
-            self._fused_setup_enabled
-            and getattr(self, "_latency_fused", False)
-            and not _STEEL_CAPTURE
-            and not self._sync_timing_active()
-        )
-
-    def _snapshot_stage3_per_array(self, stage3_qd: wp.array, joint_qdd: wp.array) -> None:
-        """Copy the stage-3 velocities and accelerations to the debug snapshots, one copy each."""
-        wp.copy(self._debug_stage3_qd_work, stage3_qd)
-        wp.copy(self._debug_stage3_joint_qdd, joint_qdd)
-        wp.copy(self._debug_stage3_v_hat, self._v_hat)
-
-    def _snapshot_stage3(self, stage3_qd: wp.array, joint_qdd: wp.array) -> None:
-        """Write what :meth:`_snapshot_stage3_per_array` writes in one launch."""
-        wp.launch(
-            _copy_three,
-            dim=stage3_qd.shape[0],
-            inputs=[stage3_qd, joint_qdd, self._v_hat],
-            outputs=[self._debug_stage3_qd_work, self._debug_stage3_joint_qdd, self._debug_stage3_v_hat],
-            device=self.model.device,
-        )
-
-    def _moved_clear_arrays(self, mf_active: bool, propagation_active: bool, colored_contacts: bool) -> list:
-        """Arrays the per-pass path zeros right before their first use later in the step, as (ints, floats).
-
-        Nothing reads or writes them between the row-build clear and those uses, so latency mode zeros them
-        in the merged clear instead and their own memsets (:meth:`_zero_at_first_use`) skip.
-        """
-        ints, floats = [], []
-        if colored_contacts:
-            ints.append(self._color_world_unit_cursor)  # collect_propagation_units
-        if propagation_active:
-            ints += [self._propagation_body_split_seen, self._propagation_joint_split]  # count_propagation_joint_split
-        if mf_active:
-            floats += [self._mf_rhs, self._mf_eff_mass_inv]  # compute_mf_effective_mass_and_rhs
-        return ints, floats
-
-    def _take_pre_cleared(self, array: wp.array) -> bool:
-        """Whether a merged clear this step already wrote ``array``'s first-use value; consumes the mark."""
-        if id(array) in self._pre_cleared:
-            self._pre_cleared.discard(id(array))
-            return True
-        return False
-
-    def _zero_at_first_use(self, *arrays: wp.array) -> None:
-        """Zero arrays before their first use this step, unless a merged clear already did."""
-        for array in arrays:
-            if not self._take_pre_cleared(array):
-                array.zero_()
-
-    def _copy_at_first_use(self, dest: wp.array, src: wp.array) -> None:
-        """Copy ``src`` to ``dest`` before its first use this step, unless a merged clear already did."""
-        if not self._take_pre_cleared(dest):
-            wp.copy(dest, src)
-
-    def _stage1_cleared_arrays(self, state_in: State, state_aug: State) -> tuple:
-        """The (body_f_s, body_ft_s, qd_work, joint_qdd) arrays stages 1 to 3 clear or copy, ``None`` if not this step."""
+    def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self._contact_compliance:
+            _contact_compliance.start_step(self, contacts, dt)
+            _contact_compliance.begin_rows(self)
         model = self.model
-        body_f_s = None if self._fk_id_cache_enabled else state_aug._body_f_s  # _stage1_fk_id
-        body_ft_s = state_aug._body_ft_s if model.articulation_count else None  # inverse dynamics
-        qd_work = self._qd_work if self._enable_joint_velocity_limits else None  # prescale input
-        return body_f_s, body_ft_s, qd_work, state_aug._joint_qdd  # _stage3_zero_qdd
-
-    def _clear_stage1_state_per_array(self, state_in: State, state_aug: State) -> None:
-        """Clear and copy what :meth:`_stage1_cleared_arrays` names, array by array."""
-        body_f_s, body_ft_s, qd_work, joint_qdd = self._stage1_cleared_arrays(state_in, state_aug)
-        for array in (body_f_s, body_ft_s, joint_qdd):
-            if array is not None:
-                array.zero_()
-        if qd_work is not None:
-            wp.copy(qd_work, state_in.joint_qd)
-
-    def _clear_stage1_state(self, state_in: State, state_aug: State) -> None:
-        """Write what :meth:`_clear_stage1_state_per_array` writes in one launch; the first uses then skip it."""
-        arrays = self._stage1_cleared_arrays(state_in, state_aug)
-        body_f_s, body_ft_s, qd_work, joint_qdd = (
-            array if array is not None else empty
-            for array, empty in zip(
-                arrays,
-                (self._empty_spatial, self._empty_spatial, self._empty_float, self._empty_float),
-                strict=True,
-            )
-        )
-        wp.launch(
-            _clear_stage1_state,
-            dim=max(array.shape[0] for array in (body_f_s, body_ft_s, qd_work, joint_qdd)),
-            inputs=[body_f_s, body_ft_s, state_in.joint_qd, qd_work, joint_qdd],
-            device=self.model.device,
-        )
-        self._pre_cleared.update(id(array) for array in arrays if array is not None)
-
-    def _clear_step_row_state_per_array(
-        self, mf_active: bool, propagation_active: bool, colored_contacts: bool = False
-    ) -> None:
-        """Clear the row-allocation state, counters and accumulators the row build starts from, array by array."""
-        model = self.model
+        max_constraints = self._articulation_constraint_max
+        mf_active = self._has_free_rigid_bodies
+        propagation_active = self._propagation_contacts_enabled()
         if self._has_contact_target_velocity:
             self._mf_target_velocity.zero_()
 
@@ -12574,270 +12291,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_body_impulses.zero_()
             self._propagation_body_count.zero_()
             self._propagation_body_seen.zero_()
-
-    def _clear_step_row_state(self, mf_active: bool, propagation_active: bool, colored_contacts: bool) -> None:
-        """Write what :meth:`_clear_step_row_state_per_array` writes, and zero :meth:`_moved_clear_arrays`, in one launch."""
-
-        def ints(array, active=True):
-            return array.flatten() if active else self._empty_int
-
-        def floats(array, active=True):
-            return array.flatten() if active else self._empty_float
-
-        propagation = propagation_active
-        arrays = [
-            ints(self._slot_counter),
-            ints(self._dense_contact_world_flag),
-            ints(self._row_dropped_all),
-            ints(self._dense_first_rejected_slot),
-            ints(self._mf_slot_counter, mf_active),
-            ints(self._mf_first_rejected_slot, mf_active),
-            ints(self._mf_constraint_count, mf_active),
-            ints(self._propagation_slot_counter, propagation),
-            ints(self._propagation_first_rejected_slot, propagation),
-            ints(self._propagation_constraint_count, propagation),
-            ints(self._propagation_body_count, propagation),
-            ints(self._propagation_body_seen, propagation),
-            floats(self._mf_target_velocity, self._has_contact_target_velocity),
-            floats(self._mf_impulses, mf_active),
-            floats(self._propagation_impulses, propagation),
-            floats(self._propagation_J_a, propagation),
-            floats(self._propagation_J_b, propagation),
-            floats(self._propagation_MiJt_a, propagation),
-            floats(self._propagation_MiJt_b, propagation),
-            floats(self._propagation_body_impulses, propagation),
-        ]
-        moved_ints, moved_floats = self._moved_clear_arrays(mf_active, propagation_active, colored_contacts)
-        moved_ints += [None] * (3 - len(moved_ints))
-        moved_floats += [None] * (2 - len(moved_floats))
-        self._pre_cleared.update(id(a) for a in moved_ints + moved_floats if a is not None)
-        arrays += [ints(a, a is not None) for a in moved_ints] + [floats(a, a is not None) for a in moved_floats]
-        wp.launch(
-            _clear_step_row_state,
-            dim=max(array.shape[0] for array in arrays),
-            inputs=[*arrays, _ROW_SLOT_UNBOUNDED],
-            device=self.model.device,
-        )
-
-    def _velocity_limit_slot_args(self) -> tuple[list, list]:
-        model = self.model
-        inputs = [
-            model.articulation_start,
-            self._articulation_dof_start,
-            self._articulation_H_rows,
-            model.joint_type,
-            model.joint_qd_start,
-            model.joint_dof_dim,
-            model.joint_velocity_limit,
-            self._v_hat,
-            self._velocity_limit_activation_fraction,
-            self._vel_limit_drive_slot_arg,
-            self._vel_limit_skip_driven,
-            self._art_to_world,
-            self._articulation_constraint_max,
-            self._constraint_art_active,
-        ]
-        outputs = [self._velocity_limit_sign, self._slot_counter]
-        return inputs, [self._velocity_limit_slot, *outputs]
-
-    def _allocate_velocity_limit_slots(self) -> None:
-        """Reserve each velocity-limited DOF's lower/upper rows, a thread per articulation."""
-        inputs, outputs = self._velocity_limit_slot_args()
-
-        def launch(mode):
-            wp.launch(
-                allocate_joint_velocity_limit_slots,
-                dim=self.model.articulation_count,
-                inputs=inputs,
-                outputs=[*outputs, mode, self._row_cursor],
-                device=self.model.device,
-            )
-
-        self._reserve_rows(self._articulation_world_index, self._slot_counter, launch)
-
-    def _allocate_velocity_limit_slots_warp(self) -> None:
-        """Reserve what :meth:`_allocate_velocity_limit_slots` reserves with a warp per articulation."""
-        inputs, outputs = self._velocity_limit_slot_args()
-
-        def launch(mode):
-            wp.launch_tiled(
-                allocate_joint_velocity_limit_slots_warp,
-                dim=[self.model.articulation_count],
-                inputs=inputs,
-                outputs=[*outputs, mode, self._row_cursor],
-                block_dim=VELOCITY_LIMIT_WARP_THREADS,
-                device=self.model.device,
-            )
-
-        self._reserve_rows(self._articulation_world_index, self._slot_counter, launch)
-
-    def _populate_velocity_limit_args(self, size: int) -> tuple[list, list]:
-        model = self.model
-        inputs = [
-            model.articulation_start,
-            self._articulation_dof_start,
-            model.joint_type,
-            model.joint_qd_start,
-            model.joint_dof_dim,
-            model.joint_velocity_limit,
-            self._art_to_world,
-            self._velocity_limit_slot,
-            self._velocity_limit_sign,
-            self._group_to_art[size],
-            self._cfm,
-        ]
-        outputs = [
-            self._J_by_size[size],
-            self._row_type,
-            self._row_parent,
-            self._row_mu,
-            self._row_beta,
-            self._row_cfm,
-            self._phi,
-            self._target_velocity,
-        ]
-        return inputs, outputs
-
-    def _populate_velocity_limit_rows(self) -> None:
-        """Write the velocity-limit rows' Jacobian entries and metadata, a launch per size group."""
-        for size in self._size_groups:
-            inputs, outputs = self._populate_velocity_limit_args(size)
-            wp.launch(
-                populate_joint_velocity_limit_J_for_size,
-                dim=self._n_arts_by_size[size],
-                inputs=inputs,
-                outputs=outputs,
-                device=self.model.device,
-            )
-
-    def _populate_velocity_limit_rows_warp(self) -> None:
-        """Write what :meth:`_populate_velocity_limit_rows` writes with a warp per articulation.
-
-        Size groups without a prismatic, revolute or D6 joint (free bodies) have no velocity-limit rows,
-        so they get no launch.
-        """
-        for size in self._velocity_limit_row_sizes:
-            inputs, outputs = self._populate_velocity_limit_args(size)
-            wp.launch_tiled(
-                populate_joint_velocity_limit_J_for_size_warp,
-                dim=[self._n_arts_by_size[size]],
-                inputs=inputs,
-                outputs=outputs,
-                block_dim=VELOCITY_LIMIT_WARP_THREADS,
-                device=self.model.device,
-            )
-
-    def _link_patch_rows_per_route(self, contacts: Contacts) -> None:
-        """Link each route's friction-patch rows and share their Coulomb budgets, one launch per route."""
-        for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
-            if parents is not None:
-                wp.launch(
-                    link_patch_rows,
-                    dim=contacts.rigid_contact_max,
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        self._friction_patches.view,
-                        self._contact_world,
-                        self._contact_slot,
-                        self._contact_path,
-                        self._contact_slots_needed,
-                        route,
-                        parents,
-                        mu,
-                    ],
-                    device=self.model.device,
-                )
-
-    def _patch_routes(self, *, linked: bool):
-        """The enabled-route flags and each route's (parents, mu, impulses), stand-ins for routes that are off."""
-        enabled = [0, 0, 0]
-        arrays = [(self._empty_int_2d, self._empty_float_2d, self._empty_float_2d)] * 3
-        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
-            if linked and parents is None:
-                continue
-            enabled[route] = 1
-            arrays[route] = (parents, mu, impulses)
-        return wp.vec3i(*enabled), arrays
-
-    def _link_patch_rows(self, contacts: Contacts) -> None:
-        """Write what :meth:`_link_patch_rows_per_route` writes in one launch."""
-        enabled, arrays = self._patch_routes(linked=True)
-        wp.launch(
-            link_patch_rows_all_routes,
-            dim=contacts.rigid_contact_max,
-            inputs=[
-                contacts.rigid_contact_count,
-                self._friction_patches.view,
-                self._contact_world,
-                self._contact_slot,
-                self._contact_path,
-                self._contact_slots_needed,
-                enabled,
-                *(array for parents, mu, _impulses in arrays for array in (parents, mu)),
-            ],
-            device=self.model.device,
-        )
-
-    def _finish_patch_impulses_args(self, state_in: State, state_out: State, contacts: Contacts) -> list:
-        return [
-            contacts.rigid_contact_count,
-            self._friction_patches.current,
-            state_in.body_q,
-            state_out.body_q,
-            state_out.body_qd,
-            self.model.body_com,
-            contacts.rigid_contact_surface_velocity,
-            self._contact_world,
-            self._contact_slot,
-            self._contact_path,
-            self._contact_slots_needed,
-        ]
-
-    def _finish_patch_impulses_per_route(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
-        """Cache each route's solved patch friction and release slipping anchors, one launch per route."""
-        common = self._finish_patch_impulses_args(state_in, state_out, contacts)
-        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
-            wp.launch(
-                finish_patch_impulses,
-                dim=contacts.rigid_contact_max,
-                inputs=[*common, route, parents, mu, impulses, dt],
-                device=self.model.device,
-            )
-
-    def _finish_patch_impulses(self, state_in: State, state_out: State, contacts: Contacts, dt: float) -> None:
-        """Write what :meth:`_finish_patch_impulses_per_route` writes in one launch."""
-        enabled, arrays = self._patch_routes(linked=False)
-        wp.launch(
-            finish_patch_impulses_all_routes,
-            dim=contacts.rigid_contact_max,
-            inputs=[
-                *self._finish_patch_impulses_args(state_in, state_out, contacts),
-                enabled,
-                *(array for route_arrays in arrays for array in route_arrays),
-                dt,
-            ],
-            device=self.model.device,
-        )
-
-    def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
-        if self._contact_compliance:
-            _contact_compliance.start_step(self, contacts, dt)
-            _contact_compliance.begin_rows(self)
-        model = self.model
-        max_constraints = self._articulation_constraint_max
-        mf_active = self._has_free_rigid_bodies
-        propagation_active = self._propagation_contacts_enabled()
-        colored_contacts = bool(
-            propagation_active
-            and self._propagation_colored
-            and contacts is not None
-            and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts.rigid_contact_max > 0
-        )
-        if self._fused_setup_active():
-            self._clear_step_row_state(mf_active, propagation_active, colored_contacts)
-        else:
-            self._clear_step_row_state_per_array(mf_active, propagation_active, colored_contacts)
 
         has_free_rigid_flag = 1 if mf_active else 0
         propagation_flag = 1 if propagation_active else 0
@@ -13324,10 +12777,38 @@ class SolverSteel(SolverBase, CouplingInterface):
         # phase schedule, which visits velocity-limit rows in a dedicated
         # final pass regardless of slot order.
         if self._enable_joint_velocity_limits and self._velocity_limit_slot is not None:
-            if self._fused_setup_active():
-                self._allocate_velocity_limit_slots_warp()
-            else:
-                self._allocate_velocity_limit_slots()
+
+            def launch_velocity_limits(mode):
+                wp.launch(
+                    allocate_joint_velocity_limit_slots,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self._articulation_dof_start,
+                        self._articulation_H_rows,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_velocity_limit,
+                        self._v_hat,
+                        self._velocity_limit_activation_fraction,
+                        self._vel_limit_drive_slot_arg,
+                        self._vel_limit_skip_driven,
+                        self._art_to_world,
+                        max_constraints,
+                        self._constraint_art_active,
+                    ],
+                    outputs=[
+                        self._velocity_limit_slot,
+                        self._velocity_limit_sign,
+                        self._slot_counter,
+                        mode,
+                        self._row_cursor,
+                    ],
+                    device=model.device,
+                )
+
+            self._reserve_rows(self._articulation_world_index, self._slot_counter, launch_velocity_limits)
 
         # Unconditional phase-5 boundary snapshot; dense contact rows start here.
         wp.launch(
@@ -13352,10 +12833,36 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for size in self._size_groups:
                     self._J_by_size[size].zero_()
                 j_buffers_zeroed = True
-            if self._fused_setup_active():
-                self._populate_velocity_limit_rows_warp()
-            else:
-                self._populate_velocity_limit_rows()
+            for size in self._size_groups:
+                n_arts = self._n_arts_by_size[size]
+                wp.launch(
+                    populate_joint_velocity_limit_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        model.articulation_start,
+                        self._articulation_dof_start,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_velocity_limit,
+                        self._art_to_world,
+                        self._velocity_limit_slot,
+                        self._velocity_limit_sign,
+                        self._group_to_art[size],
+                        self._cfm,
+                    ],
+                    outputs=[
+                        self._J_by_size[size],
+                        self._row_type,
+                        self._row_parent,
+                        self._row_mu,
+                        self._row_beta,
+                        self._row_cfm,
+                        self._phi,
+                        self._target_velocity,
+                    ],
+                    device=model.device,
+                )
 
         if (
             contacts is not None
@@ -13796,7 +13303,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 # per-world unit lists, color them, and rewrite contact_slot
                 # in color-sorted order so the row builder below writes every
                 # color segment into contiguous row memory.
-                self._zero_at_first_use(self._color_world_unit_cursor)
+                self._color_world_unit_cursor.zero_()
                 wp.launch(
                     collect_propagation_units,
                     dim=contacts.rigid_contact_max,
@@ -14137,10 +13644,24 @@ class SolverSteel(SolverBase, CouplingInterface):
                     )
 
         if self._friction_anchors_enabled and contacts is not None:
-            if self._fused_setup_active():
-                self._link_patch_rows(contacts)
-            else:
-                self._link_patch_rows_per_route(contacts)
+            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
+                if parents is not None:
+                    wp.launch(
+                        link_patch_rows,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self._friction_patches.view,
+                            self._contact_world,
+                            self._contact_slot,
+                            self._contact_path,
+                            self._contact_slots_needed,
+                            route,
+                            parents,
+                            mu,
+                        ],
+                        device=model.device,
+                    )
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
@@ -14989,7 +14510,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
 
         # Compute effective mass and RHS
-        self._zero_at_first_use(self._mf_rhs, self._mf_eff_mass_inv)
+        self._mf_rhs.zero_()
+        self._mf_eff_mass_inv.zero_()
         wp.launch(
             compute_mf_effective_mass_and_rhs,
             dim=self._world_count * self._free_body_constraint_max,
@@ -15091,77 +14613,35 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._remove_free_root_transport(state_in, state_aug)
 
-    def _integrate_joints_args(self, state_in: State, state_aug: State, state_out: State, dt: float) -> list:
-        model = self.model
-        return [
-            model.joint_type,
-            model.joint_parent,
-            model.joint_child,
-            model.joint_q_start,
-            model.joint_qd_start,
-            self._kinematic_joint_mask,
-            model.joint_dof_dim,
-            model.body_com,
-            model.joint_X_c,
-            state_in.joint_q,
-            state_in.joint_qd,
-            state_aug._joint_qdd,
-            dt,
-            self._rigid_body_angular_damping,
-            self._rigid_body_linear_damping,
-            self._dynamics_joint_active,
-            state_out.joint_q,
-            state_out.joint_qd,
-        ]
-
-    def _update_qdd_then_integrate_joints(self, state_in: State, state_aug: State, state_out: State, dt: float):
-        """Turn the solved velocity into ``joint_qdd`` and integrate the joints, a launch per pass."""
-        self._stage6_update_qdd(state_in, state_aug, dt)
-        if self.model.joint_count:
-            wp.launch(
-                kernel=integrate_generalized_joints,
-                dim=self.model.joint_count,
-                inputs=self._integrate_joints_args(state_in, state_aug, state_out, dt),
-                device=self.model.device,
-            )
-
-    def _update_qdd_and_integrate_joints(self, state_in: State, state_aug: State, state_out: State, dt: float):
-        """Write what :meth:`_update_qdd_then_integrate_joints` writes in one launch, a thread per joint."""
-        model = self.model
-        wp.launch(
-            update_qdd_and_integrate_joints,
-            dim=model.joint_count,
-            inputs=[
-                self._free_root_slot_by_joint,
-                self._free_root_joint_indices if self._free_root_joint_count else self._empty_int,
-                self._kinematic_dof_mask,
-                1.0 / dt,
-                self._dynamics_dof_active,
-                self._v_out,
-                *self._integrate_joints_args(state_in, state_aug, state_out, dt),
-            ],
-            device=model.device,
-        )
-
-    def _stage6_integrate(
-        self, state_in: State, state_aug: State, state_out: State, dt: float, update_qdd: bool = False
-    ):
-        """Integrate the joints from ``joint_qdd``, then publish kinematics and integrate particles.
-
-        With ``update_qdd``, :meth:`_stage6_update_qdd` runs first, merged into the integration launch.
-        """
+    def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
 
         if model.joint_count:
-            if update_qdd:
-                self._update_qdd_and_integrate_joints(state_in, state_aug, state_out, dt)
-            else:
-                wp.launch(
-                    kernel=integrate_generalized_joints,
-                    dim=model.joint_count,
-                    inputs=self._integrate_joints_args(state_in, state_aug, state_out, dt),
-                    device=model.device,
-                )
+            wp.launch(
+                kernel=integrate_generalized_joints,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    model.joint_dof_dim,
+                    model.body_com,
+                    model.joint_X_c,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    state_aug._joint_qdd,
+                    dt,
+                    self._rigid_body_angular_damping,
+                    self._rigid_body_linear_damping,
+                    self._dynamics_joint_active,
+                ],
+                outputs=[state_out.joint_q, state_out.joint_qd],
+                device=model.device,
+            )
+
             self._compute_parent_wrenches(state_in, state_aug, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
