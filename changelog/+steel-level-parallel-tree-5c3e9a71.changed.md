@@ -1,0 +1,1 @@
+Speed up `SolverSteel` propagation setup and velocity refresh for branched articulations such as dexterous hands: the one-warp tree kernels factor the tree, build the body responses, and refresh link velocities one depth level at a time, with every per-joint input staged on chip. Results are bitwise identical to the joint-by-joint walk, which chains keep.

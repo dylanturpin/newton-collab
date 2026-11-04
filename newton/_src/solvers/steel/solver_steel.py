@@ -7657,14 +7657,22 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._refresh_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._propagation_joint_parent_slot = None
+        # size groups whose factor/response kernels walk the tree a depth level at a time, and the
+        # level order those kernels read (see _build_propagation_tree_levels)
+        self._propagation_tree_level_by_size: dict[int, bool] = {}
+        self._propagation_tree_levels = None
         if model.device.is_cuda and self._propagation_contacts_enabled():
             self._propagation_joint_parent_slot = self._build_propagation_joint_parent_slot(model)
+            level_arrays, art_level_counts = self._build_propagation_tree_levels(model)
             articulation_start_np = model.articulation_start.numpy()
+            art_dof_counts = np.diff(model.joint_qd_start.numpy()[articulation_start_np])
             group_max_joints: dict[int, int] = {}
+            group_max_dofs: dict[int, int] = {}
             for size in self._size_groups:
                 arts = self._group_to_art[size].numpy()
                 joint_counts = articulation_start_np[arts + 1] - articulation_start_np[arts]
                 group_max_joints[int(size)] = int(joint_counts.max()) if joint_counts.size else 0
+                group_max_dofs[int(size)] = int(art_dof_counts[arts].max()) if arts.size else 0
             for size in self._size_groups:
                 size_i = int(size)
                 single_dof = self._propagation_tree_single_dof_by_size.get(size_i, False)
@@ -7692,17 +7700,47 @@ class SolverSteel(SolverBase, CouplingInterface):
                     # special case (has_free_root); any other group stages
                     # multi-DOF blocks for every joint (multidof).
                     flavour = {"has_free_root": free_root and not single_dof, "multidof": multidof}
-                    self._factor_tree_warp_kernels_by_size[size_i] = _get_factor_propagation_tree_revolute_kernel(
-                        size_i, device_arch, **flavour
+                    # Trees with several joints per depth level (a hand's fingers) factor and build
+                    # their responses a level at a time; chains keep the serial joint walk.
+                    joints, levels = art_level_counts[self._group_to_art[size].numpy()].sum(axis=0)
+                    level = (
+                        not multidof
+                        and self._propagation_tree_multidof_by_size.get(size_i, False)
+                        and levels > 0
+                        and joints >= _PROPAGATION_TREE_LEVEL_MIN_SPEEDUP * levels
+                        and _propagation_tree_level_shared_bytes(
+                            group_max_joints[size_i], group_max_dofs[size_i], self._articulation_max_dofs
+                        )
+                        <= _PROPAGATION_TREE_WARP_SHARED_MAX
                     )
-                    self._response_tree_warp_kernels_by_size[size_i] = (
-                        _get_propagation_tree_body_response_revolute_kernel(size_i, device_arch, **flavour)
-                    )
+                    self._propagation_tree_level_by_size[size_i] = bool(level)
+                    if level:
+                        self._propagation_tree_levels = level_arrays
+                        self._factor_tree_warp_kernels_by_size[size_i] = _get_factor_propagation_tree_level_kernel(
+                            size_i,
+                            group_max_joints[size_i],
+                            group_max_dofs[size_i],
+                            self._articulation_max_dofs,
+                            device_arch,
+                            has_free_root=flavour["has_free_root"],
+                        )
+                        self._response_tree_warp_kernels_by_size[size_i] = (
+                            _get_propagation_tree_body_response_level_kernel(
+                                size_i, group_max_joints[size_i], device_arch, has_free_root=flavour["has_free_root"]
+                            )
+                        )
+                    else:
+                        self._factor_tree_warp_kernels_by_size[size_i] = _get_factor_propagation_tree_revolute_kernel(
+                            size_i, device_arch, **flavour
+                        )
+                        self._response_tree_warp_kernels_by_size[size_i] = (
+                            _get_propagation_tree_body_response_revolute_kernel(size_i, device_arch, **flavour)
+                        )
                     self._propagate_tree_warp_kernels_by_size[size_i] = _get_propagate_tree_impulses_revolute_kernel(
                         size_i, group_max_joints[size_i], device_arch, **flavour
                     )
                     self._refresh_tree_warp_kernels_by_size[size_i] = _get_refresh_propagation_tree_body_qd_warp_kernel(
-                        size_i, group_max_joints[size_i], device_arch
+                        size_i, group_max_joints[size_i], device_arch, levels=bool(level)
                     )
 
         # ── Cached-response kernels (propagation_cached_response) ────────────
@@ -7871,6 +7909,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         for name in ("articulation_start", "joint_parent", "joint_child", "joint_qd_start"):
             setattr(tree, name, getattr(model, name))
         tree.joint_parent_slot = self._propagation_joint_parent_slot
+        if self._propagation_tree_levels is not None:
+            tree.level_joint, _level_run, tree.level_offsets, tree.level_art_start = self._propagation_tree_levels
         tree.S_flat = self._propagation_joint_S_flat
         tree.com_rel = self._propagation_body_com_rel
         tree.U = self._propagation_tree_U
@@ -7914,7 +7954,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             colored.native,
             rows.native,
             gemv,
-            tuple((propagate.native, refresh.native) for _size, propagate, refresh in slots),
+            tuple((propagate.native, refresh.native, refresh.levels) for _size, propagate, refresh in slots),
             has_phase3=self._split_matrix_free_row_phase_may_have_work(3),
             has_phase5=self._split_matrix_free_row_phase_may_have_work(5),
         )
@@ -8035,6 +8075,56 @@ class SolverSteel(SolverBase, CouplingInterface):
                 if parent >= 0:
                     parent_slot[j] = child_to_slot.get(parent, -1)
         return wp.array(parent_slot, dtype=wp.int32, device=model.device)
+
+    def _build_propagation_tree_levels(self, model) -> tuple[tuple[wp.array, ...], np.ndarray]:
+        """Depth-level order of every articulation's joints, for the level-parallel tree kernels.
+
+        Returns the device arrays ``(level_joint, level_run, level_offsets, level_art_start)`` and a
+        per-articulation ``[joints, levels]`` count. Over an articulation's joint range,
+        ``level_joint`` lists its joint slots (relative to the first joint) level by level, root
+        level first; within a level, children of one parent are adjacent in descending slot order
+        and ``level_run`` holds the size of that sibling run at its first entry (0 elsewhere, and 0
+        for world-rooted joints, which reduce into nothing). Level ``l`` of articulation ``a``
+        spans ``level_offsets[level_art_start[a] + l]`` up to the next offset. An articulation that
+        is not topologically ordered (a parent slot at or after its child) gets one level per
+        joint; the level kernels are only registered for ordered trees.
+        """
+        articulation_start = model.articulation_start.numpy()
+        parent_slot = self._propagation_joint_parent_slot.numpy()
+        level_joint = np.zeros(int(model.joint_count), dtype=np.int32)
+        level_run = np.zeros(int(model.joint_count), dtype=np.int32)
+        level_offsets: list[int] = []
+        art_level_start = np.zeros(int(model.articulation_count) + 1, dtype=np.int32)
+        counts = np.zeros((int(model.articulation_count), 2), dtype=np.int64)
+        for art in range(int(model.articulation_count)):
+            joint_start = int(articulation_start[art])
+            n_joints = int(articulation_start[art + 1]) - joint_start
+            slots = [int(p) for p in parent_slot[joint_start : joint_start + n_joints]]
+            depth = list(range(n_joints))
+            if all(p < j for j, p in enumerate(slots)):
+                for j, p in enumerate(slots):
+                    depth[j] = depth[p] + 1 if p >= 0 else 0
+            # level, then parent, then descending slot: the serial factor's per-parent reduction order
+            order = sorted(range(n_joints), key=lambda j: (depth[j], slots[j], -j))
+            level_joint[joint_start : joint_start + n_joints] = order
+            keys = [(depth[j], slots[j]) for j in order]
+            for k, j in enumerate(order):
+                if slots[j] >= 0 and (k == 0 or keys[k - 1] != keys[k]):
+                    run = 1
+                    while k + run < n_joints and keys[k + run] == keys[k]:
+                        run += 1
+                    level_run[joint_start + k] = run
+            n_levels = max(depth) + 1 if n_joints else 0
+            art_level_start[art] = len(level_offsets)
+            level_offsets.extend(int(np.searchsorted([key[0] for key in keys], lv)) for lv in range(n_levels))
+            level_offsets.append(n_joints)
+            counts[art] = (n_joints, n_levels)
+        art_level_start[-1] = len(level_offsets)
+        arrays = tuple(
+            wp.array(np.asarray(values, dtype=np.int32), dtype=wp.int32, device=model.device)
+            for values in (level_joint, level_run, level_offsets, art_level_start)
+        )
+        return arrays, counts
 
     def _init_size_group_streams(self, model):
         """Initialize CUDA streams for parallel kernel launches across size groups.
@@ -8759,6 +8849,10 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _launch_refresh_propagation_tree_body_qd(self, size: int, n_arts: int, *, force: bool) -> None:
         refresh_kernel = getattr(self, "_refresh_tree_warp_kernels_by_size", {}).get(int(size))
         if refresh_kernel is not None:
+            levels = []
+            if getattr(refresh_kernel, "levels", False):
+                level_joint, _level_run, level_offsets, level_art_start = self._propagation_tree_levels
+                levels = [level_joint, level_offsets, level_art_start]
             wp.launch_tiled(
                 refresh_kernel,
                 dim=[n_arts],
@@ -8772,6 +8866,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self._propagation_joint_parent_slot,
+                    *levels,
                     self._propagation_joint_S_flat,
                     self._propagation_body_com_rel,
                     self._v_out,
@@ -8912,6 +9007,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
+            # the level-parallel warp kernels also take the parent slots and the level order
+            level_args = []
+            if getattr(self, "_propagation_tree_level_by_size", {}).get(int(size), False):
+                level_args = [self._propagation_joint_parent_slot, *self._propagation_tree_levels]
             with self._sync_timed(f"prop_setup_factor_size{int(size)}"):
                 factor_kernel = getattr(self, "_factor_tree_warp_kernels_by_size", {}).get(int(size))
                 if factor_kernel is not None:
@@ -8924,6 +9023,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self.model.joint_parent,
                             self.model.joint_child,
                             self.model.joint_qd_start,
+                            *level_args,
                             self._propagation_joint_S_flat,
                             self.model.joint_armature,
                             self._articulation_max_dofs,
@@ -8984,6 +9084,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self.model.joint_parent,
                             self.model.joint_child,
                             self.model.joint_qd_start,
+                            *level_args,
                             self._propagation_joint_S_flat,
                             self._propagation_body_com_rel,
                             self._propagation_tree_U,
@@ -20037,6 +20138,98 @@ _PROPAGATION_APPLY_ROW_CUDA = """
 """
 
 
+# Shared scratch and joint-space block of the multi-DOF factor step (U rows of the joint already in
+# ``propagation_tree_U``): D = S^T U plus armature and aug-row stiffness, its in-place Cholesky factor
+# and inverse, written to ``propagation_tree_D_chol``/``propagation_tree_D_inv`` and kept in
+# ``s_Dinv_root`` for the U D^-1 U^T reduction.
+_FACTOR_ROOT_DECL = """
+    __shared__ float s_D_root[36];
+    __shared__ float s_Dinv_root[36];
+"""
+_FACTOR_ROOT_D_BLOCK = """
+            // D = S^T U (+ armature and aug-row stiffness on the diagonal).
+            for (int elem = lane; elem < dc * dc; elem += 32) {
+                const int a = elem / dc;
+                const int b = elem - a * dc;
+                float value = 0.0f;
+                for (int r = 0; r < 6; ++r) {
+                    value += propagation_joint_S_flat.data[(dof_start + a) * 6 + r]
+                        * propagation_tree_U.data[(dof_start + b) * 6 + r];
+                }
+                if (a == b) {
+                    value += joint_armature.data[dof_start + a];
+                    const int aug_count = aug_row_counts.data[art];
+                    for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
+                        const int row_index = art * max_dofs + aug_i;
+                        if (aug_row_dof_index.data[row_index] == dof_start + a) {
+                            const float K = aug_row_K.data[row_index];
+                            if (K > 0.0f) {
+                                value += K;
+                            }
+                        }
+                    }
+                }
+                s_D_root[a * 6 + b] = value;
+            }
+            __syncwarp(mask);
+            // In-place Cholesky mirroring the serial kernel: the lower
+            // triangle holds the factor, the upper keeps raw D entries. Lane 0
+            // takes each pivot, then the rows below it go one per lane.
+            for (int jj = 0; jj < dc; ++jj) {
+                if (lane == 0) {
+                    float s = s_D_root[jj * 6 + jj];
+                    for (int k = 0; k < jj; ++k) {
+                        const float cjk = s_D_root[jj * 6 + k];
+                        s -= cjk * cjk;
+                    }
+                    if (s <= 1.0e-12f) {
+                        s = 1.0e-12f;
+                    }
+                    s_D_root[jj * 6 + jj] = sqrtf(s);
+                }
+                __syncwarp(mask);
+                const int i = jj + 1 + lane;
+                if (i < dc) {
+                    const float inv_s = 1.0f / s_D_root[jj * 6 + jj];
+                    float v = s_D_root[i * 6 + jj];
+                    for (int k = 0; k < jj; ++k) {
+                        v -= s_D_root[i * 6 + k] * s_D_root[jj * 6 + k];
+                    }
+                    s_D_root[i * 6 + jj] = v * inv_s;
+                }
+                __syncwarp(mask);
+            }
+            // Invert D via forward/backward solves, a column per lane.
+            {
+                const int col = lane;
+                if (col < dc) {
+                    for (int i = 0; i < dc; ++i) {
+                        float v = (i == col) ? 1.0f : 0.0f;
+                        for (int k = 0; k < i; ++k) {
+                            v -= s_D_root[i * 6 + k] * s_Dinv_root[k * 6 + col];
+                        }
+                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
+                    }
+                    for (int i = dc - 1; i >= 0; --i) {
+                        float v = s_Dinv_root[i * 6 + col];
+                        for (int k = i + 1; k < dc; ++k) {
+                            v -= s_D_root[k * 6 + i] * s_Dinv_root[k * 6 + col];
+                        }
+                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
+                    }
+                }
+            }
+            __syncwarp(mask);
+            for (int elem = lane; elem < dc * dc; elem += 32) {
+                const int a = elem / dc;
+                const int b = elem - a * dc;
+                propagation_tree_D_chol.data[joint * 36 + a * 6 + b] = s_D_root[a * 6 + b];
+                propagation_tree_D_inv.data[joint * 36 + a * 6 + b] = s_Dinv_root[a * 6 + b];
+            }
+            __syncwarp(mask);
+"""
+
+
 @cache
 def _get_factor_propagation_tree_revolute_kernel(
     size: int, device_arch: str, *, has_free_root: bool = False, multidof: bool = False
@@ -20246,11 +20439,9 @@ def _get_factor_propagation_tree_revolute_kernel(
 """
 
     if has_free_root or multidof:
-        root_decl = """
-    __shared__ float s_D_root[36];
-    __shared__ float s_Dinv_root[36];
-"""
-        root_factor = """
+        root_decl = _FACTOR_ROOT_DECL
+        root_factor = (
+            """
         if (//ROOT_CONDITION) {
             const int dc = dof_end - dof_start;
             // U rows for all root DOFs: U_a = Ia(child) S_a.
@@ -20265,80 +20456,9 @@ def _get_factor_propagation_tree_revolute_kernel(
                 propagation_tree_U.data[(dof_start + a) * 6 + r] = u_val;
             }
             __syncwarp(mask);
-            // D = S^T U (+ armature and aug-row stiffness on the diagonal).
-            for (int elem = lane; elem < dc * dc; elem += 32) {
-                const int a = elem / dc;
-                const int b = elem - a * dc;
-                float value = 0.0f;
-                for (int r = 0; r < 6; ++r) {
-                    value += propagation_joint_S_flat.data[(dof_start + a) * 6 + r]
-                        * propagation_tree_U.data[(dof_start + b) * 6 + r];
-                }
-                if (a == b) {
-                    value += joint_armature.data[dof_start + a];
-                    const int aug_count = aug_row_counts.data[art];
-                    for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
-                        const int row_index = art * max_dofs + aug_i;
-                        if (aug_row_dof_index.data[row_index] == dof_start + a) {
-                            const float K = aug_row_K.data[row_index];
-                            if (K > 0.0f) {
-                                value += K;
-                            }
-                        }
-                    }
-                }
-                s_D_root[a * 6 + b] = value;
-            }
-            __syncwarp(mask);
-            if (lane == 0) {
-                // In-place Cholesky mirroring the serial kernel: the lower
-                // triangle holds the factor, the upper keeps raw D entries.
-                for (int jj = 0; jj < dc; ++jj) {
-                    float s = s_D_root[jj * 6 + jj];
-                    for (int k = 0; k < jj; ++k) {
-                        const float cjk = s_D_root[jj * 6 + k];
-                        s -= cjk * cjk;
-                    }
-                    if (s <= 1.0e-12f) {
-                        s = 1.0e-12f;
-                    }
-                    s = sqrtf(s);
-                    s_D_root[jj * 6 + jj] = s;
-                    const float inv_s = 1.0f / s;
-                    for (int i = jj + 1; i < dc; ++i) {
-                        float v = s_D_root[i * 6 + jj];
-                        for (int k = 0; k < jj; ++k) {
-                            v -= s_D_root[i * 6 + k] * s_D_root[jj * 6 + k];
-                        }
-                        s_D_root[i * 6 + jj] = v * inv_s;
-                    }
-                }
-                // Invert D column by column via forward/backward solves.
-                for (int col = 0; col < dc; ++col) {
-                    for (int i = 0; i < dc; ++i) {
-                        float v = (i == col) ? 1.0f : 0.0f;
-                        for (int k = 0; k < i; ++k) {
-                            v -= s_D_root[i * 6 + k] * s_Dinv_root[k * 6 + col];
-                        }
-                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
-                    }
-                    for (int i = dc - 1; i >= 0; --i) {
-                        float v = s_Dinv_root[i * 6 + col];
-                        for (int k = i + 1; k < dc; ++k) {
-                            v -= s_D_root[k * 6 + i] * s_Dinv_root[k * 6 + col];
-                        }
-                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
-                    }
-                }
-            }
-            __syncwarp(mask);
-            for (int elem = lane; elem < dc * dc; elem += 32) {
-                const int a = elem / dc;
-                const int b = elem - a * dc;
-                propagation_tree_D_chol.data[joint * 36 + a * 6 + b] = s_D_root[a * 6 + b];
-                propagation_tree_D_inv.data[joint * 36 + a * 6 + b] = s_Dinv_root[a * 6 + b];
-            }
-            __syncwarp(mask);
+"""
+            + _FACTOR_ROOT_D_BLOCK
+            + """
             // Ia(child) -= U D^-1 U^T; the root has no parent to reduce into.
             for (int elem = lane; elem < 36; elem += 32) {
                 const int row = elem / 6;
@@ -20356,6 +20476,7 @@ def _get_factor_propagation_tree_revolute_kernel(
             __syncwarp(mask);
 //ROOT_EXIT
 """
+        )
         if multidof:
             # every multi-DOF joint takes the block, then falls through to its parent reduction
             root_factor = root_factor.replace("//ROOT_CONDITION", "dof_end - dof_start > 1").replace(
@@ -20742,6 +20863,720 @@ def _get_propagation_tree_body_response_revolute_kernel(
     propagation_tree_body_response_revolute_template.__name__ = name
     propagation_tree_body_response_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagation_tree_body_response_revolute_template)
+
+
+def _propagation_tree_level_shared_bytes(max_joints: int, max_art_dofs: int, aug_cap: int) -> int:
+    """Static shared memory of the level-parallel factor tree kernel (the larger of the factor/response pair)."""
+    joints_cap = max(int(max_joints), 1)
+    # per joint: two 6x6 blocks, U, S and the d-terms (6 each), D^-1, armature, COM edge (3) floats, eight
+    # ints, and the level offsets; per DOF a slot; per aug row its DOF and stiffness; the root's D blocks
+    per_joint = (2 * 36 + 3 * 6 + 2 + 3) * 4 + 8 * 4 + 4
+    return joints_cap * per_joint + 4 + max(int(max_art_dofs), 1) * 4 + max(int(aug_cap), 1) * 8 + 4 * 36 * 4
+
+
+# Minimum ratio of joints to depth levels (the serial steps a level walk removes) for a size group to
+# take the level-parallel factor/response kernels; a chain (ratio 1) keeps the serial joint walk.
+_PROPAGATION_TREE_LEVEL_MIN_SPEEDUP = 1.5
+
+_PROPAGATION_TREE_LEVEL_PRELUDE = """
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const unsigned mask = 0xffffffffu;
+    const int art = group_to_art.data[group_idx];
+    const int joint_start = articulation_start.data[art];
+    const int joint_end = articulation_start.data[art + 1];
+    const int n_joints = joint_end - joint_start;
+    const int level_begin = level_art_start.data[art];
+    const int n_levels = level_art_start.data[art + 1] - level_begin - 1;
+
+    // Everything the level steps read is staged on chip first (lane-parallel loads), so a level costs
+    // shared-memory latency only; global memory sees the outputs.
+    __shared__ float s_A[CAP * 36];
+    __shared__ float s_B[CAP * 36];
+    __shared__ float s_U[CAP * 6];
+    __shared__ float s_S[CAP * 6];
+    __shared__ float s_dinv[CAP];
+    __shared__ float s_e[CAP * 3];
+    __shared__ int s_child[CAP];
+    __shared__ int s_pslot[CAP];
+    __shared__ int s_gdof[CAP];
+    __shared__ int s_order[CAP];
+    __shared__ int s_run[CAP];
+    __shared__ int s_level[CAP + 1];
+
+    for (int j = lane; j < n_joints; j += 32) {
+        const int joint = joint_start + j;
+        const int dof_start = joint_qd_start.data[joint];
+        s_child[j] = joint_child.data[joint];
+        s_pslot[j] = joint_parent_slot.data[joint];
+        s_gdof[j] = (dof_start < joint_qd_start.data[joint + 1]) ? dof_start : -1;
+        s_order[j] = level_joint.data[joint];
+        s_run[j] = level_run.data[joint];
+    }
+    for (int l = lane; l <= n_levels; l += 32) {
+        s_level[l] = level_offsets.data[level_begin + l];
+    }
+    __syncwarp(mask);
+    // a joint's first motion-subspace row (its only one below the multi-DOF root)
+    for (int idx = lane; idx < n_joints * 6; idx += 32) {
+        const int j = idx / 6;
+        const int gdof = s_gdof[j];
+        s_S[idx] = (gdof >= 0) ? propagation_joint_S_flat.data[gdof * 6 + (idx - j * 6)] : 0.0f;
+    }
+    for (int idx = lane; idx < n_joints * 3; idx += 32) {
+        const int j = idx / 3;
+        const int comp = idx - j * 3;
+        float e = 0.0f;
+        if (s_pslot[j] >= 0) {
+            const int parent = joint_parent.data[joint_start + j];
+            e = propagation_body_com_rel.data[s_child[j] * 3 + comp]
+                - propagation_body_com_rel.data[parent * 3 + comp];
+        }
+        s_e[idx] = e;
+    }
+"""
+
+
+@cache
+def _get_factor_propagation_tree_level_kernel(
+    size: int, max_joints: int, max_art_dofs: int, aug_cap: int, device_arch: str, *, has_free_root: bool = False
+) -> "wp.Kernel":
+    """Build a level-parallel variant of :func:`_get_factor_propagation_tree_revolute_kernel`.
+
+    The serial kernel walks the joints one at a time, a warp sync and several global-memory round
+    trips per joint. This variant walks the tree's depth levels deepest first and factors every joint
+    of a level at once (a 6x6 column, a DOF or a joint per lane), with the articulated inertias and
+    every per-joint input staged in shared memory, so a level step costs on-chip latency only.
+    Siblings that reduce into one parent first stage their transformed inertias; one pass per parent
+    then adds them in the serial kernel's order (descending joint index, ``level_run``). Every value
+    is the serial kernel's expression in its order, so the outputs are bitwise identical to the
+    serial walk and deterministic.
+
+    ``level_joint``/``level_run``/``level_offsets``/``level_art_start`` are the host-built level order
+    (:meth:`SolverSteel._build_propagation_tree_levels`). Every joint of a level step is 0/1-DOF; with
+    ``has_free_root`` the multi-DOF root, alone on level 0, runs the serial kernel's root block.
+    ``max_art_dofs`` bounds an articulation's DOFs and ``aug_cap`` its augmented drive rows (the row
+    stride ``max_dofs``): the rows are staged once and matched to their joints up front, where the
+    serial kernel scans them for every joint.
+    """
+    joints_cap = max(int(max_joints), 1)
+    snippet = (
+        _PROPAGATION_TREE_LEVEL_PRELUDE.replace("CAP", str(joints_cap))
+        + f"""
+    __shared__ float s_dp[{joints_cap} * 6];
+    __shared__ float s_arm[{joints_cap}];
+    __shared__ int s_kfirst[{joints_cap}];
+    __shared__ int s_kcount[{joints_cap}];
+    __shared__ int s_dof_slot[{max(int(max_art_dofs), 1)}];
+    __shared__ int s_aug_dof[{max(int(aug_cap), 1)}];
+    __shared__ float s_aug_K[{max(int(aug_cap), 1)}];
+"""
+        + """
+    const int dof_base = joint_qd_start.data[joint_start];
+    const int n_dofs = joint_qd_start.data[joint_end] - dof_base;
+    const int aug_count = aug_row_counts.data[art];
+    for (int j = lane; j < n_joints; j += 32) {
+        const int joint = joint_start + j;
+        const int gdof = s_gdof[j];
+        s_arm[j] = (gdof >= 0) ? joint_armature.data[gdof] : 0.0f;
+        s_kfirst[j] = 0x7fffffff;
+        s_kcount[j] = 0;
+        for (int dof = joint_qd_start.data[joint]; dof < joint_qd_start.data[joint + 1]; ++dof) {
+            s_dof_slot[dof - dof_base] = j;
+        }
+    }
+    for (int aug_i = lane; aug_i < aug_count; aug_i += 32) {
+        s_aug_dof[aug_i] = aug_row_dof_index.data[art * max_dofs + aug_i];
+        s_aug_K[aug_i] = aug_row_K.data[art * max_dofs + aug_i];
+    }
+    __syncwarp(mask);
+    // each joint's stiff aug rows: the first one and how many (the D step adds them in row order)
+    for (int aug_i = lane; aug_i < aug_count; aug_i += 32) {
+        const int local = s_aug_dof[aug_i] - dof_base;
+        if (local >= 0 && local < n_dofs && s_aug_K[aug_i] > 0.0f) {
+            const int slot = s_dof_slot[local];
+            atomicMin(&s_kfirst[slot], aug_i);
+            atomicAdd(&s_kcount[slot], 1);
+        }
+    }
+//FREE_ROOT_DECL
+    // every link's spatial inertia in its world-aligned COM frame, a link per lane (the serial
+    // kernel's per-entry sums, unrolled)
+    for (int j = lane; j < n_joints; j += 32) {
+        const int body = s_child[j];
+        const wp::quat_t<wp::float32> q = wp::quat_inverse(body_q_com.data[body].q);
+        const wp::mat_t<3, 3, wp::float32> R = wp::quat_to_matrix(q);
+        const wp::mat_t<6, 6, wp::float32> I_local = body_I_m.data[body];
+        #pragma unroll
+        for (int row = 0; row < 6; ++row) {
+            #pragma unroll
+            for (int col = 0; col < 6; ++col) {
+                const int row_block = (row >= 3) ? 3 : 0;
+                const int col_block = (col >= 3) ? 3 : 0;
+                const int rr = row - row_block;
+                const int cc = col - col_block;
+                float value = 0.0f;
+                #pragma unroll
+                for (int a = 0; a < 3; ++a) {
+                    #pragma unroll
+                    for (int b = 0; b < 3; ++b) {
+                        value += R.data[a][rr] * I_local.data[row_block + a][col_block + b] * R.data[b][cc];
+                    }
+                }
+                s_A[j * 36 + row * 6 + col] = value;
+            }
+        }
+    }
+    __syncwarp(mask);
+
+    for (int level = n_levels - 1; level >= 0; --level) {
+        const int lo = s_level[level];
+        const int n = s_level[level + 1] - lo;
+//FREE_ROOT_LEVEL
+        // U = Ia S for every DOF of the level, and the six products of d = S^T U
+        for (int idx = lane; idx < n * 6; idx += 32) {
+            const int k = idx / 6;
+            const int r = idx - k * 6;
+            const int j = s_order[lo + k];
+            const int gdof = s_gdof[j];
+            if (gdof >= 0) {
+                float u = 0.0f;
+                for (int c = 0; c < 6; ++c) {
+                    u += s_A[j * 36 + r * 6 + c] * s_S[j * 6 + c];
+                }
+                propagation_tree_U.data[gdof * 6 + r] = u;
+                s_U[j * 6 + r] = u;
+                s_dp[j * 6 + r] = s_S[j * 6 + r] * u;
+            }
+        }
+        __syncwarp(mask);
+        for (int k = lane; k < n; k += 32) {
+            const int j = s_order[lo + k];
+            const int gdof = s_gdof[j];
+            if (gdof >= 0) {
+                // the serial kernel's shuffle-tree sum of the six products
+                const float d_part = ((s_dp[j * 6 + 0] + s_dp[j * 6 + 4]) + s_dp[j * 6 + 2])
+                    + ((s_dp[j * 6 + 1] + s_dp[j * 6 + 5]) + s_dp[j * 6 + 3]);
+                float d_value = d_part + s_arm[j];
+                for (int aug_i = s_kfirst[j], found = 0; found < s_kcount[j]; ++aug_i) {
+                    if (s_aug_dof[aug_i] == gdof && s_aug_K[aug_i] > 0.0f) {
+                        d_value += s_aug_K[aug_i];
+                        ++found;
+                    }
+                }
+                if (d_value <= 1.0e-12f) {
+                    d_value = 1.0e-12f;
+                }
+                const int joint = joint_start + j;
+                const float inv_d = 1.0f / d_value;
+                propagation_tree_D_chol.data[joint * 36] = sqrtf(d_value);
+                propagation_tree_D_inv.data[joint * 36] = inv_d;
+                s_dinv[j] = inv_d;
+            }
+        }
+        __syncwarp(mask);
+        // Ia(child) -= U D^-1 U^T, a column per task
+        for (int idx = lane; idx < n * 6; idx += 32) {
+            const int k = idx / 6;
+            const int col = idx - k * 6;
+            const int j = s_order[lo + k];
+            if (s_gdof[j] >= 0) {
+                const float inv_d = s_dinv[j];
+                for (int row = 0; row < 6; ++row) {
+                    float reduced = s_A[j * 36 + row * 6 + col];
+                    reduced -= s_U[j * 6 + row] * inv_d * s_U[j * 6 + col];
+                    s_A[j * 36 + row * 6 + col] = reduced;
+                }
+            }
+        }
+        __syncwarp(mask);
+        // each child's inertia moved to its parent's COM and staged per child, a column per task
+        for (int idx = lane; idx < n * 6; idx += 32) {
+            const int k = idx / 6;
+            const int col = idx - k * 6;
+            const int j = s_order[lo + k];
+            if (s_pslot[j] >= 0) {
+                const float ex = s_e[j * 3 + 0];
+                const float ey = s_e[j * 3 + 1];
+                const float ez = s_e[j * 3 + 2];
+
+                float v0 = 0.0f;
+                float v1 = 0.0f;
+                float v2 = 0.0f;
+                float v3 = 0.0f;
+                float v4 = 0.0f;
+                float v5 = 0.0f;
+                if (col == 0) {
+                    v0 = 1.0f;
+                } else if (col == 1) {
+                    v1 = 1.0f;
+                } else if (col == 2) {
+                    v2 = 1.0f;
+                } else if (col == 3) {
+                    v1 = -ez;
+                    v2 = ey;
+                    v3 = 1.0f;
+                } else if (col == 4) {
+                    v0 = ez;
+                    v2 = -ex;
+                    v4 = 1.0f;
+                } else {
+                    v0 = -ey;
+                    v1 = ex;
+                    v5 = 1.0f;
+                }
+                const float* Ic = &s_A[j * 36];
+                const float w0 = Ic[0 * 6 + 0] * v0 + Ic[0 * 6 + 1] * v1 + Ic[0 * 6 + 2] * v2
+                    + Ic[0 * 6 + 3] * v3 + Ic[0 * 6 + 4] * v4 + Ic[0 * 6 + 5] * v5;
+                const float w1 = Ic[1 * 6 + 0] * v0 + Ic[1 * 6 + 1] * v1 + Ic[1 * 6 + 2] * v2
+                    + Ic[1 * 6 + 3] * v3 + Ic[1 * 6 + 4] * v4 + Ic[1 * 6 + 5] * v5;
+                const float w2 = Ic[2 * 6 + 0] * v0 + Ic[2 * 6 + 1] * v1 + Ic[2 * 6 + 2] * v2
+                    + Ic[2 * 6 + 3] * v3 + Ic[2 * 6 + 4] * v4 + Ic[2 * 6 + 5] * v5;
+                const float w3 = Ic[3 * 6 + 0] * v0 + Ic[3 * 6 + 1] * v1 + Ic[3 * 6 + 2] * v2
+                    + Ic[3 * 6 + 3] * v3 + Ic[3 * 6 + 4] * v4 + Ic[3 * 6 + 5] * v5;
+                const float w4 = Ic[4 * 6 + 0] * v0 + Ic[4 * 6 + 1] * v1 + Ic[4 * 6 + 2] * v2
+                    + Ic[4 * 6 + 3] * v3 + Ic[4 * 6 + 4] * v4 + Ic[4 * 6 + 5] * v5;
+                const float w5 = Ic[5 * 6 + 0] * v0 + Ic[5 * 6 + 1] * v1 + Ic[5 * 6 + 2] * v2
+                    + Ic[5 * 6 + 3] * v3 + Ic[5 * 6 + 4] * v4 + Ic[5 * 6 + 5] * v5;
+
+                s_B[j * 36 + 0 * 6 + col] = w0;
+                s_B[j * 36 + 1 * 6 + col] = w1;
+                s_B[j * 36 + 2 * 6 + col] = w2;
+                s_B[j * 36 + 3 * 6 + col] = w3 + ey * w2 - ez * w1;
+                s_B[j * 36 + 4 * 6 + col] = w4 + ez * w0 - ex * w2;
+                s_B[j * 36 + 5 * 6 + col] = w5 + ex * w1 - ey * w0;
+            }
+        }
+        __syncwarp(mask);
+        // a parent column per task: add its children of this level in descending joint order, the serial order
+        for (int idx = lane; idx < n * 6; idx += 32) {
+            const int k = idx / 6;
+            const int col = idx - k * 6;
+            const int run = s_run[lo + k];
+            if (run > 0) {
+                const int pslot = s_pslot[s_order[lo + k]];
+                float acc[6];
+                #pragma unroll
+                for (int row = 0; row < 6; ++row) {
+                    acc[row] = s_A[pslot * 36 + row * 6 + col];
+                }
+                for (int t = 0; t < run; ++t) {
+                    const int child_slot = s_order[lo + k + t];
+                    #pragma unroll
+                    for (int row = 0; row < 6; ++row) {
+                        acc[row] += s_B[child_slot * 36 + row * 6 + col];
+                    }
+                }
+                #pragma unroll
+                for (int row = 0; row < 6; ++row) {
+                    s_A[pslot * 36 + row * 6 + col] = acc[row];
+                }
+            }
+        }
+        __syncwarp(mask);
+    }
+
+    for (int idx = lane; idx < n_joints * 36; idx += 32) {
+        const int j = idx / 36;
+        propagation_tree_Ia.data[s_child[j] * 36 + (idx - j * 36)] = s_A[idx];
+    }
+#endif
+"""
+    )
+    if has_free_root:
+        # level 0 is the multi-DOF root alone (slot 0): the serial kernel's root block on the staged inertia
+        root_level = (
+            """
+        if (level == 0) {
+            const int joint = joint_start;
+            const int dof_start = joint_qd_start.data[joint];
+            const int dof_end = joint_qd_start.data[joint + 1];
+            const int dc = dof_end - dof_start;
+            for (int elem = lane; elem < dc * 6; elem += 32) {
+                s_S_root[elem] = propagation_joint_S_flat.data[dof_start * 6 + elem];
+            }
+            __syncwarp(mask);
+            for (int elem = lane; elem < dc * 6; elem += 32) {
+                const int a = elem / 6;
+                const int r = elem - a * 6;
+                float u_val = 0.0f;
+                for (int c = 0; c < 6; ++c) {
+                    u_val += s_A[r * 6 + c] * s_S_root[a * 6 + c];
+                }
+                propagation_tree_U.data[(dof_start + a) * 6 + r] = u_val;
+                s_U_root[elem] = u_val;
+            }
+            __syncwarp(mask);
+"""
+            + _FACTOR_ROOT_D_BLOCK.replace("aug_row_dof_index.data[row_index]", "s_aug_dof[aug_i]")
+            .replace("aug_row_K.data[row_index]", "s_aug_K[aug_i]")
+            .replace("propagation_joint_S_flat.data[(dof_start + a) * 6 + r]", "s_S_root[a * 6 + r]")
+            .replace("propagation_tree_U.data[(dof_start + b) * 6 + r]", "s_U_root[b * 6 + r]")
+            + """
+            for (int elem = lane; elem < 36; elem += 32) {
+                const int row = elem / 6;
+                const int col = elem - row * 6;
+                float reduced = s_A[elem];
+                for (int a = 0; a < dc; ++a) {
+                    const float U_ar = s_U_root[a * 6 + row];
+                    for (int b = 0; b < dc; ++b) {
+                        reduced -= U_ar * s_Dinv_root[a * 6 + b]
+                            * s_U_root[b * 6 + col];
+                    }
+                }
+                s_A[elem] = reduced;
+            }
+            __syncwarp(mask);
+            continue;
+        }
+"""
+        )
+        root_decl = _FACTOR_ROOT_DECL + "    __shared__ float s_S_root[36];\n    __shared__ float s_U_root[36];\n"
+        snippet = snippet.replace("//FREE_ROOT_DECL", root_decl).replace("//FREE_ROOT_LEVEL", root_level)
+    else:
+        snippet = snippet.replace("//FREE_ROOT_DECL", "").replace("//FREE_ROOT_LEVEL", "")
+
+    @wp.func_native(snippet)
+    def factor_propagation_tree_level_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_run: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        joint_armature: wp.array[float],
+        max_dofs: int,
+        aug_row_counts: wp.array[int],
+        aug_row_dof_index: wp.array[int],
+        aug_row_K: wp.array[float],
+        body_I_m: wp.array[wp.spatial_matrix],
+        body_q_com: wp.array[wp.transform],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_Ia: wp.array3d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_chol: wp.array3d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+    ): ...
+
+    def factor_propagation_tree_level_template(  # pragma: no cover - compiled by wp.kernel
+        group_to_art: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_run: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        joint_armature: wp.array[float],
+        max_dofs: int,
+        aug_row_counts: wp.array[int],
+        aug_row_dof_index: wp.array[int],
+        aug_row_K: wp.array[float],
+        body_I_m: wp.array[wp.spatial_matrix],
+        body_q_com: wp.array[wp.transform],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_Ia: wp.array3d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_chol: wp.array3d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+    ):
+        group_idx, _lane = wp.tid()
+        factor_propagation_tree_level_native(
+            group_idx,
+            group_to_art,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            level_joint,
+            level_run,
+            level_offsets,
+            level_art_start,
+            propagation_joint_S_flat,
+            joint_armature,
+            max_dofs,
+            aug_row_counts,
+            aug_row_dof_index,
+            aug_row_K,
+            body_I_m,
+            body_q_com,
+            propagation_body_com_rel,
+            propagation_tree_Ia,
+            propagation_tree_U,
+            propagation_tree_D_chol,
+            propagation_tree_D_inv,
+        )
+
+    name = f"factor_propagation_tree_level_{size}_j{joints_cap}_d{max_art_dofs}_a{aug_cap}"
+    if has_free_root:
+        name += "_fr"
+    factor_propagation_tree_level_template.__name__ = name
+    factor_propagation_tree_level_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(factor_propagation_tree_level_template)
+
+
+@cache
+def _get_propagation_tree_body_response_level_kernel(
+    size: int, max_joints: int, device_arch: str, *, has_free_root: bool = False
+) -> "wp.Kernel":
+    """Build a level-parallel variant of :func:`_get_propagation_tree_body_response_revolute_kernel`.
+
+    A link's response depends only on its parent's, so the root-to-leaf walk runs one depth level at
+    a time with every link of the level in flight (a response column, one unit wrench, per lane) and
+    the parents' exact and split responses and the per-joint inputs in shared memory. Every entry is
+    computed by the serial kernel's arithmetic, so the outputs are bitwise identical to it. Takes the serial kernel's
+    arguments plus the parent slots and the level order of
+    :func:`_get_factor_propagation_tree_level_kernel` (``level_run`` and the ``propagation_tree_body_delta``
+    scratch unused).
+    """
+    joints_cap = max(int(max_joints), 1)
+    snippet = (
+        _PROPAGATION_TREE_LEVEL_PRELUDE.replace("CAP", str(joints_cap))
+        + f"""
+    __shared__ float s_weight[{joints_cap}];
+"""
+        + """
+    for (int idx = lane; idx < n_joints * 6; idx += 32) {
+        const int j = idx / 6;
+        const int gdof = s_gdof[j];
+        s_U[idx] = (gdof >= 0) ? propagation_tree_U.data[gdof * 6 + (idx - j * 6)] : 0.0f;
+    }
+    for (int j = lane; j < n_joints; j += 32) {
+        s_dinv[j] = (s_gdof[j] >= 0) ? propagation_tree_D_inv.data[(joint_start + j) * 36] : 0.0f;
+        s_weight[j] = (float)max(propagation_joint_split.data[joint_start + j], 1);
+    }
+    __syncwarp(mask);
+    for (int level = 0; level < n_levels; ++level) {
+        const int lo = s_level[level];
+        const int n = s_level[level + 1] - lo;
+//FREE_ROOT_LEVEL
+        // a response column (unit wrench) per task: everything but the final row pick depends on it only
+        for (int idx = lane; idx < n * 6; idx += 32) {
+            const int k = idx / 6;
+            const int col = idx - k * 6;
+            const int j = s_order[lo + k];
+            const int child = s_child[j];
+            const int pslot = s_pslot[j];
+            const int gdof = s_gdof[j];
+            const int has_dof = (gdof >= 0);
+            const float inv_d = s_dinv[j];
+            const float ex = s_e[j * 3 + 0];
+            const float ey = s_e[j * 3 + 1];
+            const float ez = s_e[j * 3 + 2];
+
+            float b0 = 0.0f;
+            float b1 = 0.0f;
+            float b2 = 0.0f;
+            float b3 = 0.0f;
+            float b4 = 0.0f;
+            float b5 = 0.0f;
+            if (col == 0) {
+                b0 = 1.0f;
+            } else if (col == 1) {
+                b1 = 1.0f;
+            } else if (col == 2) {
+                b2 = 1.0f;
+            } else if (col == 3) {
+                b3 = 1.0f;
+            } else if (col == 4) {
+                b4 = 1.0f;
+            } else {
+                b5 = 1.0f;
+            }
+
+            const float s_dot_f = s_S[j * 6 + col];
+            float p0 = b0;
+            float p1 = b1;
+            float p2 = b2;
+            float p3 = b3;
+            float p4 = b4;
+            float p5 = b5;
+            if (has_dof) {
+                const float scale = inv_d * s_dot_f;
+                p0 -= s_U[j * 6 + 0] * scale;
+                p1 -= s_U[j * 6 + 1] * scale;
+                p2 -= s_U[j * 6 + 2] * scale;
+                p3 -= s_U[j * 6 + 3] * scale;
+                p4 -= s_U[j * 6 + 4] * scale;
+                p5 -= s_U[j * 6 + 5] * scale;
+            }
+
+            const float pp[6] = {p0, p1, p2, p3 + ey * p2 - ez * p1, p4 + ez * p0 - ex * p2, p5 + ex * p1 - ey * p0};
+            float parent_delta[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float parent_split[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            if (pslot >= 0) {
+                for (int r = 0; r < 6; ++r) {
+                    float exact = 0.0f;
+                    float split = 0.0f;
+                    for (int c = 0; c < 6; ++c) {
+                        exact += s_A[pslot * 36 + r * 6 + c] * pp[c];
+                        split += s_B[pslot * 36 + r * 6 + c] * pp[c];
+                    }
+                    parent_delta[r] = exact;
+                    parent_split[r] = split;
+                }
+                parent_delta[0] += parent_delta[4] * ez - parent_delta[5] * ey;
+                parent_delta[1] += parent_delta[5] * ex - parent_delta[3] * ez;
+                parent_delta[2] += parent_delta[3] * ey - parent_delta[4] * ex;
+                parent_split[0] += parent_split[4] * ez - parent_split[5] * ey;
+                parent_split[1] += parent_split[5] * ex - parent_split[3] * ez;
+                parent_split[2] += parent_split[3] * ey - parent_split[4] * ex;
+            }
+
+            float qdd = 0.0f;
+            float qdd_split = 0.0f;
+            if (has_dof) {
+                float parent_dot = 0.0f;
+                float split_dot = 0.0f;
+                for (int r = 0; r < 6; ++r) {
+                    parent_dot += s_U[j * 6 + r] * parent_delta[r];
+                    split_dot += s_U[j * 6 + r] * parent_split[r];
+                }
+                const float weight = s_weight[j];
+                qdd = inv_d * (s_dot_f - parent_dot);
+                qdd_split = inv_d * (weight * s_dot_f - split_dot);
+            }
+            for (int row = 0; row < 6; ++row) {
+                float value = parent_delta[row];
+                float split_value = parent_split[row];
+                if (has_dof) {
+                    value += s_S[j * 6 + row] * qdd;
+                    split_value += s_S[j * 6 + row] * qdd_split;
+                }
+                const int elem = row * 6 + col;
+                s_A[j * 36 + elem] = value;
+                s_B[j * 36 + elem] = split_value;
+                propagation_tree_Ia.data[child * 36 + elem] = value;
+                propagation_body_response.data[child * 36 + elem] = value;
+                propagation_body_response_split.data[child * 36 + elem] = split_value;
+            }
+        }
+        __syncwarp(mask);
+    }
+#endif
+"""
+    )
+    if has_free_root:
+        root_level = """
+        if (level == 0) {
+            // Multi-DOF root link (slot 0, alone on level 0): response = S D^-1 S^T (no parent).
+            const int joint = joint_start;
+            const int root_dof_start = joint_qd_start.data[joint];
+            const int root_dc = joint_qd_start.data[joint + 1] - root_dof_start;
+            const int root_child = s_child[0];
+            const float root_weight = (float)max(propagation_joint_split.data[joint], 1);
+            for (int elem = lane; elem < 36; elem += 32) {
+                const int row = elem / 6;
+                const int col = elem - row * 6;
+                float value = 0.0f;
+                for (int a = 0; a < root_dc; ++a) {
+                    float qdd = 0.0f;
+                    for (int b = 0; b < root_dc; ++b) {
+                        qdd += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                            * propagation_joint_S_flat.data[(root_dof_start + b) * 6 + col];
+                    }
+                    value += propagation_joint_S_flat.data[(root_dof_start + a) * 6 + row] * qdd;
+                }
+                const float split_value = root_weight * value;
+                s_A[elem] = value;
+                s_B[elem] = split_value;
+                propagation_tree_Ia.data[root_child * 36 + elem] = value;
+                propagation_body_response.data[root_child * 36 + elem] = value;
+                propagation_body_response_split.data[root_child * 36 + elem] = split_value;
+            }
+            __syncwarp(mask);
+            continue;
+        }
+"""
+        snippet = snippet.replace("//FREE_ROOT_LEVEL", root_level)
+    else:
+        snippet = snippet.replace("//FREE_ROOT_LEVEL", "")
+
+    @wp.func_native(snippet)
+    def propagation_tree_body_response_level_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_run: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_joint_split: wp.array[int],
+        propagation_tree_Ia: wp.array3d[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_response: wp.array3d[float],
+        propagation_body_response_split: wp.array3d[float],
+    ): ...
+
+    def propagation_tree_body_response_level_template(  # pragma: no cover - compiled by wp.kernel
+        group_to_art: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_run: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_joint_split: wp.array[int],
+        propagation_tree_Ia: wp.array3d[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_response: wp.array3d[float],
+        propagation_body_response_split: wp.array3d[float],
+    ):
+        group_idx, _lane = wp.tid()
+        propagation_tree_body_response_level_native(
+            group_idx,
+            group_to_art,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            level_joint,
+            level_run,
+            level_offsets,
+            level_art_start,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            propagation_tree_U,
+            propagation_tree_D_inv,
+            propagation_joint_split,
+            propagation_tree_Ia,
+            propagation_tree_body_delta,
+            propagation_body_response,
+            propagation_body_response_split,
+        )
+
+    name = f"propagation_tree_body_response_level_{size}_j{joints_cap}"
+    if has_free_root:
+        name += "_fr"
+    propagation_tree_body_response_level_template.__name__ = name
+    propagation_tree_body_response_level_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(propagation_tree_body_response_level_template)
 
 
 @cache
@@ -21839,7 +22674,9 @@ def _get_propagation_cached_gemv_kernel(
 
 
 @cache
-def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int, device_arch: str) -> "wp.Kernel":
+def _get_refresh_propagation_tree_body_qd_warp_kernel(
+    size: int, max_joints: int, device_arch: str, *, levels: bool = False
+) -> "wp.Kernel":
     """Build a one-warp variant of ``refresh_propagation_tree_body_qd_for_size``.
 
     The refresh is a single root-to-leaf pass: each link's live COM twist is
@@ -21856,6 +22693,13 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
     free-root or multi-DOF shape: those checks also guarantee the topological
     joint order (parents before children) and in-articulation parents that
     ``joint_parent_slot`` indexing relies on.
+
+    ``levels`` walks the tree a depth level at a time instead (every link of a
+    level in flight, six lanes each), in the level order of
+    :meth:`SolverSteel._build_propagation_tree_levels`, which the kernel then
+    takes as three extra arguments after ``joint_parent_slot``. Each link's
+    twist is the same expression of its parent's, so the outputs are bitwise
+    identical to the joint walk.
     """
     joints_cap = max(int(max_joints), 1)
     snippet = f"""
@@ -21878,10 +22722,11 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
     __shared__ float s_e[{joints_cap} * 3];
     __shared__ int s_child[{joints_cap}];
     __shared__ int s_pslot[{joints_cap}];
-
+//LEVEL_LOAD
     for (int j = lane; j < n_joints; j += 32) {{
         s_child[j] = joint_child.data[joint_start + j];
         s_pslot[j] = joint_parent_slot.data[joint_start + j];
+//LEVEL_JOINT_LOAD
     }}
     __syncwarp(mask);
     for (int idx = lane; idx < n_joints * 6; idx += 32) {{
@@ -21909,31 +22754,78 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
     }}
     __syncwarp(mask);
 
-    for (int j = 0; j < n_joints; ++j) {{
-        if (lane < 6) {{
-            float value = s_Sv[j * 6 + lane];
+//TREE_WALK
+#endif
+"""
+    link = """
+            float value = s_Sv[j * 6 + c];
             const int pslot = s_pslot[j];
-            if (pslot >= 0) {{
-                value += s_bd[pslot * 6 + lane];
-                if (lane < 3) {{
+            if (pslot >= 0) {
+                value += s_bd[pslot * 6 + c];
+                if (c < 3) {
                     const float ex = s_e[j * 3 + 0];
                     const float ey = s_e[j * 3 + 1];
                     const float ez = s_e[j * 3 + 2];
                     const float wx = s_bd[pslot * 6 + 3];
                     const float wy = s_bd[pslot * 6 + 4];
                     const float wz = s_bd[pslot * 6 + 5];
-                    if (lane == 0) value += wy * ez - wz * ey;
-                    else if (lane == 1) value += wz * ex - wx * ez;
+                    if (c == 0) value += wy * ez - wz * ey;
+                    else if (c == 1) value += wz * ex - wx * ez;
                     else value += wx * ey - wy * ex;
-                }}
-            }}
-            s_bd[j * 6 + lane] = value;
-            propagation_body_qd.data[s_child[j] * 6 + lane] = value;
-        }}
-        __syncwarp(mask);
-    }}
-#endif
+                }
+            }
+            s_bd[j * 6 + c] = value;
+            propagation_body_qd.data[s_child[j] * 6 + c] = value;
 """
+    # the level order loads with the topology, before the first sync
+    level_load = f"""
+    __shared__ int s_order[{joints_cap}];
+    __shared__ int s_level[{joints_cap} + 1];
+    const int level_begin = level_art_start.data[art];
+    const int n_levels = level_art_start.data[art + 1] - level_begin - 1;
+    for (int l = lane; l <= n_levels; l += 32) {{
+        s_level[l] = level_offsets.data[level_begin + l];
+    }}
+"""
+    level_joint_load = """
+        s_order[j] = level_joint.data[joint_start + j];
+"""
+    level_walk = (
+        """
+    for (int level = 0; level < n_levels; ++level) {
+        const int lo = s_level[level];
+        for (int idx = lane; idx < (s_level[level + 1] - lo) * 6; idx += 32) {
+            const int j = s_order[lo + idx / 6];
+            const int c = idx - (idx / 6) * 6;
+"""
+        + link
+        + """
+        }
+        __syncwarp(mask);
+    }
+"""
+    )
+    joint_walk = (
+        """
+    for (int j = 0; j < n_joints; ++j) {
+        if (lane < 6) {
+            const int c = lane;
+"""
+        + link
+        + """
+        }
+        __syncwarp(mask);
+    }
+"""
+    )
+    level_snippet = (
+        snippet.replace("//LEVEL_LOAD\n", level_load)
+        .replace("//LEVEL_JOINT_LOAD\n", level_joint_load)
+        .replace("//TREE_WALK", level_walk)
+    )
+    snippet = (
+        snippet.replace("//LEVEL_LOAD\n", "").replace("//LEVEL_JOINT_LOAD\n", "").replace("//TREE_WALK", joint_walk)
+    )
 
     @wp.func_native(snippet)
     def refresh_propagation_tree_body_qd_warp_native(
@@ -21986,11 +22878,80 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int
             propagation_body_qd,
         )
 
-    name = f"refresh_propagation_tree_body_qd_warp_{size}_j{joints_cap}"
-    refresh_propagation_tree_body_qd_warp_template.__name__ = name
-    refresh_propagation_tree_body_qd_warp_template.__qualname__ = name
-    kernel = wp.kernel(enable_backward=False, module="unique")(refresh_propagation_tree_body_qd_warp_template)
-    kernel.native = refresh_propagation_tree_body_qd_warp_native  # the device function, for the fused latency kernel
+    @wp.func_native(level_snippet)
+    def refresh_propagation_tree_body_qd_level_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ): ...
+
+    def refresh_propagation_tree_body_qd_level_template(  # pragma: no cover - compiled by wp.kernel
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        level_joint: wp.array[int],
+        level_offsets: wp.array[int],
+        level_art_start: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ):
+        group_idx, _lane = wp.tid()
+        refresh_propagation_tree_body_qd_level_native(
+            group_idx,
+            group_to_art,
+            art_to_world,
+            dense_contact_world_flag,
+            force_refresh,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            level_joint,
+            level_offsets,
+            level_art_start,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            v_out,
+            propagation_body_qd,
+        )
+
+    if levels:
+        template, native = (
+            refresh_propagation_tree_body_qd_level_template,
+            refresh_propagation_tree_body_qd_level_native,
+        )
+        name = f"refresh_propagation_tree_body_qd_level_{size}_j{joints_cap}"
+    else:
+        template, native = refresh_propagation_tree_body_qd_warp_template, refresh_propagation_tree_body_qd_warp_native
+        name = f"refresh_propagation_tree_body_qd_warp_{size}_j{joints_cap}"
+    template.__name__ = name
+    template.__qualname__ = name
+    kernel = wp.kernel(enable_backward=False, module="unique")(template)
+    kernel.native = native  # the device function, for the fused latency kernel
+    kernel.levels = levels  # the native takes the level order (after joint_parent_slot)
     return kernel
 
 
