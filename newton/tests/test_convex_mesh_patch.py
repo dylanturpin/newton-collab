@@ -519,6 +519,7 @@ def test_patch_deterministic(test, device):
 
 
 def test_patch_rejects_prebuilt_narrow_phase(test, device):
+    """Check that the flag cannot be combined with a prebuilt narrow phase."""
     model = _unverified_slab_model(device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     with test.assertRaises(ValueError):

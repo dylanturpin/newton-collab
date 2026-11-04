@@ -59,7 +59,7 @@ FACE_CLIP_MIN_DOUBLE_AREA = wp.constant(1.0e-10)
 FACE_CLIP_DEPTH_TOLERANCE = wp.constant(1.0e-4)
 # Hull vertices within this distance [m] of a hull's extreme plane along the normal are mesh-patch candidates.
 CONVEX_MESH_PATCH_SLAB = wp.constant(2.0e-5)
-# Slab widenings (x4 each) tried while the candidates and the witness span no triangle.
+# Slab passes; each later pass, run only while the candidates and the witness span no triangle, is 4x wider.
 CONVEX_MESH_PATCH_SLAB_STEPS = 2
 # Candidate buffer; each hull may fill at most half of it.
 CONVEX_MESH_PATCH_CAPACITY = 64
@@ -1385,7 +1385,8 @@ def create_build_manifold(
         """Write up to 7 vertex contacts between two verified convex meshes, each with exact witnesses along the normal.
 
         Candidates are each hull's vertices near its extreme plane along the normal, ray-cast onto the other
-        hull; none may be deeper than the GJK/MPR witness. Skips the GJK/MPR witness, which the caller writes.
+        hull; none may be deeper than the GJK/MPR witness by more than 1e-4 m. Skips the GJK/MPR witness, which the caller
+        writes.
         """
         axis_u, axis_v = orthonormal_basis(normal)
         mesh_a = wp.mesh_get(unpack_mesh_ptr(geom_a.auxiliary))
@@ -1408,7 +1409,7 @@ def create_build_manifold(
             v = wp.quat_rotate(relative_orientation_b, wp.cw_mul(mesh_b.points[i], geom_b.scale)) + relative_position_b
             bottom_b = wp.min(bottom_b, wp.dot(v, normal))
 
-        # Widen the slab until it holds a support triangle besides the GJK/MPR witness.
+        # A second, 4x wider pass runs only if the first holds no support triangle besides the GJK/MPR witness.
         slab = float(CONVEX_MESH_PATCH_SLAB)
         slab_prev = float(-1.0)
         count_a = int(0)
