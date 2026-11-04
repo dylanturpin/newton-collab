@@ -489,6 +489,10 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         self.assertEqual(solver.solve_mode, "colored")
         self.assertEqual(solver.articulated_contact_response, "propagation")
 
+
+class TestSteelSolveModeOptionsCpu(unittest.TestCase):
+    """Runs without CUDA: CPU is the only device where the colored mode runs serially."""
+
     def test_colored_sleeping_requires_cuda(self):
         """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
         model = _floor_model("cpu", "static")
