@@ -1576,6 +1576,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_cached_response = _ConstructionOption()
     propagation_cached_response_body_max = _ConstructionOption()
     propagation_color_order = _ConstructionOption()
+    free_rigid_torsional_friction = _ConstructionOption()
+    free_rigid_rolling_friction = _ConstructionOption()
     deterministic = _ConstructionOption()
 
     @classmethod
@@ -1803,6 +1805,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
         propagation_color_order: Literal["contact", "longest_first"] = "contact",
+        free_rigid_torsional_friction: float | None = None,
+        free_rigid_rolling_friction: float | None = None,
         deterministic: wp.DeterministicMode | None = None,
     ):
         """Create a Steel solver for a finalized model.
@@ -2288,6 +2292,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 sweep where one body carries many contacts with different row counts; on some
                 stacked scenes it converges more slowly at a fixed iteration count. Other
                 responses ignore it.
+            free_rigid_torsional_friction: Experimental torsional coefficient [m] for every free-body
+                contact, replacing the shapes' ``steel:condim`` gate and
+                :attr:`~newton.Model.shape_material_mu_torsional` for that coefficient only; ``None`` keeps the
+                shape data. Meant for sweeps that cannot edit shape data. Construction-only.
+            free_rigid_rolling_friction: Experimental rolling coefficient [m] for every free-body contact,
+                replacing the shapes' ``steel:condim`` gate and
+                :attr:`~newton.Model.shape_material_mu_rolling` for that coefficient only; ``None`` keeps the
+                shape data. Construction-only.
             deterministic: Run-to-run determinism of the solve. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit ``wp.config.deterministic``, which defaults to
                 ``NOT_GUARANTEED``. With ``RUN_TO_RUN`` the solver reserves its constraint rows in a fixed
@@ -2536,7 +2548,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 f"got {articulated_contact_response!r}"
             )
         self._articulated_contact_response = articulated_contact_response
-        configure_free_rigid_angular_friction(self, model)
+        configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
         inherited = deterministic is None
         if inherited:
             deterministic = wp.config.deterministic

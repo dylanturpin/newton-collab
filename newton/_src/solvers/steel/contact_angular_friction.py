@@ -24,20 +24,29 @@ from .kernels import (
 )
 
 
-def configure_free_rigid_angular_friction(solver, model) -> None:
-    """Decide from the shapes' ``steel:condim`` whether free-body contacts get angular rows, and validate the options.
+def configure_free_rigid_angular_friction(solver, model, torsional: float | None, rolling: float | None) -> None:
+    """Decide from ``steel:condim`` and the solver-wide overrides whether free-body contacts get angular rows.
 
-    Raises :class:`ValueError` for a condim other than 3, 4 or 6 or an invalid gated coefficient, and
+    Raises :class:`ValueError` for a condim other than 3, 4 or 6, an invalid gated coefficient or override, and
     :class:`NotImplementedError` for an option the angular rows do not support.
     """
+    for name, value in (("free_rigid_torsional_friction", torsional), ("free_rigid_rolling_friction", rolling)):
+        if value is not None and (not np.isfinite(float(value)) or float(value) < 0.0):
+            raise ValueError(f"{name} must be finite and non-negative [m], or None")
+    solver._free_rigid_torsional_friction = None if torsional is None else float(torsional)
+    solver._free_rigid_rolling_friction = None if rolling is None else float(rolling)
     condim = solver._namespaced_attribute("condim")
     values = condim.numpy() if condim is not None and model.shape_count else None
     if values is not None:
         _check_condim_values(values)
-    solver._free_rigid_angular_rows = bool(values is not None and np.any(values >= 4))
+    overridden = torsional is not None or rolling is not None
+    # Kernel argument for a model without steel:condim; the gate kernel ignores it.
+    solver._free_rigid_condim_placeholder = wp.zeros(1, dtype=wp.int32, device=model.device)
+    solver._free_rigid_angular_rows = bool(overridden or (values is not None and np.any(values >= 4)))
     if not solver._free_rigid_angular_rows:
         return
-    _check_gated_coefficients(model, values)
+    if values is not None:
+        _check_gated_coefficients(model, values)
     unsupported = [
         name
         for name, requested in (
@@ -53,7 +62,8 @@ def configure_free_rigid_angular_friction(solver, model) -> None:
         if requested
     ]
     if unsupported:
-        raise NotImplementedError(f"steel:condim above 3 does not support {', '.join(unsupported)}")
+        source = "free_rigid_*_friction" if overridden else "steel:condim above 3"
+        raise NotImplementedError(f"{source} does not support {', '.join(unsupported)}")
 
 
 def refresh_free_rigid_angular_friction(solver) -> None:
@@ -61,13 +71,18 @@ def refresh_free_rigid_angular_friction(solver) -> None:
     if not solver._free_rigid_angular_rows:
         return
     model = solver.model
+    condim = solver._namespaced_attribute("condim")
+    torsional, rolling = solver._free_rigid_torsional_friction, solver._free_rigid_rolling_friction
     wp.launch(
         gate_free_rigid_angular_coefficients,
         dim=model.shape_count,
         inputs=[
-            solver._namespaced_attribute("condim"),
+            condim if condim is not None else solver._free_rigid_condim_placeholder,
+            int(condim is not None),
             model.shape_material_mu_torsional,
             model.shape_material_mu_rolling,
+            -1.0 if torsional is None else torsional,
+            -1.0 if rolling is None else rolling,
         ],
         outputs=[solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling],
         device=model.device,
@@ -76,8 +91,9 @@ def refresh_free_rigid_angular_friction(solver) -> None:
 
 def validate_free_rigid_angular_friction(solver) -> None:
     """Read ``steel:condim`` and the gated coefficients on the host and raise :class:`ValueError` for invalid values."""
-    if solver._free_rigid_angular_rows:
-        values = solver._namespaced_attribute("condim").numpy()
+    condim = solver._namespaced_attribute("condim")
+    if solver._free_rigid_angular_rows and condim is not None:
+        values = condim.numpy()
         _check_condim_values(values)
         _check_gated_coefficients(solver.model, values)
 

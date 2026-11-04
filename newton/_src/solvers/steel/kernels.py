@@ -6654,20 +6654,29 @@ def build_mf_contact_rows(
 @wp.kernel
 def gate_free_rigid_angular_coefficients(
     shape_condim: wp.array[wp.int32],
+    has_condim: int,
     shape_mu_torsional: wp.array[float],
     shape_mu_rolling: wp.array[float],
+    torsional_override: float,
+    rolling_override: float,
     # outputs
     free_rigid_mu_torsional: wp.array[float],
     free_rigid_mu_rolling: wp.array[float],
 ):
-    """Write each shape's free-rigid coefficients [m]: torsional from ``condim`` 4, rolling from 6, else zero."""
+    """Write each shape's free-rigid coefficients [m]: an override where given, else the material behind condim."""
     shape = wp.tid()
-    condim = shape_condim[shape]
+    condim = int(3)
+    if has_condim != 0:
+        condim = shape_condim[shape]
     torsional = float(0.0)
     rolling = float(0.0)
-    if condim >= 4:
+    if torsional_override >= 0.0:
+        torsional = torsional_override
+    elif condim >= 4:
         torsional = shape_mu_torsional[shape]
-    if condim >= 6:
+    if rolling_override >= 0.0:
+        rolling = rolling_override
+    elif condim >= 6:
         rolling = shape_mu_rolling[shape]
     if not wp.isfinite(torsional) or torsional < 0.0:
         torsional = 0.0

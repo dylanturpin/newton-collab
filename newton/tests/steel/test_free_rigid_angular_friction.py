@@ -694,6 +694,59 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         self.assertFalse(solver._free_rigid_angular_rows)
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+class TestFreeRigidAngularFrictionOverrides(unittest.TestCase):
+    def test_condim_and_materials_match_the_override(self):
+        """Give the override and the per-shape condim gate with the same coefficient the same trajectory."""
+        override = _simulate("sphere", 0.5, rolling_material=0.0, free_rigid_rolling_friction=0.002, **_ROLLING)
+        shapes = _simulate("sphere", 0.5, **_rows(rolling=0.002), **_ROLLING)
+        np.testing.assert_array_equal(override[0], shapes[0])
+        np.testing.assert_array_equal(override[1], shapes[1])
+
+    def test_override_stops_a_rolling_sphere_without_condim(self):
+        """Stop a rolling sphere at the Coulomb distance from the solver-wide rolling coefficient alone."""
+        _, twist, travel = _simulate("sphere", 0.8, free_rigid_rolling_friction=0.002, **_ROLLING)
+        self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
+        expected = _coulomb_stopping_distance(0.3, 0.002)
+        self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
+
+    def test_one_override_keeps_the_other_coefficient_on_condim(self):
+        """Override only rolling: condim 3 adds no spin row, condim 4 keeps its material spin row."""
+        seen = {}
+
+        def observe(solver, contacts, observables):
+            seen["torsional"] = solver._free_rigid_mu_torsional.numpy().copy()
+            seen["rolling"] = solver._free_rigid_mu_rolling.numpy().copy()
+
+        _simulate("sphere", 0.0, steps=1, torsional_material=5.0e-4, free_rigid_rolling_friction=0.001, observe=observe)
+        np.testing.assert_array_equal(seen["torsional"], 0.0)
+        np.testing.assert_allclose(seen["rolling"], 0.001)
+        _simulate(
+            "sphere",
+            0.0,
+            steps=1,
+            condim=4,
+            torsional_material=5.0e-4,
+            free_rigid_rolling_friction=0.001,
+            observe=observe,
+        )
+        np.testing.assert_allclose(seen["torsional"], 5.0e-4)
+        np.testing.assert_allclose(seen["rolling"], 0.001)
+
+    def test_invalid_overrides_raise(self):
+        """Reject a negative or non-finite override, and an override on an unsupported option."""
+        model, _ = _scene("sphere")
+        for name in ("free_rigid_torsional_friction", "free_rigid_rolling_friction"):
+            for value in (-1.0e-3, float("nan"), float("inf")):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
+                    SolverSteel(model, **{name: value})
+        with self.assertRaisesRegex(NotImplementedError, "free_rigid_"):
+            SolverSteel(model, solve_mode="split", free_rigid_rolling_friction=1.0e-3)
+        solver = SolverSteel(model, free_rigid_rolling_friction=1.0e-3)
+        self.assertEqual(solver.free_rigid_rolling_friction, 1.0e-3)
+        self.assertIsNone(solver.free_rigid_torsional_friction)
+
+
 def test_linear_row_builder_leaves_the_angular_rows(test, device):
     """Write only the normal and sliding rows of a six-row free-body contact; rows 3-5 belong to the angular builder."""
     sentinel = 123.0
