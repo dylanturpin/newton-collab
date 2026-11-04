@@ -23,6 +23,7 @@ from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
     PROPAGATION_UNIT_META,
     PROPAGATION_UNIT_RING,
+    accumulate_free_rigid_angular_wrenches_from_impulses,
     build_mf_contact_rows,
 )
 from newton._src.solvers.steel.solver_steel import (
@@ -1669,8 +1670,61 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
         np.testing.assert_array_equal(output.numpy()[0, 3:], sentinel)
 
 
+def test_parent_wrench_reads_only_the_contact_row_family(test, device):
+    """Report each contact's spin torque from its own row family when the other family has no rows allocated."""
+    # Debug mode bounds-checks every array access, so a read of the other family's rows aborts.
+    module = wp.get_module("newton_tests_steel_parent_wrench_debug")
+    wp.set_module_options({"mode": "debug"}, module=module)
+    kernel = wp.Kernel(accumulate_free_rigid_angular_wrenches_from_impulses.func, module=module)
+    spin = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    for path in (1, 2):
+        own_type = wp.full((1, 4), spin, dtype=int, device=device)
+        own_impulses = wp.full((1, 4), 0.5, dtype=wp.float32, device=device)
+        empty_type = wp.zeros((1, 0), dtype=int, device=device)
+        empty_impulses = wp.zeros((1, 0), dtype=wp.float32, device=device)
+        mf = (own_type, own_impulses) if path == 1 else (empty_type, empty_impulses)
+        propagation = (own_type, own_impulses) if path == 2 else (empty_type, empty_impulses)
+        counts = wp.array([4], dtype=wp.int32, device=device)
+        zero_counts = wp.array([0], dtype=wp.int32, device=device)
+        wrench = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        wp.launch(
+            kernel,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                1,
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([path], dtype=wp.int32, device=device),
+                wp.array([4], dtype=wp.int32, device=device),
+                wp.array([wp.vec3(0.0, 0.0, 1.0)], dtype=wp.vec3, device=device),
+                wp.array([0], dtype=int, device=device),
+                wp.array([-1], dtype=int, device=device),
+                wp.array([0], dtype=int, device=device),
+                counts if path == 1 else zero_counts,
+                *mf,
+                counts if path == 2 else zero_counts,
+                *propagation,
+                2.0,
+            ],
+            outputs=[wrench],
+            device=device,
+        )
+        np.testing.assert_allclose(
+            wrench.numpy()[0], [0.0, 0.0, 0.0, 0.0, 0.0, -1.0], atol=1e-6, err_msg=f"path {path}"
+        )
+
+
 class TestFreeRigidAngularRowBuilder(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestFreeRigidAngularRowBuilder,
+    "test_parent_wrench_reads_only_the_contact_row_family",
+    test_parent_wrench_reads_only_the_contact_row_family,
+    devices=get_test_devices(),
+)
 
 
 add_function_test(

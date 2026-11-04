@@ -6979,11 +6979,15 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
     if path == 2:
         row_count = propagation_constraint_count[world]
     for row in range(slot + 3, wp.min(slot + contact_slots_needed[c], row_count)):
-        row_type = mf_row_type[world, row]
-        impulse = mf_impulses[world, row]
+        # The two row families have independent capacities, so index only the contact's own.
+        row_type = int(0)
+        impulse = float(0.0)
         if path == 2:
             row_type = propagation_row_type[world, row]
             impulse = propagation_impulses[world, row]
+        else:
+            row_type = mf_row_type[world, row]
+            impulse = mf_impulses[world, row]
         # A propagation torsion spare shares these slots on non-free pairs; its torque is reported separately.
         if row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING or row_type == PGS_CONSTRAINT_TYPE_CONTACT_SPIN:
             axis = normal
