@@ -504,6 +504,7 @@ def _compute_bias_forces_per_joint(
             body_q_com,
             body_solve_origin,
             model.body_world,
+            model.body_disable_gravity,
             model.gravity,
         ],
         outputs=[body_f_s],

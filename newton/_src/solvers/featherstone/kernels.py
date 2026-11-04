@@ -1614,6 +1614,7 @@ def eval_rigid_id_body_force(
     body_q_com: wp.array[wp.transform],
     body_solve_origin: wp.array[wp.vec3],
     body_world: wp.array[wp.int32],
+    body_disable_gravity: wp.array[bool],
     gravity: wp.array[wp.vec3],
     # outputs
     body_f_s: wp.array2d[wp.spatial_vector],
@@ -1651,7 +1652,9 @@ def eval_rigid_id_body_force(
     X_sm = body_q_com[child]
     x_com_s = wp.transform_get_translation(X_sm) - body_solve_origin[child]
     m = body_mass[child]
-    f_g = m * gravity[body_world[child]]
+    f_g = wp.vec3()
+    if not body_disable_gravity[child]:
+        f_g = m * gravity[body_world[child]]
     I_s = transform_spatial_inertia(
         wp.transform(x_com_s, wp.transform_get_rotation(X_sm)), spatial_inertia(m, body_inertia[child])
     )
