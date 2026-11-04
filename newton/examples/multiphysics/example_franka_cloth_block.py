@@ -255,7 +255,6 @@ class Example:
             def rigid_solver(view):
                 return SolverSteel(
                     view,
-                    solve_mode="matrix_free",
                     iterations=24,
                     enable_joint_limits=True,
                     articulation_constraint_max=256,

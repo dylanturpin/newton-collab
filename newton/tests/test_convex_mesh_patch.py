@@ -585,7 +585,7 @@ def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
         model,
         iterations=32,
         contact_regularization=0.01,
-        solve_mode="matrix_free",
+        solve_mode="serial",
         contact_shared_anchor=True,
         enable_sleeping=True,
     )

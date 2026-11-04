@@ -1,1 +1,1 @@
-Accept models whose worlds have different DOF counts with the `"propagation"` and `"propagation_colored"` contact responses of `newton.solvers.SolverSteel`.
+Accept models whose worlds have different DOF counts with the `"propagation"` contact response of `newton.solvers.SolverSteel`.

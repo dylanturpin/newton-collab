@@ -70,6 +70,8 @@ class SupportMapDataProvider:
     """Optional model-owned hull validation data for support mapping."""
 
     shape_support_data: wp.array[wp.vec4i]
+    # Nonzero when all 32 lanes of the warp hold the same pair (cooperative overlap refinement).
+    warp_cooperative: int
 
 
 @wp.struct
@@ -80,6 +82,7 @@ class AcceleratedSupportMapDataProvider:
     support_lut: wp.array[int]
     support_vertex_offsets: wp.array[int]
     support_neighbors: wp.array[int]
+    warp_cooperative: int  # as in SupportMapDataProvider
 
 
 @wp.func

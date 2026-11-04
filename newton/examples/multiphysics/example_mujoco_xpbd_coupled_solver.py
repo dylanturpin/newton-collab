@@ -71,7 +71,7 @@ def _rigid_solver_entry_args(
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
     if rigid_solver == "steel":
         # The chain and boxes pile up on the ground, past the default 32 dense contact rows.
-        return "steel", SolverSteel, {"solve_mode": "matrix_free", "articulation_constraint_max": 256}
+        return "steel", SolverSteel, {"articulation_constraint_max": 256}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 

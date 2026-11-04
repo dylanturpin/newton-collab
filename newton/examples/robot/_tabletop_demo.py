@@ -123,7 +123,7 @@ class TabletopDemo:
         self.contacts = self.pipeline.contacts()
         self.solver = SolverSteel(
             self.model,
-            solve_mode="matrix_free",
+            solve_mode=args.solve_mode,
             articulated_contact_response=args.contact_response,
             deterministic=deterministic,
             iterations=args.iterations,
@@ -155,10 +155,16 @@ class TabletopDemo:
         parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
         parser.add_argument("--iterations", type=int, default=12, help="Steel sweeps per substep")
         parser.add_argument(
+            "--solve-mode",
+            choices=("serial", "colored"),
+            default="serial",
+            help="Steel Gauss-Seidel sweep order; 'colored' requires --contact-response propagation",
+        )
+        parser.add_argument(
             "--contact-response",
-            choices=("immediate", "propagation", "propagation_colored"),
+            choices=("immediate", "propagation"),
             default="immediate",
-            help="Steel matrix-free articulated contact response",
+            help="Steel articulated contact response",
         )
         return parser
 

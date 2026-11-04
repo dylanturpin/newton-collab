@@ -100,7 +100,7 @@ def _test_solver_mimic(test, device, solver_name):
                     )
                 generalized = False
             elif solver_name == "steel":
-                solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free")
+                solver = newton.solvers.SolverSteel(model)
                 generalized = True
             elif solver_name == "vbd":
                 solver = newton.solvers.SolverVBD(
@@ -411,7 +411,7 @@ add_function_test(
     test_mimic_compound_d6_coordinate_gradients,
     devices=devices,
 )
-# Steel mimic rows need the CUDA-only matrix-free solve; its split solve rejects them.
+# Steel requires CUDA.
 for device in get_cuda_test_devices():
     add_function_test(TestSolverMimic, "test_steel_mimic", test_steel_mimic, devices=[device])
 

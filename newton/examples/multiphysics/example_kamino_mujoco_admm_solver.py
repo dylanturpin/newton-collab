@@ -144,7 +144,7 @@ class Example:
             rigid_name = "steel"
 
             def rigid_factory(v):
-                return SolverSteel(v, solve_mode="matrix_free")
+                return SolverSteel(v)
 
         else:
             rigid_name = "mjc"

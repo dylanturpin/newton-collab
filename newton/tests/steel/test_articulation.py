@@ -34,7 +34,7 @@ from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
 def _run(steps: int = 720, crank_target: float = 0.6, **solver_kwargs):
     builder = _build_four_bar()
     model = builder.finalize()
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1, **solver_kwargs)
+    solver = newton.solvers.SolverSteel(model, iterations=16, baumgarte=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -48,7 +48,7 @@ def _run(steps: int = 720, crank_target: float = 0.6, **solver_kwargs):
     return solver, model, state_0
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelConnect(unittest.TestCase):
     def test_loop_joint_presence_is_stable(self):
         """Verify a trailing BALL loop joint no longer NaNs the articulation solve."""
@@ -90,7 +90,7 @@ class TestSteelConnect(unittest.TestCase):
 
         loop_joint = b.add_joint_ball(parent=left, child=right)
         model = b.finalize()
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free")
+        solver = newton.solvers.SolverSteel(model)
 
         self.assertEqual(int(model.joint_articulation.numpy()[loop_joint]), -1)
         np.testing.assert_array_equal(
@@ -118,7 +118,6 @@ class TestSteelConnect(unittest.TestCase):
 
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
         self.assertFalse(solver._has_loop_joints)
@@ -191,7 +190,7 @@ class TestSteelConnect(unittest.TestCase):
         b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
         model = b.finalize()
 
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
+        solver = newton.solvers.SolverSteel(model, iterations=16, baumgarte=0.1)
         self.assertEqual(
             getattr(solver, "_connect_count", 0),
             1,
@@ -220,7 +219,7 @@ _REL_P = np.array([0.0, 0.0, -0.2])
 
 
 def _pgs_mode():
-    return "matrix_free" if wp.get_device().is_cuda else "split"
+    return "serial"
 
 
 def _build_carried_load(*, enabled: bool = True, world_parent: bool = False):
@@ -420,8 +419,8 @@ def test_four_bar_capture_matches_eager(test, device):
     targets = model.joint_target_q.numpy().copy()
     targets[0] = 0.6
     control.joint_target_q.assign(targets)
-    eager = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
-    captured = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
+    eager = SolverSteel(model, iterations=16, baumgarte=0.1)
+    captured = SolverSteel(model, iterations=16, baumgarte=0.1)
     e0, e1 = model.state(), model.state()
     c0, c1 = model.state(), model.state()
 
@@ -447,7 +446,7 @@ def check_standalone_world_root_is_not_loop_joint(test, device, **solver_kwargs)
     model = b.finalize(device=device)
     test.assertEqual(model.joint_articulation.numpy().tolist(), [0, -1])
     test.assertEqual(standalone_joint, 1)
-    solver = SolverSteel(model, solve_mode="matrix_free", **solver_kwargs)
+    solver = SolverSteel(model, **solver_kwargs)
     test.assertEqual(solver._connect_count, 0)
     np.testing.assert_array_equal(solver._model_plan.loop_joint_articulation, np.array([-1, -1], dtype=np.int32))
 
@@ -461,7 +460,7 @@ def test_disabled_loop_joint_starts_released(test, device):
     """Start a loop joint disabled in Model.joint_enabled released, and engage it later."""
     b, _, load, joints = _build_carried_load(enabled=False, world_parent=True)
     model = b.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.2)
+    solver = SolverSteel(model, iterations=16, baumgarte=0.2)
     state_0, state_1 = model.state(), model.state()
     z0 = float(state_0.body_q.numpy()[load, 2])
     for _ in range(48):
@@ -506,9 +505,9 @@ def test_imported_connect_equality_is_enforced(test, device):
         test.assertEqual(model.mujoco.equality_constraint_count, 1)
         if not convert:
             with test.assertRaisesRegex(NotImplementedError, "equality"):
-                SolverSteel(model, solve_mode="matrix_free")
+                SolverSteel(model)
             continue
-        solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
+        solver = SolverSteel(model, iterations=16)
         test.assertEqual(solver._connect_count, 1)
         state_0, state_1 = model.state(), model.state()
         for _ in range(120):
@@ -535,7 +534,7 @@ def test_imported_weld_equality_holds_the_authored_pose(test, device):
     # The converted WELD becomes a FIXED loop joint parallel to the hinge.
     _expect_one_warning(test, UserWarning, "another joint already connects these bodies", lambda: b.add_mjcf(mjcf))
     model = b.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
+    solver = SolverSteel(model, iterations=16)
     test.assertEqual(solver._connect_count, 1)
     state_0, state_1, control = model.state(), model.state(), model.control()
     q_start = state_0.body_q.numpy()[0, 3:].copy()
@@ -565,7 +564,7 @@ def test_imported_weld_with_zero_torquescale_leaves_rotation_free(test, device):
         b.add_mjcf(mjcf)
     test.assertTrue(any("torquescale=0" in str(w.message) for w in caught))
     model = b.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16)
+    solver = SolverSteel(model, iterations=16)
     test.assertEqual(solver._connect_count, 1)
     test.assertEqual(int(solver._connect_rows_np[0]), 3)
 
@@ -673,9 +672,7 @@ def _run_four_bar(steps: int = 720, crank_target: float = 0.6, iterations: int =
     pre-elimination enforces the closure independently of the sweep budget.
     """
     model = _build_four_bar().finalize()
-    solver = newton.solvers.SolverSteel(
-        model, solve_mode="matrix_free", iterations=iterations, baumgarte=0.1, **solver_kwargs
-    )
+    solver = newton.solvers.SolverSteel(model, iterations=iterations, baumgarte=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -701,7 +698,7 @@ def _build_overcapacity_mixed_bilateral_model():
     return builder.finalize()
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelPreelimination(unittest.TestCase):
     def test_default_preserves_all_bilateral_trajectory(self):
         """Match the implicit default to explicit all-bilateral elimination."""
@@ -709,9 +706,7 @@ class TestSteelPreelimination(unittest.TestCase):
         builder.set_joint_mimic(1, 0)
         model = builder.finalize()
         solvers = [
-            newton.solvers.SolverSteel(
-                model, solve_mode="matrix_free", iterations=8, enable_bilateral_preelimination=True, **options
-            )
+            newton.solvers.SolverSteel(model, iterations=8, enable_bilateral_preelimination=True, **options)
             for options in ({}, {"bilateral_preelimination_include_mimics": True})
         ]
         states = [(model.state(), model.state()) for _ in solvers]
@@ -745,7 +740,6 @@ class TestSteelPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver_all = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_bilateral_preelimination=True,
             )
         self.assertFalse(solver_all._preelim_active)
@@ -753,7 +747,6 @@ class TestSteelPreelimination(unittest.TestCase):
 
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=8,
             enable_bilateral_preelimination=True,
             bilateral_preelimination_include_mimics=False,
@@ -821,7 +814,6 @@ class TestSteelPreelimination(unittest.TestCase):
         model = builder.finalize()
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=2,
             baumgarte=0.1,
             articulation_constraint_max=128,
@@ -867,7 +859,6 @@ class TestSteelPreelimination(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "propagation"):
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 articulated_contact_response="propagation",
                 enable_bilateral_preelimination=True,
             )
@@ -891,17 +882,6 @@ class TestSteelPreelimination(unittest.TestCase):
             seen.update(rows[w, : counts[w]].tolist())
         self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
 
-    def test_unsupported_mode_warns_and_falls_back(self):
-        """Non-matrix-free modes warn and keep the iterative rows."""
-        model = _build_four_bar().finalize()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            solver = newton.solvers.SolverSteel(
-                model, solve_mode="split", iterations=16, enable_bilateral_preelimination=True
-            )
-        self.assertFalse(solver._preelim_active)
-        self.assertTrue(any("matrix_free" in str(w.message) for w in caught))
-
     def test_velocity_iterations_warn_and_fall_back(self):
         """The TGS velocity pass is unsupported in v1: warn and fall back."""
         model = _build_four_bar().finalize()
@@ -909,7 +889,6 @@ class TestSteelPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 iterations=16,
                 velocity_iterations=4,
                 enable_bilateral_preelimination=True,
@@ -1015,7 +994,7 @@ def _run_four_bar_preelim_upstream(
     keeps it small at the same budget.
     """
     model = _build_four_bar().finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=iterations, baumgarte=0.1, **solver_kwargs)
+    solver = SolverSteel(model, iterations=iterations, baumgarte=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -1060,9 +1039,7 @@ def test_mimic_held_at_low_iterations(test, device):
         builder = _build_four_bar()
         builder.set_joint_mimic(1, 0, coeffs=(0.0, -1.0))
         model = builder.finalize(device=device)
-        solver = SolverSteel(
-            model, solve_mode="matrix_free", iterations=1, baumgarte=0.1, enable_bilateral_preelimination=enabled
-        )
+        solver = SolverSteel(model, iterations=1, baumgarte=0.1, enable_bilateral_preelimination=enabled)
         test.assertEqual(solver._preelim_active, enabled)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -1100,7 +1077,6 @@ def test_preelimination_with_free_body_in_world(test, device):
         model = builder.finalize(device=device)
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=2,
             baumgarte=0.1,
             articulation_constraint_max=64,
@@ -1136,8 +1112,8 @@ def test_preelimination_capture_matches_eager(test, device):
     control.joint_target_q.assign(targets)
     options = {"iterations": 2, "baumgarte": 0.1, "enable_bilateral_preelimination": True}
     eager, captured = (
-        SolverSteel(model, solve_mode="matrix_free", **options),
-        SolverSteel(model, solve_mode="matrix_free", **options),
+        SolverSteel(model, **options),
+        SolverSteel(model, **options),
     )
     e0, e1 = model.state(), model.state()
     c0, c1 = model.state(), model.state()
@@ -1185,7 +1161,7 @@ class TestSteelMimicLayout(unittest.TestCase):
                         q_start[follower + 1] - q_start[follower], qd_start[follower + 1] - qd_start[follower]
                     )
                     with self.assertRaisesRegex(ValueError, "joint-owned mimic.*position and velocity"):
-                        newton.solvers.SolverSteel(model, solve_mode="split")
+                        newton.solvers.SolverSteel(model)
 
     def test_scalar_and_d6_mimic_coordinate_maps(self):
         """Preserve componentwise mimic maps after a quaternion-layout free base."""
@@ -1198,7 +1174,7 @@ class TestSteelMimicLayout(unittest.TestCase):
                 with self.subTest(device=device, joint_type=joint_type):
                     builder, leader, follower = _build_mimic_layout(joint_type)
                     model = builder.finalize(device=device)
-                    solver = newton.solvers.SolverSteel(model, solve_mode="split")
+                    solver = newton.solvers.SolverSteel(model)
                     self.assertEqual(solver._mimic_count, dimensions)
                     for suffix, start, joint in (
                         ("q0", model.joint_q_start, follower),
@@ -1219,7 +1195,7 @@ class TestSteelMimicLayout(unittest.TestCase):
                     builder.add_constraint_mimic(joint0=follower, joint1=leader)
                 model = builder.finalize(device=device)
                 with self.assertWarnsRegex(UserWarning, "references a non-1-DoF"):
-                    solver = newton.solvers.SolverSteel(model, solve_mode="split")
+                    solver = newton.solvers.SolverSteel(model)
                 self.assertEqual(solver._mimic_count, 1)
                 self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
                 self.assertEqual(solver._mimic_valid_np.tolist(), [0])
@@ -1314,7 +1290,7 @@ def _run_chain(
 ):
     builder, _, _ = _build_two_revolute_chain(coef0, coef1, legacy=legacy)
     model = builder.finalize()
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1, **solver_kwargs)
+    solver = newton.solvers.SolverSteel(model, iterations=16, baumgarte=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -1328,7 +1304,7 @@ def _run_chain(
     return solver, state_0.joint_q.numpy()
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelMimic(unittest.TestCase):
     def test_identity_mimic_tracks_leader(self):
         """Verify a 1:1 mimic makes the undriven follower joint track the driven leader."""
@@ -1347,7 +1323,7 @@ class TestSteelMimic(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             builder.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=0.1, coef1=-0.5)
-        solver = newton.solvers.SolverSteel(builder.finalize(), solve_mode="matrix_free")
+        solver = newton.solvers.SolverSteel(builder.finalize())
         self.assertEqual(solver._mimic_count, 1)
         self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
 
@@ -1370,7 +1346,7 @@ class TestSteelMimic(unittest.TestCase):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.replicate(template, world_count=4)
         model = builder.finalize()
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free")
+        solver = newton.solvers.SolverSteel(model)
 
         self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
@@ -1380,7 +1356,7 @@ class TestSteelMimic(unittest.TestCase):
         builder, _, _ = _build_two_revolute_chain(0.0, 1.0, legacy=True)
         builder.constraint_mimic_enabled[0] = False
         model = builder.finalize()
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=16)
+        solver = newton.solvers.SolverSteel(model, iterations=16)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         targets = model.joint_target_q.numpy().copy()
@@ -1424,7 +1400,6 @@ class TestSteelMimic(unittest.TestCase):
         scene.replicate(builder, world_count=2)  # per-world row counts exclude the global world
         solver = newton.solvers.SolverSteel(
             scene.finalize(),
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             propagation_same_articulation_rows=True,
             articulation_constraint_max=64,
@@ -1479,7 +1454,7 @@ def test_runtime_coefficient_change(test, device):
     """Read joint-owned coefficients every step, also from a captured graph."""
     builder, _, follower = _build_two_revolute_chain_mimic_upstream(0.0, 1.0)
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
+    solver = SolverSteel(model, iterations=16, baumgarte=0.1)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -1515,7 +1490,7 @@ def test_mimic_row_overflow_is_reported(test, device):
     model = builder.finalize(device=device)
     # A zero activation gap keeps the (far) joint-limit rows out of the single row slot.
     options = {"articulation_constraint_max": 1, "joint_limit_activation_gap": 0.0, "warn_constraint_overflow": False}
-    solver = SolverSteel(model, solve_mode="matrix_free", **options)
+    solver = SolverSteel(model, **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
     test.assertEqual(int(solver._mimic_slot.numpy()[0]), 0)
@@ -1526,7 +1501,7 @@ def test_mimic_row_overflow_is_reported(test, device):
         # A second, consistent row on the other joint (identity coupling in both directions).
         builder.add_constraint_mimic(joint0=0, joint1=1, coef0=0.0, coef1=1.0)
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", **options)
+    solver = SolverSteel(model, **options)
     state_0, state_1 = model.state(), model.state()
     solver.step(state_0, state_1, model.control(), None, DT)
     test.assertEqual(int(solver._constraint_count.numpy()[0]), 1)
@@ -1574,7 +1549,7 @@ def _build_hinge(spring_k: float, spring_ref: float, damping: float, limit_upper
 
 def _run_springs(builder, steps: int = 1200, qd0: float = 0.0, **solver_kwargs):
     model = builder.finalize()
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=8, **solver_kwargs)
+    solver = newton.solvers.SolverSteel(model, iterations=8, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     if qd0 != 0.0:
         qd = state_0.joint_qd.numpy()
@@ -1589,7 +1564,7 @@ def _run_springs(builder, steps: int = 1200, qd0: float = 0.0, **solver_kwargs):
     return state_0
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelSprings(unittest.TestCase):
     def test_spring_converges_to_reference(self):
         """Verify an undriven joint settles at the passive spring's reference position."""
@@ -1665,13 +1640,13 @@ def _construct(test, model, *, solve_mode, expect_warning):
     return solver
 
 
-def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, solve_mode="matrix_free"):
+def test_zero_or_absent_spring_stiffness_does_not_warn(test, device, solve_mode="serial"):
     """Construct silently without the spring attributes, and with zero registered stiffness."""
     _construct(test, _hinge_model(device, damping=0.1), solve_mode=solve_mode, expect_warning=False)
     _construct(test, _hinge_model(device, damping=0.1, spring_k=0.0), solve_mode=solve_mode, expect_warning=False)
 
 
-def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve_mode="matrix_free"):
+def test_spring_attribute_edits_leave_damping_refresh_intact(test, device, solve_mode="serial"):
     """Refresh damping on a JOINT_DOF_PROPERTIES notify while still applying no spring torque."""
     model = _hinge_model(device, damping=0.0, spring_k=0.0, spring_ref=0.5)
     solver = _construct(test, model, solve_mode=solve_mode, expect_warning=False)
@@ -1703,7 +1678,6 @@ for _name, _func in (
     ),
 ):
     add_function_test(TestSteelSpringsUpstream, _name, _func, devices=get_cuda_test_devices())
-    add_function_test(TestSteelSpringsUpstream, f"{_name}_split", _func, devices=get_test_devices(), solve_mode="split")
 
 
 add_function_test(
@@ -1993,20 +1967,15 @@ OMEGA_Y = 20.0
 SLIDE_VX = 2.0
 
 
-# (solve_mode, articulated_contact_response, velocity_iterations): the split
+# (solve_mode, articulated_contact_response, velocity_iterations): the
 # velocity post-pass converts velocity to acceleration at two more patched
 # sites, and each propagation response variant is a separately generated
 # contact path
 SLIDER_CONFIGS = [
-    ("split", "immediate", 0),
-]
-
-
-SLIDER_CONFIGS_CUDA = [
-    ("matrix_free", "immediate", 0),
-    ("matrix_free", "immediate", 2),
-    ("matrix_free", "propagation", 0),
-    ("matrix_free", "propagation_colored", 0),
+    ("serial", "immediate", 0),
+    ("serial", "immediate", 2),
+    ("serial", "propagation", 0),
+    ("colored", "propagation", 0),
 ]
 
 
@@ -2115,10 +2084,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
         agreeing the trajectories match to solver precision.
         """
         device = wp.get_device()
-        configs = list(SLIDER_CONFIGS)
-        if device.is_cuda:
-            configs += SLIDER_CONFIGS_CUDA
-        for solve_mode, response, vel_iters in configs:
+        for solve_mode, response, vel_iters in SLIDER_CONFIGS:
             with self.subTest(solve_mode=solve_mode, response=response, velocity_iterations=vel_iters):
                 model = _build_slider(device)
                 still, contacts_still = _slide_heights(model, 0.0, solve_mode, response, vel_iters)
@@ -2311,7 +2277,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
         """Keep the final velocity-postpass conversion observable and wired."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverSteel(model, solve_mode="split")
+        solver = SolverSteel(model)
         solver._rigid_body_angular_damping.zero_()
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
@@ -2338,7 +2304,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("CUDA graph capture requires a CUDA device")
-        heights_ref, _ = _slide_heights(_build_slider(device), OMEGA_Y, "matrix_free")
+        heights_ref, _ = _slide_heights(_build_slider(device), OMEGA_Y, "serial")
 
         model = _build_slider(device)
         state_0, state_1 = model.state(), model.state()
@@ -2347,7 +2313,7 @@ class TestSteelFreeRootPredictor(unittest.TestCase):
         joint_qd[3:6] = (0.0, OMEGA_Y, 0.0)
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         solver._rigid_body_angular_damping.zero_()
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
@@ -2391,26 +2357,22 @@ def _model(device, inertia, omega, *, armature=0.0, mass=1.0):
 
 def test_free_spin_energy(test, device):
     inertia = np.diag([0.001, 0.02, 0.0205])
-    for mode in ("split", "matrix_free"):
-        if mode == "matrix_free" and not wp.get_device(device).is_cuda:
-            continue
-        model, state, output = _model(device, inertia, (100.0, 20.0, 50.0))
-        solver = newton.solvers.SolverSteel(model, solve_mode=mode)
-        solver._rigid_body_angular_damping.zero_()
-        control = model.control()
+    model, state, output = _model(device, inertia, (100.0, 20.0, 50.0))
+    solver = newton.solvers.SolverSteel(model)
+    solver._rigid_body_angular_damping.zero_()
+    control = model.control()
+    omega = _body_omega(state)
+    energy = 0.5 * omega @ inertia @ omega
+    momentum = np.linalg.norm(inertia @ omega)
+    for step in range(1000):
+        solver.step(state, output, control, None, 1.0 / 240.0)
+        state, output = output, state
         omega = _body_omega(state)
-        energy = 0.5 * omega @ inertia @ omega
-        momentum = np.linalg.norm(inertia @ omega)
-        with test.subTest(mode=mode):
-            for step in range(1000):
-                solver.step(state, output, control, None, 1.0 / 240.0)
-                state, output = output, state
-                omega = _body_omega(state)
-                observed = 0.5 * omega @ inertia @ omega
-                test.assertTrue(np.isfinite(observed), f"nonfinite energy at step {step}")
-                test.assertAlmostEqual(observed / energy, 1.0, delta=1.0e-3, msg=f"step {step}")
-            test.assertAlmostEqual(np.linalg.norm(inertia @ omega) / momentum, 1.0, delta=1.0e-3)
-            np.testing.assert_allclose(state.body_qd.numpy()[0, :3], [0.1, 0.2, 0.3], atol=2.0e-4)
+        observed = 0.5 * omega @ inertia @ omega
+        test.assertTrue(np.isfinite(observed), f"nonfinite energy at step {step}")
+        test.assertAlmostEqual(observed / energy, 1.0, delta=1.0e-3, msg=f"step {step}")
+    test.assertAlmostEqual(np.linalg.norm(inertia @ omega) / momentum, 1.0, delta=1.0e-3)
+    np.testing.assert_allclose(state.body_qd.numpy()[0, :3], [0.1, 0.2, 0.3], atol=2.0e-4)
 
 
 def test_principal_axis_torque(test, device):
@@ -2539,7 +2501,7 @@ def _mixed_scene(device, *, arm, totes):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
     control.joint_target_q.fill_(0.1)
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free" if wp.get_device(device).is_cuda else "split")
+    solver = newton.solvers.SolverSteel(model)
     solver._rigid_body_angular_damping.zero_()
     return model, solver, control, [state, output]
 
@@ -2810,7 +2772,7 @@ def _step_once_joint_qd_convention_upstream(model, solver):
     return state_out
 
 
-def test_joint_qd_matches_featherstone_far_from_origin(test, device, solve_mode="matrix_free"):
+def test_joint_qd_matches_featherstone_far_from_origin(test, device, solve_mode="serial"):
     """Match SolverFeatherstone's joint_qd and body_qd from the same public twist, far from the origin."""
     for origin in ORIGINS:
         with test.subTest(origin=origin):
@@ -2830,9 +2792,6 @@ for _name, _func in (
     ("test_joint_qd_matches_featherstone_far_from_origin", test_joint_qd_matches_featherstone_far_from_origin),
 ):
     add_function_test(TestSteelJointQdConventionUpstream, _name, _func, devices=get_cuda_test_devices())
-    add_function_test(
-        TestSteelJointQdConventionUpstream, f"{_name}_split", _func, devices=get_test_devices(), solve_mode="split"
-    )
 
 
 def _build_branched_d6(device):
@@ -3018,14 +2977,12 @@ for _name, _func in (
     ("test_translated_d6_spin_holds_position", test_translated_d6_spin_holds_position),
     ("test_free_and_distance_roots_use_com_twists", test_free_and_distance_roots_use_com_twists),
 ):
-    add_function_test(TestSteelJointMotion, f"{_name}_split", _func, devices=get_test_devices(), solve_mode="split")
-    add_function_test(TestSteelJointMotion, _name, _func, devices=get_cuda_test_devices(), solve_mode="matrix_free")
+    add_function_test(TestSteelJointMotion, _name, _func, devices=get_cuda_test_devices())
 add_function_test(
     TestSteelJointMotion,
     "test_translated_d6_spin_holds_position_propagation",
     test_translated_d6_spin_holds_position,
     devices=get_cuda_test_devices(),
-    solve_mode="matrix_free",
     articulated_contact_response="propagation",
 )
 add_function_test(
@@ -3040,7 +2997,6 @@ add_function_test(
     "test_multi_angular_d6_motion_matches_fk_parallel_tree",
     test_multi_angular_d6_motion_matches_fk,
     devices=get_cuda_test_devices(),
-    solve_mode="matrix_free",
     parallel_tree=True,
 )
 
@@ -3056,10 +3012,9 @@ def _build_two_world_free_model(device):
     return builder.finalize(device=device)
 
 
-def _make_solver(model, *, solve_mode: str, dense_warmstart: bool, mf_warmstart: bool):
+def _make_solver(model, *, dense_warmstart: bool, mf_warmstart: bool):
     return SolverSteel(
         model,
-        solve_mode=solve_mode,
         contact_warmstart=dense_warmstart or mf_warmstart,
         articulation_constraint_max=4,
         free_body_constraint_max=4,
@@ -3098,7 +3053,7 @@ class TestSteelReset(unittest.TestCase):
     def test_model_changes_invalidate_impulses_without_clearing_overflow(self):
         """Invalidate changed-model impulses while retaining invalid-transition status."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, dense_warmstart=True, mf_warmstart=True)
         for flags in (
             newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
             newton.ModelFlags.JOINT_DOF_PROPERTIES,
@@ -3115,7 +3070,7 @@ class TestSteelReset(unittest.TestCase):
     def test_model_change_world_mask_limits_impulse_invalidation(self):
         """Invalidate impulses only in the masked worlds, in either mask layout."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, dense_warmstart=True, mf_warmstart=True)
         for mask in ((False, True), (False, True, False)):
             with self.subTest(mask=mask):
                 specs = _history_specs(solver)
@@ -3126,17 +3081,16 @@ class TestSteelReset(unittest.TestCase):
 
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
-            ("dense selected", "split", True, False, (True, False)),
-            ("MF selected", "split", False, True, (True, False)),
-            ("combined selected", "split", True, True, (True, False)),
-            ("combined all", "split", True, True, (True, True)),
+            ("dense selected", True, False, (True, False)),
+            ("MF selected", False, True, (True, False)),
+            ("combined selected", True, True, (True, False)),
+            ("combined all", True, True, (True, True)),
         )
-        for name, solve_mode, dense_warmstart, mf_warmstart, reset_worlds in cases:
+        for name, dense_warmstart, mf_warmstart, reset_worlds in cases:
             with self.subTest(name=name):
                 model = _build_two_world_free_model("cpu")
                 solver = _make_solver(
                     model,
-                    solve_mode=solve_mode,
                     dense_warmstart=dense_warmstart,
                     mf_warmstart=mf_warmstart,
                 )
@@ -3150,7 +3104,7 @@ class TestSteelReset(unittest.TestCase):
 
     def test_reset_validates_mask_before_disabled_noop(self):
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, solve_mode="split", dense_warmstart=False, mf_warmstart=False)
+        solver = _make_solver(model, dense_warmstart=False, mf_warmstart=False)
         solver._impulses.fill_(17.0)
         before = solver._impulses.numpy().copy()
 
@@ -3167,7 +3121,7 @@ class TestSteelReset(unittest.TestCase):
     def test_reset_is_cuda_graph_capturable(self):
         device = wp.get_device("cuda:0")
         model = _build_two_world_free_model(device)
-        solver = _make_solver(model, solve_mode="split", dense_warmstart=True, mf_warmstart=True)
+        solver = _make_solver(model, dense_warmstart=True, mf_warmstart=True)
         state = model.state()
         mask = wp.array((True, False), dtype=wp.bool, device=device)
         specs = _history_specs(solver)
@@ -3217,7 +3171,7 @@ def _stack_on_platform(device, num_worlds=2):
     return builder.finalize(device=device)
 
 
-def _run_split(model, solver, steps):
+def _run_stack(model, solver, steps):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
@@ -3230,11 +3184,10 @@ def _run_split(model, solver, steps):
 
 
 def test_mixed_world_stack_rests(test, device):
-    """Rest a box stack on an articulated platform: dense and free-body rows exchange impulses every sweep."""
+    """Rest a box stack on an articulated platform: articulation and free-body rows exchange impulses every sweep."""
     model = _stack_on_platform(device)
-    solver = SolverSteel(model, solve_mode="split", iterations=16)
-    test.assertTrue(solver._has_mixed_contacts)
-    state = _run_split(model, solver, 240)
+    solver = SolverSteel(model, iterations=16)
+    state = _run_stack(model, solver, 240)
     solver.check_constraint_capacity()
     test.assertGreater(int(solver._constraint_count.numpy()[0]), 0)
     test.assertGreater(int(solver._mf_constraint_count.numpy()[0]), 0)
@@ -3247,69 +3200,13 @@ def test_mixed_world_stack_rests(test, device):
     test.assertLess(float(np.abs(state.body_qd.numpy()).max()), 2.0e-2)
 
 
-def test_mixed_world_matches_matrix_free_solve(test, device):
-    """Converge to the matrix-free solve's resting state on the same mixed scene."""
-    final = {}
-    for solve_mode in ("split", "matrix_free"):
-        model = _stack_on_platform(device)
-        solver = SolverSteel(model, solve_mode=solve_mode, iterations=32)
-        final[solve_mode] = _run_split(model, solver, 120).body_q.numpy()
-    np.testing.assert_allclose(final["split"], final["matrix_free"], rtol=0.0, atol=2.0e-3)
+class TestSteelMixedWorld(unittest.TestCase):
+    pass
 
 
-def test_captured_mixed_step_matches_eager(test, device):
-    """Replay captured collide + split step on a mixed scene like eager stepping."""
-    trajectories = []
-    for capture in (False, True):
-        model = _stack_on_platform(device)
-        solver = SolverSteel(model, solve_mode="split")
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
-
-        def substep(
-            solver=solver, pipeline=pipeline, contacts=contacts, state_0=state_0, state_1=state_1, control=control
-        ):
-            pipeline.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, DT)
-            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
-                wp.copy(getattr(state_0, name), getattr(state_1, name))
-
-        substep()
-        if capture:
-            with wp.ScopedCapture(device=device) as graph:
-                substep()
-            for _ in range(59):
-                wp.capture_launch(graph.graph)
-        else:
-            for _ in range(59):
-                substep()
-        trajectories.append(state_0.body_q.numpy())
-    # The right-hand side accumulates the contributions of several articulations with atomics,
-    # so two runs agree only to accumulated round-off (about 1e-5 here).
-    np.testing.assert_allclose(trajectories[1][:, :3], trajectories[0][:, :3], rtol=0.0, atol=1.0e-4)
-    np.testing.assert_allclose(trajectories[1][:, 3:], trajectories[0][:, 3:], rtol=0.0, atol=5.0e-4)
-
-
-class TestSteelSplit(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "requires a CUDA device to compare against")
-    def test_cpu_and_cuda_split_solves_agree(self):
-        """Match the CPU split solve (scalar kernels) and the CUDA split solve (native kernels)."""
-        final = {}
-        for device in ("cpu", "cuda:0"):
-            model = _stack_on_platform(device)
-            final[device] = _run_split(model, SolverSteel(model, solve_mode="split"), 120).body_q.numpy()
-        np.testing.assert_allclose(final["cpu"][:, :3], final["cuda:0"][:, :3], rtol=0.0, atol=1.0e-4)
-        np.testing.assert_allclose(final["cpu"][:, 3:], final["cuda:0"][:, 3:], rtol=0.0, atol=5.0e-4)
-
-
-for _name, _func, _devices in (
-    ("test_mixed_world_stack_rests", test_mixed_world_stack_rests, get_test_devices()),
-    ("test_mixed_world_matches_matrix_free_solve", test_mixed_world_matches_matrix_free_solve, get_cuda_test_devices()),
-    ("test_captured_mixed_step_matches_eager", test_captured_mixed_step_matches_eager, get_cuda_test_devices()),
-):
-    add_function_test(TestSteelSplit, _name, _func, devices=_devices)
+add_function_test(
+    TestSteelMixedWorld, "test_mixed_world_stack_rests", test_mixed_world_stack_rests, devices=get_test_devices()
+)
 
 
 class TestSteelBodyGravity(unittest.TestCase):
@@ -3330,12 +3227,11 @@ class TestSteelBodyGravity(unittest.TestCase):
                 expected[body, leaf] = gravity[body, leaf] * 0.08
         expected[-1] = gravity[-1] * 0.08
         expected[model.body_disable_gravity.numpy()] = 0.0
-        for mode in ("split", "matrix_free"):
-            for parallel in (False, True):
-                with self.subTest(mode=mode, parallel_tree=parallel):
-                    state = _advance(model, SolverSteel, {"solve_mode": mode, "parallel_tree": parallel}, steps=8)
-                    np.testing.assert_allclose(state.body_qd.numpy()[:, :3], expected, atol=2.0e-6)
-                    np.testing.assert_allclose(state.body_qd.numpy()[:, 3:], 0.0, atol=1.0e-7)
+        for parallel in (False, True):
+            with self.subTest(parallel_tree=parallel):
+                state = _advance(model, SolverSteel, {"parallel_tree": parallel}, steps=8)
+                np.testing.assert_allclose(state.body_qd.numpy()[:, :3], expected, atol=2.0e-6)
+                np.testing.assert_allclose(state.body_qd.numpy()[:, 3:], 0.0, atol=1.0e-7)
 
     def test_parallel_tree_mixed_com_wrench(self):
         """Match branched selective gravity to external forces at enabled centers of mass."""
@@ -3347,86 +3243,83 @@ class TestSteelBodyGravity(unittest.TestCase):
         forces = np.zeros((model.body_count, 6), dtype=np.float32)
         forces[:, :3] = model.body_mass.numpy()[:, None] * gravity
         forces[model.body_disable_gravity.numpy()] = 0.0
-        for mode in ("split", "matrix_free"):
-            serial = None
-            for parallel in (False, True):
-                with self.subTest(mode=mode, parallel_tree=parallel):
-                    options = {"solve_mode": mode, "parallel_tree": parallel}
-                    state = _advance(model, SolverSteel, options, steps=8)
-                    control = _advance(reference, SolverSteel, options, steps=8, forces=forces)
-                    for name in ("body_q", "body_qd"):
+        serial = None
+        for parallel in (False, True):
+            with self.subTest(parallel_tree=parallel):
+                options = {"parallel_tree": parallel}
+                state = _advance(model, SolverSteel, options, steps=8)
+                control = _advance(reference, SolverSteel, options, steps=8, forces=forces)
+                for name in ("body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(state, name).numpy(), getattr(control, name).numpy(), atol=3.0e-6
+                    )
+                    if serial is not None:
                         np.testing.assert_allclose(
-                            getattr(state, name).numpy(), getattr(control, name).numpy(), atol=3.0e-6
+                            getattr(state, name).numpy(), getattr(serial, name).numpy(), atol=3.0e-6
                         )
-                        if serial is not None:
-                            np.testing.assert_allclose(
-                                getattr(state, name).numpy(), getattr(serial, name).numpy(), atol=3.0e-6
-                            )
-                    self.assertGreater(float(np.linalg.norm(state.body_qd.numpy()[:, 3:])), 0.01)
-                    serial = state
+                self.assertGreater(float(np.linalg.norm(state.body_qd.numpy()[:, 3:])), 0.01)
+                serial = state
 
     def test_parallel_tree_runtime_flags_and_graph(self):
         """Refresh selective tree gravity and world vectors during notified graph replay."""
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("Parallel tree graph capture requires CUDA")
-        for mode in ("split", "matrix_free"):
-            with self.subTest(mode=mode):
-                builder = newton.ModelBuilder()
-                for gravity in ((1.0, -2.0, -10.0), (4.0, -5.0, 2.0)):
-                    builder.add_world(_gravity_tree(gravity))
-                model = builder.finalize(device=device)
-                solvers, states, graphs, outputs, controls = [], [], [], [], []
-                for parallel in (False, True):
-                    options = {"solve_mode": mode, "parallel_tree": parallel}
-                    _advance(model, SolverSteel, options, steps=2)
-                    solver = SolverSteel(model, **options)
-                    solver._rigid_body_angular_damping.zero_()
-                    self.assertEqual(solver._tree_plan is not None, parallel)
-                    self.assertTrue(solver._fk_id_cache_enabled)
-                    state, output = model.state(), model.state()
-                    control = model.control()
-                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                    with wp.ScopedCapture(device) as capture:
-                        state.clear_forces()
-                        solver.step(state, output, control, None, 0.01)
-                        output.clear_forces()
-                        solver.step(output, state, control, None, 0.01)
-                    solvers.append(solver)
-                    states.append(state)
-                    graphs.append(capture.graph)
-                    # Keep captured state and control allocations alive for replay.
-                    outputs.append(output)
-                    controls.append(control)
-                for phase in range(3):
-                    if phase == 1:
-                        flags = model.body_disable_gravity.numpy()
-                        flags[5:7] = ~flags[5:7]
-                        model.body_disable_gravity.assign(flags)
-                        for solver in solvers:
-                            solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-                    elif phase == 2:
-                        gravity = model.gravity.numpy()
-                        gravity[1] = (3.0, 7.0, -5.0)
-                        model.gravity.assign(gravity)
-                        for solver in solvers:
-                            solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
-                    before = states[0].body_qd.numpy().copy()
-                    for graph in graphs:
-                        wp.capture_launch(graph)
-                    delta = np.zeros((model.body_count, 3), dtype=np.float32)
-                    gravity = model.gravity.numpy()[model.body_world.numpy()]
-                    for body in range(model.body_count):
-                        leaf = body % 4 - 1
-                        if leaf >= 0:
-                            delta[body, leaf] = gravity[body, leaf] * 0.02
-                    delta[model.body_disable_gravity.numpy()] = 0.0
-                    for state in states:
-                        np.testing.assert_allclose(state.body_qd.numpy()[:, :3] - before[:, :3], delta, atol=2.0e-6)
-                    for name in ("body_q", "body_qd"):
-                        np.testing.assert_allclose(
-                            getattr(states[1], name).numpy(), getattr(states[0], name).numpy(), atol=3.0e-6
-                        )
+        builder = newton.ModelBuilder()
+        for gravity in ((1.0, -2.0, -10.0), (4.0, -5.0, 2.0)):
+            builder.add_world(_gravity_tree(gravity))
+        model = builder.finalize(device=device)
+        solvers, states, graphs, outputs, controls = [], [], [], [], []
+        for parallel in (False, True):
+            options = {"parallel_tree": parallel}
+            _advance(model, SolverSteel, options, steps=2)
+            solver = SolverSteel(model, **options)
+            solver._rigid_body_angular_damping.zero_()
+            self.assertEqual(solver._tree_plan is not None, parallel)
+            self.assertTrue(solver._fk_id_cache_enabled)
+            state, output = model.state(), model.state()
+            control = model.control()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            with wp.ScopedCapture(device) as capture:
+                state.clear_forces()
+                solver.step(state, output, control, None, 0.01)
+                output.clear_forces()
+                solver.step(output, state, control, None, 0.01)
+            solvers.append(solver)
+            states.append(state)
+            graphs.append(capture.graph)
+            # Keep captured state and control allocations alive for replay.
+            outputs.append(output)
+            controls.append(control)
+        for phase in range(3):
+            if phase == 1:
+                flags = model.body_disable_gravity.numpy()
+                flags[5:7] = ~flags[5:7]
+                model.body_disable_gravity.assign(flags)
+                for solver in solvers:
+                    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+            elif phase == 2:
+                gravity = model.gravity.numpy()
+                gravity[1] = (3.0, 7.0, -5.0)
+                model.gravity.assign(gravity)
+                for solver in solvers:
+                    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+            before = states[0].body_qd.numpy().copy()
+            for graph in graphs:
+                wp.capture_launch(graph)
+            delta = np.zeros((model.body_count, 3), dtype=np.float32)
+            gravity = model.gravity.numpy()[model.body_world.numpy()]
+            for body in range(model.body_count):
+                leaf = body % 4 - 1
+                if leaf >= 0:
+                    delta[body, leaf] = gravity[body, leaf] * 0.02
+            delta[model.body_disable_gravity.numpy()] = 0.0
+            for state in states:
+                np.testing.assert_allclose(state.body_qd.numpy()[:, :3] - before[:, :3], delta, atol=2.0e-6)
+            for name in ("body_q", "body_qd"):
+                np.testing.assert_allclose(
+                    getattr(states[1], name).numpy(), getattr(states[0], name).numpy(), atol=3.0e-6
+                )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_usd_selective_gravity(self):
@@ -3553,54 +3446,53 @@ class TestSteelBodyGravity(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("CUDA graph capture requires CUDA")
-        for mode in ("split", "matrix_free"):
-            for notify in (False, True):
-                with self.subTest(mode=mode, notify=notify):
-                    builder = newton.ModelBuilder()
-                    builder.replicate(_free_pair(), 4)
-                    model = builder.finalize(device=device)
-                    _advance(model, SolverSteel, {"solve_mode": mode}, steps=2)
-                    solver = SolverSteel(model, solve_mode=mode)
-                    solver._rigid_body_angular_damping.zero_()
-                    state, output = model.state(), model.state()
-                    control = model.control()
-                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        for notify in (False, True):
+            with self.subTest(notify=notify):
+                builder = newton.ModelBuilder()
+                builder.replicate(_free_pair(), 4)
+                model = builder.finalize(device=device)
+                _advance(model, SolverSteel, {}, steps=2)
+                solver = SolverSteel(model)
+                solver._rigid_body_angular_damping.zero_()
+                state, output = model.state(), model.state()
+                control = model.control()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
-                    self.assertTrue(solver._fk_id_cache_enabled)
-                    with wp.ScopedCapture(device) as capture:
-                        state.clear_forces()
-                        solver.step(state, output, control, None, 0.01)
-                        output.clear_forces()
-                        solver.step(output, state, control, None, 0.01)
-                    self.assertIs(solver._fk_id_cache_source_state, state)
-                    for _ in range(4):
-                        wp.capture_launch(capture.graph)
-                    expected = np.array([0.0, -0.8] * 4, dtype=np.float32)
-                    np.testing.assert_allclose(state.body_qd.numpy()[:, 2], expected, atol=2.0e-6)
-                    old_flags = model.body_disable_gravity.numpy()
-                    flags = old_flags.copy()
-                    flags[2:4] = [False, True]
-                    model.body_disable_gravity.assign(flags)
-                    np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
-                    if notify:
-                        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-                        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+                self.assertTrue(solver._fk_id_cache_enabled)
+                with wp.ScopedCapture(device) as capture:
+                    state.clear_forces()
+                    solver.step(state, output, control, None, 0.01)
+                    output.clear_forces()
+                    solver.step(output, state, control, None, 0.01)
+                self.assertIs(solver._fk_id_cache_source_state, state)
+                for _ in range(4):
                     wp.capture_launch(capture.graph)
-                    expected += np.where(flags, 0.0, -0.1)
-                    expected += np.where(flags if notify else old_flags, 0.0, -0.1)
-                    np.testing.assert_allclose(state.body_qd.numpy()[:, 2], expected, atol=2.0e-6)
-                    old_gravity = model.gravity.numpy()
-                    gravity = old_gravity.copy()
-                    gravity[2] = [3.0, 0.0, -5.0]
-                    model.gravity.assign(gravity)
-                    if notify:
-                        solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
-                    before = state.body_qd.numpy().copy()
-                    wp.capture_launch(capture.graph)
-                    world = model.body_world.numpy()
-                    delta = (gravity[world] + (gravity if notify else old_gravity)[world]) * 0.01
-                    delta[flags] = 0.0
-                    np.testing.assert_allclose(state.body_qd.numpy()[:, :3] - before[:, :3], delta, atol=2.0e-6)
+                expected = np.array([0.0, -0.8] * 4, dtype=np.float32)
+                np.testing.assert_allclose(state.body_qd.numpy()[:, 2], expected, atol=2.0e-6)
+                old_flags = model.body_disable_gravity.numpy()
+                flags = old_flags.copy()
+                flags[2:4] = [False, True]
+                model.body_disable_gravity.assign(flags)
+                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
+                if notify:
+                    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                    np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+                wp.capture_launch(capture.graph)
+                expected += np.where(flags, 0.0, -0.1)
+                expected += np.where(flags if notify else old_flags, 0.0, -0.1)
+                np.testing.assert_allclose(state.body_qd.numpy()[:, 2], expected, atol=2.0e-6)
+                old_gravity = model.gravity.numpy()
+                gravity = old_gravity.copy()
+                gravity[2] = [3.0, 0.0, -5.0]
+                model.gravity.assign(gravity)
+                if notify:
+                    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+                before = state.body_qd.numpy().copy()
+                wp.capture_launch(capture.graph)
+                world = model.body_world.numpy()
+                delta = (gravity[world] + (gravity if notify else old_gravity)[world]) * 0.01
+                delta[flags] = 0.0
+                np.testing.assert_allclose(state.body_qd.numpy()[:, :3] - before[:, :3], delta, atol=2.0e-6)
 
 
 def _add_free_body(builder, label, disabled):
@@ -3635,10 +3527,7 @@ def _mixed_articulation(gravity):
 
 def _solver_options():
     """Exercise serial and cached dynamics in both Feather solvers."""
-    choices = [(SolverFeatherstone, {}), (SolverSteel, {"solve_mode": "split"})]
-    if wp.get_device().is_cuda:
-        choices.append((SolverSteel, {"solve_mode": "matrix_free"}))
-    return choices
+    return [(SolverFeatherstone, {}), (SolverSteel, {"solve_mode": "serial"})]
 
 
 def _advance(model, solver_type, options, *, steps, forces=None):
@@ -3728,13 +3617,12 @@ def _advance_parent_wrench(pipeline, solver, states, control, steps, *, observab
 def _sleeping_wrench_solvers(model):
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         enable_sleeping=True,
         sleep_quiet_time=0.05,
         friction_anchor_beta=0.0,
         articulation_constraint_max=128,
     )
-    reference = SolverSteel(model, solve_mode="matrix_free", friction_anchor_beta=0.0, articulation_constraint_max=128)
+    reference = SolverSteel(model, friction_anchor_beta=0.0, articulation_constraint_max=128)
     return solver, reference
 
 
@@ -3853,7 +3741,8 @@ def test_parent_wrench_eager_step_before_first_replay(test, device):
     """Step eagerly between capturing a BODY_PARENT_F step and its first replay, and match an eager twin."""
     colored = {
         "enable_joint_velocity_limits": True,
-        "articulated_contact_response": "propagation_colored",
+        "solve_mode": "colored",
+        "articulated_contact_response": "propagation",
         "enable_sleeping": True,
         "contact_torsion_device": True,
         "velocity_iterations": 0,
@@ -3867,7 +3756,6 @@ def test_parent_wrench_eager_step_before_first_replay(test, device):
                     set_torsion_radius(model, 0.02)
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     friction_anchor_beta=0.0,
                     articulation_constraint_max=128,
                     **options,
@@ -3980,14 +3868,12 @@ def test_parent_wrench_matches_inverse_dynamics_on_every_path(test, device):
     transmits nothing.
     """
     model, state, control = _branched_chains(device)
-    configurations = [{"solve_mode": "split"}]
-    if wp.get_device(device).is_cuda:
-        configurations += [
-            {"solve_mode": "matrix_free"},
-            {"solve_mode": "matrix_free", "parallel_tree": True},
-            {"solve_mode": "matrix_free", "use_parallel_streams": False},
-            {"solve_mode": "matrix_free", "double_buffer": False},
-        ]
+    configurations = [
+        {"solve_mode": "serial"},
+        {"solve_mode": "serial", "parallel_tree": True},
+        {"solve_mode": "serial", "use_parallel_streams": False},
+        {"solve_mode": "serial", "double_buffer": False},
+    ]
     joint_f = control.joint_f.numpy()
     qd_start = model.joint_qd_start.numpy()
     free_bodies = model.joint_child.numpy()[model.joint_type.numpy() == int(newton.JointType.FREE)]
@@ -4094,7 +3980,7 @@ def _gripper_scene(device, *, lift_z=0.5, lift_drive=True, flange_drive=True, lo
 _CONTACT_CONFIGURATIONS = {
     # The production profile: patch friction, shared anchors, spin rows and sleeping.
     "production": {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "iterations": 32,
         "contact_regularization": 0.01,
         "contact_shared_anchor": True,
@@ -4108,14 +3994,13 @@ _CONTACT_CONFIGURATIONS = {
         "articulation_constraint_max": 256,
         "free_body_constraint_max": 256,
     },
-    "point_friction": {"solve_mode": "matrix_free", "friction_anchor_beta": 0.0, "articulation_constraint_max": 256},
-    "split": {"solve_mode": "split", "articulation_constraint_max": 64},
+    "point_friction": {"solve_mode": "serial", "friction_anchor_beta": 0.0, "articulation_constraint_max": 256},
     "propagation": {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "articulated_contact_response": "propagation",
         "articulation_constraint_max": 256,
     },
-    "velocity_pass": {"solve_mode": "matrix_free", "velocity_iterations": 4, "articulation_constraint_max": 256},
+    "velocity_pass": {"solve_mode": "serial", "velocity_iterations": 4, "articulation_constraint_max": 256},
 }
 
 
@@ -4220,7 +4105,7 @@ def test_parent_wrench_excludes_velocity_limit_prescaling(test, device):
     )
     builder.add_articulation([hub_joint, disk_joint])
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_velocity_limits=True)
+    solver = SolverSteel(model, enable_joint_velocity_limits=True)
     solver._rigid_body_angular_damping.zero_()
     observables = solver.observables(FLAGS)
     state_in, state_out = model.state(), model.state()
@@ -4235,7 +4120,7 @@ def test_parent_wrench_includes_loop_closure_reactions(test, device):
     """Loop-closure forces reach both closure links: an undriven joint in a four-bar transmits no axis torque."""
     builder = _build_four_bar()
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.1)
+    solver = SolverSteel(model, iterations=16, baumgarte=0.1)
     solver._rigid_body_angular_damping.zero_()
     observables = solver.observables(FLAGS)
     state_0, state_1 = model.state(), model.state()
@@ -4262,7 +4147,7 @@ def test_parent_wrench_of_a_load_held_by_closures(test, device):
         with test.subTest(world_parent=world_parent):
             builder, carrier, load, _joints = _build_carried_load(world_parent=world_parent)
             model = builder.finalize(device=device)
-            solver = SolverSteel(model, solve_mode="matrix_free", iterations=16, baumgarte=0.2)
+            solver = SolverSteel(model, iterations=16, baumgarte=0.2)
             observables = solver.observables(FLAGS)
             state_0, state_1 = model.state(), model.state()
             control = model.control()
@@ -4410,7 +4295,7 @@ def test_parent_wrench_of_a_near_redundant_closure(test, device):
                 child_xform=wp.transform((lever, 0.0, 0.0), wp.quat_identity()),
             )
             model = builder.finalize(device=device)
-            solver = SolverSteel(model, solve_mode="split", iterations=64, cfm=0.0)
+            solver = SolverSteel(model, iterations=64, cfm=0.0)
             solver._rigid_body_angular_damping.zero_()
             state = model.state()
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -4426,7 +4311,7 @@ def test_parent_wrench_of_a_near_redundant_closure(test, device):
 def test_parent_wrench_warns_without_preeliminated_closures(test, device):
     """Pre-eliminated loop closures have no stored impulses, so requesting the wrench warns once."""
     model = _build_four_bar().finalize(device=device)
-    solver = SolverSteel(model, solve_mode="matrix_free", enable_bilateral_preelimination=True)
+    solver = SolverSteel(model, enable_bilateral_preelimination=True)
     observables = solver.observables(FLAGS)
     state_0, state_1 = model.state(), model.state()
     with test.assertWarnsRegex(UserWarning, "pre-eliminated loop-closure"):
@@ -4513,9 +4398,7 @@ def test_parent_wrench_excludes_joint_armature(test, device):
     Projected onto its motion subspace, every wrench is the applied joint force less ``armature * qdd``. The FREE
     body has no ``joint_f``, so it reports ``-armature * qdd``, and the weld reports its child's rigid-body wrench.
     """
-    configurations = [{"solve_mode": "split"}]
-    if wp.get_device(device).is_cuda:
-        configurations.append({"solve_mode": "matrix_free"})
+    configurations = [{"solve_mode": "serial"}]
     for armature in (0.0, 9.0):
         model, state, control = _armature_scene(device, armature)
         joint_f = control.joint_f.numpy()
@@ -4553,7 +4436,7 @@ def test_parent_wrench_excludes_joint_armature(test, device):
                 np.testing.assert_allclose(wrench[2, 3:], 0.01 * alpha, rtol=1.0e-4, atol=1.0e-4)
 
 
-def test_parent_wrench_of_a_contact_stop_with_armature(test, device, solve_mode="split"):
+def test_parent_wrench_of_a_contact_stop_with_armature(test, device):
     """Report a contact-stopped FREE body's armature share of the impact as its joint wrench.
 
     The contact impulse stops the armature-augmented inertia; the body's own mass takes ``m * dv / dt`` of it and
@@ -4562,7 +4445,7 @@ def test_parent_wrench_of_a_contact_stop_with_armature(test, device, solve_mode=
     for armature in (0.0, 9.0):
         with test.subTest(armature=armature):
             model = _sphere_on_ground(device, armature, dense=False)
-            solver = SolverSteel(model, solve_mode=solve_mode, cfm=0.0)
+            solver = SolverSteel(model, cfm=0.0)
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             observables = solver.observables(FLAGS | {SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
@@ -4600,7 +4483,7 @@ def test_parent_wrench_of_a_commanded_free_joint(test, device):
             state = model.state()
             control = model.control()
             control.joint_f.assign(np.array([10.0, 0.0, 0.0, 0.0, 0.0, 10.0], dtype=np.float32))
-            solver = SolverSteel(model, solve_mode="split")
+            solver = SolverSteel(model)
             solver._rigid_body_angular_damping.zero_()
             wrench, qdd = _step_armature_scene(model, state, control, solver)
             np.testing.assert_allclose(qdd[[0, 5]], 10.0 / (1.0 + armature), rtol=1.0e-5)
@@ -4628,7 +4511,7 @@ def test_parent_wrench_of_a_held_kinematic_joint(test, device):
             )
             model = builder.finalize(device=device)
             model.joint_armature.fill_(armature)
-            solver = SolverSteel(model, solve_mode="split")
+            solver = SolverSteel(model)
             solver._rigid_body_angular_damping.zero_()
             wrench, qdd = _step_armature_scene(model, model.state(), model.control(), solver)
             test.assertEqual(float(qdd[0]), 0.0)
@@ -4640,7 +4523,7 @@ def test_parent_wrench_matches_mujoco_with_armature(test, device):
     for armature in (0.0, 9.0):
         with test.subTest(armature=armature):
             model, state, control = _armature_scene(device, armature)
-            solver = SolverSteel(model, solve_mode="matrix_free")
+            solver = SolverSteel(model)
             solver._rigid_body_angular_damping.zero_()
             steel, _ = _step_armature_scene(model, state, control, solver)
             mujoco, _ = _step_armature_scene(
@@ -4684,13 +4567,6 @@ for _name in (
     "test_parent_wrench_of_a_held_kinematic_joint",
 ):
     add_function_test(TestSteelParentWrench, _name, globals()[_name], devices=get_test_devices())
-add_function_test(
-    TestSteelParentWrench,
-    "test_parent_wrench_of_a_contact_stop_with_armature_matrix_free",
-    test_parent_wrench_of_a_contact_stop_with_armature,
-    devices=get_cuda_test_devices(),
-    solve_mode="matrix_free",
-)
 add_function_test(
     TestSteelParentWrench,
     "test_parent_wrench_matches_mujoco_with_armature",
@@ -4811,7 +4687,7 @@ def _system_angular_momentum(model, pose_prev, pose, pose_next, dt):
 
 
 def _pgs_mode_for(device):
-    return "matrix_free" if wp.get_device(device).is_cuda else "split"
+    return "serial"
 
 
 def test_open_closure_on_floating_base_conserves_angular_momentum(test, device):
@@ -5063,7 +4939,7 @@ def test_revolute_loop_spatial_loop_stays_rigid(test, device):
 def test_revolute_loop_pre_eliminates_five_rows(test, device):
     """Bilateral pre-elimination takes all five rows of a REVOLUTE closure."""
     gap, misalignment = _worst_closure_metrics(
-        *_build_square_loop("revolute"), device=device, solve_mode="matrix_free", enable_bilateral_preelimination=True
+        *_build_square_loop("revolute"), device=device, enable_bilateral_preelimination=True
     )
     test.assertLess(gap, 1.0e-4)
     test.assertLess(misalignment, 0.01)
@@ -5193,7 +5069,7 @@ for _name in (
     "test_revolute_loop_warns_about_ignored_limits_and_drives",
 ):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_test_devices())
-# Bilateral pre-elimination is a matrix-free feature.
+# Bilateral pre-elimination runs on CUDA only.
 add_function_test(
     TestSteelRevoluteLoop,
     "test_revolute_loop_pre_eliminates_five_rows",
@@ -5246,13 +5122,12 @@ def test_free_body_linear_damping_defaults_to_zero(test, device):
 
 
 _LINEAR_DAMPING_ROUTES = {
-    "split": {"solve_mode": "split"},
-    "matrix_free": {"solve_mode": "matrix_free"},
-    "propagation": {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
-    "propagation_colored": {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"},
-    "velocity_post_pass": {"solve_mode": "matrix_free", "velocity_iterations": 2},
+    "serial": {"solve_mode": "serial"},
+    "propagation": {"solve_mode": "serial", "articulated_contact_response": "propagation"},
+    "colored": {"solve_mode": "colored", "articulated_contact_response": "propagation"},
+    "velocity_post_pass": {"solve_mode": "serial", "velocity_iterations": 2},
     "propagation_velocity_post_pass": {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "articulated_contact_response": "propagation",
         "velocity_iterations": 2,
     },
@@ -5321,8 +5196,7 @@ def test_linear_damping_on_every_route(test, device):
     """Verify damped roots follow ``(1 - d dt)^n`` on frictionless ground on every solve route."""
     steps, dt, damping = 40, 0.01, 0.5
     expected = np.outer((1.0 - damping * dt) ** np.arange(1, steps + 1), (1.0, 0.5))
-    routes = _LINEAR_DAMPING_ROUTES if wp.get_device(device).is_cuda else {"split": _LINEAR_DAMPING_ROUTES["split"]}
-    for route, options in routes.items():
+    for route, options in _LINEAR_DAMPING_ROUTES.items():
         with test.subTest(route=route):
             history = _horizontal_root_velocities(device, damping, steps, dt, **options)
             np.testing.assert_allclose(history[:, 0], expected, rtol=1e-3, atol=1e-5, err_msg="free box")

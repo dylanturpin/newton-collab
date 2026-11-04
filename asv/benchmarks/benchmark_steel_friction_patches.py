@@ -103,7 +103,6 @@ def run(
     model.rigid_contact_max = worlds * tiles * tiles * 4
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode="matrix_free",
         iterations=32,
         baumgarte=0.05,
         contact_warmstart=warmstart,

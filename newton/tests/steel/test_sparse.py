@@ -735,7 +735,7 @@ class TestSparseContacts(unittest.TestCase):
 
 
 _PAIR_SOLVER = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "articulation_constraint_max": 64,
     "free_body_constraint_max": 32,
     "iterations": 8,
@@ -797,17 +797,10 @@ def _build_sparse_diagonal_pair_model(
 def test_sparse_diagonal_is_selected_only_where_supported(test, device):
     """Keep the general sweep without streams, on CPU, with a free body or with options it does not solve."""
     model = _build_sparse_diagonal_pair_model(device=device)
-    if not wp.get_device(device).is_cuda:
-        solver = SolverSteel(
-            model,
-            solve_mode="split",
-            enable_joint_limits=True,
-            articulation_constraint_max=64,
-            use_parallel_streams=True,
-        )
-        test.assertFalse(solver._sparse_diagonal_contact_solve)
-        return
     options = dict(_PAIR_SOLVER, use_parallel_streams=True)
+    if not wp.get_device(device).is_cuda:
+        test.assertFalse(SolverSteel(model, **options)._sparse_diagonal_contact_solve)
+        return
     test.assertTrue(SolverSteel(model, **options)._sparse_diagonal_contact_solve)
     for label, overrides in (
         ("no streams", {"use_parallel_streams": False}),
@@ -1660,7 +1653,7 @@ def _build_model(*, free_count=0, free_first=False, robot_count=1, prescribed=Fa
 def _make_solver(model, sparse, **overrides):
     """Change only the representation selection between comparison solvers."""
     options = {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
         "friction_mode": "fixed_normal",
@@ -2142,9 +2135,7 @@ class TestSteelSparseSelectionGuard(unittest.TestCase):
     def test_y_tree_selects_sparse_factors(self):
         """Select sparse factors for the uncoupled Y tree used by the bilateral guard."""
         self.assertEqual(
-            SolverSteel(
-                _build_y_tree("cuda:0"), solve_mode="matrix_free", friction_anchor_beta=0.0
-            )._sparse_mass_matrix_size,
+            SolverSteel(_build_y_tree("cuda:0"), friction_anchor_beta=0.0)._sparse_mass_matrix_size,
             3,
         )
 
@@ -2157,7 +2148,7 @@ class TestSteelSparseSelectionGuard(unittest.TestCase):
             ("disabled closure", {"closure": True, "closure_enabled": False}),
         ):
             with self.subTest(label):
-                solver = SolverSteel(_build_y_tree("cuda:0", **kwargs), solve_mode="matrix_free")
+                solver = SolverSteel(_build_y_tree("cuda:0", **kwargs))
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertGreater(solver._J_by_size[3].size, 1)
 
@@ -2831,7 +2822,6 @@ def _run_mixed_response(
     with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             contact_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
             enable_joint_limits=inactive_joint_limit_capacity,
@@ -3131,7 +3121,6 @@ class TestSteelLocalOwners(unittest.TestCase):
                 set_torsion_radius(model, radius)
                 solvers[radius] = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     iterations=8,

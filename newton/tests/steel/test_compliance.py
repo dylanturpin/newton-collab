@@ -25,7 +25,6 @@ from newton._src.solvers.steel.contact_compliance import (
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     compute_world_contact_bias,
-    pgs_solve_mf_loop,
 )
 from newton.geometry import HydroelasticSDF
 from newton.solvers import SolverSteel
@@ -40,6 +39,7 @@ from newton.tests.steel._fixtures import (
     run_fixture,
     select_colored_variant,
     set_torsion_radius,
+    steel_mode_options,
 )
 from newton.tests.unittest_utils import (
     add_function_test,
@@ -105,9 +105,8 @@ def run_native_hydro_fixture(*, articulated=True, response="immediate"):
                 model,
                 contact_compliance=enabled,
                 friction_anchor_beta=0.0,
-                solve_mode="matrix_free",
                 row_schedule="interleaved",
-                articulated_contact_response=response,
+                **steel_mode_options(response),
                 enable_restitution=False,
                 iterations=128,
                 contact_regularization=0.0,
@@ -123,7 +122,7 @@ def run_native_hydro_fixture(*, articulated=True, response="immediate"):
             step_input.clear_forces()
             solver.step(step_input, output, model.control(), contacts, 0.0025)
             paths = solver._contact_path.numpy()[:count]
-            route = 2 if response == "propagation_colored" else (0 if articulated else 1)
+            route = 2 if response == "colored" else (0 if articulated else 1)
             if not np.all(paths == route):
                 raise AssertionError("Native hydro fixture did not use the requested contact route")
             impulses, row_types = {
@@ -170,7 +169,6 @@ def run_paired_fixture(*, hinv_jt_kernel, friction, steps=40):
                 model,
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
-                solve_mode="matrix_free",
                 enable_restitution=False,
                 contact_friction_scale=1.0 if friction > 0.0 else 0.0,
                 joint_limit_activation_gap=0.0,
@@ -352,7 +350,7 @@ def run_fixture_contact_compliance_upstream(
             **extra,
         )
         options.update(solver_options or {})
-        solver = SolverSteel(model, solve_mode="matrix_free", **options)
+        solver = SolverSteel(model, **options)
         state, next_state = model.state(), model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         trace = []
@@ -382,7 +380,7 @@ def test_omitted_friction_anchor_beta_keeps_patches_without_compliance(test, dev
     model = builder.finalize(device=device)
     for kwargs in ({}, {"friction_anchor_beta": None}, {"contact_compliance": False}):
         with test.subTest(**kwargs):
-            solver = SolverSteel(model, solve_mode="matrix_free", **kwargs)
+            solver = SolverSteel(model, **kwargs)
             test.assertEqual(solver._friction_anchor_beta, 0.2)
             test.assertTrue(solver._friction_anchors_enabled)
 
@@ -445,7 +443,7 @@ class TestContactComplianceLaw(unittest.TestCase):
             ("friction_mode", "coulomb_newton"),
             ("contact_friction_shared_anchor", True),
         ):
-            kwargs = {"solve_mode": "matrix_free", "enable_restitution": False, key: value}
+            kwargs = {"solve_mode": "serial", "enable_restitution": False, key: value}
             with self.assertRaisesRegex(ValueError, key):
                 SolverSteel(model, contact_compliance=True, **kwargs)
 
@@ -766,7 +764,6 @@ def _run_free_spheres(*, dense_rows, graph, steps=20):
             setattr(contacts, name, wp.zeros(32, dtype=float))
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             contact_compliance=True,
             friction_anchor_beta=0.0,
             enable_restitution=False,
@@ -972,12 +969,12 @@ class TestContactComplianceCapture(unittest.TestCase):
                     episode.fixture.solver.validate_contact_compliance()
 
 
-_COLORED = {"articulated_contact_response": "propagation_colored"}
+_COLORED = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestContactComplianceColored(unittest.TestCase):
-    """Compliant contacts on ``articulated_contact_response="propagation_colored"`` rows."""
+    """Compliant contacts on ``solve_mode="colored", articulated_contact_response="propagation"`` rows."""
 
     def test_support_matches_immediate(self):
         """Recover mg/k indentation on colored rows for articulated and free spheres, as immediate does."""
@@ -1019,7 +1016,7 @@ class TestContactComplianceColored(unittest.TestCase):
         for articulated in (True, False):
             with self.subTest(articulated=articulated):
                 immediate = run_native_hydro_fixture(articulated=articulated)
-                colored = run_native_hydro_fixture(articulated=articulated, response="propagation_colored")
+                colored = run_native_hydro_fixture(articulated=articulated, response="colored")
                 self.assertEqual(
                     colored["compliant"]["consumed_compliant_contacts"],
                     colored["native_material"]["positive_stiffness_contacts"],
@@ -1033,7 +1030,7 @@ class TestContactComplianceColored(unittest.TestCase):
     def test_rising_kinematic_support_matches_immediate(self):
         """A compliant sphere on a kinematic platform rising at 0.1 m/s rides it as on immediate."""
         traces = {}
-        for response in ("immediate", "propagation_colored"):
+        for response in ("immediate", "colored"):
             builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
             builder.rigid_gap = 0.005
             platform = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()))
@@ -1050,8 +1047,7 @@ class TestContactComplianceColored(unittest.TestCase):
                 setattr(contacts, name, wp.zeros(32, dtype=float, device="cuda:0"))
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
-                articulated_contact_response=response,
+                **steel_mode_options(response),
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 enable_restitution=False,
@@ -1075,8 +1071,8 @@ class TestContactComplianceColored(unittest.TestCase):
                 trace.append(state.body_qd.numpy()[sphere].copy())
             self.assertEqual(solver.compliance_contact_count, 1)
             traces[response] = np.asarray(trace)
-        np.testing.assert_allclose(traces["propagation_colored"], traces["immediate"], atol=1e-6, rtol=0)
-        self.assertAlmostEqual(float(traces["propagation_colored"][-1, 2]), 0.1, delta=1e-4)
+        np.testing.assert_allclose(traces["colored"], traces["immediate"], atol=1e-6, rtol=0)
+        self.assertAlmostEqual(float(traces["colored"][-1, 2]), 0.1, delta=1e-4)
 
     def test_device_coefficients_match_host_law(self):
         """Prepare colored open-gap and penetrating rows exactly as the float64 host law."""
@@ -1210,7 +1206,7 @@ class TestContactComplianceColored(unittest.TestCase):
     def test_incompatible_colored_options_rejected(self):
         """Colored compliance keeps rejecting sleeping, contact torsion and free-rigid angular rows."""
         model = make_fixture(articulated=True, enabled=False).model
-        base = {**_COLORED, "solve_mode": "matrix_free", "contact_compliance": True, "friction_anchor_beta": 0.0}
+        base = {**_COLORED, "contact_compliance": True, "friction_anchor_beta": 0.0}
         base["enable_restitution"] = False
         with self.assertRaisesRegex(ValueError, "no compliance"):
             SolverSteel(model, **base, enable_sleeping=True)
@@ -1390,80 +1386,10 @@ class TestContactComplianceContactsLease(unittest.TestCase):
 DT = 1.0 / 60.0
 
 
-PATH_DENSE = 0  # contact routing id of the dense Delassus path
+PATH_DENSE = 0  # contact routing id of the dense row path
 
 
-def _solve_rows(device, n_rows, g, iterations=300):
-    """Solve ``n_rows`` identical unit contact rows on one 6-DOF body with unit
-    mass and rhs = -1 through the reference MF loop kernel."""
-    m = 8
-    J = np.zeros((1, m, 6), dtype=np.float32)
-    for r in range(n_rows):
-        J[0, r, 2] = 1.0
-    row_type = np.zeros((1, m), dtype=np.int32)
-    row_type[0, :n_rows] = PGS_CONSTRAINT_TYPE_CONTACT
-    eff_inv = np.zeros((1, m), dtype=np.float32)
-    eff_inv[0, :n_rows] = 1.0
-    rhs = np.zeros((1, m), dtype=np.float32)
-    rhs[0, :n_rows] = -1.0
-    body_a = np.full((1, m), -1, dtype=np.int32)
-    body_a[0, :n_rows] = 0
-
-    mf_impulses = wp.zeros((1, m), dtype=wp.float32)
-    v_out = wp.zeros(6, dtype=wp.float32)
-    wp.launch(
-        pgs_solve_mf_loop,
-        dim=1,
-        inputs=[
-            wp.array([n_rows], dtype=wp.int32),
-            wp.array(body_a, dtype=wp.int32),
-            wp.full((1, m), -1, dtype=wp.int32),  # body_b
-            wp.array(J, dtype=wp.float32),  # MiJt_a (unit mass)
-            wp.zeros((1, m, 6), dtype=wp.float32),  # MiJt_b
-            wp.array(J, dtype=wp.float32),  # J_a
-            wp.zeros((1, m, 6), dtype=wp.float32),  # J_b
-            wp.array(eff_inv, dtype=wp.float32),
-            wp.array(rhs, dtype=wp.float32),
-            wp.array(row_type, dtype=wp.int32),
-            wp.full((1, m), -1, dtype=wp.int32),  # row_parent
-            wp.zeros((1, m), dtype=wp.float32),  # row_mu
-            wp.full((1, m), 1.0 / (1.0 + g), dtype=wp.float32),  # mf_row_w
-            wp.array([0], dtype=wp.int32),  # body_to_articulation
-            wp.array([0], dtype=wp.int32),  # art_dof_start
-            iterations,
-            1.0,  # omega
-            1,  # regularize
-            iterations,  # friction_start_iteration (no friction rows)
-            0,  # iteration_offset
-            mf_impulses,
-            v_out,
-        ],
-        device=device,
-    )
-    return mf_impulses.numpy()[0, :n_rows]
-
-
-def test_regularization_fixed_points(test: unittest.TestCase, device):
-    """Analytic contracts of the regularized update on unit rows:
-
-    - one determined row converges to ``1/(1+g)`` of the rigid impulse (the
-      documented load deficit);
-    - two redundant identical rows converge to the unique symmetric split
-      ``lambda_1 = lambda_2 = 1/(2+g)``;
-    - ``g = 0`` reproduces the exact rigid law (total impulse 1).
-    """
-    with wp.ScopedDevice(device):
-        g = 0.5
-        lam = _solve_rows(device, 1, g)
-        test.assertAlmostEqual(float(lam[0]), 1.0 / (1.0 + g), places=5)
-        lam = _solve_rows(device, 2, g)
-        test.assertAlmostEqual(float(lam[0]), 1.0 / (2.0 + g), places=5)
-        test.assertAlmostEqual(float(lam[1]), 1.0 / (2.0 + g), places=5)
-        lam = _solve_rows(device, 2, 0.0)
-        test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
-
-
-def _stack_scene(device, g, solve_mode="matrix_free", response="immediate", velocity_iterations=2):
+def _stack_scene(device, g, response="immediate", velocity_iterations=2):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.003
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -1484,10 +1410,9 @@ def _stack_scene(device, g, solve_mode="matrix_free", response="immediate", velo
     )
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode=solve_mode,
         iterations=8,
         velocity_iterations=velocity_iterations,
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         contact_regularization=g,
         contact_warmstart=True,
     )
@@ -1510,21 +1435,13 @@ def _run(model, pipeline, solver, frames, dt=DT):
 
 
 def test_regularization_route_agreement(test: unittest.TestCase, device):
-    """The regularized update must agree across the matrix-free execution
-    routes: the fused MF-GS kernel (matrix_free/immediate), the standalone
-    MF kernel (split/immediate), and the colored propagation sweep: same
-    scene, same g, matching resting poses."""
+    """The regularized update must agree across the execution routes: the
+    fused MF-GS kernel (serial/immediate) and the colored propagation sweep:
+    same scene, same g, matching resting poses."""
     with wp.ScopedDevice(device):
         results = {}
-        for label, mode, response, velit in (
-            ("fused", "matrix_free", "immediate", 2),
-            # velocity iterations are matrix_free-only; split runs without
-            ("standalone", "split", "immediate", 0),
-            ("propagation_colored", "matrix_free", "propagation_colored", 2),
-        ):
-            model, pipeline, solver, _bodies = _stack_scene(
-                device, g=0.05, solve_mode=mode, response=response, velocity_iterations=velit
-            )
+        for label, response in (("fused", "immediate"), ("colored", "colored")):
+            model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response)
             body_q, _ = _run(model, pipeline, solver, 120)
             results[label] = body_q
         ref = results["fused"]
@@ -1569,28 +1486,19 @@ def _sag_formula(g, rate):
 def test_regularization_documented_sag(test: unittest.TestCase, device):
     """The regularizer is a numerical damped compliance: a resting box sags by
     ``g * a * dt^2 / beta`` (6.8 mm at g = 0.5 and 60 Hz, 0.43 mm at 240 Hz), on the
-    matrix-free route."""
+    serial route."""
     with wp.ScopedDevice(device):
         for rate in (60, 240):
-            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, contact_warmstart=True)
+            sag = _resting_box(device, 0.5, "serial", rate, 3 * rate, contact_warmstart=True)
             expected = _sag_formula(0.5, rate)
             test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
-
-
-def test_regularization_split_route_documented_sag(test: unittest.TestCase, device):
-    """The split route's standalone matrix-free kernel carries the same law as the
-    fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
-    with wp.ScopedDevice(device):
-        sag = _resting_box(device, 0.5, "split", 60, 180, contact_warmstart=True)
-        expected = _sag_formula(0.5, 60)
-        test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
 
 def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
     """The velocity-only pass solves the exact rigid law: a settled stack holds
     its height to well under a millimetre over the last second."""
     with wp.ScopedDevice(device):
-        for response in ("immediate", "propagation_colored"):
+        for response in ("immediate", "colored"):
             model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
             _, zs = _run(model, pipeline, solver, 240)
             drift = abs(zs[-1] - zs[179])
@@ -1601,7 +1509,7 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
 
 def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, device):
     """Same-articulation link-link contacts stay dense under the ``propagation`` and
-    ``propagation_colored`` schedules, and their velocity-only pass runs through
+    colored propagation schedules, and their velocity-only pass runs through
     nested fused-GS launches inside the propagation-tree launcher. Every one of
     those launches must be rigid (``soft_relax=True``), and the converged velocity
     after the pass must be the ``g = 0`` solution, since the rigid law does not
@@ -1611,8 +1519,7 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         model = _build_scissor_model(device)
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response=response,
+            **steel_mode_options(response),
             iterations=8,
             velocity_iterations=8,
             contact_regularization=g,
@@ -1622,6 +1529,8 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         )
         calls = []
         in_velocity_pass = {"on": False}
+        # observe the per-pass launches; latency mode runs the same loop as one kernel (TestLatencyFusedLoop)
+        solver._latency_fused = False
         launch = solver._launch_matrix_free_gs_solve
         post = solver._run_matrix_free_velocity_post_solve
 
@@ -1653,7 +1562,7 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         return calls, state_out.joint_qd.numpy().copy()
 
     with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation_colored"):
+        for response in ("propagation", "colored"):
             calls, qd_soft = stepped(response, 0.5)
             velocity_calls = [soft for on, soft in calls if on]
             position_calls = [soft for on, soft in calls if not on]
@@ -1692,7 +1601,6 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         )
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=8,
             velocity_iterations=2,
             contact_regularization=0.02,
@@ -1753,25 +1661,11 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        solve_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
-        solver = newton.solvers.SolverSteel(model, solve_mode=solve_mode)
+        solver = newton.solvers.SolverSteel(model)
         test.assertFalse(solver._regularization_enabled)
         test.assertIs(solver._row_w, solver._contact_row_w_dummy)
         test.assertIs(solver._mf_row_w, solver._contact_row_w_dummy)
         test.assertEqual(solver._row_w.shape, (1, 1))
-
-
-def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
-    """The standalone MF route must not read its one-element inactive weight argument."""
-    with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(
-            device, g=0.0, solve_mode="split", response="immediate", velocity_iterations=0
-        )
-        body_q, _zs = _run(model, pipeline, solver, 1)
-        test.assertGreater(int(solver._mf_constraint_count.numpy().sum()), 1)
-        test.assertTrue(np.isfinite(body_q).all())
-        test.assertIs(solver._mf_row_w, solver._contact_row_w_dummy)
-        test.assertEqual(float(solver._mf_row_w.numpy()[0, 0]), 1.0)
 
 
 def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
@@ -1799,60 +1693,14 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
         test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)
 
 
-def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase, device):
-    """An actual articulated dense contact receives the same g*d diagonal term."""
-    with wp.ScopedDevice(device):
-        model = _build_scissor_model(device)
-        solver = newton.solvers.SolverSteel(
-            model,
-            solve_mode="split",
-            iterations=0,
-            velocity_iterations=0,
-            contact_regularization=0.5,
-            contact_friction_scale=0.0,
-            articulation_constraint_max=64,
-            free_body_constraint_max=16,
-        )
-        unregularized_diag = {}
-        apply_regularization = solver._stage6_apply_contact_regularization
-
-        def recording_apply_regularization():
-            unregularized_diag["value"] = solver._diag.numpy()[0].copy()
-            apply_regularization()
-
-        solver._stage6_apply_contact_regularization = recording_apply_regularization
-        state_in = model.state()
-        state_out = model.state()
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        collision_pipeline = newton.CollisionPipeline(model)
-        contacts = collision_pipeline.contacts()
-        state_in.clear_forces()
-        collision_pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
-        wp.synchronize()
-        rows = _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0]))
-        test.assertGreater(len(rows), 0)
-        base_diag = unregularized_diag["value"]
-        regularized_diag = solver._diag.numpy()[0]
-        weights = solver._row_w.numpy()[0]
-        for slot in rows.values():
-            test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
-            test.assertAlmostEqual(
-                float(regularized_diag[slot]),
-                1.5 * float(base_diag[slot]),
-                delta=1.0e-5 * max(float(base_diag[slot]), 1.0),
-            )
-
-
 def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
     """Serial and colored propagation solve real articulated rows with per-row weights."""
     with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation_colored"):
+        for response in ("propagation", "colored"):
             model = _build_scissor_model(device)
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
-                articulated_contact_response=response,
+                **steel_mode_options(response),
                 propagation_same_articulation_rows=True,
                 iterations=1,
                 velocity_iterations=0,
@@ -1918,7 +1766,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=16,
             velocity_iterations=0,
             contact_regularization=g,
@@ -1950,14 +1797,6 @@ class TestSteelRegularization(unittest.TestCase):
 
 add_function_test(
     TestSteelRegularization,
-    "test_regularization_fixed_points",
-    test_regularization_fixed_points,
-    devices=get_test_devices(),
-)
-
-
-add_function_test(
-    TestSteelRegularization,
     "test_regularization_route_agreement",
     test_regularization_route_agreement,
     devices=get_selected_cuda_test_devices(),
@@ -1969,14 +1808,6 @@ add_function_test(
     "test_regularization_documented_sag",
     test_regularization_documented_sag,
     devices=get_selected_cuda_test_devices(),
-)
-
-
-add_function_test(
-    TestSteelRegularization,
-    "test_regularization_split_route_documented_sag",
-    test_regularization_split_route_documented_sag,
-    devices=get_test_devices(),
 )
 
 
@@ -2022,24 +1853,8 @@ add_function_test(
 
 add_function_test(
     TestSteelRegularization,
-    "test_zero_regularization_split_runtime_uses_no_weights",
-    test_zero_regularization_split_runtime_uses_no_weights,
-    devices=get_test_devices(),
-)
-
-
-add_function_test(
-    TestSteelRegularization,
     "test_exact_surface_contact_is_regularized",
     test_exact_surface_contact_is_regularized,
-    devices=get_test_devices(),
-)
-
-
-add_function_test(
-    TestSteelRegularization,
-    "test_assembled_dense_regularization_scales_diagonal",
-    test_assembled_dense_regularization_scales_diagonal,
     devices=get_test_devices(),
 )
 
@@ -2106,9 +1921,7 @@ def _resting_box_regularization_upstream(device, g, rate, frames, articulated=Fa
         deterministic=True,
         contact_matching="latest",
     )
-    solver = newton.solvers.SolverSteel(
-        model, solve_mode="matrix_free", iterations=12, contact_regularization=g, **solver_kwargs
-    )
+    solver = newton.solvers.SolverSteel(model, iterations=12, contact_regularization=g, **solver_kwargs)
     _, zs = _run(model, pipeline, solver, frames, dt=1.0 / rate)
     return 0.05 - zs[-1]
 
@@ -2118,7 +1931,6 @@ def _scissor_step(device, g, velocity_iterations):
     model = _build_scissor_model(device)
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode="matrix_free",
         iterations=8,
         velocity_iterations=velocity_iterations,
         contact_regularization=g,
