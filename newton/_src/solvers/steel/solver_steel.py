@@ -948,9 +948,10 @@ def _unprojected_equality_constraints(model: Model) -> np.ndarray:
     (or rejected) through that entity. A row without a valid link is MuJoCo-only physics.
 
     A link is valid only when the target is structurally the row's projection, as the importers
-    build it: a CONNECT or WELD row links a ball or fixed joint outside any articulation that
-    joins the row's two bodies (or its body and the world), and a JOINT row links a mimic
-    constraint between the row's two joints. Anchors and coefficients are not compared.
+    build it: a CONNECT row links a ball joint and a WELD row a fixed joint (or a ball joint when its
+    torquescale is 0) outside any articulation that joins the row's two bodies (or its body and the
+    world), and a JOINT row links a mimic constraint between the row's two joints. Anchors and
+    coefficients are not compared.
     """
     from ..mujoco.enums import EqType  # noqa: PLC0415
     from ..mujoco.equality import MjcEqualityTargetKind  # noqa: PLC0415
@@ -974,6 +975,8 @@ def _unprojected_equality_constraints(model: Model) -> np.ndarray:
 
         eq_type = field("type")
         body1, body2 = field("body1"), field("body2")
+        torquescale = getattr(mujoco, "equality_constraint_torquescale", None)
+        torquescale = torquescale.numpy() if torquescale is not None else np.ones(count, dtype=np.float32)
         joint1, joint2 = field("joint1"), field("joint2")
         joint_count = int(model.joint_count)
         joint_type = model.joint_type.numpy() if joint_count else None
@@ -985,19 +988,20 @@ def _unprojected_equality_constraints(model: Model) -> np.ndarray:
         mimic_count = int(getattr(model, "constraint_mimic_count", 0) or 0)
         mimic_joint0 = model.constraint_mimic_joint0.numpy() if mimic_count else None
         mimic_joint1 = model.constraint_mimic_joint1.numpy() if mimic_count else None
-        loop_joint_type = {int(EqType.CONNECT): int(JointType.BALL), int(EqType.WELD): int(JointType.FIXED)}
+        loop_joint_types = {int(EqType.CONNECT): {int(JointType.BALL)}, int(EqType.WELD): {int(JointType.FIXED)}}
         for row in range(count):
             kind, index = int(target_kind[row]), int(target[row])
             if kind == int(MjcEqualityTargetKind.JOINT) and 0 <= index < joint_count:
-                expected_type = loop_joint_type.get(int(eq_type[row]))
+                expected_types = set(loop_joint_types.get(int(eq_type[row]), ()))
+                if int(eq_type[row]) == int(EqType.WELD) and float(torquescale[row]) == 0.0:
+                    expected_types.add(int(JointType.BALL))  # rotation-free weld, as the importers convert it
                 in_tree = joint_articulation is not None and int(joint_articulation[index]) >= 0
                 # The importers make body1 the parent and body2 the child, or the world the
                 # parent of body1; compare the endpoints as a set so either order is accepted.
                 rows_bodies = {int(body1[row]), int(body2[row])}
                 joint_bodies = {int(joint_parent[index]), int(joint_child[index])}
                 projected[row] = (
-                    expected_type is not None
-                    and int(joint_type[index]) == expected_type
+                    int(joint_type[index]) in expected_types
                     and not in_tree
                     and int(joint_child[index]) >= 0
                     and joint_bodies == rows_bodies
@@ -1519,10 +1523,11 @@ class SolverSteel(SolverBase, CouplingInterface):
     are unaffected. Legacy constraints take precedence for their follower and
     retain their REVOLUTE/PRISMATIC-only support.
 
-    Loop-closing BALL and REVOLUTE joints (joints outside the articulation tree whose child
+    Loop-closing BALL, REVOLUTE and FIXED joints (joints outside the articulation tree whose child
     belongs to an articulation) are enforced as bilateral rows: three that pin the joint's
     anchors together, plus, for a REVOLUTE closure, two that keep the child's hinge axis
-    aligned with the parent's. A loop closure carries no joint coordinate, so limits and
+    aligned with the parent's, or, for a FIXED (weld) closure, three that hold the two anchor
+    frames' relative rotation at zero. A loop closure carries no joint coordinate, so limits and
     drive gains on a loop REVOLUTE joint are ignored (with a warning). The rows read
     :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_X_p` /
     :attr:`~newton.Model.joint_X_c` and, for REVOLUTE closures,
@@ -2293,9 +2298,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 responses become ``Y' = Y - Y_B S^-1 (J_B Y)`` and the predictor velocity is
                 projected onto the bilateral constraint manifold once per step, replacing the
                 iterative enforcement. Requires ``solve_mode='matrix_free'`` with
-                ``velocity_iterations == 0`` and at most 8 bilateral rows per
-                articulation; unsupported configurations warn and fall back to iterative
-                rows. Defaults to False.
+                ``velocity_iterations == 0`` and at most 8 bilateral rows per articulation
+                (a FIXED (weld) loop closure, such as a link-break weld, takes 6); unsupported
+                configurations warn and fall back to iterative rows. Defaults to False.
             bilateral_preelimination_include_mimics (bool, optional): Include mimic rows
                 in the pre-eliminated bilateral block. When False, only connect rows are
                 pre-eliminated and mimic rows remain in the iterative sweep. This avoids
@@ -3089,7 +3094,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._init_joint_friction_load(model)
         if self._has_loop_joints and self._articulated_contact_response != "immediate":
             raise ValueError(
-                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, or imported weld equalities) are "
+                "SolverSteel: loop-closing joints (BALL/connect, REVOLUTE, FIXED, or imported weld equalities) are "
                 f"only supported with articulated_contact_response='immediate' "
                 f"(got {self._articulated_contact_response!r})."
             )
@@ -4988,12 +4993,12 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing BALL and REVOLUTE joints are excluded from FK/ID by
+        Loop-closing BALL, REVOLUTE and FIXED joints are excluded from FK/ID by
         :meth:`_SteelModelPlan.build` and enforced here as bilateral rows: three
         pinning the joint's parent/child anchors together, plus, for a REVOLUTE closure,
-        two aligning the child's hinge axis with the parent's. Their stored owner comes
-        from the child body's tree articulation, independent of joint ordering. FIXED
-        (weld) loop joints warn and are ignored for now. All buffers are allocated once
+        two aligning the child's hinge axis with the parent's, or, for a FIXED (weld) closure, three
+        holding the two anchor frames' relative rotation at zero. Their stored owner comes
+        from the child body's tree articulation, independent of joint ordering. All buffers are allocated once
         (CUDA-graph-safe). The rows read the joint's enabled flag in
         :attr:`~newton.Model.joint_enabled`, the translations of its
         :attr:`~newton.Model.joint_X_p` / :attr:`~newton.Model.joint_X_c` and, for a REVOLUTE closure, its
@@ -5040,10 +5045,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                         "joint coordinate, so they are ignored (only the hinge itself is enforced).",
                         stacklevel=2,
                     )
+            elif int(joint_type[j]) == int(JointType.FIXED):
+                rows = 6
             else:
                 warnings.warn(
                     f"SolverSteel: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect and REVOLUTE closures are enforced); ignored.",
+                    f"{int(joint_type[j])} (only BALL/connect, REVOLUTE and FIXED closures are enforced); ignored.",
                     stacklevel=2,
                 )
                 continue
@@ -5084,7 +5091,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_rows_np = np.asarray(rows_l, dtype=np.int32)
         self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
-        self._connect_row_inv_norm = wp.zeros((n, 5), dtype=float, device=device)
+        self._connect_row_inv_norm = wp.zeros((n, 6), dtype=float, device=device)
         self._connect_count = n
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
