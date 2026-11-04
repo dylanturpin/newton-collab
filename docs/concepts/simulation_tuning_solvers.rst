@@ -379,7 +379,7 @@ repository examples spend tuning effort, not a shared solver API.
        ``"propagation_colored"`` solve contact torsion with ``contact_torsion_device=True`` and
        ``velocity_iterations=0``. ``"propagation"`` rejects contact compliance and
        ``"propagation_colored"`` accepts it without contact torsion, which rejects the
-       hydroelastic contacts that compliance needs. The propagation responses reject
+       hydroelastic contacts that compliance needs, and without sleeping. The propagation responses reject
        loop-closing joints, and fall back from bilateral pre-elimination to iterative mimic rows
        with a warning.
        ``"propagation_colored"`` supports sleeping and the ``friction_mode`` values other than

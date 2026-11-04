@@ -2662,10 +2662,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                         and articulated_contact_response == "propagation_colored",
                     ),
                     # Sleeping is tested only with the colored sweep, not with the plain sweep's
-                    # torsion and same-articulation rows.
+                    # torsion and same-articulation rows, and not with colored compliance.
                     (
                         "enable_sleeping=True",
-                        bool(enable_sleeping) and articulated_contact_response != "propagation_colored",
+                        bool(enable_sleeping)
+                        and (articulated_contact_response != "propagation_colored" or self._contact_compliance),
                     ),
                     (
                         f"friction_mode={self._friction_mode!r}",
