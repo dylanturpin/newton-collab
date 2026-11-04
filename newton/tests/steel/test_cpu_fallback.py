@@ -104,12 +104,12 @@ def _build(device, scene):
     return model
 
 
-def _rollout(device, scene, response):
+def _rollout(device, scene, mode):
     model = _build(device, scene)
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        solve_mode=mode[0],
+        articulated_contact_response=mode[1],
         iterations=12,
         enable_joint_limits=True,
         articulation_constraint_max=64,
@@ -134,12 +134,16 @@ def _rollout(device, scene, response):
     return solver, start, np.asarray(q), np.asarray(qd)
 
 
+# (solve_mode, articulated_contact_response); "colored" runs the serial propagation sweep on CPU.
+_MODES = (("serial", "immediate"), ("serial", "propagation"), ("colored", "propagation"))
+
+
 class TestSteelCpuFallback(unittest.TestCase):
     def test_cpu_rollouts_move_and_stay_finite(self):
         for scene in _SCENES:
-            for response in ("immediate", "propagation", "propagation_colored"):
-                with self.subTest(scene=scene, response=response):
-                    solver, start, q, qd = _rollout("cpu", scene, response)
+            for mode in _MODES:
+                with self.subTest(scene=scene, mode=mode):
+                    solver, start, q, qd = _rollout("cpu", scene, mode)
                     self.assertTrue(np.isfinite(q).all() and np.isfinite(qd).all())
                     # Not a silent no-op: contacts hold the bodies above the ground and the drives swing the arms.
                     self.assertGreater(np.abs(q[-1, :, :3] - start[:, :3]).max(), 1.0e-3)
@@ -149,10 +153,10 @@ class TestSteelCpuFallback(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
     def test_cpu_tracks_cuda(self):
         for scene in _SCENES:
-            for response in ("immediate", "propagation", "propagation_colored"):
-                with self.subTest(scene=scene, response=response):
-                    _, _, q_cpu, qd_cpu = _rollout("cpu", scene, response)
-                    _, _, q_gpu, qd_gpu = _rollout("cuda:0", scene, response)
+            for mode in _MODES:
+                with self.subTest(scene=scene, mode=mode):
+                    _, _, q_cpu, qd_cpu = _rollout("cpu", scene, mode)
+                    _, _, q_gpu, qd_gpu = _rollout("cuda:0", scene, mode)
                     # Same rows in the same order; only the dot-product summation order differs. Velocities
                     # see isolated stick/slip flips at impacts, positions stay within float round-off growth.
                     np.testing.assert_allclose(q_cpu[..., :3], q_gpu[..., :3], atol=1.0e-4)
@@ -168,7 +172,7 @@ class TestSteelCpuFallback(unittest.TestCase):
             {"enable_joint_friction": True},
         ):
             with self.subTest(options=options), self.assertRaisesRegex(NotImplementedError, "require CUDA"):
-                SolverSteel(model, solve_mode="matrix_free", **options)
+                SolverSteel(model, **options)
 
 
 if __name__ == "__main__":

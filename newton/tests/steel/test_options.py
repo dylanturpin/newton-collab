@@ -4,6 +4,7 @@
 """Global worlds, target layouts and the private API surface of SolverSteel."""
 
 import ast
+import re
 import unittest
 import warnings
 from pathlib import Path
@@ -66,14 +67,14 @@ def _construct(test, model, expect_warning, **kwargs):
 
 
 def _modes(device):
-    return ["matrix_free", "split"] if device.is_cuda else ["split"]
+    return ["serial"]
 
 
 class TestSteelGlobalWorld(unittest.TestCase):
     def test_global_kinematic_floor_supports_every_world(self):
         """A global kinematic floor stops the boxes of every world exactly like world geometry does."""
         device = wp.get_device()
-        for mode in ["matrix_free"] if device.is_cuda else []:
+        for mode in ["serial"] if device.is_cuda else []:
             with self.subTest(mode=mode):
                 static_model = _floor_model(device, "static")
                 static_v = _step_once(static_model, SolverSteel(static_model, solve_mode=mode))[0][:2]
@@ -98,11 +99,13 @@ class TestSteelGlobalWorld(unittest.TestCase):
                 np.testing.assert_allclose(v[1], static_v[1], atol=1.0e-5)
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False])
 
-    def test_split_global_kinematic_floor_flags_other_worlds(self):
+    def test_propagation_global_kinematic_floor_flags_other_worlds(self):
         """Without prescribed-response elision, other worlds' contacts with a global kinematic body are flagged."""
         device = wp.get_device()
         model = _floor_model(device, "kinematic")
-        solver = _construct(self, model, True, solve_mode="split", warn_constraint_overflow=False)
+        solver = _construct(
+            self, model, True, articulated_contact_response="propagation", warn_constraint_overflow=False
+        )
         _, contacts = _step_once(model, solver)
         count = int(contacts.rigid_contact_count.numpy()[0])
         paths = solver._contact_path.numpy()[:count]
@@ -138,8 +141,15 @@ class TestSteelGlobalWorld(unittest.TestCase):
             with self.subTest(mode=mode):
                 # A dynamic global body always keeps response DOFs in world 0.
                 _construct(self, _floor_model(device, "dynamic"), True, solve_mode=mode)
-                # A global kinematic free body is prescribed only on the matrix_free/immediate path.
-                _construct(self, _floor_model(device, "kinematic"), mode != "matrix_free", solve_mode=mode)
+                # A global kinematic free body is prescribed on the immediate path.
+                _construct(self, _floor_model(device, "kinematic"), False, solve_mode=mode)
+                _construct(
+                    self,
+                    _floor_model(device, "kinematic"),
+                    True,
+                    solve_mode=mode,
+                    articulated_contact_response="propagation",
+                )
                 # World geometry is solvable in every world.
                 _construct(self, _floor_model(device, "static"), False, solve_mode=mode)
 
@@ -166,7 +176,7 @@ class TestSteelGlobalWorld(unittest.TestCase):
             floor = builder.add_link(mass=1.0, is_kinematic=True)
             builder.add_articulation([builder.add_joint_prismatic(-1, floor, axis=newton.Axis.Z)])
             builder.add_shape_box(floor, hx=5.0, hy=5.0, hz=0.5)
-            _construct(self, builder.finalize(device=device), True, solve_mode="matrix_free")
+            _construct(self, builder.finalize(device=device), True)
 
 
 def _floating_base_arm():
@@ -193,7 +203,7 @@ def test_floating_base_drive_reads_its_own_target(test, device, drive_mode):
     """A revolute drive after a free joint must read its target at joint_target_q_start, not its DOF index."""
     with wp.ScopedDevice(device):
         model, hinge = _floating_base_arm()
-        solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+        solve_mode = "serial"
         solver = newton.solvers.SolverSteel(model, solve_mode=solve_mode, iterations=16, drive_mode=drive_mode)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -229,12 +239,6 @@ _TILED_KERNEL_HELPERS = (
     "_get_triangular_solve_kernel",
     "_get_hinv_jt_kernel",
     "_get_hinv_jt_plain_kernel",
-    "_get_hinv_jt_fused_kernel",
-    "_get_delassus_kernel",
-    "_get_pgs_solve_tiled_row_kernel",
-    "_get_pgs_solve_tiled_contact_kernel",
-    "_get_pgs_solve_streaming_kernel",
-    "_get_pgs_solve_mf_kernel",
 )
 
 
@@ -386,14 +390,15 @@ class TestSteelPrivateApiUpstream(unittest.TestCase):
         )
         cls.solver_methods = {node.name: node for node in cls.solver_class.body if isinstance(node, ast.FunctionDef)}
 
+    @unittest.skipUnless(wp.is_cuda_available(), "SolverSteel requires CUDA")
     def test_step_option_assignment_validates_like_the_constructor(self):
         """Reject invalid step-option assignments, keep the previous value, and normalize valid ones."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
         builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
-        model = builder.finalize(device="cpu")
-        solver = SolverSteel(model, solve_mode="split", friction_anchor_beta=0.0)
+        model = builder.finalize(device="cuda:0")
+        solver = SolverSteel(model, friction_anchor_beta=0.0)
         invalid = {
             "velocity_drive_mode": "frozen",
             "contact_warmstart_decay": -1.0,
@@ -419,7 +424,7 @@ class TestSteelPrivateApiUpstream(unittest.TestCase):
         self.assertIs(type(solver.baumgarte), float)
         self.assertIs(solver.warn_constraint_overflow, False)
         with self.assertRaisesRegex(ValueError, "velocity_drive_mode must be 'active' or 'freeze'"):
-            SolverSteel(model, solve_mode="split", friction_anchor_beta=0.0, velocity_drive_mode="frozen")
+            SolverSteel(model, friction_anchor_beta=0.0, velocity_drive_mode="frozen")
 
     def test_solver_is_exported_once_from_newton_solvers(self):
         """Expose the solver through newton.solvers only."""
@@ -448,6 +453,35 @@ class TestSteelPrivateApiUpstream(unittest.TestCase):
                 self.assertIn(helper_name, calls)
                 if first_continue is not None:
                     self.assertLess(calls[helper_name], first_continue)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "SolverSteel requires CUDA")
+class TestSteelSolveModeOptions(unittest.TestCase):
+    def test_solve_mode_and_response_spellings(self):
+        """Reject removed spellings with a pointer to the new one and expose the validated pair."""
+        model = _floor_model("cuda:0", "static")
+        removed = (
+            ({"solve_mode": "split"}, "solve_mode='serial'"),
+            ({"solve_mode": "matrix_free"}, "solve_mode='serial'"),
+            (
+                {"articulated_contact_response": "propagation_colored"},
+                "solve_mode='colored' with articulated_contact_response='propagation'",
+            ),
+            (
+                {"solve_mode": "colored", "articulated_contact_response": "immediate"},
+                "requires articulated_contact_response='propagation'",
+            ),
+        )
+        for kwargs, message in removed:
+            with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, re.escape(message)):
+                SolverSteel(model, **kwargs)
+
+        solver = SolverSteel(model)
+        self.assertEqual(solver.solve_mode, "serial")
+        self.assertEqual(solver.articulated_contact_response, "immediate")
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
+        self.assertEqual(solver.solve_mode, "colored")
+        self.assertEqual(solver.articulated_contact_response, "propagation")
 
 
 if __name__ == "__main__":

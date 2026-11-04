@@ -20,7 +20,7 @@ class Example(TabletopDemo):
     @staticmethod
     def create_parser():
         parser = TabletopDemo.create_parser()
-        parser.set_defaults(contact_response="propagation_colored")
+        parser.set_defaults(solve_mode="colored", contact_response="propagation")
         return parser
 
     def populate(self, builder, info, ee, down, fingers):

@@ -77,7 +77,7 @@ solvers = {
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, angular_damping=0.0),
     "semi_implicit": lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0),
     "kamino": newton.solvers.SolverKamino,
-    "steel": lambda model: newton.solvers.SolverSteel(model, solve_mode="matrix_free"),
+    "steel": newton.solvers.SolverSteel,
 }
 for device in devices:
     for solver_name, solver_fn in solvers.items():

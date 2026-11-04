@@ -848,7 +848,7 @@ solvers = {
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=2),
     "semi_implicit": newton.solvers.SolverSemiImplicit,
     "kamino": newton.solvers.SolverKamino,
-    "steel": lambda model: newton.solvers.SolverSteel(model, solve_mode="matrix_free"),
+    "steel": newton.solvers.SolverSteel,
 }
 
 

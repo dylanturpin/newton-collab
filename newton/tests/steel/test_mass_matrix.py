@@ -228,9 +228,7 @@ def test_sleeping_diagonal_dynamics_skip_is_exact(test, device):
     runs = []
     for skip in (False, True):
         model = _build_fixed_base_star_model(device, num_branches=3, ground=True)
-        solver = SolverSteel(
-            model, solve_mode="matrix_free", enable_sleeping=True, sleep_quiet_time=0.05, articulation_constraint_max=64
-        )
+        solver = SolverSteel(model, enable_sleeping=True, sleep_quiet_time=0.05, articulation_constraint_max=64)
         test.assertTrue(solver._execution_plan.use_diagonal_mass(3))
         solver._sleeping.skip_dynamics = skip
         pipeline = newton.CollisionPipeline(model)
@@ -434,43 +432,19 @@ def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_id_each_ste
 
 
 class TestSteelMassUpdateInterval(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
-    def test_split_fk_id_cache_does_not_alias_active_step_state(self):
-        """Keep split-mode cached dynamics isolated from active solve scratch."""
+    @unittest.skipUnless(wp.is_cuda_available(), "serial PGS requires CUDA")
+    def test_serial_fk_id_cache_keeps_zero_copy_path(self):
+        """Keep serial dynamics publication on its validated zero-copy path."""
         model = _build_floating_model("cuda:0")
-        solver = SolverSteel(model, update_mass_matrix_interval=2, solve_mode="split")
-        state_in = _make_floating_state(model)
-        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
-        cache = solver._fk_id_cache
-
-        active_cache_pairs = (
-            (state_aug._body_q_com, cache.body_q_com),
-            (state_aug._joint_S_s, cache.joint_S_s),
-            (state_aug._body_I_s, cache.body_I_s),
-            (solver._body_inertia_terms, cache.body_inertia_terms),
-            (state_aug._body_v_s, cache.body_v_s),
-            (state_aug._body_f_s, cache.body_f_s),
-            (state_aug._body_a_s, cache.body_a_s),
-            (solver._articulation_origin, cache.articulation_origin),
-        )
-        for active, cached in active_cache_pairs:
-            self.assertNotEqual(active.ptr, cached.ptr)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free PGS requires CUDA")
-    def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
-        """Keep matrix-free dynamics publication on its validated zero-copy path."""
-        model = _build_floating_model("cuda:0")
-        solver = SolverSteel(model, update_mass_matrix_interval=2, solve_mode="matrix_free")
+        solver = SolverSteel(model, update_mass_matrix_interval=2)
 
         self.assertTrue(solver._fk_id_cache_enabled)
-        self.assertFalse(solver._fk_id_cache_uses_snapshot)
-        self.assertIsNone(solver._fk_id_cache)
 
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_velocity_limits=True)
+        solver = SolverSteel(model, enable_joint_velocity_limits=True)
         self.assertFalse(solver._fk_id_cache_enabled)
         self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
 
@@ -588,17 +562,16 @@ class TestSteelMassUpdateInterval(unittest.TestCase):
         FK/ID reuse path then consumes cleared body forces while its cache still reads valid.
         """
         warm_model = _build_model("cuda:0", ground=False)
-        warm_solver = SolverSteel(warm_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
+        warm_solver = SolverSteel(warm_model, update_mass_matrix_interval=2)
         warm_solver.step(_make_initial_state(warm_model), warm_model.state(), warm_model.control(), None, DT)
         wp.synchronize_device("cuda:0")
 
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        # matrix_free keeps the zero-copy FK/ID reuse path; split restores its snapshot and would mask the defect.
-        graph_solver = SolverSteel(graph_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
-        eager_solver = SolverSteel(eager_model, update_mass_matrix_interval=2, solve_mode="matrix_free")
+        # The serial solver keeps the zero-copy FK/ID reuse path, so a cleared cache is not masked by a snapshot.
+        graph_solver = SolverSteel(graph_model, update_mass_matrix_interval=2)
+        eager_solver = SolverSteel(eager_model, update_mass_matrix_interval=2)
         self.assertTrue(graph_solver._fk_id_cache_enabled)
-        self.assertFalse(graph_solver._fk_id_cache_uses_snapshot)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()
@@ -632,8 +605,8 @@ class TestSteelMassUpdateInterval(unittest.TestCase):
         """
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        graph_solver = SolverSteel(graph_model, solve_mode="matrix_free")
-        eager_solver = SolverSteel(eager_model, solve_mode="matrix_free")
+        graph_solver = SolverSteel(graph_model)
+        eager_solver = SolverSteel(eager_model)
         self.assertTrue(graph_solver._fk_id_cache_enabled)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
@@ -870,7 +843,7 @@ def _run_trajectory_mass_update_interval_upstream(model, solver, num_steps):
     return np.stack(history)
 
 
-def test_mass_refresh_cadence_follows_interval(test, device, solve_mode="matrix_free"):
+def test_mass_refresh_cadence_follows_interval(test, device, solve_mode="serial"):
     """Refresh every articulation's factorization on every ``interval``-th step only."""
     model = _build_model_mass_update_interval_upstream(device)
     solver = SolverSteel(model, solve_mode=solve_mode, update_mass_matrix_interval=2)
@@ -886,7 +859,7 @@ def test_mass_refresh_cadence_follows_interval(test, device, solve_mode="matrix_
         test.assertEqual(solver._mass_update_mask.numpy().tolist(), expected, f"step {step_index}")
 
 
-def test_stale_factorization_stays_close_to_interval_one(test, device, solve_mode="matrix_free"):
+def test_stale_factorization_stays_close_to_interval_one(test, device, solve_mode="serial"):
     """Keep an interval-2 contact trajectory close to the every-step refresh."""
     history = {}
     for interval in (1, 2):
@@ -900,7 +873,7 @@ def test_stale_factorization_stays_close_to_interval_one(test, device, solve_mod
     test.assertGreater(moved, 1.0e-3)
 
 
-def test_timestep_change_forces_a_refresh(test, device, solve_mode="matrix_free"):
+def test_timestep_change_forces_a_refresh(test, device, solve_mode="serial"):
     """Refresh the augmented mass matrix when the time step changes on a reuse step."""
     model = _build_model_mass_update_interval_upstream(device, ground=False)
     solver = SolverSteel(model, solve_mode=solve_mode, update_mass_matrix_interval=4)
@@ -914,7 +887,7 @@ def test_timestep_change_forces_a_refresh(test, device, solve_mode="matrix_free"
     test.assertEqual(solver._mass_update_mask.numpy().tolist(), [1, 1])
 
 
-def test_captured_two_substep_replay_matches_eager(test, device, solve_mode="matrix_free"):
+def test_captured_two_substep_replay_matches_eager(test, device, solve_mode="serial"):
     """Replay two captured substeps, including the first-step allocations, like eager stepping."""
     graph_model = _build_model_mass_update_interval_upstream(device, ground=False)
     eager_model = _build_model_mass_update_interval_upstream(device, ground=False)
@@ -953,14 +926,6 @@ for _name in (
     "test_captured_two_substep_replay_matches_eager",
 ):
     add_function_test(TestSteelMassUpdateIntervalUpstream, _name, globals()[_name], devices=devices)
-    split_devices = devices if _name == "test_captured_two_substep_replay_matches_eager" else get_test_devices()
-    add_function_test(
-        TestSteelMassUpdateIntervalUpstream,
-        f"{_name}_split",
-        globals()[_name],
-        devices=split_devices,
-        solve_mode="split",
-    )
 
 
 INITIAL_JOINT_Q_notify_inertial = 0.3
@@ -1051,7 +1016,7 @@ class TestSteelNotifyInertial(unittest.TestCase):
             if caller_refreshes_fk:
                 newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
-            SolverSteel(model, solve_mode="split").step(
+            SolverSteel(model).step(
                 state_0,
                 state_1,
                 model.control(),
@@ -1136,7 +1101,7 @@ class TestSteelNotifyInertial(unittest.TestCase):
         """Refresh cached mass factors on JOINT_PROPERTIES, eagerly and under graph replay."""
         device = wp.get_device()
         interval = 100
-        modes = ["split", "matrix_free"] if device.is_cuda else ["split"]
+        modes = ["serial"]
 
         def shift_child_frame(model):
             joint_X_c = model.joint_X_c.numpy()
@@ -1183,7 +1148,7 @@ class TestSteelNotifyInertial(unittest.TestCase):
 
 def _check_joint_dof_edit_matches_fresh_solver(test, device, name: str, value: float, flag):
     """Assign one joint DOF property after a step, notify ``flag``, and compare the next step to a fresh solver."""
-    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+    solve_mode = "serial"
     # Graph capture needs a CUDA device.
     for capture in (False, True) if wp.get_device(device).is_cuda else (False,):
         with test.subTest(capture=capture):
@@ -1313,27 +1278,27 @@ def _check_friction_edit_matches_fresh_solver(test, device, replace: bool, solve
             np.testing.assert_allclose(state_1.joint_qd.numpy(), fresh_out.joint_qd.numpy(), atol=1.0e-5)
 
 
-def test_replaced_joint_damping_matches_fresh_solver(test, device, solve_mode="matrix_free"):
+def test_replaced_joint_damping_matches_fresh_solver(test, device, solve_mode="serial"):
     """Read a joint damping array replaced on the model at the next JOINT_DOF_PROPERTIES notify."""
     _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_PROPERTIES, solve_mode)
 
 
-def test_assigned_joint_damping_matches_fresh_solver(test, device, solve_mode="matrix_free"):
+def test_assigned_joint_damping_matches_fresh_solver(test, device, solve_mode="serial"):
     """Read joint damping modified in place at the next JOINT_DOF_PROPERTIES notify."""
     _check_damping_edit_matches_fresh_solver(test, device, False, ModelFlags.JOINT_DOF_PROPERTIES, solve_mode)
 
 
-def test_dof_force_flag_reads_replaced_joint_damping(test, device, solve_mode="matrix_free"):
+def test_dof_force_flag_reads_replaced_joint_damping(test, device, solve_mode="serial"):
     """Read a joint damping array replaced on the model at the next JOINT_DOF_FORCE_PROPERTIES notify."""
     _check_damping_edit_matches_fresh_solver(test, device, True, ModelFlags.JOINT_DOF_FORCE_PROPERTIES, solve_mode)
 
 
-def test_replaced_shape_friction_matches_fresh_solver(test, device, solve_mode="matrix_free"):
+def test_replaced_shape_friction_matches_fresh_solver(test, device, solve_mode="serial"):
     """Read a friction array replaced on the model at the next SHAPE_PROPERTIES notify."""
     _check_friction_edit_matches_fresh_solver(test, device, replace=True, solve_mode=solve_mode)
 
 
-def test_assigned_shape_friction_matches_fresh_solver(test, device, solve_mode="matrix_free"):
+def test_assigned_shape_friction_matches_fresh_solver(test, device, solve_mode="serial"):
     """Read friction modified in place at the next SHAPE_PROPERTIES notify."""
     _check_friction_edit_matches_fresh_solver(test, device, replace=False, solve_mode=solve_mode)
 
@@ -1362,13 +1327,6 @@ for _name in (
     "test_assigned_shape_friction_matches_fresh_solver",
 ):
     add_function_test(TestSteelNotifyReplacedArrays, _name, globals()[_name], devices=get_cuda_test_devices())
-    add_function_test(
-        TestSteelNotifyReplacedArrays,
-        f"{_name}_split",
-        globals()[_name],
-        devices=get_test_devices(),
-        solve_mode="split",
-    )
 
 
 INITIAL_JOINT_Q_notify_inertial_upstream = 0.3
@@ -1400,7 +1358,7 @@ def _build_model_notify_inertial_upstream(device, com=None):
     return model
 
 
-def test_step_refreshes_reused_state_after_joint_q_write(test, device, solve_mode="matrix_free"):
+def test_step_refreshes_reused_state_after_joint_q_write(test, device, solve_mode="serial"):
     """Pick up a joint_q write into a state the solver produced on the previous step."""
     model = _build_model_notify_inertial_upstream(device)
     solver = SolverSteel(model, solve_mode=solve_mode)
@@ -1424,7 +1382,7 @@ def test_step_refreshes_reused_state_after_joint_q_write(test, device, solve_mod
     np.testing.assert_allclose(state_0.body_q.numpy(), reference_out.body_q.numpy(), rtol=0.0, atol=1.0e-6)
 
 
-def test_kinematic_flag_change_is_picked_up(test, device, solve_mode="matrix_free"):
+def test_kinematic_flag_change_is_picked_up(test, device, solve_mode="serial"):
     """Hold a body still once it is flagged kinematic and the solver is notified."""
     model = _build_model_notify_inertial_upstream(device, com=NEW_COM)
     solver = SolverSteel(model, solve_mode=solve_mode)
@@ -1450,13 +1408,6 @@ for _name in (
     "test_kinematic_flag_change_is_picked_up",
 ):
     add_function_test(TestSteelNotifyInertialUpstream, _name, globals()[_name], devices=devices)
-    add_function_test(
-        TestSteelNotifyInertialUpstream,
-        f"{_name}_split",
-        globals()[_name],
-        devices=get_test_devices(),
-        solve_mode="split",
-    )
 
 
 WORLD_COUNT = 3
@@ -1478,7 +1429,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Refresh the effective armature and its size groups exactly as a host rebuild would."""
         device = wp.get_device()
         model = _build_model_notify_device(device)
-        options = {"solve_mode": "matrix_free", "enable_joint_friction": True} if device.is_cuda else {}
+        options = {"enable_joint_friction": True}
         solver = SolverSteel(model, **options)
         rng = np.random.default_rng(0)
         model.joint_armature.assign(rng.uniform(0.0, 0.5, model.joint_dof_count).astype(np.float32))
@@ -1528,7 +1479,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Replay a captured notify and pick up armature and geometry written after the capture."""
         device = wp.get_device("cuda:0")
         model = _build_model_notify_device(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True, friction_anchor_beta=0.2)
+        solver = SolverSteel(model, enable_joint_friction=True, friction_anchor_beta=0.2)
         patches = solver._friction_patches
         flags = (
             ModelFlags.JOINT_PROPERTIES
@@ -1548,7 +1499,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         scale[2] *= 1.25
         model.shape_scale.assign(scale)
         wp.capture_launch(capture.graph)
-        _assert_armature_matches(self, solver, SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True))
+        _assert_armature_matches(self, solver, SolverSteel(model, enable_joint_friction=True))
         expected_radius, expected_valid, _ = _host_update_geometry(model, patches, seen, valid_before)
         np.testing.assert_array_equal(patches.body_radius.numpy(), expected_radius)
         np.testing.assert_array_equal(patches.previous.valid.numpy(), expected_valid)
@@ -1559,7 +1510,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Replay a captured narrow-flag notify and pick up armature, damping, friction and materials edited in place."""
         device = wp.get_device("cuda:0")
         model = _build_model_notify_device(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         flags = (
             ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
             | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
@@ -1581,7 +1532,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         for name in materials:
             edited[name] = rng.uniform(0.01, 0.9, model.shape_count).astype(np.float32)
             getattr(model, name).assign(edited[name])
-        fresh = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        fresh = SolverSteel(model, enable_joint_friction=True)
         revolute, _ = _friction_dofs(model)
         friction = np.zeros(model.joint_dof_count, dtype=np.float32)
         friction[revolute[2]] = -1.0
@@ -1605,7 +1556,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Latch the world of each invalid coefficient on replay and report it outside capture."""
         device = wp.get_device("cuda:0")
         model = _build_model_notify_device(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, free = _friction_dofs(model)
@@ -1632,7 +1583,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Keep the flag through later valid replays and resets until the host reports it once."""
         device = wp.get_device("cuda:0")
         model = _build_model_notify_device(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, _ = _friction_dofs(model)
@@ -1654,7 +1605,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Leave the flag clear for valid coefficients, including zero and supported nonzero values."""
         device = wp.get_device("cuda:0")
         model = _build_model_notify_device(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
         revolute, _ = _friction_dofs(model)
@@ -1673,7 +1624,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
     def test_eager_notify_raises_for_invalid_joint_friction(self):
         """Raise from an eager notify after applying it, and accept the next valid notify."""
         model = _build_model_notify_device(wp.get_device("cuda:0"))
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         revolute, _ = _friction_dofs(model)
         model.joint_armature.fill_(0.3)
         friction = np.zeros(model.joint_dof_count, dtype=np.float32)
@@ -1691,7 +1642,7 @@ class TestSteelNotifyDevice(unittest.TestCase):
         """Attribute loop-closing and global DOFs to their solver world in a sparse layout."""
         device = wp.get_device("cuda:0")
         model, dofs = _build_loop_model(device)
-        solver = SolverSteel(model, solve_mode="matrix_free", enable_joint_friction=True)
+        solver = SolverSteel(model, enable_joint_friction=True)
         self.assertEqual(solver._world_count, 3)
         with wp.ScopedCapture(device=device) as capture:
             solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
@@ -1875,7 +1826,6 @@ def _run_mixed_response(
     with kernel_overrides({"hinv_jt_kernel": kernel}):
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             contact_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
             contact_friction_scale=1.0 if friction > 0.0 else 0.0,
@@ -2011,7 +1961,6 @@ def _run_diagonal_mass_local(kernel, *, iterations, graph, steps=24):
     with kernel_overrides(overrides):
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=iterations,
             enable_joint_limits=True,
             joint_limit_activation_gap=0.0,
@@ -2102,7 +2051,7 @@ def _armature_impact(model, solver, joint_qd):
 
 
 def _armature_modes(device):
-    return ["matrix_free", "split"] if device.is_cuda else ["split"]
+    return ["serial"]
 
 
 class TestSteelResponseDiagonal(unittest.TestCase):
@@ -2742,7 +2691,6 @@ class TestSteelResponseDiagonal(unittest.TestCase):
                 set_torsion_radius(model, radius)
                 solvers[radius] = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     iterations=8,
@@ -2752,7 +2700,6 @@ class TestSteelResponseDiagonal(unittest.TestCase):
             set_torsion_radius(model, 0.0)
             point = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_joint_limits=True,
                 joint_limit_activation_gap=0.0,
                 iterations=8,
@@ -2986,7 +2933,6 @@ class TestSteelResponseDiagonal(unittest.TestCase):
                 set_torsion_radius(model, radius)
                 solvers[radius] = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     iterations=8,
@@ -3001,7 +2947,7 @@ class TestSteelResponseDiagonal(unittest.TestCase):
     def test_local_owners_are_limited_to_small_world_counts(self):
         """Select local owners only up to one world per SM; larger models solve exactly as the general owner."""
         limit = wp.get_device("cuda:0").sm_count
-        kwargs = {"solve_mode": "matrix_free", "articulation_constraint_max": 32, "free_body_constraint_max": 32}
+        kwargs = {"solve_mode": "serial", "articulation_constraint_max": 32, "free_body_constraint_max": 32}
         with kernel_overrides({"hinv_jt_kernel": "par_row"}):
             for world_count, expected in ((limit, True), (limit + 1, False)):
                 model = _build_mixed_response_model("cuda:0", world_count=world_count)

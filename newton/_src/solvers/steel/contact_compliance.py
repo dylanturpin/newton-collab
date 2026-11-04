@@ -96,13 +96,12 @@ def normal_coefficients(stiffness, damping, separation, *, dt):
 
 def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
-    if settings["articulated_contact_response"] not in ("immediate", "propagation_colored"):
+    if settings["articulated_contact_response"] == "propagation" and settings["solve_mode"] != "colored":
         raise ValueError(
-            "contact_compliance requires articulated_contact_response 'immediate' or 'propagation_colored'; "
-            f"got {settings['articulated_contact_response']!r}"
+            "contact_compliance requires articulated_contact_response='immediate' or solve_mode='colored'; "
+            f"got solve_mode={settings['solve_mode']!r} with articulated_contact_response='propagation'"
         )
     required = {
-        "solve_mode": "matrix_free",
         "row_schedule": "interleaved",
         "velocity_iterations": 0,
         "contact_warmstart": False,

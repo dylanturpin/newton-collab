@@ -1,0 +1,1 @@
+Remove `SolverSteel(solve_mode="split")`, which solved articulated contacts through a dense Delassus matrix per world and offered no benefit over the matrix-free solve. Passing it raises `ValueError`; use the default `solve_mode`. CPU now runs the matrix-free solver.

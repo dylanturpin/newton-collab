@@ -202,7 +202,7 @@ def test_steel_ball_joint_damping_matches_featherstone(test: TestJointDamping, d
     """Decay Steel ball-joint speed with joint damping, as SolverFeatherstone does."""
 
     def solver_fn(model):
-        return newton.solvers.SolverSteel(model, solve_mode="matrix_free")
+        return newton.solvers.SolverSteel(model)
 
     def featherstone_fn(model):
         return newton.solvers.SolverFeatherstone(model, angular_damping=0.0)
@@ -247,7 +247,7 @@ solvers = {
     "semi_implicit": (lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0), True),
     "kamino": (newton.solvers.SolverKamino, False),
     "steel": (
-        lambda model: newton.solvers.SolverSteel(model, solve_mode="matrix_free"),
+        newton.solvers.SolverSteel,
         False,
     ),
 }

@@ -18,7 +18,7 @@ from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.kernels import PGS_CONSTRAINT_TYPE_TORSION
 from newton._src.solvers.steel.sleeping import _SleepState
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import set_torsion_radius
+from newton.tests.steel._fixtures import set_torsion_radius, steel_mode_options
 from newton.tests.steel.test_propagation import _build_arm_heap_model
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -85,7 +85,6 @@ class TestSleeping(unittest.TestCase):
             sleep_quiet_time=0.05,
             iterations=16,
             friction_anchor_beta=0,
-            solve_mode="split",
         )
         sleeping = solver._sleeping
         state = model.state()
@@ -143,7 +142,7 @@ class TestSleeping(unittest.TestCase):
     def test_default_and_explicit_disabled_match(self):
         """Preserve the existing trajectory with sleeping explicitly disabled."""
         model, pipeline, explicit, states, control = _scene(enabled=False)
-        default = newton.solvers.SolverSteel(model, iterations=16, solve_mode="split", friction_anchor_beta=0)
+        default = newton.solvers.SolverSteel(model, iterations=16, friction_anchor_beta=0)
         reference = [model.state(), model.state()]
         _advance(model, pipeline, explicit, states, control, 30)
         _advance(model, pipeline, default, reference, control, 30)
@@ -205,7 +204,6 @@ def _scene(*, enabled=True, ground=True, device="cpu", stack=False):
         sleep_quiet_time=0.05,
         iterations=16,
         friction_anchor_beta=0,
-        solve_mode="matrix_free" if model.device.is_cuda else "split",
     )
     return model, pipeline, solver, [model.state(), model.state()], model.control()
 
@@ -247,7 +245,6 @@ def _drive_scene(device, sleeping):
     model = builder.finalize(device=device)
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         drive_mode="rows",
         iterations=16,
         friction_anchor_beta=0.0,
@@ -451,7 +448,7 @@ def _scene_sleeping_dynamics():
 
 
 _PROFILE = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "row_schedule": "interleaved",
     "articulated_contact_response": "immediate",
     "iterations": 32,
@@ -1057,7 +1054,7 @@ def _articulations_sleeping_production_upstream(device, tiles=False, profile=Non
     model = builder.finalize(device=device)
     # Deterministic contact order, as in production, so A/B trajectories compare bitwise.
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", **(profile or PROFILE))
+    solver = newton.solvers.SolverSteel(model, **(profile or PROFILE))
     return model, pipeline, solver, [model.state(), model.state()], model.control()
 
 
@@ -1363,7 +1360,6 @@ def _runtime(model):
         model,
         enable_sleeping=True,
         friction_anchor_beta=0.0,
-        solve_mode="split",
         sleep_quiet_time=0.05,
         iterations=16,
     )
@@ -1416,7 +1412,6 @@ class TestSleepWorkSkipping(unittest.TestCase):
                     sleep_angular_threshold=0.15,
                     sleep_quiet_time=0.5,
                     enable_joint_limits=True,
-                    solve_mode="matrix_free",
                     iterations=8,
                     friction_anchor_beta=0.0,
                     articulation_constraint_max=256,
@@ -1642,7 +1637,6 @@ class _Scene:
             sleep_quiet_time=0.05,
             friction_anchor_beta=0.0,
             iterations=16,
-            solve_mode="matrix_free" if self.model.device.is_cuda else "split",
             **options,
         )
         self.states = [self.model.state(), self.model.state()]
@@ -1694,7 +1688,6 @@ def test_ant_joint_limits_skip_and_restore(test, device):
         with test.subTest(skip_constraints=skip):
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_sleeping=True,
                 sleep_skip_constraints=skip,
                 sleep_linear_threshold=0.05,
@@ -1798,7 +1791,6 @@ class _Scene_sleep_work_skipping_upstream:
         options = {} if skip else {"sleep_skip_constraints": False}
         self.solver = newton.solvers.SolverSteel(
             self.model,
-            solve_mode="matrix_free",
             enable_sleeping=True,
             sleep_quiet_time=0.05,
             friction_anchor_beta=0.0,
@@ -1831,13 +1823,15 @@ HEAP_DT = 1.0 / 240.0
 
 
 class _Heap:
-    """An arm drooping onto box heaps, one per world, stepped in place so steps can be captured."""
+    """An arm drooping onto box heaps, one per world, stepped in place so steps can be captured.
 
-    def __init__(self, response="propagation_colored", *, model=None, worlds=4, heap=(5, 2, 2), **solver_kwargs):
+    ``response`` is a :func:`steel_mode_options` label.
+    """
+
+    def __init__(self, response="colored", *, model=None, worlds=4, heap=(5, 2, 2), **solver_kwargs):
         self.model = model if model is not None else _build_arm_heap_model("cuda:0", worlds=worlds, heap=heap)
         args = {
-            "solve_mode": "matrix_free",
-            "articulated_contact_response": response,
+            **steel_mode_options(response),
             "deterministic": True,
             "iterations": 16,
             "contact_regularization": 0.01,
@@ -1912,24 +1906,22 @@ def _touches(bodies, mask):
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
 class TestSleepingColoredPropagation(unittest.TestCase):
-    """Passive-island sleeping with ``articulated_contact_response="propagation_colored"``."""
+    """Passive-island sleeping with ``solve_mode="colored", articulated_contact_response="propagation"``."""
 
     STEPS = 360
 
     def test_gate_admits_colored_only(self):
         """Construct colored propagation with sleeping; keep rejecting plain propagation."""
         model = _build_arm_heap_model("cuda:0", worlds=1)
-        for response in ("immediate", "propagation_colored"):
-            SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=response, enable_sleeping=True)
-        with self.assertRaisesRegex(ValueError, "immediate or propagation_colored"):
-            SolverSteel(
-                model, solve_mode="matrix_free", articulated_contact_response="propagation", enable_sleeping=True
-            )
+        SolverSteel(model, enable_sleeping=True)
+        SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
+        with self.assertRaisesRegex(ValueError, "immediate response or solve_mode='colored'"):
+            SolverSteel(model, articulated_contact_response="propagation", enable_sleeping=True)
 
     def test_separated_boxes_sleep_and_wake_at_immediate_steps(self):
         """Sleep, force-wake and resettle separated boxes at the same steps as immediate, with units only while awake."""
         traces = {}
-        for response in ("immediate", "propagation_colored"):
+        for response in ("immediate", "colored"):
             builder = newton.ModelBuilder()
             builder.add_ground_plane()
             for x in (0.0, 0.5):
@@ -1947,11 +1939,11 @@ class TestSleepingColoredPropagation(unittest.TestCase):
                 scene.step(clear=k != 120)
                 awake.append(scene.solver._sleeping.body_awake.numpy().copy())
                 poses.append(scene.state_in.body_q.numpy().copy())
-                if response == "propagation_colored":
+                if response == "colored":
                     _contact, body_a, body_b = scene.units()
                     units.append([int(np.sum((body_a == b) | (body_b == b))) for b in (0, 1)])
             traces[response] = (np.array(awake), np.array(poses), np.array(units))
-        immediate, colored = traces["immediate"], traces["propagation_colored"]
+        immediate, colored = traces["immediate"], traces["colored"]
         np.testing.assert_array_equal(colored[0], immediate[0])
         awake, units = colored[0], colored[2]
         slept = int(np.argmax(awake.sum(axis=1) == 0))
@@ -2178,20 +2170,20 @@ class TestSleepingColoredPropagation(unittest.TestCase):
         model = scene_builder.finalize(device="cuda:0")
         model.rigid_contact_max = 8192
         first_sleep, final_asleep = {}, {}
-        for response in ("immediate", "propagation_colored"):
+        for response in ("immediate", "colored"):
             scene = _Heap(response, model=model)
             first = np.full(model.articulation_count, -1)
             for k in range(360):
                 scene.step()
                 asleep = scene.solver._sleeping.art_awake.numpy() == 0
                 first[(first < 0) & asleep] = k
-                if response == "propagation_colored" and k == 0:
+                if response == "colored" and k == 0:
                     self.assertGreater(len(scene.units()[0]), 0)
             first_sleep[response], final_asleep[response] = first, asleep
         self.assertEqual(len(scene.units()[0]), 0)
         self.assertTrue(final_asleep["immediate"].all())
-        self.assertTrue(final_asleep["propagation_colored"].all())
-        delta = np.abs(first_sleep["propagation_colored"] - first_sleep["immediate"])
+        self.assertTrue(final_asleep["colored"].all())
+        delta = np.abs(first_sleep["colored"] - first_sleep["immediate"])
         self.assertLessEqual(int(delta.max()), 6)
 
 

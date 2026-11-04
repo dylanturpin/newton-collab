@@ -201,7 +201,7 @@ def test_descendant_free_joint_f_world_force_under_rotated_parent(
 
 
 def _steel(model):
-    return newton.solvers.SolverSteel(model, solve_mode="matrix_free")
+    return newton.solvers.SolverSteel(model)
 
 
 devices = get_test_devices()

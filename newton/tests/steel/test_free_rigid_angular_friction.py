@@ -119,7 +119,7 @@ def _simulate(
         model.shape_material_mu_torsional.fill_(torsional_material)
     if condim is not None:
         model.steel.condim.fill_(condim)
-    options = {"solve_mode": "matrix_free", "iterations": 32, "deterministic": True, **solver_kwargs}
+    options = {"solve_mode": "serial", "iterations": 32, "deterministic": True, **solver_kwargs}
     solver = SolverSteel(model, **options)
     if on_solver is not None:
         on_solver(solver)
@@ -179,7 +179,7 @@ def _simulate(
     return pose, twist, float(np.linalg.norm(pose[:2] - start[:2]))
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "Steel serial solve requires CUDA")
 class TestFreeRigidAngularFriction(unittest.TestCase):
     def test_rolling_sphere_stops_at_the_coulomb_distance(self):
         """Stop a rolling sphere within 5% of the analytic Coulomb distance; keep it rolling when off."""
@@ -328,7 +328,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                     custom_attributes={"steel:condim": condim},
                 )
             model = builder.finalize()
-            solver = SolverSteel(model, solve_mode="matrix_free", iterations=32, friction_anchor_beta=0.2)
+            solver = SolverSteel(model, iterations=32, friction_anchor_beta=0.2)
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             state_0, state_1, control = model.state(), model.state(), model.control()
@@ -386,7 +386,6 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             model = builder.finalize()
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 iterations=32,
                 friction_anchor_beta=0.2,
                 free_rigid_rolling_friction=0.001 if mixed else None,
@@ -534,7 +533,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model, _ = _scene("sphere")
         model.steel.condim.fill_(6)
         model.shape_material_mu_rolling.fill_(0.001)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         with wp.ScopedCapture(device=model.device) as capture:
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         model.shape_material_mu_rolling.fill_(0.003)
@@ -554,7 +553,6 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model, _ = _scene("sphere")
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=32,
             deterministic=True,
             contact_warmstart=True,
@@ -614,27 +612,24 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         self.assertLess(float(np.linalg.norm(seen["parent"][3:])), 0.02 * torque)
 
     def test_invalid_options_raise(self):
-        """Reject bad coefficients and condim, unsupported solve modes, and a condim raise without rebuilding."""
+        """Reject bad coefficients and condim, an unsupported friction mode, and a condim raise without rebuilding."""
         model, _ = _scene("sphere")
         for value in (-1.0e-3, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SolverSteel(model, free_rigid_rolling_friction=value)
         with self.assertRaises(ValueError):
-            SolverSteel(model, solve_mode="split", free_rigid_rolling_friction=1.0e-3)
-        with self.assertRaises(ValueError):
             # Point friction: bisection with persistent patches would warn before the rejection under test.
             SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 friction_mode="bisection",
                 friction_anchor_beta=0.0,
                 free_rigid_rolling_friction=1.0e-3,
             )
         model.steel.condim.fill_(7)
         with self.assertRaises(ValueError):
-            SolverSteel(model, solve_mode="matrix_free")
+            SolverSteel(model)
         model.steel.condim.fill_(3)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         model.steel.condim.fill_(6)
         with self.assertRaises(ValueError):
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
@@ -658,7 +653,7 @@ def _row_arrays(solver, response):
     )
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "Steel serial solve requires CUDA")
 class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
     """The rows on the plain propagation response, which routes free-free contacts to propagation rows."""
 
@@ -842,7 +837,6 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
                 model, _ = _scene("sphere")
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     iterations=32,
                     contact_warmstart=True,
                     free_rigid_rolling_friction=0.002,
@@ -934,7 +928,7 @@ class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
         np.testing.assert_array_equal(eager, captured)
 
 
-_COLORED = {"articulated_contact_response": "propagation_colored"}
+_COLORED = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
 
 
 def _simulate_colored(variant, *args, on_solver=None, **kwargs):
@@ -997,7 +991,7 @@ def _pile_rollout(spins, steps, graph_at=None, **solver_kwargs):
     """Step a pile from :func:`_pile` with every angular row on, optionally replaying a captured step from ``graph_at``."""
     model, qd = _pile(spins)
     options = {
-        "solve_mode": "matrix_free",
+        "solve_mode": "serial",
         "iterations": 16,
         "deterministic": True,
         "free_rigid_rolling_friction": 0.002,
@@ -1036,7 +1030,7 @@ def _pile_rollout(spins, steps, graph_at=None, **solver_kwargs):
     return np.array(history), solver
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "Steel serial solve requires CUDA")
 class TestFreeRigidAngularFrictionColored(unittest.TestCase):
     """The rows on the colored propagation response, solved inside their contact's colored unit."""
 
@@ -1178,7 +1172,6 @@ class TestFreeRigidAngularFrictionColored(unittest.TestCase):
         model, _ = _scene("sphere")
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=32,
             contact_warmstart=True,
             free_rigid_rolling_friction=0.002,
@@ -1409,10 +1402,10 @@ def _padded_body_scene(pad_condim: int, body: str = "free"):
 
 
 def _spin_solver(model):
-    return SolverSteel(model, solve_mode="matrix_free", iterations=16, deterministic=True, friction_anchor_beta=0.0)
+    return SolverSteel(model, iterations=16, deterministic=True, friction_anchor_beta=0.0)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+@unittest.skipUnless(wp.is_cuda_available(), "Steel serial solve requires CUDA")
 class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
     def _spin(self, pad_condim: int, body_pairs: bool, solver_first: bool = True):
         model, _, pad = _padded_body_scene(pad_condim)
@@ -1492,12 +1485,10 @@ class TestFreeRigidAngularFrictionBodyPairReduction(unittest.TestCase):
 
         expected = pad_contacts()
         self.assertGreater(expected, 0)
-        zero = SolverSteel(
-            model, solve_mode="matrix_free", free_rigid_torsional_friction=0.0, free_rigid_rolling_friction=0.0
-        )
+        zero = SolverSteel(model, free_rigid_torsional_friction=0.0, free_rigid_rolling_friction=0.0)
         self.assertEqual(pad_contacts(), expected)
         model.steel.condim.fill_(3)
-        rows_off = SolverSteel(model, solve_mode="matrix_free")
+        rows_off = SolverSteel(model)
         self.assertFalse(rows_off._free_rigid_angular_rows)
         pipeline.refresh_body_pair_reduction_groups()
         self.assertEqual(pad_contacts(), expected)
@@ -1513,7 +1504,7 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
     """MJCF ``condim`` stays with MuJoCo: registering the Steel attributes never enables angular rows."""
 
     def test_mjcf_condim_does_not_enable_angular_rows(self):
-        """Construct the same split solver for MJCF condim 3/4/6, direct or inherited, with and without registration."""
+        """Construct the same solver for MJCF condim 3/4/6, direct or inherited, with and without registration."""
         for registered in (False, True):
             for condim in (3, 4, 6):
                 for inherited in (False, True):
@@ -1530,10 +1521,10 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
                         if registered:
                             SolverSteel.register_custom_attributes(builder)
                         builder.add_mjcf(mjcf)
-                        model = builder.finalize(device="cpu")
+                        model = builder.finalize()
                         if registered:
                             np.testing.assert_array_equal(model.steel.condim.numpy(), 3)
-                        solver = SolverSteel(model, solve_mode="split")
+                        solver = SolverSteel(model)
                         self.assertFalse(solver._free_rigid_angular_rows)
 
 

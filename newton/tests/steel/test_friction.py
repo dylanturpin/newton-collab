@@ -15,7 +15,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.steel import solver_steel
-from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.contact_angular_friction import angular_friction_gs_sources
 from newton._src.solvers.steel.friction_patches import (
     _pose_motion,
@@ -36,9 +35,7 @@ from newton._src.solvers.steel.kernels import (
     compute_propagation_effective_mass_and_rhs,
     compute_propagation_rhs_bias,
     compute_world_contact_bias,
-    pgs_solve_loop,
 )
-from newton._src.solvers.steel.solver_steel import _get_pgs_solve_tiled_row_kernel
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import (
     COLORED_VARIANTS,
@@ -48,6 +45,7 @@ from newton.tests.steel._fixtures import (
     run_fixture,
     select_colored_variant,
     set_torsion_radius,
+    steel_mode_options,
 )
 from newton.tests.steel.test_propagation import _STATE_FIELDS, _build_arm_heap_model, _Stepper, _world_slices
 from newton.tests.steel.test_sleeping import _Heap, _touches
@@ -129,7 +127,7 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
 
 
 _SQUEEZE_SOLVER = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "articulated_contact_response": "immediate",
     "iterations": 64,
     "velocity_iterations": 0,
@@ -193,7 +191,7 @@ def _build_incline(theta_deg: float, mu: float):
 def _run_incline(steps: int, dt: float, **solver_kwargs):
     theta, mu = 30.0, 0.3
     model, box, _rot = _build_incline(theta, mu)
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=32, baumgarte=0.05, **solver_kwargs)
+    solver = newton.solvers.SolverSteel(model, iterations=32, baumgarte=0.05, **solver_kwargs)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
@@ -233,9 +231,7 @@ def _mesh_incline_model(mus):
 
 def _run_mesh_incline(model, seconds: float, dt: float, iterations: int):
     """Step the inclines with friction patches; return per-step body poses and velocities, and the solver."""
-    solver = newton.solvers.SolverSteel(
-        model, solve_mode="matrix_free", iterations=iterations, friction_anchor_beta=0.2
-    )
+    solver = newton.solvers.SolverSteel(model, iterations=iterations, friction_anchor_beta=0.2)
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
@@ -455,7 +451,7 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         self.assertGreater(c_prop[2], 0)
         # matrix-free route: free box resting on a static slab
         model, _, _ = _build_incline(0.0, 0.5)
-        c_mf = check(model, {"solve_mode": "matrix_free", "iterations": 16, "baumgarte": 0.05})
+        c_mf = check(model, {"solve_mode": "serial", "iterations": 16, "baumgarte": 0.05})
         self.assertGreater(c_mf[1], 0)
 
     def test_graph_capture_replays(self):
@@ -667,13 +663,13 @@ class TestSteelFrictionAnchorKernels(unittest.TestCase):
             got = _rhs_for_family(family, phi=pre, row_beta=None, baumgarte=baumgarte, dt=dt, bias_scale=None)
             np.testing.assert_allclose(got, 0.0, atol=1.0e-9, err_msg=family)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""
-        device = "cpu"
+        device = "cuda:0"
         model = _build_two_world_free_model(device)
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="split",
             friction_anchor_beta=0.2,
             articulation_constraint_max=4,
             free_body_constraint_max=4,
@@ -722,14 +718,13 @@ def _slide(device, mode, beta, mesh, angle, response=None, *, locked_tangent=Fal
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode=mode,
         friction_anchor_beta=beta,
         iterations=64,
         cfm=0.0 if locked_tangent else 1.0e-6,
         free_body_constraint_max=128,
         articulation_constraint_max=32,
         row_watermark=True,
-        articulated_contact_response=response or "immediate",
+        **{"solve_mode": mode, **steel_mode_options(response or "immediate")},
     )
     solver._rigid_body_angular_damping.zero_()
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
@@ -755,105 +750,29 @@ class TestSteelFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_articulated_sliding_direction(self):
         """Preserve sliding direction through dense and every articulated propagation route."""
-        for response in ("immediate", "propagation", "propagation_colored"):
+        for response in ("immediate", "propagation", "colored"):
             with self.subTest(response=response):
-                velocity, direction, _ = _slide("cuda:0", "matrix_free", 0.2, False, np.pi / 4, response)
+                velocity, direction, _ = _slide("cuda:0", "serial", 0.2, False, np.pi / 4, response)
                 np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_locked_tangent_preserves_other_friction_direction(self):
         """Retain friction along a slider when its first tangent has zero response."""
-        for response in ("immediate", "propagation", "propagation_colored"):
+        for response in ("immediate", "propagation", "colored"):
             for beta in (0.0, 0.2):
                 with self.subTest(response=response, beta=beta):
                     velocity, direction, watermarks = _slide(
-                        "cuda:0", "matrix_free", beta, False, 0.0, response, locked_tangent=True
+                        "cuda:0", "serial", beta, False, 0.0, response, locked_tangent=True
                     )
                     np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
                     for key, value in watermarks.items():
                         if "overflow" in key or "dropped" in key:
                             self.assertEqual(value, 0, key)
 
-    def test_unequal_tangent_masses(self):
-        """Solve sticking and sliding blocks with rotated, unequal tangent masses in one sweep."""
-        devices = ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
-        capacity = 32
-        for device in devices:
-            for angle, small_eigenvalue in (
-                (0.0, 1.0),
-                (0.37, 1.0),
-                (1.1, 1.0),
-                (0.37, 0.0),
-                (0.0, 0.0),
-                (0.0, 1.0e-4),
-                (0.0, 1.0e-6),
-                (0.0, 1.0e-8),
-            ):
-                for regime in ("sticking", "sliding", "fixed", "weak_sliding", "sliding_fixed"):
-                    if regime == "weak_sliding" and small_eigenvalue == 0.0:
-                        continue
-                    sliding = regime in ("sliding", "weak_sliding", "sliding_fixed")
-                    with self.subTest(device=device, angle=angle, small_eigenvalue=small_eigenvalue, regime=regime):
-                        rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
-                        tangent_mass = rotation @ np.diag([small_eigenvalue, 7.0]) @ rotation.T
-                        direction = np.array([0.6, 0.8])
-                        expected = -(0.3 if sliding else 0.1) * direction
-                        if regime == "fixed":
-                            expected = np.array([0.125, 0.0])
-                        velocity = 2.0 * direction if sliding else np.zeros(2)
-                        if regime == "weak_sliding":
-                            # A tiny positive KKT multiplier still requires a boundary impulse.
-                            # Absolute bisection resolution loses the weak direction here.
-                            velocity = small_eigenvalue * direction
-                        matrix = np.eye(capacity, dtype=np.float32)
-                        matrix[1:3, 1:3] = tangent_mass
-                        rhs = np.zeros((1, capacity), dtype=np.float32)
-                        rhs[0, :3] = [-1.0, *(velocity - tangent_mass @ expected)]
-                        if regime == "fixed":
-                            # Power-of-two impulses make the stored row residual exactly zero.
-                            rhs[0, 1:3] = -(matrix[1:3, 1:3] @ expected)
-                        row_types = np.full((1, capacity), -1, dtype=np.int32)
-                        row_types[0, :3] = [0, 2, 2]
-                        parents = np.full((1, capacity), -1, dtype=np.int32)
-                        parents[0, 1:3] = 0
-                        initial = np.zeros((1, capacity), dtype=np.float32)
-                        if regime in ("fixed", "sliding_fixed"):
-                            initial[0, :3] = [1.0, *expected]
-                        impulses = wp.array(initial, dtype=float, device=device)
-                        args = [
-                            wp.array([3], dtype=int, device=device),
-                            wp.array(np.diag(matrix)[None], dtype=float, device=device),
-                            wp.array(matrix[None], dtype=float, device=device),
-                            wp.array(rhs, dtype=float, device=device),
-                            impulses,
-                            1,
-                            1.0,
-                            wp.array(row_types, dtype=int, device=device),
-                            wp.array(parents, dtype=int, device=device),
-                            wp.full((1, capacity), 0.3, dtype=float, device=device),
-                            0,
-                            0,
-                        ]
-                        if device == "cpu":
-                            wp.launch(pgs_solve_loop, dim=1, inputs=[args[0], *args[1:]], device=device)
-                        else:
-                            kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
-                            wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
-                        actual = impulses.numpy()[0, :3]
-                        if regime in ("fixed", "sliding_fixed"):
-                            np.testing.assert_array_equal(actual, initial[0, :3])
-                        elif small_eigenvalue == 0.0 and not sliding:
-                            # A singular sticking block has multiple impulse solutions.
-                            np.testing.assert_allclose(tangent_mass @ actual[1:] + rhs[0, 1:3], 0.0, atol=1.0e-6)
-                            self.assertLessEqual(float(np.linalg.norm(actual[1:])), 0.300001)
-                        else:
-                            np.testing.assert_allclose(actual, [1.0, *expected], atol=1.0e-6)
-
     def test_sliding_direction(self):
         """Oppose sliding in every direction for analytic and mesh boxes, with and without patches."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        modes = ("split", "matrix_free") if wp.is_cuda_available() else ("split",)
-        for mode in modes:
+        for mode in ("serial",):
             for beta in (0.0, 0.2):
                 for mesh in (False, True):
                     for angle in (0.0, np.pi / 6, np.pi / 4, 2 * np.pi / 3):
@@ -891,7 +810,6 @@ def _belt_ride(mode, articulated, steps=120, window=30):
     model = builder.finalize(device="cuda:0")
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         articulated_contact_response="immediate",
         friction_mode=mode,
         friction_anchor_beta=0.0,
@@ -920,7 +838,7 @@ def _belt_ride(mode, articulated, steps=120, window=30):
 
 
 class TestSteelKinematicBeltFriction(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_kinematic_belt_drags_the_box(self):
         """A box on a kinematic belt reaches the belt speed in every friction mode, free and articulated."""
         for articulated in (False, True):
@@ -931,7 +849,7 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
                     self.assertEqual(mf_rows == 0, articulated)
                     self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_surface_velocity_belt_drags_the_box(self):
         """A box on a mesh belt with surface velocity reaches the surface speed.
 
@@ -945,13 +863,13 @@ class TestSteelKinematicBeltFriction(unittest.TestCase):
             (False, "immediate", "coulomb_newton", 0.0),
             (True, "immediate", "fixed_normal", 0.2),
             (True, "propagation", "fixed_normal", 0.2),
-            (True, "propagation_colored", "fixed_normal", 0.0),
+            (True, "colored", "fixed_normal", 0.0),
         ):
             with self.subTest(articulated=articulated, response=response, mode=mode, anchor_beta=anchor_beta):
                 mean_vx = _surface_belt_ride(mode, articulated, response, anchor_beta)
                 self.assertAlmostEqual(mean_vx, 0.5, delta=5.0e-3)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_surface_velocity_anchor_history_follows_a_timestep_change(self):
         """A box riding a mesh belt with persistent anchors keeps no anchor error when the timestep changes."""
         phi_after_change, vx = _surface_belt_dt_change()
@@ -992,7 +910,6 @@ def _surface_belt_dt_change(steps_before=120, steps_after=60):
     belt.mesh.velocities.fill_(wp.vec3(0.5, 0.0, 0.0))
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         friction_anchor_beta=0.2,
         iterations=32,
         free_body_constraint_max=64,
@@ -1029,7 +946,6 @@ def _surface_belt_start(steps_still, steps_moving):
     model = builder.finalize(device="cuda:0")
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         enable_sleeping=True,
         sleep_quiet_time=0.1,
         iterations=32,
@@ -1065,7 +981,6 @@ def _surface_belt_drop(velocity, steps=240):
     belt.mesh.velocities.fill_(wp.vec3(*velocity))
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         enable_restitution=True,
         iterations=32,
         free_body_constraint_max=64,
@@ -1109,8 +1024,7 @@ def _surface_belt_ride(mode, articulated, response, anchor_beta, speed=0.5, step
     belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         friction_mode=mode,
         friction_anchor_beta=anchor_beta,
         iterations=32,
@@ -1156,8 +1070,7 @@ def _resting_box(response, mode, articulated, steps=120):
     model = builder.finalize(device="cuda:0")
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         friction_mode=mode,
         friction_anchor_beta=0.0,
         iterations=32,
@@ -1180,16 +1093,14 @@ def _resting_box(response, mode, articulated, steps=120):
 
 
 class TestSteelCoupledFrictionRest(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_resting_box_keeps_its_contacts(self):
         """A box resting on four zero-gap contacts stays still in every coupled mode, free and articulated.
 
         A box lifted by one float32 ulp loses its zero-gap contacts on the next step and falls, so this checks
         that the coupled normal solve reaches the support load as exactly as fixed_normal does.
         """
-        for response, mode, articulated in itertools.product(
-            ("immediate", "propagation_colored"), _COUPLED_MODES, (False, True)
-        ):
+        for response, mode, articulated in itertools.product(("immediate", "colored"), _COUPLED_MODES, (False, True)):
             with self.subTest(response=response, mode=mode, articulated=articulated):
                 max_spin, min_contacts = _resting_box(response, mode, articulated)
                 self.assertEqual(min_contacts, 4)
@@ -1216,7 +1127,7 @@ def _ground_box(device, **solver_kwargs):
     model = builder.finalize(device=device)
     kwargs = {
         "iterations": 32,
-        "solve_mode": "matrix_free" if model.device.is_cuda else "split",
+        "solve_mode": "serial",
     }
     kwargs.update(solver_kwargs)
     solver = newton.solvers.SolverSteel(model, **kwargs)
@@ -1988,8 +1899,8 @@ class TestFrictionPatchDeviceFlood(unittest.TestCase):
         model.rigid_contact_max = 4096
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             iterations=8,
             free_body_constraint_max=4096,
         )
@@ -2093,7 +2004,7 @@ def _frozen_plates(device="cuda:0"):
                 builder.add_shape_box(body, xform=wp.transform(offset, wp.quat_identity()), hx=tile, hy=tile, hz=0.01)
     model = builder.finalize(device=device)
     model.rigid_contact_max = 1024
-    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+    solve_mode = "serial"
     solver = newton.solvers.SolverSteel(model, solve_mode=solve_mode, iterations=8, free_body_constraint_max=1024)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=1024)
     contacts = pipeline.contacts()
@@ -2218,8 +2129,6 @@ class TestSteelFrictionPatches(unittest.TestCase):
                     kwargs = dict(_SQUEEZE_SOLVER)
                     kwargs.pop("contact_shared_anchor")
                     kwargs.pop("contact_friction_shared_anchor")
-                    if not model.device.is_cuda:
-                        kwargs.update(solve_mode="split", enable_bilateral_preelimination=False)
                     if not enabled:
                         kwargs["friction_anchor_beta"] = 0.0
                     solver = newton.solvers.SolverSteel(model, **kwargs)
@@ -2444,32 +2353,11 @@ class TestSteelFrictionPatches(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cuda:0")
-        for kwargs in ({"solve_mode": "matrix_free", "friction_mode": "bisection"},):
+        for kwargs in ({"solve_mode": "serial", "friction_mode": "bisection"},):
             with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
                 solver = newton.solvers.SolverSteel(model, **kwargs)
                 self.assertFalse(solver._friction_anchors_enabled)
                 self.assertEqual(solver._friction_anchor_beta, 0.0)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix_free requires CUDA")
-    def test_matrix_free_ignores_dense_pgs_kernel_for_friction(self):
-        """pgs_kernel only selects the split-mode dense solve, so matrix_free keeps patch friction."""
-        builder = newton.ModelBuilder()
-        body = builder.add_body()
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cuda:0")
-        for kernel in ("tiled_contact", "streaming"):
-            with self.subTest(pgs_kernel=kernel):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error")
-                    with kernel_overrides({"pgs_kernel": kernel}):
-                        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free")
-                    self.assertTrue(solver._friction_anchors_enabled)
-                    self.assertAlmostEqual(solver._friction_anchor_beta, 0.2)
-                    with kernel_overrides({"pgs_kernel": kernel}):
-                        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", friction_anchor_beta=0.3)
-                    self.assertAlmostEqual(solver._friction_anchor_beta, 0.3)
-                self.assertIsNone(solver._pgs_solve_streaming_kernel)
-                self.assertIsNone(solver._pgs_solve_tiled_contact_kernel)
 
     def test_shared_point_flags_warn_with_patch_friction(self):
         """Explain when patch anchors override an explicitly requested shared friction point."""
@@ -2486,16 +2374,6 @@ class TestSteelFrictionPatches(unittest.TestCase):
         model = builder.finalize(device="cpu")
         with self.assertRaisesRegex(ValueError, "Patch friction requires"):
             newton.solvers.SolverSteel(model, friction_anchor_beta=0.2, friction_mode="bisection")
-        # CPU resolves every native kernel selector to the scalar loop, so only CUDA rejects them.
-        with kernel_overrides({"pgs_kernel": "tiled_contact"}):
-            solver = newton.solvers.SolverSteel(model, friction_anchor_beta=0.2)
-        self.assertEqual(solver._pgs_kernel, "loop")
-        if wp.is_cuda_available():
-            cuda_model = builder.finalize(device="cuda:0")
-            for kernel in ("tiled_contact", "streaming"):
-                with self.subTest(pgs_kernel=kernel), self.assertRaisesRegex(ValueError, "Patch friction requires"):
-                    with kernel_overrides({"pgs_kernel": kernel}):
-                        newton.solvers.SolverSteel(cuda_model, friction_anchor_beta=0.2)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
@@ -2522,7 +2400,7 @@ class TestSteelFrictionPatches(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_propagation_variants_preserve_a_warmstarted_patch(self):
         """Retain a sticking articulated grasp across cached and colored propagation."""
-        for response in ("propagation", "propagation_colored"):
+        for response in ("propagation", "colored"):
             with self.subTest(response=response), self.assertWarnsRegex(UserWarning, "Patch friction selects"):
                 drift, solver, state = _run_squeeze(
                     5.0,
@@ -2531,7 +2409,7 @@ class TestSteelFrictionPatches(unittest.TestCase):
                     contact_warmstart=True,
                     contact_friction_position_iterations=-1,
                     contact_regularization=0.0,
-                    articulated_contact_response=response,
+                    **steel_mode_options(response),
                 )
                 self.assertTrue(np.isfinite(state.body_q.numpy()).all())
                 self.assertLess(abs(drift), 2.0e-4)
@@ -2568,7 +2446,6 @@ class TestSteelFrictionPatches(unittest.TestCase):
                     model,
                     friction_anchor_beta=0.2,
                     iterations=64,
-                    solve_mode="matrix_free" if wp.is_cuda_available() else "split",
                 )
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
                 contacts = pipeline.contacts()
@@ -2587,54 +2464,19 @@ class TestSteelFrictionPatches(unittest.TestCase):
                 else:
                     self.assertGreater(angular_speed, 1.0)
 
-    def test_pooled_coulomb_budget(self):
-        """Share the loaded middle normal's budget across two unloaded anchor normals."""
-        self._check_pooled_projection("cpu", native=False)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
-    def test_native_pooled_coulomb_budget(self):
-        """Use the complete patch's normal load in native CUDA projection."""
-        self._check_pooled_projection("cuda:0", native=True)
-
-    def _check_pooled_projection(self, device, native):
-        capacity = 32  # Native row kernels use a full warp of storage.
-        count = wp.array([7], dtype=int, device=device)
-        diag = wp.ones((1, capacity), dtype=float, device=device)
-        matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device=device)
-        rhs = wp.array([[0, -100, 0, -4, 0, -100, 0] + [0] * 25], dtype=float, device=device)
-        impulses = wp.zeros((1, capacity), dtype=float, device=device)
-        rows = wp.array([[0, 2, 2, 0, 0, 2, 2] + [-1] * 25], dtype=int, device=device)
-        parents = wp.array([[3, 0, 0, 4, 0, 4, 4] + [-1] * 25], dtype=int, device=device)
-        mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25] + [0] * 25], dtype=float, device=device)
-        args = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, 0, 0]
-        if native:
-            kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
-            wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
-        else:
-            wp.launch(pgs_solve_loop, dim=1, inputs=[count, *args[1:]], device=device)
-        np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
-
-    def test_planar_patch_reduces_friction_rows(self):
-        """Retain a box face's four normals while using only two friction anchors."""
-        self._check_planar_patch("cpu", "split")
-
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_planar_patch_reduces_friction_rows(self):
-        """Solve the same patch layout with native split and fused kernels."""
-        for mode in ("split", "matrix_free"):
-            with self.subTest(mode=mode):
-                self._check_planar_patch("cuda:0", mode)
+        """Retain a box face's four normals while using only two friction anchors."""
+        self._check_planar_patch("cuda:0")
 
-    def _check_planar_patch(self, device, mode):
+    def _check_planar_patch(self, device):
         with wp.ScopedDevice(device):
             builder = newton.ModelBuilder()
             builder.add_ground_plane()
             body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.099), wp.quat_identity()))
             builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
             model = builder.finalize()
-            solver = newton.solvers.SolverSteel(
-                model, friction_anchor_beta=0.2, articulation_constraint_max=64, solve_mode=mode
-            )
+            solver = newton.solvers.SolverSteel(model, friction_anchor_beta=0.2, articulation_constraint_max=64)
             pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, contact_matching="latest")
             contacts = pipeline.contacts()
             state = model.state()
@@ -2708,7 +2550,7 @@ def _check_notified_friction_edit(test, device, replace, capture):
     body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=32)
+    solver = newton.solvers.SolverSteel(model, iterations=32)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
@@ -2816,7 +2658,7 @@ MU_ROLLING = 0.01
 
 
 SOLVER_OPTIONS = {
-    "solve_mode": "matrix_free",
+    "solve_mode": "serial",
     "articulated_contact_response": "immediate",
     "iterations": 16,
     "friction_anchor_beta": 0.0,
@@ -3791,7 +3633,6 @@ class TestSteelRollingFriction(unittest.TestCase):
 
     def test_unsupported_routes_are_rejected(self):
         rejected = (
-            {"solve_mode": "split"},
             {"friction_anchor_beta": 0.2},
             {"contact_warmstart": True},
             {"velocity_iterations": 2},
@@ -3841,7 +3682,7 @@ class TestSteelRollingFriction(unittest.TestCase):
 
 
 _PLAIN = {"articulated_contact_response": "propagation"}
-_COLORED = {"articulated_contact_response": "propagation_colored"}
+_COLORED = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
 # Rolling, sliding and spinning starts; the reference cases of test_trajectories_match_the_reference_joint_cone.
 _TRACK_CASES = (
     {"radius": 0.02, "mu_rolling": 0.01},
@@ -3910,8 +3751,7 @@ def turntable_spin(response, steps=8, on_solver=None):
     model.body_flags.assign(flags)
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         iterations=64,
         friction_anchor_beta=0.0,
         articulation_constraint_max=64,
@@ -4050,16 +3890,14 @@ class TestSteelRollingFrictionPropagation(unittest.TestCase):
                 )
                 rates[label] = spin_rate(scene)
                 if label == "both":
-                    trajectories[response["articulated_contact_response"]] = scene.run(40)
+                    trajectories[response.get("solve_mode", "serial")] = scene.run(40)
             with self.subTest(**response):
                 self.assertAlmostEqual(
                     rates["spin row"], mu_torsional * GRAVITY / inertia, delta=0.005 * rates["spin row"]
                 )
                 self.assertGreater(rates["torsion"], 0.5 * rates["spin row"])
                 self.assertAlmostEqual(rates["both"], rates["spin row"] + rates["torsion"], delta=0.01 * rates["both"])
-        np.testing.assert_allclose(
-            trajectories["propagation_colored"], trajectories["propagation"], rtol=0.0, atol=1.0e-5
-        )
+        np.testing.assert_allclose(trajectories["colored"], trajectories["serial"], rtol=0.0, atol=1.0e-5)
 
     def test_prescribed_spin_turns_a_resting_sphere(self):
         """A kinematic platform spins up a resting sphere through the spin row, as on immediate, with it folded."""
@@ -4072,7 +3910,7 @@ class TestSteelRollingFrictionPropagation(unittest.TestCase):
                     select_colored_variant(solver, v)
                     self.assertTrue(np.any(solver._body_prescribed.numpy()))
 
-                self.assertAlmostEqual(turntable_spin("propagation_colored", on_solver=check), expected, delta=1.0e-4)
+                self.assertAlmostEqual(turntable_spin("colored", on_solver=check), expected, delta=1.0e-4)
         self.assertAlmostEqual(turntable_spin("propagation"), expected, delta=1.0e-4)
 
     def test_graph_replay_matches_eager(self):
@@ -4308,8 +4146,8 @@ class _ModeScene:
         builder.replicate(world, worlds)
         self.model = builder.finalize(device="cuda:0")
         args = {
-            "solve_mode": "matrix_free",
-            "articulated_contact_response": response,
+            "solve_mode": "serial",
+            **steel_mode_options(response),
             "friction_mode": mode,
             "friction_anchor_beta": 0.0,
             "iterations": 32,
@@ -4359,7 +4197,7 @@ def _mode_trace(response, mode, steps, **kwargs):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestColoredFrictionModes(unittest.TestCase):
-    """``friction_mode`` other than fixed_normal with ``articulated_contact_response="propagation_colored"``."""
+    """``friction_mode`` other than fixed_normal with ``solve_mode="colored", articulated_contact_response="propagation"``."""
 
     SLIP = math.atan(_MODE_MU)
     TOLERANCE = 1.0e-4
@@ -4380,7 +4218,7 @@ class TestColoredFrictionModes(unittest.TestCase):
             for mode in _COUPLED_MODES:
                 with self.subTest(angle=angle, iterations=iterations, mode=mode):
                     immediate = _mode_trace("immediate", mode, 20, angle=angle, iterations=iterations)
-                    scene = _ModeScene("propagation_colored", mode, angle=angle, iterations=iterations)
+                    scene = _ModeScene("colored", mode, angle=angle, iterations=iterations)
                     colored = scene.run(20)
                     self._assert_no_lost_rows(scene)
                     np.testing.assert_allclose(colored, immediate, atol=self.TOLERANCE, rtol=0.0)
@@ -4400,8 +4238,8 @@ class TestColoredFrictionModes(unittest.TestCase):
             for mode in _COUPLED_MODES:
                 with self.subTest(angle=angle, iterations=iterations, mode=mode):
                     kwargs = {"angle": angle, "iterations": iterations}
-                    free = _mode_trace("propagation_colored", mode, 12, **kwargs)
-                    articulated = _mode_trace("propagation_colored", mode, 12, articulated=True, **kwargs)
+                    free = _mode_trace("colored", mode, 12, **kwargs)
+                    articulated = _mode_trace("colored", mode, 12, articulated=True, **kwargs)
                     np.testing.assert_allclose(articulated, free, atol=self.TOLERANCE, rtol=0.0)
                     if mode == "bisection":
                         immediate = _mode_trace("immediate", mode, 12, articulated=True, **kwargs)
@@ -4412,7 +4250,7 @@ class TestColoredFrictionModes(unittest.TestCase):
         for mode in _COUPLED_MODES:
             with self.subTest(mode=mode):
                 immediate = _mode_trace("immediate", mode, 120, scene="sphere")
-                colored = _mode_trace("propagation_colored", mode, 120, scene="sphere")
+                colored = _mode_trace("colored", mode, 120, scene="sphere")
                 np.testing.assert_allclose(colored, immediate, atol=self.TOLERANCE, rtol=0.0)
                 speed, spin = colored[-1, 0, 0], colored[-1, 0, 4]
                 self.assertAlmostEqual(speed, 2.0 * 5.0 / 7.0, delta=0.02)
@@ -4436,8 +4274,8 @@ class TestColoredFrictionModes(unittest.TestCase):
                 model = builder.finalize(device="cuda:0")
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
-                    articulated_contact_response="propagation_colored",
+                    solve_mode="colored",
+                    articulated_contact_response="propagation",
                     friction_mode=mode,
                     friction_anchor_beta=0.0,
                     iterations=32,
@@ -4470,7 +4308,7 @@ class TestColoredFrictionModes(unittest.TestCase):
             for variant in COLORED_VARIANTS:
                 with self.subTest(mode=mode, variant=variant):
                     trace = _ModeScene(
-                        "propagation_colored", mode, angle=self.SLIP + 0.05, iterations=4, worlds=2, variant=variant
+                        "colored", mode, angle=self.SLIP + 0.05, iterations=4, worlds=2, variant=variant
                     ).run(20)
                     if reference is None:
                         reference = trace
@@ -4483,9 +4321,7 @@ class TestColoredFrictionModes(unittest.TestCase):
         for mode in _COUPLED_MODES:
             with self.subTest(mode=mode):
                 runs = [
-                    _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=3, deterministic=True).run(
-                        30
-                    )
+                    _ModeScene("colored", mode, angle=self.SLIP + 0.05, worlds=3, deterministic=True).run(30)
                     for _ in range(2)
                 ]
                 np.testing.assert_array_equal(runs[0], runs[1])
@@ -4494,10 +4330,10 @@ class TestColoredFrictionModes(unittest.TestCase):
         """Replaying a captured step matches eager stepping bitwise in every mode."""
         for mode in _COUPLED_MODES:
             with self.subTest(mode=mode):
-                eager = _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
+                eager = _ModeScene("colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
                 eager.step(2)
                 expected = eager.run(10)
-                captured = _ModeScene("propagation_colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
+                captured = _ModeScene("colored", mode, angle=self.SLIP + 0.05, worlds=2, deterministic=True)
                 captured.step(2)
                 with wp.ScopedCapture(device="cuda:0") as capture:
                     captured.step()
@@ -4512,7 +4348,7 @@ class TestColoredFrictionModes(unittest.TestCase):
         for mode in _COUPLED_MODES:
             with self.subTest(mode=mode):
                 asleep = {}
-                for response in ("immediate", "propagation_colored"):
+                for response in ("immediate", "colored"):
                     scene = _ModeScene(response, mode, enable_sleeping=True, sleep_quiet_time=0.05)
                     awake = []
                     for _ in range(120):
@@ -4520,12 +4356,12 @@ class TestColoredFrictionModes(unittest.TestCase):
                         awake.append(bool(scene.solver._sleeping.body_awake.numpy()[0]))
                     asleep[response] = awake
                 self.assertFalse(asleep["immediate"][-1])
-                self.assertEqual(asleep["propagation_colored"], asleep["immediate"])
+                self.assertEqual(asleep["colored"], asleep["immediate"])
 
     def test_unsupported_combinations_are_rejected(self):
         """Colored keeps the immediate restrictions of the coupled modes; other propagation responses raise."""
         model = _ModeScene("immediate", "fixed_normal").model
-        base = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        base = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
         for mode in _COUPLED_MODES:
             with self.subTest(mode=mode):
                 SolverSteel(model, **base, friction_mode=mode, friction_anchor_beta=0.0)
@@ -4540,7 +4376,6 @@ class TestColoredFrictionModes(unittest.TestCase):
                 with self.assertRaises(NotImplementedError):
                     SolverSteel(
                         model,
-                        solve_mode="matrix_free",
                         articulated_contact_response="propagation",
                         friction_mode=mode,
                         friction_anchor_beta=0.0,
