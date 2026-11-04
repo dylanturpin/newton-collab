@@ -176,7 +176,12 @@ def _contact_arrays(contacts):
 
 
 # Tilts at which the support-mapping manifold already spans three contacts on these supports.
-_LEGACY_SPANNING = {("plane", (20.0, 0.0, 10.0)), ("box", (20.0, 0.0, 10.0))}
+_LEGACY_SPANNING = {
+    ("plane", (20.0, 0.0, 10.0)),
+    ("box", (20.0, 0.0, 10.0)),
+    ("plane", (7.0, 3.0, 0.0)),
+    ("box", (7.0, 3.0, 0.0)),
+}
 
 
 def test_rounded_hull_rests_on_face(test, device):
