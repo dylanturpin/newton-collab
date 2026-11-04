@@ -75,6 +75,22 @@ class TestConvexDecompositionCache(unittest.TestCase):
         builder.approximate_meshes(method=method, shape_indices=[shape], raise_on_failure=raise_on_failure, **kwargs)
         return builder
 
+    def test_split_hull_budget_ignores_per_component_cache_entries(self):
+        """Keep a merged CoACD hull budget, split across components, apart from per-component cache entries."""
+        mesh = newton.Mesh(self.vertices, self.faces, maxhullvert=64)
+        settings = {
+            "threshold": 0.05,
+            "mcts_nodes": 20,
+            "mcts_iterations": 5,
+            "mcts_max_depth": 1,
+            "merge": True,
+            "max_convex_hull": 1,
+        }
+        per_component_key = _convex_cache.hash_inputs(mesh, "coacd", settings)
+        _convex_cache.write(self.cache_dir, per_component_key, [(self.vertices + 5, self.faces.copy())])
+        self._build(merge=True, max_convex_hull=1)
+        self.assertEqual(self.coacd.call_count, 1)
+
     def test_cache_reuses_parts_across_builders(self):
         """Reuse ordered parts without calling either backend on a cache hit."""
         for method, backend in (("coacd", self.coacd), ("vhacd", self.vhacd)):

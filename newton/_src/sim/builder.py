@@ -9977,7 +9977,14 @@ class ModelBuilder:
                             else {"maxNumVerticesPerCH": mesh.maxhullvert}
                         )
                         settings.update(remeshing_kwargs)
-                        cache_key = _convex_cache.hash_inputs(mesh, method, settings) if cache_dir is not None else None
+                        # A merged CoACD hull budget is split across the mesh's components, unlike upstream's
+                        # per-component limit; keep those decompositions apart in a shared cache.
+                        key_settings = settings
+                        if method == "coacd" and "max_convex_hull" in settings and settings.get("merge"):
+                            key_settings = {**settings, "hull_budget": "split_across_components"}
+                        cache_key = (
+                            _convex_cache.hash_inputs(mesh, method, key_settings) if cache_dir is not None else None
+                        )
                         decomposition = _convex_cache.try_load(cache_dir, cache_key) if cache_key is not None else None
                         if decomposition is None:
                             decomposition = []
