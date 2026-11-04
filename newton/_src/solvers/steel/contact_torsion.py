@@ -67,10 +67,7 @@ def configure_contact_torsion(solver):
     solver._contact_torsion_enabled = enabled
     # Plain propagation solves the torsion rows of its propagation contacts in a post-pass of each sweep;
     # colored propagation solves each inside its group's host unit.
-    solver._propagation_torsion_rows = enabled and solver._articulated_contact_response in (
-        "propagation",
-        "propagation_colored",
-    )
+    solver._propagation_torsion_rows = enabled and solver._articulated_contact_response == "propagation"
     solver._torsion_stats = {}
     if enabled:
         _validate_torsion_mode(solver)
@@ -81,14 +78,13 @@ def _validate_torsion_mode(solver):
     if (
         not solver.model.device.is_cuda
         or solver.model.requires_grad
-        or solver._solve_mode != "matrix_free"
         or solver._friction_mode != "fixed_normal"
         or solver._row_schedule != "interleaved"
         or solver._contact_warmstart
         or solver._contact_compliance
     ):
         raise ValueError(
-            "Contact torsion requires CUDA non-differentiable matrix_free/current/interleaved, without warmstart or "
+            "Contact torsion requires CUDA non-differentiable current/interleaved solving, without warmstart or "
             "compliance"
         )
     if solver._articulated_contact_response != "immediate" and solver._velocity_iterations > 0:

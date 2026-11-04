@@ -12,7 +12,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -64,7 +63,7 @@ def _box_on_ground(device, worlds=1):
     return builder.finalize(device=device)
 
 
-def test_capacity_failure_is_observable(test, device, solve_mode="matrix_free"):
+def test_capacity_failure_is_observable(test, device, solve_mode="serial"):
     """Flag dropped free-body contact rows until reset, without optional telemetry."""
     model = _box_on_ground(device)
     solver = SolverSteel(model, solve_mode=solve_mode, free_body_constraint_max=1, warn_constraint_overflow=False)
@@ -150,17 +149,6 @@ add_function_test(
 )
 
 
-for _name in ("test_capacity_failure_is_observable",):
-    add_function_test(
-        TestSteelCapacityStatusUpstream,
-        f"{_name}_split",
-        globals()[_name],
-        devices=get_test_devices(),
-        check_output=_name != "test_overflow_warning_is_printed_once",
-        solve_mode="split",
-    )
-
-
 def _driven_model(count=1, worlds=1, device="cpu"):
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     for _ in range(count):
@@ -177,62 +165,6 @@ def _driven_model(count=1, worlds=1, device="cpu"):
 
 
 class TestSteelSafety(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "requires the native tiled CUDA solver")
-    def test_partial_warp_capacity_preserves_world_boundaries(self):
-        """Keep partial-warp loads and stores inside each world's row allocation."""
-        device = wp.get_cuda_device()
-        for capacity in (33, 35, 40):
-            with self.subTest(capacity=capacity):
-                model = _driven_model(worlds=3, device=device)
-                with kernel_overrides({"pgs_kernel": "tiled_row"}):
-                    solver = SolverSteel(model, solve_mode="split", articulation_constraint_max=capacity)
-                initial = np.zeros((3, capacity), dtype=np.float32)
-                initial[2] = 1234.0  # Inactive world must remain untouched.
-                solver._constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))
-                solver._impulses.assign(initial)
-                solver._diag.fill_(2.0)
-                solver._C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (3, 1, 1)))
-                solver._rhs.fill_(-1.0)
-                solver._row_type.zero_()
-                solver._row_parent.zero_()
-                solver._row_mu.zero_()
-                solver._dispatch_dense_pgs_solve(iterations=1, friction_start_iteration=0)
-                expected = initial.copy()
-                expected[0] = 0.5
-                expected[1, 0] = 0.5
-                np.testing.assert_array_equal(solver._impulses.numpy(), expected)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "requires the native tiled CUDA solver")
-    def test_dense_capacity_beyond_static_shared_memory_builds(self):
-        """Solve a dense capacity whose packed Delassus triangle exceeds static shared memory."""
-        device = wp.get_cuda_device()
-        capacity = 256
-        model = _driven_model(worlds=2, device=device)
-        solver = SolverSteel(model, solve_mode="split", articulation_constraint_max=capacity)
-        self.assertEqual(solver._pgs_kernel, "loop")
-        self.assertIsNone(solver._pgs_solve_tiled_row_kernel)
-        state, output = model.state(), model.state()
-        solver.step(state, output, model.control(), None, 0.01)
-        self.assertTrue(np.isfinite(output.body_qd.numpy()).all())
-
-        solver._constraint_count.assign(np.array([capacity, 1], dtype=np.int32))
-        solver._impulses.zero_()
-        solver._diag.fill_(2.0)
-        solver._C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (2, 1, 1)))
-        solver._rhs.fill_(-1.0)
-        solver._row_type.zero_()
-        solver._row_parent.zero_()
-        solver._row_mu.zero_()
-        solver._dispatch_dense_pgs_solve(iterations=1, friction_start_iteration=0)
-        expected = np.zeros((2, capacity), dtype=np.float32)
-        expected[0] = 0.5
-        expected[1, 0] = 0.5
-        np.testing.assert_array_equal(solver._impulses.numpy(), expected)
-
-        with self.assertRaisesRegex(ValueError, "shared memory"):
-            with kernel_overrides({"pgs_kernel": "tiled_row"}):
-                SolverSteel(model, solve_mode="split", articulation_constraint_max=capacity)
-
     def test_partial_reset_refreshes_only_selected_mass_factors(self):
         """Preserve factor reuse in worlds outside a partial episode reset."""
         devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
@@ -750,16 +682,16 @@ class TestSteelRowAllocation(unittest.TestCase):
         model.rigid_contact_max = 256
         dense_routed = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             articulation_constraint_max=320,
             free_body_constraint_max=256,
         )
         self.assertEqual(int(dense_routed._articulation_constraint_max), 320)
         propagation_routed = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             articulation_constraint_max=320,
             free_body_constraint_max=256,
             propagation_same_articulation_rows=True,
@@ -780,7 +712,7 @@ class TestSteelRowAllocation(unittest.TestCase):
         builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize()
         model.rigid_contact_max = 256
-        kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        kwargs = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
         summed = newton.solvers.SolverSteel(
             model, articulation_constraint_max=32, free_body_constraint_max=256, **kwargs
         )
@@ -799,9 +731,7 @@ class TestSteelRowAllocation(unittest.TestCase):
         with self.assertRaises(ValueError):
             newton.solvers.SolverSteel(model, propagation_constraint_max=0, **kwargs)
         with self.assertRaises(ValueError):
-            newton.solvers.SolverSteel(
-                model, solve_mode="matrix_free", articulated_contact_response="immediate", propagation_constraint_max=64
-            )
+            newton.solvers.SolverSteel(model, articulated_contact_response="immediate", propagation_constraint_max=64)
 
     def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget(self):
         """With the propagation family sized to the contacts, a tiny free-body budget drops no contact rows."""
@@ -824,8 +754,8 @@ class TestSteelRowAllocation(unittest.TestCase):
         def dropped(**options):
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
-                articulated_contact_response="propagation_colored",
+                solve_mode="colored",
+                articulated_contact_response="propagation",
                 free_body_constraint_max=4,
                 row_watermark=True,
                 warn_constraint_overflow=False,
@@ -969,7 +899,7 @@ def _build_chain_worlds(world_link_counts: list[int], device, root_height=1.0, f
     return scene.finalize(device=device)
 
 
-def _final_joint_q(model, steps=60, solve_mode="matrix_free", response="immediate", from_fk=False):
+def _final_joint_q(model, steps=60, solve_mode="serial", response="immediate", from_fk=False):
     solver = SolverSteel(
         model, solve_mode=solve_mode, articulation_constraint_max=64, articulated_contact_response=response
     )
@@ -989,31 +919,17 @@ def _final_joint_q(model, steps=60, solve_mode="matrix_free", response="immediat
 
 def test_hetero_matrix_free_constructs(test, device):
     """Construct on worlds whose DOF counts differ."""
-    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device), solve_mode="matrix_free")
+    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [1, 3, 1, 3])
 
 
 def test_homogeneous_matrix_free_constructs(test, device):
     """Construct on worlds with identical DOF counts."""
-    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device), solve_mode="matrix_free")
+    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
 
-def test_hetero_split_constructs(test, device):
-    """Construct the split solve on worlds whose DOF counts differ."""
-    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device), solve_mode="split")
-    test.assertEqual(solver._solve_mode, "split")
-    test.assertEqual(solver._size_groups, [3, 1])
-
-
-def test_homogeneous_split_constructs(test, device):
-    """Construct the split solve on worlds with identical DOF counts."""
-    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device), solve_mode="split")
-    test.assertEqual(solver._solve_mode, "split")
-    test.assertEqual(solver._size_groups, [3])
-
-
-def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="matrix_free"):
+def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="serial"):
     """Simulate each world of a heterogeneous model exactly as it simulates alone."""
     combined = _final_joint_q(_build_chain_worlds([1, 3], device), solve_mode=solve_mode)
     single = _final_joint_q(_build_chain_worlds([1], device), solve_mode=solve_mode)
@@ -1024,10 +940,11 @@ def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="matrix_fr
 def test_homogeneous_propagation_constructs(test, device):
     """Construct every propagation response on worlds with identical DOF counts."""
     model = _build_chain_worlds([3, 3, 3, 3], device)
-    for response in ("propagation", "propagation_colored"):
-        with test.subTest(response=response):
-            solver = SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=response)
-            test.assertEqual(solver._articulated_contact_response, response)
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            solver = SolverSteel(model, solve_mode=solve_mode, articulated_contact_response="propagation")
+            test.assertEqual(solver._solve_mode, solve_mode)
+            test.assertEqual(solver._articulated_contact_response, "propagation")
             np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
 
@@ -1037,21 +954,21 @@ def test_hetero_propagation_matches_isolated_worlds(test, device):
     The chains hang low enough to hit the ground, so every world solves propagation contact rows.
     """
 
-    def run(link_counts, free_box, response):
+    def run(link_counts, free_box, solve_mode):
         model = _build_chain_worlds(link_counts, device, 0.35, free_box)
-        return _final_joint_q(model, response=response, from_fk=True)
+        return _final_joint_q(model, solve_mode=solve_mode, response="propagation", from_fk=True)
 
-    for response in ("propagation", "propagation_colored"):
-        with test.subTest(response=response):
-            combined = run([1, 3], None, response)
-            single = run([1], None, response)
-            triple = run([3], None, response)
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            combined = run([1, 3], None, solve_mode)
+            single = run([1], None, solve_mode)
+            triple = run([3], None, solve_mode)
             # The cached response sizes its reductions by the model's body capacity, so the sums reassociate.
             np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-4)
             # One articulation size, with a free box that still makes the world DOF counts differ.
-            combined = run([3, 3], [False, True], response)
-            plain = run([3], [False], response)
-            boxed = run([3], [True], response)
+            combined = run([3, 3], [False, True], solve_mode)
+            plain = run([3], [False], solve_mode)
+            boxed = run([3], [True], solve_mode)
             np.testing.assert_allclose(combined, np.concatenate([plain, boxed]), rtol=0.0, atol=1.0e-4)
 
 
@@ -1061,15 +978,15 @@ def test_hetero_propagation_keeps_the_next_world_velocities(test, device):
     The first chain lies on the ground and solves many rows; the second hangs clear above a resting box.
     """
 
-    def run(root_height, free_box, response):
+    def run(root_height, free_box, solve_mode):
         model = _build_chain_worlds([3] * len(free_box), device, root_height, free_box)
-        return _final_joint_q(model, response=response, from_fk=True)
+        return _final_joint_q(model, solve_mode=solve_mode, response="propagation", from_fk=True)
 
-    for response in ("propagation", "propagation_colored"):
-        with test.subTest(response=response):
-            combined = run([0.03, 2.0], [False, True], response)
-            lying = run([0.03], [False], response)
-            hanging = run([2.0], [True], response)
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            combined = run([0.03, 2.0], [False, True], solve_mode)
+            lying = run([0.03], [False], solve_mode)
+            hanging = run([2.0], [True], solve_mode)
             np.testing.assert_allclose(combined, np.concatenate([lying, hanging]), rtol=0.0, atol=1.0e-4)
 
 
@@ -1095,31 +1012,6 @@ add_function_test(
     "test_hetero_worlds_match_isolated_worlds",
     test_hetero_worlds_match_isolated_worlds,
     devices=devices,
-)
-
-
-split_devices = get_test_devices()
-
-
-add_function_test(
-    TestSteelHeteroWorlds, "test_hetero_split_constructs", test_hetero_split_constructs, devices=split_devices
-)
-
-
-add_function_test(
-    TestSteelHeteroWorlds,
-    "test_homogeneous_split_constructs",
-    test_homogeneous_split_constructs,
-    devices=split_devices,
-)
-
-
-add_function_test(
-    TestSteelHeteroWorlds,
-    "test_hetero_worlds_match_isolated_worlds_split",
-    test_hetero_worlds_match_isolated_worlds,
-    devices=split_devices,
-    solve_mode="split",
 )
 
 

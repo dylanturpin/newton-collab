@@ -20,7 +20,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.kernels import PROPAGATION_UNIT_META, PROPAGATION_UNIT_RING
 from newton._src.solvers.steel.solver_steel import (
     PROPAGATION_COLOR_TAIL,
@@ -35,6 +34,7 @@ from newton.tests.steel._fixtures import (
     _build_scissor_model,
     _contact_rows,
     set_torsion_radius,
+    steel_mode_options,
 )
 from newton.tests.unittest_utils import LIBC
 
@@ -207,8 +207,7 @@ def _make_solver(
 ) -> SolverSteel:
     return SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         iterations=8,
         contact_warmstart=False,
         propagation_cached_response=cached,
@@ -329,7 +328,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         cls.model_fixed = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=True)
 
     def test_cached_path_detected(self):
-        solver = _make_solver(self.model_multi, "propagation_colored", cached=True)
+        solver = _make_solver(self.model_multi, "colored", cached=True)
         self.assertTrue(solver._propagation_cached_response_active)
         self.assertIsNotNone(solver._propagation_cached_gemv_kernel)
         self.assertIsNotNone(solver._propagation_cache_R)
@@ -349,7 +348,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         # eligibility must exclude nothing here: all arts are free-root trees
         self.assertTrue(np.all(solver._propagation_cache_art_eligible.numpy() == 1))
 
-        off = _make_solver(self.model_multi, "propagation_colored", cached=False)
+        off = _make_solver(self.model_multi, "colored", cached=False)
         self.assertFalse(off._propagation_cached_response_active)
         self.assertIsNone(off._propagation_cache_R)
 
@@ -365,13 +364,13 @@ class TestPropagationCachedResponse(unittest.TestCase):
 
     def test_lockstep_multi_contact_bodies(self):
         """Three contact spheres per articulation: cross blocks B_ab are live."""
-        stats, _, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_multi, "colored", 40)
         self.assertTrue(np.all(test._propagation_cache_world_flag.numpy() == 1))
         self._assert_stats(stats, expect_min_bodies=2)
 
     def test_lockstep_second_size_group(self):
         """Two articulations per world -> two DOF-size groups, both cached."""
-        stats, _, test = _run_lockstep(self, self.model_two_groups, "propagation_colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_two_groups, "colored", 40)
         sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 2, f"expected two size groups, got {sizes}")
         for size in sizes:
@@ -393,7 +392,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         every table-mounted robot — takes the other one, so gate it
         explicitly against the tree walk on the same contact-rich scene.
         """
-        stats, _, test = _run_lockstep(self, self.model_fixed, "propagation_colored", 40)
+        stats, _, test = _run_lockstep(self, self.model_fixed, "colored", 40)
         sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
         for size in sizes:
             # A fully single-DOF group takes the plain fixed-base extraction
@@ -411,7 +410,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
     def test_overflow_falls_back_to_tree_walk(self):
         """Cache capacity below the active-body count: every world must take
         the device-side tree-walk fallback and match the cached=False run."""
-        stats, ref, test = _run_lockstep(self, self.model_multi, "propagation_colored", 40, cache_max_bodies=2)
+        stats, ref, test = _run_lockstep(self, self.model_multi, "colored", 40, cache_max_bodies=2)
         self.assertTrue(test._propagation_cached_response_active)
         self.assertEqual(test._propagation_cache_max_bodies, 2)
         flags = test._propagation_cache_world_flag.numpy()
@@ -436,7 +435,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         """
         model = _build_clutter_model(self.device, n_boxes=2)
         stats, ref, test = _run_lockstep(
-            self, model, "propagation_colored", 40, cache_max_bodies=4, articulation_constraint_max=128
+            self, model, "colored", 40, cache_max_bodies=4, articulation_constraint_max=128
         )
         self.assertTrue(test._propagation_cached_response_active)
         counts = ref._propagation_body_count.numpy()
@@ -479,7 +478,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         wrench j at body b; B_ab column j is the resulting COM twist delta at
         body a. Both fall out of _ref_propagate run at zero initial velocity.
         """
-        solver = _make_solver(model, "propagation_colored", cached=True)
+        solver = _make_solver(model, "colored", cached=True)
         state_in, state_out = model.state(), model.state()
         control = model.control()
         state_in.joint_qd.assign(_seed_joint_qd(model))
@@ -545,7 +544,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
     def test_impulses_consumed(self):
         """Deferred body impulses must be cleared by the GEMV each iteration."""
         model = self.model_multi
-        solver = _make_solver(model, "propagation_colored", cached=True)
+        solver = _make_solver(model, "colored", cached=True)
         state_in, state_out = model.state(), model.state()
         control = model.control()
         state_in.joint_qd.assign(_seed_joint_qd(model))
@@ -690,11 +689,11 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
 
     def test_colored_is_bitwise_repeatable(self):
         """Repeat colored steps bitwise across runs and identical worlds."""
-        self._assert_repeatable("propagation_colored", mu=0.7)
+        self._assert_repeatable("colored", mu=0.7)
 
     def test_colored_frictionless_is_bitwise_repeatable(self):
         """Repeat frictionless colored steps bitwise across runs and identical worlds."""
-        self._assert_repeatable("propagation_colored", mu=0.0)
+        self._assert_repeatable("colored", mu=0.0)
 
     def test_plain_frictionless_is_bitwise_repeatable(self):
         """Repeat frictionless plain propagation steps bitwise across runs and identical worlds."""
@@ -703,7 +702,7 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
     def test_body_list_is_sorted_within_partitions(self):
         """Sort each partition of the body list by body index and keep the slot map its inverse."""
         model = _build_clutter_model("cuda:0", n_boxes=2)
-        for response in ("propagation", "propagation_colored"):
+        for response in ("propagation", "colored"):
             _, solver, _ = _cached_rollout(model, response, 20, cache_max_bodies=4)
             counts = solver._propagation_body_count.numpy()
             split = solver._propagation_cache_body_count.numpy()
@@ -720,10 +719,10 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
     def test_slot_order_changes_the_cached_sum(self):
         """Fail-before reproducer: a fixed descending slot order changes the result, so claim order mattered."""
         model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        ascending, _, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        ascending, _, _ = _cached_rollout(model, "colored", self.STEPS)
         module = inspect.getmodule(SolverSteel)
         with patch.object(module, "rank_propagation_body_map", _rank_propagation_body_map_descending):
-            descending, _, max_active = _cached_rollout(model, "propagation_colored", self.STEPS)
+            descending, _, max_active = _cached_rollout(model, "colored", self.STEPS)
         self.assertGreaterEqual(max_active, 2)
         differs = np.any(ascending != descending, axis=1)
         self.assertTrue(differs.any(), "slot order did not reach the cached sum")
@@ -734,7 +733,7 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
     def test_adverse_claim_order_gives_the_same_step(self):
         """Claiming bodies in reverse row order must not change any result."""
         model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        reference, _, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        reference, _, _ = _cached_rollout(model, "colored", self.STEPS)
         module = inspect.getmodule(SolverSteel)
         launch = wp.launch
 
@@ -744,7 +743,7 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
             return launch(kernel, dim, *args, **kwargs)
 
         with patch.object(module.wp, "launch", adverse_launch):
-            adverse, solver, max_active = _cached_rollout(model, "propagation_colored", self.STEPS)
+            adverse, solver, max_active = _cached_rollout(model, "colored", self.STEPS)
         self.assertGreaterEqual(max_active, 2)
         np.testing.assert_array_equal(adverse, reference)
         claimed = solver._propagation_body_claim_list.numpy()
@@ -762,8 +761,8 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
         q = model.joint_q.numpy()
         q[model.joint_coord_count // 2 :] = np.array([0.0, -0.6, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         model.joint_q.assign(q)
-        first, solver, _ = _cached_rollout(model, "propagation_colored", 20)
-        second, _, _ = _cached_rollout(model, "propagation_colored", 20)
+        first, solver, _ = _cached_rollout(model, "colored", 20)
+        second, _, _ = _cached_rollout(model, "colored", 20)
         np.testing.assert_array_equal(first, second)
         self.assertTrue(np.isfinite(first).all())
         np.testing.assert_array_equal(solver._propagation_body_count.numpy(), [0, 1])
@@ -773,11 +772,11 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
     def test_cache_capacity_boundary(self):
         """At exactly the cap the world stays cached and matches the tree walk; one over the cap falls back."""
         model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        _, solver, _ = _cached_rollout(model, "propagation_colored", self.STEPS)
+        _, solver, _ = _cached_rollout(model, "colored", self.STEPS)
         active = int(solver._propagation_cache_body_count.numpy().min())
         self.assertGreaterEqual(active, 2)
         for cap in (active, active - 1):
-            stats, _, test = _run_lockstep(self, model, "propagation_colored", 30, cache_max_bodies=cap)
+            stats, _, test = _run_lockstep(self, model, "colored", 30, cache_max_bodies=cap)
             flags = test._propagation_cache_world_flag.numpy()
             counts = test._propagation_cache_body_count.numpy()
             np.testing.assert_array_equal(flags, (counts <= cap).astype(flags.dtype), err_msg=f"cap {cap}")
@@ -787,12 +786,12 @@ class TestPropagationBodyMapOrder(unittest.TestCase):
                 self.assertTrue(np.any(counts > cap), f"no world over cap {cap}: counts {counts}")
             for key, diff in stats.max_diffs.items():
                 self.assertLessEqual(diff, TestPropagationCachedResponse.TOL, f"cap {cap} {key}: {diff:.3e}")
-            first, _, _ = _cached_rollout(model, "propagation_colored", 30, cache_max_bodies=cap)
-            second, _, _ = _cached_rollout(model, "propagation_colored", 30, cache_max_bodies=cap)
+            first, _, _ = _cached_rollout(model, "colored", 30, cache_max_bodies=cap)
+            second, _, _ = _cached_rollout(model, "colored", 30, cache_max_bodies=cap)
             np.testing.assert_array_equal(first, second, err_msg=f"cap {cap}")
 
 
-PROPAGATION_RESPONSES = ("propagation", "propagation_colored")
+PROPAGATION_RESPONSES = ("propagation", "colored")
 
 
 REGULARIZED = {"baumgarte": 0.0, "cfm": 0.0, "contact_regularization": 3.0}
@@ -802,7 +801,7 @@ REGULARIZED = {"baumgarte": 0.0, "cfm": 0.0, "contact_regularization": 3.0}
 PROPAGATION_ROUTES = (
     ("propagation", False),
     ("propagation", True),
-    ("propagation_colored", False),
+    ("colored", False),
 )
 
 
@@ -916,8 +915,7 @@ def _linkage_gripper_model(device):
 def _solver(model, response, iterations, cached=False, **kwargs):
     return SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         propagation_cached_response=cached,
         friction_anchor_beta=0.0,
         articulation_constraint_max=96,
@@ -948,7 +946,7 @@ class TestPropagationSharedBody(unittest.TestCase):
         """Rows of every world touch a shared jointless floor as static geometry and leave its scratch untouched."""
         model, floor = _build_shared_floor_model(wp.get_cuda_device())
         floor_shapes = np.flatnonzero(model.shape_body.numpy() == floor)
-        for response in ("propagation", "propagation_colored"):
+        for response in ("propagation", "colored"):
             with self.subTest(response=response):
                 solver = _make_solver(model, response, cached=False)
                 pipeline = newton.CollisionPipeline(model)
@@ -992,7 +990,7 @@ class TestPropagationCoupledContacts(unittest.TestCase):
         for serial in (False, True):
             with self.subTest(serial=serial):
                 # The colored response always maps its row-bearing bodies, which the serial kernel reads.
-                solver = _solver(model, "propagation_colored", 1, baumgarte=0.0, cfm=0.0)
+                solver = _solver(model, "colored", 1, baumgarte=0.0, cfm=0.0)
                 if serial:
                     _force_serial_fallback(solver)
                 list(_rollout(model, solver, np.array([-1.0], dtype=np.float32), 1))
@@ -1009,7 +1007,7 @@ class TestPropagationCoupledContacts(unittest.TestCase):
         for serial in (False, True):
             with self.subTest(serial=serial):
                 # The colored response always maps its row-bearing bodies, which the serial kernel reads.
-                solver = _solver(model, "propagation_colored", 1)
+                solver = _solver(model, "colored", 1)
                 self.assertIsNotNone(solver._response_tree_warp_kernels_by_size[int(solver._size_groups[0])])
                 if serial:
                     _force_serial_fallback(solver)
@@ -1068,8 +1066,7 @@ class TestPropagationCoupledContacts(unittest.TestCase):
             with self.subTest(response=response):
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
-                    articulated_contact_response=response,
+                    **steel_mode_options(response),
                     iterations=64,
                     friction_anchor_beta=0.0,
                     contact_friction_gap_max=0.001,
@@ -1141,8 +1138,7 @@ def _zero_iteration_step(model: newton.Model, solver: SolverSteel):
 def _make_solver_propagation_same_articulation(model: newton.Model, mode: str, **kwargs) -> SolverSteel:
     return SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=mode,
+        **steel_mode_options(mode),
         iterations=0,
         velocity_iterations=0,
         contact_friction_scale=0.0,
@@ -1245,7 +1241,7 @@ def _propagation_operator_diag(solver: SolverSteel) -> np.ndarray:
     return diag
 
 
-SAME_ARTICULATION_RESPONSES = ("propagation", "propagation_colored")
+SAME_ARTICULATION_RESPONSES = ("propagation", "colored")
 
 
 def _closing_gripper_model(world_count: int) -> newton.Model:
@@ -1374,8 +1370,7 @@ class TestPropagationSameArticulation(unittest.TestCase):
             with self.subTest(response=response):
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
-                    articulated_contact_response=response,
+                    **steel_mode_options(response),
                     propagation_same_articulation_rows=True,
                     iterations=1,
                     articulation_constraint_max=64,
@@ -1415,8 +1410,7 @@ def _make_solver_propagation_free_root_warp(model: newton.Model, response: str) 
     # cached-response GEMV replacement has its own equivalence gate in this module.
     return SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         iterations=8,
         contact_warmstart=False,
         propagation_cached_response=False,
@@ -1546,7 +1540,7 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         cls.model_free = _build_free_root_chain_model(cls.device, base_z=2.0, contact_sphere=None, ground=False)
 
     def test_free_root_shape_detected(self):
-        solver = _make_solver_propagation_free_root_warp(self.model_free, "propagation_colored")
+        solver = _make_solver_propagation_free_root_warp(self.model_free, "colored")
         sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
         self.assertEqual(len(sizes), 1)
         size = sizes[0]
@@ -1565,8 +1559,8 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         both solvers reach bitwise-identical states and tree factorizations
         are computed from identical inputs.
         """
-        solver_w = _make_solver_propagation_free_root_warp(self.model_free, "propagation_colored")
-        solver_s = _make_solver_propagation_free_root_warp(self.model_free, "propagation_colored")
+        solver_w = _make_solver_propagation_free_root_warp(self.model_free, "colored")
+        solver_s = _make_solver_propagation_free_root_warp(self.model_free, "colored")
         _force_serial_fallback(solver_s)
         state_w = _step_n(self.model_free, solver_w, n_steps)
         state_s = _step_n(self.model_free, solver_s, n_steps)
@@ -1700,7 +1694,7 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
         """
         for contact_sphere, base_z in (("base", 0.115), ("deep", 0.12)):
             model = _build_free_root_chain_model(self.device, base_z=base_z, contact_sphere=contact_sphere, ground=True)
-            for response in ("propagation_colored", "propagation"):
+            for response in ("colored", "propagation"):
                 with self.subTest(contact=contact_sphere, articulated_contact_response=response):
                     results = {}
                     for mode in ("warp", "serial", "serial2"):
@@ -1755,8 +1749,8 @@ def _solver_colored_pipeline(model, env, regularization=0.0):
                 os.environ.pop(key, None)
         return newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             iterations=8,
             free_body_constraint_max=8192,
             articulation_constraint_max=64,
@@ -1935,8 +1929,8 @@ def _settle(model, steps=12, **solver_kwargs):
     model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response="propagation_colored",
+        solve_mode="colored",
+        articulated_contact_response="propagation",
         iterations=6,
         free_body_constraint_max=8192,
         articulation_constraint_max=64,
@@ -2115,7 +2109,6 @@ class TestSteelColoredScheduling(unittest.TestCase):
         model_ref.rigid_contact_max = 8192
         solver = newton.solvers.SolverSteel(
             model_ref,
-            solve_mode="matrix_free",
             articulated_contact_response="immediate",
             iterations=6,
             free_body_constraint_max=8192,
@@ -2161,8 +2154,8 @@ class TestSteelColoredScheduling(unittest.TestCase):
                 getattr(state_in, name).assign(getattr(state, name))
             trial = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
-                articulated_contact_response="propagation_colored",
+                solve_mode="colored",
+                articulated_contact_response="propagation",
                 iterations=6,
                 contact_warmstart=False,
                 free_body_constraint_max=8192,
@@ -2210,8 +2203,8 @@ class TestSteelColoredScheduling(unittest.TestCase):
         model.rigid_contact_max = 256
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             free_body_constraint_max=256,
         )
         prescribed = solver._body_prescribed.numpy()
@@ -2329,7 +2322,7 @@ class TestSteelColoredScheduling(unittest.TestCase):
         """Reject an unknown propagation_color_order and keep the option read-only."""
         model, _ = _heap(nx=2, ny=2, nz=1)
         model.rigid_contact_max = 256
-        kwargs = {"solve_mode": "matrix_free", "articulated_contact_response": "propagation_colored"}
+        kwargs = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
         with self.assertRaisesRegex(ValueError, "propagation_color_order must be"):
             newton.solvers.SolverSteel(model, propagation_color_order="longest", **kwargs)
         solver = newton.solvers.SolverSteel(model, propagation_color_order="contact", **kwargs)
@@ -2343,8 +2336,8 @@ class TestSteelColoredScheduling(unittest.TestCase):
         model.rigid_contact_max = 65536
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
             free_body_constraint_max=32768,
             articulation_constraint_max=2048,
         )
@@ -2412,8 +2405,8 @@ _STATE_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
 
 def _colored_deterministic_solver(model, **kwargs):
     args = {
-        "solve_mode": "matrix_free",
-        "articulated_contact_response": "propagation_colored",
+        "solve_mode": "colored",
+        "articulated_contact_response": "propagation",
         "deterministic": True,
         "iterations": 16,
         "contact_regularization": 0.01,
@@ -2722,8 +2715,7 @@ class TestSteelColoredDeterministic(unittest.TestCase):
         def rollout(response):
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
-                articulated_contact_response=response,
+                **steel_mode_options(response),
                 deterministic=True,
                 velocity_iterations=velocity_iterations,
                 iterations=16,
@@ -2745,8 +2737,8 @@ class TestSteelColoredDeterministic(unittest.TestCase):
                 state_in, state_out = state_out, state_in
             return solver, contacts, state_in.body_qd.numpy().copy(), state_in.body_q.numpy().copy()
 
-        solver, contacts, body_qd, body_q = rollout("propagation_colored")
-        _, _, repeat_qd, repeat_q = rollout("propagation_colored")
+        solver, contacts, body_qd, body_q = rollout("colored")
+        _, _, repeat_qd, repeat_q = rollout("colored")
         np.testing.assert_array_equal(body_qd, repeat_qd)
         np.testing.assert_array_equal(body_q, repeat_q)
         immediate_qd = rollout("immediate")[2]
@@ -2865,8 +2857,7 @@ def _make_solver_colored_unit_capacity(model: newton.Model, response: str) -> So
     """Build a serial or colored propagation solver with six contact rows."""
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         iterations=8,
         contact_warmstart=False,
         propagation_cached_response=False,
@@ -2949,7 +2940,7 @@ class TestSteelColoredUnitCapacity(unittest.TestCase):
         """Match impulses, body velocity, and a short trajectory with mixed-length units."""
         device = "cuda:0"
         model = _build_mixed_gap_model(device)
-        colored = _make_solver_colored_unit_capacity(model, "propagation_colored")
+        colored = _make_solver_colored_unit_capacity(model, "colored")
         serial = _make_solver_colored_unit_capacity(model, "propagation")
         colored_in, colored_out = model.state(), model.state()
         serial_in, serial_out = model.state(), model.state()
@@ -2995,8 +2986,8 @@ class TestSteelColoredUnitCapacity(unittest.TestCase):
         """Replay a captured mixed-unit colored step with the same result as eager execution."""
         device = wp.get_device("cuda:0")
         model = _build_mixed_gap_model(str(device))
-        graph_solver = _make_solver_colored_unit_capacity(model, "propagation_colored")
-        eager_solver = _make_solver_colored_unit_capacity(model, "propagation_colored")
+        graph_solver = _make_solver_colored_unit_capacity(model, "colored")
+        eager_solver = _make_solver_colored_unit_capacity(model, "colored")
         graph_state, graph_out = model.state(), model.state()
         eager_state, eager_out = model.state(), model.state()
         initial_q, initial_qd = _seed_state(model, graph_state)
@@ -3175,17 +3166,15 @@ def _build_contact_model(device):
     return model
 
 
-def _solver_leaf_publication(model, *, enabled, mode="split", velocity_limits=False):
-    with kernel_overrides({"pgs_kernel": "loop"}):
-        solver = SolverSteel(
-            model,
-            solve_mode=mode,
-            iterations=8,
-            update_mass_matrix_interval=2,
-            use_parallel_streams=False,
-            enable_joint_velocity_limits=velocity_limits,
-            parallel_tree=enabled,
-        )
+def _solver_leaf_publication(model, *, enabled, velocity_limits=False):
+    solver = SolverSteel(
+        model,
+        iterations=8,
+        update_mass_matrix_interval=2,
+        use_parallel_streams=False,
+        enable_joint_velocity_limits=velocity_limits,
+        parallel_tree=enabled,
+    )
     if enabled and model.device.is_cuda:
         assert solver._tree_plan is not None
     if not enabled or model.device.is_cpu:
@@ -3202,10 +3191,8 @@ def _solver_leaf_publication(model, *, enabled, mode="split", velocity_limits=Fa
 
 
 def _fields(solver, state):
-    cache = solver._fk_id_cache
-
     def dynamics(name):
-        return getattr(solver, f"_{name}") if cache is None else getattr(cache, name)
+        return getattr(solver, f"_{name}")
 
     return {
         "body_q": state.body_q,
@@ -3234,7 +3221,7 @@ class TestLeafPublication(unittest.TestCase):
 
     def _check_graph_publication(self, model):
         device = model.device
-        solvers = [_solver_leaf_publication(model, enabled=value, mode="matrix_free") for value in (False, True)]
+        solvers = [_solver_leaf_publication(model, enabled=value) for value in (False, True)]
         inputs = {
             name: getattr(model, name)
             for name in (
@@ -3393,31 +3380,29 @@ class TestLeafPublication(unittest.TestCase):
 
     def test_cached_next_step_dynamics_and_reset(self):
         """Feed publication back into original dynamics across refresh/reuse and reset."""
-        self._check_cached_next_step_dynamics_and_reset("cpu", "split")
-        self._check_cached_next_step_dynamics_and_reset("cpu", "split", loaded=True)
+        self._check_cached_next_step_dynamics_and_reset("cpu")
+        self._check_cached_next_step_dynamics_and_reset("cpu", loaded=True)
 
     def test_cuda_cached_next_step_dynamics_and_reset(self):
-        """Preserve complete CUDA steps with matrix-free and snapshot-backed publication."""
+        """Preserve complete CUDA steps with cached publication."""
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("CUDA full-step coverage requires CUDA")
         for device in devices:
             self._check_current_frames_and_notifications(device)
-            for mode in ("matrix_free", "split"):
-                with self.subTest(device=str(device), mode=mode):
-                    self._check_cached_next_step_dynamics_and_reset(device, mode)
-                    self._check_cached_next_step_dynamics_and_reset(device, mode, loaded=True)
-            self._check_cached_next_step_dynamics_and_reset(device, "matrix_free", loaded=True, velocity_limits=True)
+            with self.subTest(device=str(device)):
+                self._check_cached_next_step_dynamics_and_reset(device)
+                self._check_cached_next_step_dynamics_and_reset(device, loaded=True)
+            self._check_cached_next_step_dynamics_and_reset(device, loaded=True, velocity_limits=True)
 
-    def _check_cached_next_step_dynamics_and_reset(self, device, mode, *, loaded=False, velocity_limits=False):
+    def _check_cached_next_step_dynamics_and_reset(self, device, *, loaded=False, velocity_limits=False):
         model = _build_contact_model(device) if loaded else _build_model_leaf_publication(device, leaves=4)[0]
         contact_capacity = 32 if loaded else 1
         model.rigid_contact_max = contact_capacity
         if velocity_limits:
             model.joint_velocity_limit.fill_(0.01)
         solvers = [
-            _solver_leaf_publication(model, enabled=value, mode=mode, velocity_limits=velocity_limits)
-            for value in (False, True)
+            _solver_leaf_publication(model, enabled=value, velocity_limits=velocity_limits) for value in (False, True)
         ]
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -3601,7 +3586,7 @@ class TestSteelTreePlan(unittest.TestCase):
     def test_complete_finger_levels_and_serial_group(self):
         """Schedule every finger segment and retain serial trees as one-lane groups."""
         model = _build_fingers(include_chain=True)
-        solver = SolverSteel(model, solve_mode="split", use_parallel_streams=False)
+        solver = SolverSteel(model, use_parallel_streams=False)
         plan = _SteelTreePlan.build(model, solver._articulation_joint_end)
         self.assertIsNotNone(plan)
         self.assertTrue(any(group.lanes > 1 for group in plan.groups))
@@ -3682,12 +3667,12 @@ class TestSteelTreePlan(unittest.TestCase):
     def test_serial_and_unsafe_topologies_fall_back(self):
         """Retain wholly serial, aliased, cross-articulation and loop topologies."""
         model, _, _ = _build_model_leaf_publication(chain=True)
-        solver = SolverSteel(model, solve_mode="split", use_parallel_streams=False)
+        solver = SolverSteel(model, use_parallel_streams=False)
         self.assertIsNone(_SteelTreePlan.build(model, solver._articulation_joint_end))
         for unsafe in ("alias", "foreign_parent", "loop"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
-                solver = SolverSteel(model, solve_mode="split", use_parallel_streams=False)
+                solver = SolverSteel(model, use_parallel_streams=False)
                 ends = solver._articulation_joint_end.numpy().copy()
                 if unsafe == "alias":
                     children = model.joint_child.numpy().copy()
@@ -3715,7 +3700,6 @@ class TestSteelTreeExecution(unittest.TestCase):
                 set_torsion_radius(model, 0.01)
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     parallel_tree=True,
                     contact_torsion_device=True,
                     friction_anchor_beta=0.0,
@@ -3741,9 +3725,7 @@ class TestSteelTreeExecution(unittest.TestCase):
                     model.joint_spring_stiffness.assign(np.linspace(0.3, 0.8, model.joint_dof_count, dtype=np.float32))
                     model.joint_spring_ref.fill_(0.1)
                     solvers = [
-                        _solver_leaf_publication(
-                            model, enabled=value, mode="matrix_free", velocity_limits=velocity_limits
-                        )
+                        _solver_leaf_publication(model, enabled=value, velocity_limits=velocity_limits)
                         for value in (False, True)
                     ]
                     states = [model.state() for _ in solvers]
@@ -3813,7 +3795,6 @@ class TestSteelTreeExecution(unittest.TestCase):
                     for parallel in (False, True):
                         solver = SolverSteel(
                             model,
-                            solve_mode="matrix_free",
                             iterations=8,
                             use_parallel_streams=False,
                             enable_joint_velocity_limits=velocity_limits,
@@ -3872,7 +3853,7 @@ class TestSteelTreeExecution(unittest.TestCase):
             self.skipTest("Parallel tree publication requires CUDA")
         for device in devices:
             model, _, _ = _build_branched_model(device, floating_root=True)
-            solver = _solver_leaf_publication(model, enabled=True, mode="matrix_free")
+            solver = _solver_leaf_publication(model, enabled=True)
             solver._fk_id_cache_enabled = False
             state = model.state()
             state.body_q.fill_(-123.25)
@@ -3969,7 +3950,7 @@ class TestPropagationMultiDofWarp(TestPropagationFreeRootWarp):
         cls.model_free = _build_ball_tree_model(cls.device)
 
     def test_free_root_shape_detected(self):
-        solver = _make_solver_propagation_free_root_warp(self.model_free, "propagation_colored")
+        solver = _make_solver_propagation_free_root_warp(self.model_free, "colored")
         size = next(int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0)
         self.assertFalse(solver._propagation_tree_single_dof_by_size[size])
         self.assertFalse(solver._propagation_tree_free_root_by_size[size])
@@ -4063,7 +4044,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
     def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
         """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
         solver = SolverSteel(
-            model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", **solver_options
+            model, solve_mode="colored", articulated_contact_response="propagation", **solver_options
         )
         self.assertTrue(solver._latency_fused)
         wide = [0]
@@ -4137,7 +4118,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
         # stage timing and kernel capture observe the per-pass launches, so latency mode steps aside for them
         model = _build_latency_scene("cuda:0")
         solver = SolverSteel(
-            model, solve_mode="matrix_free", articulated_contact_response="propagation_colored", iterations=4
+            model, solve_mode="colored", articulated_contact_response="propagation", iterations=4
         )
         self.assertTrue(solver._latency_fused)
         pipeline = newton.CollisionPipeline(model)
@@ -4175,8 +4156,8 @@ class TestLatencyFusedLoop(unittest.TestCase):
         scene.add_ground_plane()
         solver = SolverSteel(
             scene.finalize(device="cuda:0"),
-            solve_mode="matrix_free",
-            articulated_contact_response="propagation_colored",
+            solve_mode="colored",
+            articulated_contact_response="propagation",
         )
         self.assertFalse(solver._latency_fused)
 

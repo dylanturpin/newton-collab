@@ -177,7 +177,6 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
     if (
         not model.device.is_cuda
         or model.requires_grad
-        or solver._solve_mode != "matrix_free"
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._contact_compliance
@@ -185,7 +184,7 @@ def validate_free_rigid_angular_friction_mode(solver) -> None:
         or (solver._has_free_rigid_bodies and solver._pgs_solve_mf_gs_kernel is None)
     ):
         raise ValueError(
-            "Free-rigid angular friction (steel:condim above 3) requires CUDA non-differentiable matrix_free "
+            "Free-rigid angular friction (steel:condim above 3) requires CUDA non-differentiable "
             "solving with row_schedule='interleaved', friction_mode='fixed_normal', the fused matrix-free GS kernel, "
             "and no contact compliance"
         )
@@ -275,7 +274,6 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
     if (
         not model.device.is_cuda
         or model.requires_grad
-        or solver._solve_mode != "matrix_free"
         or solver._row_schedule != "interleaved"
         or solver._friction_mode != "fixed_normal"
         or solver._friction_anchors_enabled
@@ -285,7 +283,7 @@ def validate_torsional_rolling_friction_mode(solver) -> None:
         or (immediate and (solver._contact_torsion_enabled or solver._sleeping is not None))
     ):
         raise ValueError(
-            "enable_torsional_rolling_friction requires CUDA non-differentiable matrix_free/interleaved solving with "
+            "enable_torsional_rolling_friction requires CUDA non-differentiable interleaved solving with "
             "friction_mode='fixed_normal', point friction (friction_anchor_beta=0), and no warm start, velocity "
             "iterations or contact compliance; on 'immediate' also no contact torsion radius or sleeping"
         )

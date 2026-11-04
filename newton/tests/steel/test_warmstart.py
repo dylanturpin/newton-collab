@@ -56,7 +56,7 @@ def _run_press(
     steps: int,
     warm_kwargs: dict,
     contact_matching: str | None = "sticky",
-    solve_mode: str = "matrix_free",
+    solve_mode: str = "serial",
     articulated_contact_response: str = "immediate",
     propagation_cached_response: bool = True,
 ):
@@ -338,18 +338,11 @@ class TestSteelIdentityWarmstartKernel(unittest.TestCase):
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = newton.solvers.SolverSteel(model, solve_mode="split", contact_warmstart=True)
+        solver = newton.solvers.SolverSteel(model, contact_warmstart=True)
         solver.step(model.state(), model.state(), model.control(), None, 1.0 / 60.0)
 
-    def test_split_mode_holds_the_press(self):
-        """The identity carry works on the CPU-supported dense-row route."""
-        impulses, speeds, _ = _run_press(120, {"contact_warmstart": True}, solve_mode="split")
-        self.assertGreater(float(impulses[-1]), 0.0)
-        self.assertLess(float(np.ptp(impulses[-10:])), 1.0e-5)
-        self.assertLess(float(speeds[-10:].max()), 1.0e-4)
 
-
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelIdentityWarmstart(unittest.TestCase):
     def test_real_contact_insertion_moves_slots_without_cross_seeding(self):
         """A newly inserted lower-key contact shifts a persistent contact's real MF slot."""
@@ -364,7 +357,6 @@ class TestSteelIdentityWarmstart(unittest.TestCase):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=8,
             contact_warmstart=True,
         )
@@ -473,29 +465,31 @@ class TestSteelIdentityWarmstart(unittest.TestCase):
     def test_single_flag_enables_dense_and_mf_carry(self):
         """contact_warmstart=True is the single all-contact warm-start mode."""
         model = _build_press()
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", contact_warmstart=True, iterations=4)
+        solver = newton.solvers.SolverSteel(model, contact_warmstart=True, iterations=4)
         self.assertTrue(solver._contact_warmstart)
         self.assertTrue(solver._mf_warmstart_enabled)
 
     def test_propagation_routes_hold_static_press(self):
         """Serial, colored, and cached propagation install carried impulses once."""
         cases = (
-            ("propagation", False),
-            ("propagation_colored", False),
-            ("propagation_colored", True),
+            ("serial", False),
+            ("colored", False),
+            ("colored", True),
         )
-        for response, cached in cases:
-            with self.subTest(response=response, cached=cached):
+        for solve_mode, cached in cases:
+            with self.subTest(solve_mode=solve_mode, cached=cached):
                 cold, _, state_cold = _run_press(
                     160,
                     {},
-                    articulated_contact_response=response,
+                    solve_mode=solve_mode,
+                    articulated_contact_response="propagation",
                     propagation_cached_response=cached,
                 )
                 warm, speed, state_warm = _run_press(
                     160,
                     {"contact_warmstart": True},
-                    articulated_contact_response=response,
+                    solve_mode=solve_mode,
+                    articulated_contact_response="propagation",
                     propagation_cached_response=cached,
                 )
                 self.assertGreater(float(warm[-1]), 0.0)
@@ -578,7 +572,7 @@ def _seeded_sphere_impulses(solver, contacts, shapes, model, articulated, state_
     return seeds
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel matrix-free mode requires CUDA")
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverSteel requires CUDA")
 class TestSteelWarmstartProvenance(unittest.TestCase):
     """Warm start reads match indices only when they refer to the contact set it solved."""
 
@@ -703,7 +697,7 @@ class TestSteelWarmstartProvenance(unittest.TestCase):
                     self.assertAlmostEqual(got, want, delta=1.0e-6 * max(1.0, abs(want)))
 
 
-def _resting_box_rows(device, articulated: bool, solve_mode: str = "matrix_free", **solver_kwargs):
+def _resting_box_rows(device, articulated: bool, **solver_kwargs):
     """Settle a box on the ground with warm start; return the model, pipeline, contacts, solver and states.
 
     ``articulated`` mounts the box on a vertical prismatic joint, so its contacts are dense
@@ -723,9 +717,7 @@ def _resting_box_rows(device, articulated: bool, solve_mode: str = "matrix_free"
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverSteel(
-        model, solve_mode=solve_mode, contact_warmstart=True, iterations=12, **solver_kwargs
-    )
+    solver = newton.solvers.SolverSteel(model, contact_warmstart=True, iterations=12, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
     control = model.control()
@@ -777,17 +769,11 @@ def test_graph_replay_rescales_history_once_after_a_timestep_change(test, device
 
 def test_edited_warmstart_decay_reaches_every_row_family(test, device):
     """Seed dense and free-body rows with the edited decay, as a solver constructed with it reports."""
-    # Matrix-free mode runs on CUDA only.
-    solve_modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
-    for solve_mode, articulated, decay in itertools.product(solve_modes, (True, False), (0.0, 0.25)):
-        label = f"{solve_mode} {'articulated' if articulated else 'free'} decay={decay}"
+    for articulated, decay in itertools.product((True, False), (0.0, 0.25)):
+        label = f"{'articulated' if articulated else 'free'} decay={decay}"
         with test.subTest(label):
-            model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(
-                device, articulated, solve_mode
-            )
-            fresh = newton.solvers.SolverSteel(
-                model, solve_mode=solve_mode, contact_warmstart=True, contact_warmstart_decay=decay
-            )
+            model, pipeline, contacts, solver, state_0, state_1, control = _resting_box_rows(device, articulated)
+            fresh = newton.solvers.SolverSteel(model, contact_warmstart=True, contact_warmstart_decay=decay)
             impulses, row_type = (
                 (solver._impulses, solver._row_type) if articulated else (solver._mf_impulses, solver._mf_row_type)
             )
@@ -878,7 +864,7 @@ def test_substeps_reuse_contacts_with_their_own_history(test, device):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", iterations=8, contact_warmstart=True)
+    solver = newton.solvers.SolverSteel(model, iterations=8, contact_warmstart=True)
     states = [model.state(), model.state()]
     control = model.control()
     dt = 1.0 / 240.0
@@ -997,9 +983,7 @@ def _stack(device, restitution=0.0, drop=False):
         deterministic=True,
         contact_matching="latest",
     )
-    solver = newton.solvers.SolverSteel(
-        model, solve_mode="matrix_free", iterations=8, velocity_iterations=2, contact_warmstart=True
-    )
+    solver = newton.solvers.SolverSteel(model, iterations=8, velocity_iterations=2, contact_warmstart=True)
     return model, pipeline, solver
 
 
@@ -1165,9 +1149,7 @@ def test_warm_carry_no_kick_after_dt_change_on_impact(test: unittest.TestCase, d
                 contact_matching="latest",
             )
             contacts = pipeline.contacts()
-            solver = newton.solvers.SolverSteel(
-                model, solve_mode="matrix_free", iterations=8, velocity_iterations=2, contact_warmstart=True
-            )
+            solver = newton.solvers.SolverSteel(model, iterations=8, velocity_iterations=2, contact_warmstart=True)
             s0, s1 = model.state(), model.state()
             control = model.control()
             newton.eval_fk(model, model.joint_q, model.joint_qd, s0)

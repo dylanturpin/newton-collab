@@ -253,23 +253,18 @@ repository examples spend tuning effort, not a shared solver API.
        ``contact_shared_anchor``, ``contact_friction_shared_anchor``,
        ``row_watermark``, ``row_schedule``, ``use_parallel_streams``,
        ``double_buffer``, ``friction_mode``.
-     - Experimental. The default ``solve_mode="matrix_free"`` requires CUDA and
-       implements every option. ``solve_mode="split"`` runs on CPU and CUDA (pass it
-       explicitly on CPU) and stores a dense ``articulation_constraint_max`` squared
-       Delassus matrix per world; it raises for joint velocity limits,
-       ``drive_mode="rows"``, mimic joints, loop-closing joints, friction
-       patches, contact regularization, velocity-only iterations, warm start,
-       restitution, contact torsion, contact compliance, sleeping, the
-       propagation contact responses, the non-interleaved ``row_schedule``
-       values and the non-default ``friction_mode`` values. Joint limits are enforced only with
+     - Experimental; runs on CUDA and, with world-serial kernels, on CPU. Steel never assembles the Delassus matrix: every
+       Gauss-Seidel row recomputes ``J v`` and uses only its diagonal. ``solve_mode``
+       sets the sweep order: ``"serial"`` (default) sweeps each world's rows in order,
+       and ``"colored"`` sweeps the propagation contact rows in parallel colors (it
+       requires ``articulated_contact_response="propagation"``; see below). Joint limits are enforced only with
        ``enable_joint_limits=True`` (off by default). Contacts and joint limits are hard
        constraints solved by projected Gauss-Seidel, so contact ``ke`` / ``kd``
        are not used; more ``iterations`` reduce residual penetration and
        slip, and ``baumgarte`` sets how much position error is corrected per
-       step. In the matrix-free solve, friction acts through persistent patches by
+       step. Friction acts through persistent patches by
        default (``friction_anchor_beta``), which hold static loads without creep;
-       ``friction_anchor_beta=0`` selects point friction, which the split solve
-       always uses. A small
+       ``friction_anchor_beta=0`` selects point friction. A small
        ``contact_regularization`` (for example ``0.02``) makes the
        normal-force split of redundant contacts unique and helps stacks hold at
        low iteration counts, at the cost of a small resting sag.
@@ -287,8 +282,7 @@ repository examples spend tuning effort, not a shared solver API.
        prepares these rows on the device, which CUDA graph capture requires.
        The experimental ``contact_compliance`` option solves hydroelastic
        contacts with positive stiffness as implicit spring-dampers instead, with
-       the ``"immediate"`` or ``"propagation_colored"`` articulated contact
-       response; it uses point friction, and a captured step reports its input
+       the ``"immediate"`` articulated contact response or ``solve_mode="colored"``; it uses point friction, and a captured step reports its input
        errors through ``validate_contact_compliance()`` after replay.
        Joint drives are integrated implicitly by default, which keeps large
        drive gains stable at ordinary ``dt``; ``drive_mode="rows"`` solves
@@ -314,8 +308,8 @@ repository examples spend tuning effort, not a shared solver API.
        before the sweep with a regularized Schur complement, which keeps closed chains
        nearly closed at low iteration counts. The regularization leaves a small
        residual (it is not exact elimination), and an unsupported articulation
-       disables elimination for the whole solver with a warning. In the
-       matrix-free solve, branched articulations of one shared
+       disables elimination for the whole solver with a warning. With the
+       immediate response, branched articulations of one shared
        topology select sparse mass factors automatically from the model's
        structure when contacts use hard point friction
        (``friction_anchor_beta=0``), not from a performance estimate
@@ -329,28 +323,28 @@ repository examples spend tuning effort, not a shared solver API.
        them; it saves work on scenes where many objects rest, and costs a few
        extra launches per step when nothing sleeps. ``articulated_contact_response``
        selects how contacts of articulated bodies are solved: ``"immediate"`` rows of
-       the generalized coordinates, or the matrix-free ``"propagation"`` responses,
-       which solve them as body-space rows and propagate their impulses through each
-       articulation tree. In ``"propagation"`` and ``"propagation_colored"`` every
+       the generalized coordinates, or the ``"propagation"`` response,
+       which solves them as body-space rows and propagates their impulses through each
+       articulation tree. With ``"propagation"`` every
        contact row, free bodies included, shares one family of ``free_body_constraint_max +
        articulation_constraint_max`` rows per world (a scene whose bodies are all free keeps a
        single dense row, since none of its rows can land there), or of
        ``propagation_constraint_max`` rows when that is set, which lets
        ``free_body_constraint_max`` shrink to the rows that stay matrix-free (the velocity-limit
-       rows). ``"propagation_colored"`` sweeps them in
+       rows). ``solve_mode="colored"`` sweeps them in
        parallel batches of contacts that share no responding body, which pays off on
        scenes with many contacts per world. A scene whose bodies are all free can also set
        ``articulation_constraint_max=1``: none of its rows can land on the dense family, and
-       that capacity still sizes per-body Jacobian blocks and per-world dense matrices.
+       that capacity still sizes per-body Jacobian blocks and per-world row buffers.
        ``propagation_cached_response`` replaces the
        per-iteration tree walk with cached per-body responses (on by default); which is
-       faster depends on the model. ``"propagation"`` rejects
-       contact compliance; the propagation responses reject loop-closing joints, and fall
+       faster depends on the model. The serial ``"propagation"`` sweep rejects
+       contact compliance; the propagation response rejects loop-closing joints, and falls
        back from bilateral pre-elimination to iterative mimic rows with a warning.
-       ``"propagation"`` and ``"propagation_colored"`` support
+       ``"propagation"`` supports, in both solve modes,
        contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
        ``enable_torsional_rolling_friction``, and ``deterministic=True``
-       (``"propagation_colored"`` without ``contact_warmstart``); ``"propagation_colored"``
+       (``solve_mode="colored"`` without ``contact_warmstart``); ``solve_mode="colored"``
        also supports sleeping and the ``friction_mode`` values other than ``"fixed_normal"``,
        which it applies to articulated contacts as well; ``enable_torsional_rolling_friction``
        requires ``"fixed_normal"`` and no contact compliance on every response.

@@ -189,51 +189,25 @@ class TestSteelLaunchConfig(unittest.TestCase):
         model = _build_chain_model(num_links=2, num_worlds=1)
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
         self.assertEqual(solver._articulated_contact_response, "propagation")
 
         for removed in ("bad", "propagation_fused"):
             with self.assertRaisesRegex(ValueError, f"articulated_contact_response must be .*got '{removed}'"):
-                SolverSteel(model, solve_mode="matrix_free", articulated_contact_response=removed)
-
-        with self.assertRaisesRegex(NotImplementedError, "solve_mode='matrix_free'"):
-            SolverSteel(model, solve_mode="split", articulated_contact_response="propagation")
+                SolverSteel(model, articulated_contact_response=removed)
 
         with self.assertRaisesRegex(NotImplementedError, "friction_mode='fixed_normal'"):
             SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 articulated_contact_response="propagation",
                 friction_mode="bisection",
             )
         propagation_debug = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
         )
         self.assertEqual(propagation_debug._articulated_contact_response, "propagation")
-
-    def test_joint_limit_solver_compatibility_validation(self):
-        model = _build_chain_model(num_links=2, num_worlds=1)
-
-        with self.assertRaisesRegex(NotImplementedError, "requires solve_mode='matrix_free'"):
-            SolverSteel(
-                model,
-                solve_mode="split",
-                enable_joint_velocity_limits=True,
-            )
-
-        for pgs_kernel in ("tiled_contact", "streaming"):
-            with self.subTest(pgs_kernel=pgs_kernel):
-                with self.assertRaisesRegex(ValueError, "contact-only"):
-                    with kernel_overrides({"pgs_kernel": pgs_kernel}):
-                        SolverSteel(
-                            model,
-                            solve_mode="split",
-                            enable_joint_limits=True,
-                        )
 
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
@@ -244,7 +218,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
             "_cholesky_kernels_by_size",
             "_triangular_solve_kernels_by_size",
             "_hinv_jt_kernels_by_size",
-            "_hinv_jt_fused_kernels_by_size",
         ):
             implicit_kernels = getattr(implicit, attr)
             explicit_kernels = getattr(explicit, attr)
@@ -269,7 +242,7 @@ class TestSteelLaunchConfig(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "compact response mapping requires CUDA matrix-free mode")
     def test_compact_world_dof_mapping_pads_heterogeneous_worlds(self):
-        solver = SolverSteel(_build_heterogeneous_world_model(), solve_mode="matrix_free")
+        solver = SolverSteel(_build_heterogeneous_world_model())
         self.assertEqual(solver._max_world_dofs, 6)
         np.testing.assert_array_equal(solver._world_dof_count.numpy(), np.array((6, 1), dtype=np.int32))
         indices = solver._world_dof_indices.numpy()
@@ -341,28 +314,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
                 small_dof_threshold=12,
                 tile_threads=64,
             )
-
-    def test_hinv_fusion_requires_full_working_set_to_fit(self):
-        fitting = _SteelExecutionPlan.build(
-            [23],
-            max_constraints=64,
-            max_shared_memory=101376,
-            cholesky_kernel="auto",
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        oversized = _SteelExecutionPlan.build(
-            [23],
-            max_constraints=384,
-            max_shared_memory=101376,
-            cholesky_kernel="auto",
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertTrue(fitting.use_fused_hinv_jt(23))
-        self.assertFalse(oversized.use_fused_hinv_jt(23))
 
     def test_cholesky_execution_plan_respects_shared_memory(self):
         """Fall back for oversized auto tiles and reject forced invalid launches."""
@@ -438,7 +389,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
         model = _build_sparse_diagonal_pair_model(device="cuda:0")
         optimized = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulation_constraint_max=64,
             free_body_constraint_max=32,
             iterations=8,
@@ -448,7 +398,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
         )
         reference = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulation_constraint_max=64,
             free_body_constraint_max=32,
             iterations=8,
@@ -505,7 +454,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
         def make_solver(**kwargs):
             return SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 articulation_constraint_max=96,
                 free_body_constraint_max=32,
                 iterations=8,
@@ -568,7 +516,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
         model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulation_constraint_max=64,
             free_body_constraint_max=32,
             iterations=8,
@@ -688,12 +635,10 @@ class TestSteelLaunchConfig(unittest.TestCase):
         """Keep the extra tiled reduction off response buffers that already alias world storage."""
         aliased = SolverSteel(
             _build_chain_model(num_links=23, num_worlds=1),
-            solve_mode="matrix_free",
             articulation_constraint_max=192,
         )
         direct = SolverSteel(
             _build_chain_model(num_links=23, num_worlds=1, with_free_body=True),
-            solve_mode="matrix_free",
             articulation_constraint_max=192,
         )
 
@@ -744,10 +689,9 @@ class TestSteelLaunchConfig(unittest.TestCase):
     def test_non_default_tile_threads_compiles_and_steps(self):
         model = _build_chain_model()
         forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
-        with kernel_overrides({**forced, "serial_kernel_block_dim": 64, "tile_threads": 128, "pgs_kernel": "loop"}):
-            solver = SolverSteel(model, solve_mode="split", articulation_constraint_max=384)
+        with kernel_overrides({**forced, "serial_kernel_block_dim": 64, "tile_threads": 128}):
+            solver = SolverSteel(model, articulation_constraint_max=384)
         self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver._size_groups))
-        self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver._size_groups))
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(5):
@@ -765,7 +709,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
 
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             enable_joint_velocity_limits=True,
             iterations=2,
@@ -786,27 +729,22 @@ class TestSteelLaunchConfig(unittest.TestCase):
 
     def test_fuse_joint_velocity_limits_validation(self):
         # fuse_joint_velocity_limits defaults to True but only engages in the
-        # matrix_free + rows + velocity-limits formulation; anywhere else
+        # rows + velocity-limits formulation; anywhere else
         # it must be silently inert (no error), so the default doesn't
         # constrain unrelated solver modes.
         model = _build_chain_model(num_links=2, num_worlds=1)
         for kwargs in (
-            {},  # neither matrix_free nor velocity limits nor physx drive
-            {"solve_mode": "matrix_free", "drive_mode": "rows"},  # no velocity limits
+            {},  # neither velocity limits nor physx drive
+            {"solve_mode": "serial", "drive_mode": "rows"},  # no velocity limits
         ):
             with self.subTest(kwargs=kwargs):
-                if kwargs.get("solve_mode") == "matrix_free" and model.device.is_cpu:
-                    with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-                        SolverSteel(model, fuse_joint_velocity_limits=True, **kwargs)
-                    continue
                 solver = SolverSteel(model, fuse_joint_velocity_limits=True, **kwargs)
                 self.assertFalse(solver._velocity_limits_fused)
         if wp.is_cuda_available():
             # drive_mode='augmented' with velocity limits enabled is inert too
-            # (matrix_free construction requires CUDA).
+            # (serial construction requires CUDA).
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="augmented",
                 fuse_joint_velocity_limits=True,
@@ -816,14 +754,12 @@ class TestSteelLaunchConfig(unittest.TestCase):
             # and an explicit False opts out.
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="rows",
             )
             self.assertTrue(solver._velocity_limits_fused)
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="rows",
                 fuse_joint_velocity_limits=False,
@@ -836,7 +772,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
             # limits the fraction disabled.
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="rows",
                 fuse_joint_velocity_limits=True,
@@ -850,7 +785,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
             for velocity_drive_mode in ("freeze", "active"):
                 solver = SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     enable_joint_velocity_limits=True,
                     drive_mode="rows",
                     fuse_joint_velocity_limits=True,
@@ -878,7 +812,6 @@ class TestSteelLaunchConfig(unittest.TestCase):
             model.joint_velocity_limit.assign(np.full(n, qdot_max, dtype=np.float32))
             solver = SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 drive_mode="rows",
                 enable_joint_velocity_limits=True,
                 fuse_joint_velocity_limits=fuse,
@@ -965,7 +898,7 @@ def _push_joints(model, solver):
 def _steel_entry(name, joint, configure_view=None):
     return SolverCoupled.Entry(
         name=name,
-        solver=lambda view: SolverSteel(view, solve_mode="split"),
+        solver=SolverSteel,
         bodies=[joint],
         joints=[joint],
         configure_view=configure_view,
@@ -975,18 +908,18 @@ def _steel_entry(name, joint, configure_view=None):
 def test_caller_disabled_joints_raise_through_views(test, device):
     """A joint the caller disabled raises whether Steel gets a model, a view, or a coupled entry view."""
     enabled = _build_prismatic_links(device, (True,))
-    q, qd = _push_joints(enabled, SolverSteel(enabled, solve_mode="split"))
+    q, qd = _push_joints(enabled, SolverSteel(enabled))
     np.testing.assert_allclose(q, [1.0e-4], rtol=1.0e-5)
     np.testing.assert_allclose(qd, [1.0e-2], rtol=1.0e-5)
 
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
-        SolverSteel(_build_prismatic_links(device, (False,)), solve_mode="split")
+        SolverSteel(_build_prismatic_links(device, (False,)))
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
-        SolverSteel(ModelView(_build_prismatic_links(device, (False,)), "standalone"), solve_mode="split")
+        SolverSteel(ModelView(_build_prismatic_links(device, (False,)), "standalone"))
     view = ModelView(_build_prismatic_links(device, (True,)), "view_disabled")
     view.disable_joints(wp.array([0], dtype=int, device=device))
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
-        SolverSteel(view, solve_mode="split")
+        SolverSteel(view)
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
         SolverCoupled(model=_build_prismatic_links(device, (False,)), entries=[_steel_entry("owned", 0)])
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
@@ -1019,9 +952,7 @@ def test_coupled_views_accept_joints_other_entries_own(test, device):
 
 def test_coupled_view_rejects_unowned_disabled_joint(test, device):
     """A caller-disabled joint that no entry owns raises even when the entry owns its child body."""
-    entry = SolverCoupled.Entry(
-        name="steel", solver=lambda view: SolverSteel(view, solve_mode="split"), bodies=[0, 1], joints=[0]
-    )
+    entry = SolverCoupled.Entry(name="steel", solver=SolverSteel, bodies=[0, 1], joints=[0])
     with test.assertRaisesRegex(NotImplementedError, "disabled joints"):
         SolverCoupled(model=_build_prismatic_links(device, (True, False)), entries=[entry])
 
@@ -1064,7 +995,7 @@ def _build_admm_cross_chain(device, *, cross_joint: str = "ball", cross_joint_en
 
 def _admm_cross_chain_solver(model):
     def steel(view):
-        return SolverSteel(view, solve_mode="split")
+        return SolverSteel(view)
 
     # The world-1 link makes both entries heterogeneous, so their views keep the full layout and the cross joint.
     return SolverCoupledADMM(
@@ -1346,47 +1277,11 @@ def _build_chain_model_launch_config_upstream(device, num_links=3, num_worlds=2,
     return main.finalize(device=device)
 
 
-def _build_limited_chain_on_ground(device, num_links, num_worlds=2, *, with_free_body=False):
-    """A hanging chain of driven, limited capsule links above the ground, optionally with a falling box."""
-    world = newton.ModelBuilder()
-    world.add_ground_plane()
-    joints = []
-    parent = -1
-    top = 0.3 * num_links + 0.2
-    for i in range(num_links):
-        link = world.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, top - 0.3 * i), wp.quat_identity()))
-        world.add_shape_capsule(link, radius=0.04, half_height=0.12)
-        joints.append(
-            world.add_joint_revolute(
-                parent,
-                link,
-                axis=wp.vec3(0.0, 1.0, 0.0),
-                parent_xform=wp.transform(
-                    wp.vec3(0.0, 0.0, top + 0.15) if parent < 0 else wp.vec3(0.0, 0.0, -0.15), wp.quat_identity()
-                ),
-                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.15), wp.quat_identity()),
-                limit_lower=-0.6,
-                limit_upper=0.6,
-                target_ke=200.0,
-                target_kd=5.0,
-                target_pos=0.3,
-            )
-        )
-        parent = link
-    world.add_articulation(joints)
-    if with_free_body:
-        body = world.add_body(xform=wp.transform(wp.vec3(0.3, 0.0, 0.3), wp.quat_rpy(0.2, 0.1, 0.3)))
-        world.add_shape_box(body, hx=0.1, hy=0.08, hz=0.06)
-    builder = newton.ModelBuilder()
-    builder.replicate(world, num_worlds)
-    return builder.finalize(device=device)
-
-
 def test_default_kernel_selection_is_cached(test, device):
     """Resolve identical solver shapes to the same cached kernel objects."""
     model = _build_chain_model_launch_config_upstream(device)
-    first = SolverSteel(model, solve_mode="matrix_free")
-    second = SolverSteel(model, solve_mode="matrix_free")
+    first = SolverSteel(model)
+    second = SolverSteel(model)
     for attr in ("_cholesky_kernels_by_size", "_triangular_solve_kernels_by_size", "_hinv_jt_kernels_by_size"):
         first_kernels = getattr(first, attr)
         second_kernels = getattr(second, attr)
@@ -1400,12 +1295,10 @@ def test_diagonal_fusion_requires_nonaliased_world_response(test, device):
     """Compute the row diagonal in H^-1 J^T only when it writes separate world storage."""
     aliased = SolverSteel(
         _build_chain_model_launch_config_upstream(device, num_links=23, num_worlds=1),
-        solve_mode="matrix_free",
         articulation_constraint_max=192,
     )
     direct = SolverSteel(
         _build_chain_model_launch_config_upstream(device, num_links=23, num_worlds=1, with_free_body=True),
-        solve_mode="matrix_free",
         articulation_constraint_max=192,
     )
     test.assertTrue(aliased._jy_world_aliased)
@@ -1422,7 +1315,7 @@ def test_tiled_and_loop_kernels_step_identically(test, device):
     for overrides in ({}, {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}):
         model = _build_chain_model_launch_config_upstream(device, num_links=14, num_worlds=2)
         with kernel_overrides(overrides):
-            solver = SolverSteel(model, solve_mode="matrix_free", articulation_constraint_max=64)
+            solver = SolverSteel(model, articulation_constraint_max=64)
         if not overrides:
             test.assertTrue(solver._execution_plan.use_tiled_cholesky(14))
             test.assertTrue(solver._execution_plan.use_tiled_hinv_jt(14))
@@ -1435,74 +1328,13 @@ def test_tiled_and_loop_kernels_step_identically(test, device):
     np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=1.0e-4)
 
 
-def test_split_defaults(test, device):
-    """Keep the documented defaults in split mode and allocate its Delassus storage."""
-    solver = SolverSteel(
-        _build_chain_model_launch_config_upstream(device, num_links=2, num_worlds=2), solve_mode="split"
-    )
-    test.assertEqual(solver._solve_mode, "split")
-    test.assertEqual(solver._iterations, 12)
-    test.assertEqual(solver._articulation_constraint_max, 32)
-    test.assertEqual(solver._C.shape, (2, 32, 32))
-    test.assertFalse(solver._jy_world_aliased)
-    test.assertFalse(solver._hinv_jt_writes_world)
-
-
-def test_split_kernel_selection_is_cached(test, device):
-    """Resolve identical split-mode solver shapes to the same cached kernel objects."""
-    model = _build_chain_model_launch_config_upstream(device, num_links=14, num_worlds=2, with_free_body=True)
-    first = SolverSteel(model, solve_mode="split")
-    second = SolverSteel(model, solve_mode="split")
-    test.assertEqual(first._delassus_kernels_by_size.keys(), second._delassus_kernels_by_size.keys())
-    for size, kernel in first._delassus_kernels_by_size.items():
-        test.assertIs(kernel, second._delassus_kernels_by_size[size])
-    test.assertIs(first._pgs_solve_tiled_row_kernel, second._pgs_solve_tiled_row_kernel)
-    test.assertIs(first._pgs_solve_mf_kernel, second._pgs_solve_mf_kernel)
-
-
-def test_split_native_and_scalar_kernels_step_identically(test, device):
-    """Match the native split-mode kernels and the scalar Warp kernels of the CPU path on CUDA."""
-    scalar = {
-        "cholesky_kernel": "loop",
-        "trisolve_kernel": "loop",
-        "hinv_jt_kernel": "par_row",
-        "delassus_kernel": "par_row_col",
-        "pgs_kernel": "loop",
-    }
-    for with_free_body in (False, True):
-        trajectories = []
-        for overrides in ({}, scalar):
-            model = _build_limited_chain_on_ground(device, 14, with_free_body=with_free_body)
-            with kernel_overrides(overrides):
-                solver = SolverSteel(
-                    model, solve_mode="split", enable_joint_limits=True, articulation_constraint_max=64
-                )
-            if not overrides:
-                test.assertIsNotNone(solver._pgs_solve_tiled_row_kernel)
-            pipeline = newton.CollisionPipeline(model)
-            contacts = pipeline.contacts()
-            state_0, state_1 = model.state(), model.state()
-            control = model.control()
-            for _ in range(120):
-                pipeline.collide(state_0, contacts)
-                solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-                state_0, state_1 = state_1, state_0
-            solver.check_constraint_capacity()
-            test.assertGreater(int(solver._constraint_count.numpy().max()), 0)
-            trajectories.append(state_0.joint_q.numpy().copy())
-        with test.subTest(with_free_body=with_free_body):
-            np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=1.0e-4)
-
-
 def test_drive_mode_validation(test, device):
     """Default to the implicit drive and reject unknown drive formulations."""
     model = _build_chain_model_launch_config_upstream(device, num_links=2, num_worlds=1)
     solver = SolverSteel(model)
     test.assertEqual(solver._drive_mode, "augmented")
     test.assertFalse(solver._velocity_limits_fused)
-    test.assertEqual(SolverSteel(model, solve_mode="matrix_free", drive_mode="rows").drive_mode, "rows")
-    with test.assertRaisesRegex(NotImplementedError, "requires solve_mode='matrix_free'"):
-        SolverSteel(model, solve_mode="split", drive_mode="rows")
+    test.assertEqual(SolverSteel(model, drive_mode="rows").drive_mode, "rows")
     with test.assertRaisesRegex(ValueError, "drive_mode"):
         SolverSteel(model, drive_mode="implicit")
 
@@ -1524,21 +1356,6 @@ for _name, _func in (
     ("test_drive_mode_validation", test_drive_mode_validation),
 ):
     add_function_test(TestSteelLaunchConfigUpstream, _name, _func, devices=devices)
-
-
-split_devices = get_test_devices()
-
-
-for _name, _func, _devices in (
-    ("test_split_defaults", test_split_defaults, split_devices),
-    ("test_split_kernel_selection_is_cached", test_split_kernel_selection_is_cached, split_devices),
-    (
-        "test_split_native_and_scalar_kernels_step_identically",
-        test_split_native_and_scalar_kernels_step_identically,
-        devices,
-    ),
-):
-    add_function_test(TestSteelLaunchConfigUpstream, _name, _func, devices=_devices)
 
 
 def _scene(device, worlds=2):
@@ -1608,7 +1425,7 @@ def _run(model, steps=60, capture=False, **solver_kwargs):
     return solver, state_0.joint_q.numpy().copy()
 
 
-def test_captured_double_buffer_matches_eager(test, device, solve_mode="matrix_free"):
+def test_captured_double_buffer_matches_eager(test, device, solve_mode="serial"):
     """Replay a two-step graph of the double-buffered solve with the eager result."""
     model = _scene(device)
     _, eager = _run(model, solve_mode=solve_mode, use_parallel_streams=True, double_buffer=True)
@@ -1630,7 +1447,6 @@ def test_reset_after_an_eager_error_steps_like_a_fresh_solver(test, device):
         set_torsion_radius(model, 0.01)
         solver = SolverSteel(
             model,
-            solve_mode="matrix_free",
             iterations=16,
             baumgarte=0.1,
             double_buffer=True,
@@ -1667,7 +1483,6 @@ cuda_devices = get_cuda_test_devices()
 
 for _fn in (test_captured_double_buffer_matches_eager,):
     add_function_test(TestSteelStreams, _fn.__name__, _fn, devices=cuda_devices)
-    add_function_test(TestSteelStreams, f"{_fn.__name__}_split", _fn, devices=cuda_devices, solve_mode="split")
 
 
 add_function_test(
@@ -1783,7 +1598,7 @@ def _build_model(device):
 def _run_double_buffer_capture(device, double_buffer, pause_between_steps, replays):
     """Capture two Steel steps, optionally with a capture-pausing conditional node between them."""
     model = _build_model(device)
-    solver = SolverSteel(model, solve_mode="matrix_free", double_buffer=double_buffer)
+    solver = SolverSteel(model, double_buffer=double_buffer)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()

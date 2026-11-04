@@ -273,7 +273,6 @@ class Example:
             # Experimental: hydroelastic contacts as implicit compliant rows with point friction.
             self.solver = newton.solvers.SolverSteel(
                 self.model,
-                solve_mode="matrix_free",
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 enable_restitution=False,
