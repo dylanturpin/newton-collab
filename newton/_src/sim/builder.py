@@ -9994,7 +9994,12 @@ class ModelBuilder:
                             for component_index, (component_vertices, component_faces) in enumerate(components):
                                 if method == "coacd":
                                     cmesh = coacd.Mesh(component_vertices, component_faces)
-                                    component_settings = {**settings, "max_convex_hull": hull_budgets[component_index]}
+                                    component_settings = settings
+                                    if "max_convex_hull" in settings:
+                                        component_settings = {
+                                            **settings,
+                                            "max_convex_hull": hull_budgets[component_index],
+                                        }
                                     # Cap with Qhull rather than CoACD's decimation, which is orders of magnitude slower.
                                     decomposition.extend(
                                         remesh_convex_hull(v, maxhullvert=mesh.maxhullvert)
