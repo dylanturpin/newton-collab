@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wind an articulated rope onto a passive winch to raise a bucket.
 
-Command: python -m newton.examples steel_toy_well
-
 Drag bodies to apply forces, pause or scrub the robot path, and reset the scene.
 Only the robot joints are position-driven; object motion comes from contacts.
+
+Success criteria:
+- The robot turns the winch handle and the rope winds onto the drum.
+- The bucket rises toward the winch without the rope passing through the drum.
+
+Runs:
+- `python -m newton.examples steel_toy_well`
 """
 
 import numpy as np
