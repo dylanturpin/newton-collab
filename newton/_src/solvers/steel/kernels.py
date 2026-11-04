@@ -12208,6 +12208,25 @@ ROW_WATERMARK_FAMILY_STRIDE = 5
 ROW_WATERMARK_CONTACT_SLOT = 3 * ROW_WATERMARK_FAMILY_STRIDE
 
 
+@wp.func
+def _accumulate_row_watermark(
+    world: int,
+    constraint_count: wp.array[wp.int32],
+    slot_counter: wp.array[wp.int32],
+    dropped_contact_rows: wp.array[wp.int32],
+    capacity: int,
+    base: int,
+    watermarks: wp.array[wp.int32],
+):
+    requested = slot_counter[world]
+    wp.atomic_max(watermarks, base, constraint_count[world])
+    wp.atomic_max(watermarks, base + 1, requested)
+    wp.atomic_max(watermarks, base + 2, dropped_contact_rows[world])
+    if requested > capacity:
+        wp.atomic_max(watermarks, base + 3, requested - capacity)
+        wp.atomic_add(watermarks, base + 4, 1)
+
+
 @wp.kernel
 def accumulate_row_watermarks(
     constraint_count: wp.array[wp.int32],
@@ -12223,14 +12242,48 @@ def accumulate_row_watermarks(
     Slots from ``base``: retained rows, requested rows (accepted plus rejected reservations),
     dropped contact rows, excess over ``capacity`` (maxima) and overflowing world-steps (a sum).
     """
+    _accumulate_row_watermark(
+        wp.tid(), constraint_count, slot_counter, dropped_contact_rows, capacity, base, watermarks
+    )
+
+
+@wp.kernel(enable_backward=False)
+def accumulate_all_row_watermarks(
+    family_enabled: wp.vec3i,
+    count_0: wp.array[wp.int32],
+    requested_0: wp.array[wp.int32],
+    dropped_0: wp.array[wp.int32],
+    capacity_0: int,
+    count_1: wp.array[wp.int32],
+    requested_1: wp.array[wp.int32],
+    dropped_1: wp.array[wp.int32],
+    capacity_1: int,
+    count_2: wp.array[wp.int32],
+    requested_2: wp.array[wp.int32],
+    dropped_2: wp.array[wp.int32],
+    capacity_2: int,
+    contact_count: wp.array[wp.int32],
+    # outputs
+    watermarks: wp.array[wp.int32],
+):
+    """:func:`accumulate_row_watermarks` for every enabled family plus :func:`accumulate_contact_watermark`.
+
+    One thread per world; the integer maxima and sums do not depend on order, so one launch accumulates
+    what the per-family launches do. ``contact_count`` is empty without contacts.
+    """
     world = wp.tid()
-    requested = slot_counter[world]
-    wp.atomic_max(watermarks, base, constraint_count[world])
-    wp.atomic_max(watermarks, base + 1, requested)
-    wp.atomic_max(watermarks, base + 2, dropped_contact_rows[world])
-    if requested > capacity:
-        wp.atomic_max(watermarks, base + 3, requested - capacity)
-        wp.atomic_add(watermarks, base + 4, 1)
+    if family_enabled[0] != 0:
+        _accumulate_row_watermark(world, count_0, requested_0, dropped_0, capacity_0, 0, watermarks)
+    if family_enabled[1] != 0:
+        _accumulate_row_watermark(
+            world, count_1, requested_1, dropped_1, capacity_1, ROW_WATERMARK_FAMILY_STRIDE, watermarks
+        )
+    if family_enabled[2] != 0:
+        _accumulate_row_watermark(
+            world, count_2, requested_2, dropped_2, capacity_2, 2 * ROW_WATERMARK_FAMILY_STRIDE, watermarks
+        )
+    if world == 0 and contact_count.shape[0] > 0:
+        wp.atomic_max(watermarks, ROW_WATERMARK_CONTACT_SLOT, contact_count[0])
 
 
 @wp.kernel

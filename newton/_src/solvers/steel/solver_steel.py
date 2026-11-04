@@ -85,7 +85,14 @@ from .cpu_fallback import (
     reject_cpu_unsupported_matrix_free_features,
 )
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
-from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
+from .friction_patches import (
+    _FrictionPatchState,
+    finish_patch_impulses,
+    finish_patch_impulses_all_routes,
+    link_patch_rows,
+    link_patch_rows_all_routes,
+    seed_patch_impulses,
+)
 from .kernels import (
     ANGULAR_FRICTION_DENSE,
     ANGULAR_FRICTION_FREE_RIGID,
@@ -122,6 +129,7 @@ from .kernels import (
     ROW_WATERMARK_FAMILY_STRIDE,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
+    accumulate_all_row_watermarks,
     accumulate_articulation_tau,
     accumulate_connect_wrenches_from_impulses,
     accumulate_contact_watermark,
@@ -404,6 +412,85 @@ def _clear_dense_row_state(slot_counter: wp.array[int], contact_world: wp.array[
     contact_world[world] = 0
     for family in range(3):
         dropped[family, world] = 0
+
+
+@wp.kernel(enable_backward=False)
+def _copy_three(
+    a: wp.array[float],
+    b: wp.array[float],
+    c: wp.array[float],
+    a_out: wp.array[float],
+    b_out: wp.array[float],
+    c_out: wp.array[float],
+):
+    """Copy three equally sized arrays in one launch."""
+    i = wp.tid()
+    a_out[i] = a[i]
+    b_out[i] = b[i]
+    c_out[i] = c[i]
+
+
+@wp.func
+def _fill_int(values: wp.array[int], i: int, value: int):
+    if i < values.shape[0]:
+        values[i] = value
+
+
+@wp.func
+def _fill_float(values: wp.array[float], i: int, value: float):
+    if i < values.shape[0]:
+        values[i] = value
+
+
+@wp.kernel(enable_backward=False)
+def _clear_step_row_state(
+    slot_counter: wp.array[int],
+    contact_world: wp.array[int],
+    dropped: wp.array[int],
+    dense_first_rejected: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    mf_first_rejected: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    propagation_first_rejected: wp.array[int],
+    propagation_constraint_count: wp.array[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_seen: wp.array[int],
+    mf_target_velocity: wp.array[float],
+    mf_impulses: wp.array[float],
+    propagation_impulses: wp.array[float],
+    propagation_J_a: wp.array[float],
+    propagation_J_b: wp.array[float],
+    propagation_MiJt_a: wp.array[float],
+    propagation_MiJt_b: wp.array[float],
+    propagation_body_impulses: wp.array[float],
+    unbounded: int,
+):
+    """One launch for the row-build prologue's clears; every array is a flat view, empty when its family is off.
+
+    Writes the values the per-array memsets and fills write, so the result is bitwise the same.
+    """
+    i = wp.tid()
+    _fill_int(slot_counter, i, 0)
+    _fill_int(contact_world, i, 0)
+    _fill_int(dropped, i, 0)
+    _fill_int(dense_first_rejected, i, unbounded)
+    _fill_int(mf_slot_counter, i, 0)
+    _fill_int(mf_first_rejected, i, unbounded)
+    _fill_int(mf_constraint_count, i, 0)
+    _fill_int(propagation_slot_counter, i, 0)
+    _fill_int(propagation_first_rejected, i, unbounded)
+    _fill_int(propagation_constraint_count, i, 0)
+    _fill_int(propagation_body_count, i, 0)
+    _fill_int(propagation_body_seen, i, 0)
+    _fill_float(mf_target_velocity, i, 0.0)
+    _fill_float(mf_impulses, i, 0.0)
+    _fill_float(propagation_impulses, i, 0.0)
+    _fill_float(propagation_J_a, i, 0.0)
+    _fill_float(propagation_J_b, i, 0.0)
+    _fill_float(propagation_MiJt_a, i, 0.0)
+    _fill_float(propagation_MiJt_b, i, 0.0)
+    _fill_float(propagation_body_impulses, i, 0.0)
 
 
 @wp.kernel
@@ -3560,6 +3647,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         self._dummy_is_free_rigid = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_mf_slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=model.device)
+        # Empty stand-ins for the arrays of families a merged setup launch skips.
+        self._empty_int = wp.empty(0, dtype=wp.int32, device=model.device)
+        self._empty_float = wp.empty(0, dtype=wp.float32, device=model.device)
+        self._empty_int_2d = wp.empty((0, 0), dtype=wp.int32, device=model.device)
+        self._empty_float_2d = wp.empty((0, 0), dtype=wp.float32, device=model.device)
+        # Latency mode merges the setup launches outside the PGS loop; see _fused_setup_active.
+        self._fused_setup_enabled = not model.requires_grad
         self._init_deterministic_rows(model)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
@@ -10319,9 +10413,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._joint_friction_load_active:
                 self._compute_joint_friction_load(state_in, state_aug)
             self._clamp_rigid_velocity_limits(self._v_hat)
-            wp.copy(self._debug_stage3_qd_work, stage3_qd)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug._joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self._v_hat)
+            if self._fused_setup_active():
+                self._snapshot_stage3(stage3_qd, state_aug._joint_qdd)
+            else:
+                self._snapshot_stage3_per_array(stage3_qd, state_aug._joint_qdd)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -10584,30 +10679,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._friction_anchors_enabled:
             with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if contacts is not None:
-                    for route, parents, mu, impulses, _decay in self._patch_row_arrays():
-                        wp.launch(
-                            finish_patch_impulses,
-                            dim=contacts.rigid_contact_max,
-                            inputs=[
-                                contacts.rigid_contact_count,
-                                self._friction_patches.current,
-                                state_in.body_q,
-                                state_out.body_q,
-                                state_out.body_qd,
-                                model.body_com,
-                                contacts.rigid_contact_surface_velocity,
-                                self._contact_world,
-                                self._contact_slot,
-                                self._contact_path,
-                                self._contact_slots_needed,
-                                route,
-                                parents,
-                                mu,
-                                impulses,
-                                dt,
-                            ],
-                            device=model.device,
-                        )
+                    if self._fused_setup_active():
+                        self._finish_patch_impulses(state_in, state_out, contacts, dt)
+                    else:
+                        self._finish_patch_impulses_per_route(state_in, state_out, contacts, dt)
                     self._friction_patches.store(state_in)
                 else:
                     self._friction_patches.previous.valid.zero_()
@@ -10693,7 +10768,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._clear_double_buffer()
 
         if self._row_watermark:
-            self._accumulate_row_watermarks(contacts)
+            if self._fused_setup_active():
+                self._accumulate_row_watermarks_fused(contacts)
+            else:
+                self._accumulate_row_watermarks(contacts)
 
         if self._device_torsion is not None:
             self._device_torsion.end_step(state_out)
@@ -10877,8 +10955,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 " the scene (see the class documentation), and reset before accepting transitions."
             )
 
-    def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
-        """Fold this step's row counts into the high-water marks."""
+    def _row_watermark_families(self) -> dict:
+        """Each live row family's (count, requested, dropped, capacity), keyed by family index."""
         families = {
             0: (self._constraint_count, self._slot_counter, self._row_dropped_dense, self._articulation_constraint_max),
         }
@@ -10896,7 +10974,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._row_dropped_propagation,
                 self._propagation_max_constraints,
             )
-        for family, (count, requested, dropped, capacity) in families.items():
+        return families
+
+    def _accumulate_row_watermarks(self, contacts: Contacts | None) -> None:
+        """Fold this step's row counts into the high-water marks, one launch per family."""
+        for family, (count, requested, dropped, capacity) in self._row_watermark_families().items():
             wp.launch(
                 accumulate_row_watermarks,
                 dim=self._world_count,
@@ -10912,6 +10994,25 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._row_watermarks],
                 device=self.model.device,
             )
+
+    def _accumulate_row_watermarks_fused(self, contacts: Contacts | None) -> None:
+        """Write what :meth:`_accumulate_row_watermarks` writes in one launch."""
+        enabled = [0, 0, 0]
+        args = [self._empty_int, self._empty_int, self._empty_int, 0] * 3
+        for family, family_args in self._row_watermark_families().items():
+            enabled[family] = 1
+            args[4 * family : 4 * family + 4] = family_args
+        wp.launch(
+            accumulate_all_row_watermarks,
+            dim=self._world_count,
+            inputs=[
+                wp.vec3i(*enabled),
+                *args,
+                contacts.rigid_contact_count if contacts is not None else self._empty_int,
+            ],
+            outputs=[self._row_watermarks],
+            device=self.model.device,
+        )
 
     def constraint_row_watermarks(self) -> dict[str, int]:
         """Return the row high-water marks accumulated since construction (``row_watermark`` only).
@@ -12080,14 +12181,39 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_warmstart_decay if self._contact_warmstart else 0.0,
             )
 
-    def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
-        if self._contact_compliance:
-            _contact_compliance.start_step(self, contacts, dt)
-            _contact_compliance.begin_rows(self)
+    def _fused_setup_active(self) -> bool:
+        """Whether this step merges the per-step setup launches (latency mode only).
+
+        Latency mode (few worlds) leaves the setup work outside the PGS loop a chain of launches that each do
+        little work, so their launch latency dominates. The merged launches write the same values. Like the
+        fused loop, they step aside for the debug hooks that observe the per-pass launches.
+        """
+        return (
+            self._fused_setup_enabled
+            and getattr(self, "_latency_fused", False)
+            and not _STEEL_CAPTURE
+            and not self._sync_timing_active()
+        )
+
+    def _snapshot_stage3_per_array(self, stage3_qd: wp.array, joint_qdd: wp.array) -> None:
+        """Copy the stage-3 velocities and accelerations to the debug snapshots, one copy each."""
+        wp.copy(self._debug_stage3_qd_work, stage3_qd)
+        wp.copy(self._debug_stage3_joint_qdd, joint_qdd)
+        wp.copy(self._debug_stage3_v_hat, self._v_hat)
+
+    def _snapshot_stage3(self, stage3_qd: wp.array, joint_qdd: wp.array) -> None:
+        """Write what :meth:`_snapshot_stage3_per_array` writes in one launch."""
+        wp.launch(
+            _copy_three,
+            dim=stage3_qd.shape[0],
+            inputs=[stage3_qd, joint_qdd, self._v_hat],
+            outputs=[self._debug_stage3_qd_work, self._debug_stage3_joint_qdd, self._debug_stage3_v_hat],
+            device=self.model.device,
+        )
+
+    def _clear_step_row_state_per_array(self, mf_active: bool, propagation_active: bool) -> None:
+        """Clear the row-allocation state, counters and accumulators the row build starts from, array by array."""
         model = self.model
-        max_constraints = self._articulation_constraint_max
-        mf_active = self._has_free_rigid_bodies
-        propagation_active = self._propagation_contacts_enabled()
         if self._has_contact_target_velocity:
             self._mf_target_velocity.zero_()
 
@@ -12126,6 +12252,150 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_body_impulses.zero_()
             self._propagation_body_count.zero_()
             self._propagation_body_seen.zero_()
+
+    def _clear_step_row_state(self, mf_active: bool, propagation_active: bool) -> None:
+        """Write what :meth:`_clear_step_row_state_per_array` writes in one launch."""
+
+        def ints(array, active=True):
+            return array.flatten() if active else self._empty_int
+
+        def floats(array, active=True):
+            return array.flatten() if active else self._empty_float
+
+        propagation = propagation_active
+        arrays = [
+            ints(self._slot_counter),
+            ints(self._dense_contact_world_flag),
+            ints(self._row_dropped_all),
+            ints(self._dense_first_rejected_slot),
+            ints(self._mf_slot_counter, mf_active),
+            ints(self._mf_first_rejected_slot, mf_active),
+            ints(self._mf_constraint_count, mf_active),
+            ints(self._propagation_slot_counter, propagation),
+            ints(self._propagation_first_rejected_slot, propagation),
+            ints(self._propagation_constraint_count, propagation),
+            ints(self._propagation_body_count, propagation),
+            ints(self._propagation_body_seen, propagation),
+            floats(self._mf_target_velocity, self._has_contact_target_velocity),
+            floats(self._mf_impulses, mf_active),
+            floats(self._propagation_impulses, propagation),
+            floats(self._propagation_J_a, propagation),
+            floats(self._propagation_J_b, propagation),
+            floats(self._propagation_MiJt_a, propagation),
+            floats(self._propagation_MiJt_b, propagation),
+            floats(self._propagation_body_impulses, propagation),
+        ]
+        wp.launch(
+            _clear_step_row_state,
+            dim=max(array.shape[0] for array in arrays),
+            inputs=[*arrays, _ROW_SLOT_UNBOUNDED],
+            device=self.model.device,
+        )
+
+    def _link_patch_rows_per_route(self, contacts: Contacts) -> None:
+        """Link each route's friction-patch rows and share their Coulomb budgets, one launch per route."""
+        for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
+            if parents is not None:
+                wp.launch(
+                    link_patch_rows,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self._friction_patches.view,
+                        self._contact_world,
+                        self._contact_slot,
+                        self._contact_path,
+                        self._contact_slots_needed,
+                        route,
+                        parents,
+                        mu,
+                    ],
+                    device=self.model.device,
+                )
+
+    def _patch_routes(self, *, linked: bool):
+        """The enabled-route flags and each route's (parents, mu, impulses), stand-ins for routes that are off."""
+        enabled = [0, 0, 0]
+        arrays = [(self._empty_int_2d, self._empty_float_2d, self._empty_float_2d)] * 3
+        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
+            if linked and parents is None:
+                continue
+            enabled[route] = 1
+            arrays[route] = (parents, mu, impulses)
+        return wp.vec3i(*enabled), arrays
+
+    def _link_patch_rows(self, contacts: Contacts) -> None:
+        """Write what :meth:`_link_patch_rows_per_route` writes in one launch."""
+        enabled, arrays = self._patch_routes(linked=True)
+        wp.launch(
+            link_patch_rows_all_routes,
+            dim=contacts.rigid_contact_max,
+            inputs=[
+                contacts.rigid_contact_count,
+                self._friction_patches.view,
+                self._contact_world,
+                self._contact_slot,
+                self._contact_path,
+                self._contact_slots_needed,
+                enabled,
+                *(array for parents, mu, _impulses in arrays for array in (parents, mu)),
+            ],
+            device=self.model.device,
+        )
+
+    def _finish_patch_impulses_args(self, state_in: State, state_out: State, contacts: Contacts) -> list:
+        return [
+            contacts.rigid_contact_count,
+            self._friction_patches.current,
+            state_in.body_q,
+            state_out.body_q,
+            state_out.body_qd,
+            self.model.body_com,
+            contacts.rigid_contact_surface_velocity,
+            self._contact_world,
+            self._contact_slot,
+            self._contact_path,
+            self._contact_slots_needed,
+        ]
+
+    def _finish_patch_impulses_per_route(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
+        """Cache each route's solved patch friction and release slipping anchors, one launch per route."""
+        common = self._finish_patch_impulses_args(state_in, state_out, contacts)
+        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
+            wp.launch(
+                finish_patch_impulses,
+                dim=contacts.rigid_contact_max,
+                inputs=[*common, route, parents, mu, impulses, dt],
+                device=self.model.device,
+            )
+
+    def _finish_patch_impulses(self, state_in: State, state_out: State, contacts: Contacts, dt: float) -> None:
+        """Write what :meth:`_finish_patch_impulses_per_route` writes in one launch."""
+        enabled, arrays = self._patch_routes(linked=False)
+        wp.launch(
+            finish_patch_impulses_all_routes,
+            dim=contacts.rigid_contact_max,
+            inputs=[
+                *self._finish_patch_impulses_args(state_in, state_out, contacts),
+                enabled,
+                *(array for route_arrays in arrays for array in route_arrays),
+                dt,
+            ],
+            device=self.model.device,
+        )
+
+    def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self._contact_compliance:
+            _contact_compliance.start_step(self, contacts, dt)
+            _contact_compliance.begin_rows(self)
+        model = self.model
+        max_constraints = self._articulation_constraint_max
+        mf_active = self._has_free_rigid_bodies
+        propagation_active = self._propagation_contacts_enabled()
+        if self._fused_setup_active():
+            self._clear_step_row_state(mf_active, propagation_active)
+        else:
+            self._clear_step_row_state_per_array(mf_active, propagation_active)
 
         has_free_rigid_flag = 1 if mf_active else 0
         propagation_flag = 1 if propagation_active else 0
@@ -13468,24 +13738,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                     )
 
         if self._friction_anchors_enabled and contacts is not None:
-            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
-                if parents is not None:
-                    wp.launch(
-                        link_patch_rows,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self._friction_patches.view,
-                            self._contact_world,
-                            self._contact_slot,
-                            self._contact_path,
-                            self._contact_slots_needed,
-                            route,
-                            parents,
-                            mu,
-                        ],
-                        device=model.device,
-                    )
+            if self._fused_setup_active():
+                self._link_patch_rows(contacts)
+            else:
+                self._link_patch_rows_per_route(contacts)
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
