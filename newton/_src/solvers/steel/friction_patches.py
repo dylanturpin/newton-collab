@@ -1592,6 +1592,39 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
     return load
 
 
+@wp.func
+def _link_patch_row(
+    c: int,
+    patches: FrictionPatches,
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route: int,
+    parents: wp.array2d[int],
+    mu: wp.array2d[float],
+):
+    """Link allocated contact ``c`` of ``route`` (its slot is valid and its path is ``route``)."""
+    row = patches.next_contact[c]
+    if row < 0:
+        return
+    next_slot = slot[c]
+    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
+    while row != c:
+        if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
+            if next_slot == slot[c]:
+                next_slot = slot[row]
+            if patches.weight[row] > 0.0 and slots_needed[row] >= 3:
+                anchors += 1
+            if patches.weight[c] == 0.0:
+                break
+        row = patches.next_contact[row]
+    parents[world[c], slot[c]] = next_slot
+    if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
+        for t in range(1, 3):
+            mu[world[c], slot[c] + t] /= float(anchors)
+
+
 @wp.kernel(enable_backward=False)
 def link_patch_rows(
     count: wp.array[int],
@@ -1613,24 +1646,40 @@ def link_patch_rows(
     c = wp.tid()
     if c >= count[0] or slot[c] < 0 or path[c] != route:
         return
-    row = patches.next_contact[c]
-    if row < 0:
+    _link_patch_row(c, patches, world, slot, path, slots_needed, route, parents, mu)
+
+
+@wp.kernel(enable_backward=False)
+def link_patch_rows_all_routes(
+    count: wp.array[int],
+    patches: FrictionPatches,
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route_enabled: wp.vec3i,
+    parents_0: wp.array2d[int],
+    mu_0: wp.array2d[float],
+    parents_1: wp.array2d[int],
+    mu_1: wp.array2d[float],
+    parents_2: wp.array2d[int],
+    mu_2: wp.array2d[float],
+):
+    """:func:`link_patch_rows` for every enabled route in one launch.
+
+    A contact belongs to one route and the launches per route touch disjoint rows, so this writes what
+    they write. ``route_enabled[r]`` is 0 for a route that has no launch; its arrays are then never read.
+    """
+    c = wp.tid()
+    if c >= count[0] or slot[c] < 0:
         return
-    next_slot = slot[c]
-    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
-    while row != c:
-        if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
-            if next_slot == slot[c]:
-                next_slot = slot[row]
-            if patches.weight[row] > 0.0 and slots_needed[row] >= 3:
-                anchors += 1
-            if patches.weight[c] == 0.0:
-                break
-        row = patches.next_contact[row]
-    parents[world[c], slot[c]] = next_slot
-    if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
-        for t in range(1, 3):
-            mu[world[c], slot[c] + t] /= float(anchors)
+    route = path[c]
+    if route == 0 and route_enabled[0] != 0:
+        _link_patch_row(c, patches, world, slot, path, slots_needed, 0, parents_0, mu_0)
+    elif route == 1 and route_enabled[1] != 0:
+        _link_patch_row(c, patches, world, slot, path, slots_needed, 1, parents_1, mu_1)
+    elif route == 2 and route_enabled[2] != 0:
+        _link_patch_row(c, patches, world, slot, path, slots_needed, 2, parents_2, mu_2)
 
 
 @wp.func
@@ -1708,9 +1757,9 @@ contacts the later normal rows keep moving that load, so a sliding anchor can en
 """
 
 
-@wp.kernel(enable_backward=False)
-def finish_patch_impulses(
-    count: wp.array[int],
+@wp.func
+def _finish_patch_impulse(
+    c: int,
     frame: _PatchFrame,
     q: wp.array[wp.transform],
     q_out: wp.array[wp.transform],
@@ -1727,20 +1776,7 @@ def finish_patch_impulses(
     impulses: wp.array2d[float],
     dt: float,
 ):
-    """Cache solved friction and release saturated anchors with tangential motion.
-
-    The motion tolerance is relative to geometry and timestep. Merely resting at the
-    Coulomb limit does not prove sliding, so it must not erase static history.
-    """
-    c = wp.tid()
-    if c >= count[0] or frame.valid[c] == 0:
-        return
-    if slot[c] < 0:
-        # Capacity rejection provides no solved normal load; preserve the
-        # geometrically supported history until rows are available again.
-        return
-    if path[c] != route:
-        return
+    """Finish valid, allocated contact ``c`` of ``route``."""
     w = world[c]
     s = slot[c]
     load = patch_normal_load(parents, impulses, w, s)
@@ -1778,3 +1814,95 @@ def finish_patch_impulses(
     if radius > 0.0 and wp.length(tangent) >= (1.0 - _SLIP_SATURATION_TOLERANCE) * radius:
         if wp.dot(speed, tangent) < -radius * (1.0e-5 * frame.radius[c] / dt):
             frame.valid[c] = 0
+
+
+@wp.kernel(enable_backward=False)
+def finish_patch_impulses(
+    count: wp.array[int],
+    frame: _PatchFrame,
+    q: wp.array[wp.transform],
+    q_out: wp.array[wp.transform],
+    qd_out: wp.array[wp.spatial_vector],
+    com: wp.array[wp.vec3],
+    contact_surface_velocity: wp.array[wp.vec3],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route: int,
+    parents: wp.array2d[int],
+    mu: wp.array2d[float],
+    impulses: wp.array2d[float],
+    dt: float,
+):
+    """Cache solved friction and release saturated anchors with tangential motion.
+
+    The motion tolerance is relative to geometry and timestep. Merely resting at the
+    Coulomb limit does not prove sliding, so it must not erase static history.
+    """
+    c = wp.tid()
+    if c >= count[0] or frame.valid[c] == 0:
+        return
+    if slot[c] < 0:
+        # Capacity rejection provides no solved normal load; preserve the
+        # geometrically supported history until rows are available again.
+        return
+    if path[c] != route:
+        return
+    _finish_patch_impulse(
+        c, frame, q, q_out, qd_out, com, contact_surface_velocity, world, slot, path, slots_needed, route, parents,
+        mu, impulses, dt,
+    )  # fmt: skip
+
+
+@wp.kernel(enable_backward=False)
+def finish_patch_impulses_all_routes(
+    count: wp.array[int],
+    frame: _PatchFrame,
+    q: wp.array[wp.transform],
+    q_out: wp.array[wp.transform],
+    qd_out: wp.array[wp.spatial_vector],
+    com: wp.array[wp.vec3],
+    contact_surface_velocity: wp.array[wp.vec3],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route_enabled: wp.vec3i,
+    parents_0: wp.array2d[int],
+    mu_0: wp.array2d[float],
+    impulses_0: wp.array2d[float],
+    parents_1: wp.array2d[int],
+    mu_1: wp.array2d[float],
+    impulses_1: wp.array2d[float],
+    parents_2: wp.array2d[int],
+    mu_2: wp.array2d[float],
+    impulses_2: wp.array2d[float],
+    dt: float,
+):
+    """:func:`finish_patch_impulses` for every enabled route in one launch.
+
+    Each contact is finished by its own route's launch and writes only its own records, so one launch that
+    dispatches on the contact's path writes the same values.
+    """
+    c = wp.tid()
+    if c >= count[0] or frame.valid[c] == 0:
+        return
+    if slot[c] < 0:
+        return
+    route = path[c]
+    if route == 0 and route_enabled[0] != 0:
+        _finish_patch_impulse(
+            c, frame, q, q_out, qd_out, com, contact_surface_velocity, world, slot, path, slots_needed, 0,
+            parents_0, mu_0, impulses_0, dt,
+        )  # fmt: skip
+    elif route == 1 and route_enabled[1] != 0:
+        _finish_patch_impulse(
+            c, frame, q, q_out, qd_out, com, contact_surface_velocity, world, slot, path, slots_needed, 1,
+            parents_1, mu_1, impulses_1, dt,
+        )  # fmt: skip
+    elif route == 2 and route_enabled[2] != 0:
+        _finish_patch_impulse(
+            c, frame, q, q_out, qd_out, com, contact_surface_velocity, world, slot, path, slots_needed, 2,
+            parents_2, mu_2, impulses_2, dt,
+        )  # fmt: skip
