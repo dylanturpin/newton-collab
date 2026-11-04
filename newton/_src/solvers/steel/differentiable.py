@@ -738,6 +738,7 @@ class DifferentiableStep:
                 b.joint_qdd_out,
                 dt,
                 solver._rigid_body_angular_damping,
+                solver._rigid_body_linear_damping,
                 solver._dynamics_joint_active,
             ],
             outputs=[state_out.joint_q, state_out.joint_qd],

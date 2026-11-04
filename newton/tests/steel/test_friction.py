@@ -2035,6 +2035,112 @@ class TestFrictionPatchDeviceFlood(unittest.TestCase):
         for name, value in serial.items():
             np.testing.assert_array_equal(device[name], value, err_msg=f"{name} differs between the floods")
 
+    def test_frozen_pair_floods_on_device_when_its_carry_fails(self):
+        """A frozen pair whose contacts no longer repeat floods on a warp and matches the serial flood exactly.
+
+        Reversing the contact order breaks the carry, as an unordered collision pipeline does every step.
+        """
+        model, contacts, patches = _frozen_plates()
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        names = ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin1")
+        original = {name: getattr(contacts, "rigid_contact_" + name).numpy().copy() for name in names}
+        reversed_order = {}
+        for name, values in original.items():
+            reversed_order[name] = values.copy()
+            reversed_order[name][:count] = values[:count][::-1]
+        state = model.state()
+        frozen = wp.ones(model.body_count, dtype=int, device=model.device)
+
+        def run(device_flood):
+            patches.device_flood = device_flood
+            patches.previous.valid.zero_()
+            patches.build(model, state, contacts)
+            patches.store(state)
+            for name, values in reversed_order.items():
+                getattr(contacts, "rigid_contact_" + name).assign(values)
+            patches.build(model, state, contacts, frozen_bodies=frozen)
+            listed = int(patches._flood_pair_count.numpy()[0])
+            for name, values in original.items():
+                getattr(contacts, "rigid_contact_" + name).assign(values)
+            outputs = {"frame." + name: getattr(patches.current, name) for name in _PATCH_FRAME_OUTPUTS}
+            outputs.update({"view." + name: getattr(patches.view, name) for name in _PATCH_VIEW_OUTPUTS})
+            return listed, {name: array.numpy().copy() for name, array in outputs.items()}
+
+        _, serial = run(False)
+        listed, device = run(True)
+        self.assertEqual(listed, _flooded_pairs(patches, count), "a frozen pair skipped the device flood")
+        source = device["frame.source"][:count]
+        self.assertLess(int(np.count_nonzero(source >= 0)), count, "the frozen pairs carried their history")
+        for name, value in serial.items():
+            np.testing.assert_array_equal(device[name], value, err_msg=f"{name} differs between the floods")
+
+
+_PATCH_FRAME_OUTPUTS = ("owner", "members", "valid", "source", "anchor_a", "anchor_b", "displacement")
+_PATCH_VIEW_OUTPUTS = ("weight", "next_contact", "point_a", "point_b", "phi")
+
+
+def _frozen_plates(device="cuda:0"):
+    """Settled plates of box tiles on the ground, each pair large enough for the device flood."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.rigid_gap = 0.002
+    builder.add_ground_plane()
+    tile = 0.03
+    for level in range(3):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.01 + 0.0205 * level), wp.quat_identity()))
+        for ix in range(4):
+            for iy in range(4):
+                offset = wp.vec3((ix - 1.5) * 2 * tile, (iy - 1.5) * 2 * tile, 0.0)
+                builder.add_shape_box(body, xform=wp.transform(offset, wp.quat_identity()), hx=tile, hy=tile, hz=0.01)
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 1024
+    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
+    solver = newton.solvers.SolverSteel(model, solve_mode=solve_mode, iterations=8, free_body_constraint_max=1024)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=1024)
+    contacts = pipeline.contacts()
+    control = model.control()
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(10):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    pipeline.collide(state_0, contacts)
+    model.body_q.assign(state_0.body_q)
+    return model, contacts, solver._friction_patches
+
+
+def _flooded_pairs(patches, count):
+    keys = patches.current.keys.numpy()[:count]
+    _, sizes = np.unique(keys, return_counts=True)
+    return int(np.count_nonzero(sizes > 32))
+
+
+class TestFrozenPairCarry(unittest.TestCase):
+    def test_frozen_pair_carry_maps_regions_across_frames(self):
+        """A frozen pair whose contacts repeat skips the device flood and keeps each contact's region."""
+        for device in devices():
+            with self.subTest(device=device):
+                model, contacts, patches = _frozen_plates(device)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                state = model.state()
+                patches.previous.valid.zero_()
+                patches.build(model, state, contacts)
+                patches.store(state)
+                previous_owner = patches.previous.owner.numpy()[:count].copy()
+                previous_indices = patches.previous.indices.numpy()[:count].copy()
+                frozen = wp.ones(model.body_count, dtype=int, device=device)
+                patches.build(model, state, contacts, frozen_bodies=frozen)
+                if wp.get_device(device).is_cuda:
+                    self.assertEqual(int(patches._flood_pair_count.numpy()[0]), 0)
+                indices = patches.current.indices.numpy()[:count]
+                owner = patches.current.owner.numpy()
+                np.testing.assert_array_equal(patches.current.source.numpy()[indices], previous_indices)
+                position = np.empty(count, dtype=int)
+                position[previous_indices] = np.arange(count)
+                np.testing.assert_array_equal(owner[indices], indices[position[previous_owner[previous_indices]]])
+                regions = np.unique(owner[:count])
+                self.assertGreater(len(regions), 4, "too few friction regions to exercise the carry")
+                self.assertLess(len(regions), count, "no region spans several contacts")
+
 
 class TestSteelFrictionPatches(unittest.TestCase):
     def test_default_friction_preserves_free_rolling(self):

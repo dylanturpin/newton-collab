@@ -317,6 +317,60 @@ def test_gradient_matches_analytic_pendulum(test, device):
     np.testing.assert_allclose(initial.joint_q.grad.numpy(), [1.0], rtol=1.0e-6)
 
 
+def test_linear_damping_matches_default_and_scales_adjoint(test, device):
+    """Linear damping matches the default step, and the adjoint carries its ``1 - d dt`` per step."""
+    damping, steps = 3.0, 10
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(mass=2.0, inertia=wp.mat33(np.diag([0.08, 0.12, 0.16])))
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    model = builder.finalize(device=device, requires_grad=True)
+    solver = SolverSteel(model, differentiable=True)
+    solver._rigid_body_angular_damping.zero_()
+    solver._rigid_body_linear_damping.fill_(damping)
+    inputs = dict(_random_inputs(model, seed=4), joint_f=np.zeros(6, np.float32))
+    inputs["joint_qd"][3:] = 0.0
+    tape = wp.Tape()
+    final, initial, _ = _rollout(model, solver, inputs, steps, tape=tape)
+    scale = (1.0 - damping * _DT) ** steps
+    np.testing.assert_allclose(final.joint_qd.numpy()[:3], scale * inputs["joint_qd"][:3], rtol=1.0e-5)
+    tape.backward(grads={final.joint_qd: wp.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=float, device=device)})
+    np.testing.assert_allclose(initial.joint_qd.grad.numpy()[:3], scale, rtol=1.0e-5)
+
+    inputs = _random_inputs(_build_floating_chain(device), seed=5)
+    reference_model, model = _build_floating_chain(device, requires_grad=False), _build_floating_chain(device)
+    reference_solver = SolverSteel(reference_model, friction_anchor_beta=0.0)
+    solver = SolverSteel(model, differentiable=True)
+    reference_solver._rigid_body_linear_damping.fill_(damping)
+    solver._rigid_body_linear_damping.fill_(damping)
+    reference, _, _ = _rollout(reference_model, reference_solver, inputs, 30, rotate=True)
+    result, _, _ = _rollout(model, solver, inputs, 30)
+    for attribute in ("joint_q", "joint_qd"):
+        expected, actual = getattr(reference, attribute).numpy(), getattr(result, attribute).numpy()
+        if wp.get_device(device).is_cpu:
+            np.testing.assert_array_equal(actual, expected)
+        else:
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2.0e-4)
+
+    rng = np.random.default_rng(6)
+    wqd = rng.normal(size=model.joint_dof_count).astype(np.float32)
+    direction = rng.normal(size=model.joint_dof_count).astype(np.float32)
+    direction /= np.linalg.norm(direction)
+
+    def loss_of(joint_qd, tape=None):
+        final, initial, _ = _rollout(model, solver, dict(inputs, joint_qd=joint_qd), 3, tape=tape)
+        return float(final.joint_qd.numpy() @ wqd), final, initial
+
+    tape = wp.Tape()
+    _, final, initial = loss_of(inputs["joint_qd"], tape)
+    tape.backward(grads={final.joint_qd: wp.array(wqd, dtype=float, device=device)})
+    analytic = float(initial.joint_qd.grad.numpy() @ direction)
+    eps = 1.0e-2
+    fd = (loss_of(inputs["joint_qd"] + eps * direction)[0] - loss_of(inputs["joint_qd"] - eps * direction)[0]) / (
+        2 * eps
+    )
+    test.assertAlmostEqual(analytic, fd, delta=2.0e-3 * max(1.0, abs(fd)))
+
+
 def test_repeated_backward_is_stable(test, device):
     model = _build_floating_chain(device)
     solver = SolverSteel(model, differentiable=True)
@@ -3123,6 +3177,7 @@ for _device in get_test_devices():
         test_forward_matches_default,
         test_gradient_matches_finite_difference,
         test_gradient_matches_analytic_pendulum,
+        test_linear_damping_matches_default_and_scales_adjoint,
         test_repeated_backward_is_stable,
         test_contact_forward_matches_default,
         test_contact_gradient_matches_finite_difference,
