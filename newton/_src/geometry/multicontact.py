@@ -65,6 +65,8 @@ CONVEX_MESH_PATCH_SLAB_STEPS = 2
 CONVEX_MESH_PATCH_CAPACITY = 64
 # Patch points written per pair besides the GJK/MPR witness.
 CONVEX_MESH_PATCH_POINTS = 7
+# Hull vertices farther than this [m] inside their own hull are not candidates.
+CONVEX_MESH_PATCH_SURFACE_TOLERANCE = wp.constant(1.0e-6)
 # Allowed excess [m] of a candidate's depth over the GJK/MPR depth.
 CONVEX_MESH_PATCH_DEPTH_TOLERANCE = wp.constant(1.0e-4)
 # Patch points closer than this [m] are merged.
@@ -983,6 +985,27 @@ def hull_centroid(points: wp.array[wp.vec3], scale: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def hull_surface_offset(
+    points: wp.array[wp.vec3], indices: wp.array[wp.int32], scale: wp.vec3, centroid: wp.vec3, point: wp.vec3
+) -> float:
+    """Return the largest signed distance [m] of ``point`` from a convex triangle hull's face planes (negative inside)."""
+    offset = float(-1.0e30)
+    for f in range(indices.shape[0] // 3):
+        p0 = wp.cw_mul(points[indices[3 * f]], scale)
+        p1 = wp.cw_mul(points[indices[3 * f + 1]], scale)
+        p2 = wp.cw_mul(points[indices[3 * f + 2]], scale)
+        n = wp.cross(p1 - p0, p2 - p0)
+        n_len = wp.length(n)
+        if n_len <= 1.0e-14:
+            continue
+        n = n / n_len
+        if wp.dot(n, p0 - centroid) < 0.0:
+            n = -n
+        offset = wp.max(offset, wp.dot(n, point - p0))
+    return offset
+
+
+@wp.func
 def hull_line_interval(
     points: wp.array[wp.vec3],
     indices: wp.array[wp.int32],
@@ -1403,6 +1426,18 @@ def create_build_manifold(
                     # Each hull gets half the buffer, so neither side can starve the other or overrun it.
                     if h > slab or h <= slab_prev or count_b >= wp.static(CONVEX_MESH_PATCH_CAPACITY // 2):
                         continue
+                    # A vertex the triangles do not reference can lie inside the hull; it is not a surface point.
+                    if (
+                        hull_surface_offset(
+                            mesh_b.points,
+                            mesh_b.indices,
+                            geom_b.scale,
+                            centroid_b,
+                            wp.cw_mul(mesh_b.points[i], geom_b.scale),
+                        )
+                        < -CONVEX_MESH_PATCH_SURFACE_TOLERANCE
+                    ):
+                        continue
                     lo, hi, hit = hull_line_interval(mesh_a.points, mesh_a.indices, geom_a.scale, centroid_a, v, normal)
                     distance = -hi
                     if hit and distance <= depth_max and distance >= mpr_distance - CONVEX_MESH_PATCH_DEPTH_TOLERANCE:
@@ -1417,6 +1452,11 @@ def create_build_manifold(
                     w = wp.cw_mul(mesh_a.points[i], geom_a.scale)
                     h = top_a - wp.dot(w, normal)
                     if h > slab or h <= slab_prev or count_a >= wp.static(CONVEX_MESH_PATCH_CAPACITY // 2):
+                        continue
+                    if (
+                        hull_surface_offset(mesh_a.points, mesh_a.indices, geom_a.scale, centroid_a, w)
+                        < -CONVEX_MESH_PATCH_SURFACE_TOLERANCE
+                    ):
                         continue
                     w_b = wp.quat_rotate_inv(relative_orientation_b, w - relative_position_b)
                     lo, hi, hit = hull_line_interval(

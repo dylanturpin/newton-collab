@@ -298,6 +298,24 @@ def test_patch_spans_disc_on_disc(test, device):
     test.assertGreater(span.min(), 0.02, f"patch spans only {span}")
 
 
+def test_unreferenced_vertices_are_not_witnesses(test, device):
+    """Check that hull vertices no triangle references, some just inside the hull, never become witnesses."""
+    points = _puck_points().astype(np.float32)
+    # The hull's triangles over every input point: about half of the bottom points are left inside it.
+    hull_vertices, hull_indices = _hull(points)
+    rows = {tuple(p): i for i, p in enumerate(points.tolist())}
+    indices = np.array([rows[tuple(p)] for p in hull_vertices[hull_indices].tolist()], np.int32)
+    test.assertLess(len(np.unique(indices)), len(points))
+    slab = _box(0.2, 0.15, 0.0017)
+    model = _build_pair(
+        device, (points, indices), wp.quat_identity(), 2.0e-4, slab, wp.quat_identity(), False, (1.0, 1.0, 1.0)
+    )
+    state, contacts = _collide(model, True)
+    errors, _, _ = _witness_report(model, state, contacts)
+    test.assertGreaterEqual(len(errors), 3)
+    test.assertLess(errors.max(), SURFACE_TOLERANCE, f"witness {errors.max():.3e} m off its hull")
+
+
 def _unverified_slab_model(device):
     """Return a disc resting on a slab whose top triangles meet 50 um below the slab's vertex hull."""
     p = [[-0.1, -0.1, -0.01], [0.1, -0.1, -0.01], [0.1, 0.1, -0.01], [-0.1, 0.1, -0.01]]
@@ -509,8 +527,8 @@ def test_patch_rejects_prebuilt_narrow_phase(test, device):
         )
 
 
-def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
-    """Return the late mean |yaw rate| and rms tilt rate [rad/s] of a puck with a 0.1 mm domed, 30 um rough bottom."""
+def _puck_points():
+    """Return the points of a 36 mm puck whose bottom is a 0.1 mm dome with 30 um vertical noise."""
     rng = np.random.default_rng(0)
     angles = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
     bottom = [_ring(0.036, -0.03, 32)]
@@ -522,7 +540,12 @@ def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
     bottom.append([[0.0, 0.0, -0.0301]])
     bottom = np.vstack(bottom)
     bottom[:, 2] += rng.uniform(-3.0e-5, 3.0e-5, len(bottom))
-    puck_vertices, puck_indices = _hull(np.vstack([bottom, _ring(0.036, 0.03, 32)]))
+    return np.vstack([bottom, _ring(0.036, 0.03, 32)])
+
+
+def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
+    """Return the late mean |yaw rate| and rms tilt rate [rad/s] of the puck resting on a convex-hull slab."""
+    puck_vertices, puck_indices = _hull(_puck_points())
     slab_vertices, slab_indices = _box(0.2, 0.15, 0.0017)
     builder = newton.ModelBuilder()
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.002, margin=0.0)
@@ -579,6 +602,7 @@ for _function in (
     test_witnesses_on_hull_surfaces_swapped_scaled,
     test_patch_spans_disc_on_disc,
     test_unverified_hull_keeps_vertex_face_contacts,
+    test_unreferenced_vertices_are_not_witnesses,
     test_saturated_candidates_stay_bounded,
     test_patch_leaves_other_pairs_unchanged,
     test_patch_deterministic,
