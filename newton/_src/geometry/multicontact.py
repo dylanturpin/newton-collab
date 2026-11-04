@@ -57,6 +57,21 @@ FACE_CLIP_MERGE_DISTANCE_SQ = wp.constant(1.0e-8)
 FACE_CLIP_MIN_DOUBLE_AREA = wp.constant(1.0e-10)
 # Allowed excess [m] of the patch depth over the MPR/GJK depth before falling back.
 FACE_CLIP_DEPTH_TOLERANCE = wp.constant(1.0e-4)
+# Hull vertices within this distance [m] of a hull's extreme plane along the normal are mesh-patch candidates.
+CONVEX_MESH_PATCH_SLAB = wp.constant(2.0e-5)
+# Slab widenings (x4 each) tried while the candidates and the witness span no triangle.
+CONVEX_MESH_PATCH_SLAB_STEPS = 2
+# Candidate buffer; each hull may fill at most half of it.
+CONVEX_MESH_PATCH_CAPACITY = 64
+# Patch points written per pair besides the GJK/MPR witness.
+CONVEX_MESH_PATCH_POINTS = 7
+# Allowed excess [m] of a candidate's depth over the GJK/MPR depth.
+CONVEX_MESH_PATCH_DEPTH_TOLERANCE = wp.constant(1.0e-4)
+# Patch points closer than this [m] are merged.
+CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ = wp.constant(1.0e-8)
+# Twice the triangle area [m^2] below which a patch point adds no support.
+CONVEX_MESH_PATCH_MIN_DOUBLE_AREA = wp.constant(1.0e-10)
+_ConvexMeshPatchChosen = wp.types.vector(length=CONVEX_MESH_PATCH_POINTS, dtype=wp.int32)
 # Sampled support points of one shape (one row per sample) and their contact distances.
 _SamplePoints = wp.types.matrix(shape=(5, 3), dtype=wp.float32)
 _SampleDistances = wp.types.vector(length=5, dtype=wp.float32)
@@ -958,12 +973,61 @@ def face_clip_side(
     return dst_count
 
 
+@wp.func
+def hull_centroid(points: wp.array[wp.vec3], scale: wp.vec3) -> wp.vec3:
+    """Return the mean of a hull's scaled vertices, an interior point."""
+    centroid = wp.vec3(0.0)
+    for i in range(points.shape[0]):
+        centroid += wp.cw_mul(points[i], scale)
+    return centroid / float(points.shape[0])
+
+
+@wp.func
+def hull_line_interval(
+    points: wp.array[wp.vec3],
+    indices: wp.array[wp.int32],
+    scale: wp.vec3,
+    centroid: wp.vec3,
+    origin: wp.vec3,
+    direction: wp.vec3,
+):
+    """Return the parameter interval of ``origin + t * direction`` inside a verified convex hull, and whether it hits.
+
+    The hit is false unless both ends of the interval are bounded by hull faces.
+    """
+    lo = float(-1.0e30)
+    hi = float(1.0e30)
+    hit = bool(True)
+    for f in range(indices.shape[0] // 3):
+        p0 = wp.cw_mul(points[indices[3 * f]], scale)
+        p1 = wp.cw_mul(points[indices[3 * f + 1]], scale)
+        p2 = wp.cw_mul(points[indices[3 * f + 2]], scale)
+        n = wp.cross(p1 - p0, p2 - p0)
+        n_len = wp.length(n)
+        if n_len <= 1.0e-14:
+            continue
+        n = n / n_len
+        if wp.dot(n, p0 - centroid) < 0.0:
+            n = -n
+        s = wp.dot(n, direction)
+        r = wp.dot(n, p0 - origin)
+        if wp.abs(s) <= 1.0e-9:
+            if r < -EPS:
+                hit = False
+        elif s > 0.0:
+            hi = wp.min(hi, r / s)
+        else:
+            lo = wp.max(lo, r / s)
+    return lo, hi, hit and lo > -1.0e29 and hi < 1.0e29 and lo <= hi + EPS
+
+
 def create_build_manifold(
     support_func: Any,
     writer_func: Any,
     post_process_contact: Any,
     _support_funcs: Any = None,
     face_clip: bool = False,
+    convex_mesh_patch: bool = False,
 ):
     """
     Factory function to create manifold generation functions with a specific support mapping function.
@@ -979,10 +1043,12 @@ def create_build_manifold(
         post_process_contact: Function to post-process contact data
         face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's contact patch
             against the box or plane reference face, falling back to perturbed support mapping.
+        convex_mesh_patch: Give verified convex-mesh pairs whose sampled features are not flat to
+            ``EPS`` up to 7 vertex contacts with exact witnesses, falling back to vertex-face contacts.
 
     Returns:
         build_manifold function that generates up to 5 contact points between two shapes
-        using perturbed support mapping and polygon clipping.
+        (8 with ``convex_mesh_patch``) using perturbed support mapping and polygon clipping.
     """
 
     @wp.func
@@ -1272,6 +1338,188 @@ def create_build_manifold(
             contact_data.contact_point_center = wp.quat_rotate(orientation_a, center_local) + position_a_world
             contact_data.contact_normal_a_to_b = normal_world
             contact_data.contact_distance = point[2]
+            contact_data.sort_sub_key = (contact_template.sort_sub_key << 3) | slot
+            contact_data = post_process_contact(
+                contact_data, geom_a, position_a_world, orientation_a, geom_b, position_b_ws, quaternion_b_ws
+            )
+            writer_func(contact_data, writer_data, -1)
+        return chosen_count
+
+    @wp.func
+    def build_convex_mesh_patch_manifold(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_a: wp.quat,
+        position_a_world: wp.vec3,
+        relative_orientation_b: wp.quat,
+        relative_position_b: wp.vec3,
+        p_a: wp.vec3,
+        p_b: wp.vec3,
+        normal: wp.vec3,
+        writer_data: Any,
+        contact_template: ContactData,
+    ) -> int:
+        """Write up to 7 vertex contacts between two verified convex meshes, each with exact witnesses along the normal.
+
+        Candidates are each hull's vertices near its extreme plane along the normal, ray-cast onto the other
+        hull; none may be deeper than the GJK/MPR witness. Skips the GJK/MPR witness, which the caller writes.
+        """
+        axis_u, axis_v = orthonormal_basis(normal)
+        mesh_a = wp.mesh_get(unpack_mesh_ptr(geom_a.auxiliary))
+        mesh_b = wp.mesh_get(unpack_mesh_ptr(geom_b.auxiliary))
+        depth_max = contact_template.gap_sum + contact_template.margin_a + contact_template.margin_b
+        mpr_distance = wp.dot(p_b - p_a, normal)
+        mpr_center = 0.5 * (p_a + p_b)
+        normal_b = wp.quat_rotate_inv(relative_orientation_b, normal)
+        centroid_a = hull_centroid(mesh_a.points, geom_a.scale)
+        centroid_b = hull_centroid(mesh_b.points, geom_b.scale)
+        centers = wp.zeros(shape=(CONVEX_MESH_PATCH_CAPACITY,), dtype=wp.vec3f)
+        distances = wp.zeros(shape=(CONVEX_MESH_PATCH_CAPACITY,), dtype=wp.float32)
+        count = int(0)
+
+        top_a = float(-1.0e30)
+        for i in range(mesh_a.points.shape[0]):
+            top_a = wp.max(top_a, wp.dot(wp.cw_mul(mesh_a.points[i], geom_a.scale), normal))
+        bottom_b = float(1.0e30)
+        for i in range(mesh_b.points.shape[0]):
+            v = wp.quat_rotate(relative_orientation_b, wp.cw_mul(mesh_b.points[i], geom_b.scale)) + relative_position_b
+            bottom_b = wp.min(bottom_b, wp.dot(v, normal))
+
+        # Widen the slab until it holds a support triangle besides the GJK/MPR witness.
+        slab = float(CONVEX_MESH_PATCH_SLAB)
+        slab_prev = float(-1.0)
+        count_a = int(0)
+        count_b = int(0)
+        has_triangle = bool(False)
+        for _attempt in range(wp.static(CONVEX_MESH_PATCH_SLAB_STEPS)):
+            if not has_triangle:
+                # B's slab vertices against A's surface, which lies at the top of A's interval along the normal.
+                for i in range(mesh_b.points.shape[0]):
+                    v = (
+                        wp.quat_rotate(relative_orientation_b, wp.cw_mul(mesh_b.points[i], geom_b.scale))
+                        + relative_position_b
+                    )
+                    h = wp.dot(v, normal) - bottom_b
+                    # Each hull gets half the buffer, so neither side can starve the other or overrun it.
+                    if h > slab or h <= slab_prev or count_b >= wp.static(CONVEX_MESH_PATCH_CAPACITY // 2):
+                        continue
+                    lo, hi, hit = hull_line_interval(mesh_a.points, mesh_a.indices, geom_a.scale, centroid_a, v, normal)
+                    distance = -hi
+                    if hit and distance <= depth_max and distance >= mpr_distance - CONVEX_MESH_PATCH_DEPTH_TOLERANCE:
+                        center = v + (0.5 * hi) * normal
+                        if wp.length_sq(center - mpr_center) > CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ:
+                            centers[count] = center
+                            distances[count] = distance
+                            count += 1
+                            count_b += 1
+                # A's slab vertices against B's surface, which lies at the bottom of B's interval.
+                for i in range(mesh_a.points.shape[0]):
+                    w = wp.cw_mul(mesh_a.points[i], geom_a.scale)
+                    h = top_a - wp.dot(w, normal)
+                    if h > slab or h <= slab_prev or count_a >= wp.static(CONVEX_MESH_PATCH_CAPACITY // 2):
+                        continue
+                    w_b = wp.quat_rotate_inv(relative_orientation_b, w - relative_position_b)
+                    lo, hi, hit = hull_line_interval(
+                        mesh_b.points, mesh_b.indices, geom_b.scale, centroid_b, w_b, normal_b
+                    )
+                    distance = lo
+                    if hit and distance <= depth_max and distance >= mpr_distance - CONVEX_MESH_PATCH_DEPTH_TOLERANCE:
+                        center = w + (0.5 * lo) * normal
+                        if wp.length_sq(center - mpr_center) > CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ:
+                            centers[count] = center
+                            distances[count] = distance
+                            count += 1
+                            count_a += 1
+                # Widen only while the candidates and the GJK/MPR witness span no triangle.
+                far = mpr_center
+                far_sq = float(0.0)
+                for i in range(count):
+                    d = centers[i] - mpr_center
+                    d = d - wp.dot(d, normal) * normal
+                    if wp.length_sq(d) > far_sq:
+                        far_sq = wp.length_sq(d)
+                        far = centers[i]
+                edge = far - mpr_center
+                for i in range(count):
+                    if (
+                        wp.abs(wp.dot(wp.cross(edge, centers[i] - mpr_center), normal))
+                        > CONVEX_MESH_PATCH_MIN_DOUBLE_AREA
+                    ):
+                        has_triangle = True
+                slab_prev = slab
+                slab = slab * 4.0
+
+        if count == 0:
+            return 0
+
+        # Reduce to the deepest point, the farthest point, then the largest triangle and quadrilateral.
+        chosen = _ConvexMeshPatchChosen(-1)
+        chosen_count = int(1)
+        chosen[0] = 0
+        for i in range(count):
+            if distances[i] < distances[chosen[0]]:
+                chosen[0] = i
+        c0 = centers[chosen[0]]
+        best_dist_sq = float(CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ)
+        for i in range(count):
+            d = centers[i] - c0
+            du = wp.dot(d, axis_u)
+            dv = wp.dot(d, axis_v)
+            if du * du + dv * dv > best_dist_sq:
+                best_dist_sq = du * du + dv * dv
+                chosen[1] = i
+                chosen_count = 2
+        if chosen_count == 2:
+            e = centers[chosen[1]] - c0
+            eu = wp.dot(e, axis_u)
+            ev = wp.dot(e, axis_v)
+            best_area = float(CONVEX_MESH_PATCH_MIN_DOUBLE_AREA)
+            side = float(0.0)
+            for i in range(count):
+                d = centers[i] - c0
+                area = eu * wp.dot(d, axis_v) - ev * wp.dot(d, axis_u)
+                if wp.abs(area) > best_area:
+                    best_area = wp.abs(area)
+                    side = wp.sign(area)
+                    chosen[2] = i
+                    chosen_count = 3
+            if chosen_count == 3:
+                best_area = float(CONVEX_MESH_PATCH_MIN_DOUBLE_AREA)
+                for i in range(count):
+                    d = centers[i] - c0
+                    area = -side * (eu * wp.dot(d, axis_v) - ev * wp.dot(d, axis_u))
+                    if area > best_area:
+                        best_area = area
+                        chosen[3] = i
+                        chosen_count = 4
+        # Farthest-point fill: each extra point maximizes its in-plane distance to the chosen ones.
+        for extra in range(wp.static(CONVEX_MESH_PATCH_POINTS - 4)):
+            if chosen_count == 4 + extra:
+                best_gap = float(CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ)
+                best_i = int(-1)
+                for i in range(count):
+                    gap = float(1.0e30)
+                    for slot in range(chosen_count):
+                        d = centers[i] - centers[chosen[slot]]
+                        du = wp.dot(d, axis_u)
+                        dv = wp.dot(d, axis_v)
+                        gap = wp.min(gap, du * du + dv * dv)
+                    if gap > best_gap:
+                        best_gap = gap
+                        best_i = i
+                if best_i >= 0:
+                    chosen[chosen_count] = best_i
+                    chosen_count += 1
+
+        normal_world = wp.quat_rotate(orientation_a, normal)
+        position_b_ws = wp.quat_rotate(orientation_a, relative_position_b) + position_a_world
+        quaternion_b_ws = orientation_a * relative_orientation_b
+        for slot in range(chosen_count):
+            k = chosen[slot]
+            contact_data = contact_template
+            contact_data.contact_point_center = wp.quat_rotate(orientation_a, centers[k]) + position_a_world
+            contact_data.contact_normal_a_to_b = normal_world
+            contact_data.contact_distance = distances[k]
             contact_data.sort_sub_key = (contact_template.sort_sub_key << 3) | slot
             contact_data = post_process_contact(
                 contact_data, geom_a, position_a_world, orientation_a, geom_b, position_b_ws, quaternion_b_ws
@@ -1575,7 +1823,28 @@ def create_build_manifold(
             # A tessellated feature that is not flat to EPS can still rest on a
             # verified face. Its sampled support points then give exact
             # vertex-face contacts instead of a single deepest contact.
-            if planar_a and planar_b and feature_a_flat != feature_b_flat:
+            if wp.static(convex_mesh_patch):
+                # Triangle half-spaces bound the shape only for a verified closed convex hull.
+                if (
+                    geom_a.shape_type == int(GeoType.CONVEX_MESH)
+                    and geom_b.shape_type == int(GeoType.CONVEX_MESH)
+                    and _has_verified_hull(geom_a, data_provider)
+                    and _has_verified_hull(geom_b, data_provider)
+                ):
+                    count_out = build_convex_mesh_patch_manifold(
+                        geom_a,
+                        geom_b,
+                        orientation_a,
+                        position_a_world,
+                        relative_orientation_b,
+                        relative_position_b,
+                        p_a,
+                        p_b,
+                        normal,
+                        writer_data,
+                        contact_template,
+                    )
+            if count_out == 0 and planar_a and planar_b and feature_a_flat != feature_b_flat:
                 face_on_b = feature_b_flat
                 vertex_points = points_a
                 vertex_polygon = a_buffer

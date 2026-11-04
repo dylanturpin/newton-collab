@@ -1793,6 +1793,7 @@ class CollisionPipeline:
         deterministic: bool = False,
         box_box_sat: bool = False,
         convex_face_clip: bool = False,
+        convex_mesh_patch: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1901,6 +1902,17 @@ class CollisionPipeline:
                 often keeps a single support vertex. Selected at construction and
                 fixed for the pipeline's lifetime. Experimental: the option and
                 its contacts may change without a deprecation period. Cannot be
+                combined with a prebuilt ``narrow_phase``. Defaults to False.
+            convex_mesh_patch: For a pair of convex meshes with verified hull
+                topology whose sampled contact features are not flat to 10 um,
+                ray-cast each hull's vertices within 20 um of its extreme plane
+                along the normal onto the other hull, and keep up to 7 of these
+                exact-witness contacts plus the GJK/MPR contact. Pairs the patch
+                does not cover keep the vertex-face or single-point manifold.
+                A pair can then report up to 8 contacts; size
+                ``rigid_contact_max`` for that. Selected at construction and fixed
+                for the pipeline's lifetime. Experimental: the option and its
+                contacts may change without a deprecation period. Cannot be
                 combined with a prebuilt ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
@@ -2119,6 +2131,11 @@ class CollisionPipeline:
                 raise ValueError(
                     "convex_face_clip cannot be used when narrow_phase is provided; "
                     "construct the NarrowPhase with convex_face_clip=True instead"
+                )
+            if convex_mesh_patch:
+                raise ValueError(
+                    "convex_mesh_patch cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with convex_mesh_patch=True instead"
                 )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
@@ -2425,6 +2442,7 @@ class CollisionPipeline:
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 box_box_sat=box_box_sat,
                 convex_face_clip=convex_face_clip,
+                convex_mesh_patch=convex_mesh_patch,
                 convex_support_acceleration=model._convex_support_lut.shape[0] > 1,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
