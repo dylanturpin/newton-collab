@@ -18,6 +18,7 @@ import warp as wp
 from ...core.reset import reset_world_selected
 from ...core.types import MAXVAL, override
 from ...exceptions import NewtonWarning
+from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import MeshProperties, ShapeFlags
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian, eval_mass_matrix
@@ -29,6 +30,7 @@ from .contact_angular_friction import (
     accumulate_free_rigid_angular_wrenches,
     configure_free_rigid_angular_friction,
     free_rigid_angular_friction_gs_sources,
+    free_rigid_reduction_material_key,
     free_rigid_route_bodies,
     launch_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
@@ -1522,6 +1524,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         """Per-body awake flags, shape ``(body_count,)``; see :ref:`steel_sleep_observable`."""
 
+    # The default configuration is conformance-tested against body-pair-reduced contact buffers
+    # (test_contact_reduction_body_pairs); compliance and warm start reject them in step().
+    supports_body_pair_reduced_contacts: bool = True
+
     SUPPORTED_OBSERVABLES = frozenset(
         {
             SolverBase.ObservableKind.BODY_PARENT_F,
@@ -2970,6 +2976,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._status_snapshot_event = None
         self._status_snapshot_checked = False
         self._status_readback_stream = None
+        # Last, so a failed construction leaves the model's reduction keys untouched.
+        reduction_key = free_rigid_reduction_material_key(self)
+        if reduction_key is not None:
+            add_reduction_material_key(model, self, reduction_key)
 
     def _refresh_shape_materials(self) -> None:
         """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
@@ -6933,12 +6943,26 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._contact_compliance:
             # Reject unsupported state before any stage can launch work.
             _contact_compliance.validate_step(self)
+            # The material law is validated on unreduced contacts only; a captured step also leases the buffer.
+            self._require_unreduced_contacts(
+                contacts, supports_body_pair_reduced_contacts=False, configuration="contact_compliance=True"
+            )
         self.validate_observables(observables, contacts)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "Steel contact capacity mismatch: received "
                 f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
+            )
+        if self._contact_warmstart:
+            # A reduced stream is valid when it carries retained identities; an unreduced captured stream keeps
+            # its reader lease so a later producer cannot change its layout behind graph replay.
+            self._require_unreduced_contacts(
+                contacts,
+                supports_body_pair_reduced_contacts=bool(
+                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
+                ),
+                configuration="contact_warmstart=True",
             )
         if self._contact_warmstart and contacts is not None and contacts.rigid_contact_match_index is None:
             raise ValueError(
