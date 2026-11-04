@@ -517,6 +517,86 @@ def test_imported_connect_equality_is_enforced(test, device):
         test.assertLess(abs(float(state_0.joint_q.numpy()[0])), 1.0e-2)
 
 
+def test_imported_weld_equality_holds_the_authored_pose(test, device):
+    """An imported MuJoCo WELD on a tilted body holds it where it is authored instead of snapping it to the world axes."""
+    mjcf = """
+    <mujoco>
+      <worldbody>
+        <body name="paddle" pos="0 0 1" euler="0 45 0">
+          <joint name="hinge" type="hinge" axis="0 1 0"/>
+          <geom type="box" pos="0.3 0 0" size="0.3 0.05 0.05"/>
+        </body>
+      </worldbody>
+      <equality><weld body1="paddle"/></equality>
+    </mujoco>
+    """
+    b = newton.ModelBuilder()
+    # The converted WELD becomes a FIXED loop joint parallel to the hinge.
+    _expect_one_warning(test, UserWarning, "another joint already connects these bodies", lambda: b.add_mjcf(mjcf))
+    model = b.finalize(device=device)
+    solver = SolverSteel(model, iterations=16)
+    test.assertEqual(solver._connect_count, 1)
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    q_start = state_0.body_q.numpy()[0, 3:].copy()
+    for _ in range(30):
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertLess(abs(float(state_0.joint_q.numpy()[0])), 1.0e-3)
+    test.assertGreater(abs(float(state_0.body_q.numpy()[0, 3:] @ q_start)), 1.0 - 1.0e-6)
+
+
+def test_imported_weld_with_zero_torquescale_leaves_rotation_free(test, device):
+    """A MuJoCo weld with torquescale 0 pins only its anchor: welded at the hinge, the paddle swings as a pendulum."""
+    mjcf = """
+    <mujoco>
+      <worldbody>
+        <body name="paddle" pos="0 0 1" euler="0 45 0">
+          <joint name="hinge" type="hinge" axis="0 1 0"/>
+          <geom type="box" pos="0.3 0 0" size="0.3 0.05 0.05"/>
+        </body>
+      </worldbody>
+      <equality><weld body1="paddle" anchor="0 0 1" torquescale="0"/></equality>
+    </mujoco>
+    """
+    b = newton.ModelBuilder()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        b.add_mjcf(mjcf)
+    test.assertTrue(any("torquescale=0" in str(w.message) for w in caught))
+    model = b.finalize(device=device)
+    solver = SolverSteel(model, iterations=16)
+    test.assertEqual(solver._connect_count, 1)
+    test.assertEqual(int(solver._connect_rows_np[0]), 3)
+
+    # Reference: a compound pendulum about the hinge, theta'' = m g r_x(theta) / I_pivot, integrated with RK4.
+    dt, steps = 1.0 / 240.0, 30
+    m = float(model.body_mass.numpy()[0])
+    q0 = wp.quat(*model.body_q.numpy()[0, 3:])
+    r0 = np.array(wp.quat_rotate(q0, wp.vec3(*model.body_com.numpy()[0])))
+    i_pivot = float(model.body_inertia.numpy()[0][1, 1]) + m * (r0[0] ** 2 + r0[2] ** 2)
+
+    def accel(th):
+        return m * 9.81 * (np.cos(th) * r0[0] + np.sin(th) * r0[2]) / i_pivot
+
+    th, w, h = 0.0, 0.0, dt / 20
+    for _ in range(20 * steps):
+        k1 = (w, accel(th))
+        k2 = (w + 0.5 * h * k1[1], accel(th + 0.5 * h * k1[0]))
+        k3 = (w + 0.5 * h * k2[1], accel(th + 0.5 * h * k2[0]))
+        k4 = (w + h * k3[1], accel(th + h * k3[0]))
+        th += h * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]) / 6
+        w += h * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]) / 6
+
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+    swing = float(state_0.joint_q.numpy()[0])
+    test.assertGreater(abs(th), 0.1)
+    # Semi-implicit Euler leads the exact swing by about one step, (N + 1) / N = 3.3 % for N = 30.
+    test.assertAlmostEqual(swing, th, delta=0.05 * abs(th))
+
+
 def _expect_one_warning(test, category, pattern, call):
     """Return ``call()``, requiring it to emit exactly one warning, of ``category`` and matching ``pattern``."""
     with warnings.catch_warnings(record=True) as caught:
@@ -546,6 +626,8 @@ cuda_devices = get_cuda_test_devices()
 for _name in (
     "test_four_bar_capture_matches_eager",
     "test_imported_connect_equality_is_enforced",
+    "test_imported_weld_equality_holds_the_authored_pose",
+    "test_imported_weld_with_zero_torquescale_leaves_rotation_free",
 ):
     add_function_test(TestSteelConnectUpstream, _name, globals()[_name], devices=cuda_devices)
 

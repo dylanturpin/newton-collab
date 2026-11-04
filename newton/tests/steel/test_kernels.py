@@ -1111,7 +1111,7 @@ def test_equality_link_must_name_the_projected_constraint(test, device):
     with test.assertRaisesRegex(NotImplementedError, r"equality_constraint rows \[0\]"):
         SolverSteel(_build_box_with_equality(device, enabled=True, target_kind=1, target=0))
 
-    def build_pendulum_with_connect(eq_type: int, joint_kind: str, row_names_world: bool):
+    def build_pendulum_with_connect(eq_type: int, joint_kind: str, row_names_world: bool, torquescale: float = 1.0):
         builder = newton.ModelBuilder()
         link = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
         builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
@@ -1130,6 +1130,7 @@ def test_equality_link_must_name_the_projected_constraint(test, device):
                 "mujoco:equality_constraint_enabled": True,
                 "mujoco:equality_constraint_target_kind": 1,
                 "mujoco:equality_constraint_target": loop,
+                "mujoco:equality_constraint_torquescale": torquescale,
             }
         )
         return builder.finalize(device=device)
@@ -1166,10 +1167,11 @@ def test_equality_link_must_name_the_projected_constraint(test, device):
             SolverSteel(builder.finalize(device=device))
     # The matching projection is judged through its loop joint instead: these closures join a
     # dynamic body outside the articulation (or weld), which this solver warns about and skips.
-    for eq_type, joint_kind in ((0, "ball"), (1, "fixed")):
-        with test.subTest(eq_type=eq_type, joint_kind=joint_kind, matching=True):
+    # A WELD with torquescale 0 is rotation free, so its projection is a ball joint.
+    for eq_type, joint_kind, torquescale in ((0, "ball", 1.0), (1, "fixed", 1.0), (1, "ball", 0.0)):
+        with test.subTest(eq_type=eq_type, joint_kind=joint_kind, torquescale=torquescale, matching=True):
             with test.assertWarnsRegex(UserWarning, "loop joint"):
-                SolverSteel(build_pendulum_with_connect(eq_type, joint_kind, False))
+                SolverSteel(build_pendulum_with_connect(eq_type, joint_kind, False, torquescale))
 
     # A JOINT row linking a mimic between other joints is likewise unenforced; the importer's
     # own projection is enforced through its mimic constraint.
