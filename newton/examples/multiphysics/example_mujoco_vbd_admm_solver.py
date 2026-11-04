@@ -81,7 +81,7 @@ def _rigid_solver_entry_args(
     if rigid_solver == "mujoco":
         return "mjc", SolverMuJoCo, dict(mujoco_kwargs or {})
     if rigid_solver == "steel":
-        return "steel", SolverSteel, {"solve_mode": "matrix_free"}
+        return "steel", SolverSteel, {}
     raise ValueError(f"Unsupported rigid solver '{rigid_solver}'")
 
 

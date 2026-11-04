@@ -130,7 +130,7 @@ def _simulate(
         model.shape_material_mu.fill_(sliding_material)
     if condim is not None:
         model.steel.condim.fill_(condim)
-    options = {"solve_mode": "matrix_free", "iterations": 32, "deterministic": _RUN_TO_RUN, **solver_kwargs}
+    options = {"iterations": 32, "deterministic": _RUN_TO_RUN, **solver_kwargs}
     solver = SolverSteel(model, **options)
     if on_solver is not None:
         on_solver(solver)
@@ -236,7 +236,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             builder.add_shape_sphere(body, radius=_RADIUS, cfg=cfg, custom_attributes={"steel:condim": 6})
         model = builder.finalize()
         model.steel.rigid_body_angular_damping.fill_(0.0)
-        solver = SolverSteel(model, solve_mode="matrix_free", iterations=32, deterministic=_RUN_TO_RUN)
+        solver = SolverSteel(model, iterations=32, deterministic=_RUN_TO_RUN)
         pipeline = newton.CollisionPipeline(model, deterministic=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
@@ -370,7 +370,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                     custom_attributes={"steel:condim": condim},
                 )
             model = builder.finalize()
-            solver = SolverSteel(model, solve_mode="matrix_free", iterations=32, friction_anchor_beta=0.2)
+            solver = SolverSteel(model, iterations=32, friction_anchor_beta=0.2)
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             state_0, state_1, control = model.state(), model.state(), model.control()
@@ -431,7 +431,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                     custom_attributes={"steel:condim": condim},
                 )
             model = builder.finalize()
-            solver = SolverSteel(model, solve_mode="matrix_free", iterations=32, friction_anchor_beta=0.2)
+            solver = SolverSteel(model, iterations=32, friction_anchor_beta=0.2)
             self.assertEqual(solver._free_rigid_angular_rows, mixed)
             pipeline = newton.CollisionPipeline(model, deterministic=True)
             contacts = pipeline.contacts()
@@ -544,7 +544,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model, _ = _scene("sphere")
         model.steel.condim.fill_(6)
         model.shape_material_mu_rolling.fill_(0.001)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         with wp.ScopedCapture(device=model.device) as capture:
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         model.shape_material_mu_rolling.fill_(0.003)
@@ -565,9 +565,7 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model.steel.condim.fill_(6)
         model.shape_material_mu_rolling.fill_(0.002)
         model.shape_material_mu_torsional.fill_(0.0)
-        solver = SolverSteel(
-            model, solve_mode="matrix_free", iterations=32, deterministic=_RUN_TO_RUN, contact_warmstart=True
-        )
+        solver = SolverSteel(model, iterations=32, deterministic=_RUN_TO_RUN, contact_warmstart=True)
         pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky")
         contacts = pipeline.contacts()
         states = [model.state(), model.state()]
@@ -663,18 +661,17 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model, _ = _scene("sphere")
         model.steel.condim.fill_(6)
         for options, option in (
-            ({"solve_mode": "split"}, "solve_mode='split'"),
             # Point friction: bisection with persistent patches would warn before the rejection under test.
             ({"friction_mode": "bisection", "friction_anchor_beta": 0.0}, "friction_mode='bisection'"),
         ):
             with self.subTest(option=option), self.assertRaisesRegex(NotImplementedError, option):
-                SolverSteel(model, **{"solve_mode": "matrix_free", **options})
+                SolverSteel(model, **{**options})
         for condim in (0, 1, 2, 5, 7):
             model.steel.condim.fill_(condim)
             with self.subTest(condim=condim), self.assertRaisesRegex(ValueError, "3, 4 or 6"):
-                SolverSteel(model, solve_mode="matrix_free")
+                SolverSteel(model)
         model.steel.condim.fill_(6)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         model.steel.condim.fill_(5)
         spatial_inertia = solver._body_I_m.numpy()
         model.body_mass.assign(2.0 * model.body_mass.numpy())
@@ -691,9 +688,9 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
                 model.steel.condim.fill_(condim)
                 array.fill_(value)
                 with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
-                    SolverSteel(model, solve_mode="matrix_free")
+                    SolverSteel(model)
                 array.assign(original)
-                solver = SolverSteel(model, solve_mode="matrix_free")
+                solver = SolverSteel(model)
                 array.fill_(value)
                 with self.subTest(name=name, value=value, notify=True), self.assertRaisesRegex(ValueError, name):
                     solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
@@ -701,11 +698,11 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         # A coefficient the shape's condim leaves off is not read.
         model.steel.condim.fill_(4)
         model.shape_material_mu_rolling.fill_(-1.0)
-        SolverSteel(model, solve_mode="matrix_free")
+        SolverSteel(model)
         model.shape_material_mu_rolling.fill_(0.0)
         # A solver built without the rows ignores later condim edits.
         model.steel.condim.fill_(3)
-        solver = SolverSteel(model, solve_mode="matrix_free")
+        solver = SolverSteel(model)
         for condim in (5, 6):
             model.steel.condim.fill_(condim)
             solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
@@ -758,8 +755,6 @@ class TestFreeRigidAngularFrictionOverrides(unittest.TestCase):
             for value in (-1.0e-3, float("nan"), float("inf")):
                 with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
                     SolverSteel(model, **{name: value})
-        with self.assertRaisesRegex(NotImplementedError, "free_rigid_"):
-            SolverSteel(model, solve_mode="split", free_rigid_rolling_friction=1.0e-3)
         solver = SolverSteel(model, free_rigid_rolling_friction=1.0e-3)
         self.assertEqual(solver.free_rigid_rolling_friction, 1.0e-3)
         self.assertIsNone(solver.free_rigid_torsional_friction)
@@ -796,7 +791,6 @@ def _warm_started_impulses(test, response_options, route):
     model, _ = _scene("sphere")
     solver = SolverSteel(
         model,
-        solve_mode="matrix_free",
         iterations=32,
         contact_warmstart=True,
         deterministic=_RUN_TO_RUN,
@@ -1094,7 +1088,6 @@ def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
     model = builder.finalize()
     set_torsion_radius(model, 0.01, shapes=[top_shape])
     options = {
-        "solve_mode": "matrix_free",
         "iterations": 32,
         "deterministic": _RUN_TO_RUN,
         "contact_torsion_device": True,
@@ -1148,7 +1141,7 @@ def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
     return float(np.linalg.norm(state_0.body_q.numpy()[sphere][:2] - start))
 
 
-_COLORED = {"articulated_contact_response": "propagation_colored"}
+_COLORED = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
 
 
 def _simulate_colored(test, variant, *args, on_solver=None, **kwargs):
@@ -1194,7 +1187,6 @@ def _pile_rollout(spins, steps, graph_at=None, overrides=None, **solver_kwargs):
     """Step a pile from :func:`_pile` with every angular row on, optionally replaying a captured step from ``graph_at``."""
     model, qd = _pile(spins)
     options = {
-        "solve_mode": "matrix_free",
         "iterations": 16,
         "deterministic": _RUN_TO_RUN,
         "friction_anchor_beta": 0.2,

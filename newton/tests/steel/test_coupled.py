@@ -25,7 +25,7 @@ DT = 1.0 / 480.0
 
 
 def _steel(view, **kwargs):
-    return SolverSteel(view, solve_mode="matrix_free", **kwargs)
+    return SolverSteel(view, **kwargs)
 
 
 def _build_box_cloth(
@@ -439,7 +439,6 @@ def _undamped(solver):
 def test_articulated_graph_capture_matches_eager(test, device):
     """Match eager stepping with graph replay of an articulated source across proxy iterations and friction models."""
     options = {
-        "solve_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "iterations": 16,
         "articulation_constraint_max": 32,
@@ -987,7 +986,7 @@ def test_split_articulation_gets_free_root(test, device):
     """Step a split arm subtree on its view's FREE root like the same arm built on a FREE root."""
 
     def steel(view):
-        return SolverSteel(view, solve_mode="split")
+        return SolverSteel(view)
 
     world_count = 2
     model, bodies_per_world, joints_per_world = _build_split_arm(device, base=True, world_count=world_count)
@@ -1056,16 +1055,15 @@ def test_coupling_owned_disabled_joints_are_accepted(test, device):
     joints = [builder.add_joint_free(root), builder.add_joint_revolute(root, child, axis=newton.Axis.Z)]
     builder.add_articulation(joints)
     model = builder.finalize(device=device)
-    solve_mode = "matrix_free" if wp.get_device(device).is_cuda else "split"
     hinge = wp.array([1], dtype=int, device=device)
 
     view = ModelView(model, "owned_elsewhere")
     view.disable_joints(hinge)
     with test.assertRaisesRegex(NotImplementedError, "disabled joints in an articulation tree"):
-        SolverSteel(view, solve_mode=solve_mode)
+        SolverSteel(view)
 
     view.mark_coupling_disabled_joints(hinge)
-    solver = SolverSteel(view, solve_mode=solve_mode)
+    solver = SolverSteel(view)
     state_0, state_1 = view.state(), view.state()
     solver.step(state_0, state_1, view.control(), None, 1.0e-3)
     solver.check_constraint_capacity()

@@ -744,9 +744,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
-        if not wp.get_device().is_cuda:
-            self.skipTest("Steel contact warm start requires the CUDA matrix-free solve")
-        cases = (("contact_warmstart=True", {"solve_mode": "matrix_free", "contact_warmstart": True}),)
+        cases = (("contact_warmstart=True", {"contact_warmstart": True}),)
         for label, kwargs in cases:
             with self.subTest(configuration=label):
                 solver = newton.solvers.SolverSteel(model, **kwargs)
@@ -1065,7 +1063,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
                 solver = newton.solvers.SolverSteel(
                     model,
-                    solve_mode="matrix_free",
                     articulated_contact_response=response,
                     articulation_constraint_max=4,
                     free_body_constraint_max=4,
@@ -1097,7 +1094,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         Sequential PGS observes row order, so the sorted conformance cases do
         not establish support for ``CollisionPipeline(deterministic=False)``.
-        This exercises the default split solver with strict contact compaction.
+        This exercises the default serial solver with strict contact compaction.
         """
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
@@ -1123,30 +1120,24 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         """Settle identically on/off in every Steel contact mode.
 
         supports_body_pair_reduced_contacts is class-wide, so the evidence must cover
-        the dense and matrix-free contact paths, not only the default split
-        mode the other tests exercise (matrix-free additionally runs generated
-        native CUDA).
+        the articulated, free-body and propagation contact paths of both solve modes.
         """
         if not wp.get_device().is_cuda:
             self.skipTest("Steel contact-mode conformance is a CUDA-only merge gate")
 
+        # Use a non-free prismatic articulation for every propagation variant.
         configs = [
-            ("split", "immediate", 16, _prismatic_jointed_foot, "articulation"),
-            ("split", "immediate", 16, _free_jointed_foot, "free_body"),
+            ("serial", "immediate", 16, _prismatic_jointed_foot, "articulation"),
+            ("serial", "immediate", None, _free_jointed_foot, "free_body"),
+            ("serial", "propagation", 16, _prismatic_jointed_foot, "propagation"),
+            ("colored", "propagation", 16, _prismatic_jointed_foot, "propagation"),
         ]
-        # Matrix-free (and its propagation response family) is CUDA-only. Use
-        # a non-free prismatic articulation for every propagation variant.
-        configs += [
-            ("matrix_free", "immediate", None, _free_jointed_foot, "free_body"),
-            ("matrix_free", "propagation", 16, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation_colored", 16, _prismatic_jointed_foot, "propagation"),
-        ]
-        # Dense, propagation, and propagation_colored run 16 iterations. The
+        # Articulated, propagation, and colored rows run 16 iterations. The
         # ``None`` entry deliberately omits iterations and asserts the
         # production default (12), rather than testing a stale assumed default.
         # At 8 iterations the UNREDUCED redundant set does not converge (dense
-        # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
-        # the REDUCED set and split land at the true 0.01500 at every
+        # settles 5 mm high, serial/colored propagation 4.8 mm high at 0.01980;
+        # the REDUCED set lands at the true 0.01500 at every
         # iteration count) -- redundant near-parallel rows hurt PGS
         # conditioning, the same effect as the stack-collapse case, and
         # reduction itself is what removes it.  The comparison must be against
@@ -1213,7 +1204,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         solver = newton.solvers.SolverSteel(
             model,
-            solve_mode="matrix_free",
             articulated_contact_response="propagation",
             propagation_same_articulation_rows=True,
             row_watermark=True,
@@ -2413,7 +2403,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
-        solver = newton.solvers.SolverSteel(model, solve_mode="matrix_free", contact_warmstart=True)
+        solver = newton.solvers.SolverSteel(model, contact_warmstart=True)
         control = model.control()
         solver.step(state_0, state_1, control, contacts, DT)
         with wp.ScopedCapture(device) as solver_capture:
@@ -3218,7 +3208,6 @@ class TestBodyPairReductionTouchingFootprint(unittest.TestCase):
             contacts = pipeline.contacts()
             solver = newton.solvers.SolverSteel(
                 model,
-                solve_mode="matrix_free",
                 iterations=16,
                 baumgarte=0.2,
                 contact_regularization=0.01,

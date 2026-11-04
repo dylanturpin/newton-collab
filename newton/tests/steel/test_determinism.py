@@ -26,7 +26,7 @@ from newton._src.solvers.steel.kernels import (
     crba_fill_par_dof,
 )
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import _build_four_bar
+from newton.tests.steel._fixtures import _build_four_bar, steel_mode_options
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
 
 RUN_TO_RUN = wp.DeterministicMode.RUN_TO_RUN
@@ -37,7 +37,7 @@ CRBA_ARTICULATIONS = 256
 CRBA_LAUNCHES = 8
 
 # Joint-limit and velocity-limit rows of two floating ants per world, plus free boxes; drive rows need drive gains.
-MATRIX_FREE_OPTIONS = {
+SERIAL_OPTIONS = {
     "drive_mode": "rows",
     "enable_joint_limits": True,
     "enable_joint_velocity_limits": True,
@@ -48,31 +48,23 @@ MATRIX_FREE_OPTIONS = {
     "warn_constraint_overflow": False,
 }
 
-SPLIT_OPTIONS = {
-    "solve_mode": "split",
-    "enable_joint_limits": True,
-    "articulation_constraint_max": 128,
-    "free_body_constraint_max": 256,
-    "warn_constraint_overflow": False,
-}
-
 # Device-prepared contact torsion rows follow the contact rows of their world.
-TORSION_OPTIONS = {**MATRIX_FREE_OPTIONS, "contact_torsion_device": True, "articulation_constraint_max": 512}
-TORSION_COLORED_OPTIONS = {**TORSION_OPTIONS, "articulated_contact_response": "propagation_colored"}
+TORSION_OPTIONS = {**SERIAL_OPTIONS, "contact_torsion_device": True, "articulation_constraint_max": 512}
+TORSION_COLORED_OPTIONS = {**TORSION_OPTIONS, "solve_mode": "colored", "articulated_contact_response": "propagation"}
 
 # Joint-friction rows alongside contact, drive, joint-limit and velocity-limit rows; unfused limits keep their rows.
 FRICTION_OPTIONS = {
-    **MATRIX_FREE_OPTIONS,
+    **SERIAL_OPTIONS,
     "enable_joint_friction": True,
     "fuse_joint_velocity_limits": False,
     "articulation_constraint_max": 512,
 }
 
 # Warm-started impulses are matched through contact matching and carried across steps.
-WARMSTART_OPTIONS = {**MATRIX_FREE_OPTIONS, "contact_warmstart": True, "velocity_iterations": 2}
+WARMSTART_OPTIONS = {**SERIAL_OPTIONS, "contact_warmstart": True, "velocity_iterations": 2}
 
 # The body-space propagation responses; they also take the free-body contacts.
-PROPAGATION_RESPONSES = ("propagation", "propagation_colored")
+PROPAGATION_RESPONSES = ("propagation", "colored")
 
 # Ants alone select the sparse mass factors and their one-warp joint-limit builder.
 SPARSE_OPTIONS = {
@@ -165,7 +157,7 @@ def test_full_reset_matches_fresh_solver(test, device):
     for interval in (1, 3):
         with test.subTest(update_mass_matrix_interval=interval):
             model = _build_pendulum_model(device)
-            options = {"solve_mode": "split", "update_mass_matrix_interval": interval}
+            options = {"update_mass_matrix_interval": interval}
             reused = SolverSteel(model, **options)
             _simulate(model, reused, 5)
             reused.reset(model.state())
@@ -323,10 +315,8 @@ def test_deterministic_runs_are_bitwise_identical(test, device):
     torsion_model = _build_contact_scene(device, torsion_radius=0.02)
     friction_model = _build_contact_scene(device, joint_friction=0.4)
     configurations = [
-        ("split", model, SPLIT_OPTIONS, False),
-        ("split_graph", model, SPLIT_OPTIONS, True),
-        ("matrix_free", model, MATRIX_FREE_OPTIONS, False),
-        ("matrix_free_graph", model, MATRIX_FREE_OPTIONS, True),
+        ("serial", model, SERIAL_OPTIONS, False),
+        ("serial_graph", model, SERIAL_OPTIONS, True),
         ("torsion_graph", torsion_model, TORSION_OPTIONS, True),
         ("torsion_colored_graph", torsion_model, TORSION_COLORED_OPTIONS, True),
         ("warmstart_graph", model, WARMSTART_OPTIONS, True),
@@ -348,7 +338,7 @@ def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
         for cached, graph in ((True, False), (False, False), (True, True)):
             options = {
                 **WARMSTART_OPTIONS,
-                "articulated_contact_response": response,
+                **steel_mode_options(response),
                 "propagation_cached_response": cached,
             }
             with test.subTest(response=response, cached=cached, graph=graph):
@@ -398,9 +388,7 @@ def _check_propagation_coverage(test, model, options):
     body_count = solver._propagation_body_count.numpy()
     body_list = solver._propagation_body_list.numpy()
     # Only the colored sweep and the cached response read the body map.
-    reads_body_map = (
-        options["articulated_contact_response"] == "propagation_colored" or options["propagation_cached_response"]
-    )
+    reads_body_map = options.get("solve_mode") == "colored" or options["propagation_cached_response"]
     test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map)
     if options["propagation_cached_response"]:
         test.assertTrue(np.all(solver._propagation_cache_world_flag.numpy() == 1))
@@ -494,8 +482,7 @@ def test_deterministic_launches_replay_identically(test, device):
     _check_launches_replay(
         test,
         (
-            ("matrix_free", model, MATRIX_FREE_OPTIONS),
-            ("split", model, SPLIT_OPTIONS),
+            ("serial", model, SERIAL_OPTIONS),
             ("torsion", torsion_model, TORSION_OPTIONS),
             ("warmstart", model, WARMSTART_OPTIONS),
             ("sparse", ant_model, SPARSE_OPTIONS),
@@ -513,11 +500,11 @@ def test_deterministic_propagation_launches_replay_identically(test, device):
             (
                 f"{response}_{name}",
                 model,
-                {**options, "articulated_contact_response": response, "propagation_cached_response": cached},
+                {**options, **steel_mode_options(response), "propagation_cached_response": cached},
             )
             for response in PROPAGATION_RESPONSES
             for name, options, cached in (
-                ("cached", MATRIX_FREE_OPTIONS, True),
+                ("cached", SERIAL_OPTIONS, True),
                 ("uncached_warmstart", WARMSTART_OPTIONS, False),
             )
         ],
@@ -536,7 +523,6 @@ def _check_launches_replay(test, configurations):
             newton.eval_fk(scene, scene.joint_q, scene.joint_qd, state_0)
             _actuate(scene, control)
             varied = set()
-            coupling_contacts = 0
             for _ in range(12):
                 state_0.clear_forces()
                 pipeline.collide(state_0, contacts)
@@ -546,21 +532,8 @@ def _check_launches_replay(test, configurations):
                 ):
                     solver.step(state_0, state_1, control, contacts, 0.005)
                 state_0, state_1 = state_1, state_0
-                coupling_contacts += _count_articulation_coupling_contacts(solver, contacts)
             test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-            if name == "split":
-                # Ant-on-ant contacts give Delassus entries terms from both articulations of a world.
-                test.assertGreater(coupling_contacts, 0)
             test.assertEqual(varied, set())
-
-
-def _count_articulation_coupling_contacts(solver, contacts):
-    """Count the dense-path contacts between two articulations."""
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    art_a = solver._contact_art_a.numpy()[:count]
-    art_b = solver._contact_art_b.numpy()[:count]
-    dense = solver._contact_path.numpy()[:count] == 0
-    return int((dense & (art_a >= 0) & (art_b >= 0) & (art_a != art_b)).sum())
 
 
 def _route_contacts(model, state, contacts, **options):
@@ -587,11 +560,9 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     pipeline.collide(state, contacts)
 
-    world, _, path, needed, _, _ = _route_contacts(
-        model, state, contacts, solve_mode="split", free_body_constraint_max=4096
-    )
+    world, _, path, needed, _, _ = _route_contacts(model, state, contacts, free_body_constraint_max=4096)
     small_world, slot, small_path, _, dropped, overflow = _route_contacts(
-        model, state, contacts, solve_mode="split", free_body_constraint_max=24
+        model, state, contacts, free_body_constraint_max=24
     )
     for w in range(model.world_count):
         routed = np.nonzero((path == 1) & (world == w))[0]
@@ -622,7 +593,7 @@ def test_overflow_warning_names_deterministic_mode(test, device):
     check_output = not (wp.get_device(device).is_cpu and sys.platform == "win32")
     for deterministic in (wp.DeterministicMode.NOT_GUARANTEED, RUN_TO_RUN):
         with test.subTest(deterministic=deterministic.name):
-            solver = SolverSteel(model, deterministic=deterministic, solve_mode="split", free_body_constraint_max=24)
+            solver = SolverSteel(model, deterministic=deterministic, free_body_constraint_max=24)
             capture = StdOutCapture()
             if check_output:
                 capture.begin()
@@ -797,7 +768,7 @@ def _check_inherited_global_mode(device):
     model = _build_contact_scene(device)
 
     def run(deterministic):
-        solver = SolverSteel(model, deterministic=deterministic, **MATRIX_FREE_OPTIONS)
+        solver = SolverSteel(model, deterministic=deterministic, **SERIAL_OPTIONS)
         with _warp_lowering_off():
             pipeline = newton.CollisionPipeline(model, deterministic=True)
             contacts = pipeline.contacts()

@@ -12,9 +12,10 @@ import newton
 from newton._src.solvers.steel.kernels import combine_shape_coefficients, mixed_contact_restitution
 from newton._src.solvers.steel.solver_steel import _MATERIAL_COMBINE_MODES
 from newton.solvers import SolverSteel
+from newton.tests.steel._fixtures import steel_mode_options
 
 COMBINE_MODES = ("average", "min", "multiply", "max")
-RESPONSE_MODES = ("immediate", "propagation", "propagation_colored")
+RESPONSE_MODES = ("immediate", "propagation", "colored")
 SLIDE_DT = 5.0e-3
 SLIDE_STEPS = 40
 SLIDE_SPEED = 3.0
@@ -74,7 +75,7 @@ def _slide_box(device, *, scene, response, friction_combine, box_mu=0.8, ground_
     box_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=box_mu, restitution=0.0, gap=0.01)
     box = builder.add_shape_box(body, hx=SLIDE_HALF, hy=SLIDE_HALF, hz=SLIDE_HALF, cfg=box_cfg)
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, iterations=32, articulated_contact_response=response, friction_combine=friction_combine)
+    solver = SolverSteel(model, iterations=32, **steel_mode_options(response), friction_combine=friction_combine)
 
     def edit(step):
         if edit_box_mu is not None and step == edit_box_mu[0]:
@@ -101,7 +102,7 @@ def _bounce(device, *, scene, response, restitution_combine, sphere_e=0.8, groun
         iterations=16,
         cfm=0.0,
         restitution_velocity_threshold=0.0,
-        articulated_contact_response=response,
+        **steel_mode_options(response),
         restitution_combine=restitution_combine,
     )
     solver._rigid_body_angular_damping.zero_()
@@ -167,8 +168,8 @@ class TestSteelMaterialCombine(unittest.TestCase):
         for name in ("friction_combine", "restitution_combine"):
             with self.subTest(option=name):
                 with self.assertRaisesRegex(ValueError, f"{name} must be one of"):
-                    SolverSteel(model, solve_mode="split", **{name: "geometric"})
-                solver = SolverSteel(model, solve_mode="split", **{name: "max"})
+                    SolverSteel(model, **{name: "geometric"})
+                solver = SolverSteel(model, **{name: "max"})
                 self.assertEqual(getattr(solver, name), "max")
                 with self.assertRaises(AttributeError):
                     setattr(solver, name, "min")

@@ -82,7 +82,6 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     metrics = wp.zeros(6, dtype=wp.float32, device=model.device)
     solver = newton.solvers.SolverSteel(
         model,
-        solve_mode="matrix_free",
         contact_warmstart=warm,
         iterations=iterations,
         friction_mode=friction,

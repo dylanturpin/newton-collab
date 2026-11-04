@@ -310,7 +310,6 @@ class Example:
             def rigid_solver(v):
                 return SolverSteel(
                     v,
-                    solve_mode="matrix_free",
                     iterations=int(args.steel_iterations),
                     enable_joint_limits=True,
                     articulation_constraint_max=64,

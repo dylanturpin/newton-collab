@@ -484,11 +484,7 @@ def test_kinematic_free_base_prescribed_motion(
             device, kinematic_first=kinematic_first
         )
         solver = solver_fn(model)
-        if (
-            isinstance(solver, newton.solvers.SolverSteel)
-            and solver._solve_mode == "matrix_free"
-            and solver._articulated_contact_response == "immediate"
-        ):
+        if isinstance(solver, newton.solvers.SolverSteel) and solver._articulated_contact_response == "immediate":
             body_to_articulation = solver._body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
@@ -888,11 +884,10 @@ def test_kinematic_prescribed_response_lifetime(
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "steel_matrix_free": lambda model: newton.solvers.SolverSteel(model, solve_mode="matrix_free"),
-    "steel_split": lambda model: newton.solvers.SolverSteel(model, solve_mode="split"),
+    "steel_serial": newton.solvers.SolverSteel,
     "steel_propagation": lambda model: newton.solvers.SolverSteel(model, articulated_contact_response="propagation"),
-    "steel_propagation_colored": lambda model: newton.solvers.SolverSteel(
-        model, articulated_contact_response="propagation_colored"
+    "steel_colored": lambda model: newton.solvers.SolverSteel(
+        model, solve_mode="colored", articulated_contact_response="propagation"
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
@@ -908,12 +903,7 @@ for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name in (
-            "mujoco_warp",
-            "steel_matrix_free",
-            "steel_propagation",
-            "steel_propagation_colored",
-        ):
+        if device.is_cpu and solver_name in ("mujoco_warp",):
             continue
 
         add_function_test(
@@ -922,7 +912,7 @@ for device in devices:
             test_kinematic_free_base_prescribed_motion,
             devices=[device],
             solver_fn=solver_fn,
-            check_reversed_order=solver_name == "steel_matrix_free",
+            check_reversed_order=solver_name == "steel_serial",
         )
         if solver_name.startswith("steel"):
             add_function_test(
@@ -932,10 +922,10 @@ for device in devices:
                 devices=[device],
                 solver_fn=solver_fn,
             )
-        if solver_name == "steel_matrix_free":
+        if solver_name == "steel_serial":
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_free_base_drives_dense_articulation_steel_matrix_free",
+                "test_kinematic_free_base_drives_dense_articulation_steel_serial",
                 test_kinematic_free_base_drives_dense_articulation,
                 devices=[device],
                 solver_fn=solver_fn,

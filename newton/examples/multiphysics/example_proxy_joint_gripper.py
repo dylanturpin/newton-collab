@@ -118,7 +118,6 @@ class Example:
             def rigid_factory(v):
                 return SolverSteel(
                     v,
-                    solve_mode="matrix_free",
                     iterations=int(args.steel_iterations),
                     enable_joint_limits=True,
                 )

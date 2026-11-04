@@ -222,7 +222,6 @@ class Example:
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
             return "steel", lambda v: SolverSteel(
                 v,
-                solve_mode="matrix_free",
                 iterations=int(args.steel_iterations),
                 enable_joint_limits=True,
                 articulation_constraint_max=64,

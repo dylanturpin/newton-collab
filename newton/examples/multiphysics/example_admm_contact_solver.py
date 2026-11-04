@@ -80,7 +80,7 @@ class Example:
         if args.tray_solver == "steel":
 
             def tray_factory(v):
-                return SolverSteel(v, solve_mode="matrix_free")
+                return SolverSteel(v)
 
         elif args.tray_solver == "mujoco":
 

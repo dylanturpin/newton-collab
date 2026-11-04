@@ -33,7 +33,7 @@ def test_capture_substeps(test, device, substeps):
         example.viewer = ViewerNull()
         example.pipeline = newton.CollisionPipeline(example.model)
         example.contacts = example.pipeline.contacts()
-        example.solver = SolverSteel(example.model, solve_mode="matrix_free", iterations=4)
+        example.solver = SolverSteel(example.model, iterations=4)
         example.sim_substeps = substeps
         example.sim_dt = 1 / (60 * substeps)
         example.simulate()

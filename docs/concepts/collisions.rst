@@ -2362,8 +2362,8 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
-   :class:`~newton.solvers.SolverSteel` applies restitution in ``dense``,
-   ``split``, and ``matrix_free`` modes. Its ordinary normal row combines the
+   :class:`~newton.solvers.SolverSteel` applies restitution in every
+   ``solve_mode``. Its ordinary normal row combines the
    two shape coefficients by ``restitution_combine`` and uses the rebound
    target only when the contact closes faster than
    ``restitution_velocity_threshold`` at the start of the step and touches the
