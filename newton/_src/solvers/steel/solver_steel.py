@@ -457,6 +457,13 @@ def _validate_equality_constraints(model: Model) -> None:
 
 
 @wp.kernel
+def _zero_disabled_gravity_acceleration(disable_gravity: wp.array[wp.bool], acceleration: wp.array[wp.vec3]):
+    body = wp.tid()
+    if disable_gravity[body]:
+        acceleration[body] = wp.vec3(0.0)
+
+
+@wp.kernel
 def _clear_dense_row_state(
     slot_counter: wp.array[int], dense_contact_world_flag: wp.array[int], dropped: wp.array2d[int]
 ):
@@ -3532,6 +3539,25 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._friction_patches.reserve_history_snapshot()
 
     @override
+    @override
+    def coupling_eval_gravity_acceleration(
+        self,
+        out_body_acceleration: "wp.array[wp.vec3] | None",
+        out_particle_acceleration: "wp.array[wp.vec3] | None",
+    ) -> None:
+        """Evaluate gravity acceleration, omitting bodies with ``body_disable_gravity`` set."""
+        super().coupling_eval_gravity_acceleration(out_body_acceleration, out_particle_acceleration)
+        model = self.model
+        if out_body_acceleration is None or out_body_acceleration.shape[0] == 0 or model.body_disable_gravity is None:
+            return
+        wp.launch(
+            _zero_disabled_gravity_acceleration,
+            dim=out_body_acceleration.shape[0],
+            inputs=[model.body_disable_gravity],
+            outputs=[out_body_acceleration],
+            device=model.device,
+        )
+
     def coupling_effective_mass_refresh_flags(self) -> int:
         """Return the model flags after which the articulated effective masses change."""
         return int(
@@ -8678,6 +8704,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             0,
             model.body_world,
             model.gravity,
+            model.body_disable_gravity,
         ]
         fk_outputs = [
             state_in.body_q,

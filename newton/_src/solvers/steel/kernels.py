@@ -1170,6 +1170,7 @@ def eval_rigid_fk_id(
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
+    body_disable_gravity: wp.array[bool],
     articulation_active: wp.array[int],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1223,7 +1224,9 @@ def eval_rigid_fk_id(
     for i in range(start, end):
         parent = joint_parent[i]
         child = joint_child[i]
-        gravity_s = gravity[body_world[child]]
+        gravity_s = wp.vec3()
+        if not body_disable_gravity[child]:
+            gravity_s = gravity[body_world[child]]
         parent_v_s = wp.spatial_vector()
         parent_a_s = wp.spatial_vector()
         if parent >= 0:
@@ -1397,6 +1400,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
         materialize_body_inertia_terms: int,
         body_world: wp.array[int],
         gravity: wp.array[wp.vec3],
+        body_disable_gravity: wp.array[bool],
         articulation_active: wp.array[int],
         body_q: wp.array[wp.transform],
         body_q_com: wp.array[wp.transform],
@@ -1493,7 +1497,9 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                                 body_q,
                                 body_q_com,
                             )
-                        gravity_s = gravity[body_world[child]]
+                        gravity_s = wp.vec3()
+                        if not body_disable_gravity[child]:
+                            gravity_s = gravity[body_world[child]]
                         parent_v_s, parent_a_s = compute_link_velocity(
                             joint,
                             parent,
