@@ -22,12 +22,14 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
 
    newton_solvers_experimental
    newton_solvers_mujoco
+   newton_solvers_steel
    newton_solvers_style3d
 
 .. rubric:: Submodules
 
 - :doc:`newton.solvers.experimental <newton_solvers_experimental>`
 - :doc:`newton.solvers.mujoco <newton_solvers_mujoco>`
+- :doc:`newton.solvers.steel <newton_solvers_steel>`
 - :doc:`newton.solvers.style3d <newton_solvers_style3d>`
 
 .. rubric:: Classes
