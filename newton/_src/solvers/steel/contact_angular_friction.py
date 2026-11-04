@@ -20,6 +20,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     accumulate_free_rigid_angular_wrenches_from_impulses,
     build_mf_angular_friction_rows,
+    build_propagation_free_rigid_angular_rows,
     gate_free_rigid_angular_coefficients,
 )
 
@@ -53,7 +54,7 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
             (f"solve_mode={solver._solve_mode!r}", solver._solve_mode != "matrix_free"),
             (
                 f"articulated_contact_response={solver._articulated_contact_response!r}",
-                solver._articulated_contact_response != "immediate",
+                solver._articulated_contact_response == "propagation_colored",
             ),
             (f"row_schedule={solver._row_schedule!r}", solver._row_schedule != "interleaved"),
             (f"friction_mode={solver._friction_mode!r}", solver._friction_mode != "fixed_normal"),
@@ -184,6 +185,47 @@ def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads
     )
 
 
+def launch_propagation_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
+    """Write the rolling and spin rows that follow each free-body propagation contact's sliding pair."""
+    wp.launch(
+        build_propagation_free_rigid_angular_rows,
+        dim=threads,
+        inputs=[
+            contacts.rigid_contact_count,
+            threads,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver._contact_world,
+            solver._contact_slot,
+            solver._contact_path,
+            solver._contact_slots_needed,
+            solver._contact_art_a,
+            solver._contact_art_b,
+            solver._articulation_response_dof_count,
+            solver._is_free_rigid,
+            solver.model.shape_body,
+            state_aug._body_v_s,
+            solver._prescribed_articulation,
+            solver._free_rigid_mu_torsional,
+            solver._free_rigid_mu_rolling,
+        ],
+        outputs=[
+            solver._propagation_body_a,
+            solver._propagation_body_b,
+            solver._propagation_J_a,
+            solver._propagation_J_b,
+            solver._propagation_row_type,
+            solver._propagation_row_parent,
+            solver._propagation_row_mu,
+            solver._propagation_phi,
+            solver._propagation_target_velocity,
+            solver._propagation_row_rebound_velocity,
+        ],
+        device=solver.model.device,
+    )
+
+
 def accumulate_free_rigid_angular_wrenches(solver, contacts, rigid_contact_max: int, inv_dt: float, wrench) -> None:
     """Add the solved rolling and spin torques of free-body contacts to the ``BODY_PARENT_F`` contact wrenches."""
     wp.launch(
@@ -203,6 +245,10 @@ def accumulate_free_rigid_angular_wrenches(solver, contacts, rigid_contact_max: 
             solver._mf_constraint_count,
             solver._mf_row_type,
             solver._mf_impulses,
+            solver._propagation_constraint_count,
+            # Contacts take path 2 only under an active propagation response, which allocates its row types.
+            solver._propagation_row_type if solver._propagation_active else solver._mf_row_type,
+            solver._propagation_impulses,
             inv_dt,
         ],
         outputs=[wrench],

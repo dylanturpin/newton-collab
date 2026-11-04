@@ -34,6 +34,7 @@ from .contact_angular_friction import (
     free_rigid_reduction_material_key,
     free_rigid_route_bodies,
     launch_free_rigid_angular_friction_rows,
+    launch_propagation_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
     validate_free_rigid_angular_friction,
 )
@@ -55,6 +56,7 @@ from .kernels import (
     MATERIAL_COMBINE_MULTIPLY,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
+    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -11349,6 +11351,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device_arch,
                 worlds_per_block=_PROPAGATION_WORLDS_PER_BLOCK,
                 contact_torsion=self._propagation_torsion_rows,
+                free_rigid_angular=self._free_rigid_angular_rows,
             )
 
     def _init_colored_kernels(self, model) -> None:
@@ -11516,6 +11519,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_art_a,
                 self._contact_art_b,
                 self._articulation_response_dof_count,
+                self._is_free_rigid,
                 model.shape_body,
                 state_in.body_q,
                 model.body_com,
@@ -11547,6 +11551,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             device=model.device,
         )
+        if self._free_rigid_angular_rows:
+            launch_propagation_free_rigid_angular_friction_rows(self, state_aug, contacts, contact_build_threads)
         wp.launch(
             finalize_mf_constraint_counts,
             dim=self._world_count,
@@ -20273,7 +20279,11 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 
 @cache
 def _get_pgs_solve_propagation_contact_kernel(
-    propagation_max_constraints: int, device_arch: str, worlds_per_block: int = 1, contact_torsion: bool = False
+    propagation_max_constraints: int,
+    device_arch: str,
+    worlds_per_block: int = 1,
+    contact_torsion: bool = False,
+    free_rigid_angular: bool = False,
 ) -> "wp.Kernel":
     """Build the one-warp-per-world Gauss-Seidel sweep over the propagation rows.
 
@@ -20289,6 +20299,8 @@ def _get_pgs_solve_propagation_contact_kernel(
 
     ``contact_torsion`` skips the contact torsion rows in the row loop and solves them after it,
     with their group's residual sliding budget, as the immediate response's torsion sweep does.
+    ``free_rigid_angular`` also solves the rolling pair (a disk, at its first row) and the spin row (a box)
+    that follow a free-body contact's sliding pair, bounded by their coefficient times the pooled patch load.
     """
     _ = device_arch
     M = propagation_max_constraints
@@ -20304,6 +20316,32 @@ def _get_pgs_solve_propagation_contact_kernel(
         else ""
     )
     torsion_sweep = _propagation_torsion_sweep_source(friction_type) if contact_torsion else ""
+    rolling_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
+    # A disk block (the sliding pair, or the rolling pair) is solved at its first row; a bounded row starts cold.
+    is_disk = (
+        f"(row_type == {friction_type} || row_type == {rolling_type})"
+        if free_rigid_angular
+        else f"(row_type == {friction_type})"
+    )
+    is_bounded = (
+        f"(row_type == {friction_type} || row_type == {rolling_type} || row_type == {spin_type})"
+        if free_rigid_angular
+        else f"(row_type == {friction_type})"
+    )
+    spin_projection = (
+        f"""}} else if (row_type == {spin_type}) {{
+                const int parent_idx = propagation_row_parent.data[off];
+                float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                for (int patch_row = propagation_row_parent.data[world_base + parent_idx];
+                     patch_row >= 0 && patch_row != parent_idx;
+                     patch_row = propagation_row_parent.data[world_base + patch_row])
+                    lambda_n += propagation_impulses.data[world_base + patch_row];
+                const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
+                new_impulse = fminf(fmaxf(new_impulse, -radius), radius);"""
+        if free_rigid_angular
+        else ""
+    )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -20360,12 +20398,12 @@ def _get_pgs_solve_propagation_contact_kernel(
             }}
         }}
         {torsion_skip}
-        if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+        if ({is_bounded} && global_iter < friction_start_iteration) {{
             if (lane == 0) propagation_impulses.data[off] = 0.0f;
             __syncwarp();
             continue;
         }}
-        if (eff_inv <= 0.0f && row_type != {friction_type}) {{
+        if (eff_inv <= 0.0f && !{is_disk}) {{
             __syncwarp();
             continue;
         }}
@@ -20401,7 +20439,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             float new_impulse = old_impulse + omega * delta;
             if (row_type == {contact_type}) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
-            }} else if (row_type == {friction_type}) {{
+            }} else if ({is_disk}) {{
                 const int parent_idx = propagation_row_parent.data[off];
                 // A patch's normal rows form a cycle through their parent links and share its load.
                 float lambda_n = propagation_impulses.data[world_base + parent_idx];
@@ -20410,11 +20448,13 @@ def _get_pgs_solve_propagation_contact_kernel(
                      patch_row = propagation_row_parent.data[world_base + patch_row])
                     lambda_n += propagation_impulses.data[world_base + patch_row];
                 const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                if (i != parent_idx + 1) {{
-                    // The first tangent row solves both tangents of its contact.
+                // A disk block is solved at its first row: the sliding pair at parent + 1, the rolling pair at + 3.
+                const int block_start = row_type == {friction_type} ? parent_idx + 1 : parent_idx + 3;
+                if (i != block_start) {{
+                    // The block's first row solves both of its rows.
                     new_impulse = old_impulse;
                 }} else {{
-                    sib = parent_idx + 2;
+                    sib = i + 1;
                     const int sib_off = world_base + sib;
                     const float other = propagation_impulses.data[sib_off];
                     float sibling_residual = propagation_rhs.data[sib_off];
@@ -20440,6 +20480,7 @@ def _get_pgs_solve_propagation_contact_kernel(
                     sib_delta = sib_new - other;
                     propagation_impulses.data[sib_off] = sib_new;
                 }}
+            {spin_projection}
             }}
             delta_impulse = new_impulse - old_impulse;
             propagation_impulses.data[off] = new_impulse;
@@ -20563,7 +20604,10 @@ def _get_pgs_solve_propagation_contact_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}{'_torsion' if contact_torsion else ''}"
+    name = (
+        f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}{'_torsion' if contact_torsion else ''}"
+        f"{'_fra' if free_rigid_angular else ''}"
+    )
     pgs_solve_propagation.__name__ = name
     pgs_solve_propagation.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(pgs_solve_propagation)

@@ -4446,6 +4446,24 @@ def contact_base_rows(slots_needed: int):
 
 
 @wp.func
+def free_body_contact(
+    art_a: int, art_b: int, articulation_response_dof_count: wp.array[int], is_free_rigid: wp.array[int]
+):
+    """Return whether every responding side of a contact is a free body, as the allocator classifies free-body pairs.
+
+    On the propagation rows such a contact's rows past its sliding pair are free-body angular rows; any other
+    contact's extra row is its contact torsion spare.
+    """
+    if art_a >= 0:
+        if articulation_response_dof_count[art_a] > 0 and is_free_rigid[art_a] == 0:
+            return False
+    if art_b >= 0:
+        if articulation_response_dof_count[art_b] > 0 and is_free_rigid[art_b] == 0:
+            return False
+    return True
+
+
+@wp.func
 def _has_torsion_radius(shape_a: int, shape_b: int, shape_torsion_radius: wp.array[float]):
     radius = float(0.0)
     if shape_a >= 0:
@@ -4521,7 +4539,8 @@ def _allocate_world_contact_slot(
     is within the friction gap threshold and, with friction patches, when it is one
     of its region's friction anchors. With ``free_rigid_angular``, a free-body contact with
     friction also reserves a rolling pair and a spin row for its positive pair coefficients,
-    on the first anchor of its patch. With ``torsion_spares``, a propagation contact that is not
+    on the first anchor of its patch, also when it routes to the propagation rows. With ``torsion_spares``,
+    a propagation contact that is not
     between free bodies and whose shapes have a torsion radius reserves one more row after them,
     for its contact torsion group (see :func:`contact_base_rows`). ``contact_slots_needed`` records
     the reservation (1, 3, up to 6 with free-body angular rows, or 4 with a torsion spare), which
@@ -4650,7 +4669,7 @@ def _allocate_world_contact_slot(
         # A friction patch carries one set of angular rows, on its first anchor, with the patch's whole budget.
         if (
             free_rigid_angular != 0
-            and is_mf
+            and free_body_pair
             and (friction_patches.enabled == 0 or _first_patch_anchor(friction_patches, c))
         ):
             torsional, rolling = free_rigid_angular_friction_coefficients(
@@ -6817,6 +6836,109 @@ def build_mf_angular_friction_rows(
 
 
 @wp.kernel
+def build_propagation_free_rigid_angular_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    is_free_rigid: wp.array[int],
+    shape_body: wp.array[int],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    free_rigid_mu_torsional: wp.array[float],
+    free_rigid_mu_rolling: wp.array[float],
+    # outputs
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_phi: wp.array2d[float],
+    propagation_target_velocity: wp.array2d[float],
+    propagation_row_rebound_velocity: wp.array2d[float],
+):
+    """Write the rolling pair and spin row that follow a free-body propagation contact's sliding pair.
+
+    The rows match :func:`build_mf_angular_friction_rows`: pure angular, ``J = [0, axis]`` on body A and
+    ``[0, -axis]`` on body B, bounded by their coefficient times the pooled normal load.
+    """
+    total_contacts = wp.min(contact_count[0], contact_normal.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        slots = contact_slots_needed[c]
+        slot = contact_slot[c]
+        if contact_path[c] != 2 or slot < 0 or slots <= 3:
+            continue
+        art_a = contact_art_a[c]
+        art_b = contact_art_b[c]
+        if not free_body_contact(art_a, art_b, articulation_response_dof_count, is_free_rigid):
+            continue
+        world = contact_world[c]
+        shape_a = contact_shape0[c]
+        shape_b = contact_shape1[c]
+        torsional, rolling = free_rigid_angular_friction_coefficients(
+            shape_a, shape_b, free_rigid_mu_torsional, free_rigid_mu_rolling
+        )
+        body_a = -1
+        body_b = -1
+        if shape_a >= 0:
+            body_a = shape_body[shape_a]
+        if shape_b >= 0:
+            body_b = shape_body[shape_b]
+        response_body_a = -1
+        response_body_b = -1
+        if body_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
+            response_body_a = body_a
+        if body_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
+            response_body_b = body_b
+        normal = -contact_normal[c]
+        t0, t1 = contact_tangent_basis(normal)
+        for row_offset in range(3, slots):
+            axis = normal
+            row_type = PGS_CONSTRAINT_TYPE_CONTACT_SPIN
+            mu = torsional
+            if rolling > 0.0 and row_offset < 5:
+                row_type = PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+                mu = rolling
+                axis = t0
+                if row_offset == 4:
+                    axis = t1
+            row = slot + row_offset
+            for k in range(3):
+                propagation_J_a[world, row, k] = 0.0
+                propagation_J_b[world, row, k] = 0.0
+                propagation_J_a[world, row, 3 + k] = 0.0
+                propagation_J_b[world, row, 3 + k] = 0.0
+                if response_body_a >= 0:
+                    propagation_J_a[world, row, 3 + k] = axis[k]
+                if response_body_b >= 0:
+                    propagation_J_b[world, row, 3 + k] = -axis[k]
+            propagation_body_a[world, row] = response_body_a
+            propagation_body_b[world, row] = response_body_b
+            propagation_row_type[world, row] = row_type
+            propagation_row_parent[world, row] = slot
+            propagation_row_mu[world, row] = mu
+            propagation_phi[world, row] = 0.0
+            propagation_row_rebound_velocity[world, row] = 0.0
+            # A prescribed side's angular rate moves into the target, as its linear rate does for sliding rows.
+            known = float(0.0)
+            if body_a >= 0 and art_a >= 0 and prescribed_articulation[art_a] != 0:
+                known += wp.dot(axis, wp.spatial_bottom(body_v_s[body_a]))
+            if body_b >= 0 and art_b >= 0 and prescribed_articulation[art_b] != 0:
+                known -= wp.dot(axis, wp.spatial_bottom(body_v_s[body_b]))
+            propagation_target_velocity[world, row] = -known
+
+
+@wp.kernel
 def accumulate_free_rigid_angular_wrenches_from_impulses(
     contact_count: wp.array[wp.int32],
     rigid_contact_max: int,
@@ -6831,13 +6953,19 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
     mf_constraint_count: wp.array[wp.int32],
     mf_row_type: wp.array2d[int],
     mf_impulses: wp.array2d[wp.float32],
+    propagation_constraint_count: wp.array[wp.int32],
+    propagation_row_type: wp.array2d[int],
+    propagation_impulses: wp.array2d[wp.float32],
     inv_dt: float,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
 ):
     """Add the rolling and spin rows of each free-body contact to its two bodies as world-frame torques."""
     c = wp.tid()
-    if c >= wp.min(contact_count[0], rigid_contact_max) or contact_path[c] != 1:
+    if c >= wp.min(contact_count[0], rigid_contact_max):
+        return
+    path = contact_path[c]
+    if path != 1 and path != 2:
         return
     slot = contact_slot[c]
     if slot < 0:
@@ -6847,13 +6975,23 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
     normal = -contact_normal[c]
     t0, t1 = contact_tangent_basis(normal)
     torque = wp.vec3(0.0)
-    for row in range(slot + 3, wp.min(slot + contact_slots_needed[c], mf_constraint_count[world])):
-        axis = normal
-        if mf_row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING:
-            axis = t0
-            if row == slot + 4:
-                axis = t1
-        torque += mf_impulses[world, row] * inv_dt * axis
+    row_count = mf_constraint_count[world]
+    if path == 2:
+        row_count = propagation_constraint_count[world]
+    for row in range(slot + 3, wp.min(slot + contact_slots_needed[c], row_count)):
+        row_type = mf_row_type[world, row]
+        impulse = mf_impulses[world, row]
+        if path == 2:
+            row_type = propagation_row_type[world, row]
+            impulse = propagation_impulses[world, row]
+        # A propagation torsion spare shares these slots on non-free pairs; its torque is reported separately.
+        if row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING or row_type == PGS_CONSTRAINT_TYPE_CONTACT_SPIN:
+            axis = normal
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING:
+                axis = t0
+                if row == slot + 4:
+                    axis = t1
+            torque += impulse * inv_dt * axis
     if contact_shape0[c] >= 0 and shape_body[contact_shape0[c]] >= 0:
         wp.atomic_add(body_contact_wrench, shape_body[contact_shape0[c]], wp.spatial_vector(wp.vec3(0.0), torque))
     if contact_shape1[c] >= 0 and shape_body[contact_shape1[c]] >= 0:
@@ -8431,6 +8569,7 @@ def build_propagation_contact_rows(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     articulation_response_dof_count: wp.array[int],
+    is_free_rigid: wp.array[int],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -8468,7 +8607,8 @@ def build_propagation_contact_rows(
     through the row target velocity. With friction patches the friction rows act at the
     patch anchor points and their ``phi`` holds ``friction_anchor_beta`` times the anchor's
     tangential displacement. A reserved contact torsion spare becomes an inert torsion row
-    without bodies, which contact torsion preparation may then take for its group.
+    without bodies, which contact torsion preparation may then take for its group. A free-body
+    contact's rows past its sliding pair are left to :func:`build_propagation_free_rigid_angular_rows`.
     """
     total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
     for c in range(wp.tid(), total_contacts, total_num_threads):
@@ -8528,7 +8668,10 @@ def build_propagation_contact_rows(
             restitution_velocity_threshold,
         )
         base_rows = contact_base_rows(contact_slots_needed[c])
-        if contact_slots_needed[c] > base_rows:
+        # A free-body contact's extra rows are its angular rows (build_propagation_free_rigid_angular_rows).
+        if contact_slots_needed[c] > base_rows and not free_body_contact(
+            art_a, art_b, articulation_response_dof_count, is_free_rigid
+        ):
             # The step cleared its Jacobians.
             spare = slot + base_rows
             propagation_body_a[world, spare] = -1

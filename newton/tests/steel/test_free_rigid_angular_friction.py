@@ -5,6 +5,7 @@
 
 import math
 import unittest
+from typing import NamedTuple
 
 import numpy as np
 import warp as wp
@@ -16,7 +17,12 @@ from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
     build_mf_contact_rows,
+)
+from newton._src.solvers.steel.solver_steel import (
+    _PROPAGATION_WORLDS_PER_BLOCK,
+    _get_pgs_solve_propagation_contact_kernel,
 )
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import set_torsion_radius
@@ -100,6 +106,7 @@ def _simulate(
     parent_f=False,
     anchor_deg=None,
     on_solver=None,
+    on_step=None,
     **solver_kwargs,
 ):
     model, bodies = _scene(body, tilt_deg, inertia, count, anchor_deg)
@@ -158,6 +165,8 @@ def _simulate(
         for _ in range(steps):
             step(state_0, state_1)
             state_0, state_1 = state_1, state_0
+            if on_step is not None:
+                on_step(state_0.body_q.numpy()[obj], state_0.body_qd.numpy()[obj])
     elif graph:
         with wp.ScopedCapture(device=model.device) as capture:
             step(state_0, state_1)
@@ -647,7 +656,10 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
             ({"solve_mode": "split"}, "solve_mode='split'"),
             # Point friction: bisection with persistent patches would warn before the rejection under test.
             ({"friction_mode": "bisection", "friction_anchor_beta": 0.0}, "friction_mode='bisection'"),
-            ({"articulated_contact_response": "propagation"}, "articulated_contact_response='propagation'"),
+            (
+                {"articulated_contact_response": "propagation_colored"},
+                "articulated_contact_response='propagation_colored'",
+            ),
         ):
             with self.subTest(option=option), self.assertRaisesRegex(NotImplementedError, option):
                 SolverSteel(model, **{"solve_mode": "matrix_free", **options})
@@ -745,6 +757,507 @@ class TestFreeRigidAngularFrictionOverrides(unittest.TestCase):
         solver = SolverSteel(model, free_rigid_rolling_friction=1.0e-3)
         self.assertEqual(solver.free_rigid_rolling_friction, 1.0e-3)
         self.assertIsNone(solver.free_rigid_torsional_friction)
+
+
+_PROPAGATION = {"articulated_contact_response": "propagation"}
+_RESPONSES = {"immediate": {}, "propagation": _PROPAGATION}
+# Matrix-free (1) on the immediate response; the propagation responses route free-free contacts to propagation (2).
+_ROUTE = {"immediate": 1, "propagation": 2}
+_BOTH = {"free_rigid_rolling_friction": 0.002, "free_rigid_torsional_friction": 0.001}
+
+
+def _row_arrays(solver, response):
+    """Return the row type, parent, coefficient and impulse arrays that carry free-body contacts on ``response``."""
+    if response == "immediate":
+        return solver._mf_row_type, solver._mf_row_parent, solver._mf_row_mu, solver._mf_impulses
+    return (
+        solver._propagation_row_type,
+        solver._propagation_row_parent,
+        solver._propagation_row_mu,
+        solver._propagation_impulses,
+    )
+
+
+def _trajectory(*args, simulate=_simulate, **kwargs):
+    """Return the body's poses and twists after every step."""
+    poses, twists = [], []
+    simulate(*args, on_step=lambda pose, twist: (poses.append(pose), twists.append(twist)), **kwargs)
+    return np.array(poses), np.array(twists)
+
+
+def _warm_started_impulses(test, response_options, route):
+    """Return a spinning sphere's solved angular-contact impulses and the warm start gathered from them."""
+    model, _ = _scene("sphere")
+    solver = SolverSteel(
+        model,
+        solve_mode="matrix_free",
+        iterations=32,
+        contact_warmstart=True,
+        deterministic=_RUN_TO_RUN,
+        **_BOTH,
+        **response_options,
+    )
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky")
+    contacts = pipeline.contacts()
+    states = [model.state(), model.state()]
+    qd = states[0].joint_qd.numpy()
+    qd[3:6] = (10.0, 0.0, 6.0)
+    states[0].joint_qd.assign(qd)
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    control = model.control()
+    impulses = solver._mf_impulses if route == 1 else solver._propagation_impulses
+    for steps in (20, 1):
+        if steps == 1:
+            # A solve-free step leaves exactly the gathered warm start in the impulses.
+            solver._iterations = 0
+        for _ in range(steps):
+            states[0].clear_forces()
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, _DT)
+            states.reverse()
+        slot = int(solver._contact_slot.numpy()[0])
+        if steps == 20:
+            test.assertEqual(int(solver._contact_path.numpy()[0]), route)
+            solved = impulses.numpy()[0, slot : slot + 6].copy()
+    return solved, impulses.numpy()[0, slot : slot + 6]
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
+class TestFreeRigidAngularFrictionPropagation(unittest.TestCase):
+    """The rows on the plain propagation response, which routes free-free contacts to the propagation rows."""
+
+    def test_rows_take_each_response_route(self):
+        """Lay out normal, sliding pair, rolling pair and spin on the route each response gives the contact."""
+        for response, options in _RESPONSES.items():
+            for torsional, rolling, slots in ((0.001, 0.0, 4), (0.0, 0.002, 5), (0.001, 0.002, 6)):
+                seen = {}
+
+                def observe(solver, contacts, observables, seen=seen, response=response, slots=slots):
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    seen["path"] = solver._contact_path.numpy()[:count].tolist()
+                    seen["slots"] = solver._contact_slots_needed.numpy()[:count].tolist()
+                    row_type, row_parent, row_mu, _ = _row_arrays(solver, response)
+                    slot = int(solver._contact_slot.numpy()[0])
+                    seen["types"] = row_type.numpy()[0, slot : slot + slots].tolist()
+                    seen["parents"] = row_parent.numpy()[0, slot + 1 : slot + slots].tolist()
+                    seen["mu"] = row_mu.numpy()[0, slot + 3 : slot + slots].tolist()
+                    seen["slot"] = slot
+
+                with self.subTest(response=response, torsional=torsional, rolling=rolling):
+                    _simulate(
+                        "sphere",
+                        0.0,
+                        steps=2,
+                        free_rigid_torsional_friction=torsional,
+                        free_rigid_rolling_friction=rolling,
+                        observe=observe,
+                        **options,
+                    )
+                    self.assertEqual(seen["path"], [_ROUTE[response]])
+                    self.assertEqual(seen["slots"], [slots])
+                    angular = [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * (2 if rolling else 0)
+                    angular += [PGS_CONSTRAINT_TYPE_CONTACT_SPIN] if torsional else []
+                    expected = [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]
+                    self.assertEqual(seen["types"], expected + angular)
+                    self.assertEqual(seen["parents"], [seen["slot"]] * (slots - 1))
+                    coefficients = [rolling] * (2 if rolling else 0) + ([torsional] if torsional else [])
+                    np.testing.assert_allclose(seen["mu"], coefficients, rtol=1.0e-6)
+
+    def test_rolling_sphere_stops_at_the_coulomb_distance(self):
+        """Stop a rolling sphere within 5% of the analytic Coulomb distance on the propagation rows."""
+        for rolling in (0.002, 0.004):
+            with self.subTest(rolling=rolling):
+                _, twist, travel = _simulate("sphere", 0.8, **_rows(rolling=rolling), **_ROLLING, **_PROPAGATION)
+                self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
+                expected = _coulomb_stopping_distance(0.3, rolling)
+                self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
+
+    def test_spin_row_stops_a_spinning_sphere_at_the_coulomb_rate(self):
+        """Decelerate a spinning sphere at mu_s m g / I on the propagation rows, and stop it."""
+        torsional = 5.0e-4
+        options = {"free_rigid_torsional_friction": torsional, "free_rigid_rolling_friction": 0.0, **_PROPAGATION}
+        rate = torsional * _MASS * _GRAVITY / (0.4 * _MASS * _RADIUS**2)
+        _, twist, _ = _simulate("sphere", 0.2, angular=(0.0, 0.0, 6.0), **options)
+        self.assertAlmostEqual(twist[5], 6.0 - rate * 0.2, delta=0.1)
+        _, twist, _ = _simulate("sphere", 0.6, angular=(0.0, 0.0, 6.0), **options)
+        self.assertLess(abs(twist[5]), 1.0e-3)
+
+    def test_spin_is_relative_to_a_turning_support(self):
+        """Spin a resting sphere up to a kinematic turntable's rate at mu_s m g / I on the propagation rows."""
+        torsional = 5.0e-4
+        options = {"free_rigid_torsional_friction": torsional, "free_rigid_rolling_friction": 0.0, **_PROPAGATION}
+        rate = torsional * _GRAVITY / (0.4 * _RADIUS**2)
+        _, twist, _ = _simulate("sphere", 0.1, support_angular=(0.0, 0.0, 2.0), **options)
+        self.assertAlmostEqual(twist[5], rate * 0.1, delta=0.05)
+        _, twist, _ = _simulate("sphere", 0.5, support_angular=(0.0, 0.0, 2.0), **options)
+        self.assertAlmostEqual(twist[5], 2.0, delta=1.0e-3)
+
+    def test_rows_stay_within_their_bounds(self):
+        """Bound the rolling pair by mu_r and the spin row by mu_s times the contact's normal impulse."""
+        seen = {}
+
+        def observe(solver, contacts, observables):
+            slot = int(solver._contact_slot.numpy()[0])
+            impulses = solver._propagation_impulses.numpy()[0]
+            seen["normal"], seen["rolling"] = impulses[slot], float(np.linalg.norm(impulses[slot + 3 : slot + 5]))
+            seen["spin"] = abs(float(impulses[slot + 5]))
+
+        for steps in (1, 5, 40):
+            with self.subTest(steps=steps):
+                _simulate(
+                    "sphere", 0.0, steps=steps, angular=(10.0, 0.0, 6.0), observe=observe, **_BOTH, **_PROPAGATION
+                )
+                self.assertGreater(seen["normal"], 0.0)
+                self.assertLessEqual(seen["rolling"], 0.002 * seen["normal"] * (1.0 + 1.0e-5))
+                self.assertLessEqual(seen["spin"], 0.001 * seen["normal"] * (1.0 + 1.0e-5))
+
+    def test_rows_stay_within_the_pooled_load_after_every_sweep(self):
+        """Hold every rolling and spin impulse at zero before friction starts and within the pooled patch load after."""
+        sweeps = _sweep_box()
+        self.assertTrue(any(sweep.offset < sweep.friction_start for sweep in sweeps))
+        _assert_cold_before_friction_start(self, sweeps)
+        _assert_within_the_pooled_load(self, sweeps)
+        # A four-anchor patch saturates far above any one anchor's load, so the pooled bound is the one in force.
+        self.assertGreater(_own_load_ratio(sweeps), 2.0)
+
+    def test_sweep_checks_catch_an_unguarded_or_unpooled_kernel(self):
+        """Trip the sweep checks with the rows-off kernel, which neither holds nor bounds them, and an unpooled load."""
+
+        def unguarded(solver):
+            solver._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
+                solver._propagation_max_constraints,
+                solver.model.device.arch,
+                worlds_per_block=_PROPAGATION_WORLDS_PER_BLOCK,
+            )
+
+        with self.assertRaisesRegex(AssertionError, "before friction start"):
+            _assert_cold_before_friction_start(self, _sweep_box(on_solver=unguarded))
+
+        def unpooled(solver):
+            # Cut each normal row's patch ring before the sweep, after the recorder has read the true ring.
+            row_type = solver._propagation_row_type.numpy()
+            row_parent = solver._propagation_row_parent.numpy()
+            row_parent[row_type == PGS_CONSTRAINT_TYPE_CONTACT] = -1
+            solver._propagation_row_parent.assign(row_parent)
+
+        sweeps = _sweep_box(before_sweep=unpooled)
+        _assert_within_the_pooled_load(self, sweeps)
+        self.assertLessEqual(_own_load_ratio(sweeps), 1.0 + 1.0e-5)
+
+    def test_rows_never_add_energy(self):
+        """End a contact step with no more kinetic energy than the rows-off step, for an anisotropic inertia."""
+        inertia = _ANISOTROPIC * 4.0e-5
+        omega = (1.0, 0.0, -3.0)
+
+        def energy(twist):
+            return 0.5 * _MASS * float(twist[:3] @ twist[:3]) + 0.5 * float(twist[3:6] @ inertia @ twist[3:6])
+
+        for rolling in (1.0, 1.0e-3, 1.0e-4):
+            with self.subTest(rolling=rolling):
+                kwargs = {"angular": omega, "inertia": inertia, "steps": 1, **_PROPAGATION}
+                _, twist_free, _ = _simulate("sphere", 0.0, **kwargs)
+                _, twist, _ = _simulate(
+                    "sphere", 0.0, free_rigid_rolling_friction=rolling, free_rigid_torsional_friction=rolling, **kwargs
+                )
+                self.assertLessEqual(energy(twist), energy(twist_free) * (1.0 + 1.0e-4))
+
+    def test_trajectory_matches_the_immediate_response(self):
+        """Track the immediate response's free-sphere trajectory at every step with rolling and spin rows on.
+
+        The bound is empirical for this fixture: the two routes round differently, so their twists drift apart.
+        """
+        motion = {"steps": 60, "linear": (0.0, -0.3, 0.0), "angular": (10.0, 0.0, 6.0)}
+        pose_immediate, twist_immediate = _trajectory("sphere", 0.0, **motion, **_BOTH)
+        pose, twist = _trajectory("sphere", 0.0, **motion, **_BOTH, **_PROPAGATION)
+        _, twist_off = _trajectory("sphere", 0.0, **motion)
+        np.testing.assert_allclose(twist, twist_immediate, rtol=0.0, atol=5.0e-5)
+        np.testing.assert_allclose(pose[:, :3], pose_immediate[:, :3], rtol=0.0, atol=1.0e-6)
+        # The rows change the trajectory far beyond that gap, so this is no silent drop.
+        self.assertGreater(float(np.max(np.abs(twist_immediate[-1] - twist_off[-1]))), 1.0)
+
+    def test_rows_start_cold_under_warm_start(self):
+        """Carry the normal and sliding impulses but start the angular rows at zero, as the immediate route does."""
+        for response, options in _RESPONSES.items():
+            with self.subTest(response=response):
+                solved, gathered = _warm_started_impulses(self, options, _ROUTE[response])
+                self.assertTrue(np.all(solved[[0, 3, 4, 5]] != 0.0))
+                self.assertGreater(gathered[0], 0.0)
+                np.testing.assert_array_equal(gathered[3:6], 0.0)
+
+    def test_free_joint_parent_wrench_balances_the_rolling_torque(self):
+        """Keep a rolling free sphere's parent wrench at zero on the propagation route, rows asserted first."""
+        seen = {}
+
+        def observe(solver, contacts, observables):
+            slot = int(solver._contact_slot.numpy()[0])
+            seen["path"] = int(solver._contact_path.numpy()[0])
+            seen["types"] = solver._propagation_row_type.numpy()[0, slot + 3 : slot + 5].tolist()
+            seen["rolling"] = float(np.linalg.norm(solver._propagation_impulses.numpy()[0, slot + 3 : slot + 5])) / _DT
+            seen["parent"] = observables.body_parent_f.numpy()[1]
+
+        _simulate(
+            "sphere",
+            0.0,
+            steps=4,
+            anchor_deg=45.0,
+            parent_f=True,
+            observe=observe,
+            **_rows(rolling=0.002),
+            **_ROLLING,
+            **_PROPAGATION,
+        )
+        self.assertEqual(seen["path"], 2)
+        self.assertEqual(seen["types"], [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * 2)
+        torque = 0.002 * _MASS * _GRAVITY
+        self.assertAlmostEqual(seen["rolling"], torque, delta=0.05 * torque)
+        self.assertLess(float(np.linalg.norm(seen["parent"][3:])), 0.02 * torque)
+
+    def test_composes_with_anchors_torsion_warm_start_and_velocity_iterations(self):
+        """Keep the Coulomb stopping distance with each option that touches the propagation rows."""
+        expected = _coulomb_stopping_distance(0.3, 0.004)
+        for options in (
+            {
+                "friction_anchor_beta": 0.2,
+                "torsion_radius": 0.01,
+                "contact_torsion_device": True,
+            },
+            {"contact_warmstart": True, "contact_matching": "sticky"},
+            {"velocity_iterations": 1},
+        ):
+            with self.subTest(**options):
+                _, twist, travel = _simulate(
+                    "sphere", 0.8, **_rows(rolling=0.004), **_ROLLING, **options, **_PROPAGATION
+                )
+                self.assertLess(np.linalg.norm(twist[3:6]), 1.0e-3)
+                self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
+
+    def test_angular_rows_and_torsion_spares_share_a_world(self):
+        """Give an articulated contact its torsion spare and a free-body contact its angular rows in one world."""
+        expected = _coulomb_stopping_distance(0.3, 0.004)
+        travel = _mixed_rollout(self, **_PROPAGATION)
+        self.assertAlmostEqual(travel, expected, delta=0.05 * expected)
+
+    def test_repeated_and_captured_runs_are_bitwise_identical(self):
+        """Match two eager runs and a CUDA-graph replay bit for bit, with several bodies."""
+        kwargs = {
+            "friction_anchor_beta": 0.2,
+            "count": 3,
+            **_rows(rolling=0.001, torsional=0.001),
+            **_ROLLING,
+            **_PROPAGATION,
+        }
+        first, _, _ = _simulate("sphere", 0.3, **kwargs)
+        second, _, _ = _simulate("sphere", 0.3, **kwargs)
+        captured, _, _ = _simulate("sphere", 0.3, graph=True, **kwargs)
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(first, captured)
+
+
+def _mixed_rollout(test, seconds=0.8, **solver_kwargs):
+    """Roll a free sphere beside a box on a prismatic joint whose contacts take torsion rows; return the sphere travel.
+
+    Checks every step that the box's contacts carry a torsion spare and the sphere's contact its angular rows.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    SolverSteel.register_custom_attributes(builder)
+    table = builder.add_body(xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(table, hx=2.0, hy=2.0, hz=0.05)
+    sphere_inertia = wp.mat33(*(np.eye(3, dtype=np.float32) * 0.4 * _MASS * _RADIUS**2).ravel())
+    box_inertia = wp.mat33(*(np.eye(3, dtype=np.float32) * _MASS * (2.0 * _RADIUS) ** 2 / 6.0).ravel())
+    sphere = builder.add_body(
+        xform=wp.transform((0.0, 0.0, _RADIUS), wp.quat_identity()),
+        mass=_MASS,
+        inertia=sphere_inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_sphere(sphere, radius=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+    box = builder.add_link(
+        xform=wp.transform((0.5, 0.0, _RADIUS + 1.0e-3), wp.quat_identity()),
+        mass=_MASS,
+        inertia=box_inertia,
+        lock_inertia=True,
+    )
+    box_shape = builder.add_shape_box(
+        box, hx=_RADIUS, hy=_RADIUS, hz=_RADIUS, cfg=newton.ModelBuilder.ShapeConfig(density=0.0)
+    )
+    joint = builder.add_joint_prismatic(
+        -1, box, axis=newton.Axis.Z, parent_xform=wp.transform((0.5, 0.0, _RADIUS + 1.0e-3))
+    )
+    builder.add_articulation([joint])
+    model = builder.finalize()
+    set_torsion_radius(model, 0.01, shapes=[box_shape])
+    options = {
+        "solve_mode": "matrix_free",
+        "iterations": 32,
+        "deterministic": _RUN_TO_RUN,
+        "contact_torsion_device": True,
+        "free_rigid_rolling_friction": 0.004,
+        **solver_kwargs,
+    }
+    solver = SolverSteel(model, **options)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    qd = state_0.joint_qd.numpy()
+    sphere_dof = int(model.joint_qd_start.numpy()[int(np.flatnonzero(model.joint_child.numpy() == sphere)[0])])
+    qd[sphere_dof : sphere_dof + 3] = _ROLLING["linear"]
+    qd[sphere_dof + 3 : sphere_dof + 6] = _ROLLING["angular"]
+    state_0.joint_qd.assign(qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    start = state_0.body_q.numpy()[sphere][:2].copy()
+    shape_body = model.shape_body.numpy()
+    seen = set()
+    for _ in range(int(seconds / _DT)):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, _DT)
+        state_0, state_1 = state_1, state_0
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        slots = solver._contact_slot.numpy()[:count]
+        types = solver._propagation_row_type.numpy()[0]
+        for c, (slot, needed) in enumerate(zip(slots, solver._contact_slots_needed.numpy()[:count], strict=True)):
+            bodies = {
+                int(shape_body[contacts.rigid_contact_shape0.numpy()[c]]),
+                int(shape_body[contacts.rigid_contact_shape1.numpy()[c]]),
+            }
+            if slot < 0:
+                continue
+            if box in bodies and needed == 4:
+                test.assertEqual(types[slot + 3], PGS_CONSTRAINT_TYPE_TORSION)
+                seen.add("torsion")
+            elif sphere in bodies:
+                test.assertEqual(int(needed), 5)
+                test.assertEqual(types[slot + 3 : slot + 5].tolist(), [PGS_CONSTRAINT_TYPE_CONTACT_ROLLING] * 2)
+                seen.add("rolling")
+    test.assertEqual(seen, {"torsion", "rolling"})
+    test.assertTrue(np.all(np.isfinite(state_0.body_qd.numpy())))
+    return float(np.linalg.norm(state_0.body_q.numpy()[sphere][:2] - start))
+
+
+class _Sweep(NamedTuple):
+    offset: int
+    friction_start: int
+    before: np.ndarray
+    after: np.ndarray
+    row_type: np.ndarray
+    row_parent: np.ndarray
+    row_mu: np.ndarray
+
+
+def _sweep_box(on_solver=None, before_sweep=None, response=None):
+    """Record world 0's propagation rows around every sweep of a spinning box on a persistent patch.
+
+    ``response`` holds the solver's response options, plain propagation by default.
+    """
+    sweeps = []
+
+    def record(solver):
+        if on_solver is not None:
+            on_solver(solver)
+        solve, snapshot, propagate = (
+            solver._launch_propagation_solve,
+            solver._snapshot_propagation_cache_twists,
+            solver._propagation_propagate_impulses,
+        )
+        sweep = {}
+
+        # Each propagation iteration snapshots the cache twists right before its sweep and propagates right after.
+        def launch(*args, friction_start_iteration=0, iteration_offset=0, **kwargs):
+            sweep.update(offset=iteration_offset, friction_start=friction_start_iteration, active=True)
+            try:
+                solve(
+                    *args,
+                    friction_start_iteration=friction_start_iteration,
+                    iteration_offset=iteration_offset,
+                    **kwargs,
+                )
+            finally:
+                sweep["active"] = False
+
+        def before(*args, **kwargs):
+            snapshot(*args, **kwargs)
+            if sweep.get("active"):
+                count = int(solver._propagation_constraint_count.numpy()[0])
+                sweep["rows"] = [array.numpy()[0, :count].copy() for array in _row_arrays(solver, "propagation")]
+                if before_sweep is not None:
+                    before_sweep(solver)
+
+        def after(*args, **kwargs):
+            if sweep.get("active") and "rows" in sweep:
+                rows = sweep.pop("rows")
+                impulses = solver._propagation_impulses.numpy()[0, : rows[0].shape[0]].copy()
+                sweeps.append(_Sweep(sweep["offset"], sweep["friction_start"], rows[3], impulses, *rows[:3]))
+                sweep["offset"] += 1
+            propagate(*args, **kwargs)
+
+        solver._launch_propagation_solve = launch
+        solver._snapshot_propagation_cache_twists = before
+        solver._propagation_propagate_impulses = after
+
+    _simulate(
+        "box",
+        0.0,
+        steps=3,
+        angular=(0.0, 0.0, 6.0),
+        friction_anchor_beta=0.2,
+        contact_friction_position_iterations=8,
+        on_solver=record,
+        **_BOTH,
+        **(_PROPAGATION if response is None else response),
+    )
+    return sweeps
+
+
+def _angular_blocks(sweep):
+    """Yield each rolling pair's and spin row's first row and width."""
+    for row in np.flatnonzero(sweep.row_type == PGS_CONSTRAINT_TYPE_CONTACT_SPIN):
+        yield int(row), 1
+    rolling = sweep.row_type == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+    for row in np.flatnonzero(rolling & ~np.roll(rolling, 1)):
+        yield int(row), 2
+
+
+def _projection_load(sweep, row):
+    """Return the pooled patch normal load the sweep projects ``row`` with.
+
+    Patch normals before ``row`` hold this sweep's values and those after it the previous sweep's.
+    """
+    normal = int(sweep.row_parent[row])
+    load, patch_row = 0.0, normal
+    while True:
+        load += float(sweep.after[patch_row] if patch_row < row else sweep.before[patch_row])
+        patch_row = int(sweep.row_parent[patch_row])
+        if patch_row < 0 or patch_row == normal:
+            return load
+
+
+def _assert_cold_before_friction_start(test, sweeps):
+    for sweep in sweeps:
+        if sweep.offset < sweep.friction_start:
+            for row, width in _angular_blocks(sweep):
+                test.assertTrue(np.all(sweep.after[row : row + width] == 0.0), f"row {row} moved before friction start")
+
+
+def _assert_within_the_pooled_load(test, sweeps):
+    for sweep in sweeps:
+        for row, width in _angular_blocks(sweep):
+            impulse = float(np.linalg.norm(sweep.after[row : row + width]))
+            bound = float(sweep.row_mu[row]) * _projection_load(sweep, row)
+            test.assertLessEqual(impulse, bound * (1.0 + 1.0e-5) + 1.0e-12, f"row {row} exceeds the pooled load")
+
+
+def _own_load_ratio(sweeps):
+    """Return the largest angular impulse over its own anchor's normal-load bound."""
+    ratio = 0.0
+    for sweep in sweeps:
+        for row, width in _angular_blocks(sweep):
+            normal = int(sweep.row_parent[row])
+            load = float(sweep.after[normal] if normal < row else sweep.before[normal])
+            impulse = float(np.linalg.norm(sweep.after[row : row + width]))
+            if load > 0.0:
+                ratio = max(ratio, impulse / (float(sweep.row_mu[row]) * load))
+    return ratio
 
 
 def test_linear_row_builder_leaves_the_angular_rows(test, device):

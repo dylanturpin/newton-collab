@@ -25,6 +25,7 @@ from .kernels import (
     WARP_DETERMINISM_OFF,
     _has_torsion_radius,
     contact_base_rows,
+    free_body_contact,
 )
 
 # Match the retained host oracle's rounding at angular cancellation and
@@ -130,6 +131,10 @@ def _gather(
     slots: wp.array[int],
     worlds: wp.array[int],
     slots_needed: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    is_free_rigid: wp.array[int],
     shape_a: wp.array[int],
     shape_b: wp.array[int],
     normals: wp.array[wp.vec3],
@@ -180,7 +185,12 @@ def _gather(
     family = int(-1)
     if paths[c] == 0:
         family = _DENSE
-    elif paths[c] == 2 and rows > base_rows:
+    elif (
+        paths[c] == 2
+        and rows > base_rows
+        # A free-body contact's extra rows are its angular rows, not a torsion spare.
+        and not free_body_contact(contact_art_a[c], contact_art_b[c], articulation_response_dof_count, is_free_rigid)
+    ):
         family = _PROPAGATION
     elif paths[c] == 2 and patch_mode != 0 and not _has_torsion_radius(shape_a[c], shape_b[c], shape_radius):
         # A contact without a radius reserves no spare, but it still rejects its patch, as on dense rows.
@@ -1073,6 +1083,10 @@ class DeviceTorsionPreparation:
                 s._contact_slot,
                 s._contact_world,
                 s._contact_slots_needed,
+                s._contact_art_a,
+                s._contact_art_b,
+                s._articulation_response_dof_count,
+                s._is_free_rigid,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
                 contacts.rigid_contact_normal,
