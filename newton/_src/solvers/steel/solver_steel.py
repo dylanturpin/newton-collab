@@ -78,6 +78,11 @@ from .contact_torsion import (
     torque_sweep_source,
     validate_torsion_step,
 )
+from .cpu_fallback import (
+    pgs_solve_mf_gs_cpu,
+    pgs_solve_propagation_contact_cpu,
+    reject_cpu_unsupported_matrix_free_features,
+)
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -2772,7 +2777,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError(
                 "deterministic=True with contact_warmstart requires the 'immediate' or 'propagation' response"
             )
-        self._propagation_colored = articulated_contact_response == "propagation_colored"
+        # CPU fallback: the colored row solve is CUDA-only; the CPU runs the serial propagation sweep.
+        self._propagation_colored = articulated_contact_response == "propagation_colored" and model.device.is_cuda
         # Cone and creep speed of the spin and rolling rows of articulated contacts on the propagation row family.
         self._propagation_angular_friction = (
             (self._torsional_rolling_friction_cone, self._torsional_rolling_friction_creep_speed)
@@ -2855,9 +2861,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 "solve_mode='matrix_free'"
             )
         if model.device.is_cpu and self._solve_mode == "matrix_free":
-            raise NotImplementedError(
-                "SolverSteel solve_mode='matrix_free' requires CUDA; use solve_mode='split' on CPU."
-            )
+            # CPU fallback: portable row kernels (cpu_fallback.py) cover the core
+            # matrix-free solve; features with only native CUDA rows are rejected.
+            reject_cpu_unsupported_matrix_free_features(self, model, friction_mode)
         if row_schedule not in ("interleaved", "contact_then_internal", "phased"):
             raise ValueError(
                 f"row_schedule must be 'interleaved', 'contact_then_internal', or 'phased', got {row_schedule!r}"
@@ -3533,7 +3539,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self._contact_warmstart
         response_pair = (
             None
-            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None
+            # CPU fallback: the paired response kernels are native CUDA.
+            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None or model.device.is_cpu
             else self._select_paired_response()
         )
         self._paired_response_primary_size = response_pair[0] if response_pair is not None else None
@@ -7698,10 +7705,18 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             # One kernel per row phase the step launches, each with its phase compiled in.
             phases = self._matrix_free_gs_row_phases()
-            self._pgs_solve_mf_gs_kernels = {
-                phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
-            }
-            self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
+            if model.device.is_cpu:
+                # CPU fallback: launch_row_phase runs pgs_solve_mf_gs_cpu instead of the native kernels.
+                self._pgs_solve_mf_gs_kernels = {}
+                self._pgs_solve_mf_gs_kernel = pgs_solve_mf_gs_cpu
+                self._cpu_mf_gs_v = wp.zeros(
+                    (self._world_count, self._max_world_dofs), dtype=wp.float32, device=model.device
+                )
+            else:
+                self._pgs_solve_mf_gs_kernels = {
+                    phase: self._pgs_solve_mf_gs_kernel_for_phase(row_phase=phase) for phase in phases
+                }
+                self._pgs_solve_mf_gs_kernel = self._pgs_solve_mf_gs_kernels[phases[0]]
         # Per-world sweep history for nesterov_momentum; a (1, 1) dummy when it is off.
         momentum_shape = (
             (
@@ -8052,6 +8067,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         return iterations - active
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
+        if self.model.device.is_cpu:
+            # CPU fallback: the portable MF-GS kernel reads the unpacked rows; remember the rhs.
+            self._cpu_mf_meta_rhs = mf_rhs
+            return
         pack_kernel = self._pack_mf_meta_kernel
         if pack_kernel is None:
             raise RuntimeError("Matrix-free metadata pack kernel is unavailable for this solver shape")
@@ -8069,6 +8088,69 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             outputs=[self._mf_meta_packed],
             block_dim=32,
+            device=self.model.device,
+        )
+
+    def _launch_cpu_matrix_free_gs(
+        self,
+        *,
+        dense_rhs: wp.array,
+        iterations: int,
+        omega: float,
+        row_phase: int,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: bool,
+        regularize: bool,
+    ) -> None:
+        """CPU fallback: launch the world-serial twin of the native fused MF-GS kernel."""
+        wp.launch(
+            pgs_solve_mf_gs_cpu,
+            dim=self._world_count,
+            inputs=[
+                self._max_world_dofs,
+                self._constraint_count,
+                self._dense_phase_bounds,
+                self._world_dof_indices,
+                dense_rhs,
+                self._diag,
+                self._row_w,
+                self._J_world,
+                self._Y_world,
+                self._row_type,
+                self._row_parent,
+                self._row_mu,
+                int(self._drive_mode == "rows"),
+                int(self._enable_joint_velocity_limits),
+                int(self._velocity_limits_fused),
+                self._drive_target_vel_bias,
+                self._drive_vel_multiplier,
+                self._drive_impulse_multiplier,
+                self._drive_max_impulse,
+                self._drive_vel_limit,
+                self._mf_constraint_count,
+                self._mf_contact_rows_end,
+                self._mf_dof_a,
+                self._mf_dof_b,
+                self._mf_eff_mass_inv,
+                self._cpu_mf_meta_rhs,
+                self._mf_row_type,
+                self._mf_row_parent,
+                self._mf_J_a,
+                self._mf_J_b,
+                self._mf_MiJt_a,
+                self._mf_MiJt_b,
+                self._mf_row_mu,
+                self._mf_row_w,
+                iterations,
+                omega,
+                int(regularize),
+                row_phase,
+                friction_start_iteration,
+                iteration_offset,
+                int(freeze_drive_rows),
+            ],
+            outputs=[self._impulses, self._mf_impulses, self._cpu_mf_gs_v, self._v_out],
             device=self.model.device,
         )
 
@@ -8333,6 +8415,19 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if self.model.device.is_cpu:
+                # CPU fallback: world-serial twin of the native fused MF-GS kernel.
+                self._launch_cpu_matrix_free_gs(
+                    dense_rhs=dense_rhs,
+                    iterations=phase_iterations,
+                    omega=omega,
+                    row_phase=row_phase,
+                    friction_start_iteration=int(friction_start_iteration),
+                    iteration_offset=int(phase_iteration_offset),
+                    freeze_drive_rows=freeze_drive_rows,
+                    regularize=bool(self._regularization_enabled and not soft_relax),
+                )
+                return
             if (
                 _STEEL_CAPTURE
                 and getattr(self, "_steel_step_n", -1) == _STEEL_CAPTURE_STEP
@@ -9448,6 +9543,40 @@ class SolverSteel(SolverBase, CouplingInterface):
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=iteration_offset,
                 regularize=regularize,
+            )
+            self._propagate_response()
+            return
+        if self.model.device.is_cpu:
+            # CPU fallback: world-serial twin of the native propagation contact kernel.
+            wp.launch(
+                pgs_solve_propagation_contact_cpu,
+                dim=self._world_count,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_MiJt_a,
+                    self._propagation_MiJt_b,
+                    self._propagation_J_a,
+                    self._propagation_J_b,
+                    self._propagation_eff_mass_inv,
+                    rhs,
+                    self._propagation_row_w,
+                    self._propagation_row_type,
+                    self._propagation_row_parent,
+                    self._propagation_row_mu,
+                    1,
+                    omega,
+                    int(regularize and self._regularization_enabled),
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[
+                    self._propagation_impulses,
+                    self._propagation_body_qd,
+                    self._propagation_body_impulses,
+                ],
+                device=self.model.device,
             )
             self._propagate_response()
             return

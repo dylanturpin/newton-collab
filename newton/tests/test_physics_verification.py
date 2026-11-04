@@ -1538,8 +1538,7 @@ def test_fixed_loop_joint(test, device, solver_fn):
 
 
 def _steel(model):
-    # The matrix-free solve is CUDA-only; split is the CPU route.
-    return newton.solvers.SolverSteel(model, solve_mode="matrix_free" if model.device.is_cuda else "split")
+    return newton.solvers.SolverSteel(model, solve_mode="matrix_free")
 
 
 devices = get_test_devices()
@@ -1699,6 +1698,13 @@ for device in devices:
     # Friction tests live in test_rigid_friction_ramp.py.
 
     # Restitution test
+    add_function_test(
+        TestPhysicsVerification,
+        "test_restitution_steel",
+        test_restitution,
+        devices=[device],
+        solver_fn=_steel,
+    )
     if device.is_cuda:
         add_function_test(
             TestPhysicsVerification,
@@ -1716,14 +1722,6 @@ for device in devices:
             devices=[device],
             solver_fn=newton.solvers.SolverKamino,
             rebound_rtol=0.03,
-        )
-        # Steel restitution needs the CUDA-only matrix-free solve.
-        add_function_test(
-            TestPhysicsVerification,
-            "test_restitution_steel",
-            test_restitution,
-            devices=[device],
-            solver_fn=_steel,
         )
 
     # Full rigid restitution sweep: endpoint and intermediate coefficients,

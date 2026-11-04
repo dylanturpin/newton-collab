@@ -903,13 +903,7 @@ for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name in (
-            "mujoco_warp",
-            "steel_matrix_free",
-            "steel_propagation",
-        ):
-            continue
-        if device.is_cpu and solver_name == "steel_matrix_free":
+        if device.is_cpu and solver_name in ("mujoco_warp",):
             continue
 
         add_function_test(
