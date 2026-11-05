@@ -38,6 +38,7 @@ from newton._src.solvers.steel.solver_steel import (
     _use_resident_mfgs_metadata,
 )
 from newton.solvers import SolverBase, SolverSteel
+from newton.tests.steel._fixtures import _build_four_bar
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -69,7 +70,7 @@ def _built_rows(
             wp.array([lower], dtype=wp.float32, device=device),
             wp.array([upper], dtype=wp.float32, device=device),
             wp.array([q], dtype=wp.float32, device=device),
-            gap,
+            wp.array([gap], dtype=wp.float32, device=device),
             wp.array([qd], dtype=wp.float32, device=device),
             speed_scale,
             0.01,
@@ -584,8 +585,8 @@ def _build_drive_jump_link(device, *, driven_parent: bool):
     return builder.finalize(device=device)
 
 
-def _drive_jump_max_q(model, dt: float, target: float, **solver_options) -> float:
-    """Step ``model`` with every drive target at ``target`` and return the largest limited-joint position."""
+def _drive_jump_max_q(model, dt: float, target: float, coord: int = -1, **solver_options) -> float:
+    """Step ``model`` with every drive target at ``target`` and return the largest position of ``coord``."""
     solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -593,7 +594,7 @@ def _drive_jump_max_q(model, dt: float, target: float, **solver_options) -> floa
     peak = -np.inf
     for _ in range(6):
         solver.step(state_0, state_1, control, None, dt)
-        peak = max(peak, float(state_1.joint_q.numpy()[-1]))
+        peak = max(peak, float(state_1.joint_q.numpy()[coord]))
         state_0, state_1 = state_1, state_0
     return peak
 
@@ -610,6 +611,50 @@ def test_default_gap_holds_a_joint_accelerated_within_the_step(test, device):
             )
             default = _drive_jump_max_q(model, dt, target, drive_mode=drive_mode)
             test.assertLessEqual(always, 0.3 + 1.0e-3)
+            test.assertLessEqual(default, always + 1.0e-4)
+
+
+def _build_constrained_follower(device, *, closure: str):
+    """Build a passive revolute follower limited to 0.3 rad, resting at 0.24 rad, coupled to a leader driven past it.
+
+    ``closure="mimic"`` couples the follower to the leader with an identity mimic; ``"connect"`` builds a
+    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. Returns the model and the
+    follower's coordinate.
+    """
+    if closure == "mimic":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        inertia = wp.mat33(np.eye(3) * 0.1)
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        follower = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(
+                -1, leader, axis=newton.Axis.Z, target_ke=1.0e3, target_kd=10.0, limit_lower=-3.0, limit_upper=3.0
+            ),
+            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, limit_lower=-0.3, limit_upper=0.3),
+        ]
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[1], joints[0])
+        builder.joint_q[:] = [0.24, 0.24]
+        return builder.finalize(device=device), 1
+    builder = _build_four_bar()
+    builder.gravity = wp.vec3(0.0, 0.0, 0.0)
+    builder.joint_target_ke[0] = 1.0e3
+    builder.joint_target_kd[0] = 10.0
+    builder.joint_limit_lower[2] = -0.3
+    builder.joint_limit_upper[2] = 0.3
+    builder.joint_q[:3] = [0.24, -0.24, 0.24]
+    return builder.finalize(device=device), 2
+
+
+def test_default_gap_holds_a_constrained_follower(test, device):
+    """A follower that a mimic or loop closure carries across its bound in one step stops there, as with ``inf``."""
+    for closure, dt in itertools.product(("mimic", "connect"), (1.0 / 60.0, 1.0 / 120.0)):
+        with test.subTest(closure=closure, dt=dt):
+            model, coord = _build_constrained_follower(device, closure=closure)
+            options = {"articulated_contact_response": "immediate"}
+            always = _drive_jump_max_q(model, dt, 1.0, coord, joint_limit_activation_gap=float("inf"), **options)
+            default = _drive_jump_max_q(model, dt, 1.0, coord, **options)
+            test.assertLessEqual(always, 0.3 + 0.02)
             test.assertLessEqual(default, always + 1.0e-4)
 
 
@@ -698,6 +743,7 @@ for _name, _func in (
         "test_default_gap_holds_a_joint_accelerated_within_the_step",
         test_default_gap_holds_a_joint_accelerated_within_the_step,
     ),
+    ("test_default_gap_holds_a_constrained_follower", test_default_gap_holds_a_constrained_follower),
     ("test_velocity_limit_unit_rows_match_the_reduction", test_velocity_limit_unit_rows_match_the_reduction),
 ):
     add_function_test(TestSteelJointLimitActivationGapUpstream, _name, _func, devices=devices)
@@ -738,6 +784,7 @@ class TestSteelJointLimitWarp(unittest.TestCase):
         joint_q = wp.array(rng.uniform(-1.2, 1.2, dof_count).astype(np.float32), dtype=wp.float32, device=device)
         # Speeds that widen some gaps past their bound and leave others short of it.
         joint_qd = wp.array(rng.uniform(-40.0, 40.0, dof_count).astype(np.float32), dtype=wp.float32, device=device)
+        gap = wp.array(rng.choice([0.05, np.inf], dof_count).astype(np.float32), dtype=wp.float32, device=device)
         art_to_world = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
         group_to_art = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
         scalar = _outputs(articulation_count, max_constraints, size, device)
@@ -755,7 +802,7 @@ class TestSteelJointLimitWarp(unittest.TestCase):
                 lower,
                 upper,
                 joint_q,
-                0.05,
+                gap,
                 joint_qd,
                 2.0,
                 0.01,
@@ -784,7 +831,7 @@ class TestSteelJointLimitWarp(unittest.TestCase):
                 lower,
                 upper,
                 joint_q,
-                0.05,
+                gap,
                 joint_qd,
                 2.0,
                 0.01,

@@ -2332,10 +2332,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 motion. Limit rows are speculative and apply no impulse while the joint cannot reach
                 its bound within the step, so the skipped rows are no-ops unless constraint impulses
                 in the solve, such as contacts, accelerate the joint toward the bound by more than
-                the margin in one step. With ``drive_mode="rows"`` the drives act inside the solve,
-                so ``None`` allocates every limit row, as ``inf`` does. A violated limit always has
-                its row. A bound at or
-                beyond ``MAXVAL`` (the builder's unlimited default) has no row. Must be ``None`` or
+                the margin in one step. Mimic and connect rows also act inside the solve, so mimic
+                endpoints and the tree joints a loop closure spans always have their limit rows. With
+                ``drive_mode="rows"`` the drives act inside the solve too, so ``None`` allocates every
+                limit row, as ``inf`` does. A violated limit always has its row. A bound at or beyond
+                ``MAXVAL`` (the builder's unlimited default) has no row. Must be ``None`` or
                 non-negative and not NaN. Defaults to ``None``.
 
                 .. versionchanged:: 1.8
@@ -3067,6 +3068,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         # counts their rows (see _estimate_dense_internal_rows_per_world).
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
+        self._build_joint_limit_gap(model)
         self._build_preelimination_plan(model)
         self._setup_passive_joint_forces(model)
         self._compute_world_response_dof_mapping(model)
@@ -5046,6 +5048,40 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._connect_rows = wp.array(self._connect_rows_np, dtype=wp.int32, device=device)
         self._connect_row_inv_norm = wp.zeros((n, 6), dtype=float, device=device)
         self._connect_count = n
+
+    def _build_joint_limit_gap(self, model) -> None:
+        """Build the per-DOF limit-row activation gap.
+
+        Under the default speed-aware gate, mimic endpoints and the tree joints a loop closure spans get
+        ``inf``: mimic and connect rows move them inside the solve, which ``v_hat`` cannot see.
+        """
+        gap = np.full(model.joint_dof_count, self._joint_limit_gap_base, dtype=np.float32)
+        if self._joint_limit_activation_speed_scale > 0.0 and model.joint_count:
+            if self._mimic_count:
+                valid = self._mimic_valid_np != 0
+                gap[self._mimic_dof0.numpy()[valid]] = np.inf
+                gap[self._mimic_dof1.numpy()[valid]] = np.inf
+            if self._connect_count:
+                joint_parent = model.joint_parent.numpy()
+                joint_child = model.joint_child.numpy()
+                joint_qd_start = model.joint_qd_start.numpy()
+                tree = np.flatnonzero(
+                    (model.joint_articulation.numpy() >= 0) & (self._model_plan.loop_joint_articulation < 0)
+                )
+                parent_joint = dict(zip(joint_child[tree].tolist(), tree.tolist(), strict=True))
+
+                def path(body):
+                    joints = set()
+                    while body in parent_joint:
+                        joint = parent_joint[body]
+                        joints.add(joint)
+                        body = int(joint_parent[joint])
+                    return joints
+
+                for j in self._connect_joint.numpy().tolist():
+                    for joint in path(int(joint_parent[j])) ^ path(int(joint_child[j])):
+                        gap[joint_qd_start[joint] : joint_qd_start[joint + 1]] = np.inf
+        self._joint_limit_gap = wp.array(gap, dtype=float, device=model.device)
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
@@ -12594,7 +12630,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_limit_lower,
                     model.joint_limit_upper,
                     state_in.joint_q,
-                    self._joint_limit_gap_base,
+                    self._joint_limit_gap,
                     self._v_hat,
                     self._joint_limit_activation_speed_scale,
                     self._baumgarte,
@@ -12636,7 +12672,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_gap_base,
+                                self._joint_limit_gap,
                                 self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
@@ -12684,7 +12720,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_gap_base,
+                                self._joint_limit_gap,
                                 self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
@@ -12722,7 +12758,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 state_in.joint_q,
-                                self._joint_limit_gap_base,
+                                self._joint_limit_gap,
                                 self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
@@ -15025,7 +15061,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const float q = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             phi_value = side == 0 ? q - bound : bound - q;
-            float act_gap = activation_gap;
+            float act_gap = activation_gap.data[dof];
             if (activation_speed_scale > 0.0f) act_gap += activation_speed_scale * dt * fabsf(joint_qd.data[dof]);
             active = fabsf(bound) < {MAXVAL:.1e}f && (side == 0 ? q <= bound + act_gap : q >= bound - act_gap);
         }}
@@ -15074,7 +15110,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         joint_limit_lower: wp.array[float],
         joint_limit_upper: wp.array[float],
         joint_q: wp.array[float],
-        activation_gap: float,
+        activation_gap: wp.array[float],
         joint_qd: wp.array[float],
         activation_speed_scale: float,
         dt: float,
@@ -15103,7 +15139,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         joint_limit_lower: wp.array[float],
         joint_limit_upper: wp.array[float],
         joint_q: wp.array[float],
-        activation_gap: float,
+        activation_gap: wp.array[float],
         joint_qd: wp.array[float],
         activation_speed_scale: float,
         dt: float,

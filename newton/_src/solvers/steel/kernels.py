@@ -2826,7 +2826,7 @@ def prepare_fused_diagonal_joint_limits(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    activation_gap: float,
+    activation_gap: wp.array[float],
     joint_qd: wp.array[float],
     activation_speed_scale: float,
     pgs_beta: float,
@@ -2852,7 +2852,9 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            gap = joint_limit_effective_gap(activation_gap, activation_speed_scale, dt, joint_qd[global_dof])
+            gap = joint_limit_effective_gap(
+                activation_gap[global_dof], activation_speed_scale, dt, joint_qd[global_dof]
+            )
             if wp.abs(lower) < MAXVAL and q <= lower + gap:
                 phi = q - lower
                 scale = 1.0
@@ -4120,7 +4122,7 @@ def build_joint_limit_rows_for_size(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    joint_limit_activation_gap: float,
+    joint_limit_activation_gap: wp.array[float],
     joint_qd: wp.array[float],
     joint_limit_activation_speed_scale: float,
     dt: float,
@@ -4164,7 +4166,7 @@ def build_joint_limit_rows_for_size(
 
             local_dof = dof - dof_start
             gap = joint_limit_effective_gap(
-                joint_limit_activation_gap, joint_limit_activation_speed_scale, dt, joint_qd[dof]
+                joint_limit_activation_gap[dof], joint_limit_activation_speed_scale, dt, joint_qd[dof]
             )
 
             for side in range(2):
