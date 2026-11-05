@@ -9285,7 +9285,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             return (
                 wp.array(start, dtype=wp.int32, device=device),
                 wp.array(elements.astype(np.int32), dtype=wp.int32, device=device),
-                wp.array(element_world[elements].astype(np.int32), dtype=wp.int32, device=device),
             )
 
         art_world = self._art_to_world.numpy()
@@ -9303,7 +9302,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             cursor_size = max(cursor_size, self._free_rigid_body_count)
         self._row_cursor = wp.zeros(cursor_size, dtype=wp.int32, device=device)
         for size in self._size_groups:
-            self._world_groups_by_size[size] = world_index(art_world[self._group_to_art[size].numpy()])[:2]
+            self._world_groups_by_size[size] = world_index(art_world[self._group_to_art[size].numpy()])
 
         sort_capacity = 2 * self._max_contacts_alloc
         self._contact_sort_keys = wp.zeros(sort_capacity, dtype=wp.int32, device=device)
@@ -9315,7 +9314,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._sorted_contact_slots_needed = wp.zeros(self._max_contacts_alloc + 1, dtype=wp.int32, device=device)
         self._sorted_contact_slot_offsets = wp.zeros(self._max_contacts_alloc + 1, dtype=wp.int32, device=device)
         # Scans run on preallocated scratch, so a capture Warp does not track can record them.
-        scan_length = max(cursor_size, self._max_contacts_alloc) + 1
+        scan_length = self._max_contacts_alloc + 1
         self._ordered_scan_scratch = wp.zeros(_scan_scratch_size(scan_length, device), dtype=wp.int64, device=device)
         self._ordered_scan_total = wp.zeros(1, dtype=wp.int32, device=device)
         self._contact_slot_scan_length = wp.ones(1, dtype=wp.int32, device=device)
@@ -9326,7 +9325,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             launch(ROW_SLOTS_ATOMIC)
             return
         device = self.model.device
-        world_element_start, world_elements, _element_world = world_index
+        world_element_start, world_elements = world_index
         self._row_cursor.zero_()
         launch(ROW_SLOTS_COUNT)
         if device.is_cuda:
