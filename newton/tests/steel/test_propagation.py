@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import inspect
 import io
 import os
@@ -4043,9 +4044,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
 
     def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
         """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", **solver_options
-        )
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", **solver_options)
         self.assertTrue(solver._latency_fused)
         wide = [0]
         loop = type(solver)._launch_matrix_free_gs_solve_propagation_tree
@@ -4117,9 +4116,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
     def test_debug_hooks_take_the_per_pass_launches(self):
         # stage timing and kernel capture observe the per-pass launches, so latency mode steps aside for them
         model = _build_latency_scene("cuda:0")
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", iterations=4
-        )
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", iterations=4)
         self.assertTrue(solver._latency_fused)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
@@ -4144,6 +4141,64 @@ class TestLatencyFusedLoop(unittest.TestCase):
         self._check_fused_matches(
             builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
         )
+
+    def _rollout(self, model, use_graph: bool) -> dict[str, np.ndarray]:
+        """Twenty-two steps of the latency scene, the last twenty eager or replayed from one captured graph."""
+        solver = SolverSteel(
+            model, solve_mode="colored", articulated_contact_response="propagation", iterations=8,
+            enable_joint_limits=True,
+        )  # fmt: skip
+        self.assertTrue(solver._latency_fused)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+
+        def two_steps():
+            for src, dst in ((state_0, state_1), (state_1, state_0)):
+                pipeline.collide(src, contacts)
+                solver.step(src, dst, control, contacts, DT)
+
+        two_steps()
+        if use_graph:
+            with patch.object(solver, "_launch_latency_fused", wraps=solver._launch_latency_fused) as fused:
+                with wp.ScopedCapture(device=model.device) as capture:
+                    two_steps()
+            self.assertGreater(fused.call_count, 0)
+        for _ in range(10):
+            if use_graph:
+                wp.capture_launch(capture.graph)
+            else:
+                two_steps()
+        return {k: getattr(state_0, k).numpy() for k in ("body_q", "body_qd", "joint_q", "joint_qd")}
+
+    def test_fused_loop_graph_capture_matches_eager(self):
+        # graph capture keeps the launch's by-value arguments, which some drivers handle only up to 4 KB
+        model = _build_latency_scene("cuda:0")
+        eager = self._rollout(model, use_graph=False)
+        replayed = self._rollout(model, use_graph=True)
+        for k, a in eager.items():
+            self.assertTrue(np.array_equal(a.view(np.uint8), replayed[k].view(np.uint8)), f"{k} differs")
+        self.assertGreater(np.abs(eager["body_qd"]).max(), 0.0)
+
+    def test_fused_loop_arguments_fit_4kb(self):
+        # past 4 KB of kernel parameters some drivers crash while capturing the launch into a graph
+        model = _build_latency_scene("cuda:0")
+        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
+        self.assertTrue(solver._latency_fused)
+        array_bytes = ctypes.sizeof(wp.zeros(1, dtype=float).__ctype__())
+
+        def param_bytes(kernel):
+            total = 0
+            for arg in kernel.adj.args:
+                if wp.types.is_array(arg.type):
+                    total += array_bytes
+                elif wp.types.type_is_struct(arg.type):
+                    total += ctypes.sizeof(arg.type().__ctype__())
+                else:
+                    total += wp.types.type_size_in_bytes(arg.type)
+            return total
+
+        self.assertLessEqual(param_bytes(solver._latency_fused_kernel), 4096)
 
     def test_off_past_one_world_per_sm(self):
         # one block per world: off once the worlds no longer fit one block per SM
