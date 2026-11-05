@@ -2721,6 +2721,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self._joint_armature_device = wp.zeros(max(model.joint_dof_count, 1), dtype=wp.float32, device=model.device)
         self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
+        # Whether any body is prescribed, which decides whether the colored sweep folds; None until the plan exists.
+        self._has_body_prescribed: bool | None = None
         self._update_kinematic_state()
         # Fully kinematic free bodies are removed from the response mapping; their
         # prescribed motion enters the contact targets of the rows that touch them.
@@ -3136,6 +3138,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
             child = model.joint_child.numpy()
             prescribed[child[kinematic[child] & (model.joint_parent.numpy() < 0)]] = 1
+        has_prescribed = bool(prescribed.any())
+        if self._has_body_prescribed not in (None, has_prescribed) and self._propagation_colored:
+            warnings.warn(
+                "SolverSteel: a kinematic articulation root was added or removed; recapture graphs of colored steps.",
+                NewtonWarning,
+                stacklevel=4,
+            )
+        self._has_body_prescribed = has_prescribed
         self._body_prescribed.assign(prescribed)
 
     def _update_effective_armature(self) -> None:
@@ -11997,26 +12007,28 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         Returns the body and right-hand-side arrays the pass's sweeps read.
         """
-        device = self.model.device
-        # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it. The
-        # fold reads the device mask, so a captured graph follows a change of the kinematic flags.
-        wp.launch(
-            fold_prescribed_propagation_sides,
-            dim=(self._world_count, self._propagation_max_constraints),
-            inputs=[
-                self._propagation_constraint_count,
-                self._propagation_body_a,
-                self._propagation_body_b,
-                self._propagation_J_a,
-                self._propagation_J_b,
-                self._body_prescribed,
-                self._propagation_body_qd,
-                propagation_rhs,
-                self._propagation_max_constraints,
-            ],
-            outputs=[self._color_body_a, self._color_body_b, self._color_rhs],
-            device=device,
-        )
+        if not self._has_body_prescribed:
+            body_a, body_b, rhs = self._propagation_body_a, self._propagation_body_b, propagation_rhs
+        else:
+            # Units of one color may share a prescribed body; keep the sweep off it so no two lanes write it.
+            body_a, body_b, rhs = self._color_body_a, self._color_body_b, self._color_rhs
+            wp.launch(
+                fold_prescribed_propagation_sides,
+                dim=(self._world_count, self._propagation_max_constraints),
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_J_a,
+                    self._propagation_J_b,
+                    self._body_prescribed,
+                    self._propagation_body_qd,
+                    propagation_rhs,
+                    self._propagation_max_constraints,
+                ],
+                outputs=[body_a, body_b, rhs],
+                device=self.model.device,
+            )
         # The unit records follow the step's rows, so the first pass of a step gathers them.
         if (
             self._pgs_solve_propagation_colored_warp_kernel is not None
@@ -12024,8 +12036,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             and self._colored_prefetch
         ):
             self._color_unit_meta_stale = False
-            self._launch_gather_unit_meta(self._color_body_a, self._color_body_b)
-        return self._color_body_a, self._color_body_b, self._color_rhs
+            self._launch_gather_unit_meta(body_a, body_b)
+        return body_a, body_b, rhs
 
     def _setup_latency_fused(self, model) -> None:
         """Build the one-launch colored propagation loop (latency mode) when this configuration supports it.

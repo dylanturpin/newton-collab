@@ -3502,7 +3502,7 @@ def test_colored_sleeping_islands_drop_their_torsion_rows(test, device):
 
 def test_colored_unsupported_combinations_raise(test, device):
     """Keep colored torsion rejected without device preparation, with velocity iterations and with warm start."""
-    colored = {"articulated_contact_response": "colored"}
+    colored = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
     for options, error, message in (
         (colored, NotImplementedError, "contact_torsion_device=True"),
         ({**_COLORED_TORSION, "velocity_iterations": 1}, NotImplementedError, "velocity_iterations=0"),

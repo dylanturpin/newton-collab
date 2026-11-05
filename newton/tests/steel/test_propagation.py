@@ -3467,6 +3467,25 @@ def test_kinematic_root_velocity_drives_the_colored_rows(test, device):
     np.testing.assert_allclose(twists["colored"], twists["propagation"], atol=1.0e-2 * spin * 0.35)
 
 
+def test_colored_rows_fold_only_with_kinematic_roots(test, device):
+    """Fold the colored rows only while an articulation root is kinematic, and warn when that changes."""
+    model, table = _turntable(device)
+    solver = _colored_solver(model)
+    test.assertTrue(solver._has_body_prescribed)
+    flags = model.body_flags.numpy()
+    flags[table] &= ~int(newton.BodyFlags.KINEMATIC)
+    model.body_flags.assign(flags)
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs of colored steps"):
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    test.assertFalse(solver._has_body_prescribed)
+    test.assertFalse(np.any(solver._body_prescribed.numpy()))
+    # Without a prescribed body the sweep reads the rows as built.
+    _settle(model, solver, steps=2)
+    body_a, _body_b, rhs = solver._prepare_colored_sweep(solver._propagation_rhs)
+    test.assertIs(body_a, solver._propagation_body_a)
+    test.assertIs(rhs, solver._propagation_rhs)
+
+
 class TestSteelColoredKinematicRoots(unittest.TestCase):
     pass
 
@@ -3475,6 +3494,7 @@ for _fn in (
     test_prescribed_mask_marks_kinematic_roots,
     test_kinematic_root_contacts_share_colors,
     test_kinematic_root_velocity_drives_the_colored_rows,
+    test_colored_rows_fold_only_with_kinematic_roots,
 ):
     add_function_test(TestSteelColoredKinematicRoots, _fn.__name__, _fn, devices=get_cuda_test_devices())
 
