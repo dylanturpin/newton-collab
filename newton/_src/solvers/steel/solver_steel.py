@@ -8743,7 +8743,10 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _propagation_capture_gated(self) -> bool:
         """Whether this step is captured with sleeping, so its propagation work can branch on the device."""
         device = self.model.device
-        return self._sleep_skips_dynamics and device.is_capturing and wp.is_conditional_graph_supported()
+        # capture_if builds a conditional node only in a capture Warp started; under another framework's
+        # capture it would read the flag back on the host, so the work runs unconditionally there.
+        warp_capture = device.is_cuda and device.captures.get(device.stream) is not None
+        return self._sleep_skips_dynamics and warp_capture and wp.is_conditional_graph_supported()
 
     def _run_propagation(self, work) -> None:
         """Run ``work``; a step captured with sleeping runs it only while some articulation is awake.
