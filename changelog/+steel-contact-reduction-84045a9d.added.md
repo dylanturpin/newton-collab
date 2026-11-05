@@ -1,1 +1,0 @@
-Accept body-pair-reduced contacts (`CollisionPipeline.ContactReductionConfig(body_pairs=True)`) in `SolverSteel`, including with `contact_warmstart=True`; `contact_compliance=True` and the other solvers raise `ValueError` for such buffers.

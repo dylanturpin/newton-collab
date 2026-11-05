@@ -90,7 +90,7 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
     pipeline = newton.CollisionPipeline(
         model,
         contact_matching="latest" if warm else "disabled",
-        reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=reduced),
+        body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig() if reduced else None,
     )
     contacts, control = pipeline.contacts(), model.control()
 
@@ -155,7 +155,7 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
         "warp": wp.__version__,
     }
     if reduced:
-        result["reduction"] = pipeline.body_pair_reduction_stats()
+        result["reduction"] = pipeline._body_pair_reducer.stats()
     if warm:
         count = result["final_contacts"]
         result["final_matched_fraction"] = (

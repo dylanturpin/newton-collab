@@ -67,14 +67,12 @@ Contact geometry
    See :ref:`Collisions`.
 
 Contact reduction
-   The boolean ``CollisionPipeline.reduce_contacts`` policy controls the
-   universally supported mesh/heightfield producer stage.  The optional
-   ``CollisionPipeline.ContactReductionConfig(body_pairs=True)`` postpass is a
-   different, solver-visible approximation intended for compound-body patches;
-   it is currently supported only by :class:`newton.solvers.SolverSteel`.
-   Keep it off unless measured end-to-end solver savings outweigh its fixed
-   collision cost and validate tipping- and yaw-sensitive behavior.  See
-   :ref:`Contact Reduction` for the stage and compatibility contracts.
+   ``CollisionPipeline(reduce_contacts=...)`` controls the mesh/heightfield
+   reduction every solver consumes. The opt-in
+   ``CollisionPipeline(body_pair_reduction=...)`` reduction changes which contacts
+   the solver sees and is supported by :class:`newton.solvers.SolverSteel`
+   only. Keep it off unless it lowers the
+   measured step time, and check tipping and yaw behavior when it is on.
 
 Contact material
    Shape material arrays such as :attr:`~Model.shape_material_mu`,

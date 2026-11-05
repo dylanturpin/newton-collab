@@ -548,6 +548,7 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
         self._require_unreduced_contacts(contacts)
         self._apply_module_options()
         self.validate_observables(observables)
+        self._require_unreduced_contacts(contacts)
         requires_grad = state_in.requires_grad
         step_in_place = state_in is state_out
 

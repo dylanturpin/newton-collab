@@ -18,7 +18,6 @@ import warp as wp
 from ...core.reset import reset_world_selected
 from ...core.types import MAXVAL, override
 from ...exceptions import NewtonDeprecationWarning, NewtonWarning
-from ...geometry.contact_reduction_body_pairs import add_reduction_material_key
 from ...geometry.flags import MeshProperties, ShapeFlags
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian, eval_mass_matrix
@@ -32,7 +31,6 @@ from .contact_angular_friction import (
     accumulate_free_rigid_angular_wrenches,
     configure_free_rigid_angular_friction,
     free_rigid_angular_friction_gs_sources,
-    free_rigid_reduction_material_key,
     free_rigid_route_bodies,
     launch_free_rigid_angular_friction_rows,
     launch_propagation_free_rigid_angular_friction_rows,
@@ -1569,6 +1567,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         }
     )
 
+    supports_body_pair_reduced_contacts: bool = True
+    """:meth:`step` accepts body-pair-reduced contacts, except with ``contact_compliance=True``, where it raises.
+
+    The compliant contact law is validated only on unreduced contacts.
+
+    .. experimental::
+    """
+
     # Constructor options. Most are fixed at construction; the _StepOption ones are read at every step.
     solve_mode = _ConstructionOption()
     iterations = _ConstructionOption()
@@ -1886,7 +1892,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 as a fraction of the position error removed per step.
             cfm: Constraint force mixing added to every row's effective-mass diagonal,
                 which regularizes redundant rows. Drive rows of ``drive_mode="rows"`` use
-                their exact unit response instead.
+                their exact unit response instead, and the coupled contact solves of a
+                ``friction_mode`` other than ``"fixed_normal"`` leave it off their contact blocks.
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
@@ -2210,7 +2217,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 :meth:`reset`. The input error is solver-wide: any reset clears it, and a cause
                 that persists latches it again on the next step. Grouping runs serially per world with
                 worst-case quadratic cost in the contacts of a world. No effect without
-                contact torsion. With ``articulated_contact_response="propagation"``, every
+                contact torsion. With ``articulated_contact_response="propagation"``, in either
+                ``solve_mode``, every
                 positive-radius contact on an articulated body that is routed to propagation
                 reserves one more propagation row for torsion (same-articulation contacts stay
                 dense unless ``propagation_same_articulation_rows`` is set), so size
@@ -2949,10 +2957,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._status_snapshot_event = None
         self._status_snapshot_checked = False
         self._status_readback_stream = None
-        # Last, so a failed construction leaves the model's reduction keys untouched.
-        reduction_key = free_rigid_reduction_material_key(self)
-        if reduction_key is not None:
-            add_reduction_material_key(model, self, reduction_key)
 
     def _refresh_shape_materials(self) -> None:
         """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
@@ -6846,7 +6850,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._contact_compliance:
             # Reject unsupported state before any stage can launch work.
             _contact_compliance.validate_step(self)
-            # The material law is validated on unreduced contacts only; a captured step also leases the buffer.
+            # The compliant contact law is validated on unreduced contacts only.
             self._require_unreduced_contacts(
                 contacts, supports_body_pair_reduced_contacts=False, configuration="contact_compliance=True"
             )
@@ -6856,16 +6860,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 "Steel contact capacity mismatch: received "
                 f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
-            )
-        if self._contact_warmstart:
-            # A reduced stream is valid when it carries retained identities; an unreduced captured stream keeps
-            # its reader lease so a later producer cannot change its layout behind graph replay.
-            self._require_unreduced_contacts(
-                contacts,
-                supports_body_pair_reduced_contacts=bool(
-                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
-                ),
-                configuration="contact_warmstart=True",
             )
         if self._contact_warmstart and contacts is not None and contacts.rigid_contact_match_index is None:
             raise ValueError(
@@ -8028,14 +8022,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         Per row family (``articulation``, ``free_body``, ``propagation``): the largest retained
         and requested row count of any world and step, the largest number of dropped contact
         rows, the largest excess over the capacity, and the number of overflowing world-steps;
-        and ``contact_high_water``, the largest contact count. Reads the device on the host, so
-        call it outside CUDA graph capture. Every value is ``0`` when ``row_watermark`` is off.
+        and ``contact_high_water``, the largest contact count. With ``row_watermark``, reads the
+        device on the host and raises :class:`RuntimeError` during CUDA graph capture. Every value
+        is ``0`` when ``row_watermark`` is off.
         """
-        values = (
-            self._row_watermarks.numpy().tolist()
-            if self._row_watermarks is not None
-            else [0] * (ROW_WATERMARK_CONTACT_SLOT + 1)
-        )
+        if self._row_watermarks is None:
+            values = [0] * (ROW_WATERMARK_CONTACT_SLOT + 1)
+        else:
+            if self.model.device.is_capturing:
+                raise RuntimeError("constraint_row_watermarks() must run outside CUDA graph capture")
+            values = self._row_watermarks.numpy().tolist()
         result = {}
         for family, name in enumerate(("articulation", "free_body", "propagation")):
             base = family * ROW_WATERMARK_FAMILY_STRIDE
@@ -8049,12 +8045,20 @@ class SolverSteel(SolverBase, CouplingInterface):
 
     @property
     def compliance_contact_count(self) -> int:
-        """Compliant contacts prepared by the last step (``contact_compliance`` only; synchronous readback)."""
+        """Compliant contacts prepared by the last step (``contact_compliance`` only).
+
+        With ``contact_compliance``, reads the device on the host and raises :class:`RuntimeError`
+        during CUDA graph capture.
+        """
         return 0 if self._compliance is None else _contact_compliance.counts(self)[0]
 
     @property
     def compliance_skipped_contact_count(self) -> int:
-        """Positive-stiffness contacts the row allocator excluded in the last step (``contact_compliance`` only)."""
+        """Positive-stiffness contacts the row allocator excluded in the last step (``contact_compliance`` only).
+
+        With ``contact_compliance``, reads the device on the host and raises :class:`RuntimeError`
+        during CUDA graph capture.
+        """
         return 0 if self._compliance is None else _contact_compliance.counts(self)[1]
 
     def snapshot_constraint_status(self) -> None:
@@ -22986,8 +22990,8 @@ _MF_COULOMB_NEWTON_FRICTION_SOURCE = """
 
                                 float rT0 = -last_s0;
                                 float rT1 = -last_s1;
-                                float rN = -(wNT0 * rT0 + wNT1 * rT1 + bN) / WN;
-                                new_lambda_n = rN;
+                                // The finite search can end just below zero load; the exact root is non-negative.
+                                new_lambda_n = fmaxf(-(wNT0 * rT0 + wNT1 * rT1 + bN) / WN, 0.0f);
                                 new_lambda_t1 = rT0;
                                 new_lambda_t2 = rT1;
                                 // The root search stops within a tolerance and leaves a residual tangent at mu = 0.

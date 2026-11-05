@@ -1,1 +1,0 @@
-Add opt-in body-pair contact reduction (`CollisionPipeline.ContactReductionConfig(body_pairs=True)`), which keeps a bounded, spatially spread subset of each compound body pair's contacts, and `SolverBase.supports_body_pair_reduced_contacts`, which solvers not validated on reduced buffers leave `False` and enforce in `step()`.
