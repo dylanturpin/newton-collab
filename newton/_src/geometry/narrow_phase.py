@@ -1663,14 +1663,18 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             num_distance = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
             num_work_items = num_distance
             # Large accelerated hulls benefit from a cooperative certificate.
-            # Keep small exhaustive-support pairs independent across lanes so
-            # dense refinement queues retain their full pair parallelism.
+            # Exhaustive-support pairs take it only while the queue fits one
+            # pair per block; longer queues of cheap pairs stay independent
+            # across lanes and keep their full pair parallelism. Every thread
+            # reads the same count, so a block agrees on the choice.
             lane = int(0)
             first = tid
             stride = total_num_threads
+            cooperative = False
             if wp.static(refine_overlap):
                 num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
-                if wp.static(accelerated_support):
+                cooperative = wp.static(accelerated_support) or num_work_items * wp.block_dim() <= total_num_threads
+                if cooperative:
                     lane = tid % wp.block_dim()
                     first = tid / wp.block_dim()
                     stride = total_num_threads / wp.block_dim()
@@ -1732,7 +1736,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                         certificate_ready = False
                         certificate_normal = wp.vec3(0.0)
                         certificate_depth = float(0.0)
-                        if wp.static(accelerated_support):
+                        if cooperative:
                             if not separated_pair:
                                 certificate_ready, certificate_normal, certificate_depth = wp.static(
                                     solve_mpr.cooperative_certificate
