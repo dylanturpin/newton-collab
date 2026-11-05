@@ -6,6 +6,7 @@
 import ctypes
 import functools
 import inspect
+import itertools
 import sys
 import unittest
 import warnings
@@ -2660,14 +2661,11 @@ def _check_colored_sleeping_skips_work(test, device, compliant, welded, ball):
 
 def test_colored_sleeping_runs_under_external_and_warp_capture(test, device):
     """Replay a colored sleeping step captured by Warp or directly through CUDA, and sleep and wake as eager steps do."""
-    # The RUN_TO_RUN row ordering fails under a capture Warp does not track; this test covers the sleeping solve.
-    options = {
-        "sleep_quiet_time": 0.05,
-        "friction_anchor_beta": 0.0,
-        "deterministic": wp.DeterministicMode.NOT_GUARANTEED,
-    }
-    for mode in ("warp", "external"):
-        with test.subTest(mode=mode):
+    for mode, deterministic in itertools.product(
+        ("warp", "external"), (wp.DeterministicMode.NOT_GUARANTEED, wp.DeterministicMode.RUN_TO_RUN)
+    ):
+        options = {"sleep_quiet_time": 0.05, "friction_anchor_beta": 0.0, "deterministic": deterministic}
+        with test.subTest(mode=mode, deterministic=deterministic.name):
             if mode == "external" and not sys.platform.startswith("linux"):
                 test.skipTest("the CUDA driver capture loads libcuda.so.1")
             captured, eager = (_Heap(device, model=_dumbbells_model(device), **options) for _ in range(2))
@@ -2686,14 +2684,16 @@ def test_colored_sleeping_runs_under_external_and_warp_capture(test, device):
                     eager.step(clear=False)
                     awake = captured.solver._sleeping.art_awake.numpy()
                     np.testing.assert_array_equal(
-                        awake, eager.solver._sleeping.art_awake.numpy(), err_msg=f"{mode} {k}"
+                        awake, eager.solver._sleeping.art_awake.numpy(), err_msg=f"{mode} {deterministic.name} {k}"
                     )
                     slept |= not awake.any()
                     if k == 40:
                         np.testing.assert_array_equal(awake, [1, 0])
                 a, b = captured.snapshot(), eager.snapshot()
                 for name in _FIELDS:
-                    np.testing.assert_allclose(a[name], b[name], rtol=0.0, atol=1.0e-4, err_msg=f"{mode} {name}")
+                    np.testing.assert_allclose(
+                        a[name], b[name], rtol=0.0, atol=1.0e-4, err_msg=f"{mode} {deterministic.name} {name}"
+                    )
             finally:
                 release()
 
