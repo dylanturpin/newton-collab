@@ -2251,38 +2251,44 @@ class TestSleepingColoredPropagation(unittest.TestCase):
 
     def test_colored_sleeping_runs_under_external_and_warp_capture(self):
         """Replay a colored sleeping step captured by Warp or directly through CUDA, and sleep and wake as eager steps do."""
-        # The deterministic row ordering fails under a capture Warp does not track; this test covers the sleeping solve.
-        options = {"sleep_quiet_time": 0.05, "friction_anchor_beta": 0.0, "deterministic": False}
         for mode in ("warp", "external"):
-            with self.subTest(mode=mode):
-                if mode == "external" and not sys.platform.startswith("linux"):
-                    self.skipTest("the CUDA driver capture loads libcuda.so.1")
-                captured, eager = (_Heap(model=_dumbbells_model("cuda:0"), **options) for _ in range(2))
-                replay, release = _capture_solver_step(captured, mode)
-                try:
-                    force = np.zeros((captured.model.body_count, 6), dtype=np.float32)
-                    slept = False
-                    for k in range(60):
-                        force[:] = 0.0
-                        if k == 40:
-                            self.assertTrue(slept, "both chains must sleep before the force")
-                            force[0, 2] = 5.0
-                        for scene in (captured, eager):
-                            scene.state_in.body_f.assign(force)
-                        replay()
-                        eager.step(clear=False)
-                        awake = captured.solver._sleeping.art_awake.numpy()
-                        np.testing.assert_array_equal(
-                            awake, eager.solver._sleeping.art_awake.numpy(), err_msg=f"{mode} {k}"
-                        )
-                        slept |= not awake.any()
-                        if k == 40:
-                            np.testing.assert_array_equal(awake, [1, 0])
-                    a, b = captured.snapshot(), eager.snapshot()
-                    for name in _FIELDS:
-                        np.testing.assert_allclose(a[name], b[name], rtol=0.0, atol=1.0e-4, err_msg=f"{mode} {name}")
-                finally:
-                    release()
+            for deterministic in (False, True):
+                with self.subTest(mode=mode, deterministic=deterministic):
+                    if mode == "external" and not sys.platform.startswith("linux"):
+                        self.skipTest("the CUDA driver capture loads libcuda.so.1")
+                    self._check_sleeping_replay(mode, deterministic)
+
+    def _check_sleeping_replay(self, mode, deterministic):
+        """Replay one captured solver step through sleep and a force wake against an eager twin."""
+        options = {"sleep_quiet_time": 0.05, "friction_anchor_beta": 0.0, "deterministic": deterministic}
+        captured, eager = (_Heap(model=_dumbbells_model("cuda:0"), **options) for _ in range(2))
+        replay, release = _capture_solver_step(captured, mode)
+        try:
+            force = np.zeros((captured.model.body_count, 6), dtype=np.float32)
+            slept = False
+            for k in range(60):
+                force[:] = 0.0
+                if k == 40:
+                    self.assertTrue(slept, "both chains must sleep before the force")
+                    force[0, 2] = 5.0
+                for scene in (captured, eager):
+                    scene.state_in.body_f.assign(force)
+                replay()
+                eager.step(clear=False)
+                awake = captured.solver._sleeping.art_awake.numpy()
+                np.testing.assert_array_equal(
+                    awake, eager.solver._sleeping.art_awake.numpy(), err_msg=f"{mode} {deterministic} {k}"
+                )
+                slept |= not awake.any()
+                if k == 40:
+                    np.testing.assert_array_equal(awake, [1, 0])
+            a, b = captured.snapshot(), eager.snapshot()
+            for name in _FIELDS:
+                np.testing.assert_allclose(
+                    a[name], b[name], rtol=0.0, atol=1.0e-4, err_msg=f"{mode} {deterministic} {name}"
+                )
+        finally:
+            release()
 
 
 def _capture_solver_step(scene, mode):
