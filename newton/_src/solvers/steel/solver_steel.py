@@ -15451,7 +15451,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
     dense_velocity_limit_pass = (
         f"""
-        for (int i = 0; i < m_dense; i++) {{
+        for (int i = vlim_lo; i < vlim_hi; i++) {{
             if ((s_meta_dense[i] & {type_mask}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
             float denom = s_diag_dense[i];
             if (denom <= 0.0f) continue;
@@ -15539,6 +15539,23 @@ def _get_pgs_solve_mf_gs_kernel(
     torsion_skip = f"if (row_type == {int(PGS_CONSTRAINT_TYPE_TORSION)}) continue;" if contact_torsion else ""
     torsion_sweep = torque_sweep_source(D, linked=torsion_links) if contact_torsion else ""
     torsion_link_build = torque_links_source(M_D) if torsion_links else ""
+    # The velocity-limit pass of every sweep visits only the span of this world's velocity-limit rows.
+    velocity_limit_range = (
+        f"""    int vlim_lo = m_dense;
+    int vlim_hi = 0;
+    for (int i = lane; i < m_dense; i += 32) {{
+        if ((s_meta_dense[i] & {type_mask}) == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) {{
+            vlim_lo = min(vlim_lo, i);
+            vlim_hi = i + 1;
+        }}
+    }}
+    for (int offset = 16; offset > 0; offset >>= 1) {{
+        vlim_lo = min(vlim_lo, __shfl_xor_sync(0xFFFFFFFF, vlim_lo, offset));
+        vlim_hi = max(vlim_hi, __shfl_xor_sync(0xFFFFFFFF, vlim_hi, offset));
+    }}"""
+        if has_dense_velocity_limit_rows
+        else ""
+    )
     pair_cache_capacity = _mfgs_pair_cache_capacity(M_D)
     # Streamed metadata rereads row types and parents every sweep (patch chains, torsion members).
     row_cache = pair_cache and not shared_metadata
@@ -15768,9 +15785,17 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
 
-    mf_angular_skip, mf_angular_radius, mf_angular_update = "", "", ""
+    mf_angular_skip, mf_angular_radius, mf_angular_update, mf_angular_load_decl = "", "", "", ""
     if free_rigid_angular_friction:
         mf_angular_skip, mf_angular_radius, mf_angular_update = free_rigid_angular_friction_gs_sources()
+        # The rolling and spin rows follow their sliding pair, which pools the same normal load first.
+        mf_angular_load_decl = "        int angular_load_parent = -1;\n        float angular_load = 0.0f;"
+        mf_friction_radius = mf_friction_radius.replace(
+            "                radius = fmaxf(",
+            "                angular_load_parent = mf_par;\n                angular_load = lambda_n;\n"
+            "                radius = fmaxf(",
+            1,
+        )
         mf_friction_denominator_guard += f" && mf_rt != {int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)}"
 
     local_internal_skip = (
@@ -15835,6 +15860,7 @@ def _get_pgs_solve_mf_gs_kernel(
     }}
     __syncwarp();
 {pair_cache_build}
+{velocity_limit_range}
 {torsion_link_build}
 {dense_pipe_decl}
 
@@ -15912,6 +15938,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
             }}
         }}
+{mf_angular_load_decl}
         for (int i = 0, next_i = 0; i < mf_main_end; i = next_i) {{
             int4 meta = pre_meta;
             float cur_Ja = pre_Ja;

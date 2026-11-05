@@ -244,11 +244,15 @@ def free_rigid_angular_friction_gs_sources() -> tuple[str, str, str]:
     radius = f"""
             float angular_radius = 0.0f;
             if ({angular}) {{
-                float lambda_n = s_lam_mf[mf_par];
-                for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16);
-                     patch_row >= 0 && patch_row != mf_par;
-                     patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                    lambda_n += s_lam_mf[patch_row];
+                // The contact's sliding pair, visited just before in this sweep, pooled the same normals.
+                float lambda_n = angular_load;
+                if (mf_par != angular_load_parent) {{
+                    lambda_n = s_lam_mf[mf_par];
+                    for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16);
+                         patch_row >= 0 && patch_row != mf_par;
+                         patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                        lambda_n += s_lam_mf[patch_row];
+                }}
                 angular_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                 // A zero bound with no carried impulse cannot change the velocity.
                 if (angular_radius == 0.0f && s_lam_mf[i] == 0.0f && (mf_rt != {rolling} || s_lam_mf[i + 1] == 0.0f))
