@@ -1782,6 +1782,64 @@ class Model:
         compute_shape_bvh_bounds_launch(self, self.bvh_shapes.lowers, self.bvh_shapes.uppers, self.bvh_shapes.groups)
         self.bvh_shapes.refit()
 
+    def copy_shape_geometry(self, source_shapes: wp.array, target_shapes: wp.array) -> None:
+        """Copy the collision geometry of shapes into other shape slots of this model, on the device.
+
+        This is the set path for switching a shape's mesh at an episode reset without
+        changing the model's topology: the variant geometry is finalized as a shape of the
+        same model, and the copy makes the target slot reference it. Build the variant as a
+        hidden static shape with ``collision_group=0``: :meth:`ModelBuilder.finalize` then
+        bakes its collision companions while no pair list includes it. Building it without
+        shape collision skips the SDF and edge companions, and clearing its flags after
+        finalize does not remove it from the explicit broad phase's pair list, which is
+        fixed at finalize. One kernel launch, no host synchronization, so the call can be
+        captured in a CUDA graph; rows whose source or target index is negative or out
+        of range are skipped, which lets a fixed-size per-world selection array mark
+        unselected worlds with ``-1``.
+
+        The copy covers the geometry arrays that collision reads every step together with
+        the companions that :meth:`ModelBuilder.finalize` bakes from the mesh and that would
+        otherwise go stale: :attr:`shape_scale`, :attr:`shape_transform`,
+        :attr:`shape_collision_radius`, :attr:`shape_margin`, :attr:`shape_gap`,
+        :attr:`shape_is_solid`, :attr:`shape_source_ptr`, :attr:`shape_collision_aabb_lower`,
+        :attr:`shape_collision_aabb_upper`, :attr:`shape_edge_range`,
+        :attr:`shape_heightfield_index`, :attr:`bvh_shape_bounds` and the private mesh
+        property, convex support, SDF index, mesh boundary, interior point and voxel
+        resolution arrays. The broad phase takes a mesh's bounds from the baked local AABB,
+        not from the mesh itself, so a pointer swap that leaves it behind loses the contacts.
+
+        Not copied, because the collision pipeline fixes its routing, capacities and
+        groups on them at construction: :attr:`shape_type`, :attr:`shape_body`,
+        :attr:`shape_world`, :attr:`shape_flags`, :attr:`shape_collision_group`, the
+        collision filters and the ``shape_material_*`` arrays. Source and target must share
+        the shape type and the collision class (both with or both without an SDF, the same
+        scale baking), and the pipeline's contact capacities must be sized for the largest
+        variant. The host-side :attr:`shape_source` list and the viewers' compiled meshes
+        are left unchanged. Write the body's inertial arrays separately when the variant
+        changes them.
+
+        After the copy, notify the solver with
+        ``ModelFlags.SHAPE_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES`` (for
+        :class:`~newton.solvers.SolverSteel`, pass the reset worlds as ``world_mask`` so
+        only they lose their warm start), call the solver's ``reset`` for those worlds and
+        :meth:`CollisionPipeline.reset_contact_matching` so no contact history carries
+        across the switch. :class:`~newton.solvers.SolverMuJoCo` does not follow the copy:
+        it compiles mesh geometry into its own model.
+
+        .. experimental::
+
+            This method is experimental and may change without a deprecation period. It
+            is the in-place counterpart of upstream Newton's proposed per-world body shape
+            variants; models built with that API will select variants instead of copying.
+
+        Args:
+            source_shapes: Shape indices to copy from, ``int32`` array on the model device.
+            target_shapes: Shape indices to copy into, ``int32`` array of the same length.
+        """
+        from .shape_geometry import copy_shape_geometry  # noqa: PLC0415
+
+        copy_shape_geometry(self, source_shapes, target_shapes)
+
     def bvh_build_particles(self, state: State, *, bvh_constructor: str | None = None) -> None:
         """Build or rebuild the particle BVH stored on this model.
 
