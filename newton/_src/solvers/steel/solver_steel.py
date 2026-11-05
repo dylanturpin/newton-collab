@@ -2280,7 +2280,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``solve_mode="serial"``; with ``solve_mode="colored"`` skipped islands are left out of the
                 coloring, the colored sweep and the propagation trees, and, where CUDA conditional graph
                 nodes are supported, a captured step in which every articulation that can sleep sleeps
-                skips the propagation solve. :meth:`step` raises :class:`ValueError` for a
+                skips the propagation solve. Only a capture Warp started can skip that work: in a capture another
+                framework starts, the propagation setup and solve run every step. :meth:`step` raises
+                :class:`ValueError` for a
                 nonpositive or nonfinite ``dt`` and when ``state_in`` and ``state_out`` share
                 arrays. The sleeping options are runtime solver settings with no USD schema.
             sleep_linear_threshold: Body center-of-mass speed below which a body is quiet
