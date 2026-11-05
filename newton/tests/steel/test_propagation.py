@@ -3578,29 +3578,42 @@ def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
 
 
 def _kernel_param_bytes(kernel: wp.Kernel) -> int:
-    """Upper bound on a kernel's CUDA parameter block: 4-D launch bounds, then every argument at its alignment."""
-    fields = [("shape", ctypes.c_uint32 * 4), ("size", ctypes.c_size_t), ("coord_mult", ctypes.c_size_t)]
+    """End of a kernel's CUDA parameter block, laid out from the ctypes Warp packs for its bounds and arguments."""
+    kernel.adj.get_references()  # sets kernel_dim, the launch bounds' rank, before the module is built
+    fields = [("bounds", type(wp._src.types.launch_bounds_t((0,) * kernel.adj.kernel_dim)))]
     for i, arg in enumerate(kernel.adj.args):
         if wp.types.is_array(arg.type):
-            ctype = type(wp.empty(0, dtype=float, device="cpu").__ctype__())
+            ctype = type(arg.type.__ctype__())
         elif wp.types.type_is_struct(arg.type):
             ctype = type(arg.type().__ctype__())
+        elif wp.types.type_is_composite(arg.type):
+            ctype = arg.type  # vectors, matrices and transforms are ctypes arrays of their scalars
         else:
             ctype = arg.type._type_
         fields.append((f"arg{i}", ctype))
-    return ctypes.sizeof(type("KernelParams", (ctypes.Structure,), {"_fields_": fields}))
+    layout = type("KernelParams", (ctypes.Structure,), {"_fields_": fields})
+    return getattr(layout, fields[-1][0]).offset + ctypes.sizeof(fields[-1][1])
 
 
 @wp.kernel
-def _param_layout_probe(count: int, values: wp.array[float]):
-    values[wp.tid()] = float(count)
+def _param_layout_probe(count: int, offset: wp.vec3d, values: wp.array[float]):
+    values[wp.tid()] = float(count) + float(offset[0])
+
+
+@wp.kernel
+def _param_layout_oversized(weights: wp.types.matrix((32, 32), float), values: wp.array[float]):
+    values[wp.tid()] = weights[0, 0]
 
 
 class TestKernelParamBytes(unittest.TestCase):
-    def test_counts_launch_bounds_and_alignment(self):
-        """The bound adds the launch bounds and pads each argument to its alignment, not just the argument sizes."""
-        # 32 bytes of launch bounds, a 4-byte int padded to 8, a 56-byte array descriptor
-        self.assertEqual(_kernel_param_bytes(_param_layout_probe), 96)
+    def test_counts_launch_bounds_composites_and_alignment(self):
+        """The layout adds the launch bounds, counts every vector scalar and pads each argument to its alignment."""
+        # 24-byte 1-D launch bounds, a 4-byte int padded to 8, a 24-byte vec3d, a 56-byte array descriptor
+        self.assertEqual(_kernel_param_bytes(_param_layout_probe), 112)
+
+    def test_oversized_kernel_exceeds_4kb(self):
+        """A 4 KB matrix argument puts the parameter block over 4096 bytes."""
+        self.assertGreater(_kernel_param_bytes(_param_layout_oversized), 4096)
 
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
