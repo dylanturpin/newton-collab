@@ -9281,8 +9281,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Scans run on preallocated scratch, so a capture Warp does not track can record them.
         scan_length = max(cursor_size, self._max_contacts_alloc) + 1
         self._ordered_scan_scratch = wp.zeros(_scan_scratch_size(scan_length, device), dtype=wp.int64, device=device)
-        # scan_with_total clips this length to each scanned view, so every scan covers its whole view.
-        self._ordered_scan_length = wp.full(1, scan_length, dtype=wp.int32, device=device)
         self._ordered_scan_total = wp.zeros(1, dtype=wp.int32, device=device)
         self._contact_slot_scan_length = wp.ones(1, dtype=wp.int32, device=device)
 
@@ -15777,11 +15775,11 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_angular_skip, mf_angular_radius, mf_angular_update = free_rigid_angular_friction_gs_sources()
         # The rolling and spin rows follow their sliding pair, which pools the same normal load first.
         mf_angular_load_decl = "        int angular_load_parent = -1;\n        float angular_load = 0.0f;"
-        mf_friction_radius = mf_friction_radius.replace(
+        mf_friction_radius = _replace_once(
+            mf_friction_radius,
             "                radius = fmaxf(",
             "                angular_load_parent = mf_par;\n                angular_load = lambda_n;\n"
             "                radius = fmaxf(",
-            1,
         )
         mf_friction_denominator_guard += f" && mf_rt != {int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)}"
 
