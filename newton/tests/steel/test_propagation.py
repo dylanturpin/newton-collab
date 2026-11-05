@@ -3696,7 +3696,13 @@ class TestSteelLatencyFused(unittest.TestCase):
 
     def _rollout(self, model, use_graph):
         """Twenty-two steps of the latency scene, the last twenty eager or replayed from one captured graph."""
-        solver = SolverSteel(model, **steel_mode_options("colored"), iterations=8, enable_joint_limits=True)
+        solver = SolverSteel(
+            model,
+            **steel_mode_options("colored"),
+            iterations=8,
+            enable_joint_limits=True,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
         self.assertTrue(solver._latency_fused)
         pipeline = newton.CollisionPipeline(model, deterministic=True)
         contacts = pipeline.contacts()
