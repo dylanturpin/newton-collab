@@ -393,6 +393,7 @@ class _SleepState:
         )
         solver = self.solver
         skip = int(self.skip_constraints)
+        solver._propagation_dynamics_active.zero_()
         wp.launch(
             _articulation_activity,
             self.parent.size,
@@ -405,6 +406,7 @@ class _SleepState:
                 solver._dynamics_art_mask,
                 solver._constraint_art_active,
                 solver._fk_id_cache_valid,
+                solver._propagation_dynamics_active,
             ],
             device=device,
         )
@@ -938,6 +940,7 @@ def _articulation_activity(
     active_mask: wp.array[wp.bool],
     rows_active: wp.array[int],
     fk_id_cache_valid: wp.array[int],
+    any_active: wp.array[int],
 ):
     i = wp.tid()
     step_asleep[i] = 1 - awake[i]
@@ -952,6 +955,8 @@ def _articulation_activity(
             active_mask[i] = False
         # Sleeping articulations keep stale FK/ID terms, which only their discarded dynamics read.
         fk_id_cache_valid[i] = 1 - active[i]
+    if active[i] != 0:
+        wp.atomic_max(any_active, 0, 1)
 
 
 @wp.kernel(enable_backward=False)

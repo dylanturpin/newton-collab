@@ -4111,6 +4111,35 @@ class TestPropagationLevelParallelTree(unittest.TestCase):
         model = _build_free_root_chain_model("cuda:0", base_z=2.0, contact_sphere=None, ground=False)
         self._assert_level_matches_serial(model, steps=(12,))
 
+    def test_inactive_articulations_are_skipped_like_serial(self):
+        # a sleeping articulation keeps its factor, response and refreshed twists in both walks
+        model = _build_hand_tree_model("cuda:0", floating=True)
+        active = np.ones(model.articulation_count, dtype=np.int32)
+        active[1] = 0
+        mask = wp.array(active, dtype=wp.int32, device=model.device)
+        sentinel = 1234.5
+        outputs = (*_TREE_FACTOR_OUTPUTS, "_propagation_body_qd")
+        results = {}
+        with patch.object(SolverSteel, "_propagation_tree_activity", property(lambda _self: mask)):
+            for level in (True, False):
+                solver = _make_solver_tree_kernels(model, level=level)
+                size = next(int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0)
+                self.assertEqual(solver._propagation_tree_level_by_size[size], level)
+                for name in outputs:
+                    getattr(solver, name).fill_(sentinel)
+                _step_n(model, solver, 1)
+                solver._v_out.fill_(0.25)
+                solver._refresh_propagation_body_qd_from_vout(force=True)
+                results[level] = {name: getattr(solver, name).numpy() for name in outputs}
+        art_bodies = model.body_world.numpy() == 1  # one articulation per world
+        for name in outputs:
+            with self.subTest(name=name):
+                np.testing.assert_array_equal(
+                    results[True][name].view(np.uint32), results[False][name].view(np.uint32), err_msg=name
+                )
+                self.assertTrue(np.any(results[True][name] != sentinel), name)
+        np.testing.assert_array_equal(results[True]["_propagation_body_qd"][art_bodies], sentinel)
+
     def test_multidof_trees_keep_the_serial_walk(self):
         self._assert_level_matches_serial(_build_ball_tree_model("cuda:0"), expect_level=False)
 

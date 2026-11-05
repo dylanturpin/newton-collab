@@ -2103,8 +2103,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 or ``solve_mode`` is ``"colored"``, the model has at least one articulation and no particles, and
                 warmstarting, contact compliance and velocity post-passes (``velocity_iterations``) are off.
                 Sleeping with ``solve_mode="colored"`` requires CUDA and raises ``NotImplementedError`` on CPU.
-                With ``solve_mode="colored"`` and ``sleep_skip_constraints``, sleeping islands' contacts are left out of
-                the coloring and the colored sweep; a step that overflows the propagation rows keeps that world awake.
+                With ``solve_mode="colored"`` and ``sleep_skip_constraints``, sleeping islands are left out of the
+                coloring, the colored sweep and the propagation trees, and a captured step in which every
+                articulation sleeps skips the propagation setup and solve; a step that overflows the propagation
+                rows keeps that world awake. Only a capture Warp started can skip that work: in a capture another
+                framework starts, the propagation setup and solve run every step. Such captures work with either
+                ``deterministic`` setting.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
                 solver spends work on settled scenes rather than describing the scene.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
@@ -3009,6 +3013,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._dynamics_body_active = wp.ones(model.body_count, dtype=wp.int32, device=model.device)
         # Articulations whose velocity-limit rows are allocated; row-free sleeping islands have none.
         self._constraint_art_active = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
+        # Set by sleeping when any articulation steps its dynamics; captured steps gate propagation work on it.
+        self._propagation_dynamics_active = wp.zeros(1, dtype=wp.int32, device=model.device)
 
         self._model_plan: _SteelModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
@@ -8039,6 +8045,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     ) -> None:
         """One launch for ``_launch_matrix_free_gs_solve_propagation_tree``'s whole iteration loop."""
         body_a, body_b, color_rhs = self._prepare_colored_sweep(propagation_rhs)
+        # Sleeping is set up after the fused kernel, so the tree activity joins its arguments here.
+        self._latency_fused_static[1].articulation_active = self._propagation_tree_activity
         compliance = self._compliance
         off_gamma = self._compliance_off_gamma
         colored = latency_fused.ColoredArgs()
@@ -8892,6 +8900,30 @@ class SolverSteel(SolverBase, CouplingInterface):
         else:
             launch_row_phase(0, iterations, iteration_offset)
 
+    @property
+    def _propagation_tree_activity(self) -> wp.array | None:
+        """Per-articulation activity the propagation trees skip on, or ``None`` when sleeping does not skip dynamics."""
+        return self._dynamics_art_active if self._sleep_skips_dynamics else None
+
+    def _propagation_capture_gated(self) -> bool:
+        """Whether this step is captured with sleeping, so its propagation work can branch on the device."""
+        device = self.model.device
+        # capture_if builds a conditional node only in a capture Warp started; under another framework's
+        # capture it would read the flag back on the host, so the work runs unconditionally there.
+        warp_capture = device.is_cuda and device.captures.get(device.stream) is not None
+        return self._sleep_skips_dynamics and warp_capture and wp.is_conditional_graph_supported()
+
+    def _run_propagation(self, work) -> None:
+        """Run ``work``; a step captured with sleeping runs it only while some articulation is awake.
+
+        A step whose articulations all sleep keeps their frozen state, so skipping ``work`` there
+        leaves the same outputs as an eager step.
+        """
+        if self._propagation_capture_gated():
+            wp.capture_if(self._propagation_dynamics_active, on_true=work)
+        else:
+            work()
+
     def _propagation_tree_refresh_forced(self) -> bool:
         """True when dense GS phases other than contacts may write tree dofs.
 
@@ -8931,6 +8963,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dim=[n_arts],
                 inputs=[
                     self._group_to_art[size],
+                    self._propagation_tree_activity,
                     self._art_to_world,
                     self._dense_contact_world_flag,
                     int(force),
@@ -8954,6 +8987,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             dim=n_arts,
             inputs=[
                 self._group_to_art[size],
+                self._propagation_tree_activity,
                 self._art_to_world,
                 self._dense_contact_world_flag,
                 int(force),
@@ -9092,6 +9126,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         dim=[n_arts],
                         inputs=[
                             self._group_to_art[size],
+                            self._propagation_tree_activity,
                             self.model.articulation_start,
                             self.model.joint_parent,
                             self.model.joint_child,
@@ -9122,6 +9157,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         dim=n_arts,
                         inputs=[
                             self._group_to_art[size],
+                            self._propagation_tree_activity,
                             self.model.articulation_start,
                             self.model.joint_parent,
                             self.model.joint_child,
@@ -9153,6 +9189,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         dim=[n_arts],
                         inputs=[
                             self._group_to_art[size],
+                            self._propagation_tree_activity,
                             self.model.articulation_start,
                             self.model.joint_parent,
                             self.model.joint_child,
@@ -9184,6 +9221,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._body_to_articulation,
                             self._body_to_joint,
                             self._group_to_art[size],
+                            self._propagation_tree_activity,
                             self._art_to_world,
                             self.model.articulation_start,
                             self.model.joint_parent,
@@ -9225,6 +9263,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         dim=[n_arts],
                         inputs=[
                             self._group_to_art[size],
+                            self._propagation_tree_activity,
                             self._art_to_world,
                             self._propagation_cache_world_flag,
                             # Eligible prefix length: bounds the slot scan so
@@ -9655,6 +9694,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     dim=[n_arts],
                     inputs=[
                         self._group_to_art[size],
+                        self._propagation_tree_activity,
                         self._art_to_world,
                         guard_flag,
                         self.model.articulation_start,
@@ -9681,6 +9721,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dim=n_arts,
                 inputs=[
                     self._group_to_art[size],
+                    self._propagation_tree_activity,
                     self._art_to_world,
                     guard_flag,
                     self.model.articulation_start,
@@ -9958,7 +9999,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         iteration_offset: int = 0,
     ) -> None:
         if self._propagation_contacts_enabled():
-            self._launch_matrix_free_gs_solve_propagation_tree(
+            solve = functools.partial(
+                self._launch_matrix_free_gs_solve_propagation_tree,
                 dense_rhs=self._rhs,
                 propagation_rhs=self._propagation_rhs,
                 mf_meta=self._mf_meta_packed,
@@ -9967,6 +10009,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=iteration_offset,
             )
+            self._run_propagation(solve)
         else:
             self._launch_matrix_free_gs_solve(
                 dense_rhs=self._rhs,
@@ -10575,7 +10618,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._propagation_contacts_enabled():
             with wp.ScopedTimer("S4_Propagation_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
                 with self._sync_timed("s4_propagation_setup"):
-                    self._propagation_pgs_setup(state_in, state_aug, dt)
+                    self._run_propagation(functools.partial(self._propagation_pgs_setup, state_in, state_aug, dt))
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve
@@ -20355,6 +20398,7 @@ def _get_factor_propagation_tree_revolute_kernel(
     const int art = group_to_art.data[group_idx];
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
 
     for (int joint = joint_start; joint < joint_end; ++joint) {
         const int body = joint_child.data[joint];
@@ -20592,6 +20636,7 @@ def _get_factor_propagation_tree_revolute_kernel(
     def factor_propagation_tree_revolute_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -20613,6 +20658,7 @@ def _get_factor_propagation_tree_revolute_kernel(
 
     def factor_propagation_tree_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -20635,6 +20681,7 @@ def _get_factor_propagation_tree_revolute_kernel(
         factor_propagation_tree_revolute_native(
             group_idx,
             group_to_art,
+            articulation_active,
             articulation_start,
             joint_parent,
             joint_child,
@@ -20753,6 +20800,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
     const int art = group_to_art.data[group_idx];
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
 
     for (int joint = joint_start; joint < joint_end; ++joint) {
 //FREE_ROOT_RESPONSE
@@ -20900,6 +20948,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
     def propagation_tree_body_response_revolute_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -20917,6 +20966,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
 
     def propagation_tree_body_response_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -20935,6 +20985,7 @@ def _get_propagation_tree_body_response_revolute_kernel(
         propagation_tree_body_response_revolute_native(
             group_idx,
             group_to_art,
+            articulation_active,
             articulation_start,
             joint_parent,
             joint_child,
@@ -20978,6 +21029,7 @@ _PROPAGATION_TREE_LEVEL_PRELUDE = """
     const int lane = threadIdx.x & 31;
     const unsigned mask = 0xffffffffu;
     const int art = group_to_art.data[group_idx];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
     const int n_joints = joint_end - joint_start;
@@ -21335,6 +21387,7 @@ def _get_factor_propagation_tree_level_kernel(
     def factor_propagation_tree_level_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -21361,6 +21414,7 @@ def _get_factor_propagation_tree_level_kernel(
 
     def factor_propagation_tree_level_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -21388,6 +21442,7 @@ def _get_factor_propagation_tree_level_kernel(
         factor_propagation_tree_level_native(
             group_idx,
             group_to_art,
+            articulation_active,
             articulation_start,
             joint_parent,
             joint_child,
@@ -21601,6 +21656,7 @@ def _get_propagation_tree_body_response_level_kernel(
     def propagation_tree_body_response_level_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -21623,6 +21679,7 @@ def _get_propagation_tree_body_response_level_kernel(
 
     def propagation_tree_body_response_level_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -21646,6 +21703,7 @@ def _get_propagation_tree_body_response_level_kernel(
         propagation_tree_body_response_level_native(
             group_idx,
             group_to_art,
+            articulation_active,
             articulation_start,
             joint_parent,
             joint_child,
@@ -21973,6 +22031,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
     if (guard_world >= 0 && cache_world_flag.data[guard_world] != 0) return;
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
     const int n_joints = joint_end - joint_start;
 
     __shared__ float s_pA[{joints_cap} * 6];
@@ -22091,6 +22150,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
     def propagate_tree_impulses_revolute_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
         articulation_start: wp.array[int],
@@ -22109,6 +22169,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
 
     def propagate_tree_impulses_revolute_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
         articulation_start: wp.array[int],
@@ -22128,6 +22189,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
         propagate_tree_impulses_revolute_native(
             group_idx,
             group_to_art,
+            articulation_active,
             art_to_world,
             cache_world_flag,
             articulation_start,
@@ -22329,6 +22391,7 @@ def _get_propagation_tree_cached_response_kernel(
     if (n_active > {C}) n_active = {C};
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
     const int n_joints = joint_end - joint_start;
     const int art_dof_start = joint_qd_start.data[joint_start];
 
@@ -22527,6 +22590,7 @@ def _get_propagation_tree_cached_response_kernel(
     def propagation_tree_cached_response_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
         propagation_body_count: wp.array[int],
@@ -22548,6 +22612,7 @@ def _get_propagation_tree_cached_response_kernel(
 
     def propagation_tree_cached_response_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         cache_world_flag: wp.array[int],
         propagation_body_count: wp.array[int],
@@ -22570,6 +22635,7 @@ def _get_propagation_tree_cached_response_kernel(
         propagation_tree_cached_response_native(
             group_idx,
             group_to_art,
+            articulation_active,
             art_to_world,
             cache_world_flag,
             propagation_body_count,
@@ -22810,6 +22876,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
     }}
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
     const int n_joints = joint_end - joint_start;
 
     __shared__ float s_bd[{joints_cap} * 6];
@@ -22926,6 +22993,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
     def refresh_propagation_tree_body_qd_warp_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         dense_contact_world_flag: wp.array[int],
         force_refresh: int,
@@ -22942,6 +23010,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
 
     def refresh_propagation_tree_body_qd_warp_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         dense_contact_world_flag: wp.array[int],
         force_refresh: int,
@@ -22959,6 +23028,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
         refresh_propagation_tree_body_qd_warp_native(
             group_idx,
             group_to_art,
+            articulation_active,
             art_to_world,
             dense_contact_world_flag,
             force_refresh,
@@ -22977,6 +23047,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
     def refresh_propagation_tree_body_qd_level_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         dense_contact_world_flag: wp.array[int],
         force_refresh: int,
@@ -22996,6 +23067,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
 
     def refresh_propagation_tree_body_qd_level_template(  # pragma: no cover - compiled by wp.kernel
         group_to_art: wp.array[int],
+        articulation_active: wp.array[int],
         art_to_world: wp.array[int],
         dense_contact_world_flag: wp.array[int],
         force_refresh: int,
@@ -23016,6 +23088,7 @@ def _get_refresh_propagation_tree_body_qd_warp_kernel(
         refresh_propagation_tree_body_qd_level_native(
             group_idx,
             group_to_art,
+            articulation_active,
             art_to_world,
             dense_contact_world_flag,
             force_refresh,
