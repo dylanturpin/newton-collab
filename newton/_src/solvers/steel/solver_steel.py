@@ -2076,7 +2076,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 With ``solve_mode="colored"`` and ``sleep_skip_constraints``, sleeping islands are left out of the
                 coloring, the colored sweep and the propagation trees, and a captured step in which every
                 articulation sleeps skips the propagation setup and solve; a step that overflows the propagation
-                rows keeps that world awake.
+                rows keeps that world awake. Only a capture Warp started can skip that work: in a capture another
+                framework starts, the propagation setup and solve run every step. Such captures work with either
+                ``deterministic`` setting.
                 Sleeping settings are runtime-only solver options with no USD schema: they choose how the
                 solver spends work on settled scenes rather than describing the scene.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
