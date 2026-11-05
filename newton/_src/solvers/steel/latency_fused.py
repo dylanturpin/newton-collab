@@ -184,6 +184,7 @@ class CacheArgs:
 class TreeArgs:
     """Arrays every tree group's refresh and propagation read."""
 
+    articulation_active: wp.array[int]
     art_to_world: wp.array[int]
     dense_contact_world_flag: wp.array[int]
     articulation_start: wp.array[int]
@@ -346,7 +347,7 @@ def get_fused_iteration_kernel(
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][1])(
-                            slot.world_groups[k], slot.group_to_art, tree.art_to_world,
+                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
                             tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
                             tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
                             v_out, body_qd,
@@ -382,7 +383,8 @@ def get_fused_iteration_kernel(
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][0])(
-                            slot.world_groups[k], slot.group_to_art, tree.art_to_world, slot.guard_flag,
+                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
+                            slot.guard_flag,
                             tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
                             tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
                             body_qd, v_out,
