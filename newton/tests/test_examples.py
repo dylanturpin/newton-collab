@@ -1062,6 +1062,17 @@ for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack", "pelican_bicy
         use_viewer=True,
     )
 
+# Six seconds at 50 Hz covers the longest first episode of every scene type, so every world resets at least once.
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_steel_heterogeneous",
+    devices=test_devices,
+    test_options={"num-frames": 300, "onnx_required": True, "usd_required": True},
+    test_options_cpu={"world-count": 7},
+    test_options_cuda={"world-count": 14},
+    use_viewer=True,
+)
+
 
 class TestRobotPolicyExamples(unittest.TestCase):
     pass
