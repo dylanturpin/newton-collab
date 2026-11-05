@@ -6,6 +6,7 @@
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -181,7 +182,7 @@ def _add_pair(builder, body_hull, body_rotation, penetration, support_hull, glob
     return support_shape, body_shape
 
 
-def _collide(model, convex_mesh_patch, convex_face_clip=False):
+def _collide(model, convex_mesh_patch, convex_face_clip=False, split=None):
     state = model.state()
     pipeline = newton.CollisionPipeline(
         model,
@@ -190,6 +191,8 @@ def _collide(model, convex_mesh_patch, convex_face_clip=False):
         convex_face_clip=convex_face_clip,
         convex_mesh_patch=convex_mesh_patch,
     )
+    if split is not None:
+        assert pipeline.narrow_phase.split_gjk_mpr == split
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     return state, contacts
@@ -266,7 +269,7 @@ def _witness_report(model, state, contacts, shapes=None):
     return np.asarray(errors), np.asarray(distances), np.asarray(witnesses).reshape(-1, 3)
 
 
-def _check_witness_matrix(test, device, swap, scale):
+def _check_witness_matrix(test, device, swap, scale, split=None):
     # Each pair is its own world of one model, so one pipeline collides them all.
     builder = newton.ModelBuilder()
     pairs = []
@@ -279,7 +282,7 @@ def _check_witness_matrix(test, device, swap, scale):
             builder.end_world()
             pairs.append((f"{label} g{g} swap={swap} scale={scale}", label, penetration, shapes))
     model = builder.finalize(device=device)
-    state, contacts = _collide(model, True)
+    state, contacts = _collide(model, True, split=split)
     for name, label, penetration, shapes in pairs:
         errors, distances, _ = _witness_report(model, state, contacts, shapes)
         test.assertGreater(len(errors), 0, name)
@@ -301,6 +304,40 @@ def test_witnesses_on_hull_surfaces_swapped_scaled(test, device):
     _check_witness_matrix(test, device, swap=True, scale=(1.0, 1.0, 1.0))
     _check_witness_matrix(test, device, swap=False, scale=(1.3, 0.8, 0.6))
     _check_witness_matrix(test, device, swap=True, scale=(1.3, 0.8, 0.6))
+
+
+def test_witnesses_on_hull_surfaces_split(test, device):
+    """Check the witness matrix through the split GJK/MPR kernels that large CUDA scenes use."""
+    if not device.is_cuda:
+        test.skipTest("Split collision kernels run only on CUDA")
+    with (
+        patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0),
+        patch("newton._src.sim.collide._SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD", 0),
+    ):
+        _check_witness_matrix(test, device, swap=False, scale=(1.0, 1.0, 1.0), split=True)
+        _check_witness_matrix(test, device, swap=True, scale=(1.3, 0.8, 0.6), split=True)
+
+
+def test_patch_contact_capacity(test, device):
+    """Check that the automatic capacity counts 8 contacts per convex-mesh pair with the flag."""
+
+    def model():
+        builder = newton.ModelBuilder()
+        vertices, indices = _disc(jitter=3.0e-5)
+        for _ in range(250):
+            builder.begin_world()
+            builder.add_shape_convex_hull(-1, mesh=newton.Mesh(vertices, indices))
+            body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.0025), wp.quat_identity()))
+            builder.add_shape_convex_hull(body, mesh=newton.Mesh(vertices, indices))
+            builder.end_world()
+        return builder.finalize(device=device)
+
+    off_model, on_model = model(), model()
+    test.assertEqual(int(off_model.shape_contact_pair_count), 250)
+    off = newton.CollisionPipeline(off_model, broad_phase="nxn")
+    on = newton.CollisionPipeline(on_model, broad_phase="nxn", convex_mesh_patch=True)
+    test.assertEqual(off.rigid_contact_max, 250 * 5)
+    test.assertEqual(on.rigid_contact_max, 250 * 8)
 
 
 def test_patch_spans_disc_on_disc(test, device):
@@ -469,7 +506,8 @@ def test_saturated_candidates_stay_bounded(test, device):
     """Check bounded patches when both hulls fill their candidate share, and after a collinear first pass."""
     _check_saturation(device)
     # The ridge fills its share with collinear candidates, so the slab widens and the wedge adds its vertex.
-    test.assertEqual(_check_widened_slab(device), [[3, 3], [3, 3]])
+    # No point lies across the ridge from the wedge's, so the quadrilateral step fails and the fill tops up to 7.
+    test.assertEqual(_check_widened_slab(device), [[7, 7], [7, 7]])
 
 
 def test_saturated_candidates_are_bounds_checked(test, device):
@@ -484,7 +522,7 @@ def test_saturated_candidates_are_bounds_checked(test, device):
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200, check=False)
     output = result.stdout + result.stderr
     test.assertEqual(result.returncode, 0, output[-4000:])
-    test.assertIn("SATURATION_OK [[3, 3], [3, 3]]", result.stdout)
+    test.assertIn("SATURATION_OK [[7, 7], [7, 7]]", result.stdout)
     test.assertNotIn("Assertion failed", output)
 
 
@@ -640,6 +678,8 @@ devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
 for _function in (
     test_witnesses_on_hull_surfaces,
+    test_witnesses_on_hull_surfaces_split,
+    test_patch_contact_capacity,
     test_witnesses_on_hull_surfaces_swapped_scaled,
     test_patch_spans_disc_on_disc,
     test_unverified_hull_keeps_vertex_face_contacts,
