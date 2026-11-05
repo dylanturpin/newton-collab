@@ -20,6 +20,9 @@ exposes ``kernel.native``):
 
 Block barriers order the stages as the launch chain does. The device functions read the data written in
 the loop through plain loads after a barrier, so the results match the chain bit for bit.
+
+The structs fixed at setup (cache, trees, free bodies) reach the kernel through one-element device arrays,
+which keeps its parameters under 4 KB: some drivers crash capturing a launch with more into a CUDA graph.
 """
 
 from __future__ import annotations
@@ -184,7 +187,6 @@ class CacheArgs:
 class TreeArgs:
     """Arrays every tree group's refresh and propagation read."""
 
-    articulation_active: wp.array[int]
     art_to_world: wp.array[int]
     dense_contact_world_flag: wp.array[int]
     articulation_start: wp.array[int]
@@ -320,10 +322,11 @@ def get_fused_iteration_kernel(
         cache_max_bodies: int,
         colored: ColoredArgs,
         rows: RowArgs,
-        cache: CacheArgs,
-        tree: TreeArgs,
+        cache: wp.array[CacheArgs],
+        tree: wp.array[TreeArgs],
         slots: wp.array[TreeSlot],
-        free: FreeArgs,
+        free: wp.array[FreeArgs],
+        articulation_active: wp.array[int],
         body_to_articulation: wp.array[int],
         propagation_impulses: wp.array2d[float],
         body_qd: wp.array2d[float],
@@ -347,19 +350,19 @@ def get_fused_iteration_kernel(
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][1])(
-                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
-                            tree.dense_contact_world_flag, force_refresh, tree.articulation_start, tree.joint_parent,
-                            tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot, tree.S_flat, tree.com_rel,
-                            v_out, body_qd,
+                            slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
+                            tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
+                            tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
+                            tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
                         )  # fmt: skip
             if warp_id == wp.static(free_warp):
-                _free_refresh(world, lane, free, v_out, body_qd)
+                _free_refresh(world, lane, free[0], v_out, body_qd)
             _block_sync()
             # The snapshot overlaps the sweep's start: the sweep only stages the twists in shared memory before
             # a block barrier that warp 0 reaches after the snapshot.
             if wp.static(gemv_native is not None):
                 if warp_id == 0:
-                    _cache_snapshot(world, lane, cache, cache_max_bodies, colored.body_list, body_qd)
+                    _cache_snapshot(world, lane, cache[0], cache_max_bodies, colored.body_list, body_qd)
             wp.static(colored_native)(
                 world, world_count, colored.constraint_count, colored.body_a, colored.body_b, colored.MiJt_a,
                 colored.MiJt_b, colored.J_a, colored.J_b, colored.eff_mass_inv, colored.rhs, colored.row_w,
@@ -374,23 +377,23 @@ def get_fused_iteration_kernel(
             if wp.static(gemv_native is not None):
                 if warp_id == 0:
                     wp.static(gemv_native)(
-                        world, world_count, cache.world_flag, cache.body_count, colored.body_list, cache.art_eligible,
-                        body_to_articulation, tree.articulation_start, tree.joint_qd_start, cache.R, cache.B,
-                        cache.qd_base, body_impulses, body_qd, v_out,
+                        world, world_count, cache[0].world_flag, cache[0].body_count, colored.body_list,
+                        cache[0].art_eligible, body_to_articulation, tree[0].articulation_start,
+                        tree[0].joint_qd_start, cache[0].R, cache[0].B, cache[0].qd_base, body_impulses, body_qd,
+                        v_out,
                     )  # fmt: skip
             for s in range(wp.static(n_slots)):
                 if warp_id == 1 + s:
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][0])(
-                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
-                            slot.guard_flag,
-                            tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
-                            tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
-                            body_qd, v_out,
+                            slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
+                            slot.guard_flag, tree[0].articulation_start, tree[0].joint_parent, tree[0].joint_child,
+                            tree[0].joint_qd_start, tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel,
+                            tree[0].U, tree[0].D_inv, body_impulses, body_qd, v_out,
                         )  # fmt: skip
             if warp_id == wp.static(free_warp):
-                _free_flush(world, lane, free, body_qd, body_impulses, v_out)
+                _free_flush(world, lane, free[0], body_qd, body_impulses, v_out)
             _block_sync()
             # row phase 5 (velocity limits); warp 0 runs it before the next iteration's phases 3 and 4
             if wp.static(has_phase5):

@@ -3,6 +3,7 @@
 
 """Propagation contact responses, colored sweeps, tree-parallel kernels and row schedules of SolverSteel."""
 
+import ctypes
 import inspect
 import unittest
 from unittest.mock import patch
@@ -3576,6 +3577,32 @@ def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
     return out
 
 
+def _kernel_param_bytes(kernel: wp.Kernel) -> int:
+    """Upper bound on a kernel's CUDA parameter block: 4-D launch bounds, then every argument at its alignment."""
+    fields = [("shape", ctypes.c_uint32 * 4), ("size", ctypes.c_size_t), ("coord_mult", ctypes.c_size_t)]
+    for i, arg in enumerate(kernel.adj.args):
+        if wp.types.is_array(arg.type):
+            ctype = type(wp.empty(0, dtype=float, device="cpu").__ctype__())
+        elif wp.types.type_is_struct(arg.type):
+            ctype = type(arg.type().__ctype__())
+        else:
+            ctype = arg.type._type_
+        fields.append((f"arg{i}", ctype))
+    return ctypes.sizeof(type("KernelParams", (ctypes.Structure,), {"_fields_": fields}))
+
+
+@wp.kernel
+def _param_layout_probe(count: int, values: wp.array[float]):
+    values[wp.tid()] = float(count)
+
+
+class TestKernelParamBytes(unittest.TestCase):
+    def test_counts_launch_bounds_and_alignment(self):
+        """The bound adds the launch bounds and pads each argument to its alignment, not just the argument sizes."""
+        # 32 bytes of launch bounds, a 4-byte int padded to 8, a 56-byte array descriptor
+        self.assertEqual(_kernel_param_bytes(_param_layout_probe), 96)
+
+
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestSteelLatencyFused(unittest.TestCase):
     """The one-launch colored propagation loop writes exactly what the per-pass launches write."""
@@ -3666,6 +3693,47 @@ class TestSteelLatencyFused(unittest.TestCase):
         self._check_fused_matches(
             builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
         )
+
+    def _rollout(self, model, use_graph):
+        """Twenty-two steps of the latency scene, the last twenty eager or replayed from one captured graph."""
+        solver = SolverSteel(model, **steel_mode_options("colored"), iterations=8, enable_joint_limits=True)
+        self.assertTrue(solver._latency_fused)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+
+        def two_steps():
+            for src, dst in ((state_0, state_1), (state_1, state_0)):
+                pipeline.collide(src, contacts)
+                solver.step(src, dst, control, contacts, DT)
+
+        two_steps()
+        if use_graph:
+            with patch.object(solver, "_launch_latency_fused", wraps=solver._launch_latency_fused) as fused:
+                with wp.ScopedCapture(device=model.device) as capture:
+                    two_steps()
+            self.assertGreater(fused.call_count, 0)
+        for _ in range(10):
+            if use_graph:
+                wp.capture_launch(capture.graph)
+            else:
+                two_steps()
+        return {k: getattr(state_0, k).numpy() for k in ("body_q", "body_qd", "joint_q", "joint_qd")}
+
+    def test_fused_loop_graph_capture_matches_eager(self):
+        """A captured graph of latency-mode steps replays to the eager steps' state bit for bit."""
+        model = _build_latency_scene("cuda:0")
+        eager = self._rollout(model, use_graph=False)
+        replayed = self._rollout(model, use_graph=True)
+        for k, a in eager.items():
+            np.testing.assert_array_equal(a.view(np.uint32), replayed[k].view(np.uint32), err_msg=k)
+        self.assertGreater(np.abs(eager["body_qd"]).max(), 0.0)
+
+    def test_fused_loop_arguments_fit_4kb(self):
+        """The fused loop's parameters fit the 4 KB that some drivers can capture into a CUDA graph."""
+        solver = SolverSteel(_build_latency_scene("cuda:0"), **steel_mode_options("colored"))
+        self.assertTrue(solver._latency_fused)
+        self.assertLessEqual(_kernel_param_bytes(solver._latency_fused_kernel), 4096)
 
     def test_off_past_one_world_per_sm(self):
         """Stay off once the worlds no longer fit one block per SM."""

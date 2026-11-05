@@ -12183,13 +12183,13 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         self._latency_fused_kernel = kernel
         self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots))
-        # The slot structs hold the only references to their per-world tables.
-        self._latency_fused_tree_slots = tree_slots
+        # The structs hold the only references to their per-world tables.
+        self._latency_fused_structs = (cache, tree, tree_slots, free)
         self._latency_fused_static = (
-            cache,
-            tree,
+            wp.array([cache], dtype=latency_fused.CacheArgs, device=device),
+            wp.array([tree], dtype=latency_fused.TreeArgs, device=device),
             wp.array(tree_slots, dtype=latency_fused.TreeSlot, device=device),
-            free,
+            wp.array([free], dtype=latency_fused.FreeArgs, device=device),
         )
         self._latency_fused = True
 
@@ -12256,8 +12256,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         force_refresh: bool,
     ) -> None:
         """Run the colored propagation loop's iterations as one launch of one block per world."""
-        # Sleeping is set up after the fused kernel, so its tree activity joins the arguments here.
-        self._latency_fused_static[1].articulation_active = self._propagation_tree_activity
         colored = latency_fused.ColoredArgs()
         values = [*self._colored_sweep_inputs(*colored_rows), *self._colored_unit_inputs()]
         for name, value in zip(latency_fused.COLORED_FIELDS, values, strict=True):
@@ -12281,6 +12279,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 colored,
                 rows,
                 *self._latency_fused_static,
+                # Sleeping is set up after the fused kernel, so its tree activity is passed per launch.
+                self._propagation_tree_activity,
                 self._body_to_articulation,
             ],
             outputs=[
