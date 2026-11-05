@@ -339,23 +339,23 @@ def _velocity_drive_mode(name: str, value) -> str:
 
 
 _DEPRECATED_SOLVE_MODE_SPELLINGS = {
-    "matrix_free": "solve_mode='matrix_free' is deprecated in Newton 1.8; use solve_mode='serial' (the default)",
+    "matrix_free": "solve_mode='matrix_free' is deprecated; use solve_mode='serial' (the default)",
     "split": (
-        "solve_mode='split' is deprecated in Newton 1.8 and now runs solve_mode='serial': the dense split solve "
-        "was removed, so results differ from earlier releases; omit solve_mode"
+        "solve_mode='split' is deprecated and now runs solve_mode='serial': the dense split solve was removed, "
+        "so results differ from earlier releases; omit solve_mode"
     ),
 }
 
 
 def _normalize_solve_mode(solve_mode, articulated_contact_response) -> tuple[str, str]:
-    """Map the pre-1.8 spellings onto ``(solve_mode, articulated_contact_response)``, warning for each one used."""
-    message = _DEPRECATED_SOLVE_MODE_SPELLINGS.get(solve_mode)
+    """Map the pre-1.9 spellings onto ``(solve_mode, articulated_contact_response)``, warning for each one used."""
+    message = _DEPRECATED_SOLVE_MODE_SPELLINGS.get(solve_mode) if isinstance(solve_mode, str) else None
     if message is not None:
         warnings.warn(f"SolverSteel: {message}.", NewtonDeprecationWarning, stacklevel=3)
         solve_mode = "serial"
     if articulated_contact_response == "propagation_colored":
         warnings.warn(
-            "SolverSteel: articulated_contact_response='propagation_colored' is deprecated in Newton 1.8; use "
+            "SolverSteel: articulated_contact_response='propagation_colored' is deprecated; use "
             "solve_mode='colored' with articulated_contact_response='propagation'.",
             NewtonDeprecationWarning,
             stacklevel=3,
@@ -1877,9 +1877,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``articulated_contact_response="propagation"``; any other response raises
                 :class:`ValueError`.
 
-                .. deprecated:: 1.8
-                    ``"matrix_free"`` maps to ``"serial"``, and ``"split"`` (the removed dense
-                    solve) runs ``"serial"``, each with a
+                .. deprecated:: 1.9
+                    ``"matrix_free"`` maps to ``"serial"``, and ``"split"``, whose dense Delassus
+                    solve was removed, runs ``"serial"``; each emits a
                     :class:`~newton.exceptions.NewtonDeprecationWarning`.
             iterations: Number of projected Gauss-Seidel iterations per step.
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,

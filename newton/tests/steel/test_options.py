@@ -1393,6 +1393,9 @@ class TestSteelSolveModeOptions(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, re.escape("requires articulated_contact_response='propagation'")):
             SolverSteel(model, solve_mode="colored", articulated_contact_response="immediate")
+        # An unhashable value is an unsupported mode, not a lookup error.
+        with self.assertRaisesRegex(ValueError, "solve_mode must be"):
+            SolverSteel(model, solve_mode=["serial"])
 
         solver = SolverSteel(model)
         self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
