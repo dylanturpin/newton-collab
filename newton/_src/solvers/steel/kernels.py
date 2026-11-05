@@ -4100,7 +4100,8 @@ def joint_limit_effective_gap(activation_gap: float, speed_scale: float, dt: flo
     """Return the activation gap of one limit DOF, widened by the distance it can travel this step.
 
     A speculative limit row applies no impulse while the joint cannot reach its bound within the step,
-    so rows farther than ``activation_gap + speed_scale * dt * |qd|`` are skipped. ``speed_scale == 0``
+    so rows farther than ``activation_gap + speed_scale * dt * |qd|`` are skipped; ``qd`` is the unconstrained
+    end-of-step velocity, so drives and parent motion within the step widen the gap. ``speed_scale == 0``
     returns ``activation_gap`` unchanged (the fixed-gap behavior, ``inf`` included).
     """
     if speed_scale > 0.0:

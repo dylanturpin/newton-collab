@@ -1403,8 +1403,8 @@ def _velocity_drive_mode(name: str, value) -> str:
 
 
 # Default (``joint_limit_activation_gap=None``) limit-row gate: a row is built when the joint is within
-# this distance [m or rad] of a finite bound, widened by the distance it can travel at its current speed
-# over ``_AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE`` steps.
+# this distance [m or rad] of a finite bound, widened by the distance it can travel at its unconstrained
+# end-of-step speed (``v_hat``, drives and gravity included) over ``_AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE`` steps.
 _AUTO_JOINT_LIMIT_ACTIVATION_GAP = 0.05
 _AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE = 2.0
 
@@ -2323,10 +2323,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 lower or upper position limit at which a joint-limit PGS row becomes active. A lower
                 row is allocated when ``q <= lower + gap``; an upper row is allocated when
                 ``q >= upper - gap``. ``inf`` allocates every limit row every step. ``None`` uses a
-                speed-aware gap of ``0.05 + 2 * dt * |qd|`` per DOF: limit rows are speculative and
-                apply no impulse while the joint cannot reach its bound within the step, so this
-                skips only rows that are no-ops unless the solve itself accelerates the joint by
-                more than the margin in one step. A violated limit always has its row. A bound at or
+                speed-aware gap of ``0.05 + 2 * dt * |v|`` per DOF, where ``v`` is the joint's
+                unconstrained velocity at the end of the step, after drives, gravity and parent
+                motion. Limit rows are speculative and apply no impulse while the joint cannot reach
+                its bound within the step, so the skipped rows are no-ops unless constraint impulses
+                in the solve, such as contacts, accelerate the joint toward the bound by more than
+                the margin in one step. With ``drive_mode="rows"`` the drives act inside the solve,
+                so ``None`` allocates every limit row, as ``inf`` does. A violated limit always has
+                its row. A bound at or
                 beyond ``MAXVAL`` (the builder's unlimited default) has no row. Must be ``None`` or
                 non-negative and not NaN. Defaults to ``None``.
 
@@ -2731,8 +2735,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._enable_joint_limits = enable_joint_limits
         self._enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self._bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
-        if joint_limit_activation_gap is None:
-            # Speed-aware gate: rows that cannot reach their bound this step apply no impulse.
+        if joint_limit_activation_gap is None and drive_mode == "rows":
+            # Drive rows act inside the solve, so v_hat misses them and a gate could skip a row a drive crosses.
+            self._joint_limit_activation_gap = None
+            self._joint_limit_gap_base = float("inf")
+            self._joint_limit_activation_speed_scale = 0.0
+        elif joint_limit_activation_gap is None:
+            # Speed-aware gate on v_hat: rows that cannot reach their bound this step apply no impulse.
             self._joint_limit_activation_gap = None
             self._joint_limit_gap_base = _AUTO_JOINT_LIMIT_ACTIVATION_GAP
             self._joint_limit_activation_speed_scale = _AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE
@@ -12543,7 +12552,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_limit_upper,
                     state_in.joint_q,
                     self._joint_limit_gap_base,
-                    state_in.joint_qd,
+                    self._v_hat,
                     self._joint_limit_activation_speed_scale,
                     self._baumgarte,
                     dt,
@@ -12585,7 +12594,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_upper,
                                 state_in.joint_q,
                                 self._joint_limit_gap_base,
-                                state_in.joint_qd,
+                                self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
                                 self._baumgarte,
@@ -12633,7 +12642,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_upper,
                                 state_in.joint_q,
                                 self._joint_limit_gap_base,
-                                state_in.joint_qd,
+                                self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
                                 max_constraints,
@@ -12671,7 +12680,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 model.joint_limit_upper,
                                 state_in.joint_q,
                                 self._joint_limit_gap_base,
-                                state_in.joint_qd,
+                                self._v_hat,
                                 self._joint_limit_activation_speed_scale,
                                 dt,
                                 self._art_to_world,

@@ -560,6 +560,59 @@ def test_default_gap_holds_a_fast_joint_like_always_allocate(test, device):
     np.testing.assert_allclose(default_q, always_q, rtol=0.0, atol=1.0e-5)
 
 
+def _build_drive_jump_link(device, *, driven_parent: bool):
+    """Build a limited revolute link resting 0.06 rad below its 0.3 rad bound, accelerated toward it within a step.
+
+    With ``driven_parent`` the limited joint is a passive coaxial child of a parent driven toward -1 rad, which
+    turns the child's relative angle toward its bound; otherwise its own stiff drive targets 1 rad, past the bound.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    inertia = wp.mat33(np.eye(3) * 0.1)
+    limits = {"limit_lower": -0.3, "limit_upper": 0.3}
+    if driven_parent:
+        parent = builder.add_link(mass=1.0, inertia=inertia)
+        child = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, parent, axis=newton.Axis.Z, target_ke=1.0e4, target_kd=10.0),
+            builder.add_joint_revolute(parent, child, axis=newton.Axis.Z, **limits),
+        ]
+    else:
+        link = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [builder.add_joint_revolute(-1, link, axis=newton.Axis.Z, target_ke=500.0, target_kd=10.0, **limits)]
+    builder.add_articulation(joints)
+    builder.joint_q[-1] = 0.24
+    return builder.finalize(device=device)
+
+
+def _drive_jump_max_q(model, dt: float, target: float, **solver_options) -> float:
+    """Step ``model`` with every drive target at ``target`` and return the largest limited-joint position."""
+    solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    control.joint_target_q.fill_(target)
+    peak = -np.inf
+    for _ in range(6):
+        solver.step(state_0, state_1, control, None, dt)
+        peak = max(peak, float(state_1.joint_q.numpy()[-1]))
+        state_0, state_1 = state_1, state_0
+    return peak
+
+
+def test_default_gap_holds_a_joint_accelerated_within_the_step(test, device):
+    """A resting joint that its drive or a driven parent carries across its bound in one step stops there."""
+    cases = itertools.product(("augmented", "rows"), (False, True), (1.0 / 60.0, 1.0 / 120.0))
+    for drive_mode, driven_parent, dt in cases:
+        with test.subTest(drive_mode=drive_mode, driven_parent=driven_parent, dt=dt):
+            model = _build_drive_jump_link(device, driven_parent=driven_parent)
+            target = -1.0 if driven_parent else 1.0
+            always = _drive_jump_max_q(
+                model, dt, target, drive_mode=drive_mode, joint_limit_activation_gap=float("inf")
+            )
+            default = _drive_jump_max_q(model, dt, target, drive_mode=drive_mode)
+            test.assertLessEqual(always, 0.3 + 1.0e-3)
+            test.assertLessEqual(default, always + 1.0e-4)
+
+
 def _build_spinning_velocity_limited_chain(device):
     """Build a three-link revolute chain spinning past its 1 rad/s velocity limits under gravity."""
     builder = newton.ModelBuilder()
@@ -640,6 +693,10 @@ for _name, _func in (
     (
         "test_default_gap_holds_a_fast_joint_like_always_allocate",
         test_default_gap_holds_a_fast_joint_like_always_allocate,
+    ),
+    (
+        "test_default_gap_holds_a_joint_accelerated_within_the_step",
+        test_default_gap_holds_a_joint_accelerated_within_the_step,
     ),
     ("test_velocity_limit_unit_rows_match_the_reduction", test_velocity_limit_unit_rows_match_the_reduction),
 ):
