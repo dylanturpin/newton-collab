@@ -7888,13 +7888,13 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         self._latency_fused_kernel = kernel
         self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots))
-        # the slot structs hold the only references to their per-world tables
-        self._latency_fused_tree_slots = tree_slots
+        # the structs hold the only references to their per-world tables
+        self._latency_fused_structs = (cache, tree, tree_slots, free)
         self._latency_fused_static = (
-            cache,
-            tree,
+            wp.array([cache], dtype=latency_fused.CacheArgs, device=device),
+            wp.array([tree], dtype=latency_fused.TreeArgs, device=device),
             wp.array(tree_slots, dtype=latency_fused.TreeSlot, device=device),
-            free,
+            wp.array([free], dtype=latency_fused.FreeArgs, device=device),
         )
         self._latency_fused = True
 
@@ -7946,8 +7946,6 @@ class SolverSteel(SolverBase, CouplingInterface):
     ) -> None:
         """One launch for ``_launch_matrix_free_gs_solve_propagation_tree``'s whole iteration loop."""
         body_a, body_b, color_rhs = self._prepare_colored_sweep(propagation_rhs)
-        # Sleeping is set up after the fused kernel, so the tree activity joins its arguments here.
-        self._latency_fused_static[1].articulation_active = self._propagation_tree_activity
         compliance = self._compliance
         off_gamma = self._compliance_off_gamma
         colored = latency_fused.ColoredArgs()
@@ -8000,6 +7998,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 colored,
                 rows,
                 *self._latency_fused_static,
+                # sleeping is set up after the fused kernel, so the tree activity is passed per launch
+                self._propagation_tree_activity,
                 self._body_to_articulation,
                 self._propagation_body_qd,
                 self._propagation_body_impulses,
