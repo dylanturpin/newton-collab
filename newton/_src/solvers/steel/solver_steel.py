@@ -6666,6 +6666,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         else:
             self._velocity_limit_slot = None
             self._velocity_limit_sign = None
+        # Unset unit-row tables for the MF-GS kernels, allocated here because the solve can run inside a
+        # conditional graph body, which rejects allocations.
+        self._velocity_limit_unit_dummies = (
+            wp.full((2,), -1, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.float32, device=device),
+        )
 
         if self._drive_mode == "rows" and model.joint_dof_count > 0:
             self._drive_slot = wp.full(
@@ -8290,12 +8296,6 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _mf_gs_velocity_limit_unit_args(self) -> tuple[wp.array, wp.array]:
         """Per-DOF velocity-limit slots and signs for the MF-GS unit-row path, or dummies without them."""
         if self._velocity_limit_slot is None:
-            if getattr(self, "_velocity_limit_unit_dummies", None) is None:
-                device = self.model.device
-                self._velocity_limit_unit_dummies = (
-                    wp.full((2,), -1, dtype=wp.int32, device=device),
-                    wp.zeros((2,), dtype=wp.float32, device=device),
-                )
             return self._velocity_limit_unit_dummies
         return self._velocity_limit_slot, self._velocity_limit_sign
 
