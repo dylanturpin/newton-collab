@@ -319,7 +319,10 @@ def test_witnesses_on_hull_surfaces_split(test, device):
 
 
 def test_patch_contact_capacity(test, device):
-    """Check that the automatic capacity holds the patch's 8 contacts per convex-mesh pair."""
+    """Check that the automatic capacity holds the patch's 8 contacts per convex-mesh pair.
+
+    Worlds holding one isolated box add shapes but no pairs, so they must not dilute the budget.
+    """
     lower = _disc(radius=0.03, jitter=3.0e-5, seed=4)
     upper = _disc(jitter=3.0e-5, seed=3)
     rotation = _quat_from_euler_deg(0.0, 0.0, 11.0)
@@ -329,6 +332,11 @@ def test_patch_contact_capacity(test, device):
         for _ in range(250):
             builder.begin_world()
             _add_pair(builder, upper, rotation, 1.0e-4, lower, wp.quat_identity(), False, (1.0, 1.0, 1.0))
+            builder.end_world()
+        for _ in range(1000):
+            builder.begin_world()
+            box = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+            builder.add_shape_box(box, hx=0.01, hy=0.01, hz=0.01)
             builder.end_world()
         return builder.finalize(device=device)
 

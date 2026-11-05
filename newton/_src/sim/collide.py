@@ -1936,11 +1936,12 @@ class CollisionPipeline:
                 ``rigid_contact_max`` estimate counts 8 per convex-mesh pair when
                 this is set; a capacity taken from ``model.rigid_contact_max`` or
                 passed explicitly must allow for it, as must solver budgets sized
-                from the model (e.g. ``SolverMuJoCo``'s ``njmax``). Each patched
-                pair costs up to 64 candidate ray casts over the hulls' triangles,
-                so it suits decomposed hulls of tens of vertices; a single hull
-                of several hundred vertices makes collision several times
-                slower. Selected at construction and fixed for the pipeline's
+                from the model (e.g. ``SolverMuJoCo``'s ``njmax``). The patch stores at
+                most 64 candidates per pair, but finding them tests each slab
+                vertex against the hulls' triangles, so cost grows with the
+                hulls' vertex and triangle counts. It suits decomposed hulls of
+                tens of vertices; a single hull of several hundred vertices
+                makes collision several times slower. Selected at construction and fixed for the pipeline's
                 lifetime. Experimental: the option and its
                 contacts may change without a deprecation period. Cannot be
                 combined with a prebuilt ``narrow_phase``. Defaults to False.
