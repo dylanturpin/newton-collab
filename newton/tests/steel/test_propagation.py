@@ -3636,17 +3636,17 @@ class TestSteelLatencyFused(unittest.TestCase):
         self.assertGreaterEqual(wide[0], min_wide_colors, "the scene never had a color wider than one warp")
 
     def test_fused_loop_matches_per_pass_launches(self):
-        # Trees (a revolute arm with limits, a ball chain) and free boxes in every role of the block.
+        """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
 
     def test_fused_loop_velocity_passes_match(self):
-        # The velocity pass folds and solves its own right-hand side.
+        """Match the per-pass launches in the velocity pass, which solves its own right-hand side."""
         self._check_fused_matches(
             _build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True, velocity_iterations=2
         )
 
     def test_fused_loop_contact_then_internal_matches(self):
-        # The fused loop runs the contact iterations; the internal rows follow in their own launch.
+        """Match the per-pass launches when the internal rows follow the contact iterations in their own launch."""
         self._check_fused_matches(
             _build_latency_scene("cuda:0"),
             iterations=8,
@@ -3655,7 +3655,8 @@ class TestSteelLatencyFused(unittest.TestCase):
         )
 
     def test_fused_loop_wide_colors_match(self):
-        # One world of free boxes on the ground: colors wider than a warp take the whole block.
+        """Match the per-pass launches when colors wider than a warp take the whole block."""
+        # One world of free boxes on the ground.
         builder = newton.ModelBuilder()
         for i in range(10):
             for j in range(10):
@@ -3667,7 +3668,7 @@ class TestSteelLatencyFused(unittest.TestCase):
         )
 
     def test_off_past_one_world_per_sm(self):
-        # One block per world: off once the worlds no longer fit one block per SM.
+        """Stay off once the worlds no longer fit one block per SM."""
         scene = newton.ModelBuilder()
         for _ in range(wp.get_device("cuda:0").sm_count + 1):
             world = newton.ModelBuilder()
@@ -3676,6 +3677,25 @@ class TestSteelLatencyFused(unittest.TestCase):
             scene.add_world(world)
         scene.add_ground_plane()
         solver = SolverSteel(scene.finalize(device="cuda:0"), **steel_mode_options("colored"))
+        self.assertFalse(solver._latency_fused)
+
+    def test_off_with_a_global_articulation_and_several_worlds(self):
+        """Stay off when a global articulation would be solved in world 0 beside other worlds."""
+        scene = newton.ModelBuilder()
+        for _ in range(2):
+            world = newton.ModelBuilder()
+            box = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+            world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+            scene.add_world(world)
+        # A shapeless global arm: its tree work belongs to every world, so no block owns it.
+        link = scene.add_link(
+            xform=wp.transform(wp.vec3(2.0, 0.0, 1.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3))
+        )
+        scene.add_articulation([scene.add_joint_revolute(-1, link, axis=wp.vec3(0.0, 1.0, 0.0))])
+        scene.add_ground_plane()
+        model = scene.finalize(device="cuda:0")
+        self.assertTrue(np.any(model.articulation_world.numpy() < 0))
+        solver = SolverSteel(model, **steel_mode_options("colored"))
         self.assertFalse(solver._latency_fused)
 
 
