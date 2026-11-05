@@ -19286,7 +19286,7 @@ def _get_factor_propagation_tree_revolute_kernel(
     ``multidof`` runs that multi-DOF block for every joint with more than one DOF (ball joints anywhere
     in the tree, a floating base) and then reduces the child into its parent like a 1-DOF joint, so
     any topologically ordered tree with in-articulation parents takes this kernel
-    (``_propagation_tree_multidof_by_size``).
+    (``_propagation_multidof_tree``).
     """
     snippet = """
 #if defined(__CUDA_ARCH__)
@@ -20005,7 +20005,7 @@ def _get_propagate_tree_impulses_revolute_kernel(
     per joint, lanes ``a < dof_count`` own the joint-space terms and lanes
     ``r < 6`` the spatial ones, the serial kernel's per-DOF loops unrolled
     across lanes. Registered for topologically ordered trees with
-    in-articulation parents (``_propagation_tree_multidof_by_size``); its
+    in-articulation parents (``_propagation_multidof_tree``); its
     static shared footprint is :func:`_propagate_tree_impulses_multidof_shared_bytes`.
     """
     joints_cap = max(int(max_joints), 1)

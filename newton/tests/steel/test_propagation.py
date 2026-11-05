@@ -211,8 +211,8 @@ def test_native_tree_kernels_match_generic(test, device):
                     test.assertEqual(solver._propagation_multidof_tree[size], kind == "ball" and tree_kernel == "auto")
                     state, _ = _step(model, solver)
                     results.append(state.joint_qd.numpy())
-                # Near-zero components carry the float32 rounding of the largest joint velocity.
-                atol = 1.0e-5 * max(1.0, float(np.abs(results[1]).max()))
+                # The ball chain's near-zero components carry the float32 rounding of its large joint velocities.
+                atol = 1.0e-5 * max(1.0, float(np.abs(results[1]).max())) if kind == "ball" else 1.0e-5
                 np.testing.assert_allclose(results[0], results[1], rtol=1.0e-4, atol=atol)
 
 
