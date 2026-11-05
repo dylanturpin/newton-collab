@@ -4038,6 +4038,32 @@ def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
     return out
 
 
+def _kernel_param_bytes(kernel: wp.Kernel) -> int:
+    """Upper bound on a kernel's CUDA parameter block: 4-D launch bounds, then every argument at its alignment."""
+    fields = [("shape", ctypes.c_uint32 * 4), ("size", ctypes.c_size_t), ("coord_mult", ctypes.c_size_t)]
+    for i, arg in enumerate(kernel.adj.args):
+        if wp.types.is_array(arg.type):
+            ctype = type(wp.empty(0, dtype=float, device="cpu").__ctype__())
+        elif wp.types.type_is_struct(arg.type):
+            ctype = type(arg.type().__ctype__())
+        else:
+            ctype = arg.type._type_
+        fields.append((f"arg{i}", ctype))
+    return ctypes.sizeof(type("KernelParams", (ctypes.Structure,), {"_fields_": fields}))
+
+
+@wp.kernel
+def _param_layout_probe(count: int, values: wp.array[float]):
+    values[wp.tid()] = float(count)
+
+
+class TestKernelParamBytes(unittest.TestCase):
+    def test_counts_launch_bounds_and_alignment(self):
+        """The bound adds the launch bounds and pads each argument to its alignment, not just the argument sizes."""
+        # 32 bytes of launch bounds, a 4-byte int padded to 8, a 56-byte array descriptor
+        self.assertEqual(_kernel_param_bytes(_param_layout_probe), 96)
+
+
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestLatencyFusedLoop(unittest.TestCase):
     """The one-launch propagation PGS loop writes exactly what the per-pass launches write."""
@@ -4172,7 +4198,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
         return {k: getattr(state_0, k).numpy() for k in ("body_q", "body_qd", "joint_q", "joint_qd")}
 
     def test_fused_loop_graph_capture_matches_eager(self):
-        # graph capture keeps the launch's by-value arguments, which some drivers handle only up to 4 KB
+        """A captured graph of latency-mode steps replays to the eager steps' state bit for bit."""
         model = _build_latency_scene("cuda:0")
         eager = self._rollout(model, use_graph=False)
         replayed = self._rollout(model, use_graph=True)
@@ -4181,24 +4207,11 @@ class TestLatencyFusedLoop(unittest.TestCase):
         self.assertGreater(np.abs(eager["body_qd"]).max(), 0.0)
 
     def test_fused_loop_arguments_fit_4kb(self):
-        # past 4 KB of kernel parameters some drivers crash while capturing the launch into a graph
+        """The fused loop's parameters fit the 4 KB that some drivers can capture into a CUDA graph."""
         model = _build_latency_scene("cuda:0")
         solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
         self.assertTrue(solver._latency_fused)
-        array_bytes = ctypes.sizeof(wp.zeros(1, dtype=float).__ctype__())
-
-        def param_bytes(kernel):
-            total = 0
-            for arg in kernel.adj.args:
-                if wp.types.is_array(arg.type):
-                    total += array_bytes
-                elif wp.types.type_is_struct(arg.type):
-                    total += ctypes.sizeof(arg.type().__ctype__())
-                else:
-                    total += wp.types.type_size_in_bytes(arg.type)
-            return total
-
-        self.assertLessEqual(param_bytes(solver._latency_fused_kernel), 4096)
+        self.assertLessEqual(_kernel_param_bytes(solver._latency_fused_kernel), 4096)
 
     def test_off_past_one_world_per_sm(self):
         # one block per world: off once the worlds no longer fit one block per SM
