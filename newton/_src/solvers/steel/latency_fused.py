@@ -132,6 +132,7 @@ class TreeArgs:
     com_rel: wp.array2d(dtype=float)
     U: wp.array2d(dtype=float)
     D_inv: wp.array3d(dtype=float)
+    articulation_active: wp.array(dtype=int)
 
 
 @wp.struct
@@ -288,7 +289,7 @@ def get_fused_iteration_kernel(
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][1])(
-                            slot.world_groups[k], slot.group_to_art, tree.art_to_world,
+                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
                             tree.dense_contact_world_flag, force_refresh, tree.articulation_start,
                             tree.joint_parent, tree.joint_child, tree.joint_qd_start, tree.joint_parent_slot,
                             tree.S_flat, tree.com_rel, v_out, body_qd,
@@ -326,7 +327,8 @@ def get_fused_iteration_kernel(
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][0])(
-                            slot.world_groups[k], slot.group_to_art, tree.art_to_world, slot.guard_flag,
+                            slot.world_groups[k], slot.group_to_art, tree.articulation_active, tree.art_to_world,
+                            slot.guard_flag,
                             tree.articulation_start, tree.joint_parent, tree.joint_child, tree.joint_qd_start,
                             tree.joint_parent_slot, tree.S_flat, tree.com_rel, tree.U, tree.D_inv, body_impulses,
                             body_qd, v_out,
