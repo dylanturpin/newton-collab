@@ -1667,24 +1667,20 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
 
 
 def test_parent_wrench_reads_only_the_contact_row_family(test, device):
-    """Report each contact's spin torque from its own row family when the other family has no rows allocated."""
-    # Debug mode bounds-checks every array access, so a read of the other family's rows aborts.
-    module = wp.get_module("newton_tests_steel_parent_wrench_debug")
-    wp.set_module_options({"mode": "debug"}, module=module)
-    kernel = wp.Kernel(accumulate_free_rigid_angular_wrenches_from_impulses.func, module=module)
+    """Report each contact's spin torque from its own row family, never from the other family's rows."""
     spin = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
     for path in (1, 2):
-        own_type = wp.full((1, 4), spin, dtype=int, device=device)
-        own_impulses = wp.full((1, 4), 0.5, dtype=wp.float32, device=device)
-        empty_type = wp.zeros((1, 0), dtype=int, device=device)
-        empty_impulses = wp.zeros((1, 0), dtype=wp.float32, device=device)
-        mf = (own_type, own_impulses) if path == 1 else (empty_type, empty_impulses)
-        propagation = (own_type, own_impulses) if path == 2 else (empty_type, empty_impulses)
+        own = (wp.full((1, 4), spin, dtype=int, device=device), wp.full((1, 4), 0.5, dtype=wp.float32, device=device))
+        # The other family holds spin rows with a far larger impulse, which would dominate the wrench if read.
+        other = (
+            wp.full((1, 4), spin, dtype=int, device=device),
+            wp.full((1, 4), 100.0, dtype=wp.float32, device=device),
+        )
+        mf, propagation = (own, other) if path == 1 else (other, own)
         counts = wp.array([4], dtype=wp.int32, device=device)
-        zero_counts = wp.array([0], dtype=wp.int32, device=device)
         wrench = wp.zeros(1, dtype=wp.spatial_vector, device=device)
         wp.launch(
-            kernel,
+            accumulate_free_rigid_angular_wrenches_from_impulses,
             dim=1,
             inputs=[
                 wp.array([1], dtype=wp.int32, device=device),
@@ -1697,9 +1693,9 @@ def test_parent_wrench_reads_only_the_contact_row_family(test, device):
                 wp.array([0], dtype=int, device=device),
                 wp.array([-1], dtype=int, device=device),
                 wp.array([0], dtype=int, device=device),
-                counts if path == 1 else zero_counts,
+                counts,
                 *mf,
-                counts if path == 2 else zero_counts,
+                counts,
                 *propagation,
                 2.0,
             ],
