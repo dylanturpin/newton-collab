@@ -3434,6 +3434,186 @@ for _fn in (
     add_function_test(TestSteelColoredKinematicRoots, _fn.__name__, _fn, devices=get_cuda_test_devices())
 
 
+def _build_latency_scene(device):
+    """Build ``N_WORLDS`` worlds with every latency-mode role, all touching the ground.
+
+    Each world has a fixed-base revolute arm with limits, a ball-joint chain on a floating base and a stack of free boxes.
+    """
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        builder = newton.ModelBuilder()
+        prev = -1
+        joints = []
+        for i in range(3):
+            link = builder.add_link()
+            builder.add_shape_capsule(link, radius=0.04, half_height=0.12)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=prev,
+                    child=link,
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5 if i == 0 else -0.25), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
+                    limit_lower=-0.6,
+                    limit_upper=0.6,
+                )
+            )
+            prev = link
+        builder.add_articulation(joints)
+        hub = builder.add_link(xform=wp.transform(wp.vec3(0.6, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_box(hub, hx=0.08, hy=0.08, hz=0.08)
+        joints = [builder.add_joint_free(hub)]
+        prev = hub
+        for _ in range(3):
+            link = builder.add_link()
+            builder.add_shape_capsule(link, radius=0.03, half_height=0.06)
+            joints.append(
+                builder.add_joint_ball(
+                    parent=prev,
+                    child=link,
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                )
+            )
+            prev = link
+        builder.add_articulation(joints)
+        for k in range(3):
+            # A slightly interpenetrating stack: free-body contact rows from the first step.
+            box = builder.add_body(xform=wp.transform(wp.vec3(-0.4, 0.0, 0.048 + 0.098 * k), wp.quat_identity()))
+            builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+        scene.add_world(builder)
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
+    """Collect every non-empty CUDA value array reachable through attributes, dicts, lists and tuples."""
+    seen = set() if seen is None else seen
+    out = {} if out is None else out
+    if id(obj) in seen or depth > 3:
+        return out
+    seen.add(id(obj))
+    if isinstance(obj, wp.array):
+        if obj.size > 0 and obj.device.is_cuda and not wp.types.type_is_struct(obj.dtype):
+            out.setdefault(prefix, obj)
+        return out
+    if isinstance(obj, dict):
+        items = obj.items()
+    elif isinstance(obj, (list, tuple)):
+        items = enumerate(obj)
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type) and type(obj).__module__.startswith("newton"):
+        items = vars(obj).items()
+    else:
+        return out
+    for key, value in items:
+        if isinstance(value, (wp.array, dict, list, tuple)) or hasattr(value, "__dict__"):
+            _solver_arrays(value, f"{prefix}.{key}" if prefix else str(key), depth + 1, seen, out)
+    return out
+
+
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+class TestSteelLatencyFused(unittest.TestCase):
+    """The one-launch colored propagation loop writes exactly what the per-pass launches write."""
+
+    def _check_fused_matches(self, model, *, min_wide_colors=0, **solver_options):
+        """Run the per-pass loop and the fused loop from identical state on real loop calls; require equal bits."""
+        solver = SolverSteel(model, **steel_mode_options("colored"), **solver_options)
+        self.assertTrue(solver._latency_fused)
+        loop = type(solver)._launch_propagation_solve
+        checked = []
+        wide = [0]
+        calls = [0]
+
+        def compare(self_, *args, **kwargs):
+            calls[0] += 1
+            if len(checked) >= 3 or calls[0] < 20 or int(self_._propagation_constraint_count.numpy().max()) == 0:
+                return loop(self_, *args, **kwargs)
+            offsets = self_._color_world_offsets.numpy().reshape(self_._world_count, -1)
+            sizes = np.diff(offsets, axis=1)[:, :-1]
+            if min_wide_colors and sizes.max() <= 32:
+                return loop(self_, *args, **kwargs)
+            wp.synchronize_device()
+            before = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
+            scalars = {k: v for k, v in vars(self_).items() if not isinstance(v, (wp.array, dict, list, set))}
+            self_._latency_fused = False
+            loop(self_, *args, **kwargs)
+            chain = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
+            for k, v in _solver_arrays(self_).items():
+                if k in before:
+                    v.assign(before[k])
+            for k, v in scalars.items():
+                setattr(self_, k, v)
+            self_._latency_fused = True
+            loop(self_, *args, **kwargs)
+            fused = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
+            for k, a in chain.items():
+                b = fused[k]
+                same = a.shape == b.shape and np.array_equal(
+                    np.ascontiguousarray(a).view(np.uint8), np.ascontiguousarray(b).view(np.uint8)
+                )
+                self.assertTrue(same, f"{k} differs after the fused loop")
+            checked.append(sum(not np.array_equal(chain[k], before[k]) for k in chain if k in before))
+            wide[0] = max(wide[0], int((sizes > 32).sum()))
+            return None
+
+        with patch.object(type(solver), "_launch_propagation_solve", compare):
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            for _ in range(60):
+                state_0.clear_forces()
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, DT)
+                state_0, state_1 = state_1, state_0
+        self.assertEqual(len(checked), 3, "the scene never reached the loop with contacts")
+        # The compared calls did work: the loop changed velocities and impulses.
+        self.assertTrue(all(n >= 3 for n in checked), checked)
+        self.assertGreaterEqual(wide[0], min_wide_colors, "the scene never had a color wider than one warp")
+
+    def test_fused_loop_matches_per_pass_launches(self):
+        # Trees (a revolute arm with limits, a ball chain) and free boxes in every role of the block.
+        self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
+
+    def test_fused_loop_velocity_passes_match(self):
+        # The velocity pass folds and solves its own right-hand side.
+        self._check_fused_matches(
+            _build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True, velocity_iterations=2
+        )
+
+    def test_fused_loop_contact_then_internal_matches(self):
+        # The fused loop runs the contact iterations; the internal rows follow in their own launch.
+        self._check_fused_matches(
+            _build_latency_scene("cuda:0"),
+            iterations=8,
+            enable_joint_limits=True,
+            row_schedule="contact_then_internal",
+        )
+
+    def test_fused_loop_wide_colors_match(self):
+        # One world of free boxes on the ground: colors wider than a warp take the whole block.
+        builder = newton.ModelBuilder()
+        for i in range(10):
+            for j in range(10):
+                body = builder.add_body(xform=wp.transform(wp.vec3(0.12 * i, 0.12 * j, 0.048), wp.quat_identity()))
+                builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        builder.add_ground_plane()
+        self._check_fused_matches(
+            builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
+        )
+
+    def test_off_past_one_world_per_sm(self):
+        # One block per world: off once the worlds no longer fit one block per SM.
+        scene = newton.ModelBuilder()
+        for _ in range(wp.get_device("cuda:0").sm_count + 1):
+            world = newton.ModelBuilder()
+            box = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+            world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+            scene.add_world(world)
+        scene.add_ground_plane()
+        solver = SolverSteel(scene.finalize(device="cuda:0"), **steel_mode_options("colored"))
+        self.assertFalse(solver._latency_fused)
+
+
 class TestSteelSchedule(unittest.TestCase):
     pass
 

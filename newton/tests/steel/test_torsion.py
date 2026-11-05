@@ -3576,6 +3576,8 @@ def _record_propagation_sweeps(
         _, solver, model, state, contacts = fixture(radius, device=device, step=False, **options, **response)
     if edit_contacts is not None:
         edit_contacts(contacts)
+    # Observe the per-pass sweeps; latency mode runs the loop as one kernel (TestSteelLatencyFused).
+    solver._latency_fused = False
     sweep_kernels = {
         solver._pgs_solve_propagation_kernel,
         solver._pgs_solve_propagation_colored_warp_kernel,

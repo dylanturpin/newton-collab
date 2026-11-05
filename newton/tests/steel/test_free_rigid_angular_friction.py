@@ -1228,6 +1228,8 @@ def _pile_rollout(spins, steps, graph_at=None, overrides=None, **solver_kwargs):
 
 def _rows_off_colored_kernel(solver):
     """Rebuild ``solver``'s colored sweep without the angular rows, which end each unit at its sliding pair."""
+    # The fused latency loop keeps the sweep it was built with.
+    solver._latency_fused = False
     arch = solver.model.device.arch
     entries = solver._color_world_offsets.shape[0] // solver._world_count
     warp_kernel = solver._pgs_solve_propagation_colored_warp_kernel
@@ -1479,6 +1481,8 @@ def _sweep_box(on_solver=None, before_sweep=None, response=None):
     def record(solver):
         if on_solver is not None:
             on_solver(solver)
+        # Observe the per-pass launches; latency mode runs the loop as one kernel (TestSteelLatencyFused).
+        solver._latency_fused = False
         solve, snapshot, propagate = (
             solver._launch_propagation_solve,
             solver._snapshot_propagation_cache_twists,

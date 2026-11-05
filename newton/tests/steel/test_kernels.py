@@ -1515,6 +1515,8 @@ def _row_phase_rollout(model, *, reference=None, capture=False, **options):
         # Every launch takes one kernel built with these options, which reads the phase argument.
         solver._pgs_solve_mf_gs_kernels = {0: solver._pgs_solve_mf_gs_kernel_for_phase(**reference)}
     solver.launched_phases = set()
+    # Observe the per-pass launches; latency mode runs the propagation loop as one kernel.
+    solver._latency_fused = False
     launch_phase = solver._launch_mf_gs_phase
 
     def record_phase(row_phase, *args, **kwargs):

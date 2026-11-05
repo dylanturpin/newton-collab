@@ -300,6 +300,8 @@ COLORED_VARIANTS = {
 def select_colored_variant(test, solver, variant):
     """Give ``solver`` the block sweeps of ``variant`` and check the kernel it runs."""
     if variant.startswith("block"):
+        # The fused latency loop runs the warp sweep; the block sweeps run only per pass.
+        solver._latency_fused = False
         # More bodies than the staging cap keep the twists in global memory.
         bodies = 385 if variant == "block global" else solver._max_propagation_bodies
         solver._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
