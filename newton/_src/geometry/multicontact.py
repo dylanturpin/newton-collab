@@ -1535,9 +1535,11 @@ def create_build_manifold(
                         best_area = area
                         chosen[3] = i
                         chosen_count = 4
-        # Farthest-point fill: each extra point maximizes its in-plane distance to the chosen ones.
-        for extra in range(wp.static(CONVEX_MESH_PATCH_POINTS - 4)):
-            if chosen_count == 4 + extra:
+        # Farthest-point fill, also when no triangle or quadrilateral was found: each extra point
+        # maximizes its in-plane distance to the chosen ones.
+        filling = chosen_count >= 2
+        for _extra in range(wp.static(CONVEX_MESH_PATCH_POINTS - 2)):
+            if filling and chosen_count < wp.static(CONVEX_MESH_PATCH_POINTS):
                 best_gap = float(CONVEX_MESH_PATCH_MERGE_DISTANCE_SQ)
                 best_i = int(-1)
                 for i in range(count):
@@ -1553,6 +1555,8 @@ def create_build_manifold(
                 if best_i >= 0:
                     chosen[chosen_count] = best_i
                     chosen_count += 1
+                else:
+                    filling = False
 
         normal_world = wp.quat_rotate(orientation_a, normal)
         position_b_ws = wp.quat_rotate(orientation_a, relative_position_b) + position_a_world
@@ -1727,7 +1731,7 @@ def create_build_manifold(
             contact_template: Pre-packed ContactData with static fields.
 
         Returns:
-            Number of valid contact points written (0-5).
+            Number of valid contact points written (0-5, or 0-8 with ``convex_mesh_patch``).
         """
         if wp.static(face_clip):
             if (
