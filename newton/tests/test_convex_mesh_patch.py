@@ -319,25 +319,29 @@ def test_witnesses_on_hull_surfaces_split(test, device):
 
 
 def test_patch_contact_capacity(test, device):
-    """Check that the automatic capacity counts 8 contacts per convex-mesh pair with the flag."""
+    """Check that the automatic capacity holds the patch's 8 contacts per convex-mesh pair."""
+    lower = _disc(radius=0.03, jitter=3.0e-5, seed=4)
+    upper = _disc(jitter=3.0e-5, seed=3)
+    rotation = _quat_from_euler_deg(0.0, 0.0, 11.0)
 
     def model():
         builder = newton.ModelBuilder()
-        vertices, indices = _disc(jitter=3.0e-5)
         for _ in range(250):
             builder.begin_world()
-            builder.add_shape_convex_hull(-1, mesh=newton.Mesh(vertices, indices))
-            body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.0025), wp.quat_identity()))
-            builder.add_shape_convex_hull(body, mesh=newton.Mesh(vertices, indices))
+            _add_pair(builder, upper, rotation, 1.0e-4, lower, wp.quat_identity(), False, (1.0, 1.0, 1.0))
             builder.end_world()
         return builder.finalize(device=device)
 
     off_model, on_model = model(), model()
     test.assertEqual(int(off_model.shape_contact_pair_count), 250)
-    off = newton.CollisionPipeline(off_model, broad_phase="nxn")
-    on = newton.CollisionPipeline(on_model, broad_phase="nxn", convex_mesh_patch=True)
-    test.assertEqual(off.rigid_contact_max, 250 * 5)
-    test.assertEqual(on.rigid_contact_max, 250 * 8)
+    test.assertEqual(newton.CollisionPipeline(off_model, broad_phase="nxn").rigid_contact_max, 250 * 5)
+    pipeline = newton.CollisionPipeline(on_model, broad_phase="nxn", convex_mesh_patch=True)
+    test.assertEqual(pipeline.rigid_contact_max, 250 * 8)
+    contacts = pipeline.contacts()
+    pipeline.collide(on_model.state(), contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    # Every pair writes all 8 contacts, more than the 5-per-pair budget holds.
+    test.assertEqual(count, 250 * 8)
 
 
 def test_patch_spans_disc_on_disc(test, device):
