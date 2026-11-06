@@ -586,7 +586,7 @@ def _build_drive_jump_link(device, *, driven_parent: bool):
 
 
 def _drive_jump_max_q(model, dt: float, target: float, coord: int = -1, **solver_options) -> float:
-    """Step ``model`` with every drive target at ``target`` and return the largest position of ``coord``."""
+    """Step ``model`` with every drive target at ``target`` and return the largest magnitude of ``coord``."""
     solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -594,7 +594,7 @@ def _drive_jump_max_q(model, dt: float, target: float, coord: int = -1, **solver
     peak = -np.inf
     for _ in range(6):
         solver.step(state_0, state_1, control, None, dt)
-        peak = max(peak, float(state_1.joint_q.numpy()[coord]))
+        peak = max(peak, abs(float(state_1.joint_q.numpy()[coord])))
         state_0, state_1 = state_1, state_0
     return peak
 
@@ -614,43 +614,52 @@ def test_default_gap_holds_a_joint_accelerated_within_the_step(test, device):
             test.assertLessEqual(default, always + 1.0e-4)
 
 
-def _build_constrained_follower(device, *, closure: str):
+def _build_constrained_follower(device, *, closure: str, tip: bool = False):
     """Build a passive revolute follower limited to 0.3 rad, resting at 0.24 rad, coupled to a leader driven past it.
 
     ``closure="mimic"`` couples the follower to the leader with an identity mimic; ``"connect"`` builds a
-    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. Returns the model and the
-    follower's coordinate.
+    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. With ``tip`` the follower is
+    unlimited and carries a passive coaxial link limited to 0.3 rad, resting at -0.24 rad, which the follower's
+    swing turns toward its lower bound. Returns the model and the limited coordinate.
     """
+    inertia = wp.mat33(np.eye(3) * 0.1)
+    limits = {"limit_lower": -0.3, "limit_upper": 0.3}
     if closure == "mimic":
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        inertia = wp.mat33(np.eye(3) * 0.1)
         leader = builder.add_link(mass=1.0, inertia=inertia)
         follower = builder.add_link(mass=1.0, inertia=inertia)
         joints = [
             builder.add_joint_revolute(
                 -1, leader, axis=newton.Axis.Z, target_ke=1.0e3, target_kd=10.0, limit_lower=-3.0, limit_upper=3.0
             ),
-            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, limit_lower=-0.3, limit_upper=0.3),
+            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, **({} if tip else limits)),
         ]
+        if tip:
+            link = builder.add_link(mass=1.0, inertia=inertia)
+            joints.append(builder.add_joint_revolute(follower, link, axis=newton.Axis.Z, **limits))
         builder.add_articulation(joints)
         builder.set_joint_mimic(joints[1], joints[0])
-        builder.joint_q[:] = [0.24, 0.24]
-        return builder.finalize(device=device), 1
-    builder = _build_four_bar()
+        builder.joint_q[:] = [0.24, 0.24, -0.24] if tip else [0.24, 0.24]
+        return builder.finalize(device=device), len(joints) - 1
+    builder = _build_four_bar((-0.3, 0.3) if tip else None)
     builder.gravity = wp.vec3(0.0, 0.0, 0.0)
     builder.joint_target_ke[0] = 1.0e3
     builder.joint_target_kd[0] = 10.0
-    builder.joint_limit_lower[2] = -0.3
-    builder.joint_limit_upper[2] = 0.3
     builder.joint_q[:3] = [0.24, -0.24, 0.24]
-    return builder.finalize(device=device), 2
+    if tip:
+        builder.joint_q[3] = -0.24
+    else:
+        builder.joint_limit_lower[2] = -0.3
+        builder.joint_limit_upper[2] = 0.3
+    return builder.finalize(device=device), 3 if tip else 2
 
 
 def test_default_gap_holds_a_constrained_follower(test, device):
-    """A follower that a mimic or loop closure carries across its bound in one step stops there, as with ``inf``."""
-    for closure, dt in itertools.product(("mimic", "connect"), (1.0 / 60.0, 1.0 / 120.0)):
-        with test.subTest(closure=closure, dt=dt):
-            model, coord = _build_constrained_follower(device, closure=closure)
+    """A follower, or a link below it, that a mimic or loop closure carries across its bound in one step stops there."""
+    cases = itertools.product(("mimic", "connect"), (False, True), (1.0 / 60.0, 1.0 / 120.0))
+    for closure, tip, dt in cases:
+        with test.subTest(closure=closure, tip=tip, dt=dt):
+            model, coord = _build_constrained_follower(device, closure=closure, tip=tip)
             options = {"articulated_contact_response": "immediate"}
             always = _drive_jump_max_q(model, dt, 1.0, coord, joint_limit_activation_gap=float("inf"), **options)
             default = _drive_jump_max_q(model, dt, 1.0, coord, **options)

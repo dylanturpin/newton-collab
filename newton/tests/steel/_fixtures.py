@@ -29,13 +29,14 @@ def steel_mode_options(mode: str) -> dict[str, str]:
     return {"articulated_contact_response": mode}
 
 
-def _build_four_bar():
+def _build_four_bar(tip_limits: tuple[float, float] | None = None):
     """Build a planar four-bar: two grounded revolute chains closed by a BALL loop joint.
 
     Ground pivots at x=0 and x=0.4; crank and rocker hang down 0.2 m; the coupler
     connects the crank tip to the rocker tip through the loop closure. The crank is
     position-driven; the rocker is undriven, so any coherent motion it does comes from
-    the closed loop.
+    the closed loop. With ``tip_limits`` a passive link with those limits [rad] turns on
+    the rocker's pivot axis as joint 3.
     """
     b = newton.ModelBuilder(up_axis=newton.Axis.Z)
     z0 = 0.6
@@ -67,7 +68,20 @@ def _build_four_bar():
         parent_xform=wp.transform(wp.vec3(0.4, 0.0, z0), wp.quat_identity()),
         child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
     )
-    b.add_articulation([j_crank, j_coupler, j_rocker], label="four_bar")
+    joints = [j_crank, j_coupler, j_rocker]
+    if tip_limits is not None:
+        tip = b.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+        joints.append(
+            b.add_joint_revolute(
+                parent=rocker,
+                child=tip,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                limit_lower=tip_limits[0],
+                limit_upper=tip_limits[1],
+            )
+        )
+    b.add_articulation(joints, label="four_bar")
 
     # Loop closure: coupler tip pinned to rocker tip (a trailing BALL loop joint,
     # matching how the MJCF importer closes `connect` equalities).
