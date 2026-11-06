@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import unittest
 
 import numpy as np
@@ -255,7 +256,13 @@ KINEMATIC_TEST_WRENCH = np.array([20.0, -15.0, 10.0, 0.5, -0.4, 0.3], dtype=np.f
 
 
 def _uses_maximal_coordinates(solver) -> bool:
-    return isinstance(solver, newton.solvers.SolverXPBD | newton.solvers.SolverSemiImplicit | newton.solvers.SolverVBD)
+    return isinstance(
+        solver,
+        newton.solvers.SolverKamino
+        | newton.solvers.SolverXPBD
+        | newton.solvers.SolverSemiImplicit
+        | newton.solvers.SolverVBD,
+    )
 
 
 def _create_contacts(model: newton.Model, solver):
@@ -583,6 +590,7 @@ def test_kinematic_free_base_drives_dense_articulation(
     device,
     solver_fn,
 ):
+    """A prescribed kinematic free base pushes a dense articulation's probe through contact."""
     model, _kinematic_body, _probe_body, kinematic_joint, probe_joint = _build_free_root_to_prismatic_scene(device)
     solver = solver_fn(model)
     collision_pipeline, contacts = _create_contacts(model, solver)
@@ -794,6 +802,12 @@ def test_kinematic_runtime_toggle(
         solver._update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
+    def toggle_warning():
+        # Colored Steel asks for a recapture when a kinematic articulation root appears or disappears.
+        if isinstance(solver, newton.solvers.SolverSteel) and solver._propagation_colored:
+            return test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs")
+        return contextlib.nullcontext()
+
     state_0, state_1 = model.state(), model.state()
     applied_wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -813,7 +827,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.DYNAMIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     # Phase 2: body is now dynamic — should move under applied force.
     for _ in range(phase_steps):
@@ -831,7 +846,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     pos_before_rekinematic = state_0.body_q.numpy()[body, :3].copy()
 
@@ -875,24 +891,23 @@ def test_kinematic_prescribed_response_lifetime(
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 
-def _undamped(solver):
-    """Turn off the default angular damping of the free roots."""
-    solver._rigid_body_angular_damping.zero_()
-    return solver
-
-
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "steel_serial": lambda model: _undamped(newton.solvers.SolverSteel(model)),
-    "steel_propagation": lambda model: _undamped(
-        newton.solvers.SolverSteel(model, articulated_contact_response="propagation")
+    "steel_serial": newton.solvers.SolverSteel,
+    "steel_propagation": lambda model: newton.solvers.SolverSteel(model, articulated_contact_response="propagation"),
+    "steel_colored": lambda model: newton.solvers.SolverSteel(
+        model, solve_mode="colored", articulated_contact_response="propagation"
     ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
     "semi_implicit": lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0),
     "vbd": lambda model: newton.solvers.SolverVBD(model, rigid_compliant_alm=True),
+    "lox": lambda model: newton.solvers.SolverKamino(
+        model,
+        config=newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox"),
+    ),
 }
 for device in devices:
     for solver_name, solver_fn in solvers.items():
@@ -909,15 +924,15 @@ for device in devices:
             solver_fn=solver_fn,
             check_reversed_order=solver_name == "steel_serial",
         )
-        if solver_name == "steel_serial":
-            # Steel elides prescribed free bodies only with the immediate response.
+        if solver_name.startswith("steel"):
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_steel_serial",
+                f"test_kinematic_prescribed_response_lifetime_{solver_name}",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
+        if solver_name == "steel_serial":
             add_function_test(
                 TestKinematicLinksCanonical,
                 "test_kinematic_free_base_drives_dense_articulation_steel_serial",
@@ -939,13 +954,15 @@ for device in devices:
             devices=[device],
             solver_fn=solver_fn,
         )
-        add_function_test(
-            TestKinematicLinksCanonical,
-            f"test_kinematic_runtime_toggle_{solver_name}",
-            test_kinematic_runtime_toggle,
-            devices=[device],
-            solver_fn=solver_fn,
-        )
+        # Kamino freezes body immovability when constructing the solver.
+        if solver_name != "lox":
+            add_function_test(
+                TestKinematicLinksCanonical,
+                f"test_kinematic_runtime_toggle_{solver_name}",
+                test_kinematic_runtime_toggle,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
 
 
 if __name__ == "__main__":

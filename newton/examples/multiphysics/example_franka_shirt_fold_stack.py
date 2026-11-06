@@ -1,21 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
+"""Example Franka Shirt Fold and Stack (proxy coupling)
 
-###########################################################################
-# Example Franka Shirt Fold and Stack (proxy coupling)
-#
-# The T-shirt and Franka of the cloth Franka example, at meter scale and
-# with two-way coupling. A fixed-base Franka, simulated by MuJoCo or
-# Steel, folds the VBD T-shirt with scripted IK keyframes, then picks
-# two rigid blocks off a pedestal and stacks them on the folded shirt.
-# SolverCoupledProxy exposes the gripper and the blocks to VBD as proxies,
-# so the cloth both resists the fingers and carries the block stack. Cloth
-# grasps are not deterministic: task_success() reports each run's outcome.
-#
-# Command: python -m newton.examples franka_shirt_fold_stack
-#          python -m newton.examples franka_shirt_fold_stack --rigid-solver steel
-#
-###########################################################################
+The T-shirt and Franka of the cloth Franka example, at meter scale and
+with two-way coupling. A fixed-base Franka, simulated by MuJoCo or
+Steel, folds the VBD T-shirt with scripted IK keyframes, then picks
+two rigid blocks off a pedestal and stacks them on the folded shirt.
+SolverCoupledProxy exposes the gripper and the blocks to VBD as proxies,
+so the cloth both resists the fingers and carries the block stack. Cloth
+grasps are not deterministic: task_success() reports each run's outcome.
+
+Success criteria:
+- The Franka folds the T-shirt and stacks the two blocks on it.
+- The cloth resists the fingers and carries the stack without exploding.
+
+Runs:
+- `python -m newton.examples franka_shirt_fold_stack`
+- `python -m newton.examples franka_shirt_fold_stack --rigid-solver steel`
+"""
 
 from __future__ import annotations
 
@@ -274,7 +276,7 @@ class Example:
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         builder.rigid_gap = template.rigid_gap
-        builder.replicate(template, world_count=self.world_count)
+        builder.replicate(template, copy_count=self.world_count)
         builder.add_ground_plane()
         # Tables are global like the ground so every entry's view keeps them.
         table_cfg = newton.ModelBuilder.ShapeConfig(ke=GRASP_KE, kd=GRASP_KD, mu=1.0)

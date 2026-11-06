@@ -115,9 +115,7 @@ class TabletopDemo:
             deterministic=deterministic,
             broad_phase="sap",
             rigid_contact_max=16384,
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True, body_pair_cell_size=0.06, body_pair_hysteresis=0.0
-            ),
+            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(cell_size=0.06),
             contact_matching="disabled",
         )
         self.contacts = self.pipeline.contacts()
@@ -125,7 +123,7 @@ class TabletopDemo:
             self.model,
             solve_mode=args.solve_mode,
             articulated_contact_response=args.contact_response,
-            deterministic=deterministic,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else wp.DeterministicMode.NOT_GUARANTEED,
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,

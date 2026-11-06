@@ -1,1 +1,1 @@
-The rigid/VBD ADMM, Kamino/MuJoCo ADMM four-bar, rigid/XPBD, rigid/MPM, proxy-joint gripper and rigid/soft contact examples accept `--rigid-solver steel`, and the ADMM contact example accepts `--tray-solver mujoco` and `--tray-solver steel`.
+Accept `--rigid-solver steel` in the rigid/VBD proxy and ADMM, Kamino/MuJoCo ADMM four-bar, rigid/XPBD, rigid/MPM, proxy-joint gripper, rigid/soft contact and Franka cable (`franka_cable_ik_pick_place`, `mujoco_franka_vbd_cable_admm_solver`) examples, and `--tray-solver mujoco` and `--tray-solver steel` in the ADMM contact example.

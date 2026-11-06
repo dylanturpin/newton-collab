@@ -3,7 +3,6 @@
 
 """Contact controls, contact forces, restitution and paired responses of SolverSteel."""
 
-import inspect
 import itertools
 import unittest
 import warnings
@@ -15,29 +14,32 @@ import newton
 import newton._src.solvers.steel.kernels
 from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from newton._src.solvers.steel._testing import kernel_overrides
-from newton._src.solvers.steel.friction_patches import FrictionPatches, contact_tangent_basis
+from newton._src.solvers.steel.friction import contact_tangent_basis
+from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     allocate_world_contact_slots,
-    combine_shape_coefficients,
+    apply_world_contact_restitution,
     compute_mf_effective_mass_and_rhs,
-    compute_mf_rhs_bias,
-    compute_propagation_effective_mass_and_rhs,
+    compute_mf_velocity_rhs,
     compute_world_contact_bias,
-    contact_angular_friction_coefficients,
-    mixed_contact_restitution,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
-from newton._src.solvers.steel.solver_steel import _MATERIAL_COMBINE_MODES
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import (
+    RADIUS,
+    _build_plane_model,
     _build_sparse_contact_friction_model,
-    _sphere_on_ground,
+    _diagonal_inertia,
+    _reset_state,
+    _shape_cfg,
+    _sphere_inertia,
     set_torsion_radius,
     steel_mode_options,
 )
-from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 from newton.tests.unittest_utils import (
     StdOutCapture,
     add_function_test,
@@ -52,48 +54,52 @@ PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
 
 
-PATH_PROPAGATION = 2
+_UNBOUNDED = 2**31 - 1
 
 
 def _disabled_patches(device):
+    """Return the disabled friction-patch view: every contact gets point friction rows."""
     patches = FrictionPatches()
+    patches.enabled = 0
+    patches.weight = wp.zeros(0, dtype=float, device=device)
+    patches.next_contact = wp.zeros(0, dtype=int, device=device)
+    patches.point_a = wp.zeros(0, dtype=wp.vec3, device=device)
+    patches.point_b = wp.zeros(0, dtype=wp.vec3, device=device)
     patches.phi = wp.zeros(1, dtype=wp.vec2, device=device)
     return patches
 
 
+def _friction_threshold(enable_friction: bool, friction_gap: float) -> float:
+    """Contacts always get friction rows below the threshold; ``-inf`` gives none."""
+    return friction_gap if enable_friction else -float("inf")
+
+
 def _launch_contact_allocator(
+    device,
     *,
     route: int,
     gap: float,
-    gate: float | None,
+    gate: float | None = None,
     responsive: bool = True,
     enable_friction: bool = False,
     friction_gap: float = float("inf"),
 ):
-    """Allocate one contact and return its route metadata and counters."""
-    device = "cpu"
+    """Allocate one contact of a one-DOF body against the ground and return its routing and counters."""
     outputs = {
         "world": wp.full((1,), -9, dtype=wp.int32, device=device),
         "slot": wp.full((1,), -9, dtype=wp.int32, device=device),
         "art_a": wp.full((1,), -9, dtype=wp.int32, device=device),
         "art_b": wp.full((1,), -9, dtype=wp.int32, device=device),
-        "path": wp.full((1,), -9, dtype=wp.int32, device=device),
         "slots_needed": wp.full((1,), -9, dtype=wp.int32, device=device),
+        "path": wp.full((1,), -9, dtype=wp.int32, device=device),
     }
     counters = {
         "dense_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_count": wp.zeros((1,), dtype=wp.int32, device=device),
-        "propagation_count": wp.zeros((1,), dtype=wp.int32, device=device),
-        "dense_world_flag": wp.zeros((1,), dtype=wp.int32, device=device),
         "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
-        "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
-        "dense_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-        "mf_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-        "propagation_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
-    propagation_enabled = route == PATH_PROPAGATION
     wp.launch(
         allocate_world_contact_slots,
         dim=1,
@@ -116,23 +122,21 @@ def _launch_contact_allocator(
             wp.array([int(responsive)], dtype=wp.int32, device=device),
             wp.array([int(is_free)], dtype=wp.int32, device=device),
             1,
-            int(propagation_enabled),
             0,
             0,
+            0,
+            8,
+            8,
+            8,
+            wp.array([0], dtype=wp.int32, device=device),
             float("inf") if gate is None else gate,
-            8,
-            8,
-            8,
-            friction_gap if enable_friction else -float("inf"),  # no friction rows
-            FrictionPatches(),
+            _friction_threshold(enable_friction, friction_gap),
+            _disabled_patches(device),
             0,
-            wp.zeros((1,), dtype=wp.float32, device=device),
-            wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
-            0,
             0,
         ],
         outputs=[
@@ -140,72 +144,149 @@ def _launch_contact_allocator(
             outputs["slot"],
             outputs["art_a"],
             outputs["art_b"],
+            outputs["slots_needed"],
             counters["dense_count"],
             outputs["path"],
             counters["mf_count"],
-            counters["propagation_count"],
-            counters["dense_world_flag"],
-            outputs["slots_needed"],
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
             counters["dense_dropped"],
             counters["mf_dropped"],
-            counters["propagation_dropped"],
-            counters["dense_first_rejected"],
-            counters["mf_first_rejected"],
-            counters["propagation_first_rejected"],
             wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
         ],
         device=device,
     )
-    wp.synchronize_device(device)
     return {name: int(array.numpy()[0]) for name, array in (outputs | counters).items()}
 
 
-def _dense_speculative_rhs(scale: float) -> float:
-    """Return the dense positive-gap RHS for a requested speculative scale."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+def _launch_articulation_pair_contact_allocator(
+    device,
+    *,
+    gap: float,
+    gate: float | None = None,
+    cross_articulation: bool = False,
+    enable_friction: bool = False,
+    friction_gap: float = float("inf"),
+):
+    """Allocate one contact between two non-free articulated links; return ``(slot, path, slots_needed)``."""
+    body_to_articulation = [0, 1] if cross_articulation else [0, 0]
+    articulation_count = 2 if cross_articulation else 1
+    contact_slot = wp.full((1,), -9, dtype=wp.int32, device=device)
+    contact_path = wp.full((1,), -9, dtype=wp.int32, device=device)
+    contact_slots_needed = wp.full((1,), -9, dtype=wp.int32, device=device)
+    wp.launch(
+        allocate_world_contact_slots,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            1,
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(gap, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(-1.0, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array(body_to_articulation, dtype=wp.int32, device=device),
+            wp.array([0] * articulation_count, dtype=wp.int32, device=device),
+            wp.array([1] * articulation_count, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+            wp.ones((2,), dtype=wp.int32, device=device),
+            wp.zeros((articulation_count,), dtype=wp.int32, device=device),
+            0,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            wp.zeros((articulation_count,), dtype=wp.int32, device=device),
+            float("inf") if gate is None else gate,
+            _friction_threshold(enable_friction, friction_gap),
+            _disabled_patches(device),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
+        ],
+        outputs=[
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            contact_slot,
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            contact_slots_needed,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            contact_path,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+        ],
+        device=device,
+    )
+    slots_needed = max(0, int(contact_slots_needed.numpy()[0]))
+    return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), slots_needed
+
+
+def _dense_speculative_rhs(device, scale: float) -> float:
+    """Return the dense positive-gap right-hand side for a requested speculative scale."""
+    rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
     wp.launch(
         compute_world_contact_bias,
         dim=1,
         inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0.2]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            0.5,
-            1.0,
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[1.0]], dtype=wp.float32, device=device),
+            wp.array([[PGS_CONSTRAINT_TYPE_CONTACT]], dtype=wp.int32, device=device),
+            wp.zeros((1, 1), dtype=wp.float32, device=device),
+            0.2,
+            0.2,
             scale,
             1.0,
-            1.0,
+            0.5,
         ],
-        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
-        device="cpu",
+        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device=device)],
+        device=device,
     )
     return float(rhs.numpy()[0, 0])
 
 
-def _mf_speculative_rhs(scale: float) -> float:
-    """Return the MF setup RHS for a requested speculative scale."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+def _mf_speculative_rhs(device, scale: float) -> float:
+    """Return the free-body setup right-hand side for a requested speculative scale."""
+    rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
     wp.launch(
         compute_mf_effective_mass_and_rhs,
         dim=1,
         inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1,), dtype=wp.spatial_matrix, device="cpu"),
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[-1]], dtype=wp.int32, device=device),
+            wp.array([[-1]], dtype=wp.int32, device=device),
+            wp.zeros((1, 1, 6), dtype=wp.float32, device=device),
+            wp.zeros((1, 1, 6), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.spatial_matrix, device=device),
+            wp.array([[1.0]], dtype=wp.float32, device=device),
+            wp.array([[PGS_CONSTRAINT_TYPE_CONTACT]], dtype=wp.int32, device=device),
+            wp.zeros((1, 1), dtype=wp.float32, device=device),
+            wp.zeros((1, 1), dtype=wp.float32, device=device),
             0,
-            wp.array([-1], dtype=wp.int32, device="cpu"),
-            wp.array([0], dtype=wp.int32, device="cpu"),
-            wp.zeros((1,), dtype=wp.float32, device="cpu"),
-            wp.array([float("inf")], dtype=wp.float32, device="cpu"),
+            wp.array([-1], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.array([float("inf")], dtype=wp.float32, device=device),
             1.0,
             0.2,
             1.0,
@@ -214,83 +295,90 @@ def _mf_speculative_rhs(scale: float) -> float:
             1,
         ],
         outputs=[
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
+            wp.zeros((1, 1), dtype=wp.float32, device=device),
+            wp.zeros((1, 1, 6), dtype=wp.float32, device=device),
+            wp.zeros((1, 1, 6), dtype=wp.float32, device=device),
             rhs,
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
+            wp.zeros((1, 1), dtype=wp.float32, device=device),
         ],
-        device="cpu",
+        device=device,
     )
     return float(rhs.numpy()[0, 0])
 
 
-def _propagation_speculative_rhs(scale: float) -> float:
-    """Return the propagation setup RHS for a requested speculative scale."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+def _dense_restitution_rhs(device, scale: float) -> float:
+    """Build the scaled position bias of an impacting dense contact, then apply restitution.
+
+    The row has gap 0.5 m, a 1.5 m/s rebound (restitution 0.5 from a 3 m/s step-start closing speed) and
+    incident normal velocity -3 m/s over ``dt = 0.5`` s, so the rebound fires and replaces the bias by -1.5.
+    """
+    phi = wp.array([[0.5]], dtype=wp.float32, device=device)
+    row_type = wp.array([[PGS_CONSTRAINT_TYPE_CONTACT]], dtype=wp.int32, device=device)
+    target = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    row_w = wp.ones((1, 1), dtype=wp.float32, device=device)
     wp.launch(
-        compute_propagation_effective_mass_and_rhs,
+        compute_world_contact_bias,
+        dim=1,
+        inputs=[wp.array([1], dtype=wp.int32, device=device), phi, row_type, target, 0.2, 0.2, scale, 1.0, 0.5],
+        outputs=[rhs, row_w],
+        device=device,
+    )
+    wp.launch(
+        apply_world_contact_restitution,
         dim=1,
         inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 6, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 6, 6), dtype=wp.float32, device="cpu"),
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            0,
-            wp.zeros((1, 6), dtype=wp.float32, device="cpu"),
-            wp.array([float("inf")], dtype=wp.float32, device="cpu"),
-            1.0,
-            0.2,
-            1.0,
-            0.5,
-            scale,
+            wp.array([1], dtype=wp.int32, device=device),
             1,
+            wp.array([1], dtype=wp.int32, device=device),
+            phi,
+            row_type,
+            target,
+            wp.array([[1.5]], dtype=wp.float32, device=device),
+            wp.array([-3.0], dtype=wp.float32, device=device),
+            wp.array([[0]], dtype=wp.int32, device=device),
+            wp.ones((1, 1, 1), dtype=wp.float32, device=device),
+            0.5,
+            0,
         ],
-        outputs=[
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            rhs,
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-        ],
-        device="cpu",
+        outputs=[rhs, row_w],
+        device=device,
     )
     return float(rhs.numpy()[0, 0])
 
 
-def _contact_row_outputs(device: str) -> dict[str, wp.array]:
-    """Allocate dense-contact Jacobian and metadata outputs."""
-    return {
-        "J": wp.zeros((1, 8, 3), dtype=wp.float32, device=device),
-        "row_type": wp.full((1, 8), -9, dtype=wp.int32, device=device),
-        "row_parent": wp.full((1, 8), -9, dtype=wp.int32, device=device),
-        "row_mu": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_beta": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_cfm": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_rebound_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-    }
+# Body-frame witness points and thicknesses of the dense same-articulation fixture contact.
+_DENSE_POINT0 = (0.2, 0.1, -0.05)
 
 
-def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.array], dict[str, wp.array]]:
-    """Build one same-articulation contact through serial and compact paths."""
+_DENSE_POINT1 = (-0.1, 0.05, 0.2)
+
+
+_DENSE_THICKNESS = (0.01, 0.02)
+
+
+# World positions of the fixture's two contact bodies (shape 0 on body 2, shape 1 on body 1).
+_DENSE_BODY_POSITIONS = ((0.0, 0.0, 0.0), (-0.2, 0.3, 0.1), (0.4, -0.1, 0.2))
+
+
+def _launch_dense_contact_builders(
+    device,
+    *,
+    anchors=(0, 0),
+    point0=_DENSE_POINT0,
+    point1=_DENSE_POINT1,
+    thickness=_DENSE_THICKNESS,
+    twist=(0.0, 0.0, -2.0, 0.0, 0.0, 0.0),
+):
+    """Build one same-articulation contact's Jacobian through the tree-walk and compact paths."""
     contact_count = wp.array([1], dtype=wp.int32, device=device)
-    point0 = wp.array([wp.vec3(0.2, 0.1, -0.05)], dtype=wp.vec3, device=device)
-    point1 = wp.array([wp.vec3(-0.1, 0.05, 0.2)], dtype=wp.vec3, device=device)
+    point0 = wp.array([wp.vec3(*point0)], dtype=wp.vec3, device=device)
+    point1 = wp.array([wp.vec3(*point1)], dtype=wp.vec3, device=device)
     normal = wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3, device=device)
     shape0 = wp.array([0], dtype=wp.int32, device=device)
     shape1 = wp.array([1], dtype=wp.int32, device=device)
-    thickness0 = wp.array([0.01], dtype=wp.float32, device=device)
-    thickness1 = wp.array([0.02], dtype=wp.float32, device=device)
+    thickness0 = wp.array([thickness[0]], dtype=wp.float32, device=device)
+    thickness1 = wp.array([thickness[1]], dtype=wp.float32, device=device)
     contact_world = wp.array([0], dtype=wp.int32, device=device)
     contact_slot = wp.array([0], dtype=wp.int32, device=device)
     contact_art_a = wp.array([0], dtype=wp.int32, device=device)
@@ -315,47 +403,26 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     )
     shape_body = wp.array([2, 1], dtype=wp.int32, device=device)
     body_q = wp.array(
-        [
-            wp.transform(wp.vec3(0.0), wp.quat_identity()),
-            wp.transform(wp.vec3(-0.2, 0.3, 0.1), wp.quat_identity()),
-            wp.transform(wp.vec3(0.4, -0.1, 0.2), wp.quat_identity()),
-        ],
+        [wp.transform(wp.vec3(*position), wp.quat_identity()) for position in _DENSE_BODY_POSITIONS],
         dtype=wp.transform,
         device=device,
     )
-    # Body 2 (shape 0) closes on body 1 at 2 m/s, so the impact gate keeps the mixed restitution.
-    body_v = wp.array(
-        [wp.spatial_vector(0.0), wp.spatial_vector(0.0), wp.spatial_vector(0.0, 0.0, -2.0, 0.0, 0.0, 0.0)],
-        dtype=wp.spatial_vector,
-        device=device,
-    )
-    prescribed = wp.zeros((1,), dtype=wp.int32, device=device)
-    material_mu = wp.array([0.6, 0.8], dtype=wp.float32, device=device)
-    material_restitution = wp.array([0.2, 0.4], dtype=wp.float32, device=device)
+    geometry = [point0, point1, normal, shape0, shape1, thickness0, thickness1]
+    patches = _disabled_patches(device)
 
-    common_geometry = [
-        contact_count,
-        point0,
-        point1,
-        normal,
-        shape0,
-        shape1,
-        thickness0,
-        thickness1,
-    ]
-    serial = _contact_row_outputs(device)
+    serial = wp.zeros((1, 8, 3), dtype=wp.float32, device=device)
     wp.launch(
         populate_world_J_for_size,
         dim=1,
         inputs=[
             contact_count,
             1,
-            *common_geometry[1:],
-            contact_world,
+            *geometry,
             contact_slot,
             contact_art_a,
             contact_art_b,
             contact_path,
+            contact_slots_needed,
             3,
             response_dof_count,
             art_group_idx,
@@ -367,70 +434,20 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             joint_s,
             shape_body,
             body_q,
-            body_v,
-            None,
-            prescribed,
-            material_mu,
-            material_restitution,
-            1.0,
-            1,
-            1.0,
-            0,
-            0.05,
-            1.0e-6,
-            _disabled_patches(device),  # patch friction off
-            0.0,  # friction_anchor_beta
-            0,
-            0,
-            0.5,  # restitution_velocity_threshold
+            patches,
+            *anchors,
         ],
-        outputs=list(serial.values()),
+        outputs=[serial],
         device=device,
     )
-
-    compact = _contact_row_outputs(device)
-    wp.launch(
-        prepare_world_contact_rows,
-        dim=1,
-        inputs=[
-            contact_count,
-            1,
-            *common_geometry[1:],
-            contact_world,
-            contact_slot,
-            contact_art_a,
-            contact_art_b,
-            contact_path,
-            contact_slots_needed,
-            shape_body,
-            body_q,
-            body_v,
-            None,
-            prescribed,
-            articulation_origin,
-            material_mu,
-            material_restitution,
-            1,
-            1.0,
-            0,
-            0.05,
-            1.0e-6,
-            _disabled_patches(device),  # patch friction off
-            0.0,  # friction_anchor_beta
-            0,
-            0,
-            0.5,  # restitution_velocity_threshold
-        ],
-        outputs=list(compact.values())[1:],
-        device=device,
-    )
+    compact = wp.zeros((1, 8, 3), dtype=wp.float32, device=device)
     wp.launch(
         populate_world_J_for_compact_size,
         dim=(1, 32),
         inputs=[
             contact_count,
             1,
-            *common_geometry[1:],
+            *geometry,
             contact_slot,
             contact_art_a,
             contact_art_b,
@@ -445,215 +462,56 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             joint_s,
             shape_body,
             body_q,
-            1,
-            FrictionPatches(),
-            0,
+            patches,
+            *anchors,
         ],
-        outputs=[compact["J"]],
+        outputs=[compact],
         device=device,
     )
-    wp.synchronize_device(device)
-    return serial, compact
-
-
-class TestSteelContactControls(unittest.TestCase):
-    def test_compact_contact_builder_matches_tree_walk(self):
-        """Match dense Jacobians and metadata for a same-articulation contact."""
-        serial, compact = _launch_dense_contact_builders()
-
-        for name in serial:
-            with self.subTest(output=name):
-                np.testing.assert_allclose(compact[name].numpy(), serial[name].numpy(), rtol=0.0, atol=1.0e-6)
-        # Mixed restitution 0.3 times the 2 m/s step-start closing speed.
-        self.assertAlmostEqual(float(serial["row_rebound_velocity"].numpy()[0, 0]), 0.6, delta=1.0e-6)
-
-    def test_solver_exposes_documented_defaults(self):
-        """Expose legacy-preserving defaults through the public constructor."""
-        solver = SolverSteel(newton.ModelBuilder().finalize(device="cpu"))
-
-        self.assertEqual(solver._contact_speculative_scale, 1.0)
-        self.assertIsNone(solver._contact_gap_gate)
-        self.assertIsNone(solver._contact_friction_gap_max)
-        self.assertTrue(solver._warn_constraint_overflow)
-        self.assertTrue(solver._track_row_capacity)
-        self.assertFalse(solver._row_watermark)
-        quiet_solver = SolverSteel(
-            newton.ModelBuilder().finalize(device="cpu"),
-            warn_constraint_overflow=False,
-        )
-        self.assertFalse(quiet_solver._warn_constraint_overflow)
-        self.assertFalse(quiet_solver._track_row_capacity)
-        self.assertIsNotNone(quiet_solver._row_overflow_warning_emitted)
-
-    def test_new_contact_controls_preserve_legacy_positional_layout(self):
-        """Append new controls without shifting established positional arguments."""
-        parameters = tuple(inspect.signature(SolverSteel).parameters)
-        for sequence in (
-            ("contact_friction_shared_anchor", "contact_friction_scale", "contact_shared_anchor"),
-            ("row_watermark", "restitution_velocity_threshold", "contact_speculative_scale", "contact_gap_gate"),
-        ):
-            start = parameters.index(sequence[0])
-            self.assertEqual(parameters[start : start + len(sequence)], sequence)
-
-        legacy_tail = parameters.index("contact_gap_gate")
-        for name in ("enable_restitution", "warn_constraint_overflow"):
-            self.assertGreater(parameters.index(name), legacy_tail)
-
-    def test_solver_validates_and_stores_contact_controls(self):
-        """Accept finite non-negative controls and reject malformed values."""
-        model = newton.ModelBuilder().finalize(device="cpu")
-        solver = SolverSteel(
-            model,
-            contact_speculative_scale=0.0,
-            contact_gap_gate=0.001,
-        )
-        self.assertEqual(solver._contact_speculative_scale, 0.0)
-        self.assertEqual(solver._contact_gap_gate, 0.001)
-
-        for name in ("contact_speculative_scale", "contact_gap_gate"):
-            for value in (-0.1, float("nan"), float("inf"), "invalid"):
-                with self.subTest(name=name, value=value):
-                    with self.assertRaisesRegex(ValueError, name):
-                        SolverSteel(model, **{name: value})
-
-    def test_speculative_scale_controls_every_position_rhs_family(self):
-        """Scale positive-gap position bias on dense, MF, and propagation rows."""
-        rhs_families = {
-            "dense": _dense_speculative_rhs,
-            "matrix_free": _mf_speculative_rhs,
-            "propagation": _propagation_speculative_rhs,
-        }
-        for name, compute_rhs in rhs_families.items():
-            with self.subTest(family=name):
-                self.assertEqual(compute_rhs(0.0), 0.0)
-                self.assertAlmostEqual(compute_rhs(1.0), 2.0, places=6)
-
-    def test_gap_gate_prevents_all_route_allocations(self):
-        """Drop positive gaps above the gate before any route reserves a slot; no gate keeps them."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
-            with self.subTest(route=route):
-                allocated = _launch_contact_allocator(route=route, gap=0.002, gate=None)
-                self.assertEqual(allocated["path"], route)
-                self.assertEqual(allocated["slot"], 0)
-                self.assertEqual(allocated["world"], 0)
-                self.assertEqual(allocated["art_a"], 0)
-                self.assertEqual(allocated["art_b"], -1)
-                self.assertEqual(allocated["slots_needed"], 1)
-                self.assertEqual(
-                    (
-                        allocated["dense_count"],
-                        allocated["mf_count"],
-                        allocated["propagation_count"],
-                    ),
-                    (
-                        int(route == PATH_DENSE),
-                        int(route == PATH_MATRIX_FREE),
-                        int(route == PATH_PROPAGATION),
-                    ),
-                )
-
-                dropped = _launch_contact_allocator(route=route, gap=0.002, gate=0.001)
-                self.assertEqual(dropped["slot"], -1)
-                self.assertEqual(dropped["path"], -1)
-                self.assertEqual(dropped["dense_count"], 0)
-                self.assertEqual(dropped["mf_count"], 0)
-                self.assertEqual(dropped["propagation_count"], 0)
-                self.assertEqual(dropped["dense_world_flag"], 0)
-
-    def test_gap_gate_keeps_contacts_at_threshold(self):
-        """Keep a contact whose gap equals the positive gate exactly."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
-            with self.subTest(route=route):
-                result = _launch_contact_allocator(route=route, gap=0.001, gate=0.001)
-                self.assertEqual(result["path"], route)
-                self.assertEqual(result["slots_needed"], 1)
-
-    def test_allocator_skips_contacts_without_response_dofs(self):
-        """Do not allocate a row when neither contact body can change velocity."""
-        result = _launch_contact_allocator(route=PATH_DENSE, gap=-0.001, gate=None, responsive=False)
-
-        self.assertEqual(result["slot"], -1)
-        self.assertEqual(result["path"], -1)
-        self.assertEqual(result["dense_count"], 0)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free solve requires CUDA")
-    def test_friction_gap_max_keeps_the_constructed_row_layout(self):
-        """Reject a switch to or from ``None`` after construction, and match a fresh solver after an allowed edit."""
-        model = _build_sparse_contact_friction_model(device="cuda:0")
-        # Tilted boxes make the triple and normal-only schedules give different motion.
-        transforms = model.shape_transform.numpy()
-        transforms[model.shape_body.numpy() >= 0, 3:] = np.asarray(wp.quat_rpy(0.2, 0.3, 0.1))
-        model.shape_transform.assign(transforms)
-        options = {
-            "solve_mode": "serial",
-            "iterations": 8,
-            "enable_joint_limits": True,
-            "articulation_constraint_max": 96,
-            "free_body_constraint_max": 32,
-            "use_parallel_streams": True,
-            "friction_anchor_beta": 0.0,
-        }
-        every_contact = SolverSteel(model, **options)
-        for value in (-float("inf"), -1.0, 0.01):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
-                every_contact.contact_friction_gap_max = value
-        every_contact.contact_friction_gap_max = float("inf")
-        gated = SolverSteel(model, **options, contact_friction_gap_max=0.01)
-        with self.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
-            gated.contact_friction_gap_max = None
-        gated.contact_friction_gap_max = -float("inf")
-        fresh = SolverSteel(model, **options, contact_friction_gap_max=-float("inf"))
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
-        contacts = pipeline.contacts()
-        trajectories = []
-        for solver in (gated, fresh):
-            state, output = model.state(), model.state()
-            qd = state.joint_qd.numpy()
-            qd[:] = -0.3
-            state.joint_qd.assign(qd)
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            trajectory = []
-            for _ in range(4):
-                pipeline.collide(state, contacts)
-                solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
-                solver.check_constraint_capacity()
-                state, output = output, state
-                trajectory.append(np.concatenate([state.joint_q.numpy(), state.joint_qd.numpy()]))
-            trajectories.append(np.stack(trajectory))
-        np.testing.assert_array_equal(trajectories[0], trajectories[1])
-
-    def test_overflow_warning_enabled_after_construction_latches(self):
-        """Latch the dense-row overflow warning when warnings are enabled after a quiet overflowing step."""
-        device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        scene = newton.ModelBuilder()
-        scene.add_ground_plane()
-        xform = wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity())
-        body = scene.add_link(xform=xform)
-        scene.add_shape_box(body, hx=0.15, hy=0.1, hz=0.05)
-        scene.add_articulation([scene.add_joint_prismatic(-1, body, axis=newton.Axis.Z, parent_xform=xform)])
-        model = scene.finalize(device=device)
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
-        state, output = model.state(), model.state()
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        contacts = pipeline.contacts()
-        pipeline.collide(state, contacts)
-        solver = SolverSteel(model, articulation_constraint_max=1, warn_constraint_overflow=False)
-        solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
-        self.assertTrue(solver.constraint_overflow.numpy().any())
-        self.assertEqual(solver._row_overflow_warning_emitted.numpy().tolist(), [0, 0, 0])
-        solver.warn_constraint_overflow = True
-        capture = StdOutCapture()
-        capture.begin()
-        try:
-            solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
-        finally:
-            try:
-                wp.synchronize()
-            finally:
-                printed = capture.end()
-        self.assertRegex(printed, "constraint-row overflow")
-        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
-        self.assertTrue(np.isfinite(output.joint_q.numpy()).all())
+    metadata = {
+        "row_type": wp.full((1, 8), -9, dtype=wp.int32, device=device),
+        "row_parent": wp.full((1, 8), -9, dtype=wp.int32, device=device),
+        "row_mu": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "row_rebound_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+    }
+    wp.launch(
+        prepare_world_contact_rows,
+        dim=1,
+        inputs=[
+            contact_count,
+            1,
+            *geometry,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            contact_path,
+            contact_slots_needed,
+            shape_body,
+            body_q,
+            # Body 2 (shape 0) closes on body 1 at 2 m/s, so the impact gate keeps the mixed restitution.
+            wp.array(
+                [wp.spatial_vector(0.0), wp.spatial_vector(0.0), wp.spatial_vector(*twist)],
+                dtype=wp.spatial_vector,
+                device=device,
+            ),
+            None,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            articulation_origin,
+            wp.array([0.6, 0.8], dtype=wp.float32, device=device),
+            wp.array([0.2, 0.4], dtype=wp.float32, device=device),
+            patches,
+            *anchors,
+            0.5,  # restitution_velocity_threshold
+            0,  # friction_combine
+            0,  # restitution_combine
+        ],
+        outputs=list(metadata.values()),
+        device=device,
+    )
+    return serial.numpy(), compact.numpy(), {name: array.numpy() for name, array in metadata.items()}
 
 
 def _free_body_model(device):
@@ -663,25 +521,379 @@ def _free_body_model(device):
     return builder.finalize(device=device)
 
 
+def test_compact_contact_builder_matches_tree_walk(test, device):
+    """Match the dense Jacobians of the compact and tree-walk builders for a same-articulation contact."""
+    serial, compact, metadata = _launch_dense_contact_builders(device)
+    test.assertGreater(float(np.abs(serial[0, :3]).max()), 0.0)
+    np.testing.assert_allclose(compact, serial, rtol=0.0, atol=1.0e-6)
+    np.testing.assert_array_equal(
+        metadata["row_type"][0, :3],
+        [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION],
+    )
+    np.testing.assert_array_equal(metadata["row_parent"][0, :3], [-1, 0, 0])
+    np.testing.assert_allclose(metadata["row_mu"][0, :3], 0.7, rtol=1.0e-6)
+    # Mixed restitution 0.3 times the 2 m/s step-start closing speed.
+    np.testing.assert_allclose(metadata["row_rebound_velocity"][0, :3], [0.6, 0.0, 0.0], rtol=1.0e-6)
+
+
+def test_shared_anchors_move_the_row_points_to_the_witness_midpoint(test, device):
+    """Apply shared-anchor rows at the witness midpoint while ``phi`` keeps the witness points."""
+    # The same contact with both points at the world midpoint and no thickness.
+    normal = np.array([0.0, 0.0, -1.0])
+    witness_a = np.add(_DENSE_BODY_POSITIONS[2], _DENSE_POINT0) + _DENSE_THICKNESS[0] * normal
+    witness_b = np.add(_DENSE_BODY_POSITIONS[1], _DENSE_POINT1) - _DENSE_THICKNESS[1] * normal
+    midpoint = 0.5 * (witness_a + witness_b)
+    # Spinning body 2 makes the closing speed differ between its witness point and the midpoint.
+    twist = (0.0, 0.0, -2.0, 1.0, 0.5, 0.0)
+    midpoint_rows = _launch_dense_contact_builders(
+        device,
+        point0=tuple(midpoint - _DENSE_BODY_POSITIONS[2]),
+        point1=tuple(midpoint - _DENSE_BODY_POSITIONS[1]),
+        thickness=(0.0, 0.0),
+        twist=twist,
+    )
+    witness_rows = _launch_dense_contact_builders(device, twist=twist)
+    for anchors, normal_source, friction_source in (
+        ((1, 0), midpoint_rows, midpoint_rows),
+        ((1, 1), midpoint_rows, midpoint_rows),
+        ((0, 1), witness_rows, midpoint_rows),
+    ):
+        with test.subTest(anchors=anchors):
+            serial, compact, metadata = _launch_dense_contact_builders(device, anchors=anchors, twist=twist)
+            for jacobian in (serial, compact):
+                np.testing.assert_allclose(jacobian[0, 0], normal_source[0][0, 0], rtol=0.0, atol=1.0e-6)
+                np.testing.assert_allclose(jacobian[0, 1:3], friction_source[0][0, 1:3], rtol=0.0, atol=1.0e-6)
+            np.testing.assert_allclose(metadata["phi"][0, 0], witness_rows[2]["phi"][0, 0], rtol=0.0, atol=1.0e-7)
+            # The rebound speed comes from the normal row's points.
+            np.testing.assert_allclose(
+                metadata["row_rebound_velocity"][0, 0],
+                normal_source[2]["row_rebound_velocity"][0, 0],
+                rtol=1.0e-6,
+            )
+    # The fixture's witness points are separated along and across the normal, so the rows differ.
+    test.assertGreater(float(np.abs(midpoint_rows[0][0, :3] - witness_rows[0][0, :3]).max()), 1.0e-3)
+    rebound_gap = midpoint_rows[2]["row_rebound_velocity"][0, 0] - witness_rows[2]["row_rebound_velocity"][0, 0]
+    test.assertGreater(abs(float(rebound_gap)), 0.05)
+
+
 def test_shared_anchors_warn_with_patch_friction(test, device):
     """Explain that patch anchors keep their friction points when shared anchors are requested."""
     model = _free_body_model(device)
     for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
-        with test.subTest(flag=flag), test.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
+        with test.subTest(flag=flag), test.assertWarnsRegex(newton.exceptions.NewtonWarning, "friction_anchor_beta=0"):
             SolverSteel(model, **{flag: True})
         solver = SolverSteel(model, friction_anchor_beta=0.0, **{flag: True})
         test.assertTrue(getattr(solver, flag))
 
 
-class TestSteelContactControlsUpstream(unittest.TestCase):
+def test_shared_anchors_step_on_every_route(test, device):
+    """Rest a box and a two-link arm on the ground with shared anchors in every solve and response."""
+    builder = newton.ModelBuilder()
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+    parent = -1
+    joints = []
+    for _ in range(2):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.08, hy=0.05, hz=0.05)
+        xform = wp.vec3(0.5, 0.0, 0.05) if parent == -1 else wp.vec3(0.2, 0.0, 0.0)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(xform, wp.quat_identity()),
+                child_xform=wp.transform_identity(),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    routes = (
+        {},
+        {"articulated_contact_response": "propagation"},
+    )
+
+    def run(route, shared):
+        solver = SolverSteel(
+            model,
+            friction_anchor_beta=0.0,
+            contact_shared_anchor=shared,
+            contact_friction_shared_anchor=shared,
+            articulation_constraint_max=128,
+            free_body_constraint_max=128,
+            **route,
+        )
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        control = model.control()
+        for _ in range(120):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        solver.check_constraint_capacity()
+        return state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+    for route in routes:
+        with test.subTest(**route):
+            body_q, body_qd = run(route, True)
+            reference_q, _ = run(route, False)
+            test.assertTrue(np.isfinite(body_q).all())
+            # Resting contacts have coincident witness points, so the rest pose is unchanged.
+            np.testing.assert_allclose(body_q, reference_q, rtol=0.0, atol=2.0e-3)
+            test.assertLess(float(np.abs(body_qd).max()), 0.05)
+
+
+def test_solver_exposes_documented_defaults(test, device):
+    """Expose the documented contact-control defaults, with friction patches on."""
+    model = _free_body_model(device)
+    solver = SolverSteel(model)
+    test.assertEqual(solver.friction_anchor_beta, 0.2)
+    test.assertTrue(solver._friction_anchors_enabled)
+    test.assertEqual(solver.contact_speculative_scale, 1.0)
+    test.assertIsNone(solver.contact_gap_gate)
+    test.assertIsNone(solver.contact_friction_gap_max)
+    test.assertEqual(solver.contact_regularization, 0.0)
+    test.assertEqual(solver.velocity_iterations, 0)
+    test.assertFalse(solver.contact_warmstart)
+    test.assertEqual(solver.restitution_velocity_threshold, 0.5)
+    test.assertTrue(solver.warn_constraint_overflow)
+    test.assertIsNotNone(solver._row_overflow_warning_emitted)
+    quiet_solver = SolverSteel(model, warn_constraint_overflow=False)
+    test.assertFalse(quiet_solver.warn_constraint_overflow)
+    test.assertIsNotNone(quiet_solver._row_overflow_warning_emitted)
+    point = SolverSteel(model, friction_anchor_beta=0.0)
+    test.assertFalse(point._friction_anchors_enabled)
+
+
+def test_solver_validates_and_stores_contact_controls(test, device):
+    """Accept finite non-negative controls and reject malformed values."""
+    model = _free_body_model(device)
+    solver = SolverSteel(
+        model,
+        contact_speculative_scale=0.0,
+        contact_gap_gate=0.001,
+        contact_friction_gap_max=-0.5,
+    )
+    test.assertEqual(solver.contact_speculative_scale, 0.0)
+    test.assertEqual(solver.contact_gap_gate, 0.001)
+    test.assertEqual(solver.contact_friction_gap_max, -0.5)
+
+    for name in (
+        "contact_speculative_scale",
+        "contact_gap_gate",
+        "friction_anchor_beta",
+        "restitution_velocity_threshold",
+    ):
+        for value in (-0.1, float("nan"), float("inf"), "invalid"):
+            with test.subTest(name=name, value=value):
+                with test.assertRaisesRegex(ValueError, name):
+                    SolverSteel(model, **{name: value})
+    with test.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
+        SolverSteel(model, contact_friction_gap_max=float("nan"))
+
+
+def test_zero_gap_gate_keeps_touching_contacts_only(test, device):
+    """Keep touching and penetrating contacts with a zero gate, and drop any positive gap on every route."""
+    for route, counter in ((PATH_DENSE, "dense_count"), (PATH_MATRIX_FREE, "mf_count")):
+        with test.subTest(route=route):
+            for gap, kept in ((-0.001, True), (0.0, True), (1.0e-4, False)):
+                result = _launch_contact_allocator(device, route=route, gap=gap, gate=0.0)
+                test.assertEqual(result[counter], int(kept), f"gap={gap}")
+            test.assertEqual(_launch_contact_allocator(device, route=route, gap=0.04)[counter], 1)
+    for cross_articulation in (False, True):
+        with test.subTest(cross_articulation=cross_articulation):
+            test.assertEqual(
+                _launch_articulation_pair_contact_allocator(
+                    device, gap=0.004, gate=0.003, cross_articulation=cross_articulation
+                ),
+                (-1, -1, 0),
+            )
+
+
+def test_friction_gap_max_applies_to_every_route(test, device):
+    """Give contacts beyond the friction gap a normal row only, on every route, also with a negative max."""
+    for route in (PATH_DENSE, PATH_MATRIX_FREE):
+        with test.subTest(route=route):
+            near = _launch_contact_allocator(device, route=route, gap=0.001, enable_friction=True, friction_gap=0.002)
+            far = _launch_contact_allocator(device, route=route, gap=0.004, enable_friction=True, friction_gap=0.002)
+            test.assertEqual((near["slots_needed"], far["slots_needed"]), (3, 1))
+    shallow = _launch_articulation_pair_contact_allocator(
+        device, gap=-0.0005, enable_friction=True, friction_gap=-0.001
+    )
+    deep = _launch_articulation_pair_contact_allocator(device, gap=-0.002, enable_friction=True, friction_gap=-0.001)
+    test.assertEqual(shallow, (0, PATH_DENSE, 1))
+    test.assertEqual(deep, (0, PATH_DENSE, 3))
+
+
+def test_speculative_scale_controls_every_position_rhs_family(test, device):
+    """Scale the positive-gap position bias of dense and free-body rows."""
+    for name, compute_rhs in (("dense", _dense_speculative_rhs), ("free_body", _mf_speculative_rhs)):
+        with test.subTest(family=name):
+            test.assertEqual(compute_rhs(device, 0.0), 0.0)
+            test.assertAlmostEqual(compute_rhs(device, 1.0), 2.0, places=6)
+
+
+def test_dense_restitution_removes_the_scaled_position_bias(test, device):
+    """Replace the position bias with the rebound target, independently of the speculative scale."""
+    test.assertAlmostEqual(_dense_restitution_rhs(device, 0.0), -1.5, places=6)
+    test.assertAlmostEqual(_dense_restitution_rhs(device, 1.0), -1.5, places=6)
+
+
+def test_gap_gate_prevents_all_route_allocations(test, device):
+    """Drop positive gaps above the gate before any route reserves a slot."""
+    for route in (PATH_DENSE, PATH_MATRIX_FREE):
+        with test.subTest(route=route):
+            allocated = _launch_contact_allocator(device, route=route, gap=0.002)
+            test.assertEqual(allocated["path"], route)
+            test.assertEqual(allocated["slot"], 0)
+            test.assertEqual(allocated["world"], 0)
+            test.assertEqual(allocated["art_a"], 0)
+            test.assertEqual(allocated["art_b"], -1)
+            test.assertEqual(allocated["slots_needed"], 1)
+            test.assertEqual(
+                (allocated["dense_count"], allocated["mf_count"]),
+                (int(route == PATH_DENSE), int(route == PATH_MATRIX_FREE)),
+            )
+
+            dropped = _launch_contact_allocator(device, route=route, gap=0.002, gate=0.001)
+            test.assertEqual(dropped["slot"], -1)
+            test.assertEqual(dropped["path"], -1)
+            test.assertEqual(dropped["slots_needed"], 0)
+            test.assertEqual(dropped["dense_count"], 0)
+            test.assertEqual(dropped["mf_count"], 0)
+
+
+def test_gap_gate_keeps_contacts_at_threshold(test, device):
+    """Keep a contact whose gap equals the positive gate exactly."""
+    for route in (PATH_DENSE, PATH_MATRIX_FREE):
+        with test.subTest(route=route):
+            result = _launch_contact_allocator(device, route=route, gap=0.001, gate=0.001)
+            test.assertEqual(result["path"], route)
+            test.assertEqual(result["slots_needed"], 1)
+
+
+def test_allocator_skips_contacts_without_response_dofs(test, device):
+    """Do not allocate a row when neither contact body can change velocity."""
+    result = _launch_contact_allocator(device, route=PATH_DENSE, gap=-0.001, responsive=False)
+    test.assertEqual(result["slot"], -1)
+    test.assertEqual(result["path"], -1)
+    test.assertEqual(result["dense_count"], 0)
+
+
+def test_friction_gap_max_keeps_the_constructed_row_layout(test, device):
+    """Reject a switch to or from ``None`` after construction, and match a fresh solver after an allowed edit."""
+    model = _build_sparse_contact_friction_model(device=device)
+    # Tilted boxes make the triple and normal-only schedules give different motion.
+    transforms = model.shape_transform.numpy()
+    transforms[model.shape_body.numpy() >= 0, 3:] = np.asarray(wp.quat_rpy(0.2, 0.3, 0.1))
+    model.shape_transform.assign(transforms)
+    options = {
+        "iterations": 8,
+        "enable_joint_limits": True,
+        "articulation_constraint_max": 96,
+        "free_body_constraint_max": 32,
+        "use_parallel_streams": True,
+        "friction_anchor_beta": 0.0,
+    }
+    every_contact = SolverSteel(model, **options)
+    for value in (-float("inf"), -1.0, 0.01):
+        with test.subTest(value=value), test.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
+            every_contact.contact_friction_gap_max = value
+    every_contact.contact_friction_gap_max = float("inf")
+    gated = SolverSteel(model, **options, contact_friction_gap_max=0.01)
+    with test.assertRaisesRegex(ValueError, "contact_friction_gap_max"):
+        gated.contact_friction_gap_max = None
+    gated.contact_friction_gap_max = -float("inf")
+    fresh = SolverSteel(model, **options, contact_friction_gap_max=-float("inf"))
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    contacts = pipeline.contacts()
+    trajectories = []
+    for solver in (gated, fresh):
+        state, output = model.state(), model.state()
+        qd = state.joint_qd.numpy()
+        qd[:] = -0.3
+        state.joint_qd.assign(qd)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        trajectory = []
+        for _ in range(4):
+            pipeline.collide(state, contacts)
+            solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+            solver.check_constraint_capacity()
+            state, output = output, state
+            trajectory.append(np.concatenate([state.joint_q.numpy(), state.joint_qd.numpy()]))
+        trajectories.append(np.stack(trajectory))
+    np.testing.assert_array_equal(trajectories[0], trajectories[1])
+
+
+def test_overflow_warning_enabled_after_construction_latches(test, device):
+    """Latch the dense-row overflow warning when warnings are enabled after a quiet overflowing step."""
+    scene = newton.ModelBuilder()
+    scene.add_ground_plane()
+    xform = wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity())
+    body = scene.add_link(xform=xform)
+    scene.add_shape_box(body, hx=0.15, hy=0.1, hz=0.05)
+    scene.add_articulation([scene.add_joint_prismatic(-1, body, axis=newton.Axis.Z, parent_xform=xform)])
+    model = scene.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    state, output = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    solver = SolverSteel(model, articulation_constraint_max=1, warn_constraint_overflow=False)
+    solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+    test.assertTrue(solver.constraint_overflow.numpy().any())
+    test.assertEqual(solver._row_overflow_warning_emitted.numpy().tolist(), [0, 0, 0, 0, 0])
+    solver.warn_constraint_overflow = True
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+    finally:
+        try:
+            wp.synchronize()
+        finally:
+            printed = capture.end()
+    test.assertRegex(printed, "constraint-row overflow")
+    test.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+    test.assertTrue(np.isfinite(output.joint_q.numpy()).all())
+
+
+class TestSteelContactControls(unittest.TestCase):
     pass
 
 
 devices = get_cuda_test_devices()
 
 
-for _fn in (test_shared_anchors_warn_with_patch_friction,):
-    add_function_test(TestSteelContactControlsUpstream, _fn.__name__, _fn, devices=devices)
+for _fn in (
+    test_compact_contact_builder_matches_tree_walk,
+    test_shared_anchors_move_the_row_points_to_the_witness_midpoint,
+    test_shared_anchors_warn_with_patch_friction,
+    test_shared_anchors_step_on_every_route,
+    test_solver_exposes_documented_defaults,
+    test_solver_validates_and_stores_contact_controls,
+    test_zero_gap_gate_keeps_touching_contacts_only,
+    test_friction_gap_max_applies_to_every_route,
+    test_speculative_scale_controls_every_position_rhs_family,
+    test_dense_restitution_removes_the_scaled_position_bias,
+    test_gap_gate_prevents_all_route_allocations,
+    test_gap_gate_keeps_contacts_at_threshold,
+    test_allocator_skips_contacts_without_response_dofs,
+    test_friction_gap_max_keeps_the_constructed_row_layout,
+):
+    add_function_test(TestSteelContactControls, _fn.__name__, _fn, devices=devices)
+# The test captures the device warning it expects.
+add_function_test(
+    TestSteelContactControls,
+    "test_overflow_warning_enabled_after_construction_latches",
+    test_overflow_warning_enabled_after_construction_latches,
+    devices=devices,
+    check_output=False,
+)
 
 
 DT = 1.0 / 120.0
@@ -706,10 +918,10 @@ def _box_on_ground(device, gravity=None, mu=None):
     return builder.finalize(device=device)
 
 
-def test_resting_box_reports_weight_as_linear_force(test, device, solve_mode="serial", response="immediate"):
+def test_resting_box_reports_weight_as_linear_force(test, device, response="immediate"):
     """Report the resting box's weight through the linear contact force and leave the torque zero."""
     model = _box_on_ground(device)
-    solver = SolverSteel(model, solve_mode=solve_mode, iterations=32, articulated_contact_response=response)
+    solver = SolverSteel(model, iterations=32, **steel_mode_options(response))
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
@@ -734,12 +946,12 @@ def test_resting_box_reports_weight_as_linear_force(test, device, solve_mode="se
     np.testing.assert_array_equal(wrench[:, 3:], np.zeros((count, 3)))
 
 
-def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, solve_mode="serial", response="immediate"):
+def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, response="immediate"):
     """Box on the ground under gravity tilted by ``slope_angle``, as on an incline; return its x velocity."""
     g = 9.81
     gravity = (g * np.sin(slope_angle), 0.0, -g * np.cos(slope_angle))
     model = _box_on_ground(device, gravity=gravity, mu=mu)
-    solver = SolverSteel(model, solve_mode=solve_mode, iterations=32, articulated_contact_response=response)
+    solver = SolverSteel(model, iterations=32, **steel_mode_options(response))
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
@@ -751,26 +963,46 @@ def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, solve_mode="ser
     return float(state_0.body_qd.numpy()[0, 0])
 
 
-def test_friction_holds_inside_the_cone(test, device, solve_mode="serial", response="immediate"):
+def test_friction_holds_inside_the_cone(test, device, response="immediate"):
     """Hold the box at rest when the tangential load is inside the friction cone."""
     # tan(0.3) = 0.31 < mu = 0.5.
-    velocity = _tilted_gravity_box_velocity(
-        device, slope_angle=0.3, mu=0.5, steps=120, solve_mode=solve_mode, response=response
-    )
+    velocity = _tilted_gravity_box_velocity(device, slope_angle=0.3, mu=0.5, steps=120, response=response)
     test.assertLess(abs(velocity), 1.0e-3)
 
 
-def test_friction_slides_at_the_coulomb_bound(test, device, solve_mode="serial", response="immediate"):
+def test_friction_slides_at_the_coulomb_bound(test, device, response="immediate"):
     """Accelerate the box at ``g (sin a - mu cos a)`` when the load exceeds the friction cone."""
     slope_angle, mu, steps = 0.6, 0.3, 120
-    velocity = _tilted_gravity_box_velocity(
-        device, slope_angle=slope_angle, mu=mu, steps=steps, solve_mode=solve_mode, response=response
-    )
+    velocity = _tilted_gravity_box_velocity(device, slope_angle=slope_angle, mu=mu, steps=steps, response=response)
     expected = 9.81 * (np.sin(slope_angle) - mu * np.cos(slope_angle)) * steps * DT
     test.assertAlmostEqual(velocity, expected, delta=0.03 * expected)
 
 
 ARMATURE = (9.0, 4.0, 2.0, 0.5, 1.5, 3.0)
+
+
+def _sphere_on_ground(device, armature, dense, com=(0.0, 0.0, 0.0), mu=0.0):
+    """A 1 kg sphere on a free joint, optionally with a massless fixed child that routes it to dense rows."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    body = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity()),
+        mass=1.0,
+        com=wp.vec3(com),
+        inertia=wp.mat33(np.eye(3) * 0.01),
+    )
+    joints = [builder.add_joint_free(body)]
+    if dense:
+        child = builder.add_link(mass=0.0, inertia=wp.mat33(0.0))
+        joints.append(builder.add_joint_fixed(body, child))
+    builder.add_articulation(joints)
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=mu)
+    builder.add_shape_sphere(body, radius=0.1, cfg=cfg)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
+    model = builder.finalize(device=device)
+    joint_armature = model.joint_armature.numpy()
+    joint_armature[:6] = armature
+    model.joint_armature.assign(joint_armature)
+    return model
 
 
 def _impact(model, solver, joint_qd):
@@ -789,13 +1021,13 @@ def _impact(model, solver, joint_qd):
     return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)
 
 
-def test_free_body_contact_response_includes_armature(test, device, solve_mode="serial", response="immediate"):
+def test_free_body_contact_response_includes_armature(test, device, response="immediate"):
     """Respond on free-body rows with the same armature-augmented inertia as on articulated rows."""
     stop = (0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
     for armature, expected in ((0.0, 100.0), (9.0, 1000.0)):
         with test.subTest(armature=armature):
             model = _sphere_on_ground(device, armature, dense=False)
-            solver = SolverSteel(model, solve_mode=solve_mode, cfm=0.0, articulated_contact_response=response)
+            solver = SolverSteel(model, cfm=0.0, **steel_mode_options(response))
             qd, force = _impact(model, solver, stop)
             # The sphere starts 0.1 mm deep, so the depenetration bias adds 0.2 %.
             test.assertAlmostEqual(abs(float(force[2])), expected, delta=5.0e-3 * expected)
@@ -806,16 +1038,14 @@ def test_free_body_contact_response_includes_armature(test, device, solve_mode="
     results = {}
     for dense in (False, True):
         model = _sphere_on_ground(device, ARMATURE, dense=dense, com=(0.03, -0.02, 0.01), mu=0.5)
-        solver = SolverSteel(
-            model, solve_mode=solve_mode, cfm=0.0, iterations=64, articulated_contact_response=response
-        )
+        solver = SolverSteel(model, cfm=0.0, iterations=64, **steel_mode_options(response))
         results[dense] = _impact(model, solver, oblique)
     np.testing.assert_allclose(results[False][0], results[True][0], rtol=0.0, atol=1.0e-4)
     np.testing.assert_allclose(results[False][1], results[True][1], rtol=1.0e-3, atol=1.0e-2)
 
     # A notified armature change reaches the free-body response.
     model = _sphere_on_ground(device, 0.0, dense=False)
-    solver = SolverSteel(model, solve_mode=solve_mode, cfm=0.0, articulated_contact_response=response)
+    solver = SolverSteel(model, cfm=0.0, **steel_mode_options(response))
     _impact(model, solver, stop)
     joint_armature = model.joint_armature.numpy()
     joint_armature[:6] = 9.0
@@ -825,7 +1055,7 @@ def test_free_body_contact_response_includes_armature(test, device, solve_mode="
     test.assertAlmostEqual(abs(float(force[2])), 1000.0, delta=5.0)
 
 
-def test_free_body_impact_shares_armature_momentum(test, device, solve_mode="serial", response="immediate"):
+def test_free_body_impact_shares_armature_momentum(test, device, response="immediate"):
     """Conserve the armature-augmented momentum in a frictionless plastic impact between free bodies."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
@@ -838,7 +1068,7 @@ def test_free_body_impact_shares_armature_momentum(test, device, solve_mode="ser
     joint_armature = model.joint_armature.numpy()
     joint_armature[:6] = 9.0
     model.joint_armature.assign(joint_armature)
-    solver = SolverSteel(model, solve_mode=solve_mode, cfm=0.0, iterations=64, articulated_contact_response=response)
+    solver = SolverSteel(model, cfm=0.0, iterations=64, **steel_mode_options(response))
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
     joint_qd[0] = 1.0
@@ -856,13 +1086,10 @@ def test_free_body_impact_shares_armature_momentum(test, device, solve_mode="ser
     test.assertAlmostEqual(float(10.0 * qd[0] + qd[6]), 10.0, delta=1.0e-3)
 
 
-ANCHOR_ROTATIONS = (
-    wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 1.0, 0.2)), 0.25 * np.pi),
-    wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi),
-)
+ANCHOR_ROTATION = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 1.0, 0.2)), 0.25 * np.pi)
 
 
-def _anchored_sphere(device, anchor_rotation, gravity=None, inertia=(0.004, 0.004, 0.004), max_speed=None):
+def _anchored_sphere(device, anchor_rotation, gravity=None, inertia=(0.003, 0.004, 0.006), max_speed=None):
     """An offset-COM sphere on the ground whose FREE joint has the given parent-anchor rotation."""
     builder = newton.ModelBuilder() if gravity is None else newton.ModelBuilder(gravity=gravity)
     SolverSteel.register_custom_attributes(builder)
@@ -921,49 +1148,93 @@ def _run_anchored_sphere(model, solver, steps, dt):
 
 
 def _anchored_sphere_cases():
-    """An oblique frictional impact, and the body rolling off its offset COM under gravity."""
+    """An oblique frictional impact, the body rolling off its offset COM under gravity, and velocity limits."""
+    anisotropic, isotropic = (0.003, 0.004, 0.006), (0.004, 0.004, 0.004)
     return {
-        "impact": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 1, 0.01, None),
-        "gravity": ((0.0,) * 6, None, 60, DT, None),
-        # Box velocity limits act on world axes.
-        "velocity_limits": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 3, 0.01, (0.35, 0.3)),
+        "impact": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 1, 0.01, None, anisotropic),
+        "gravity": ((0.0,) * 6, None, 60, DT, None, anisotropic),
+        # Box velocity limits act on world axes, and so does their activation gate.
+        "velocity_limits": ((0.3, -0.2, -1.0, 0.4, 0.5, -0.3), wp.vec3(0.0), 3, 0.01, (0.35, 0.3), isotropic),
     }
 
 
-def test_rotated_anchor_free_body_matches_world_aligned(test, device, solve_mode="serial", response="immediate"):
+def test_rotated_anchor_free_body_matches_world_aligned(test, device, response="immediate"):
     """Give a FREE body the same world motion whatever the rotation of its parent anchor."""
-    for inertia in ((0.004, 0.004, 0.004), (0.003, 0.004, 0.006)):
-        for case, (world_twist, gravity, steps, dt, max_speed) in _anchored_sphere_cases().items():
-            twists = []
-            for rotation in (wp.quat_identity(), *ANCHOR_ROTATIONS):
-                model = _anchored_sphere(device, rotation, gravity, inertia, max_speed)
-                _set_free_anchor(model, rotation, world_twist)
-                solver = SolverSteel(
-                    model,
-                    solve_mode=solve_mode,
-                    cfm=0.0,
-                    iterations=64,
-                    articulated_contact_response=response,
-                    velocity_limit_activation_fraction=0.5,
-                )
-                twists.append(_run_anchored_sphere(model, solver, steps, dt))
-            for rotation, twist in zip(ANCHOR_ROTATIONS, twists[1:], strict=True):
-                with test.subTest(inertia=inertia, case=case, rotation=tuple(rotation)):
-                    np.testing.assert_allclose(twist, twists[0], rtol=0.0, atol=2.0e-4)
+    for case, (world_twist, gravity, steps, dt, max_speed, inertia) in _anchored_sphere_cases().items():
+        twists = []
+        for rotation in (wp.quat_identity(), ANCHOR_ROTATION):
+            model = _anchored_sphere(device, rotation, gravity, inertia, max_speed)
+            _set_free_anchor(model, rotation, world_twist)
+            solver = SolverSteel(
+                model,
+                cfm=0.0,
+                iterations=64,
+                **steel_mode_options(response),
+                velocity_limit_activation_fraction=0.5,
+            )
+            twists.append(_run_anchored_sphere(model, solver, steps, dt))
+        with test.subTest(case=case):
+            np.testing.assert_allclose(twists[1], twists[0], rtol=0.0, atol=2.0e-4)
 
 
-def test_free_anchor_rotated_after_construction(test, device, solve_mode="serial", response="immediate"):
+def test_rotated_anchor_free_body_on_articulation_matches_world_aligned(test, device, response="immediate"):
+    """Give a FREE body rolling on a driven articulated plate the same world motion whatever its anchor rotation."""
+    twists = []
+    for rotation in (wp.quat_identity(), ANCHOR_ROTATION):
+        builder = newton.ModelBuilder()
+        plate = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()), mass=5.0)
+        builder.add_shape_box(plate, hx=0.5, hy=0.5, hz=0.05)
+        hinge = builder.add_joint_revolute(
+            parent=-1,
+            child=plate,
+            axis=(1.0, 0.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+            target_ke=2.0e3,
+            target_kd=50.0,
+        )
+        builder.add_articulation([hinge])
+        pose = wp.transform(wp.vec3(0.1, 0.0, 0.1999), wp.quat_identity())
+        ball = builder.add_link(
+            xform=pose, mass=1.0, com=wp.vec3(0.03, -0.02, 0.01), inertia=wp.mat33(np.diag([0.003, 0.004, 0.006]))
+        )
+        builder.add_shape_sphere(ball, radius=0.1)
+        anchor = wp.transform(wp.vec3(0.2, -0.1, 0.3), rotation)
+        builder.add_articulation([builder.add_joint_free(ball, parent_xform=anchor)])
+        builder.add_ground_plane()
+        model = builder.finalize(device=device)
+        local = wp.transform_inverse(anchor) * pose
+        joint_q = model.joint_q.numpy()
+        joint_q[1:8] = [*local.p, *local.q]
+        model.joint_q.assign(joint_q)
+        to_anchor = np.array(wp.quat_to_matrix(rotation)).reshape(3, 3).T
+        joint_qd = model.joint_qd.numpy()
+        joint_qd[1:4] = to_anchor @ np.array([0.4, 0.2, -0.3])
+        joint_qd[4:7] = to_anchor @ np.array([1.0, -2.0, 0.5])
+        model.joint_qd.assign(joint_qd)
+        solver = SolverSteel(model, iterations=64, **steel_mode_options(response))
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        for _ in range(60):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, model.control(), contacts, DT)
+            state_0, state_1 = state_1, state_0
+        twists.append(state_0.body_qd.numpy())
+    np.testing.assert_allclose(twists[1], twists[0], rtol=0.0, atol=1.0e-4)
+
+
+def test_free_anchor_rotated_after_construction(test, device, response="immediate"):
     """Follow a FREE body's parent anchor rotated after construction, eagerly and in a replayed graph."""
-    world_twist, gravity, steps, dt, _ = _anchored_sphere_cases()["gravity"]
-    inertia = (0.003, 0.004, 0.006)
-    rotation = ANCHOR_ROTATIONS[0]
+    world_twist, gravity, steps, dt, _, _ = _anchored_sphere_cases()["gravity"]
+    rotation = ANCHOR_ROTATION
     # The world-aligned anchor gives the expected world motion.
-    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
-    solver = SolverSteel(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    model = _anchored_sphere(device, wp.quat_identity(), gravity)
+    solver = SolverSteel(model, iterations=64, **steel_mode_options(response))
     expected = _run_anchored_sphere(model, solver, steps, dt)
 
-    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
-    solver = SolverSteel(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    model = _anchored_sphere(device, wp.quat_identity(), gravity)
+    solver = SolverSteel(model, iterations=64, **steel_mode_options(response))
     _run_anchored_sphere(model, solver, 1, dt)
     _set_free_anchor(model, rotation, world_twist)
     solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
@@ -971,8 +1242,8 @@ def test_free_anchor_rotated_after_construction(test, device, solve_mode="serial
 
     if not wp.get_device(device).is_cuda:
         return
-    model = _anchored_sphere(device, wp.quat_identity(), gravity, inertia)
-    solver = SolverSteel(model, solve_mode=solve_mode, iterations=64, articulated_contact_response=response)
+    model = _anchored_sphere(device, wp.quat_identity(), gravity)
+    solver = SolverSteel(model, iterations=64, **steel_mode_options(response))
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
@@ -1011,6 +1282,7 @@ for _name in (
     "test_free_body_contact_response_includes_armature",
     "test_free_body_impact_shares_armature_momentum",
     "test_rotated_anchor_free_body_matches_world_aligned",
+    "test_rotated_anchor_free_body_on_articulation_matches_world_aligned",
     "test_free_anchor_rotated_after_construction",
 ):
     add_function_test(TestSteelContactForce, _name, globals()[_name], devices=devices)
@@ -1020,15 +1292,18 @@ for _name in (
     )
 
 
-# Colored propagation builds the same body-space rows as propagation in a different order.
-add_function_test(
-    TestSteelContactForce,
-    "test_rotated_anchor_free_body_matches_world_aligned_propagation_colored",
-    test_rotated_anchor_free_body_matches_world_aligned,
-    devices=devices,
-    solve_mode="colored",
-    response="propagation",
-)
+# Colored propagation builds the same body-space rows as propagation and solves them differently.
+for _name in (
+    "test_rotated_anchor_free_body_matches_world_aligned",
+    "test_rotated_anchor_free_body_on_articulation_matches_world_aligned",
+):
+    add_function_test(
+        TestSteelContactForce,
+        f"{_name}_colored",
+        globals()[_name],
+        devices=devices,
+        response="colored",
+    )
 
 
 LOWER_MASS = 2.0
@@ -1077,7 +1352,7 @@ def _check_rows(test, contacts, contact_f):
     np.testing.assert_array_equal(contact_f[count:], 0.0)
 
 
-def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, torsion_radius=None, **options):
+def test_contact_f_reports_each_box_weight(test, device, steps=150, torsion_radius=None, **options):
     """Report linear-only per-contact forces that sum to each box's weight at rest."""
     model, pipeline = _stacked_boxes(device)
     if torsion_radius is not None:
@@ -1094,7 +1369,6 @@ def test_contact_f_matches_legacy_force_and_weight(test, device, steps=150, tors
         solver.step(states[0], states[1], control, contacts, DT, observables=observables)
         states.reverse()
     contact_f = observables.contact_f.numpy()
-    # The SolverBase signature, which also passes the state.
     _check_rows(test, contacts, contact_f)
     if options.get("free_body_constraint_max") is not None:
         # Rows beyond the capacity were dropped; those contacts report zero.
@@ -1152,7 +1426,7 @@ def test_contact_f_in_a_captured_graph(test, device):
 
 
 def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
-    """Report the legacy force of a sleeping island's contacts: zero with skipped rows, else the resting force."""
+    """Report a sleeping island's contact forces: zero with skipped rows, else the resting force."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverSteel(
         model,
@@ -1186,7 +1460,7 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
 
 
 def test_contact_f_of_compliant_hydroelastic_rows(test, device):
-    """Report the legacy force of hydroelastic contacts solved with contact compliance."""
+    """Report the force of hydroelastic contacts solved with contact compliance."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.default_shape_cfg = newton.ModelBuilder.ShapeConfig(
@@ -1215,12 +1489,7 @@ def test_contact_f_of_compliant_hydroelastic_rows(test, device):
             ),
         )
         solver = SolverSteel(
-            model,
-            contact_compliance=True,
-            enable_restitution=False,
-            friction_anchor_beta=0.0,
-            iterations=64,
-            free_body_constraint_max=2048,
+            model, contact_compliance=True, friction_anchor_beta=0.0, iterations=64, free_body_constraint_max=2048
         )
         contacts = pipeline.contacts()
         observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
@@ -1291,8 +1560,6 @@ def test_contact_force_kernel_reads_only_rigid_rows(test, device):
 
     impulses = wp.array([[3.0]], dtype=wp.float32, device=device)
     row_count = wp.array([1], dtype=wp.int32, device=device)
-    row_type = wp.zeros((1, 1), dtype=wp.int32, device=device)
-    row_parent = wp.zeros((1, 1), dtype=wp.int32, device=device)
     contact_f = wp.full(rows, wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL), device=device)
     wp.launch(
         newton._src.solvers.steel.kernels.compute_contact_spatial_force_from_impulses,
@@ -1303,18 +1570,13 @@ def test_contact_force_kernel_reads_only_rigid_rows(test, device):
             rigid_view([0] * rows, wp.int32),
             rigid_view([0] * rows, wp.int32),
             rigid_view([0] * rows, wp.int32),
+            rigid_view([1] * rows, wp.int32),
             impulses,
             impulses,
             impulses,
             row_count,
             row_count,
             row_count,
-            row_type,
-            row_parent,
-            row_type,
-            row_parent,
-            row_type,
-            row_parent,
             10.0,
             rigid_capacity,
         ],
@@ -1337,15 +1599,14 @@ all_devices = get_test_devices()
 
 add_function_test(
     TestSteelContactObservable,
-    "test_contact_f_matches_legacy_force_and_weight",
-    test_contact_f_matches_legacy_force_and_weight,
+    "test_contact_f_reports_each_box_weight",
+    test_contact_f_reports_each_box_weight,
     devices=cuda_devices,
 )
 
 
 for _suffix, _options in (
     ("propagation", {"articulated_contact_response": "propagation"}),
-    ("colored", {"solve_mode": "colored", "articulated_contact_response": "propagation"}),
     ("point_friction", {"friction_anchor_beta": 0.0}),
     ("torsion", {"torsion_radius": 0.01}),
     ("device_torsion", {"torsion_radius": 0.01, "contact_torsion_device": True}),
@@ -1354,8 +1615,8 @@ for _suffix, _options in (
 ):
     add_function_test(
         TestSteelContactObservable,
-        f"test_contact_f_matches_legacy_force_and_weight_{_suffix}",
-        test_contact_f_matches_legacy_force_and_weight,
+        f"test_contact_f_reports_each_box_weight_{_suffix}",
+        test_contact_f_reports_each_box_weight,
         devices=cuda_devices,
         **_options,
     )
@@ -1427,36 +1688,50 @@ add_function_test(
 )
 
 
+_DEVICE = "cuda:0"
+
+
+def _cylinder_foot(builder, pos, mass=1.0, num_cyl=7, radius=0.02, half_height=0.015):
+    """Add one free body whose collision is ``num_cyl`` small cylinders in a row.
+
+    All cylinders reach the ground at nearly the same height, so a plane contact
+    produces a multiple of ``num_cyl`` contacts for a single region.
+    """
+    body = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()), mass=mass)
+    for i in range(num_cyl):
+        x = (i - (num_cyl - 1) / 2.0) * (2.2 * radius)
+        builder.add_shape_cylinder(
+            body,
+            xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+            radius=radius,
+            half_height=half_height,
+        )
+    return body
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "SolverSteel requires CUDA")
 class TestSteelPersistentContacts(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA graph capture")
     def test_combined_history_reset_replays_with_changed_world_mask(self):
-        """Capture reduction, matching and solver resets with a live device mask."""
+        """Capture contact-matching and solver resets with a live device mask."""
         template = newton.ModelBuilder()
         _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
         builder = newton.ModelBuilder()
         builder.replicate(template, 2, spacing=(1.0, 0.0, 0.0))
         builder.add_ground_plane()
-        model = builder.finalize(device=wp.get_cuda_device())
-        pipeline = newton.CollisionPipeline(
-            model,
-            contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True,
-                body_pair_hysteresis=0.001,
-            ),
-        )
+        model = builder.finalize(device=_DEVICE)
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         solver = SolverSteel(model, contact_warmstart=True)
         state, output = model.state(), model.state()
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+        # The solver and the pipeline share the (world_count + 1,) reset-mask layout.
         mask = wp.array([False, False, False], dtype=wp.bool, device=model.device)
-        solver_mask = mask[:2]
         # Compile both reset paths before capture.
-        solver.reset(state, solver_mask)
+        solver.reset(state, mask)
         pipeline.reset_contact_matching(mask)
         with wp.ScopedCapture(device=model.device) as capture:
-            solver.reset(state, solver_mask)
+            solver.reset(state, mask)
             pipeline.reset_contact_matching(mask)
             pipeline.collide(state, contacts)
         for selected in (0, 1):
@@ -1477,7 +1752,7 @@ class TestSteelPersistentContacts(unittest.TestCase):
             self.assertTrue(np.all(matches[worlds == selected] < 0))
             self.assertTrue(np.all(matches[worlds == 1 - selected] >= 0))
 
-    def _seed_rotating_contact(self, friction, *, oblique=False, rotated=False, device="cpu"):
+    def _seed_rotating_contact(self, friction, *, oblique=False, rotated=False, device=_DEVICE):
         """Prepare a cached friction impulse and move its normal across a basis seam."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.X, gravity=wp.vec3(0.0))
         builder.add_ground_plane()
@@ -1505,6 +1780,14 @@ class TestSteelPersistentContacts(unittest.TestCase):
         normals[0] = old_normal
         contacts.rigid_contact_normal.assign(normals)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+        # Material edits reach the solver through a notification, which discards the carried
+        # contact impulses; keep their row layout so both carriers are seeded below.
+        row_type = solver._ws_prev_mf_row_type.numpy()
+        row_parent = solver._ws_prev_mf_row_parent.numpy()
+        model.shape_material_mu.fill_(friction)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        solver._ws_prev_mf_row_type.assign(row_type)
+        solver._ws_prev_mf_row_parent.assign(row_parent)
         slot = int(solver._contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
         jacobian = solver._mf_J_a if int(solver._mf_body_a.numpy()[0, slot]) >= 0 else solver._mf_J_b
@@ -1533,9 +1816,6 @@ class TestSteelPersistentContacts(unittest.TestCase):
         indices = contacts.rigid_contact_match_index.numpy()
         indices[0] = 0
         contacts.rigid_contact_match_index.assign(indices)
-        model.shape_material_mu.fill_(friction)
-        # Refresh the solver's friction copy without the history reset a SHAPE_PROPERTIES notify performs.
-        solver._refresh_shape_materials()
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver._contact_slot.numpy()[0])
         impulses = solver._mf_impulses.numpy()[0, slot : slot + 3]
@@ -1553,11 +1833,8 @@ class TestSteelPersistentContacts(unittest.TestCase):
 
     def test_cached_friction_uses_solver_normal_convention(self):
         """Project friction in the frame used by the actual contact Jacobians."""
-        devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
-        for device in devices:
-            with self.subTest(device=str(device)):
-                _, world_tangent, projected_direction = self._seed_rotating_contact(1.0, oblique=True, device=device)
-                np.testing.assert_allclose(world_tangent, 0.5 * projected_direction, atol=1.0e-6)
+        _, world_tangent, projected_direction = self._seed_rotating_contact(1.0, oblique=True)
+        np.testing.assert_allclose(world_tangent, 0.5 * projected_direction, atol=1.0e-6)
 
     def test_cached_friction_obeys_changed_material(self):
         """Clamp carried friction to the current material before applying velocity."""
@@ -1567,110 +1844,39 @@ class TestSteelPersistentContacts(unittest.TestCase):
 
     def test_rotating_contact_clamps_the_projected_friction_cone(self):
         """Project through a 30-degree normal change and saturate the current cone."""
-        devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
-        for device in devices:
-            with self.subTest(device=str(device)):
-                impulses, tangent, projected = self._seed_rotating_contact(0.1, rotated=True, device=device)
-                expected = 0.1 * projected / np.linalg.norm(projected)
-                np.testing.assert_allclose(tangent, expected, atol=1.0e-6)
-                self.assertAlmostEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0], delta=1.0e-6)
-
-    def test_matching_retains_world_distance_policy(self):
-        """Moving beyond the existing world-distance threshold must cold-start."""
-        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-        for z in (0.1, 0.29):
-            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()))
-            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cpu")
-        state = model.state()
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
-        contacts = pipeline.contacts()
-        pipeline.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertGreater(count, 0)
-        poses = state.body_q.numpy()
-        poses[:, 0] += 1.0
-        state.body_q.assign(poses)
-        pipeline.collide(state, contacts)
-        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), count)
-        self.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] < 0))
-
-    def test_reduced_contacts_preserve_warmstart_identity(self):
-        """Carry only retained contact identities through reduction and solver steps."""
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        _cylinder_foot(builder, wp.vec3(0.0, 0.0, 0.015))
-        model = builder.finalize(device="cpu")
-        solver = SolverSteel(model, contact_warmstart=True, iterations=8)
-        pipeline = newton.CollisionPipeline(
-            model,
-            contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
-        )
-        contacts = pipeline.contacts()
-        state_in, state_out = model.state(), model.state()
-        matched = 0
-        for _ in range(40):
-            pipeline.collide(state_in, contacts)
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            indices = contacts.rigid_contact_match_index.numpy()[:count]
-            valid = indices[indices >= 0]
-            self.assertEqual(len(valid), len(np.unique(valid)), "a cached impulse was assigned more than once")
-            matched += len(valid)
-            self.assertEqual(int(pipeline._contact_matcher.prev_contact_count.numpy()[0]), count)
-            state_in.clear_forces()
-            solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
-            state_in, state_out = state_out, state_in
-        stats = pipeline.body_pair_reduction_stats()
-        self.assertGreater(stats["sum_contacts_in"], stats["sum_contacts_kept"])
-        self.assertGreater(matched, 20)
-        self.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
-        self.assertGreater(float(state_in.body_q.numpy()[0, 2]), 0.012)
-
-    def test_matching_reset_also_invalidates_reduction_history(self):
-        """Partial resets preserve other worlds; material changes start cold."""
-        template = newton.ModelBuilder()
-        _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
-        builder = newton.ModelBuilder()
-        builder.replicate(template, 2, spacing=(1.0, 0.0, 0.0))
-        builder.add_ground_plane()
-        model = builder.finalize(device="cpu")
-        pipeline = newton.CollisionPipeline(
-            model,
-            contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True,
-                body_pair_hysteresis=0.001,
-            ),
-        )
-        state, contacts = model.state(), pipeline.contacts()
-        pipeline.collide(state, contacts)
-        pipeline.collide(state, contacts)
-        generations = pipeline._body_pair_reducer.history_generation.numpy().copy()
-        pipeline.reset_contact_matching(wp.array([True, False, False], dtype=wp.bool, device=model.device))
-        after = pipeline._body_pair_reducer.history_generation.numpy()
-        self.assertGreater(after[0], generations[0])
-        self.assertEqual(after[1], generations[1])
-        pipeline.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        shape0 = contacts.rigid_contact_shape0.numpy()[:count]
-        shape1 = contacts.rigid_contact_shape1.numpy()[:count]
-        worlds = np.maximum(model.shape_world.numpy()[shape0], model.shape_world.numpy()[shape1])
-        matches = contacts.rigid_contact_match_index.numpy()[:count]
-        self.assertTrue(np.any(worlds == 0) and np.any(worlds == 1))
-        self.assertTrue(np.all(matches[worlds == 0] < 0))
-        self.assertTrue(np.all(matches[worlds == 1] >= 0))
-        model.shape_material_mu.fill_(0.1)
-        pipeline.refresh_body_pair_reduction_groups()
-        pipeline.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] < 0))
+        impulses, tangent, projected = self._seed_rotating_contact(0.1, rotated=True)
+        expected = 0.1 * projected / np.linalg.norm(projected)
+        np.testing.assert_allclose(tangent, expected, atol=1.0e-6)
+        self.assertAlmostEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0], delta=1.0e-6)
 
 
-RADIUS = 0.05
+def test_matching_retains_world_distance_policy(test, device):
+    """Cold-start contacts that move beyond the world-distance threshold."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    for z in (0.1, 0.29):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    model = builder.finalize(device=device)
+    state = model.state()
+    pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+    poses = state.body_q.numpy()
+    poses[:, 0] += 1.0
+    state.body_q.assign(poses)
+    pipeline.collide(state, contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), count)
+    test.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] < 0))
 
 
-CONTACT_GAP = 0.1
+add_function_test(
+    TestSteelPersistentContacts,
+    "test_matching_retains_world_distance_policy",
+    test_matching_retains_world_distance_policy,
+    devices=get_test_devices(),
+)
 
 
 DEFAULT_DT = 1.0e-3
@@ -1683,128 +1889,34 @@ IMPACT_FRACTION = 0.4
 PATH_DENSE = 0
 
 
-RESPONSE_MODES = ("immediate", "propagation", "colored")
-
-
-EXPECTED_PATHS = {
-    ("free", "immediate"): {PATH_MATRIX_FREE},
-    ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "colored"): {PATH_PROPAGATION},
-    ("articulated", "immediate"): {PATH_DENSE},
-    ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "colored"): {PATH_PROPAGATION},
-}
-
-
-def _diagonal_inertia(value):
-    """Return an isotropic inertia tensor."""
-    return wp.mat33(value, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, value)
-
-
-def _sphere_inertia(mass):
-    """Return the inertia of a solid sphere about its centre."""
-    return _diagonal_inertia(0.4 * mass * RADIUS * RADIUS)
-
-
-def _shape_cfg(restitution):
-    """Return an inertialess, frictionless test material."""
-    return newton.ModelBuilder.ShapeConfig(
-        density=0.0,
-        mu=0.0,
-        restitution=restitution,
-        margin=0.0,
-        gap=CONTACT_GAP,
-    )
-
-
-def _build_plane_model(
-    device,
-    *,
-    separation,
-    restitution,
-    plane_restitution=None,
-    mass=1.0,
-    gravity=(0.0, 0.0, 0.0),
-    scene="free",
-):
-    """Build one sphere above a plane, optionally as a two-link articulation."""
-    builder = newton.ModelBuilder(gravity=gravity)
-    xform = wp.transform(wp.vec3(0.0, 0.0, RADIUS + separation), wp.quat_identity())
-    if scene == "free":
-        body = builder.add_body(
-            xform=xform,
-            mass=mass,
-            inertia=_sphere_inertia(mass),
-            lock_inertia=True,
-        )
-    elif scene == "articulated":
-        # A concentric, shape-free fixed child makes this a real floating
-        # articulation without adding a second contact or a changing contact
-        # point velocity to the analytical one-row problem.
-        body = builder.add_link(
-            xform=xform,
-            mass=mass,
-            inertia=_sphere_inertia(mass),
-            lock_inertia=True,
-        )
-        child_mass = 0.25 * mass
-        child = builder.add_link(
-            xform=xform,
-            mass=child_mass,
-            inertia=_sphere_inertia(child_mass),
-            lock_inertia=True,
-        )
-        root_joint = builder.add_joint_free(child=body)
-        fixed_joint = builder.add_joint_fixed(parent=body, child=child)
-        builder.add_articulation([root_joint, fixed_joint])
-    else:
-        raise ValueError(f"unknown scene {scene!r}")
-
-    builder.add_shape_sphere(body, radius=RADIUS, cfg=_shape_cfg(restitution))
-    builder.add_ground_plane(cfg=_shape_cfg(restitution if plane_restitution is None else plane_restitution))
-    return builder.finalize(device=device), body
+# The route each scene takes: a lone free body uses the free-body rows, and a
+# contact on an articulated root uses the dense rows.
+EXPECTED_PATHS = {"free": {PATH_MATRIX_FREE}, "articulated": {PATH_DENSE}}
 
 
 def _make_solver(
     model,
     *,
-    enable_restitution=None,
     velocity_iterations=0,
-    response="immediate",
     restitution_velocity_threshold=0.0,
     iterations=16,
     contact_warmstart=False,
-    mf_warmstart=False,
-    restitution_combine="average",
+    enable_restitution=True,
 ):
-    """Construct a deterministic frictionless Steel test solver."""
+    """Construct a deterministic frictionless Steel test solver without angular damping."""
     kwargs = {
-        "contact_friction_scale": 0.0,
-        **steel_mode_options(response),
         "iterations": iterations,
         "velocity_iterations": velocity_iterations,
         "cfm": 0.0,
         "relaxation": 1.0,
-        "contact_warmstart": contact_warmstart or mf_warmstart,
-        "restitution_combine": restitution_combine,
+        "contact_warmstart": contact_warmstart,
+        "enable_restitution": enable_restitution,
     }
-    if enable_restitution is not None:
-        kwargs["enable_restitution"] = enable_restitution
     if restitution_velocity_threshold is not None:
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
     solver = newton.solvers.SolverSteel(model, **kwargs)
     solver._rigid_body_angular_damping.zero_()
     return solver
-
-
-def _reset_state(model, state, vertical_velocity):
-    """Restore the authored pose and set a free root's world-z velocity."""
-    wp.copy(state.joint_q, model.joint_q)
-    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-    joint_qd[2] = vertical_velocity
-    state.joint_qd.assign(joint_qd)
-    state.clear_forces()
-    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
 
 def _step_plane(
@@ -1819,12 +1931,10 @@ def _step_plane(
     gravity=(0.0, 0.0, 0.0),
     initial_vertical_velocity=None,
     scene="free",
-    response="immediate",
-    enable_restitution=None,
     velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     iterations=16,
-    restitution_combine="average",
+    enable_restitution=True,
 ):
     """Run one sphere-plane step and return observable contact and state data."""
     model, body = _build_plane_model(
@@ -1839,11 +1949,9 @@ def _step_plane(
     solver = _make_solver(
         model,
         velocity_iterations=velocity_iterations,
-        response=response,
-        enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
         iterations=iterations,
-        restitution_combine=restitution_combine,
+        enable_restitution=enable_restitution,
     )
     state_in, state_out = model.state(), model.state()
     vz = -speed if initial_vertical_velocity is None else initial_vertical_velocity
@@ -2032,7 +2140,7 @@ def test_non_crossing_speculative_contact_does_not_bounce(test, device):
 
 
 def test_shape_restitution_uses_symmetric_arithmetic_average(test, device):
-    """Average sanitized shape coefficients symmetrically, including authored zero."""
+    """Average finite, clamped shape coefficients symmetrically, including authored zero."""
     speed = 4.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     cases = (
@@ -2041,7 +2149,6 @@ def test_shape_restitution_uses_symmetric_arithmetic_average(test, device):
         (0.8, 0.2, 0.5),
         (2.0, 0.8, 0.9),
         (-0.2, 0.8, 0.4),
-        (float("nan"), 0.8, 0.4),
     )
     for sphere_e, plane_e, mixed in cases:
         label = f"sphere={sphere_e}, plane={plane_e}"
@@ -2057,204 +2164,7 @@ def test_shape_restitution_uses_symmetric_arithmetic_average(test, device):
             _assert_velocity(test, result["after"], mixed * speed, speed, label)
 
 
-COMBINE_MODES = ("average", "min", "multiply", "max")
-
-
-def _combined(mode, a, b):
-    """Return the float32 reference combination of two coefficients."""
-    a, b = np.float32(a), np.float32(b)
-    return {
-        "average": (a + b) / np.float32(2.0),
-        "min": min(a, b),
-        "multiply": a * b,
-        "max": max(a, b),
-    }[mode]
-
-
-def test_restitution_combine_modes_on_every_route(test, device):
-    """Rebound at each mode's combined coefficient on every free and articulated route."""
-    speed = 3.0
-    separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    sphere_e, plane_e = 0.8, 0.4
-    routes = [(scene, response) for scene in ("free", "articulated") for response in RESPONSE_MODES]
-    for mode in COMBINE_MODES:
-        expected = float(_combined(mode, sphere_e, plane_e))
-        for scene, response in routes:
-            label = f"{mode}/{scene}/{response}"
-            with test.subTest(case=label):
-                result = _step_plane(
-                    device,
-                    separation=separation,
-                    speed=speed,
-                    restitution=sphere_e,
-                    plane_restitution=plane_e,
-                    scene=scene,
-                    response=response,
-                    restitution_combine=mode,
-                )
-                _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
-                _assert_velocity(test, result["after"], expected * speed, speed, label, rtol=5.0e-3)
-
-
-SLIDE_DT = 5.0e-3
-SLIDE_STEPS = 40
-SLIDE_SPEED = 3.0
-SLIDE_HALF = 0.1
-
-
-def _slide_box(device, *, scene, response, friction_combine, box_mu=0.8, ground_mu=0.4, edit=None):
-    """Slide a box across the ground and return its x speeds per step and the contact routes it used.
-
-    ``edit`` is ``(step, box_mu)``: replace the box's friction coefficient in place before that step and notify.
-    """
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    ground_cfg = newton.ModelBuilder.ShapeConfig(mu=ground_mu, restitution=0.0, gap=0.01)
-    box_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=box_mu, restitution=0.0, gap=0.01)
-    builder.add_ground_plane(cfg=ground_cfg)
-    xform = wp.transform(wp.vec3(0.0, 0.0, SLIDE_HALF), wp.quat_identity())
-    inertia = _diagonal_inertia(2.0 / 3.0 * SLIDE_HALF * SLIDE_HALF)
-    if scene == "free":
-        body = builder.add_body(xform=xform, mass=1.0, inertia=inertia, lock_inertia=True)
-    else:
-        body = builder.add_link(xform=xform, mass=1.0, inertia=inertia, lock_inertia=True)
-        child = builder.add_link(xform=xform, mass=0.25, inertia=_diagonal_inertia(0.001), lock_inertia=True)
-        root_joint = builder.add_joint_free(child=body)
-        fixed_joint = builder.add_joint_fixed(parent=body, child=child)
-        builder.add_articulation([root_joint, fixed_joint])
-    box_shape = builder.add_shape_box(body, hx=SLIDE_HALF, hy=SLIDE_HALF, hz=SLIDE_HALF, cfg=box_cfg)
-    model = builder.finalize(device=device)
-    solver = SolverSteel(model, iterations=32, friction_combine=friction_combine, **steel_mode_options(response))
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    state_in, state_out = model.state(), model.state()
-    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-    joint_qd[0] = SLIDE_SPEED
-    state_in.joint_qd.assign(joint_qd)
-    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    speeds, paths = [], set()
-    for step in range(SLIDE_STEPS):
-        if edit is not None and step == edit[0]:
-            mu = model.shape_material_mu.numpy()
-            mu[box_shape] = edit[1]
-            model.shape_material_mu.assign(mu)
-            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
-        state_in.clear_forces()
-        pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, model.control(), contacts, SLIDE_DT)
-        state_in, state_out = state_out, state_in
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        paths |= {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
-        speeds.append(float(state_in.body_qd.numpy()[body][0]))
-    return np.array(speeds), paths
-
-
-def _assert_sliding_deceleration(test, speeds, mu, label, first=5, last=None):
-    """Assert the box decelerates at mu * g between two steps while it is still sliding."""
-    last = len(speeds) - 1 if last is None else last
-    test.assertGreater(speeds[last], 0.1, f"{label}: the box stopped, so the slide no longer measures mu")
-    deceleration = (speeds[first] - speeds[last]) / ((last - first) * SLIDE_DT)
-    test.assertAlmostEqual(
-        deceleration, mu * 9.81, delta=0.02 * mu * 9.81, msg=f"{label}: deceleration {deceleration:.4f} m/s^2"
-    )
-
-
-def test_friction_combine_modes_on_every_route(test, device):
-    """Decelerate a sliding box at each mode's combined coefficient on every free and articulated route."""
-    routes = [(scene, response) for scene in ("free", "articulated") for response in RESPONSE_MODES]
-    for mode in COMBINE_MODES:
-        mu = float(_combined(mode, 0.8, 0.4))
-        for scene, response in routes:
-            label = f"{mode}/{scene}/{response}"
-            with test.subTest(case=label):
-                speeds, paths = _slide_box(device, scene=scene, response=response, friction_combine=mode)
-                test.assertEqual(paths, EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
-                _assert_sliding_deceleration(test, speeds, mu, label)
-
-
-def test_friction_combine_reads_notified_coefficient_edits(test, device):
-    """Combine an in-place, notified shape friction edit under a non-average mode."""
-    for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("articulated", "propagation")):
-        label = f"{scene}/{response}"
-        with test.subTest(case=label):
-            speeds, _ = _slide_box(
-                device,
-                scene=scene,
-                response=response,
-                friction_combine="min",
-                edit=(20, 0.2),
-            )
-            _assert_sliding_deceleration(test, speeds, 0.4, f"{label}, before the edit", first=5, last=19)
-            _assert_sliding_deceleration(test, speeds, 0.2, f"{label}, after the edit", first=22, last=39)
-
-
-@wp.kernel
-def _combine_probe(
-    shape_a: wp.array[int],
-    shape_b: wp.array[int],
-    coefficients: wp.array[float],
-    combine: int,
-    mixed: wp.array[float],
-    restitution: wp.array[float],
-    torsional: wp.array[float],
-    rolling: wp.array[float],
-):
-    i = wp.tid()
-    mixed[i] = combine_shape_coefficients(shape_a[i], shape_b[i], coefficients, combine)
-    restitution[i] = mixed_contact_restitution(shape_a[i], shape_b[i], coefficients, combine)
-    spin, roll = contact_angular_friction_coefficients(shape_a[i], shape_b[i], coefficients, coefficients, combine)
-    torsional[i] = spin
-    rolling[i] = roll
-
-
-class TestSteelMaterialCombine(unittest.TestCase):
-    def test_combine_helpers_match_float32_references(self):
-        """Combine pairs exactly per mode, keep a lone shape's value, and sanitize restitution first."""
-        values = np.array([0.8, 0.4, 0.3, 1.7, np.nan, -0.5], dtype=np.float32)
-        pairs = [(0, 1), (1, 0), (2, 3), (0, -1), (-1, 2), (-1, -1), (4, 0), (5, 3)]
-        coefficients = wp.array(values, dtype=wp.float32, device="cpu")
-        shape_a = wp.array([a for a, _ in pairs], dtype=wp.int32, device="cpu")
-        shape_b = wp.array([b for _, b in pairs], dtype=wp.int32, device="cpu")
-        for mode, mode_id in _MATERIAL_COMBINE_MODES.items():
-            with self.subTest(mode=mode):
-                mixed = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
-                restitution = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
-                torsional = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
-                rolling = wp.zeros(len(pairs), dtype=wp.float32, device="cpu")
-                wp.launch(
-                    _combine_probe,
-                    dim=len(pairs),
-                    inputs=[shape_a, shape_b, coefficients, mode_id],
-                    outputs=[mixed, restitution, torsional, rolling],
-                    device="cpu",
-                )
-                for i, (a, b) in enumerate(pairs):
-                    raw = [values[k] for k in (a, b) if k >= 0]
-                    clean = [np.float32(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else np.float32(0.0) for v in raw]
-                    expected_mixed = np.float32(0.0) if not raw else raw[0] if len(raw) == 1 else _combined(mode, *raw)
-                    expected_e = (
-                        np.float32(0.0) if not clean else clean[0] if len(clean) == 1 else _combined(mode, *clean)
-                    )
-                    if all(np.isfinite(raw)):  # Unsanitized non-finite mu is undefined input.
-                        np.testing.assert_array_equal(mixed.numpy()[i], expected_mixed, err_msg=f"pair {a},{b}")
-                        angular = max(expected_mixed, np.float32(0.0))
-                        np.testing.assert_array_equal(torsional.numpy()[i], angular, err_msg=f"pair {a},{b}")
-                        np.testing.assert_array_equal(rolling.numpy()[i], angular, err_msg=f"pair {a},{b}")
-                    np.testing.assert_array_equal(restitution.numpy()[i], expected_e, err_msg=f"pair {a},{b}")
-
-    def test_rejects_unknown_combine_mode_and_stays_read_only(self):
-        """Reject an unknown mode at construction and keep both options construction-only."""
-        model = newton.ModelBuilder().finalize(device="cpu")
-        for name in ("friction_combine", "restitution_combine"):
-            with self.subTest(option=name):
-                with self.assertRaisesRegex(ValueError, f"{name} must be one of"):
-                    SolverSteel(model, **{name: "geometric"})
-                solver = SolverSteel(model, **{name: "max"})
-                self.assertEqual(getattr(solver, name), "max")
-                with self.assertRaises(AttributeError):
-                    setattr(solver, name, "min")
-
-
-def test_restitution_velocity_threshold_uses_incident_relative_speed(test, device):
+def test_restitution_velocity_threshold_uses_relative_closing_speed(test, device):
     """Suppress low-speed bounce and activate immediately above the threshold."""
     threshold = 0.5
     restitution = 0.8
@@ -2299,6 +2209,26 @@ def test_restitution_velocity_threshold_uses_incident_relative_speed(test, devic
     _assert_velocity(test, out_a, 9.8 + 0.5 * residual_closing, 0.4, "relative threshold, body A")
     _assert_velocity(test, out_b, 9.8 - 0.5 * residual_closing, 0.4, "relative threshold, body B")
     test.assertAlmostEqual(out_a + out_b, 19.6, delta=1.0e-4, msg="relative threshold: momentum drifted")
+
+
+def test_disabled_restitution_needs_no_material_edits(test, device):
+    """Give the zero-restitution result with enable_restitution=False, leaving materials unchanged.
+
+    Zeroing one shape's coefficient still leaves the average.
+    """
+    speed = 2.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    for scene in ("free", "articulated"):
+        with test.subTest(scene=scene):
+            common = {"separation": separation, "speed": speed, "scene": scene}
+            bouncing = _step_plane(device, restitution=0.8, plane_restitution=0.8, **common)
+            one_zero = _step_plane(device, restitution=0.0, plane_restitution=0.8, **common)
+            inelastic = _step_plane(device, restitution=0.0, plane_restitution=0.0, **common)
+            disabled = _step_plane(device, restitution=0.8, plane_restitution=0.8, enable_restitution=False, **common)
+            _assert_velocity(test, bouncing["after"], 0.8 * speed, speed, f"{scene}: authored rebound")
+            _assert_velocity(test, one_zero["after"], 0.4 * speed, speed, f"{scene}: averaged rebound")
+            test.assertAlmostEqual(disabled["after"], inelastic["after"], delta=1.0e-6 * speed)
+            test.assertAlmostEqual(disabled["end_gap"], inelastic["end_gap"], delta=1.0e-7)
 
 
 def test_bouncing_ball_settles_to_rest_under_gravity(test, device):
@@ -2352,12 +2282,111 @@ def test_bouncing_ball_settles_to_rest_under_gravity(test, device):
     test.assertGreater(float(tail_heights.min()), RADIUS - 1.5e-3, "resting contact sank into the plane")
 
 
+RESPONSE_MODES = ("immediate", "propagation", "colored")
+
+
 PRESSED_DT = 5.0e-3
+
+
 PRESSED_RESTITUTION = 0.5
+
+
 PRESSED_THRESHOLD = 0.5
+
+
 FOOT_HALF_HEIGHT = 0.02
+
+
 FOOT_LEG_MASS = 4.0
+
+
 FOOT_PRESS_FORCE = 1000.0
+
+
+BOX_PRESS_FORCE = 400.0
+
+
+BOX_HALF_HEIGHT = 0.05
+
+
+def test_drive_pressed_resting_contact_does_not_bounce(test, device):
+    """Keep a foot that a drive or joint force presses onto the ground at rest on every route.
+
+    The press adds about ``dt * F / m`` of closing speed per step, well above the threshold, but the foot starts
+    each step at rest; that is a sustained contact, not an impact.
+    """
+    test.assertGreater(PRESSED_DT * FOOT_PRESS_FORCE / FOOT_LEG_MASS, 2.0 * PRESSED_THRESHOLD)
+    cases = [("explicit", response) for response in RESPONSE_MODES]
+    cases += [("augmented", "immediate"), ("augmented", "propagation")]
+    for drive, response in cases:
+        label = f"{drive}/{response}"
+        with test.subTest(case=label):
+            heights, speeds, forces = _roll_pressed_foot(device, drive=drive, response=response, steps=10)
+            test.assertLess(float(np.abs(speeds).max()), 1.0e-2, f"{label}: the pressed foot moved")
+            test.assertLess(float(heights.max()), 1.0e-3, f"{label}: the pressed foot left the ground")
+            load = FOOT_PRESS_FORCE + FOOT_LEG_MASS * 9.81
+            test.assertGreater(float(forces.min()), 0.9 * load, f"{label}: the contact released")
+            test.assertLess(float(forces.max()), 1.1 * load, f"{label}: the contact force spiked")
+
+
+def test_force_pressed_resting_free_body_does_not_bounce(test, device):
+    """Keep a free box that a large body force presses onto the ground at rest."""
+    test.assertGreater(PRESSED_DT * BOX_PRESS_FORCE, 2.0 * PRESSED_THRESHOLD)
+    for response in ("immediate", "propagation"):
+        with test.subTest(response=response):
+            heights, speeds, _forces = _roll_pressed_box(device, response=response, steps=10)
+            test.assertLess(float(np.abs(speeds).max()), 1.0e-2, f"{response}: the pressed box moved")
+            test.assertLess(float(heights.max()), 1.0e-3, f"{response}: the pressed box left the ground")
+
+
+def test_pressed_landing_rebounds_from_step_start_speed_and_settles(test, device):
+    """Rebound a pressed landing at ``e`` times its step-start closing speed, then settle under the press.
+
+    The press adds about 1.3 m/s (foot) or 2 m/s (box) of closing speed per step. A rebound target that included it
+    would leave every later landing above the threshold, a bounce cycle that never settles.
+    """
+    cases = [("rows", "immediate"), ("explicit", "colored")]
+    cases += [(drive, response) for drive in ("explicit", "augmented", "body_f") for response in RESPONSE_MODES[:2]]
+    for drive, response in cases:
+        label = f"{drive}/{response}"
+        with test.subTest(case=label):
+            landing = {"response": response, "steps": 24, "initial_gap": 0.02, "initial_speed": 0.6}
+            if drive == "body_f":
+                heights, speeds, forces = _roll_pressed_box(device, **landing)
+                load = BOX_PRESS_FORCE + 9.81
+            else:
+                heights, speeds, forces = _roll_pressed_foot(device, drive=drive, **landing)
+                load = FOOT_PRESS_FORCE + FOOT_LEG_MASS * 9.81
+            impact = int(np.argmax(forces > 0.0))
+            test.assertGreater(impact, 0, f"{label}: the contact was active before the landing")
+            landing_speed = -speeds[impact - 1]
+            test.assertGreater(landing_speed, 2.0 * PRESSED_THRESHOLD, f"{label}: the landing was not an impact")
+            rebound = PRESSED_RESTITUTION * landing_speed
+            test.assertGreater(speeds[impact], 0.9 * rebound, f"{label}: the landing did not rebound")
+            test.assertLess(speeds[impact], 1.05 * rebound, f"{label}: the press enlarged the rebound")
+            tail = slice(14, None)
+            test.assertLess(float(np.abs(speeds[tail]).max()), 1.0e-2, f"{label}: the landing did not settle")
+            test.assertLess(float(heights[tail].max()), 1.0e-3, f"{label}: the foot kept leaving the ground")
+            test.assertGreater(float(forces[tail].min()), 0.9 * load, f"{label}: the contact released")
+            test.assertLess(float(forces[tail].max()), 1.1 * load, f"{label}: the contact force spiked")
+
+
+def test_exit_velocity_is_monotonic_in_a_separating_force(test, device):
+    """Leave a touching impact at ``max(e * u_start, post-force velocity)`` as an upward force grows.
+
+    The force slows the closing contact within the step, then reverses it; the exit velocity must never drop.
+    """
+    closing_speed = 2.0
+    forces = np.linspace(0.0, 700.0, 29)
+    post_force = -closing_speed + PRESSED_DT * (forces - 9.81)
+    expected = np.maximum(PRESSED_RESTITUTION * closing_speed, post_force)
+    for scene in ("free", "articulated"):
+        for response in ("immediate", "propagation"):
+            label = f"{scene}/{response}"
+            with test.subTest(case=label):
+                exit_velocity = _sweep_separating_force(device, scene, response, forces, closing_speed)
+                np.testing.assert_allclose(exit_velocity, expected, atol=2.0e-3, err_msg=f"{label}: exit velocity")
+                test.assertGreaterEqual(float(np.diff(exit_velocity).min()), -1.0e-4, f"{label}: exit velocity dropped")
 
 
 def _build_pressed_foot(device, *, drive, initial_gap=0.0):
@@ -2418,16 +2447,21 @@ def _build_pressed_foot(device, *, drive, initial_gap=0.0):
     return model, foot, control
 
 
-def _roll_pressed_foot(device, *, drive, response, steps, initial_gap=0.0, initial_speed=0.0):
-    """Step the pressed foot and return its per-step bottom height, vertical speed and normal contact force."""
-    model, foot, control = _build_pressed_foot(device, drive=drive, initial_gap=initial_gap)
-    solver = SolverSteel(
+def _pressed_solver(model, response, drive_mode="augmented"):
+    """Build the matrix-free solver of the pressed-contact tests."""
+    return SolverSteel(
         model,
         iterations=16,
         restitution_velocity_threshold=PRESSED_THRESHOLD,
-        drive_mode="rows" if drive == "rows" else "augmented",
         **steel_mode_options(response),
+        drive_mode=drive_mode,
     )
+
+
+def _roll_pressed_foot(device, *, drive, response, steps, initial_gap=0.0, initial_speed=0.0):
+    """Step the pressed foot and return its per-step bottom height, vertical speed and normal contact force."""
+    model, foot, control = _build_pressed_foot(device, drive=drive, initial_gap=initial_gap)
+    solver = _pressed_solver(model, response, "rows" if drive == "rows" else "augmented")
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
@@ -2448,133 +2482,6 @@ def _roll_pressed_foot(device, *, drive, response, steps, initial_gap=0.0, initi
     return np.array(heights), np.array(speeds), np.array(forces)
 
 
-def test_drive_pressed_resting_contact_does_not_bounce(test, device):
-    """Keep a foot that a drive or joint force presses onto the ground at rest on every route.
-
-    The press adds about ``dt * F / m`` of closing speed per step, well above the threshold, but the foot starts
-    each step at rest; that is a sustained contact, not an impact.
-    """
-    test.assertGreater(PRESSED_DT * FOOT_PRESS_FORCE / FOOT_LEG_MASS, 2.0 * PRESSED_THRESHOLD)
-    cases = [("explicit", response) for response in RESPONSE_MODES]
-    cases += [("augmented", "immediate"), ("augmented", "propagation"), ("rows", "immediate")]
-    for drive, response in cases:
-        label = f"{drive}/{response}"
-        with test.subTest(case=label):
-            heights, speeds, forces = _roll_pressed_foot(device, drive=drive, response=response, steps=60)
-            test.assertLess(float(np.abs(speeds).max()), 1.0e-2, f"{label}: the pressed foot moved")
-            test.assertLess(float(heights.max()), 1.0e-3, f"{label}: the pressed foot left the ground")
-            load = FOOT_PRESS_FORCE + FOOT_LEG_MASS * 9.81
-            test.assertGreater(float(forces.min()), 0.9 * load, f"{label}: the contact released")
-            test.assertLess(float(forces.max()), 1.1 * load, f"{label}: the contact force spiked")
-
-
-BOX_PRESS_FORCE = 400.0
-BOX_HALF_HEIGHT = 0.05
-
-
-def test_force_pressed_resting_free_body_does_not_bounce(test, device):
-    """Keep a free box that a large body force presses onto the ground at rest."""
-    test.assertGreater(PRESSED_DT * BOX_PRESS_FORCE, 2.0 * PRESSED_THRESHOLD)
-    for response in ("immediate", "propagation"):
-        label = response
-        with test.subTest(case=label):
-            heights, speeds, _forces = _roll_pressed_box(device, response=response, steps=60)
-            test.assertLess(float(np.abs(speeds).max()), 1.0e-2, f"{label}: the pressed box moved")
-            test.assertLess(float(heights.max()), 1.0e-3, f"{label}: the pressed box left the ground")
-
-
-def test_pressed_landing_rebounds_from_step_start_speed_and_settles(test, device):
-    """Rebound a pressed landing at ``e`` times its step-start closing speed, then settle under the press.
-
-    The press adds about 1.3 m/s (foot) or 2 m/s (box) of closing speed per step. A rebound target that included it
-    would leave every later landing above the threshold, a bounce cycle that never settles.
-    """
-    cases = [("rows", "immediate")]
-    cases += [(drive, response) for drive in ("explicit", "augmented", "body_f") for response in RESPONSE_MODES]
-    for drive, response in cases:
-        label = f"{drive}/{response}"
-        with test.subTest(case=label):
-            landing = {"response": response, "steps": 40, "initial_gap": 0.02}
-            if drive == "body_f":
-                heights, speeds, forces = _roll_pressed_box(device, **landing, initial_speed=0.6)
-                load = BOX_PRESS_FORCE + 9.81
-            else:
-                heights, speeds, forces = _roll_pressed_foot(device, drive=drive, **landing, initial_speed=0.6)
-                load = FOOT_PRESS_FORCE + FOOT_LEG_MASS * 9.81
-            impact = int(np.argmax(forces > 0.0))
-            test.assertGreater(impact, 0, f"{label}: the contact was active before the landing")
-            landing_speed = -speeds[impact - 1]
-            test.assertGreater(landing_speed, 2.0 * PRESSED_THRESHOLD, f"{label}: the landing was not an impact")
-            rebound = PRESSED_RESTITUTION * landing_speed
-            test.assertGreater(speeds[impact], 0.9 * rebound, f"{label}: the landing did not rebound")
-            test.assertLess(speeds[impact], 1.05 * rebound, f"{label}: the press enlarged the rebound")
-            tail = slice(20, None)
-            test.assertLess(float(np.abs(speeds[tail]).max()), 1.0e-2, f"{label}: the landing did not settle")
-            test.assertLess(float(heights[tail].max()), 1.0e-3, f"{label}: the foot kept leaving the ground")
-            test.assertGreater(float(forces[tail].min()), 0.9 * load, f"{label}: the contact released")
-            test.assertLess(float(forces[tail].max()), 1.1 * load, f"{label}: the contact force spiked")
-
-
-def test_exit_velocity_is_monotonic_in_a_separating_force(test, device):
-    """Leave a touching impact at ``max(e * u_start, post-force velocity)`` as an upward force grows.
-
-    The force slows the closing contact within the step, then reverses it; the exit velocity must never drop.
-    """
-    closing_speed = 2.0
-    forces = np.linspace(0.0, 700.0, 29)
-    post_force = -closing_speed + PRESSED_DT * (forces - 9.81)
-    expected = np.maximum(PRESSED_RESTITUTION * closing_speed, post_force)
-    for scene, response in (
-        ("free", "immediate"),
-        ("free", "propagation"),
-        ("articulated", "immediate"),
-        ("articulated", "propagation"),
-    ):
-        label = f"{scene}/{response}"
-        with test.subTest(case=label):
-            exit_velocity = _sweep_separating_force(device, scene, response, forces, closing_speed)
-            np.testing.assert_allclose(exit_velocity, expected, atol=2.0e-3, err_msg=f"{label}: exit velocity")
-            test.assertGreaterEqual(float(np.diff(exit_velocity).min()), -1.0e-4, f"{label}: exit velocity dropped")
-
-
-def _sweep_separating_force(device, scene, response, forces, closing_speed):
-    """Step one world per force once: a 1 kg box touching the ground, closing, pushed up; return its exit speed."""
-    env = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, restitution=PRESSED_RESTITUTION, gap=0.01)
-    pose = wp.transform(wp.vec3(0.0, 0.0, BOX_HALF_HEIGHT), wp.quat_identity())
-    if scene == "free":
-        body = env.add_body(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
-    else:
-        body = env.add_link(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
-        env.add_articulation([env.add_joint_prismatic(-1, body, axis=(0.0, 0.0, 1.0), parent_xform=pose)])
-    env.add_shape_box(body, hx=0.05, hy=0.05, hz=BOX_HALF_HEIGHT, cfg=cfg)
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    builder.replicate(env, len(forces))
-    builder.add_ground_plane(cfg=cfg)
-    model = builder.finalize(device=device)
-    solver = SolverSteel(
-        model, iterations=16, restitution_velocity_threshold=PRESSED_THRESHOLD, **steel_mode_options(response)
-    )
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    state_in, state_out, control = model.state(), model.state(), model.control()
-    dofs_per_world = model.joint_dof_count // len(forces)
-    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-    joint_qd[(2 if scene == "free" else 0) :: dofs_per_world] = -closing_speed
-    state_in.joint_qd.assign(joint_qd)
-    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    state_in.clear_forces()
-    if scene == "free":
-        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
-        wrench[:, 2] = forces
-        state_in.body_f.assign(wrench)
-    else:
-        control.joint_f.assign(forces.astype(np.float32))
-    pipeline.collide(state_in, contacts)
-    solver.step(state_in, state_out, control, contacts, PRESSED_DT)
-    return state_out.body_qd.numpy()[:, 2].astype(np.float64)
-
-
 def _roll_pressed_box(device, *, response, steps, initial_gap=0.0, initial_speed=0.0):
     """Step a 1 kg free box pressed down by a body force; return its bottom height, vertical speed and contact force."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -2588,9 +2495,7 @@ def _roll_pressed_box(device, *, response, steps, initial_gap=0.0, initial_speed
     )
     builder.add_shape_box(body, hx=0.05, hy=0.05, hz=BOX_HALF_HEIGHT, cfg=cfg)
     model = builder.finalize(device=device)
-    solver = SolverSteel(
-        model, iterations=16, restitution_velocity_threshold=PRESSED_THRESHOLD, **steel_mode_options(response)
-    )
+    solver = _pressed_solver(model, response)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
@@ -2610,6 +2515,42 @@ def _roll_pressed_box(device, *, response, steps, initial_gap=0.0, initial_speed
         speeds.append(float(state_in.body_qd.numpy()[body][2]))
         forces.append(float(np.abs(observables.contact_f.numpy()[:count, 2]).sum()))
     return np.array(heights), np.array(speeds), np.array(forces)
+
+
+def _sweep_separating_force(device, scene, response, forces, closing_speed):
+    """Step one world per force once: a 1 kg box touching the ground, closing, pushed up; return its exit speed."""
+    env = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, restitution=PRESSED_RESTITUTION, gap=0.01)
+    pose = wp.transform(wp.vec3(0.0, 0.0, BOX_HALF_HEIGHT), wp.quat_identity())
+    if scene == "free":
+        body = env.add_body(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
+    else:
+        body = env.add_link(xform=pose, mass=1.0, inertia=_diagonal_inertia(0.002), lock_inertia=True)
+        env.add_articulation([env.add_joint_prismatic(-1, body, axis=(0.0, 0.0, 1.0), parent_xform=pose)])
+    env.add_shape_box(body, hx=0.05, hy=0.05, hz=BOX_HALF_HEIGHT, cfg=cfg)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    builder.replicate(env, len(forces))
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    solver = _pressed_solver(model, response)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    dofs_per_world = model.joint_dof_count // len(forces)
+    joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    joint_qd[(2 if scene == "free" else 0) :: dofs_per_world] = -closing_speed
+    state_in.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    state_in.clear_forces()
+    if scene == "free":
+        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+        wrench[:, 2] = forces
+        state_in.body_f.assign(wrench)
+    else:
+        control.joint_f.assign(forces.astype(np.float32))
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, control, contacts, PRESSED_DT)
+    return state_out.body_qd.numpy()[:, 2].astype(np.float64)
 
 
 def _build_two_sphere_model(device, *, separation, restitution, mass_a, mass_b):
@@ -2730,85 +2671,79 @@ def test_two_body_impact_conserves_momentum_and_reverses_relative_speed(test, de
 
 
 def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
-    """Measure rebound relative to prescribed motion on MF and propagation rows."""
+    """Measure rebound relative to prescribed motion on the free-body rows."""
     restitution = 0.6
     closing_speed = 3.0
     separation = IMPACT_FRACTION * closing_speed * DEFAULT_DT
-    expected_path = {"immediate": PATH_MATRIX_FREE, "propagation": PATH_PROPAGATION}
+    for frame_speed in (0.0, 7.0):
+        label = f"frame={frame_speed}"
+        with test.subTest(frame_speed=frame_speed):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            cfg = _shape_cfg(restitution)
+            dynamic_body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+                mass=1.0,
+                inertia=_sphere_inertia(1.0),
+                lock_inertia=True,
+            )
+            kinematic_body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * RADIUS + separation), wp.quat_identity()),
+                mass=1.0,
+                inertia=_sphere_inertia(1.0),
+                lock_inertia=True,
+                is_kinematic=True,
+            )
+            builder.add_shape_sphere(dynamic_body, radius=RADIUS, cfg=cfg)
+            builder.add_shape_sphere(kinematic_body, radius=RADIUS, cfg=cfg)
+            model = builder.finalize(device=device)
+            solver = _make_solver(model)
+            state_in, state_out = model.state(), model.state()
+            velocity_dynamic = frame_speed + 2.0
+            velocity_surface = frame_speed - 1.0
+            joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+            joint_qd[2] = velocity_dynamic
+            joint_qd[8] = velocity_surface
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
-    for response in ("immediate", "propagation"):
-        for frame_speed in (0.0, 7.0):
-            label = f"{response}, frame={frame_speed}"
-            with test.subTest(response=response, frame_speed=frame_speed):
-                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-                cfg = _shape_cfg(restitution)
-                dynamic_body = builder.add_body(
-                    xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-                    mass=1.0,
-                    inertia=_sphere_inertia(1.0),
-                    lock_inertia=True,
-                )
-                kinematic_body = builder.add_body(
-                    xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * RADIUS + separation), wp.quat_identity()),
-                    mass=1.0,
-                    inertia=_sphere_inertia(1.0),
-                    lock_inertia=True,
-                    is_kinematic=True,
-                )
-                builder.add_shape_sphere(dynamic_body, radius=RADIUS, cfg=cfg)
-                builder.add_shape_sphere(kinematic_body, radius=RADIUS, cfg=cfg)
-                model = builder.finalize(device=device)
-                solver = _make_solver(model, response=response)
-                state_in, state_out = model.state(), model.state()
-                velocity_dynamic = frame_speed + 2.0
-                velocity_surface = frame_speed - 1.0
-                joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-                joint_qd[2] = velocity_dynamic
-                joint_qd[8] = velocity_surface
-                state_in.joint_qd.assign(joint_qd)
-                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-                pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-                contacts = pipeline.contacts()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
-
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
-                velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
-                expected_after = velocity_surface - restitution * closing_speed
-                test.assertEqual(count, 1, f"{label}: expected one sphere contact")
-                test.assertEqual(paths, {expected_path[response]}, f"{label}: wrong contact route")
-                _assert_velocity(test, velocity_after, expected_after, closing_speed, label, rtol=5.0e-3)
-                test.assertAlmostEqual(
-                    velocity_surface - velocity_after,
-                    restitution * closing_speed,
-                    delta=1.5e-2,
-                    msg=f"{label}: restitution was not measured relative to the moving surface",
-                )
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
+            velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
+            expected_after = velocity_surface - restitution * closing_speed
+            test.assertEqual(count, 1, f"{label}: expected one sphere contact")
+            test.assertEqual(paths, {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
+            _assert_velocity(test, velocity_after, expected_after, closing_speed, label, rtol=5.0e-3)
+            test.assertAlmostEqual(
+                velocity_surface - velocity_after,
+                restitution * closing_speed,
+                delta=1.5e-2,
+                msg=f"{label}: restitution was not measured relative to the moving surface",
+            )
 
 
 def test_every_contact_response_route_enforces_restitution(test, device):
-    """Enforce the same impact law on every measured internal response route."""
+    """Enforce the same impact law on the free-body and the dense contact rows."""
     restitution = 0.65
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     for scene in ("free", "articulated"):
-        for response in RESPONSE_MODES:
-            label = f"{scene}/{response}"
-            with test.subTest(scene=scene, response=response):
-                result = _step_plane(
-                    device,
-                    separation=separation,
-                    speed=speed,
-                    restitution=restitution,
-                    scene=scene,
-                    response=response,
-                    velocity_iterations=0,
-                    iterations=16,
-                )
-                _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
-                test.assertEqual(result["paths"], EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
-                _assert_velocity(test, result["after"], restitution * speed, speed, label, rtol=5.0e-3)
+        with test.subTest(scene=scene):
+            result = _step_plane(
+                device,
+                separation=separation,
+                speed=speed,
+                restitution=restitution,
+                scene=scene,
+                velocity_iterations=0,
+                iterations=16,
+            )
+            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, scene)
+            test.assertEqual(result["paths"], EXPECTED_PATHS[scene], f"{scene}: wrong route")
+            _assert_velocity(test, result["after"], restitution * speed, speed, scene, rtol=5.0e-3)
 
 
 def test_multiworld_restitution_keeps_case_data_isolated(test, device):
@@ -2876,10 +2811,10 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.6,
     )
     solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(solver._velocity_iterations, 0)
+    test.assertEqual(solver.velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
-    test.assertEqual(solver._row_rebound_velocity.shape, (solver._world_count, solver._articulation_constraint_max))
-    test.assertEqual(solver._mf_row_rebound_velocity.shape, (solver._world_count, solver._free_body_constraint_max))
+    test.assertEqual(solver._row_rebound_velocity.shape, (solver._world_count, solver.articulation_constraint_max))
+    test.assertEqual(solver._mf_row_rebound_velocity.shape, (solver._world_count, solver.free_body_constraint_max))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -2891,50 +2826,13 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.0,
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
-    test.assertEqual(zero_solver._velocity_iterations, 0)
+    test.assertEqual(zero_solver.velocity_iterations, 0)
 
     zero_model.shape_material_restitution.fill_(0.6)
     zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
     default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
-    test.assertAlmostEqual(default_solver._restitution_velocity_threshold, 0.5)
-
-
-def test_restitution_can_be_disabled_without_changing_materials(test, device):
-    """Disable restitution while retaining authored material coefficients."""
-    model, _ = _build_plane_model(device, separation=1.0e-3, restitution=0.8)
-    solver = _make_solver(
-        model,
-        enable_restitution=False,
-        restitution_velocity_threshold=0.75,
-    )
-    np.testing.assert_array_equal(
-        solver._shape_restitution.numpy()[: model.shape_count], model.shape_material_restitution.numpy()
-    )
-    test.assertAlmostEqual(solver._restitution_velocity_threshold, 0.75)
-    test.assertGreater(solver._rebound_velocity_threshold, 1.0e30)
-
-    speed = 2.0
-    separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("free", "propagation")):
-        with test.subTest(scene=scene, response=response):
-            result = _step_plane(
-                device,
-                separation=separation,
-                speed=speed,
-                restitution=0.8,
-                scene=scene,
-                response=response,
-                enable_restitution=False,
-            )
-            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, f"{scene}/{response}")
-            _assert_velocity(
-                test,
-                result["after"],
-                -IMPACT_FRACTION * speed,
-                speed,
-                f"{scene}/{response}",
-            )
+    test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
 
 
 def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
@@ -2956,15 +2854,15 @@ def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, devi
 
 
 def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
-    """Use the current incident velocity once under dense and identity warm starting."""
+    """Use the current incident velocity once under the contact warm start of both row families."""
     restitution = 0.6
     # Both incident speeds used below must cross from this same authored pose.
     separation = IMPACT_FRACTION * 2.0 * DEFAULT_DT
     cases = (
-        ("MF", "free", True, False, PATH_MATRIX_FREE),
-        ("dense", "articulated", False, True, PATH_DENSE),
+        ("free-body rows", "free", PATH_MATRIX_FREE),
+        ("dense rows", "articulated", PATH_DENSE),
     )
-    for label, scene, mf_warmstart, contact_warmstart, expected_path in cases:
+    for label, scene, expected_path in cases:
         with test.subTest(warmstart=label):
             model, body = _build_plane_model(
                 device,
@@ -2975,8 +2873,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
             solver = _make_solver(
                 model,
                 velocity_iterations=0,
-                mf_warmstart=mf_warmstart,
-                contact_warmstart=contact_warmstart,
+                contact_warmstart=True,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
             contacts = pipeline.contacts()
@@ -3074,59 +2971,53 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
     inertia = _diagonal_inertia(0.02)
 
     for joint_kind in ("fixed", "revolute"):
-        for response in ("immediate", "propagation", "colored"):
-            with test.subTest(joint=joint_kind, response=response):
-                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-                xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
-                root = builder.add_link(xform=xform, mass=mass, inertia=inertia, lock_inertia=True)
-                child = builder.add_link(
-                    xform=xform,
-                    mass=child_mass,
-                    inertia=_diagonal_inertia(0.002),
-                    lock_inertia=True,
+        with test.subTest(joint=joint_kind):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
+            root = builder.add_link(xform=xform, mass=mass, inertia=inertia, lock_inertia=True)
+            child = builder.add_link(
+                xform=xform,
+                mass=child_mass,
+                inertia=_diagonal_inertia(0.002),
+                lock_inertia=True,
+            )
+            root_joint = builder.add_joint_free(child=root)
+            if joint_kind == "fixed":
+                child_joint = builder.add_joint_fixed(parent=root, child=child)
+            else:
+                child_joint = builder.add_joint_revolute(
+                    parent=root,
+                    child=child,
+                    axis=wp.vec3(0.0, 0.0, 1.0),
                 )
-                root_joint = builder.add_joint_free(child=root)
-                if joint_kind == "fixed":
-                    child_joint = builder.add_joint_fixed(parent=root, child=child)
-                else:
-                    child_joint = builder.add_joint_revolute(
-                        parent=root,
-                        child=child,
-                        axis=wp.vec3(0.0, 0.0, 1.0),
-                    )
-                builder.add_articulation([root_joint, child_joint])
-                cfg = _shape_cfg(restitution)
-                for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
-                    builder.add_shape_sphere(
-                        root,
-                        xform=wp.transform(wp.vec3(sx * half, sy * half, -foot_offset), wp.quat_identity()),
-                        radius=sphere_radius,
-                        cfg=cfg,
-                    )
-                builder.add_ground_plane(cfg=cfg)
-                model = builder.finalize(device=device)
-                solver = _make_solver(
-                    model,
-                    response=response,
-                    velocity_iterations=0,
-                    iterations=16,
+            builder.add_articulation([root_joint, child_joint])
+            cfg = _shape_cfg(restitution)
+            for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
+                builder.add_shape_sphere(
+                    root,
+                    xform=wp.transform(wp.vec3(sx * half, sy * half, -foot_offset), wp.quat_identity()),
+                    radius=sphere_radius,
+                    cfg=cfg,
                 )
-                state_in, state_out = model.state(), model.state()
-                _reset_state(model, state_in, -speed)
-                pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
-                contacts = pipeline.contacts()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+            builder.add_ground_plane(cfg=cfg)
+            model = builder.finalize(device=device)
+            solver = _make_solver(model, velocity_iterations=0, iterations=16)
+            state_in, state_out = model.state(), model.state()
+            _reset_state(model, state_in, -speed)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
-                qd = state_out.body_qd.numpy()[root].astype(np.float64)
-                expected_path = PATH_DENSE if response == "immediate" else PATH_PROPAGATION
-                label = f"{joint_kind}/{response}"
-                test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")
-                test.assertEqual(paths, {expected_path}, f"{label}: wrong contact route")
-                _assert_velocity(test, float(qd[2]), restitution * speed, speed, label, rtol=7.5e-3)
-                test.assertLess(np.linalg.norm(qd[3:]), 3.0e-2, f"{label}: symmetric foot spun at {qd[3:]}")
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
+            qd = state_out.body_qd.numpy()[root].astype(np.float64)
+            expected_path = PATH_DENSE
+            label = joint_kind
+            test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")
+            test.assertEqual(paths, {expected_path}, f"{label}: wrong contact route")
+            _assert_velocity(test, float(qd[2]), restitution * speed, speed, label, rtol=7.5e-3)
+            test.assertLess(np.linalg.norm(qd[3:]), 3.0e-2, f"{label}: symmetric foot spun at {qd[3:]}")
 
 
 def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, device):
@@ -3160,8 +3051,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     graph_model, graph_solver, graph_body, graph_state, graph_contacts, graph_step = make_fixture()
     eager_model, eager_solver, eager_body, eager_state, eager_contacts, eager_step = make_fixture()
 
-    # Warm both fixtures through the same history. Besides compiling kernels,
-    # this keeps the solver's double-buffer phase identical for the comparison.
+    # Warm both fixtures through the same history, which also compiles the kernels.
     _reset_state(graph_model, graph_state, -speed)
     _reset_state(eager_model, eager_state, -speed)
     graph_step()
@@ -3174,7 +3064,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
 
     # Change restitution from zero after capture. Row storage is independent
     # of construction-time values, and the coefficient must come from the
-    # solver's device buffer rather than a captured host scalar.
+    # device array rather than a captured host scalar.
     for model, solver in ((graph_model, graph_solver), (eager_model, eager_solver)):
         model.shape_material_restitution.fill_(0.75)
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
@@ -3195,9 +3085,9 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device):
     """Match a fresh solver after a SHAPE_PROPERTIES notify, eagerly and in a captured graph."""
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    # Graph capture needs a CUDA device.
-    captures = (False, True) if wp.get_device(device).is_cuda else (False,)
-    for scene, old, replace, capture in itertools.product(("free", "articulated"), (0.0, 1.0), (False, True), captures):
+    for scene, old, replace, capture in itertools.product(
+        ("free", "articulated"), (0.0, 1.0), (False, True), (False, True)
+    ):
         new = 1.0 - old
         label = f"{scene} e={old}->{new} {'replaced' if replace else 'in place'} {'captured' if capture else 'eager'}"
         with test.subTest(label):
@@ -3230,104 +3120,10 @@ def test_notify_reads_replaced_and_in_place_restitution(test, device):
             count = int(contacts.rigid_contact_count.numpy()[0])
             paths = {int(v) for v in solver._contact_path.numpy()[:count] if v >= 0}
             test.assertEqual(count, 1, f"{label}: expected one contact")
-            test.assertEqual(paths, EXPECTED_PATHS[(scene, "immediate")], f"{label}: wrong route")
+            test.assertEqual(paths, EXPECTED_PATHS[scene], f"{label}: wrong route")
             expected = float(reference.body_qd.numpy()[body][2])
             _assert_velocity(test, expected, new * speed if new else -separation / DEFAULT_DT, speed, label)
             test.assertAlmostEqual(float(state_out.body_qd.numpy()[body][2]), expected, delta=2.0e-5, msg=label)
-
-
-# (label, scene, response, velocity_iterations)
-THRESHOLD_EDIT_ROUTES = (
-    ("free", "free", "immediate", 0),
-    ("articulated", "articulated", "immediate", 0),
-    ("free/velocity_pass", "free", "immediate", 2),
-    ("free/propagation", "free", "propagation", 0),
-    ("articulated/propagation", "articulated", "propagation", 0),
-)
-
-
-def _threshold_bounce(device, route, threshold, edited=None, enable_restitution=True):
-    """Return the rebound speed of a resting-gap 1 m/s sphere impact and the solver that produced it."""
-    _label, scene, response, velocity_iterations = route
-    model, body = _build_plane_model(device, separation=0.0, restitution=1.0, scene=scene)
-    solver = _make_solver(
-        model,
-        response=response,
-        velocity_iterations=velocity_iterations,
-        enable_restitution=enable_restitution,
-        restitution_velocity_threshold=threshold,
-    )
-    if edited is not None:
-        solver.restitution_velocity_threshold = edited
-    state_in, state_out = model.state(), model.state()
-    _reset_state(model, state_in, -1.0)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    pipeline.collide(state_in, contacts)
-    solver.step(state_in, state_out, model.control(), contacts, 0.01)
-    return float(state_out.body_qd.numpy()[body][2]), solver
-
-
-def test_edited_restitution_threshold_matches_a_fresh_solver(test, device):
-    """Launch an edited threshold on every contact route exactly as a solver constructed with it."""
-    for route in THRESHOLD_EDIT_ROUTES:
-        for old, new in ((0.5, 2.0), (2.0, 0.5)):
-            label = f"{route[0]} {old}->{new}"
-            with test.subTest(label):
-                edited, solver = _threshold_bounce(device, route, old, edited=new)
-                fresh_old, _ = _threshold_bounce(device, route, old)
-                fresh_new, _ = _threshold_bounce(device, route, new)
-                test.assertGreater(abs(fresh_new - fresh_old), 0.5, f"{label}: thresholds do not discriminate")
-                test.assertAlmostEqual(edited, fresh_new, delta=2.0e-5, msg=label)
-                test.assertEqual(solver.restitution_velocity_threshold, new)
-                test.assertAlmostEqual(solver._rebound_velocity_threshold, new)
-
-    # The enable switch is construction-only: an edited threshold leaves rebounds off.
-    disabled, solver = _threshold_bounce(device, THRESHOLD_EDIT_ROUTES[0], 0.5, edited=0.0, enable_restitution=False)
-    test.assertGreater(solver._rebound_velocity_threshold, 1.0e30)
-    test.assertLess(disabled, 0.5)
-
-
-def test_captured_graph_keeps_its_restitution_threshold_until_recaptured(test, device):
-    """Replay a graph with its capture-time threshold; a recapture after the edit launches the new one."""
-    for route in THRESHOLD_EDIT_ROUTES:
-        label = route[0]
-        with test.subTest(label):
-            _label, scene, response, velocity_iterations = route
-            model, body = _build_plane_model(device, separation=0.0, restitution=1.0, scene=scene)
-            solver = _make_solver(
-                model,
-                response=response,
-                velocity_iterations=velocity_iterations,
-                enable_restitution=True,
-                restitution_velocity_threshold=0.5,
-            )
-            state_in, state_out = model.state(), model.state()
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-            contacts = pipeline.contacts()
-            control = model.control()
-
-            _reset_state(model, state_in, -1.0)
-            pipeline.collide(state_in, contacts)
-            solver.step(state_in, state_out, control, contacts, 0.01)
-            with wp.ScopedCapture(device) as before_edit:
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, 0.01)
-            solver.restitution_velocity_threshold = 2.0
-            with wp.ScopedCapture(device) as after_edit:
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, 0.01)
-
-            replays = {}
-            for name, graph in (("before", before_edit.graph), ("after", after_edit.graph)):
-                _reset_state(model, state_in, -1.0)
-                wp.capture_launch(graph)
-                replays[name] = float(state_out.body_qd.numpy()[body][2])
-            fresh_old, _ = _threshold_bounce(device, route, 0.5)
-            fresh_new, _ = _threshold_bounce(device, route, 2.0)
-            test.assertGreater(abs(fresh_new - fresh_old), 0.5, f"{label}: thresholds do not discriminate")
-            test.assertAlmostEqual(replays["before"], fresh_old, delta=2.0e-5, msg=f"{label}: capture-time graph")
-            test.assertAlmostEqual(replays["after"], fresh_new, delta=2.0e-5, msg=f"{label}: recaptured graph")
 
 
 devices_restitution = get_selected_cuda_test_devices()
@@ -3344,21 +3140,14 @@ for _fn in (
     test_restitution_uses_the_step_start_closing_speed,
     test_non_crossing_speculative_contact_does_not_bounce,
     test_shape_restitution_uses_symmetric_arithmetic_average,
-    test_restitution_combine_modes_on_every_route,
-    test_friction_combine_modes_on_every_route,
-    test_friction_combine_reads_notified_coefficient_edits,
-    test_restitution_velocity_threshold_uses_incident_relative_speed,
+    test_restitution_velocity_threshold_uses_relative_closing_speed,
+    test_disabled_restitution_needs_no_material_edits,
     test_bouncing_ball_settles_to_rest_under_gravity,
-    test_drive_pressed_resting_contact_does_not_bounce,
-    test_force_pressed_resting_free_body_does_not_bounce,
-    test_pressed_landing_rebounds_from_step_start_speed_and_settles,
-    test_exit_velocity_is_monotonic_in_a_separating_force,
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
     test_multiworld_restitution_keeps_case_data_isolated,
     test_restitution_uses_ordinary_rows_and_validates_configuration,
-    test_restitution_can_be_disabled_without_changing_materials,
     test_velocity_iteration_counts_reach_the_same_single_row_solution,
     test_warm_start_history_does_not_change_or_repeat_restitution,
     test_redundant_box_contacts_do_not_multiply_restitution_energy,
@@ -3369,18 +3158,17 @@ for _fn in (
     add_function_test(TestSteelRestitution, _fn.__name__, _fn, devices=devices_restitution)
 
 
-add_function_test(
-    TestSteelRestitution,
-    "test_edited_restitution_threshold_matches_a_fresh_solver",
-    test_edited_restitution_threshold_matches_a_fresh_solver,
-    devices=get_test_devices(),
-)
-add_function_test(
-    TestSteelRestitution,
-    "test_captured_graph_keeps_its_restitution_threshold_until_recaptured",
-    test_captured_graph_keeps_its_restitution_threshold_until_recaptured,
-    devices=get_selected_cuda_test_devices(),
-)
+class TestSteelPressedRestitution(unittest.TestCase):
+    pass
+
+
+for _fn in (
+    test_drive_pressed_resting_contact_does_not_bounce,
+    test_force_pressed_resting_free_body_does_not_bounce,
+    test_pressed_landing_rebounds_from_step_start_speed_and_settles,
+    test_exit_velocity_is_monotonic_in_a_separating_force,
+):
+    add_function_test(TestSteelPressedRestitution, _fn.__name__, _fn, devices=devices_restitution)
 
 
 SIM_DT = 1.0 / 2000.0
@@ -3389,18 +3177,19 @@ SIM_DT = 1.0 / 2000.0
 DROP = 0.12
 
 
-# The route each scene and response mode takes, measured rather than assumed.
-# A lone free body never reaches dense rows, so a single-sphere scene cannot
-# claim to cover them. Asserting the exact set keeps the suite from silently
-# claiming coverage of a path it never reaches.
-EXPECTED_PATHS = {
-    ("free", "immediate"): {PATH_MATRIX_FREE},
-    ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "colored"): {PATH_PROPAGATION},
-    ("articulated", "immediate"): {PATH_DENSE},
-    ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "colored"): {PATH_PROPAGATION},
+# The route each scene takes, measured rather than assumed: a lone free body uses the
+# free-body rows, and a contact on an articulated root uses the dense rows.
+EXPECTED_PATHS_velocity_pass_speculative = {
+    "free": {PATH_MATRIX_FREE},
+    "articulated": {PATH_DENSE},
 }
+
+
+def _make_solver_velocity_pass_speculative(model, **kwargs):
+    """Create the solver without angular damping, which would mask the contact response."""
+    solver = newton.solvers.SolverSteel(model, **kwargs)
+    solver._rigid_body_angular_damping.zero_()
+    return solver
 
 
 def _build(device, scene, mass=1.0):
@@ -3432,32 +3221,19 @@ def _build(device, scene, mass=1.0):
     return builder.finalize(device=device), body
 
 
-def _drop(
-    device,
-    velocity_iterations,
-    response="immediate",
-    steps=620,
-    scene="free",
-    *,
-    contact_warmstart=False,
-    mf_warmstart=False,
-):
+def _drop(device, velocity_iterations, steps=620, scene="free", *, contact_warmstart=False):
     """Drop a body onto a plane; return heights, velocities, contact counts, routes."""
     model, body = _build(device, scene)
-    solver = newton.solvers.SolverSteel(
-        model,
-        velocity_iterations=velocity_iterations,
-        **steel_mode_options(response),
-        contact_warmstart=contact_warmstart or mf_warmstart,
+    solver = _make_solver_velocity_pass_speculative(
+        model, velocity_iterations=velocity_iterations, contact_warmstart=contact_warmstart
     )
-    solver._rigid_body_angular_damping.zero_()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     heights, velocities, counts, routes = [], [], [], set()
     pipeline = (
         newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
-        if contact_warmstart or mf_warmstart
+        if contact_warmstart
         else newton.CollisionPipeline(model)
     )
     contacts = pipeline.contacts()
@@ -3511,42 +3287,39 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Inertia validation corrected", category=UserWarning)
         model = builder.finalize(device=device)
-    joint_qd = model.joint_qd.numpy()
+    solver = _make_solver_velocity_pass_speculative(model, velocity_iterations=velocity_iterations)
+    # The position solve does not depend on the velocity-only iterations, so a twin
+    # solver without them exposes the position-solve rows, impulses and velocity.
+    position_solver = _make_solver_velocity_pass_speculative(model)
+    state_0, state_1 = model.state(), model.state()
+    # A free body is driven through joint_qd; writing body_qd alone is discarded
+    # by the forward kinematics the solver runs from joint state.
+    joint_qd = state_0.joint_qd.numpy()
     joint_qd[2] = -abs(approach_speed)
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    before = float(state_0.body_qd.numpy()[body][2])
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-
-    def step(iterations):
-        solver = newton.solvers.SolverSteel(model, velocity_iterations=iterations)
-        solver._rigid_body_angular_damping.zero_()
-        state_0, state_1 = model.state(), model.state()
-        # A free body is driven through joint_qd; writing body_qd alone is discarded
-        # by the forward kinematics the solver runs from joint state.
-        state_0.joint_qd.assign(joint_qd)
-        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-        pipeline.collide(state_0, contacts)
-        state_0.clear_forces()
-        solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
-        return solver, state_0, state_1
-
-    # A solve without velocity iterations leaves the position pass's rows, impulses and velocity in place.
-    position, state_0, _ = step(0)
-    _, _, state_1 = step(velocity_iterations)
-    before = float(state_0.body_qd.numpy()[body][2])
+    pipeline.collide(state_0, contacts)
+    state_0.clear_forces()
+    position_state = model.state()
+    position_solver.step(state_0, position_state, model.control(), contacts, SIM_DT)
+    solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
     n = int(contacts.rigid_contact_count.numpy()[0])
-    rows = int(position._mf_constraint_count.numpy()[0])
-    phi = position._mf_phi.numpy()[0][:rows]
-    lam = position._mf_impulses.numpy()[0][:rows]
-    row_type = position._mf_row_type.numpy()[0][:rows]
+    rows = int(position_solver._mf_constraint_count.numpy()[0])
+    phi = position_solver._mf_phi.numpy()[0][:rows]
+    lam = position_solver._mf_impulses.numpy()[0][:rows]
+    row_type = position_solver._mf_row_type.numpy()[0][:rows]
     contact_rows = np.flatnonzero((row_type == 0) & (phi > 0.0))
     position_impulse = float(lam[contact_rows].max()) if contact_rows.size else 0.0
     max_phi = float(phi[contact_rows].max()) if contact_rows.size else 0.0
-    v_position = position._v_out.numpy()
-    J_a = position._mf_J_a.numpy()[0]
-    J_b = position._mf_J_b.numpy()[0]
-    dof_a = position._mf_dof_a.numpy()[0]
-    dof_b = position._mf_dof_b.numpy()[0]
-    world_dofs = position._world_dof_indices.numpy()[0]
+    v_position = position_solver._v_out.numpy()
+    J_a = position_solver._mf_J_a.numpy()[0]
+    J_b = position_solver._mf_J_b.numpy()[0]
+    dof_a = position_solver._mf_dof_a.numpy()[0]
+    dof_b = position_solver._mf_dof_b.numpy()[0]
+    world_dofs = position_solver._world_dof_indices.numpy()[0]
     end_gaps = []
     for row in contact_rows:
         jv = 0.0
@@ -3580,7 +3353,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
         position_velocity.assign(np.array([normal_velocity, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
         target_velocity.assign(np.array([[target]], dtype=np.float32))
         wp.launch(
-            compute_mf_rhs_bias,
+            compute_mf_velocity_rhs,
             dim=1,
             inputs=[
                 count,
@@ -3657,22 +3430,19 @@ def test_velocity_iterations_match_the_position_only_landing(test, device):
 
 
 def test_every_contact_response_route_lands(test, device):
-    """Land correctly on every internal contact-response route.
+    """Land correctly on the free-body and the dense contact rows.
 
-    Asserts the exact ``contact_path`` each combination took, so the suite
-    cannot claim coverage of a route the scene never reaches.
+    Asserts the exact ``contact_path`` each scene took, so the suite cannot claim
+    coverage of a route the scene never reaches.
     """
     for scene in ("free", "articulated"):
-        for response in RESPONSE_MODES:
-            label = f"{scene}/{response}"
-            h, v, n, routes = _drop(device, 4, response=response, scene=scene)
-            _assert_landed(test, h, v, n, label)
-            test.assertEqual(
-                routes,
-                EXPECTED_PATHS[(scene, response)],
-                f"{label}: exercised contact_path {sorted(routes)}, "
-                f"expected {sorted(EXPECTED_PATHS[(scene, response)])}",
-            )
+        h, v, n, routes = _drop(device, 4, scene=scene)
+        _assert_landed(test, h, v, n, scene)
+        test.assertEqual(
+            routes,
+            EXPECTED_PATHS_velocity_pass_speculative[scene],
+            f"{scene}: exercised contact_path {sorted(routes)}, expected {sorted(EXPECTED_PATHS_velocity_pass_speculative[scene])}",
+        )
 
 
 def test_non_crossing_row_keeps_its_speculative_allowance(test, device):
@@ -3752,11 +3522,7 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.replicate(template, 2)
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverSteel(
-        model,
-        velocity_iterations=4,
-    )
-    solver._rigid_body_angular_damping.zero_()
+    solver = _make_solver_velocity_pass_speculative(model, velocity_iterations=4)
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy().reshape(2, 6)
     joint_qd[0, 2] = -0.5 * gap / SIM_DT
@@ -3783,29 +3549,51 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
 
 
 def test_warm_start_with_velocity_iterations_is_supported(test, device):
-    """Allow every warm-start entry point with end-gap classification."""
-    model, _body = _build(device, "free")
-
-    def make(**kwargs):
-        return newton.solvers.SolverSteel(model, velocity_iterations=4, **kwargs)
-
-    make(contact_warmstart=True)
-
-    # Exercise dense slot warm starting and MF identity warm starting through
-    # the same velocity pass, not just their constructor paths.
-    h, v, n, routes = _drop(
-        device,
-        4,
-        response="immediate",
-        scene="articulated",
-        contact_warmstart=True,
-    )
+    """Combine the contact warm start with end-gap classification on both row families."""
+    # Exercise the dense and free-body identity warm starts through the velocity
+    # iterations, not just their construction.
+    h, v, n, routes = _drop(device, 4, scene="articulated", contact_warmstart=True)
     _assert_landed(test, h, v, n, "dense warm start")
     test.assertEqual(routes, {PATH_DENSE})
 
-    h, v, n, routes = _drop(device, 4, mf_warmstart=True)
-    _assert_landed(test, h, v, n, "matrix-free identity warm start")
+    h, v, n, routes = _drop(device, 4, contact_warmstart=True)
+    _assert_landed(test, h, v, n, "free-body warm start")
     test.assertEqual(routes, {PATH_MATRIX_FREE})
+
+
+def test_velocity_iterations_keep_angular_damping(test, device):
+    """Apply the same root angular damping to the published velocity for every iteration count."""
+    dt = 0.01
+    spin = 10.0
+    for contact, damping, iterations in itertools.product((False, True), (0.0, 0.05, 2.0), (0, 1, 4)):
+        label = f"contact={contact} damping={damping} iterations={iterations}"
+        with test.subTest(label):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81 if contact else 0.0))
+            inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+            xform = wp.transform(wp.vec3(0.0, 0.0, RADIUS), wp.quat_identity())
+            body = builder.add_body(xform=xform, mass=1.0, inertia=inertia, lock_inertia=True)
+            if contact:
+                # Frictionless contact through the centre leaves the spin to damping alone.
+                cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
+                builder.add_shape_sphere(body, radius=RADIUS, cfg=cfg)
+                builder.add_ground_plane(cfg=cfg)
+            model = builder.finalize(device=device)
+            solver = newton.solvers.SolverSteel(model, velocity_iterations=iterations)
+            solver._rigid_body_angular_damping.fill_(damping)
+            state_in, state_out = model.state(), model.state()
+            state_in.joint_qd.assign(np.array([0.0, 0.0, 0.0, 0.0, 0.0, spin], dtype=np.float32))
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            contacts = None
+            if contact:
+                pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+                contacts = pipeline.contacts()
+                pipeline.collide(state_in, contacts)
+                test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0, f"{label}: no contact")
+            solver.step(state_in, state_out, model.control(), contacts, dt)
+
+            expected = spin * (1.0 - damping * dt)
+            test.assertAlmostEqual(float(state_out.joint_qd.numpy()[5]), expected, delta=1.0e-5, msg=label)
+            test.assertAlmostEqual(float(state_out.body_qd.numpy()[body][5]), expected, delta=1.0e-5, msg=label)
 
 
 devices_velocity_pass_speculative = get_selected_cuda_test_devices()
@@ -3825,6 +3613,7 @@ for _fn in (
     test_light_body_crossing_uses_end_gap_not_impulse_scale,
     test_multiworld_end_gap_uses_each_world_position_velocity,
     test_warm_start_with_velocity_iterations_is_supported,
+    test_velocity_iterations_keep_angular_damping,
 ):
     add_function_test(
         TestSteelVelocityPassSpeculative,
@@ -4013,35 +3802,24 @@ def _run_mixed_response(
     return solver, samples
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "graph capture requires CUDA")
 class TestSteelJointlessKinematicBody(unittest.TestCase):
     PRESCRIBED_QD = (0.3, -0.2, 0.0, 0.0, 0.0, 0.5)
 
-    def _published(self, response, capture):
-        """Step a free box on a jointless kinematic floor and return the floor's state in both buffers."""
+    def _published(self, device, capture=False, **solver_options):
+        """Step a free box beside two jointless kinematic links and check each link's state in both buffers."""
         builder = newton.ModelBuilder()
         floor = builder.add_link(is_kinematic=True)
         builder.add_shape_box(floor, hx=0.5, hy=0.5, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
         box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.021)))
         builder.add_shape_box(box, hx=0.02, hy=0.02, hz=0.02)
-        model = builder.finalize(device=wp.get_cuda_device())
-        # Freed device memory holds NaN, so any unwritten scratch the solver publishes reads as NaN.
-        nan_fill = wp.full(1 << 22, float("nan"), dtype=wp.float32, device=model.device)
-        del nan_fill
-        solver = SolverSteel(model, articulated_contact_response=response)
+        # Body 2 is the second entry of the unarticulated-body list.
+        side = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.0)), is_kinematic=True)
+        builder.add_shape_box(side, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device=device)
+        solver = SolverSteel(model, **solver_options)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         states = (model.state(), model.state())
-        body_q, body_qd = states[0].body_q.numpy(), states[0].body_qd.numpy()
-        body_q[floor, 0] += 0.1
-        body_qd[floor] = self.PRESCRIBED_QD
-        states[0].body_q.assign(body_q)
-        states[0].body_qd.assign(body_qd)
-        stale_q, stale_qd = states[1].body_q.numpy(), states[1].body_qd.numpy()
-        stale_q[floor] = np.nan
-        stale_qd[floor] = np.nan
-        states[1].body_q.assign(stale_q)
-        states[1].body_qd.assign(stale_qd)
         control = model.control()
 
         def two_steps():
@@ -4052,160 +3830,290 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
         if capture:
             with wp.ScopedCapture(model.device) as scope:
                 two_steps()
-            for _ in range(2):
+        # Each round prescribes new inputs, so a copy that ran once or out of order would publish stale values.
+        for round_index in range(2):
+            body_q, body_qd = states[0].body_q.numpy(), states[0].body_qd.numpy()
+            body_q[[floor, side], 0] += 0.1
+            body_qd[floor] = np.array(self.PRESCRIBED_QD) * (round_index + 1)
+            body_qd[side] = -np.array(self.PRESCRIBED_QD) * (round_index + 1)
+            states[0].body_q.assign(body_q)
+            states[0].body_qd.assign(body_qd)
+            stale_q, stale_qd = states[1].body_q.numpy(), states[1].body_qd.numpy()
+            stale_q[[floor, side]] = np.nan
+            stale_qd[[floor, side]] = np.nan
+            states[1].body_q.assign(stale_q)
+            states[1].body_qd.assign(stale_qd)
+            if capture:
                 wp.capture_launch(scope.graph)
-        else:
-            for _ in range(2):
+            else:
                 two_steps()
+            for body in (floor, side):
+                for state in states:
+                    np.testing.assert_array_equal(state.body_q.numpy()[body], body_q[body])
+                    np.testing.assert_array_equal(state.body_qd.numpy()[body], body_qd[body])
         self.assertTrue(np.isfinite(states[0].body_q.numpy()[box]).all())
-        return body_q[floor], [(s.body_q.numpy()[floor], s.body_qd.numpy()[floor]) for s in states]
 
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture requires CUDA")
     def test_jointless_kinematic_body_publishes_its_prescribed_state(self):
-        """Pass a jointless kinematic body's input pose and velocity through every step, eager and captured."""
+        """Pass jointless kinematic bodies' input poses and velocities through every step, eager and captured."""
         for response in ("immediate", "propagation"):
             for capture in (False, True):
                 with self.subTest(response=response, capture=capture):
-                    prescribed_q, published = self._published(response, capture)
-                    for body_q, body_qd in published:
-                        np.testing.assert_array_equal(body_q, prescribed_q)
-                        np.testing.assert_array_equal(body_qd, np.array(self.PRESCRIBED_QD, dtype=np.float32))
+                    self._published(wp.get_cuda_device(), capture, **steel_mode_options(response))
 
+    def test_jointless_kinematic_body_publishes_its_prescribed_state_cpu(self):
+        """Pass jointless kinematic bodies' input poses and velocities through CPU steps beside a free body."""
+        self._published("cpu")
 
-def _momentum_solves(model, **options):
-    """Settle a scene; return the velocity error and the free-body momentum imbalance of one solve.
+    @unittest.skipUnless(wp.is_cuda_available(), "friction patches require CUDA")
+    def test_jointless_kinematic_floor_velocity_leaves_patch_friction_unchanged(self):
+        """Hold a box at the Coulomb limit on a jointless kinematic floor the same for any published floor velocity."""
+        mu, mass, half = 0.5, 2.0, 0.05
 
-    The error is the mass-weighted body velocity distance from an 8000-sweep plain Gauss-Seidel
-    solve; the imbalance is the largest gap between a free body's linear momentum change and gravity
-    plus its reported contact impulses. Both are in units of one step of gravity.
-    """
-    dt = 1.0 / 60.0
-    options = {"solve_mode": "serial", **options}
-    control = model.control()
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-    contacts = pipeline.contacts()
-    state, output = model.state(), model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    settle = SolverSteel(model, iterations=64, **options)
-    for _ in range(5):
-        pipeline.collide(state, contacts)
-        settle.step(state, output, control, contacts, dt)
-        state, output = output, state
-    pipeline.collide(state, contacts)
-    start = model.state()
-    observables = None
-
-    def solve(iterations, momentum):
-        nonlocal observables
-        start.assign(state)
-        solver = SolverSteel(model, iterations=iterations, nesterov_momentum=momentum, **options)
-        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
-        solver.step(start, output, control, contacts, dt, observables=observables)
-        return output.body_qd.numpy()
-
-    mass = model.body_mass.numpy()
-    inertia = np.trace(model.body_inertia.numpy(), axis1=1, axis2=2) / 3.0
-    reference = solve(8000, False)
-
-    def error(iterations, momentum):
-        delta = solve(iterations, momentum) - reference
-        energy = np.sum(mass * np.sum(delta[:, :3] ** 2, 1)) + np.sum(inertia * np.sum(delta[:, 3:] ** 2, 1))
-        return np.sqrt(energy) / (np.sqrt(mass.sum()) * 9.81 * dt)
-
-    def imbalance(iterations, momentum):
-        change = mass[:, None] * (solve(iterations, momentum)[:, :3] - state.body_qd.numpy()[:, :3])
-        change[:, 2] += mass * 9.81 * dt
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        impulse = observables.contact_f.numpy()[:count, :3] * dt
-        owners = model.shape_body.numpy()
-        for body, sign in (
-            (owners[contacts.rigid_contact_shape0.numpy()[:count]], 1.0),
-            (owners[contacts.rigid_contact_shape1.numpy()[:count]], -1.0),
-        ):
-            live = body >= 0
-            np.add.at(change, body[live], -sign * impulse[live])
-        return np.max(np.abs(change)) / (mass.max() * 9.81 * dt)
-
-    return error, imbalance
-
-
-def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
-    """Reach the plain Gauss-Seidel solution of a ten-box tower in fewer sweeps; reject unsupported routes."""
-    builder = newton.ModelBuilder()
-    cfg = newton.ModelBuilder.ShapeConfig(mu=0.75, gap=0.002)
-    jitter = np.random.default_rng(0).uniform(-0.002, 0.002, (10, 2))
-    for i in range(10):
-        body = builder.add_body(
-            xform=wp.transform(wp.vec3(jitter[i, 0], jitter[i, 1], 0.05 + 0.1001 * i), wp.quat_identity())
-        )
-        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
-    builder.add_ground_plane()
-    model = builder.finalize(device=device)
-    error, imbalance = _momentum_solves(model)
-
-    test.assertLess(error(2000, True), 0.05)
-    # Velocity must keep representing the reported impulses over a long solve.
-    test.assertLess(imbalance(2000, True), 1.0e-3)
-    plain, accelerated = error(24, False), error(24, True)
-    test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.3f}, momentum {accelerated:.3f}")
-
-    for options in (
-        {"solve_mode": "serial", "articulated_contact_response": "propagation"},
-        {"solve_mode": "serial", "row_schedule": "phased"},
-    ):
-        with test.subTest(**options), test.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
-            SolverSteel(model, nesterov_momentum=True, **options)
-
-
-def test_nesterov_momentum_on_articulated_rows(test, device):
-    """Accelerate dense articulated contact, joint-limit and velocity-limit rows on the general sweep only."""
-    builder = newton.ModelBuilder()
-    builder.add_ground_plane()
-    parent, joints = -1, []
-    for i in range(3):
-        link = builder.add_link(xform=wp.transform((0.2 * i + 0.1, 0.0, 0.031), wp.quat_identity()))
-        builder.add_shape_box(link, hx=0.1, hy=0.04, hz=0.03)
-        joints.append(
-            builder.add_joint_revolute(
-                parent,
-                link,
-                axis=(0.0, 1.0, 0.0),
-                parent_xform=wp.transform((0.0, 0.0, 0.031) if parent < 0 else (0.1, 0.0, 0.0), wp.quat_identity()),
-                child_xform=wp.transform((-0.1, 0.0, 0.0), wp.quat_identity()),
-                limit_lower=-0.3,
-                limit_upper=0.3,
-                velocity_limit=2.0,
+        def run(floor_velocity):
+            builder = newton.ModelBuilder()
+            floor = builder.add_link(is_kinematic=True)
+            builder.add_shape_box(
+                floor,
+                hx=0.5,
+                hy=0.5,
+                hz=0.02,
+                xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)),
+                cfg=newton.ModelBuilder.ShapeConfig(mu=mu),
             )
-        )
-        parent = link
-    builder.add_articulation(joints)
-    box = builder.add_body(xform=wp.transform((0.5, 0.0, 0.112), wp.quat_identity()))
-    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
-    model = builder.finalize(device=device)
+            box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half)))
+            builder.add_shape_box(
+                box,
+                hx=half,
+                hy=half,
+                hz=half,
+                cfg=newton.ModelBuilder.ShapeConfig(mu=mu, density=mass / (2 * half) ** 3),
+            )
+            model = builder.finalize(device=wp.get_cuda_device())
+            solver = SolverSteel(model, friction_anchor_beta=0.2)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states = [model.state(), model.state()]
+            for state in states:
+                body_qd = state.body_qd.numpy()
+                body_qd[floor, 0] = floor_velocity
+                state.body_qd.assign(body_qd)
+            body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+            body_f[box, 0] = mu * float(model.body_mass.numpy()[box]) * 9.81
+            control = model.control()
+            kept = []
+            for _ in range(60):
+                states[0].body_f.assign(body_f)
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, DEFAULT_DT)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                kept.append(int(solver._friction_patches.previous.valid.numpy()[:count].sum()))
+                states.reverse()
+            return np.array(kept), states[0].body_q.numpy()[box], states[0].body_qd.numpy()[box]
 
-    # The specialized owners have no momentum sweep, so the option must route around them.
-    test.assertTrue(SolverSteel(model)._local_internal_fast_path)
-    general = SolverSteel(model, nesterov_momentum=True)
-    for name in ("_local_internal_fast_path", "_paired_factor_coordinates", "_sparse_diagonal_contact_solve"):
-        test.assertFalse(getattr(general, name), name)
-    test.assertIsNone(general._sparse_mass_matrix_size)
+        kept, box_q, box_qd = run(0.0)
+        self.assertGreater(kept.min(), 0)
+        for floor_velocity in (-0.3, -3.0):
+            with self.subTest(floor_velocity=floor_velocity):
+                moving_kept, moving_q, moving_qd = run(floor_velocity)
+                np.testing.assert_array_equal(moving_kept, kept)
+                np.testing.assert_array_equal(moving_q, box_q)
+                np.testing.assert_array_equal(moving_qd, box_qd)
 
-    error, _ = _momentum_solves(
-        model, articulation_constraint_max=128, enable_joint_limits=True, enable_joint_velocity_limits=True
-    )
-    test.assertLess(error(2000, True), 1.0e-4)
-    plain, accelerated = error(24, False), error(24, True)
-    test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.4f}, momentum {accelerated:.4f}")
+    def test_model_without_joints_publishes_its_prescribed_state(self):
+        """Pass a jointless kinematic body's state through a step of a model that has no joints."""
+        builder = newton.ModelBuilder()
+        body = builder.add_link(is_kinematic=True)
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        self.assertEqual(model.joint_count, 0)
+        solver = SolverSteel(model)
+        state_in, state_out = model.state(), model.state()
+        body_q, body_qd = state_in.body_q.numpy(), state_in.body_qd.numpy()
+        body_q[body, 0] = 0.25
+        body_qd[body] = self.PRESCRIBED_QD
+        state_in.body_q.assign(body_q)
+        state_in.body_qd.assign(body_qd)
+        solver.step(state_in, state_out, None, None, DEFAULT_DT)
+        np.testing.assert_array_equal(state_out.body_q.numpy()[body], body_q[body])
+        np.testing.assert_array_equal(state_out.body_qd.numpy()[body], body_qd[body])
 
+    def test_model_without_articulations_publishes_its_prescribed_state(self):
+        """Pass bodies through a step of a model whose only joint is a standalone world-root joint."""
+        builder = newton.ModelBuilder()
+        root = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5)))
+        builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_joint_fixed(parent=-1, child=root)
+        body = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.69)), is_kinematic=True)
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        self.assertEqual((model.joint_count, model.articulation_count), (1, 0))
+        with self.assertWarns(DeprecationWarning):
+            model.request_state_attributes("body_parent_f")
+        solver = SolverSteel(model)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        kinds = {SolverBase.ObservableKind.CONTACT_F, SolverBase.ObservableKind.BODY_PARENT_F}
+        observables = solver.observables(kinds, contacts=contacts)
+        state_in, state_out = model.state(), model.state()
+        body_q, body_qd = state_in.body_q.numpy(), state_in.body_qd.numpy()
+        body_qd[root] = self.PRESCRIBED_QD
+        body_qd[body] = -np.array(self.PRESCRIBED_QD)
+        state_in.body_qd.assign(body_qd)
+        # Stale nonzero outputs, so a step that skips the parent wrenches would leave them.
+        observables.body_parent_f.fill_(wp.spatial_vector(42.0, 42.0, 42.0, 42.0, 42.0, 42.0))
+        state_out.body_parent_f.fill_(wp.spatial_vector(42.0, 42.0, 42.0, 42.0, 42.0, 42.0))
+        pipeline.collide(state_in, contacts)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        solver.step(state_in, state_out, None, contacts, DEFAULT_DT, observables=observables)
+        np.testing.assert_array_equal(state_out.body_q.numpy(), body_q)
+        np.testing.assert_array_equal(state_out.body_qd.numpy(), body_qd)
+        np.testing.assert_array_equal(observables.contact_f.numpy(), 0.0)
+        np.testing.assert_array_equal(observables.body_parent_f.numpy(), 0.0)
+        np.testing.assert_array_equal(state_out.body_parent_f.numpy(), 0.0)
 
-class TestSteelNesterovMomentum(unittest.TestCase):
-    pass
-
-
-for _name in ("test_nesterov_momentum_converges_a_tower_in_fewer_sweeps", "test_nesterov_momentum_on_articulated_rows"):
-    add_function_test(TestSteelNesterovMomentum, _name, globals()[_name], devices=cuda_devices)
+    def test_model_without_articulations_publishes_its_joint_state(self):
+        """Pass a standalone revolute joint's coordinates through a step of a model without articulations."""
+        builder = newton.ModelBuilder()
+        body = builder.add_link()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_joint_revolute(parent=-1, child=body, axis=(0.0, 1.0, 0.0))
+        model = builder.finalize(device="cpu")
+        self.assertEqual((model.joint_dof_count, model.articulation_count), (1, 0))
+        solver = SolverSteel(model)
+        state_in, state_out = model.state(), model.state()
+        state_in.joint_q.fill_(0.3)
+        state_in.joint_qd.fill_(0.5)
+        state_out.joint_q.fill_(np.nan)
+        state_out.joint_qd.fill_(np.nan)
+        solver.step(state_in, state_out, None, None, DEFAULT_DT)
+        np.testing.assert_array_equal(state_out.joint_q.numpy(), state_in.joint_q.numpy())
+        np.testing.assert_array_equal(state_out.joint_qd.numpy(), state_in.joint_qd.numpy())
 
 
 class TestSteelPairedResponse(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_response_matches_general_23_dof_trajectory(self):
+        """Match the general response when one warp owns a robot/free-body pair, with patch and point friction."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "articulation_constraint_max": 96,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        # Patch friction rows are not uniform triples, so the generic factor path pools the patch load; point
+        # friction keeps the contact-triple layout.
+        for label, friction_anchor_beta, triples in (("patch", None, False), ("point", 0.0, True)):
+            with self.subTest(friction=label):
+                reference_solver, reference = _run_mixed_response(
+                    "par_row", friction_anchor_beta=friction_anchor_beta, **run_kwargs
+                )
+                paired_solver, paired = _run_mixed_response(
+                    "auto", friction_anchor_beta=friction_anchor_beta, **run_kwargs
+                )
+
+                self.assertIsNone(reference_solver._paired_response_primary_size)
+                self.assertEqual(paired_solver._friction_anchors_enabled, label == "patch")
+                self.assertEqual(paired_solver._paired_response_primary_size, 23)
+                self.assertEqual(paired_solver._paired_response_secondary_size, 6)
+                self.assertIsNotNone(paired_solver._paired_response_kernel)
+                self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
+                self.assertTrue(paired_solver._paired_factor_coordinates)
+                self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)
+                self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+                self.assertTrue(
+                    any(np.any(sample[6] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
+                    "mixed scene generated no friction rows",
+                )
+                for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+                    self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+                    np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+                    for label_value, expected_value, actual_value in zip(
+                        ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+                    ):
+                        np.testing.assert_allclose(
+                            actual_value,
+                            expected_value,
+                            rtol=5.0e-4,
+                            atol=1.0e-5,
+                            err_msg=f"{label_value} differed at step {step}",
+                        )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
+    def test_paired_response_falls_back_for_matrix_free_rows(self):
+        """Keep mixed dense/matrix-free worlds in physical coordinates."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "articulation_constraint_max": 96,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "static_plane": True,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(any(sample[7] > 0 for sample in paired), "static contact generated no matrix-free rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_factor_coordinates_follow_patch_friction_and_torsion(self):
+        """Keep factor coordinates with default patch friction and yield them to the general owner for torsion."""
+        model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
+        solvers = {}
+        with kernel_overrides({"hinv_jt_kernel": "auto"}):
+            for radius in (0.0, 0.01):
+                set_torsion_radius(model, radius)
+                solvers[radius] = SolverSteel(
+                    model,
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=0.0,
+                    iterations=8,
+                    articulation_constraint_max=96,
+                    free_body_constraint_max=32,
+                )
+            set_torsion_radius(model, 0.0)
+            point = SolverSteel(
+                model,
+                enable_joint_limits=True,
+                joint_limit_activation_gap=0.0,
+                iterations=8,
+                articulation_constraint_max=96,
+                free_body_constraint_max=32,
+                friction_anchor_beta=0.0,
+            )
+        self.assertTrue(solvers[0.0]._friction_anchors_enabled)
+        self.assertTrue(solvers[0.0]._paired_factor_coordinates)
+        # Patch rows are not uniform triples; the generic factor path pools the patch load instead.
+        self.assertFalse(solvers[0.0]._factor_coordinate_contact_triples)
+        self.assertFalse(point._friction_anchors_enabled)
+        self.assertTrue(point._paired_factor_coordinates)
+        self.assertTrue(point._factor_coordinate_contact_triples)
+        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertIsNotNone(solvers[0.01]._paired_response_primary_size)
+        self.assertFalse(solvers[0.01]._paired_factor_coordinates)
+        self.assertFalse(solvers[0.01]._factor_coordinate_contact_triples)
+
     @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
     def test_paired_response_without_factor_coordinates_matches_general(self):
         """Match the general response with the explicit inverses that velocity limits keep in physical coordinates."""
@@ -4236,6 +4144,76 @@ class TestSteelPairedResponse(unittest.TestCase):
                 np.testing.assert_allclose(
                     actual_value, expected_value, rtol=5.0e-4, atol=1.0e-5, err_msg=f"{label} differed at step {step}"
                 )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response selection requires CUDA")
+    def test_paired_response_selection(self):
+        """Select the pair only for one 17-26 DOF articulation and one free body per world, in the matrix-free solve."""
+        for dof_count, expected in ((23, 23), (12, None), (27, None)):
+            with self.subTest(dof_count=dof_count):
+                model = _build_mixed_response_model("cuda:0", dof_count=dof_count)
+                solver = SolverSteel(model, articulation_constraint_max=96, free_body_constraint_max=32)
+                self.assertEqual(solver._paired_response_primary_size, expected)
+        model = _build_mixed_response_model("cuda:0", dof_count=23)
+        self.assertTrue(
+            SolverSteel(model, articulation_constraint_max=96, free_body_constraint_max=32)._paired_factor_coordinates
+        )
+        # The tiled response is chunked only when the row capacity exceeds one chunk.
+        self.assertIsNone(SolverSteel(model, articulation_constraint_max=16)._paired_response_primary_size)
+        for options in ({"enable_bilateral_preelimination": True},):
+            with self.subTest(**options):
+                solver = SolverSteel(model, articulation_constraint_max=96, free_body_constraint_max=32, **options)
+                self.assertIsNone(solver._paired_response_primary_size)
+        for options in (
+            {"enable_joint_velocity_limits": True},
+            {"contact_regularization": 0.01},
+            {"row_schedule": "phased"},
+            {"drive_mode": "rows"},
+            {"enable_joint_friction": True},
+        ):
+            with self.subTest(**options):
+                solver = SolverSteel(model, articulation_constraint_max=96, free_body_constraint_max=32, **options)
+                self.assertEqual(solver._paired_response_primary_size, 23)
+                self.assertFalse(solver._paired_factor_coordinates)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_factor_coordinates_with_contact_compliance_match_general(self):
+        """Solve compliant contacts in factor coordinates like the general response."""
+        results = {}
+        for kernel in ("par_row", "auto"):
+            model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.5)
+            with kernel_overrides({"hinv_jt_kernel": kernel}):
+                solver = SolverSteel(
+                    model,
+                    friction_anchor_beta=0.0,
+                    contact_compliance=True,
+                    iterations=16,
+                    articulation_constraint_max=96,
+                    free_body_constraint_max=32,
+                )
+            state_0, state_1 = model.state(), model.state()
+            joint_qd = state_0.joint_qd.numpy()
+            free = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
+            joint_qd[int(solver._model_plan.articulation_dof_start[free]) + 2] = -3.0
+            state_0.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, rigid_contact_max=64)
+            contacts = pipeline.contacts()
+            for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+                setattr(contacts, name, wp.zeros(64, dtype=float, device="cuda:0"))
+            compliant = 0
+            for _ in range(20):
+                pipeline.collide(state_0, contacts)
+                contacts.rigid_contact_stiffness.fill_(3000.0)
+                contacts.rigid_contact_damping.fill_(20.0)
+                contacts.rigid_contact_friction.fill_(1.0)
+                solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+                state_0, state_1 = state_1, state_0
+                compliant = max(compliant, solver.compliance_contact_count)
+            results[kernel] = (solver, compliant, state_0.joint_qd.numpy())
+        paired, compliant, joint_qd = results["auto"]
+        self.assertTrue(paired._paired_factor_coordinates)
+        self.assertGreater(compliant, 0)
+        np.testing.assert_allclose(joint_qd, results["par_row"][2], rtol=0.0, atol=1.0e-4)
 
 
 if __name__ == "__main__":

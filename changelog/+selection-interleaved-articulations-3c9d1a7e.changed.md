@@ -1,0 +1,1 @@
+Let `ArticulationView(..., homogeneous=False)` select articulations interleaved irregularly with others within a world, including their custom frequencies, by addressing each articulation through explicit model indices; `homogeneous=True` still rejects them.

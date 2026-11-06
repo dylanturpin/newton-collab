@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Operate a physical fader to drive a closed-linkage pelican automaton.
 
-Command: python -m newton.examples steel_pelican_bicycle
-
 Drag bodies to apply forces, pause or scrub the robot path, and reset the scene.
 Only the robot joints are position-driven; object motion comes from contacts.
+
+Success criteria:
+- The robot moves the fader, and the closed linkage drives the pelican's pedaling motion.
+- The linkage stays assembled, without drifting loop closures.
+
+Runs:
+- `python -m newton.examples steel_pelican_bicycle`
 """
 
 import numpy as np
