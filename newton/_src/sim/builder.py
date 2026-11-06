@@ -1338,9 +1338,16 @@ class ModelBuilder:
             actuator_mode: JointTargetMode | None = None,
             target_pos: float | None = None,
             target_vel: float | None = None,
+            spring_stiffness: float | None = None,
+            spring_ref: float | None = None,
         ):
             target_q = _resolve_joint_target_alias(target_q, target_pos, "target_q", "target_pos")
             target_qd = _resolve_joint_target_alias(target_qd, target_vel, "target_qd", "target_vel")
+            if spring_stiffness is not None:
+                stiffness = _resolve_joint_target_alias(
+                    stiffness or None, spring_stiffness, "stiffness", "spring_stiffness"
+                )
+            rest_q = _resolve_joint_target_alias(rest_q, spring_ref, "rest_q", "spring_ref")
             self.axis = wp.normalize(axis_to_vec3(axis))
             """The 3D joint axis in the joint parent anchor frame."""
             self.limit_lower = limit_lower
@@ -1400,6 +1407,40 @@ class ModelBuilder:
         def target_pos(self, value: float) -> None:
             warnings.warn("target_pos is deprecated; use target_q instead.", NewtonDeprecationWarning, stacklevel=2)
             self.target_q = value
+
+        @property
+        def spring_stiffness(self) -> float:
+            """Deprecated passive spring stiffness.
+
+            .. deprecated:: 1.9
+                Use :attr:`stiffness` instead.
+            """
+            warnings.warn(
+                "spring_stiffness is deprecated; use stiffness instead.", NewtonDeprecationWarning, stacklevel=2
+            )
+            return self.stiffness
+
+        @spring_stiffness.setter
+        def spring_stiffness(self, value: float) -> None:
+            warnings.warn(
+                "spring_stiffness is deprecated; use stiffness instead.", NewtonDeprecationWarning, stacklevel=2
+            )
+            self.stiffness = value
+
+        @property
+        def spring_ref(self) -> float | None:
+            """Deprecated passive spring reference.
+
+            .. deprecated:: 1.9
+                Use :attr:`rest_q` instead.
+            """
+            warnings.warn("spring_ref is deprecated; use rest_q instead.", NewtonDeprecationWarning, stacklevel=2)
+            return self.rest_q
+
+        @spring_ref.setter
+        def spring_ref(self, value: float | None) -> None:
+            warnings.warn("spring_ref is deprecated; use rest_q instead.", NewtonDeprecationWarning, stacklevel=2)
+            self.rest_q = value
 
         @property
         def target_vel(self) -> float:
@@ -3615,6 +3656,30 @@ class ModelBuilder:
     # creating an unused instance attribute whose targets are never applied.
     joint_target_pos = RemovedAttribute("joint_target_q", removed_in="1.5")
     joint_target_vel = RemovedAttribute("joint_target_qd", removed_in="1.5")
+
+    @property
+    def joint_spring_stiffness(self) -> list[float]:
+        """Deprecated passive joint spring stiffness per DOF.
+
+        .. deprecated:: 1.9
+            Use :attr:`joint_stiffness` instead.
+        """
+        warnings.warn(
+            "joint_spring_stiffness is deprecated; use joint_stiffness instead.", NewtonDeprecationWarning, stacklevel=2
+        )
+        return self.joint_stiffness
+
+    @property
+    def joint_spring_ref(self) -> list[float]:
+        """Deprecated passive joint spring reference per coordinate.
+
+        .. deprecated:: 1.9
+            Use :attr:`joint_rest_q` instead.
+        """
+        warnings.warn(
+            "joint_spring_ref is deprecated; use joint_rest_q instead.", NewtonDeprecationWarning, stacklevel=2
+        )
+        return self.joint_rest_q
 
     @property
     def joint_twist_lower(self) -> list[float]:
@@ -6499,6 +6564,8 @@ class ModelBuilder:
         collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
+        spring_stiffness: float | None = None,
+        spring_ref: float | None = None,
         **kwargs,
     ) -> int:
         """Adds a revolute (hinge) joint to the model. It has one degree of freedom.
@@ -6533,6 +6600,8 @@ class ModelBuilder:
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
             custom_attributes: Dictionary of custom attribute values for JOINT, JOINT_DOF, or JOINT_COORD frequency attributes.
+            spring_stiffness: Deprecated; use ``stiffness``.
+            spring_ref: Deprecated; use ``rest_q``.
 
         Returns:
             The index of the added joint.
@@ -6541,6 +6610,8 @@ class ModelBuilder:
 
         target_q = _resolve_joint_target_alias(target_q, target_pos, "target_q", "target_pos")
         target_qd = _resolve_joint_target_alias(target_qd, target_vel, "target_qd", "target_vel")
+        stiffness = _resolve_joint_target_alias(stiffness, spring_stiffness, "stiffness", "spring_stiffness")
+        rest_q = _resolve_joint_target_alias(rest_q, spring_ref, "rest_q", "spring_ref")
         if axis is None:
             axis = self.default_joint_cfg.axis
         if isinstance(axis, ModelBuilder.JointDofConfig):
@@ -6609,6 +6680,8 @@ class ModelBuilder:
         collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
+        spring_stiffness: float | None = None,
+        spring_ref: float | None = None,
     ) -> int:
         """Adds a prismatic (sliding) joint to the model. It has one degree of freedom.
 
@@ -6642,6 +6715,8 @@ class ModelBuilder:
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
             custom_attributes: Dictionary of custom attribute values for JOINT, JOINT_DOF, or JOINT_COORD frequency attributes.
+            spring_stiffness: Deprecated; use ``stiffness``.
+            spring_ref: Deprecated; use ``rest_q``.
 
         Returns:
             The index of the added joint.
@@ -6650,6 +6725,8 @@ class ModelBuilder:
 
         target_q = _resolve_joint_target_alias(target_q, target_pos, "target_q", "target_pos")
         target_qd = _resolve_joint_target_alias(target_qd, target_vel, "target_qd", "target_vel")
+        stiffness = _resolve_joint_target_alias(stiffness, spring_stiffness, "stiffness", "spring_stiffness")
+        rest_q = _resolve_joint_target_alias(rest_q, spring_ref, "rest_q", "spring_ref")
         if axis is None:
             axis = self.default_joint_cfg.axis
         if isinstance(axis, ModelBuilder.JointDofConfig):

@@ -745,6 +745,10 @@ class Model:
         "joint_damping": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_stiffness": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_rest_q": AttributeSpec(AttributeFrequency.JOINT_COORD),
+        "joint_spring_stiffness": AttributeSpec(
+            AttributeFrequency.JOINT_DOF, alias_of="joint_stiffness", deprecated=True
+        ),
+        "joint_spring_ref": AttributeSpec(AttributeFrequency.JOINT_COORD, alias_of="joint_rest_q", deprecated=True),
         "joint_limit_lower": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_upper": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_ke": AttributeSpec(AttributeFrequency.JOINT_DOF),
@@ -2162,6 +2166,38 @@ class Model:
         """Replace shape edge ranges through the deprecated public alias."""
         warn_deprecation(_COLLISION_EDGE_DEPRECATION_MSG.format(name="shape_edge_range"))
         self._shape_edge_range = value
+
+    @property
+    def joint_spring_stiffness(self) -> wp.array[wp.float32] | None:
+        """Passive joint spring stiffness, shape [joint_dof_count], float.
+
+        .. deprecated:: 1.9
+            Use :attr:`joint_stiffness` instead.
+        """
+        warn_deprecation("Model.joint_spring_stiffness is deprecated; use Model.joint_stiffness instead.")
+        return self.joint_stiffness
+
+    @joint_spring_stiffness.setter
+    def joint_spring_stiffness(self, value: wp.array[wp.float32] | None) -> None:
+        """Replace the passive joint spring stiffness through the deprecated alias."""
+        warn_deprecation("Model.joint_spring_stiffness is deprecated; use Model.joint_stiffness instead.")
+        self.joint_stiffness = value
+
+    @property
+    def joint_spring_ref(self) -> wp.array[wp.float32] | None:
+        """Passive joint spring rest coordinates, shape [joint_coord_count], float.
+
+        .. deprecated:: 1.9
+            Use :attr:`joint_rest_q` instead.
+        """
+        warn_deprecation("Model.joint_spring_ref is deprecated; use Model.joint_rest_q instead.")
+        return self.joint_rest_q
+
+    @joint_spring_ref.setter
+    def joint_spring_ref(self, value: wp.array[wp.float32] | None) -> None:
+        """Replace the passive joint spring rest coordinates through the deprecated alias."""
+        warn_deprecation("Model.joint_spring_ref is deprecated; use Model.joint_rest_q instead.")
+        self.joint_rest_q = value
 
     @property
     def joint_twist_lower(self) -> wp.array[wp.float32] | None:

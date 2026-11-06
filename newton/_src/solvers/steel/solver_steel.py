@@ -22,6 +22,7 @@ from ...geometry.flags import MeshProperties, ShapeFlags
 from ...geometry.utils import _scan_scratch_size, scan_with_total
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk, eval_jacobian, eval_mass_matrix
+from ...utils.deprecation import warn_deprecation
 from ..coupled.interface import CouplingInterface
 from ..coupled.model_view import ModelView
 from ..solver import SolverBase
@@ -8280,6 +8281,48 @@ class SolverSteel(SolverBase, CouplingInterface):
                 "be solved per world at any capacity and need a different scene layout. Reset the "
                 "affected worlds before accepting transitions."
             )
+
+    def check_joint_friction(self) -> None:
+        """Raise if a step read invalid joint friction, or if :meth:`check_constraint_capacity` raises.
+
+        .. deprecated:: 1.9
+            Use :meth:`check_constraint_capacity` instead.
+        """
+        warn_deprecation("SolverSteel.check_joint_friction() is deprecated; use check_constraint_capacity() instead.")
+        self.check_constraint_capacity()
+
+    def validate_contact_compliance(self) -> None:
+        """Raise if contact compliance rejected its input, or if :meth:`check_constraint_capacity` raises.
+
+        .. deprecated:: 1.9
+            Use :meth:`check_constraint_capacity` instead.
+        """
+        warn_deprecation(
+            "SolverSteel.validate_contact_compliance() is deprecated; use check_constraint_capacity() instead."
+        )
+        self.check_constraint_capacity()
+
+    @property
+    def joint_friction_invalid(self) -> wp.array[wp.bool]:
+        """Per-world device flags, global entry last, for invalid joint friction read by a step.
+
+        .. deprecated:: 1.9
+            Use :meth:`check_constraint_capacity` instead.
+        """
+        warn_deprecation("SolverSteel.joint_friction_invalid is deprecated; use check_constraint_capacity() instead.")
+        return self._joint_friction_invalid
+
+    @property
+    def joint_qd_public_convention(self) -> bool:
+        """``True``: free-joint ``joint_qd`` is ``(v_com_world, omega_world)``, as :func:`newton.eval_fk` reads it.
+
+        .. deprecated:: 1.9
+            Steel's ``joint_qd`` always uses this convention.
+        """
+        warn_deprecation(
+            "SolverSteel.joint_qd_public_convention is deprecated; Steel's joint_qd always uses the public convention."
+        )
+        return True
 
     def _status_sources(self) -> dict[str, wp.array]:
         """Return the device status arrays :meth:`check_constraint_capacity` reports."""

@@ -2072,11 +2072,56 @@ def test_registration_adds_no_spring_attributes(test, device):
     test.assertFalse(any(key in builder.custom_attributes for key in SPRING_KEYS))
 
 
+def test_deprecated_spring_spellings(test, device):
+    """Map the deprecated spring spellings onto the passive spring stiffness and rest coordinate."""
+    deprecated = newton.exceptions.NewtonDeprecationWarning
+    builder = newton.ModelBuilder()
+    link = builder.add_link()
+    with test.assertWarnsRegex(deprecated, "spring_stiffness is deprecated"):
+        joint = builder.add_joint_revolute(-1, link, spring_stiffness=2.0, spring_ref=0.25)
+    builder.add_articulation([joint])
+    with test.assertWarnsRegex(deprecated, "spring_ref is deprecated"):
+        cfg = newton.ModelBuilder.JointDofConfig(spring_stiffness=3.0, spring_ref=0.5)
+    test.assertEqual((cfg.stiffness, cfg.rest_q), (3.0, 0.5))
+    with test.assertRaisesRegex(ValueError, "Conflicting stiffness"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", deprecated)
+        newton.ModelBuilder.JointDofConfig(stiffness=1.0, spring_stiffness=3.0)
+    with test.assertWarnsRegex(deprecated, "joint_stiffness instead"):
+        test.assertEqual(builder.joint_spring_stiffness, [2.0])
+    with test.assertWarnsRegex(deprecated, "joint_rest_q instead"):
+        test.assertEqual(builder.joint_spring_ref, [0.25])
+    model = builder.finalize(device=device)
+    with test.assertWarnsRegex(deprecated, "Model.joint_stiffness instead"):
+        test.assertIs(model.joint_spring_stiffness, model.joint_stiffness)
+    with test.assertWarnsRegex(deprecated, "Model.joint_rest_q instead"):
+        test.assertIs(model.joint_spring_ref, model.joint_rest_q)
+    np.testing.assert_allclose(model.joint_rest_q.numpy(), [0.25])
+
+
+def test_deprecated_status_members(test, device):
+    """Delegate Steel's deprecated status members to check_constraint_capacity()."""
+    deprecated = newton.exceptions.NewtonDeprecationWarning
+    builder = newton.ModelBuilder()
+    link = builder.add_link()
+    builder.add_articulation([builder.add_joint_revolute(-1, link)])
+    solver = SolverSteel(builder.finalize(device=device))
+    for name in ("check_joint_friction", "validate_contact_compliance"):
+        with test.subTest(name=name), test.assertWarnsRegex(deprecated, f"{name}\\(\\) is deprecated"):
+            getattr(solver, name)()
+    with test.assertWarnsRegex(deprecated, "joint_friction_invalid is deprecated"):
+        test.assertIs(solver.joint_friction_invalid, solver._joint_friction_invalid)
+    with test.assertWarnsRegex(deprecated, "joint_qd_public_convention is deprecated"):
+        test.assertTrue(solver.joint_qd_public_convention)
+    solver.constraint_overflow.fill_(True)
+    with test.assertRaises(RuntimeError), warnings.catch_warnings():
+        warnings.simplefilter("ignore", deprecated)
+        solver.check_joint_friction()
+
+
 class TestSteelSprings(unittest.TestCase):
     pass
 
 
-# test_joint_damping covers passive damping on the matrix-free CUDA and split CPU routes.
 for _name, _func in (
     ("test_spring_converges_to_rest_coordinate", test_spring_converges_to_rest_coordinate),
     (
@@ -2097,6 +2142,12 @@ add_function_test(
     "test_registration_adds_no_spring_attributes",
     test_registration_adds_no_spring_attributes,
     devices=None,
+)
+add_function_test(
+    TestSteelSprings, "test_deprecated_spring_spellings", test_deprecated_spring_spellings, devices=get_test_devices()
+)
+add_function_test(
+    TestSteelSprings, "test_deprecated_status_members", test_deprecated_status_members, devices=get_test_devices()
 )
 
 
