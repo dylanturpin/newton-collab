@@ -483,6 +483,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
     """
 
     supports_body_disable_gravity = True
+    """Defers to the entries: one whose solver ignores the flag and owns a flagged body warns at construction."""
 
     @dataclass(frozen=True)
     class Entry:
