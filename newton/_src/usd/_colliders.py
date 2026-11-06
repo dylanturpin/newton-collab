@@ -418,11 +418,10 @@ def _parse_colliders(
                                         )
                                 else:
                                     remeshing_kwargs = ()
-                                    if remeshing_method == "coacd" and (
-                                        "PhysxConvexDecompositionCollisionAPI"
-                                        in prim.GetPrimTypeInfo().GetAppliedAPISchemas()
+                                    if remeshing_method == "coacd" and usd.has_applied_api_schema(
+                                        prim, "PhysxConvexDecompositionCollisionAPI"
                                     ):
-                                        remeshing_kwargs = _physx_convex_decomposition_kwargs(prim)
+                                        remeshing_kwargs = _physx_convex_decomposition_kwargs(prim, R, mesh.maxhullvert)
                                     remeshing_queue.setdefault((remeshing_method, remeshing_kwargs), []).append(
                                         shape_id
                                     )
@@ -496,9 +495,12 @@ def _parse_colliders(
             )
 
 
-def _physx_convex_decomposition_kwargs(prim: Usd.Prim) -> tuple[tuple[str, Any], ...]:
-    """Map PhysxConvexDecompositionCollisionAPI hull count and vertex limits onto CoACD settings."""
-    max_hulls = int(usd.get_attribute(prim, "physxConvexDecompositionCollision:maxConvexHulls", 32))
-    hull_vertices = int(usd.get_attribute(prim, "physxConvexDecompositionCollision:hullVertexLimit", 64))
+def _physx_convex_decomposition_kwargs(
+    prim: Usd.Prim, resolver: SchemaResolverManager, hull_vertex_limit: int
+) -> tuple[tuple[str, Any], ...]:
+    """Map the resolved PhysX hull-count limit and the mesh's hull vertex limit onto CoACD settings."""
+    max_hulls = resolver.get_value(prim, prim_type=PrimType.SHAPE, key="convex_decomposition_max_hulls")
+    if max_hulls is None:
+        return ()
     # CoACD caps the hull count only while merging, and the vertex count only while decimating.
-    return (("max_convex_hull", max_hulls), ("merge", True), ("decimate", True), ("max_ch_vertex", hull_vertices))
+    return (("max_convex_hull", max_hulls), ("merge", True), ("decimate", True), ("max_ch_vertex", hull_vertex_limit))

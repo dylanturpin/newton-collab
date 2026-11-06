@@ -12,6 +12,7 @@ import tempfile
 import types
 import unittest
 import warnings
+from typing import ClassVar
 from unittest import mock
 from urllib.parse import urlparse
 
@@ -680,29 +681,49 @@ class TestImportUsdPhysics(unittest.TestCase):
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_physx_convex_decomposition_limits(self):
-        """Honor PhysX hull count and hull vertex limits on convex decomposition."""
+        """Import opt-in PhysX limits, with one hull budget for all of a mesh's components."""
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        class LaterHullResolver(usd.SchemaResolver):
+            name = "later"
+            mapping: ClassVar[dict] = {
+                usd.PrimType.SHAPE: {"max_hull_vertices": usd.SchemaResolver.SchemaAttribute("later:hullVertexLimit")}
+            }
 
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)
         UsdPhysics.Scene.Define(stage, "/physicsScene")
-        box = newton.Mesh.create_box(
-            1.0, 1.0, 1.0, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+        source = newton.Mesh.create_sphere(
+            num_latitudes=8, num_longitudes=12, compute_normals=False, compute_uvs=False, compute_inertia=False
         )
-        for name in ("/Plain", "/Physx"):
+        for name in ("/Plain", "/Physx", "/Default", "/Other", "/Hull"):
+            vertices, indices = source.vertices, source.indices
+            if name == "/Physx":
+                vertices = np.concatenate((vertices, vertices + np.array([10.0, 0.0, 0.0])))
+                indices = np.concatenate((indices, indices + len(source.vertices)))
             mesh = UsdGeom.Mesh.Define(stage, name)
-            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
-            mesh.CreateFaceVertexCountsAttr().Set([3] * (len(box.indices) // 3))
-            mesh.CreateFaceVertexIndicesAttr().Set(box.indices.tolist())
-            mesh.CreatePointsAttr().Set([Gf.Vec3f(*point) for point in box.vertices.tolist()])
-            UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).GetApproximationAttr().Set(
-                UsdPhysics.Tokens.convexDecomposition
-            )
-        physx = stage.GetPrimAtPath("/Physx")
-        physx.AddAppliedSchema("PhysxConvexDecompositionCollisionAPI")
-        physx.CreateAttribute("physxConvexDecompositionCollision:maxConvexHulls", Sdf.ValueTypeNames.Int).Set(5)
-
+            mesh.CreateFaceVertexCountsAttr().Set([3] * (len(indices) // 3))
+            mesh.CreateFaceVertexIndicesAttr().Set(indices.tolist())
+            mesh.CreatePointsAttr().Set([Gf.Vec3f(*point) for point in vertices.tolist()])
+            prim = mesh.GetPrim()
+            prim.CreateAttribute("later:hullVertexLimit", Sdf.ValueTypeNames.Int).Set(12)
+            UsdPhysics.CollisionAPI.Apply(prim)
+            approximation = UsdPhysics.Tokens.convexHull if name == "/Hull" else UsdPhysics.Tokens.convexDecomposition
+            UsdPhysics.MeshCollisionAPI.Apply(prim).GetApproximationAttr().Set(approximation)
+            if name != "/Plain":
+                prim.AddAppliedSchema("PhysxConvexDecompositionCollisionAPI")
+            if name in ("/Plain", "/Physx", "/Other", "/Hull"):
+                hulls, vertices = (1, 8) if name == "/Physx" else (2, 16)
+                prim.CreateAttribute("physxConvexDecompositionCollision:maxConvexHulls", Sdf.ValueTypeNames.Int).Set(
+                    hulls
+                )
+                prim.CreateAttribute("physxConvexDecompositionCollision:hullVertexLimit", Sdf.ValueTypeNames.Int).Set(
+                    vertices
+                )
+                prim.CreateAttribute("physxConvexHullCollision:hullVertexLimit", Sdf.ValueTypeNames.Int).Set(
+                    4 if name == "/Other" else 32
+                )
         calls = []
         fake_coacd = types.ModuleType("coacd")
         fake_coacd.Mesh = lambda vertices, indices: (vertices, indices)
@@ -712,14 +733,56 @@ class TestImportUsdPhysics(unittest.TestCase):
             return [cmesh]
 
         fake_coacd.run_coacd = run_coacd
-        with patch_sys_module("coacd", fake_coacd):
-            newton.ModelBuilder().add_usd(stage)
-        merged = [call for call in calls if call["merge"]]
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0]["max_convex_hull"], 5)
-        self.assertTrue(merged[0]["decimate"])
-        self.assertEqual(merged[0]["max_ch_vertex"], 64)
-        self.assertEqual(len(calls), 2)
+        for physx_resolver, later_resolver in ((False, False), (True, False), (True, True)):
+            for load_visual_shapes in (False, True):
+                with self.subTest(
+                    physx_resolver=physx_resolver, later_resolver=later_resolver, load_visual_shapes=load_visual_shapes
+                ):
+                    calls.clear()
+                    builder = newton.ModelBuilder()
+                    resolvers = [usd.SchemaResolverPhysx()] if physx_resolver else []
+                    if later_resolver:
+                        resolvers.append(LaterHullResolver())
+                    with patch_sys_module("coacd", fake_coacd), warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        builder.add_usd(
+                            stage,
+                            load_visual_shapes=load_visual_shapes,
+                            schema_resolvers=resolvers,
+                        )
+                    budget_warnings = [w for w in caught if "convex hull budget" in str(w.message)]
+                    self.assertEqual(len(budget_warnings), 1 if physx_resolver else 0)
+                    merged = [call for call in calls if call["merge"]]
+                    self.assertEqual(
+                        sorted(call["max_convex_hull"] for call in merged), [1, 1, 2, 32] if physx_resolver else []
+                    )
+                    expected = {"/Plain": 32, "/Physx": 8, "/Default": 64, "/Other": 16, "/Hull": 32}
+                    if later_resolver:
+                        expected["/Default"] = 12
+                    self.assertTrue(all(call.get("decimate", False) == call["merge"] for call in calls))
+                    self.assertEqual(
+                        sorted(call["max_ch_vertex"] for call in merged),
+                        sorted([expected["/Physx"]] * 2 + [expected["/Default"], expected["/Other"]])
+                        if physx_resolver
+                        else [],
+                    )
+                    hulls = [i for i, kind in enumerate(builder.shape_type) if kind == newton.GeoType.CONVEX_MESH]
+                    self.assertEqual(len(hulls), 5 if physx_resolver else 6)
+                    for shape in hulls:
+                        label = builder.shape_label[shape]
+                        path = next(path for path in expected if label.startswith(path))
+                        limit = expected[path] if physx_resolver else newton.Mesh.MAX_HULL_VERTICES
+                        self.assertEqual(builder.shape_source[shape].maxhullvert, limit)
+                        self.assertLessEqual(len(builder.shape_source[shape].vertices), limit)
+                        if path == "/Physx" and physx_resolver:
+                            # A budget of one merges the separated components into one hull.
+                            extent = builder.shape_source[shape].vertices[:, 0]
+                            self.assertGreater(float(np.ptp(extent)), 10.0)
+                    for device in devices:
+                        with self.subTest(device=device):
+                            model = builder.finalize(device=device)
+                            self.assertEqual(model.shape_count, builder.shape_count)
+                            self.assertTrue(np.isfinite(model.shape_scale.numpy()).all())
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_physx_convex_decomposition_budget_spans_components(self):
@@ -760,14 +823,14 @@ class TestImportUsdPhysics(unittest.TestCase):
 
         fake_coacd.run_coacd = run_coacd
         with patch_sys_module("coacd", fake_coacd):
-            newton.ModelBuilder().add_usd(two_boxes_stage(10))
+            newton.ModelBuilder().add_usd(two_boxes_stage(10), schema_resolvers=[usd.SchemaResolverPhysx()])
             self.assertEqual(sum(budget for _, budget in budgets), 10)
             self.assertLess(budgets[0][1], budgets[1][1])
 
             budgets.clear()
             builder = newton.ModelBuilder()
             with self.assertWarns(UserWarning):
-                builder.add_usd(two_boxes_stage(1))
+                builder.add_usd(two_boxes_stage(1), schema_resolvers=[usd.SchemaResolverPhysx()])
             self.assertEqual([budget for _, budget in budgets], [1, 1])
             hulls = [i for i, kind in enumerate(builder.shape_type) if kind == newton.GeoType.CONVEX_MESH]
             self.assertEqual(len(hulls), 1)

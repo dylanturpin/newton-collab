@@ -822,11 +822,12 @@ For mesh colliders with ``physics:approximation = "convexDecomposition"`` and
 ``PhysxConvexDecompositionCollisionAPI`` applied, enabling
 :class:`newton.usd.SchemaResolverPhysx` imports
 ``physxConvexDecompositionCollision:maxConvexHulls`` (default 32) as CoACD's
-hull-count limit with merging enabled, independently for each connected component.
+hull-count limit with merging enabled, for the whole mesh: the budget is shared across
+its connected components in proportion to surface area, at least one hull each, and if
+the components outnumber the budget the nearest hulls are merged until it is met.
 ``physxConvexDecompositionCollision:hullVertexLimit`` (default 64) sets the mesh's
 hull vertex limit, taking precedence over ``physxConvexHullCollision:hullVertexLimit``
-for these prims. Newton's existing hull reduction applies that vertex limit to each
-output hull. Disconnected components remain separate; the result need not match
+for these prims; CoACD decimates each hull to that limit. The result need not match
 PhysX cooking.
 
 **Newton articulation remapping:**
