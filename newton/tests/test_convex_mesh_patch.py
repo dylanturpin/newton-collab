@@ -6,6 +6,7 @@
 import subprocess
 import sys
 import unittest
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -631,14 +632,17 @@ def _puck_motion(device, convex_mesh_patch, yaw, steps=4800):
         model, broad_phase="nxn", contact_matching="sticky", convex_mesh_patch=convex_mesh_patch
     )
     contacts = pipeline.contacts()
-    solver = newton.solvers.SolverSteel(
-        model,
-        iterations=32,
-        contact_regularization=0.01,
-        solve_mode="serial",
-        contact_shared_anchor=True,
-        enable_sleeping=True,
-    )
+    with warnings.catch_warnings():
+        # Shared anchors apply to the normal rows; patch friction keeps its own anchors.
+        warnings.filterwarnings("ignore", "Patch friction selects", newton.exceptions.NewtonWarning)
+        solver = newton.solvers.SolverSteel(
+            model,
+            iterations=32,
+            contact_regularization=0.01,
+            solve_mode="serial",
+            contact_shared_anchor=True,
+            enable_sleeping=True,
+        )
     state_0, state_1, control = model.state(), model.state(), model.control()
 
     def tick():
