@@ -322,7 +322,8 @@ def test_witnesses_on_hull_surfaces_split(test, device):
 def test_patch_contact_capacity(test, device):
     """Check that the automatic capacity holds the patch's 8 contacts per convex-mesh pair.
 
-    Worlds holding one isolated box add shapes but no pairs, so they must not dilute the budget.
+    Worlds holding one isolated box add shapes but no pairs, so they must not dilute the budget. A supplied
+    pair array keeps that budget on shapes whose collision flags are off.
     """
     lower = _disc(radius=0.03, jitter=3.0e-5, seed=4)
     upper = _disc(jitter=3.0e-5, seed=3)
@@ -351,6 +352,15 @@ def test_patch_contact_capacity(test, device):
     count = int(contacts.rigid_contact_count.numpy()[0])
     # Every pair writes all 8 contacts, more than the 5-per-pair budget holds.
     test.assertEqual(count, 250 * 8)
+
+    supplied_model = model()
+    supplied_model.shape_contact_pairs = wp.clone(supplied_model.shape_contact_pairs)
+    supplied_model.shape_flags.zero_()
+    pipeline = newton.CollisionPipeline(supplied_model, broad_phase="explicit", convex_mesh_patch=True)
+    test.assertEqual(pipeline.rigid_contact_max, 250 * 8)
+    contacts = pipeline.contacts()
+    pipeline.collide(supplied_model.state(), contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 250 * 8)
 
 
 def test_patch_spans_disc_on_disc(test, device):

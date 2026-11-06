@@ -841,7 +841,8 @@ def _estimate_rigid_contact_details(model: Model, convex_mesh_patch: bool = Fals
     if variant_options is not None:
         fixed_box_mask &= ~variant_options.row_mask
     convex_mesh_types = (int(GeoType.CONVEX_MESH),)
-    convex_mesh_mask = colliding_mask & (
+    # Without the collision flags, so that a supplied pair array's endpoints count as well.
+    convex_mesh_mask = (
         np.isin(shape_types, convex_mesh_types)
         if variant_options is None
         else variant_options.may_be(shape_types, convex_mesh_types)
@@ -951,7 +952,7 @@ def _estimate_rigid_contact_details(model: Model, convex_mesh_patch: bool = Fals
     # Extra per-pair contacts the convex-mesh patch can add, counted once per convex mesh.
     patch_extra = 0
     if convex_mesh_patch:
-        num_convex_meshes = int(np.count_nonzero(convex_mesh_mask))
+        num_convex_meshes = int(np.count_nonzero(colliding_mask & convex_mesh_mask))
         patch_extra = num_convex_meshes * (_CONVEX_MESH_PATCH_PAIR_MAX_CONTACTS - _RIGID_CONTACTS_PER_PRIMITIVE_PAIR)
 
     # Weighted contacts from non-plane shape types.
