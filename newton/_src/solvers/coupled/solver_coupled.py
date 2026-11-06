@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import warnings
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -15,6 +16,7 @@ import numpy as np
 import warp as wp
 
 from ...core.reset import reset_world_selected as _reset_world_selected
+from ...exceptions import NewtonWarning
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
 from ..solver import SolverBase
@@ -951,6 +953,20 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 in_place=bool(cfg.in_place),
                 free_root_joints=None if index_lists is None else index_lists.free_root_joints,
             )
+
+        disabled = model.body_disable_gravity
+        if disabled is not None and disabled.shape[0] > 0:
+            flagged = disabled.numpy()
+            for cfg in self._entry_configs:
+                solver = self._entries[cfg.name].solver
+                bodies = np.asarray(cfg.bodies, dtype=int)
+                if not type(solver).supports_body_disable_gravity and flagged[bodies].any():
+                    warnings.warn(
+                        f"SolverCoupled entry {cfg.name!r} uses {type(solver).__name__}, which ignores "
+                        "Model.body_disable_gravity; gravity acts on its bodies.",
+                        NewtonWarning,
+                        stacklevel=3,
+                    )
 
         restarts = self._iteration_restarts_possible()
         for entry in self._entries.values():

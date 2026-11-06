@@ -4,6 +4,7 @@
 """SolverSteel per-body gravity exclusion (``Model.body_disable_gravity``)."""
 
 import unittest
+import warnings
 from itertools import pairwise
 
 import numpy as np
@@ -11,6 +12,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherstone, SolverSteel
+from newton.solvers.experimental.coupled import SolverCoupled
 from newton.tests.unittest_utils import USD_AVAILABLE
 from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
 
@@ -25,6 +27,16 @@ class TestSteelBodyGravity(unittest.TestCase):
                 self.assertWarnsRegex(newton.exceptions.NewtonWarning, "ignores Model.body_disable_gravity"),
             ):
                 solver_type(model)
+        coupled = SolverCoupled
+        for body, warns in ((0, True), (1, False)):
+            entries = [coupled.Entry(name="semi", solver=newton.solvers.SolverSemiImplicit, bodies=[body])]
+            with self.subTest(coupled_body=body), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                coupled(model, entries=entries)
+            messages = [str(w.message) for w in caught if "body_disable_gravity" in str(w.message)]
+            self.assertEqual(len(messages), int(warns), messages)
+            if warns:
+                self.assertIn("entry 'semi'", messages[0])
         enabled = newton.ModelBuilder()
         _add_free_body(enabled, "enabled", False)
         newton.solvers.SolverXPBD(enabled.finalize(device="cpu"))
