@@ -391,17 +391,6 @@ python -m newton.examples --describe robot_omniwheel
       <code>python -m newton.examples cable_plectoneme</code>
     </td>
   </tr>
-  <tr><td colspan="3"><h3>Steel Tabletop Examples (CUDA)</h3></td></tr>
-  <tr>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_bolt_sweep.py"><img width="320" src="docs/images/examples/example_steel_bolt_sweep.jpg" alt="Bolt sweep"></a><br><code>python -m newton.examples steel_bolt_sweep</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_wrecking_ball.py"><img width="320" src="docs/images/examples/example_steel_wrecking_ball.jpg" alt="Wrecking ball"></a><br><code>python -m newton.examples steel_wrecking_ball</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_plate_rack.py"><img width="320" src="docs/images/examples/example_steel_plate_rack.jpg" alt="Plate rack"></a><br><code>python -m newton.examples steel_plate_rack</code></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_pelican_bicycle.py"><img width="320" src="docs/images/examples/example_steel_pelican_bicycle.jpg" alt="Pelican bicycle"></a><br><code>python -m newton.examples steel_pelican_bicycle</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_cup_unpacking.py"><img width="320" src="docs/images/examples/example_steel_cup_unpacking.jpg" alt="Cup unpacking"></a><br><code>python -m newton.examples steel_cup_unpacking</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_toy_well.py"><img width="320" src="docs/images/examples/example_steel_toy_well.jpg" alt="Toy well"></a><br><code>python -m newton.examples steel_toy_well</code></td>
-  </tr>
   <tr>
     <td align="center" width="33%">
       <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_initial_rest_pose.py">
@@ -1131,6 +1120,62 @@ python -m newton.examples --describe robot_omniwheel
       <code>python -m newton.examples steel_determinism_arms</code>
     </td>
     <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_bolt_sweep.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_bolt_sweep.jpg" alt="Steel Bolt Sweep">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_wrecking_ball.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_wrecking_ball.jpg" alt="Steel Wrecking Ball">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_plate_rack.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_plate_rack.jpg" alt="Steel Plate Rack">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_bolt_sweep</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_wrecking_ball</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_plate_rack</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_pelican_bicycle.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_pelican_bicycle.jpg" alt="Steel Pelican Bicycle">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_cup_unpacking.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_cup_unpacking.jpg" alt="Steel Cup Unpacking">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_steel_toy_well.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_toy_well.jpg" alt="Steel Toy Well">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_pelican_bicycle</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_cup_unpacking</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_toy_well</code>
     </td>
   </tr>
   <tr>

@@ -1,1 +1,1 @@
-Add `SolverSteel(propagation_constraint_max=...)` to size the propagation row family of the `"propagation"` contact response on its own, so `free_body_constraint_max` no longer has to be large enough for every contact row.
+Add `SolverSteel(propagation_constraint_max=...)` to size the propagation row family of the `"propagation"` and `"propagation_colored"` contact responses on its own, so `free_body_constraint_max` no longer has to be large enough for every contact row.
