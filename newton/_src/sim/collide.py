@@ -157,10 +157,10 @@ def _shape_may_be_mesh(model: Model, shape_types: np.ndarray, variant_options: _
     )
 
 
-def _shape_may_have_sdf_edges(model: Model, variant_options: _VariantOptions | None) -> np.ndarray:
+def _shape_may_have_sdf_edges(model: Model, shape_count: int, variant_options: _VariantOptions | None) -> np.ndarray:
     """Shapes that have, or as variant rows can hold a colliding shape with, texture-SDF edge data."""
     if getattr(model, "_shape_sdf_index", None) is None or getattr(model, "_shape_edge_range", None) is None:
-        return np.zeros(model.shape_count, dtype=bool)
+        return np.zeros(shape_count, dtype=bool)
     mask = (model._shape_sdf_index.numpy() >= 0) & (model._shape_edge_range.numpy()[:, 1] > 0)
     if variant_options is not None:
         geometry = model._variant_shape_geometry
@@ -829,7 +829,7 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
 
     mesh_mask = colliding_mask & _shape_may_be_mesh(model, shape_types, variant_options)
     # Pairs of two shapes with SDF edges route to the mesh-mesh SDF path, except box-box pairs.
-    sdf_edge_mask = colliding_mask & ~mesh_mask & _shape_may_have_sdf_edges(model, variant_options)
+    sdf_edge_mask = colliding_mask & ~mesh_mask & _shape_may_have_sdf_edges(model, len(shape_types), variant_options)
     fixed_box_mask = shape_types == int(GeoType.BOX)
     if variant_options is not None:
         fixed_box_mask &= ~variant_options.row_mask
