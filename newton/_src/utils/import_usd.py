@@ -1501,18 +1501,15 @@ def parse_usd(
             return True
         return False
 
-    def _physics_material_from_desc(sdf_path, desc):
-        """Convert one native USD material descriptor into Newton's shape material."""
-        prim = stage.GetPrimAtPath(sdf_path)
-        return _resolve_physics_material(
-            prim, desc, R, builder.default_shape_cfg, default_shape_density=default_shape_density, verbose=verbose
-        )
-
-    # Parsing physics materials from the selected import subtree.
+    # Parsing physics materials from the stage
     for sdf_path, desc in data_for_key(ret_dict, UsdPhysics.ObjectType.RigidBodyMaterial):
         if warn_invalid_desc(sdf_path, desc):
             continue
-        material_specs[str(sdf_path)] = _physics_material_from_desc(sdf_path, desc)
+        prim = stage.GetPrimAtPath(sdf_path)
+
+        material_specs[str(sdf_path)] = _resolve_physics_material(
+            prim, desc, R, builder.default_shape_cfg, default_shape_density=default_shape_density, verbose=verbose
+        )
 
     if UsdPhysics.ObjectType.RigidBody in ret_dict:
         prim_paths, rigid_body_descs = ret_dict[UsdPhysics.ObjectType.RigidBody]

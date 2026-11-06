@@ -545,7 +545,6 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
         *,
         observables: SolverBase.Observables | None = None,
     ) -> None:
-        self._require_unreduced_contacts(contacts)
         self._apply_module_options()
         self.validate_observables(observables)
         self._require_unreduced_contacts(contacts)

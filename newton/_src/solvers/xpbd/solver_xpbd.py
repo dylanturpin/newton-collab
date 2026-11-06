@@ -466,7 +466,6 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
             dt: Time step size [s].
             observables: Optional solver observable arrays allocated by :meth:`observables`.
         """
-        self._require_unreduced_contacts(contacts)
         self._ensure_restitution_module_options()
         self._apply_module_options()
         self.validate_observables(observables, contacts)

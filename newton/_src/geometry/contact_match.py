@@ -77,8 +77,7 @@ The optional contact report adds one ``int32`` flag per contact.
 Per-frame call order (inside :class:`~newton.CollisionPipeline`)::
 
     sorter.sort_full(...)
-    reducer.reduce(...)  # optional; compact contacts and their sorted keys
-    matcher.match(...)  # indices name the retained stream
+    matcher.match(...)  # on the sorted stream; indices name final rows
     matcher.replay_matched(...)  # sticky-only; overwrite matched rows
     matcher.build_report(...)  # optional; must precede save_sorted_state
     matcher.save_sorted_state(...)  # after sorting, replay, and report
@@ -1061,7 +1060,6 @@ class ContactMatcher:
         data.margin1 = margin1
         data.body_q = body_q
         data.shape_body = shape_body
-        data.pos_threshold_sq = self._pos_threshold_sq
 
         data.pos_threshold_sq = self._pos_threshold_sq
         wp.launch(_replay_matched_kernel, dim=self._capacity, inputs=[data], device=device)

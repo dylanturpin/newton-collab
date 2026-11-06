@@ -1625,10 +1625,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         """Per-body awake flags, shape ``(body_count,)``; see :ref:`steel_sleep_observable`."""
 
-    # The default configuration is conformance-tested against body-pair-reduced contact buffers
-    # (test_contact_reduction_body_pairs); compliance and warm start reject them in step().
-    supports_body_pair_reduced_contacts: bool = True
-
     SUPPORTED_OBSERVABLES = frozenset(
         {
             SolverBase.ObservableKind.BODY_PARENT_F,
