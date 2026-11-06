@@ -2,10 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Clear lightweight packing, grasp a buried mug and place it outside its box.
 
-Command: python -m newton.examples steel_cup_unpacking
-
 Drag bodies to apply forces, pause or scrub the robot path, and reset the scene.
 Only the robot joints are position-driven; object motion comes from contacts.
+
+Success criteria:
+- The robot pushes the packing aside, grasps the buried mug and lifts it out of the box.
+- The mug is placed and rests outside the box.
+- No body penetrates the box walls or the table.
+
+Runs:
+- `python -m newton.examples steel_cup_unpacking`
 """
 
 import numpy as np

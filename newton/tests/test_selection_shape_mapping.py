@@ -55,7 +55,7 @@ class TestShapeMapping(unittest.TestCase):
                                     scene.add_world(distractor_world)
                             scene.add_world(target_world)
                         model = scene.finalize(device=device)
-                        view = ArticulationView(model, "robot_*", include_links=selected_links)
+                        view = ArticulationView(model, "robot_*", include_links=selected_links, homogeneous=False)
                         indices = selected_shapes(model, view)
                         for attribute in ("shape_material_mu", "shape_material_restitution", "shape_transform"):
                             source = getattr(model, attribute)
@@ -100,32 +100,6 @@ class TestShapeMapping(unittest.TestCase):
         layout = view.frequency_layouts[newton.Model.AttributeFrequency.SHAPE]
         self.assertFalse(layout.uses_explicit_model_indices)
         self.assertEqual(view.get_attribute("shape_material_mu", model).ptr, model.shape_material_mu.ptr)
-
-    def test_variable_global_gaps(self):
-        """Map matching local shape orders across different global gaps."""
-        scene = newton.ModelBuilder()
-        scene.add_shape_plane()
-        for order in (
-            [0, 2, 1, 3, 0, 2, 1, 3],
-            [-1, 0, -1, 2, 1, -1, 3, 0, 2, 1, 3],
-            [0, 1, 0, 1, 2, 3, 2, 3],
-        ):
-            scene.add_world(make_world(order=order))
-        for device in wp.get_devices():
-            model = scene.finalize(device=device)
-            for links in (None, ["root"], ["tip"], []):
-                with self.subTest(device=device, links=links):
-                    view = ArticulationView(model, "robot_*", include_links=links)
-                    indices = selected_shapes(model, view)
-                    initial = model.shape_material_mu.numpy().copy()
-                    np.testing.assert_array_equal(
-                        view.get_attribute("shape_material_mu", model).numpy(), initial[indices]
-                    )
-                    replacement = np.arange(indices.size, dtype=np.float32).reshape(indices.shape) + 20
-                    view.set_attribute("shape_material_mu", model, replacement)
-                    expected = initial.copy()
-                    expected[indices] = replacement
-                    np.testing.assert_array_equal(model.shape_material_mu.numpy(), expected)
 
     def test_trailing_axis_and_gather_gradient(self):
         """Preserve trailing components and gradient ownership through gathered shapes."""

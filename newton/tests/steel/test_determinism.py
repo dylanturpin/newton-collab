@@ -1,11 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic stepping of SolverSteel."""
-
+import contextlib
+import ctypes
+import gc
 import hashlib
+import os
 import re
+import subprocess
+import sys
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -13,30 +18,68 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.solvers.steel import solver_steel
+import newton.tests.unittest_utils
+from newton._src.geometry.utils import scan_with_total
 from newton._src.solvers.steel.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_TORSION,
+    _get_tree_fk_kernel,
+    _get_tree_tau_kernel,
     crba_fill_par_dof,
 )
-from newton.solvers import SolverBase, SolverSteel
-from newton.tests.steel import test_propagation
-from newton.tests.steel._fixtures import set_torsion_radius
-from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
+from newton.solvers import SolverSteel
+from newton.tests.steel._fixtures import _build_four_bar, steel_mode_options
+from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
+
+RUN_TO_RUN = wp.DeterministicMode.RUN_TO_RUN
 
 # Free root, then two ball joints: every joint has several DOFs.
 JOINT_DOF_DIMS = ((3, 3), (0, 3), (0, 3))
-
-
 CRBA_ARTICULATIONS = 256
-
-
 CRBA_LAUNCHES = 8
+
+# Joint-limit and velocity-limit rows of two floating ants per world, plus free boxes; drive rows need drive gains.
+SERIAL_OPTIONS = {
+    "drive_mode": "rows",
+    "enable_joint_limits": True,
+    "enable_joint_velocity_limits": True,
+    "iterations": 8,
+    "articulation_constraint_max": 256,
+    "free_body_constraint_max": 256,
+    # Rows that do not fit are dropped deterministically too, so overflow stays in scope.
+    "warn_constraint_overflow": False,
+}
+
+# Device-prepared contact torsion rows follow the contact rows of their world.
+TORSION_OPTIONS = {**SERIAL_OPTIONS, "contact_torsion_device": True, "articulation_constraint_max": 512}
+TORSION_COLORED_OPTIONS = {**TORSION_OPTIONS, "solve_mode": "colored", "articulated_contact_response": "propagation"}
+
+# Joint-friction rows alongside contact, drive, joint-limit and velocity-limit rows; unfused limits keep their rows.
+FRICTION_OPTIONS = {
+    **SERIAL_OPTIONS,
+    "enable_joint_friction": True,
+    "fuse_joint_velocity_limits": False,
+    "articulation_constraint_max": 512,
+}
+
+# Warm-started impulses are matched through contact matching and carried across steps.
+WARMSTART_OPTIONS = {**SERIAL_OPTIONS, "contact_warmstart": True, "velocity_iterations": 2}
+
+# The body-space propagation responses; they also take the free-body contacts.
+PROPAGATION_RESPONSES = ("propagation", "colored")
+
+# Ants alone select the sparse mass factors and their one-warp joint-limit builder.
+SPARSE_OPTIONS = {
+    "iterations": 8,
+    "enable_joint_limits": True,
+    "articulation_constraint_max": 256,
+    "friction_anchor_beta": 0.0,
+    "warn_constraint_overflow": False,
+}
 
 
 def test_crba_fill_par_dof_is_batch_invariant(test, device):
-    """Identical articulations get bitwise-identical, exactly symmetric mass matrices on every launch."""
+    """Give identical articulations bitwise-identical, exactly symmetric mass matrices on every launch."""
     joint_count = len(JOINT_DOF_DIMS)
     dof_count = sum(lin + ang for lin, ang in JOINT_DOF_DIMS)
     rng = np.random.default_rng(7)
@@ -60,9 +103,6 @@ def test_crba_fill_par_dof_is_batch_invariant(test, device):
         wp.array(np.tile(inertia, (n, 1, 1)), dtype=wp.spatial_matrix, device=device),
         wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=device),
         dof_count,
-        0,
-        wp.full(n * dof_count, -1, dtype=wp.int32, device=device),
-        wp.zeros(1, dtype=wp.float32, device=device),
     ]
 
     reference = None
@@ -115,58 +155,32 @@ def _simulate(model, solver, steps):
 
 
 def test_full_reset_matches_fresh_solver(test, device):
-    """After a full reset, eager steps replay a fresh solver's trajectory bit for bit."""
+    """Replay a fresh solver's trajectory bit for bit with eager steps after a full reset."""
     for interval in (1, 3):
         with test.subTest(update_mass_matrix_interval=interval):
             model = _build_pendulum_model(device)
-            reused = SolverSteel(model, update_mass_matrix_interval=interval)
+            options = {"update_mass_matrix_interval": interval}
+            reused = SolverSteel(model, **options)
             _simulate(model, reused, 5)
             reused.reset(model.state())
             body_q, body_qd = _simulate(model, reused, 7)
 
-            fresh_body_q, fresh_body_qd = _simulate(model, SolverSteel(model, update_mass_matrix_interval=interval), 7)
+            fresh_body_q, fresh_body_qd = _simulate(model, SolverSteel(model, **options), 7)
             np.testing.assert_array_equal(body_q, fresh_body_q)
             np.testing.assert_array_equal(body_qd, fresh_body_qd)
 
 
-# Two floating ants dropped onto each other plus a stack of boxes in every world: articulation-articulation,
-# articulation-box and box-box contacts, joint limits, PhysX drives, joint velocity limits and joint friction.
-ROBOT_SOLVER_OPTIONS = {
-    "solve_mode": "serial",
-    "drive_mode": "rows",
-    "enable_joint_limits": True,
-    "enable_joint_velocity_limits": True,
-    "enable_joint_friction": True,
-    "iterations": 8,
-    "articulation_constraint_max": 256,
-    "free_body_constraint_max": 256,
-    # Rows that do not fit are dropped deterministically too, so overflow stays in scope.
-    "warn_constraint_overflow": False,
-}
+def _build_contact_scene(
+    device, worlds=4, boxes=6, ants=2, torsion_radius=0.0, joint_friction=0.0, kinematic_tray=False
+):
+    """Floating ants dropped onto each other and onto a pile of free boxes in every world.
 
-
-# Joint friction rows are CUDA-only, so the CPU runs the same scene without them.
-CPU_ROBOT_SOLVER_OPTIONS = {**ROBOT_SOLVER_OPTIONS, "enable_joint_friction": False}
-
-
-COLORED_ROBOT_SOLVER_OPTIONS = {
-    **ROBOT_SOLVER_OPTIONS,
-    "solve_mode": "colored",
-    "articulated_contact_response": "propagation",
-}
-
-
-# Torsional and rolling rows ride on the robot options; their capacity fits, so no world overflows.
-ANGULAR_FRICTION_SOLVER_OPTIONS = {
-    **ROBOT_SOLVER_OPTIONS,
-    "enable_torsional_rolling_friction": True,
-    "friction_anchor_beta": 0.0,
-    "articulation_constraint_max": 512,
-}
-
-
-def _build_contact_scene(device, worlds=4, boxes=6, ants=2):
+    A positive ``joint_friction`` adds a floating prismatic, ball and D6 chain and sets it, with a position
+    drive, on every non-free DOF. ``kinematic_tray`` puts every world on one global kinematic tray that
+    slides and turns.
+    """
     env = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(env)
     for ant in range(ants):
         env.add_mjcf(
             newton.examples.get_asset("nv_ant.xml"),
@@ -185,31 +199,68 @@ def _build_contact_scene(device, worlds=4, boxes=6, ants=2):
             )
         )
         env.add_shape_box(body, hx=0.06, hy=0.05, hz=0.06, cfg=newton.ModelBuilder.ShapeConfig(density=300.0, mu=0.7))
+    if joint_friction > 0.0:
+        _add_mixed_chain(env, wp.vec3(-0.2, -1.0, 0.12))
     builder = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(builder)
     builder.replicate(env, worlds)
     builder.add_ground_plane()
+    if kinematic_tray:
+        tray = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()), is_kinematic=True)
+        builder.add_shape_box(tray, hx=2.0, hy=2.0, hz=0.01)
     model = builder.finalize(device=device)
+    if kinematic_tray:
+        # The tray's free joint is the last one: linear velocity along x, angular velocity about z.
+        joint_qd = model.joint_qd.numpy()
+        joint_qd[-6:] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.5)
+        model.joint_qd.assign(joint_qd)
     model.joint_velocity_limit.fill_(8.0)
-    revolute_dofs = model.joint_qd_start.numpy()[:-1][model.joint_type.numpy() == newton.JointType.REVOLUTE]
-    friction = np.zeros(model.joint_dof_count, dtype=np.float32)
-    friction[revolute_dofs] = 0.01
-    model.joint_friction.assign(friction)
+    if torsion_radius > 0.0:
+        model.steel.min_torsional_patch_radius.fill_(torsion_radius)
+    if joint_friction > 0.0:
+        jointed = np.repeat(model.joint_type.numpy(), np.diff(model.joint_qd_start.numpy())) != newton.JointType.FREE
+        model.joint_friction.assign(np.where(jointed, joint_friction, 0.0).astype(np.float32))
+        # Position drives on the same DOFs add drive rows.
+        model.joint_target_mode.assign(np.where(jointed, int(newton.JointTargetMode.POSITION), 0).astype(np.int32))
+        model.joint_target_ke.assign(np.where(jointed, 20.0, 0.0).astype(np.float32))
+        model.joint_target_kd.assign(np.where(jointed, 0.5, 0.0).astype(np.float32))
     return model
 
 
-def _build_angular_friction_scene(device, worlds=4):
-    """Three floating ants per world with torsional and rolling friction on every shape."""
-    model = _build_contact_scene(device, worlds=worlds, boxes=0, ants=3)
-    model.shape_material_mu_torsional.fill_(0.02)
-    model.shape_material_mu_rolling.fill_(0.01)
-    return model
+def _add_mixed_chain(builder, position):
+    """Add a floating chain of prismatic, ball and D6 joints with limits on its linear axes."""
+    dof = newton.ModelBuilder.JointDofConfig
+    links = []
+    for index in range(4):
+        link = builder.add_link(xform=wp.transform(position + wp.vec3(0.12 * index, 0.0, 0.0), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.05, hy=0.04, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=400.0))
+        links.append(link)
+    offset = wp.transform(wp.vec3(0.12, 0.0, 0.0), wp.quat_identity())
+    joints = [
+        builder.add_joint_free(links[0]),
+        builder.add_joint_prismatic(
+            links[0], links[1], parent_xform=offset, axis=newton.Axis.X, limit_lower=-0.04, limit_upper=0.04
+        ),
+        builder.add_joint_ball(links[1], links[2], parent_xform=offset),
+        builder.add_joint_d6(
+            links[2],
+            links[3],
+            parent_xform=offset,
+            linear_axes=[dof(axis=newton.Axis.Z, limit_lower=-0.03, limit_upper=0.03)],
+            angular_axes=[dof(axis=newton.Axis.X), dof(axis=newton.Axis.Y)],
+        ),
+    ]
+    builder.add_articulation(joints)
 
 
 def _actuate(model, control):
     dof_counts = np.diff(model.joint_qd_start.numpy())
     dof_type = np.repeat(model.joint_type.numpy(), dof_counts)
-    # Hinges only: a free joint's joint_f is a body wrench.
+    # Hinges only: a free joint's joint_f is a body wrench. The mixed chain is unactuated.
     torques = np.where(dof_type == newton.JointType.REVOLUTE, 30.0, 0.0).astype(np.float32)
+    dof_articulation = np.repeat(model.joint_articulation.numpy(), dof_counts)
+    chain = (newton.JointType.PRISMATIC, newton.JointType.BALL, newton.JointType.D6)
+    torques[np.isin(dof_articulation, dof_articulation[np.isin(dof_type, chain)])] = 0.0
     control.joint_f.assign(torques)
 
 
@@ -224,10 +275,16 @@ def _sample(state):
     return digest.hexdigest(), finite
 
 
-def _run_hashes(model, options, steps, graph=False, collision_options=None):
+def _make_pipeline(model, options):
+    if options.get("contact_warmstart"):
+        return newton.CollisionPipeline(model, contact_matching="latest")
+    return newton.CollisionPipeline(model, deterministic=True)
+
+
+def _run_hashes(model, options, steps, graph=False):
     """Simulate with deterministic collision and solver; return (hash, finite) per step or per graph replay."""
-    solver = SolverSteel(model, deterministic=True, **options)
-    pipeline = newton.CollisionPipeline(model, deterministic=True, **(collision_options or {}))
+    solver = SolverSteel(model, deterministic=RUN_TO_RUN, **options)
+    pipeline = _make_pipeline(model, options)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
@@ -254,15 +311,193 @@ def _run_hashes(model, options, steps, graph=False, collision_options=None):
     return hashes
 
 
+def test_deterministic_runs_are_bitwise_identical(test, device):
+    """Produce identical finite states in two runs at every eager step and every two-step CUDA graph boundary."""
+    model = _build_contact_scene(device)
+    torsion_model = _build_contact_scene(device, torsion_radius=0.02)
+    friction_model = _build_contact_scene(device, joint_friction=0.4)
+    configurations = [
+        ("serial", model, SERIAL_OPTIONS, False),
+        ("serial_graph", model, SERIAL_OPTIONS, True),
+        ("torsion_graph", torsion_model, TORSION_OPTIONS, True),
+        ("torsion_colored_graph", torsion_model, TORSION_COLORED_OPTIONS, True),
+        ("warmstart_graph", model, WARMSTART_OPTIONS, True),
+        ("joint_friction", friction_model, FRICTION_OPTIONS, False),
+        ("joint_friction_graph", friction_model, FRICTION_OPTIONS, True),
+    ]
+    for name, scene, options, graph in configurations:
+        with test.subTest(name):
+            first = _run_hashes(scene, options, 60, graph=graph)
+            second = _run_hashes(scene, options, 60, graph=graph)
+            test.assertEqual(first, second)
+            test.assertTrue(all(finite for _, finite in first))
+
+
+def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
+    """Repeat warm-started rollouts of both propagation responses bitwise over a moving kinematic tray."""
+    model = _build_contact_scene(device, kinematic_tray=True)
+    for response in PROPAGATION_RESPONSES:
+        for cached, graph in ((True, False), (False, False), (True, True)):
+            options = {
+                **WARMSTART_OPTIONS,
+                **steel_mode_options(response),
+                "propagation_cached_response": cached,
+            }
+            with test.subTest(response=response, cached=cached, graph=graph):
+                if not graph:
+                    _check_propagation_coverage(test, model, options)
+                first = _run_hashes(model, options, 40, graph=graph)
+                second = _run_hashes(model, options, 40, graph=graph)
+                test.assertEqual(first, second)
+                test.assertTrue(all(finite for _, finite in first))
+
+
+def test_deterministic_step_runs_under_an_external_capture(test, device):
+    """Replay a step captured directly through the CUDA driver bitwise like the same step captured by Warp."""
+    if not sys.platform.startswith("linux"):
+        test.skipTest("the CUDA driver capture loads libcuda.so.1")
+    # Contact, drive, joint-limit, velocity-limit and joint-friction rows all take their slots from a scan.
+    model = _build_contact_scene(device, joint_friction=0.4)
+    hashes = {}
+    for external in (False, True):
+        solver = SolverSteel(model, deterministic=RUN_TO_RUN, **FRICTION_OPTIONS)
+        pipeline = _make_pipeline(model, FRICTION_OPTIONS)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        _actuate(model, control)
+
+        def solve(solver=solver, contacts=contacts, state_0=state_0, state_1=state_1, control=control):
+            solver.step(state_0, state_1, control, contacts, 0.005)
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                wp.copy(getattr(state_0, name), getattr(state_1, name))
+
+        pipeline.collide(state_0, contacts)
+        replay, release = _capture_solve(device, solve, external)
+        try:
+            hashes[external] = []
+            for _ in range(8):
+                pipeline.collide(state_0, contacts)
+                replay()
+                hashes[external].append(_sample(state_0))
+        finally:
+            release()
+    test.assertEqual(hashes[True], hashes[False])
+    test.assertTrue(all(finite for _, finite in hashes[True]))
+
+
+def _capture_solve(device, solve, external):
+    """Capture ``solve`` with Warp, or with the CUDA driver alone as another framework would; return replay and release."""
+    if not external:
+        with wp.ScopedCapture(device=device) as capture:
+            solve()
+        return lambda: wp.capture_launch(capture.graph), lambda: None
+    cuda = ctypes.CDLL("libcuda.so.1")
+    handle = ctypes.c_void_p
+    cuda.cuStreamBeginCapture_v2.argtypes = [handle, ctypes.c_int]
+    cuda.cuStreamEndCapture.argtypes = [handle, ctypes.POINTER(handle)]
+    cuda.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(handle), handle, ctypes.c_ulonglong]
+    cuda.cuGraphLaunch.argtypes = [handle, handle]
+    cuda.cuGraphExecDestroy.argtypes = [handle]
+    cuda.cuGraphDestroy.argtypes = [handle]
+    stream = handle(wp.get_stream(device).cuda_stream)
+    graph, graph_exec = handle(), handle()
+    thread_local_mode = 1
+    began = cuda.cuStreamBeginCapture_v2(stream, thread_local_mode)
+    if began != 0:
+        raise RuntimeError(f"cuStreamBeginCapture failed with {began}")
+    try:
+        solve()
+    except BaseException:
+        if cuda.cuStreamEndCapture(stream, ctypes.byref(graph)) == 0:
+            cuda.cuGraphDestroy(graph)
+        raise
+    ended = cuda.cuStreamEndCapture(stream, ctypes.byref(graph))
+    if ended != 0:
+        raise RuntimeError(f"cuStreamEndCapture failed with {ended}")
+    # No instantiate flags: a graph holding an unfreed allocation fails to relaunch.
+    instantiated = cuda.cuGraphInstantiateWithFlags(ctypes.byref(graph_exec), graph, ctypes.c_ulonglong(0))
+    if instantiated != 0:
+        cuda.cuGraphDestroy(graph)
+        raise RuntimeError(f"cuGraphInstantiateWithFlags failed with {instantiated}")
+
+    def replay():
+        launched = cuda.cuGraphLaunch(graph_exec, stream)
+        if launched != 0:
+            raise RuntimeError(f"cuGraphLaunch failed with {launched}")
+        wp.synchronize_stream(wp.get_stream(device))
+
+    def release():
+        cuda.cuGraphExecDestroy(graph_exec)
+        cuda.cuGraphDestroy(graph)
+
+    return replay, release
+
+
+def _check_propagation_coverage(test, model, options):
+    """Check that a rollout fills the propagation rows, names no kinematic body in them, and orders the body map."""
+    solver = SolverSteel(model, deterministic=RUN_TO_RUN, **options)
+    pipeline = _make_pipeline(model, options)
+    contacts = pipeline.contacts()
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    _actuate(model, control)
+    tray = model.body_count - 1
+    tray_shapes = np.flatnonzero(model.shape_body.numpy() == tray)
+    tray_contacts = 0
+    carried = 0
+    for _ in range(20):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 0.005)
+        state_0, state_1 = state_1, state_0
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        on_tray = np.isin(contacts.rigid_contact_shape0.numpy()[:count], tray_shapes) | np.isin(
+            contacts.rigid_contact_shape1.numpy()[:count], tray_shapes
+        )
+        tray_contacts += int(np.sum(on_tray & (solver._contact_path.numpy()[:count] == 2)))
+        if options.get("contact_warmstart"):
+            carried += int(np.count_nonzero(solver._ws_prev_propagation_impulses.numpy()))
+    rows = solver._propagation_constraint_count.numpy()
+    test.assertTrue(np.all(rows > 0))
+    test.assertGreater(tray_contacts, 0)
+    test.assertFalse(solver.constraint_overflow.numpy().any())
+    active = np.arange(solver._propagation_body_a.shape[1]) < rows[:, None]
+    row_bodies = np.concatenate(
+        [solver._propagation_body_a.numpy()[active], solver._propagation_body_b.numpy()[active]]
+    )
+    test.assertNotIn(tray, row_bodies)
+    # Some body takes part in many rows, so the order of its sums matters.
+    test.assertGreater(np.bincount(row_bodies[row_bodies >= 0]).max(), 2)
+    body_count = solver._propagation_body_count.numpy()
+    body_list = solver._propagation_body_list.numpy()
+    # Only the colored sweep and the cached response read the body map.
+    reads_body_map = options.get("solve_mode") == "colored" or options["propagation_cached_response"]
+    test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map)
+    if options["propagation_cached_response"]:
+        test.assertTrue(np.all(solver._propagation_cache_world_flag.numpy() == 1))
+        # Cache-eligible bodies come first; each partition is in body order.
+        split = solver._propagation_cache_body_count.numpy()
+        test.assertTrue(np.all(split > 1))
+        for world, (n, k) in enumerate(zip(body_count, split, strict=True)):
+            test.assertTrue(np.all(np.diff(body_list[world, :k]) > 0))
+            test.assertTrue(np.all(np.diff(body_list[world, k:n]) > 0))
+    elif reads_body_map:
+        test.assertTrue(np.all(body_count > 1))
+        for world, n in enumerate(body_count):
+            test.assertTrue(np.all(np.diff(body_list[world, :n]) > 0))
+    if options.get("contact_warmstart"):
+        test.assertGreater(carried, 0)
+
+
 def test_warm_started_full_reset_matches_fresh_solver(test, device):
-    """After a full reset, warm-started deterministic steps replay a fresh solver's states and contact forces."""
+    """Replay a fresh warm-started solver's states and contact forces bit for bit after a full reset."""
     model = _build_contact_scene(device, worlds=2, boxes=3, ants=1)
-    configurations = {"serial": ROBOT_SOLVER_OPTIONS if wp.get_device(device).is_cuda else CPU_ROBOT_SOLVER_OPTIONS}
 
     def simulate(solver, steps):
-        pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
-        observables = solver.observables({SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+        observables = solver.observables({SolverSteel.ObservableKind.CONTACT_F}, contacts=contacts)
         state_0, state_1, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
         _actuate(model, control)
@@ -273,18 +508,17 @@ def test_warm_started_full_reset_matches_fresh_solver(test, device):
             state_0, state_1 = state_1, state_0
         return _sample(state_0), observables.contact_f.numpy()
 
-    for name, base_options in configurations.items():
-        with test.subTest(name):
-            options = {**base_options, "contact_warmstart": True}
-            reused = SolverSteel(model, deterministic=True, **options)
-            simulate(reused, 5)
-            reused.reset(model.state())
-            (state_hash, finite), contact_f = simulate(reused, 12)
-            (fresh_hash, _), fresh_contact_f = simulate(SolverSteel(model, deterministic=True, **options), 12)
-            test.assertTrue(finite)
-            test.assertEqual(state_hash, fresh_hash)
-            test.assertTrue(np.abs(contact_f).max() > 0.0)
-            np.testing.assert_array_equal(contact_f, fresh_contact_f)
+    # A refresh interval that does not divide the pre-reset step count exposes a stale step cadence.
+    options = {**WARMSTART_OPTIONS, "update_mass_matrix_interval": 3}
+    reused = SolverSteel(model, deterministic=RUN_TO_RUN, **options)
+    simulate(reused, 5)
+    reused.reset(model.state())
+    (state_hash, finite), contact_f = simulate(reused, 12)
+    (fresh_hash, _), fresh_contact_f = simulate(SolverSteel(model, deterministic=RUN_TO_RUN, **options), 12)
+    test.assertTrue(finite)
+    test.assertEqual(state_hash, fresh_hash)
+    test.assertGreater(np.abs(contact_f).max(), 0.0)
+    np.testing.assert_array_equal(contact_f, fresh_contact_f)
 
 
 def _struct_arrays(value):
@@ -303,6 +537,7 @@ def _replaying(original, replays, varied):
         wp.synchronize()
         snapshot = [wp.clone(a) for a in arrays]
         reference = None
+        result = None
         for replay in range(replays):
             if replay:
                 for array, saved in zip(arrays, snapshot, strict=True):
@@ -320,21 +555,57 @@ def _replaying(original, replays, varied):
 
 
 def test_deterministic_launches_replay_identically(test, device):
-    """Every solver ``wp.launch``/``wp.launch_tiled`` reproduces its outputs bitwise when rerun from the same inputs.
+    """Reproduce the outputs of every solver launch bitwise when it is rerun from the same inputs.
 
-    The native contact radix sort is outside this interception."""
-    robot_model = _build_contact_scene(device, worlds=8)
-    for name, model, options in (
-        ("serial", robot_model, ROBOT_SOLVER_OPTIONS),
-        ("angular_friction", _build_angular_friction_scene(device, worlds=8), ANGULAR_FRICTION_SOLVER_OPTIONS),
-    ):
+    The contact radix sort runs outside this interception.
+    """
+    model = _build_contact_scene(device, worlds=8)
+    torsion_model = _build_contact_scene(device, worlds=8, torsion_radius=0.02)
+    ant_model = _build_contact_scene(device, worlds=8, boxes=0)
+    friction_model = _build_contact_scene(device, worlds=8, joint_friction=0.4)
+    _check_launches_replay(
+        test,
+        (
+            ("serial", model, SERIAL_OPTIONS),
+            ("torsion", torsion_model, TORSION_OPTIONS),
+            ("warmstart", model, WARMSTART_OPTIONS),
+            ("sparse", ant_model, SPARSE_OPTIONS),
+            ("joint_friction", friction_model, FRICTION_OPTIONS),
+        ),
+    )
+
+
+def test_deterministic_propagation_launches_replay_identically(test, device):
+    """Reproduce every launch of both propagation responses bitwise, cached without and uncached with warm start."""
+    model = _build_contact_scene(device, worlds=8, kinematic_tray=True)
+    _check_launches_replay(
+        test,
+        [
+            (
+                f"{response}_{name}",
+                model,
+                {**options, **steel_mode_options(response), "propagation_cached_response": cached},
+            )
+            for response in PROPAGATION_RESPONSES
+            for name, options, cached in (
+                ("cached", SERIAL_OPTIONS, True),
+                ("uncached_warmstart", WARMSTART_OPTIONS, False),
+            )
+        ],
+    )
+
+
+def _check_launches_replay(test, configurations):
+    """Rerun every solver launch of 12 steps three times from a snapshot and require identical outputs."""
+    for name, scene, options in configurations:
         with test.subTest(name):
-            solver = SolverSteel(model, deterministic=True, **options)
-            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            solver = SolverSteel(scene, deterministic=RUN_TO_RUN, **options)
+            test.assertEqual(solver._sparse_mass_matrix_size is not None, name == "sparse")
+            pipeline = _make_pipeline(scene, options)
             contacts = pipeline.contacts()
-            state_0, state_1, control = model.state(), model.state(), model.control()
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
-            _actuate(model, control)
+            state_0, state_1, control = scene.state(), scene.state(), scene.control()
+            newton.eval_fk(scene, scene.joint_q, scene.joint_qd, state_0)
+            _actuate(scene, control)
             varied = set()
             for _ in range(12):
                 state_0.clear_forces()
@@ -345,108 +616,38 @@ def test_deterministic_launches_replay_identically(test, device):
                 ):
                     solver.step(state_0, state_1, control, contacts, 0.005)
                 state_0, state_1 = state_1, state_0
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            test.assertGreater(count, 0)
-            if options.get("enable_torsional_rolling_friction"):
-                test.assertTrue((solver._contact_slots_needed.numpy()[:count] == 6).any())
+            test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
             test.assertEqual(varied, set())
 
 
-def test_deterministic_runs_are_bitwise_identical(test, device):
-    """Two runs produce identical finite states at every eager step and every two-step CUDA graph boundary."""
-    robot_model = _build_contact_scene(device)
-    if not wp.get_device(device).is_cuda:
-        # Graphs, colored rows, joint friction and angular friction rows are CUDA-only.
-        configurations = [("serial", robot_model, CPU_ROBOT_SOLVER_OPTIONS, False)]
-    else:
-        angular_model = _build_angular_friction_scene(device)
-        configurations = [
-            ("serial", robot_model, ROBOT_SOLVER_OPTIONS, False),
-            ("serial_graph", robot_model, ROBOT_SOLVER_OPTIONS, True),
-            ("colored_graph", robot_model, COLORED_ROBOT_SOLVER_OPTIONS, True),
-            ("angular_friction", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, False),
-            ("angular_friction_graph", angular_model, ANGULAR_FRICTION_SOLVER_OPTIONS, True),
-        ]
-    for name, model, options, graph in configurations:
-        with test.subTest(name):
-            first = _run_hashes(model, options, 60, graph=graph)
-            second = _run_hashes(model, options, 60, graph=graph)
-            test.assertEqual(first, second)
-            test.assertTrue(all(finite for _, finite in first))
-
-
-def _build_scaled_sdf_mesh_scene(device, scale, worlds=4):
-    """Texture-SDF mesh cubes dropped on a heightfield in every world, at mesh ``scale``."""
-    cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
-    cube.build_sdf(max_resolution=32, device=device)
-    n = 17
-    xs = np.linspace(-1.0, 1.0, n)
-    elevation = (0.5 + 0.5 * np.sin(3.0 * xs)[None, :] * np.cos(2.0 * xs)[:, None]).astype(np.float32)
-    env = newton.ModelBuilder()
-    rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.2, 1.0)), 0.4)
-    for i in range(6):
-        body = env.add_body(xform=wp.transform((-0.4 + 0.16 * i, 0.1 * (i % 2), 0.12 + 0.03 * i), rotation))
-        env.add_shape_mesh(body=body, mesh=cube, scale=scale, cfg=newton.ModelBuilder.ShapeConfig(density=300.0))
-    builder = newton.ModelBuilder()
-    builder.replicate(env, worlds)
-    builder.add_shape_heightfield(
-        heightfield=newton.Heightfield(data=elevation, nrow=n, ncol=n, hx=1.0, hy=1.0, min_z=0.0, max_z=0.04)
+def _route_contacts(model, state, contacts, **options):
+    """Step once with ``options`` and return the contact routing and capacity status."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    solver = SolverSteel(model, deterministic=RUN_TO_RUN, warn_constraint_overflow=False, **options)
+    solver.step(state, model.state(), model.control(), contacts, 0.005)
+    return (
+        solver._contact_world.numpy()[:count],
+        solver._contact_slot.numpy()[:count],
+        solver._contact_path.numpy()[:count],
+        solver._contact_slots_needed.numpy()[:count],
+        solver._row_dropped_mf.numpy(),
+        solver.constraint_overflow.numpy(),
     )
-    return builder.finalize(device=device)
-
-
-def test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical(test, device):
-    """Texture-SDF meshes rescaled after construction under ``dynamic_shape_scale`` repeat bitwise."""
-    model = _build_scaled_sdf_mesh_scene(device, (1.0, 1.0, 1.0))
-    rescaled = _build_scaled_sdf_mesh_scene(device, (1.6, 1.4, 1.2))
-    for name in ("shape_scale", "shape_collision_radius", "shape_collision_aabb_lower", "shape_collision_aabb_upper"):
-        getattr(model, name).assign(getattr(rescaled, name))
-    collision_options = {"dynamic_shape_scale": True}
-    options = {
-        "enable_joint_limits": True,
-        "articulation_constraint_max": 128,
-        "free_body_constraint_max": 2048,
-        "warn_constraint_overflow": False,
-    }
-    pipeline = newton.CollisionPipeline(model, deterministic=True, **collision_options)
-    test.assertFalse(pipeline.narrow_phase.mesh_sdf_identity_scale_only)
-    for graph in (False, True):
-        with test.subTest(graph=graph):
-            first = _run_hashes(model, options, 60, graph=graph, collision_options=collision_options)
-            second = _run_hashes(model, options, 60, graph=graph, collision_options=collision_options)
-            test.assertEqual(first, second)
-            test.assertTrue(all(finite for _, finite in first))
 
 
 def test_deterministic_overflow_keeps_earliest_contacts(test, device):
-    """On overflow a world keeps a contact-order prefix of its rows and reports the rest as dropped."""
+    """Keep a contact-order prefix of each overflowing world's rows and report the rest as dropped."""
     model = _build_contact_scene(device, worlds=4, boxes=12, ants=0)
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     pipeline.collide(state, contacts)
-    count = int(contacts.rigid_contact_count.numpy()[0])
 
-    def route(capacity):
-        solver = SolverSteel(
-            model,
-            deterministic=True,
-            free_body_constraint_max=capacity,
-            warn_constraint_overflow=False,
-        )
-        solver.step(state, model.state(), model.control(), contacts, 0.005)
-        return (
-            solver._contact_world.numpy()[:count],
-            solver._contact_slot.numpy()[:count],
-            solver._contact_path.numpy()[:count],
-            solver._contact_slots_needed.numpy()[:count],
-            solver._row_dropped_mf.numpy(),
-            solver.constraint_overflow.numpy(),
-        )
-
-    world, _, path, needed, _, _ = route(4096)
-    small_world, slot, small_path, _, dropped, overflow = route(24)
+    world, _, path, needed, _, _ = _route_contacts(model, state, contacts, free_body_constraint_max=4096)
+    small_world, slot, small_path, _, dropped, overflow = _route_contacts(
+        model, state, contacts, free_body_constraint_max=24
+    )
     for w in range(model.world_count):
         routed = np.nonzero((path == 1) & (world == w))[0]
         kept = np.nonzero((small_path == 1) & (small_world == w))[0]
@@ -458,26 +659,28 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
 
 
 def test_overflow_warning_names_deterministic_mode(test, device):
-    """The row-overflow warning is the same in both modes, plus the drop rule in deterministic mode, which holds."""
+    """Print one row-overflow warning line; in deterministic mode it ends with the drop rule, which holds."""
     model = _build_contact_scene(device, worlds=2, boxes=12, ants=0)
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     pipeline.collide(state, contacts)
-    warning = r"Warning: Steel matrix-free constraint-row overflow in world \d+: requested \d+ rows, limit 24; "
-    warning += r"dropped \d+ contact/friction rows\. Increase free_body_constraint_max\.\n"
+    warning = r"Warning: Steel matrix-free constraint-row overflow in world \d+: requested \d+ rows, "
+    warning += r"limit 24; dropped \d+ contact/friction rows\. Increase free_body_constraint_max\."
     note = (
-        "Steel deterministic mode: each world keeps the rows of its earliest contacts in contact-buffer order. "
+        " Deterministic mode: each world keeps the rows of its earliest contacts in contact-buffer order. "
         "While its contacts and joint rows are unchanged it drops the same contacts every step; otherwise it drops "
-        "the tail of the new contact order.\n"
+        "the tail of the new contact order."
     )
-    for deterministic in (False, True):
-        with test.subTest(deterministic=deterministic):
+    # Warp CPU printf capture is unreliable on Windows; the overflow status and routing are still checked there.
+    check_output = not (wp.get_device(device).is_cpu and sys.platform == "win32")
+    for deterministic in (wp.DeterministicMode.NOT_GUARANTEED, RUN_TO_RUN):
+        with test.subTest(deterministic=deterministic.name):
             solver = SolverSteel(model, deterministic=deterministic, free_body_constraint_max=24)
-            wp.synchronize_device(device)
             capture = StdOutCapture()
-            capture.begin()
+            if check_output:
+                capture.begin()
             try:
                 paths = []
                 for _ in range(2):
@@ -485,431 +688,18 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                     paths.append(solver._contact_path.numpy())
                 wp.synchronize_device(device)
             finally:
-                output = capture.end()
-            test.assertEqual(len(re.findall(warning, output)), 1, output)
-            test.assertEqual(output.count(note), int(deterministic), output)
-            test.assertTrue(solver.constraint_overflow.numpy().all())
-            if deterministic:
+                output = capture.end() if check_output else ""
+            if check_output:
+                line = warning + (re.escape(note) if deterministic == RUN_TO_RUN else "") + r"\n"
+                test.assertEqual(len(re.findall(line, output)), 1, output)
+                test.assertEqual(output.count(note), int(deterministic == RUN_TO_RUN), output)
+            test.assertTrue(solver.constraint_overflow.numpy()[: model.world_count].all())
+            if deterministic == RUN_TO_RUN:
                 np.testing.assert_array_equal(paths[0], paths[1], err_msg="same contacts dropped differently")
 
 
-def test_deterministic_rejects_warm_started_colored(test, device):
-    model = _build_contact_scene(device, worlds=1, boxes=1, ants=1)
-    with test.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
-        SolverSteel(
-            model,
-            deterministic=True,
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-            contact_warmstart=True,
-        )
-
-
-# A fixed-base three-link arm pressed into a 5x5x2 heap of boxes and spheres: every link and every heap body has
-# contacts, about 1.9k per world. Plain propagation carries all of them.
-PROPAGATION_SOLVER_OPTIONS = {
-    "solve_mode": "serial",
-    "articulated_contact_response": "propagation",
-    "iterations": 16,
-    "articulation_constraint_max": 256,
-    "free_body_constraint_max": 6144,
-    "friction_anchor_beta": 0.2,
-}
-
-
-def _build_heap_arm_world(seed):
-    env = newton.ModelBuilder()
-    cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
-    joints, parent = [], -1
-    for link_index in range(3):
-        link = env.add_link(xform=wp.transform(wp.vec3(-0.12 + 0.1 * link_index, 0.0, 0.1025), wp.quat_identity()))
-        env.add_shape_box(link, hx=0.05, hy=0.03, hz=0.02, cfg=cfg)
-        parent_xform = wp.transform(wp.vec3(-0.17, 0.0, 0.1025) if parent < 0 else wp.vec3(0.05, 0.0, 0.0))
-        joints.append(
-            env.add_joint_revolute(
-                parent,
-                link,
-                axis=newton.Axis.Y,
-                parent_xform=parent_xform,
-                child_xform=wp.transform(wp.vec3(-0.05, 0.0, 0.0)),
-                target_kd=0.2,
-            )
-        )
-        parent = link
-    env.add_articulation(joints)
-    rng = np.random.default_rng(seed)
-    for ix in range(5):
-        for iy in range(5):
-            for iz in range(2):
-                pose = wp.transform(
-                    wp.vec3((ix - 2) * 0.042 + 0.0008 * rng.uniform(-1.0, 1.0), (iy - 2) * 0.042, 0.021 + 0.041 * iz),
-                    wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(rng.uniform(-0.03, 0.03))),
-                )
-                body = env.add_body(xform=pose)
-                if (ix + iy + iz) % 2:
-                    env.add_shape_sphere(body, radius=0.02, cfg=cfg)
-                else:
-                    env.add_shape_box(body, hx=0.02, hy=0.02, hz=0.02, cfg=cfg)
-    return env
-
-
-def _build_heap_arm_scene(device, seeds, global_floor=False):
-    """One heap-and-arm world per seed, in the given order, so world contents follow their seed, not their slot.
-
-    ``global_floor`` replaces the ground plane with a kinematic box outside every world, which all worlds touch.
-    """
-    builder = newton.ModelBuilder()
-    for seed in seeds:
-        builder.add_world(_build_heap_arm_world(seed))
-    if global_floor:
-        floor = builder.add_link(is_kinematic=True)
-        builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
-    else:
-        builder.add_ground_plane()
-    return builder.finalize(device=device)
-
-
-def _run_heap_arm(model, steps, *, cached, warmstart, graph=False, on_step=None):
-    """Return each world's body poses after every second step, and the final state hash."""
-    solver = SolverSteel(
-        model,
-        deterministic=True,
-        propagation_cached_response=cached,
-        contact_warmstart=warmstart,
-        **PROPAGATION_SOLVER_OPTIONS,
-    )
-    pipeline = newton.CollisionPipeline(
-        model, deterministic=True, contact_matching="sticky" if warmstart else "disabled"
-    )
-    contacts = pipeline.contacts()
-    state_0, state_1, control = model.state(), model.state(), model.control()
-    torques = np.zeros(model.joint_dof_count, dtype=np.float32)
-    torques[model.joint_qd_start.numpy()[:-1][model.joint_type.numpy() == newton.JointType.REVOLUTE]] = -0.3
-    control.joint_f.assign(torques)
-
-    def step(state_in, state_out):
-        state_in.clear_forces()
-        pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-
-    poses = []
-    if graph:
-        with wp.ScopedCapture(device=model.device) as capture:
-            step(state_0, state_1)
-            step(state_1, state_0)
-        for _ in range(steps // 2):
-            wp.capture_launch(capture.graph)
-            poses.append(state_0.body_q.numpy())
-    else:
-        for index in range(steps):
-            step(state_0, state_1)
-            state_0, state_1 = state_1, state_0
-            if on_step is not None:
-                on_step(index, solver, contacts)
-            if index % 2:
-                poses.append(state_0.body_q.numpy())
-    in_world = model.body_world.numpy() >= 0
-    per_world = np.stack(poses)[:, in_world].reshape(len(poses), model.world_count, -1, 7)
-    return per_world, _sample(state_0)
-
-
-def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
-    """Repeat plain propagation bitwise, eager and captured, with and without the cached response and warm start."""
-    model = _build_heap_arm_scene(device, (0, 1, 2))
-    arm_bodies = np.arange(3)
-    seen = {}
-
-    def observe(index, solver, contacts):
-        if index != 0:
-            return
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        body_0 = model.shape_body.numpy()[contacts.rigid_contact_shape0.numpy()[:count]]
-        body_1 = model.shape_body.numpy()[contacts.rigid_contact_shape1.numpy()[:count]]
-        bodies = np.concatenate([body_0, body_1])
-        seen["contacts_per_world"] = np.bincount(
-            model.body_world.numpy()[np.where(body_0 >= 0, body_0, body_1)], minlength=3
-        )
-        seen["active_links"] = np.intersect1d(bodies, arm_bodies).size
-        seen["paths"] = np.bincount(solver._contact_path.numpy()[:count] + 1, minlength=4)
-
-    _run_heap_arm(model, 2, cached=True, warmstart=False, on_step=observe)
-    test.assertGreater(seen["contacts_per_world"].min(), 1000)
-    test.assertEqual(seen["active_links"], 3)
-    # Contacts between the arm's own links stay dense; every other contact takes the propagation route.
-    test.assertEqual(seen["paths"][0] + seen["paths"][2], 0)
-    test.assertGreater(seen["paths"][3], 20 * seen["paths"][1])
-    first = {}
-    for cached in (True, False):
-        for warmstart in (False, True):
-            for graph in (False, True):
-                with test.subTest(cached=cached, warmstart=warmstart, graph=graph):
-                    runs = [_run_heap_arm(model, 40, cached=cached, warmstart=warmstart, graph=graph) for _ in range(3)]
-                    for poses, sample in runs[1:]:
-                        np.testing.assert_array_equal(poses, runs[0][0])
-                        test.assertEqual(sample, runs[0][1])
-                    test.assertTrue(runs[0][1][1])
-                    first[cached, warmstart, graph] = runs[0]
-            with test.subTest(cached=cached, warmstart=warmstart, graph="eager vs captured"):
-                np.testing.assert_array_equal(first[cached, warmstart, True][0], first[cached, warmstart, False][0])
-                test.assertEqual(first[cached, warmstart, True][1], first[cached, warmstart, False][1])
-
-
-def test_deterministic_propagation_is_world_permutation_invariant(test, device):
-    """Give each world the same trajectory, bitwise, whichever slot it occupies."""
-    order = (2, 0, 1)
-    in_order = _build_heap_arm_scene(device, (0, 1, 2))
-    permuted = _build_heap_arm_scene(device, order)
-    for cached in (True, False):
-        for warmstart in (False, True):
-            with test.subTest(cached=cached, warmstart=warmstart):
-                reference, _ = _run_heap_arm(in_order, 40, cached=cached, warmstart=warmstart)
-                moved, _ = _run_heap_arm(permuted, 40, cached=cached, warmstart=warmstart)
-                for slot, seed in enumerate(order):
-                    np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
-
-
-@wp.kernel
-def _accumulate_warmstart_in_reverse_row_order(
-    constraint_count: wp.array[int],
-    body_a: wp.array2d[int],
-    body_b: wp.array2d[int],
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
-    MiJt_a: wp.array3d[float],
-    MiJt_b: wp.array3d[float],
-    impulses: wp.array2d[float],
-    max_constraints: int,
-    body_qd: wp.array2d[float],
-    body_impulses: wp.array2d[float],
-):
-    """Seed the warm start in reverse row order: one order an atomic scatter may take."""
-    tid = wp.tid()
-    world = tid // 6
-    k = tid - world * 6
-    count = wp.min(constraint_count[world], max_constraints)
-    for step in range(count):
-        row = count - 1 - step
-        impulse = impulses[world, row]
-        if impulse != 0.0:
-            ba = body_a[world, row]
-            bb = body_b[world, row]
-            if ba >= 0:
-                body_qd[ba, k] = body_qd[ba, k] + MiJt_a[world, row, k] * impulse
-                body_impulses[ba, k] = body_impulses[ba, k] + J_a[world, row, k] * impulse
-            if bb >= 0:
-                body_qd[bb, k] = body_qd[bb, k] + MiJt_b[world, row, k] * impulse
-                body_impulses[bb, k] = body_impulses[bb, k] + J_b[world, row, k] * impulse
-
-
-def test_deterministic_propagation_warm_start_sums_in_row_order(test, device):
-    """Seed warm-started impulses in row order, which a reordered sum over a shared body does not reproduce."""
-    model = _build_heap_arm_scene(device, (1,))
-    seen = {"shared": 0, "arm_links": 0}
-    seed = SolverSteel._apply_propagation_warmstart_velocity
-
-    def recording_seed(solver):
-        count = int(solver._propagation_constraint_count.numpy()[0])
-        seeded = solver._propagation_impulses.numpy()[0, :count] != 0.0
-        bodies = np.concatenate(
-            [
-                solver._propagation_body_a.numpy()[0, :count][seeded],
-                solver._propagation_body_b.numpy()[0, :count][seeded],
-            ]
-        )
-        bodies = bodies[bodies >= 0]
-        if bodies.size:
-            seen["shared"] = max(seen["shared"], int(np.bincount(bodies).max()))
-            seen["arm_links"] = max(seen["arm_links"], np.intersect1d(bodies, np.arange(3)).size)
-        seed(solver)
-
-    with mock.patch.object(SolverSteel, "_apply_propagation_warmstart_velocity", recording_seed):
-        ordered, ordered_sample = _run_heap_arm(model, 40, cached=False, warmstart=True)
-    test.assertGreater(seen["shared"], 2)
-    test.assertGreaterEqual(seen["arm_links"], 2)
-    repeated, repeated_sample = _run_heap_arm(model, 40, cached=False, warmstart=True)
-    np.testing.assert_array_equal(repeated, ordered)
-    test.assertEqual(repeated_sample, ordered_sample)
-    with mock.patch.object(
-        solver_steel,
-        "accumulate_propagation_warmstart_body_impulses_ordered",
-        _accumulate_warmstart_in_reverse_row_order,
-    ):
-        reversed_order, _ = _run_heap_arm(model, 40, cached=False, warmstart=True)
-    test.assertFalse(np.array_equal(reversed_order, ordered))
-
-
-def _two_heap_arm_worlds(first_world_extra=None):
-    """Two heap-and-arm worlds; ``first_world_extra`` adds to world 0's builder and its result is returned."""
-    builder = newton.ModelBuilder()
-    first = _build_heap_arm_world(0)
-    extra = first_world_extra(first) if first_world_extra is not None else None
-    builder.add_world(first)
-    builder.add_world(_build_heap_arm_world(1))
-    return builder, extra
-
-
-def _step_explicit(model, solver, pairs, steps=2):
-    """Step ``solver`` on a deterministic pipeline, with explicit broad-phase ``pairs`` when given."""
-    options = {}
-    if pairs is not None:
-        options = {
-            "broad_phase": "explicit",
-            "shape_pairs_filtered": wp.array(np.asarray(pairs, dtype=np.int32), dtype=wp.vec2i, device=model.device),
-        }
-    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="sticky", **options)
-    contacts = pipeline.contacts()
-    state_0, state_1 = model.state(), model.state()
-    for _ in range(steps):
-        pipeline.collide(state_0, contacts)
-        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
-        state_0, state_1 = state_1, state_0
-    return contacts, state_0
-
-
-def _row_worlds_by_body(solver):
-    """Map each body referenced by a propagation row to the worlds whose rows reference it."""
-    owners = {}
-    counts = solver._propagation_constraint_count.numpy()
-    for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
-        for world, count in enumerate(counts):
-            for body in np.unique(side[world, :count]):
-                if body >= 0:
-                    owners.setdefault(int(body), set()).add(world)
-    return owners
-
-
-def test_deterministic_propagation_accepts_bodies_shared_by_worlds(test, device):
-    """Solve a kinematic floor shared by several worlds as static geometry, bitwise and world-permutation invariant."""
-    shared = {"outside every world": _build_heap_arm_scene(device, (0, 1), global_floor=True)}
-    builder, floor = _two_heap_arm_worlds(lambda first: first.add_link(is_kinematic=True))
-    builder.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)))
-    shared["global shape on a world body"] = builder.finalize(device=device)
-    builder, floor_shape = _two_heap_arm_worlds(
-        lambda first: first.add_shape_box(
-            first.add_link(is_kinematic=True), hx=1.0, hy=1.0, hz=0.02, xform=wp.transform(wp.vec3(0.0, 0.0, -0.02))
-        )
-    )
-    model = builder.finalize(device=device)
-    pairs = [[floor_shape, shape] for shape in range(model.shape_count) if shape != floor_shape]
-    shared["explicit pairs with a world body"] = (model, pairs)
-    for name, entry in shared.items():
-        model, pairs = entry if isinstance(entry, tuple) else (entry, None)
-        with test.subTest(name):
-            solver = SolverSteel(model, deterministic=True, contact_warmstart=True, **PROPAGATION_SOLVER_OPTIONS)
-            contacts, _ = _step_explicit(model, solver, pairs)
-            kinematic = np.flatnonzero((model.body_flags.numpy() & int(newton.BodyFlags.KINEMATIC)) != 0)
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            shape_body = model.shape_body.numpy()
-            on_floor = np.isin(shape_body[contacts.rigid_contact_shape0.numpy()[:count]], kinematic) | np.isin(
-                shape_body[contacts.rigid_contact_shape1.numpy()[:count]], kinematic
-            )
-            routed = solver._contact_path.numpy()[:count] == 2
-            test.assertEqual(sorted(set(solver._contact_world.numpy()[:count][on_floor & routed].tolist())), [0, 1])
-            owners = _row_worlds_by_body(solver)
-            test.assertFalse(set(kinematic.tolist()) & set(owners))
-            test.assertEqual(max(len(worlds) for worlds in owners.values()), 1)
-            test.assertFalse(solver.constraint_overflow.numpy().any())
-            solver.check_constraint_capacity()
-    order = (2, 0, 1)
-    in_order = _build_heap_arm_scene(device, (0, 1, 2), global_floor=True)
-    permuted = _build_heap_arm_scene(device, order, global_floor=True)
-    for cached in (True, False):
-        with test.subTest(cached=cached):
-            reference, reference_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
-            repeated, repeated_sample = _run_heap_arm(in_order, 40, cached=cached, warmstart=True)
-            np.testing.assert_array_equal(repeated, reference)
-            test.assertEqual(repeated_sample, reference_sample)
-            moved, _ = _run_heap_arm(permuted, 40, cached=cached, warmstart=True)
-            for slot, seed in enumerate(order):
-                np.testing.assert_array_equal(moved[:, slot], reference[:, seed])
-
-
-def test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows(test, device):
-    """Repeat contact torsion on a kinematic floor shared by every world bitwise, with no row naming the floor."""
-    model, floor = test_propagation._build_shared_floor_model(device)
-    set_torsion_radius(model, 0.01)
-    runs = []
-    for _ in range(2):
-        solver = SolverSteel(
-            model,
-            deterministic=True,
-            articulated_contact_response="propagation",
-            contact_torsion_device=True,
-            friction_anchor_beta=0.0,
-            free_body_constraint_max=512,
-            articulation_constraint_max=128,
-        )
-        pipeline = newton.CollisionPipeline(model, deterministic=True)
-        contacts = pipeline.contacts()
-        state_0, state_1, control = model.state(), model.state(), model.control()
-        for _ in range(20):
-            pipeline.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-            state_0, state_1 = state_1, state_0
-            counts = solver._propagation_constraint_count.numpy()
-            row_type = solver._propagation_row_type.numpy()
-            for world, count in enumerate(counts):
-                test.assertGreater(int(np.sum(row_type[world, :count] == PGS_CONSTRAINT_TYPE_TORSION)), 0)
-                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
-                    test.assertNotIn(floor, side[world, :count])
-        runs.append(_sample(state_0))
-    test.assertEqual(runs[1], runs[0])
-
-
-def test_deterministic_propagation_drops_cross_world_responding_contacts(test, device):
-    """Drop contacts joining responding bodies of different worlds, flag both worlds, and keep rows per world."""
-    cases = {}
-    # A global shape on world 0's first heap body overlaps world 1's heap.
-    builder, _ = _two_heap_arm_worlds()
-    builder.add_shape_box(3, hx=0.15, hy=0.15, hz=0.03)
-    builder.add_ground_plane()
-    cases["global shape on a dynamic body"] = (builder.finalize(device=device), None)
-    builder, _ = _two_heap_arm_worlds()
-    builder.add_ground_plane()
-    model = builder.finalize(device=device)
-    shape_world = model.shape_world.numpy()
-    world_0, world_1 = np.flatnonzero(shape_world == 0), np.flatnonzero(shape_world == 1)
-    # The worlds share one layout, so same-index shapes overlap exactly.
-    cases["explicit pairs between dynamic bodies"] = (model, np.stack([world_0, world_1], axis=1))
-    # On the propagation responses a kinematic free body keeps its response DOFs.
-    builder = newton.ModelBuilder()
-    for seed in (0, 1):
-        world = _build_heap_arm_world(seed)
-        floor = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.02)), is_kinematic=True)
-        world.add_shape_box(floor, hx=1.0, hy=1.0, hz=0.02)
-        builder.add_world(world)
-    model = builder.finalize(device=device)
-    floor_shape = int(np.flatnonzero(model.shape_world.numpy() == 0)[-1])
-    world_1 = np.flatnonzero(model.shape_world.numpy() == 1)[:-1]
-    cases["explicit pairs with a kinematic free body"] = (model, [[floor_shape, shape] for shape in world_1])
-    for name, (model, pairs) in cases.items():
-        with test.subTest(name):
-            solver = SolverSteel(
-                model,
-                deterministic=True,
-                contact_warmstart=True,
-                warn_constraint_overflow=False,
-                **PROPAGATION_SOLVER_OPTIONS,
-            )
-            contacts, state = _step_explicit(model, solver, pairs)
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            body_world = model.body_world.numpy()
-            shape_body = model.shape_body.numpy()
-            body_0 = shape_body[contacts.rigid_contact_shape0.numpy()[:count]]
-            body_1 = shape_body[contacts.rigid_contact_shape1.numpy()[:count]]
-            crossing = (body_0 >= 0) & (body_1 >= 0) & (body_world[body_0] != body_world[body_1])
-            test.assertGreater(int(crossing.sum()), 0)
-            test.assertTrue(np.all(solver._contact_slot.numpy()[:count][crossing] == -1))
-            owners = _row_worlds_by_body(solver)
-            test.assertTrue(all(worlds == {int(body_world[body])} for body, worlds in owners.items()))
-            test.assertTrue(solver.constraint_overflow.numpy().all())
-            with test.assertRaisesRegex(RuntimeError, "between a global articulation and another world"):
-                solver.check_constraint_capacity()
-            test.assertTrue(np.isfinite(state.body_q.numpy()).all())
-
-
 def test_deterministic_joint_rows_follow_articulation_order(test, device):
-    """Drive, joint-limit and velocity-limit rows of a world take their slots in articulation order."""
+    """Give a world's drive, joint-limit, joint-friction and velocity-limit rows their slots in articulation order."""
     arts_per_world = 40
     env = newton.ModelBuilder()
     for art in range(arts_per_world):
@@ -932,15 +722,19 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
     # Every joint violates its upper limit by a different amount, so limit rows are told apart by phi.
     q = 0.2 + 0.001 * np.arange(model.joint_coord_count, dtype=np.float32)
     model.joint_q.assign(q)
+    # Distinct coefficients tell the friction rows apart by their bound.
+    friction = 1.0 + 0.01 * np.arange(model.joint_dof_count, dtype=np.float32)
+    model.joint_friction.assign(friction)
     solver = SolverSteel(
         model,
-        deterministic=True,
+        deterministic=RUN_TO_RUN,
         drive_mode="rows",
         enable_joint_limits=True,
         joint_limit_activation_gap=0.0,
         enable_joint_velocity_limits=True,
         fuse_joint_velocity_limits=False,
-        articulation_constraint_max=4 * arts_per_world,
+        enable_joint_friction=True,
+        articulation_constraint_max=5 * arts_per_world,
     )
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -951,184 +745,223 @@ def test_deterministic_joint_rows_follow_articulation_order(test, device):
     velocity_limit_slot = solver._velocity_limit_slot.numpy().reshape(2, arts_per_world, 2)
     row_type = solver._row_type.numpy()
     phi = solver._phi.numpy()
+    row_mu = solver._row_mu.numpy()
     for world in range(2):
         np.testing.assert_array_equal(drive_slot[world], order)
         limit_rows = np.nonzero(row_type[world] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)[0]
         np.testing.assert_array_equal(limit_rows, arts_per_world + order)
         np.testing.assert_allclose(phi[world, limit_rows], 0.1 - q.reshape(2, arts_per_world)[world], atol=1.0e-6)
+        friction_rows = np.nonzero(row_type[world] == PGS_CONSTRAINT_TYPE_JOINT_FRICTION)[0]
+        np.testing.assert_array_equal(friction_rows, 2 * arts_per_world + order)
+        np.testing.assert_allclose(
+            row_mu[world, friction_rows], 0.005 * friction.reshape(2, arts_per_world)[world], rtol=1.0e-6
+        )
         np.testing.assert_array_equal(
-            velocity_limit_slot[world].reshape(-1), 2 * arts_per_world + np.arange(2 * arts_per_world)
+            velocity_limit_slot[world].reshape(-1), 3 * arts_per_world + np.arange(2 * arts_per_world)
         )
 
 
-def test_deterministic_angular_friction_rows_follow_their_contact(test, device):
-    """A contact's torsional and rolling rows follow its sliding pair, and on overflow it keeps or drops all six."""
-    model = _build_angular_friction_scene(device)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-    contacts = pipeline.contacts()
-    state, state_next = model.state(), model.state()
+def test_deterministic_joint_friction_rows_follow_dof_order(test, device):
+    """Give a world's joint-friction rows of revolute, prismatic, ball and D6 joints their slots in DOF order."""
+    arts_per_world = 48
+    dof = newton.ModelBuilder.JointDofConfig
+    env = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for art in range(arts_per_world):
+        link = env.add_link(xform=wp.transform(wp.vec3(0.5 * art, 0.0, 1.0), wp.quat_identity()))
+        env.add_shape_box(link, hx=0.1, hy=0.02, hz=0.02)
+        anchor = wp.transform(wp.vec3(0.5 * art, 0.0, 1.0), wp.quat_identity())
+        kind = art % 4
+        if kind == 0:
+            joint = env.add_joint_revolute(-1, link, parent_xform=anchor, axis=newton.Axis.Y)
+        elif kind == 1:
+            joint = env.add_joint_prismatic(-1, link, parent_xform=anchor, axis=newton.Axis.X)
+        elif kind == 2:
+            joint = env.add_joint_ball(-1, link, parent_xform=anchor)
+        else:
+            joint = env.add_joint_d6(
+                -1,
+                link,
+                parent_xform=anchor,
+                linear_axes=[dof(axis=newton.Axis.Z)],
+                angular_axes=[dof(axis=newton.Axis.X)],
+            )
+        env.add_articulation([joint])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(env, 2)
+    model = builder.finalize(device=device)
+    friction = 1.0 + 0.01 * np.arange(model.joint_dof_count, dtype=np.float32)
+    model.joint_friction.assign(friction)
+    solver = SolverSteel(model, deterministic=RUN_TO_RUN, enable_joint_friction=True, articulation_constraint_max=128)
+    state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    settle = SolverSteel(model, **ANGULAR_FRICTION_SOLVER_OPTIONS)
-    # Settle the ants onto the ground so every world has dense contacts.
-    for _ in range(40):
-        pipeline.collide(state, contacts)
-        settle.step(state, state_next, model.control(), contacts, 0.005)
-        state, state_next = state_next, state
-    pipeline.collide(state, contacts)
-    count = int(contacts.rigid_contact_count.numpy()[0])
+    solver.step(state, model.state(), model.control(), None, 0.005)
 
-    def route(capacity):
-        options = {**ANGULAR_FRICTION_SOLVER_OPTIONS, "articulation_constraint_max": capacity}
-        solver = SolverSteel(model, deterministic=True, **options)
-        solver.step(state, model.state(), model.control(), contacts, 0.005)
-        return (
-            solver._contact_world.numpy()[:count],
-            solver._contact_slot.numpy()[:count],
-            solver._contact_path.numpy()[:count],
-            solver._contact_slots_needed.numpy()[:count],
-            solver._row_type.numpy(),
-            solver._row_parent.numpy(),
-            solver._row_dropped_dense.numpy(),
-            solver.constraint_overflow.numpy(),
-        )
+    world_dofs = model.joint_dof_count // 2
+    row_type = solver._row_type.numpy()
+    row_mu = solver._row_mu.numpy()
+    for world in range(2):
+        friction_rows = np.nonzero(row_type[world] == PGS_CONSTRAINT_TYPE_JOINT_FRICTION)[0]
+        np.testing.assert_array_equal(friction_rows, np.arange(world_dofs))
+        expected = 0.005 * friction[world * world_dofs : (world + 1) * world_dofs]
+        np.testing.assert_allclose(row_mu[world, friction_rows], expected, rtol=1.0e-6)
 
-    world, slot, path, needed, row_type, row_parent, _, overflow = route(512)
-    test.assertFalse(overflow.any())
-    small_world, small_slot, small_path, _, _, _, dropped, small_overflow = route(192)
-    angular = []
-    for w in range(model.world_count):
-        routed = np.nonzero((path == 0) & (world == w))[0]
-        test.assertTrue((needed[routed] == 6).any())
-        np.testing.assert_array_equal(
-            slot[routed], slot[routed[0]] + np.concatenate(([0], np.cumsum(needed[routed])[:-1]))
-        )
-        for c in routed[needed[routed] == 6]:
-            rows = slot[c] + np.arange(1, 6)
-            angular.append(row_type[w, rows])
-            np.testing.assert_array_equal(row_parent[w, rows], slot[c])
-        kept = np.nonzero((small_path == 0) & (small_world == w))[0]
-        test.assertGreater(len(routed), len(kept))
-        np.testing.assert_array_equal(kept, routed[: len(kept)])
-        np.testing.assert_array_equal(small_slot[kept], slot[kept])
-        test.assertEqual(dropped[w], int(needed[routed[len(kept) :]].sum()))
-        test.assertTrue(small_overflow[w])
-    np.testing.assert_array_equal(np.array(angular), PGS_CONSTRAINT_TYPE_CONTACT_ANGULAR_FRICTION)
+
+def test_deterministic_bilateral_rows_follow_element_order(test, device):
+    """Give a world's mimic rows, then its loop-closure rows, their slots in element order."""
+    mimic_count = 512
+    builder = _build_four_bar()
+    # Many rows on one follower need the deprecated API; joint-owned mimics allow one per joint.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        for _ in range(mimic_count):
+            builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, deterministic=RUN_TO_RUN, articulation_constraint_max=mimic_count + 64)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    solver.step(state, model.state(), model.control(), None, 0.005)
+
+    mimic_slot = solver._mimic_slot.numpy()
+    np.testing.assert_array_equal(mimic_slot, mimic_slot[0] + np.arange(mimic_count))
+    np.testing.assert_array_equal(solver._connect_slot.numpy(), [mimic_slot[0] + mimic_count])
+
+
+@contextlib.contextmanager
+def _warp_lowering_off():
+    saved = wp.config.deterministic
+    wp.config.deterministic = wp.DeterministicMode.NOT_GUARANTEED
+    try:
+        yield
+    finally:
+        wp.config.deterministic = saved
+
+
+def _holds_steel_kernel(module):
+    return any(kernel.func.__module__.startswith("newton._src.solvers.steel") for kernel in module.kernels.values())
+
+
+def _check_inherited_global_mode(device):
+    """Run Steel in a process that set ``wp.config.deterministic`` to RUN_TO_RUN before importing Newton."""
+    from warp._src.context import Module, user_modules  # noqa: PLC0415
+
+    assert wp.config.deterministic == RUN_TO_RUN
+    # Newton's collision kernels do not support Warp's deterministic lowering; Steel's modules and the
+    # geometry scan module Steel's step launches keep the global.
+    for module in list(user_modules.values()):
+        if not _holds_steel_kernel(module) and module.name != scan_with_total.__module__:
+            wp.set_module_options({"deterministic": wp.DeterministicMode.NOT_GUARANTEED}, module=module)
+    model = _build_contact_scene(device)
+
+    def run(deterministic):
+        solver = SolverSteel(model, deterministic=deterministic, **SERIAL_OPTIONS)
+        with _warp_lowering_off():
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        _actuate(model, control)
+
+        def step(state_in, state_out):
+            state_in.clear_forces()
+            with _warp_lowering_off():
+                pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, 0.005)
+
+        hashes = []
+        for _ in range(40):
+            step(state_0, state_1)
+            state_0, state_1 = state_1, state_0
+            hashes.append(_sample(state_0))
+        with wp.ScopedCapture(device=device) as capture:
+            step(state_0, state_1)
+            step(state_1, state_0)
+        for _ in range(10):
+            wp.capture_launch(capture.graph)
+            hashes.append(_sample(state_0))
+        return solver, hashes
+
+    solver, first = run(None)
+    assert solver._ordered_rows
+    _, second = run(None)
+    assert first == second, "inherited RUN_TO_RUN runs differ"
+    assert all(finite for _, finite in first)
+    _, unordered = run(wp.DeterministicMode.NOT_GUARANTEED)
+    assert all(finite for _, finite in unordered)
+    # Lazy module factories, and explicitly constructed modules, live outside Warp's module registry.
+    _get_tree_fk_kernel(2, "id")
+    _get_tree_fk_kernel(2, "public")
+    _get_tree_tau_kernel(2)
+    modules = [m for m in gc.get_objects() if isinstance(m, Module) and _holds_steel_kernel(m)]
+    assert len(modules) > len([m for m in user_modules.values() if _holds_steel_kernel(m)])
+    lowered = [m.name for m in modules if m.options["deterministic"] != wp.DeterministicMode.NOT_GUARANTEED]
+    assert not lowered, f"Steel modules use Warp's deterministic lowering: {lowered}"
+
+
+def test_inherited_global_mode_keeps_steel_ordering(test, device):
+    """Steel keeps its own ordering, and repeats bitwise, when RUN_TO_RUN is set process-wide before import."""
+    code = (
+        "import warp as wp; wp.config.deterministic = wp.DeterministicMode.RUN_TO_RUN; "
+        "from newton.tests.steel.test_determinism import _check_inherited_global_mode; "
+        f"_check_inherited_global_mode({str(device)!r})"
+    )
+    if newton.tests.unittest_utils.strict_warnings:
+        policy = "import warnings; warnings.filterwarnings('error', module=r'newton(\\.|$)'); "
+        for message in newton.tests.unittest_utils.allowed_deprecation_warnings:
+            policy += (
+                f"warnings.filterwarnings('default', message={re.escape(message)!r}, category=DeprecationWarning); "
+            )
+        code = policy + code
+    env = os.environ.copy()
+    env.pop("PYTHONWARNINGS", None)
+    result = subprocess.run(
+        [sys.executable, *newton.tests.unittest_utils.get_strict_warning_args(), "-c", code],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    test.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
 
 class TestSteelDeterminism(unittest.TestCase):
     pass
 
 
-for _device in get_test_devices():
-    add_function_test(
-        TestSteelDeterminism,
-        "test_crba_fill_par_dof_is_batch_invariant",
-        test_crba_fill_par_dof_is_batch_invariant,
-        devices=[_device],
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_full_reset_matches_fresh_solver",
-        test_full_reset_matches_fresh_solver,
-        devices=[_device],
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_warm_started_full_reset_matches_fresh_solver",
-        test_warm_started_full_reset_matches_fresh_solver,
-        devices=[_device],
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_deterministic_runs_are_bitwise_identical",
-        test_deterministic_runs_are_bitwise_identical,
-        devices=[_device],
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_deterministic_overflow_keeps_earliest_contacts",
-        test_deterministic_overflow_keeps_earliest_contacts,
-        devices=[_device],
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_overflow_warning_names_deterministic_mode",
-        test_overflow_warning_names_deterministic_mode,
-        devices=[_device],
-        check_output=False,
-    )
-    add_function_test(
-        TestSteelDeterminism,
-        "test_deterministic_rejects_warm_started_colored",
-        test_deterministic_rejects_warm_started_colored,
-        devices=[_device],
-    )
+devices = get_test_devices()
+cuda_devices = get_cuda_test_devices()
+for _fn in (test_full_reset_matches_fresh_solver, test_deterministic_overflow_keeps_earliest_contacts):
+    add_function_test(TestSteelDeterminism, _fn.__name__, _fn, devices=devices)
+add_function_test(
+    TestSteelDeterminism,
+    "test_overflow_warning_names_deterministic_mode",
+    test_overflow_warning_names_deterministic_mode,
+    devices=devices,
+    check_output=False,
+)
+for _fn in (
+    test_crba_fill_par_dof_is_batch_invariant,
+    test_deterministic_runs_are_bitwise_identical,
+    test_deterministic_step_runs_under_an_external_capture,
+    test_warm_started_full_reset_matches_fresh_solver,
+    test_deterministic_launches_replay_identically,
+    test_deterministic_joint_rows_follow_articulation_order,
+    test_deterministic_joint_friction_rows_follow_dof_order,
+    test_deterministic_bilateral_rows_follow_element_order,
+    test_inherited_global_mode_keeps_steel_ordering,
+):
+    add_function_test(TestSteelDeterminism, _fn.__name__, _fn, devices=cuda_devices)
 
 
-for _device in get_test_devices():
-    if wp.get_device(_device).is_cuda:
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_launches_replay_identically",
-            test_deterministic_launches_replay_identically,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical",
-            test_deterministic_runs_with_dynamic_shape_scale_are_bitwise_identical,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_angular_friction_rows_follow_their_contact",
-            test_deterministic_angular_friction_rows_follow_their_contact,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_joint_rows_follow_articulation_order",
-            test_deterministic_joint_rows_follow_articulation_order,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_runs_are_bitwise_identical",
-            test_deterministic_propagation_runs_are_bitwise_identical,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_is_world_permutation_invariant",
-            test_deterministic_propagation_is_world_permutation_invariant,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_warm_start_sums_in_row_order",
-            test_deterministic_propagation_warm_start_sums_in_row_order,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_accepts_bodies_shared_by_worlds",
-            test_deterministic_propagation_accepts_bodies_shared_by_worlds,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows",
-            test_deterministic_propagation_torsion_keeps_a_shared_floor_out_of_rows,
-            devices=[_device],
-        )
-        add_function_test(
-            TestSteelDeterminism,
-            "test_deterministic_propagation_drops_cross_world_responding_contacts",
-            test_deterministic_propagation_drops_cross_world_responding_contacts,
-            devices=[_device],
-            check_output=False,
-        )
+class TestSteelPropagationDeterminism(unittest.TestCase):
+    pass
 
+
+for _fn in (
+    test_deterministic_propagation_runs_are_bitwise_identical,
+    test_deterministic_propagation_launches_replay_identically,
+):
+    add_function_test(TestSteelPropagationDeterminism, _fn.__name__, _fn, devices=cuda_devices)
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

@@ -77,8 +77,7 @@ The optional contact report adds one ``int32`` flag per contact.
 Per-frame call order (inside :class:`~newton.CollisionPipeline`)::
 
     sorter.sort_full(...)
-    reducer.reduce(...)  # optional; compact contacts and their sorted keys
-    matcher.match(...)  # indices name the retained stream
+    matcher.match(...)  # on the sorted stream; indices name final rows
     matcher.replay_matched(...)  # sticky-only; overwrite matched rows
     matcher.build_report(...)  # optional; must precede save_sorted_state
     matcher.save_sorted_state(...)  # after sorting, replay, and report
@@ -448,7 +447,7 @@ class _SaveStateData:
 
 
 @wp.kernel(enable_backward=False)
-def _save_sorted_state_kernel(data: _SaveStateData):
+def _save_sorted_state_kernel(data: _SaveStateData, reset_world_mask: wp.array[wp.bool]):
     """Copy sorted contacts into the previous-frame buffers for next-frame matching.
 
     The persisted ``dst_pos_world`` is the world-space *midpoint* of the two
@@ -456,12 +455,15 @@ def _save_sorted_state_kernel(data: _SaveStateData):
     quantity.
     """
     i = wp.tid()
+    # Matching and reporting have already consumed the mask; saving does not read it.
+    if i < reset_world_mask.shape[0]:
+        reset_world_mask[i] = False
     if i == 0:
         # An overflowing narrow phase counts past capacity; only stored rows are history.
         data.dst_count[0] = wp.min(data.src_count[0], data.dst_keys.shape[0])
         data.dst_frame[0] = data.buffer_id
         data.dst_frame[1] = data.src_generation[0]
-    if i < data.src_count[0]:
+    if i < wp.min(data.src_count[0], data.dst_keys.shape[0]):
         data.dst_keys[i] = data.src_keys[i]
         data.dst_claim[i] = _CLAIM_SENTINEL
         if data.has_report != 0:
@@ -990,8 +992,12 @@ class ContactMatcher:
             data.dst_offset1_body = self._prev_pos_world
             data.has_sticky = 0
 
-        wp.launch(_save_sorted_state_kernel, dim=self._capacity, inputs=[data], device=device)
-        self._reset_world_mask.zero_()
+        wp.launch(
+            _save_sorted_state_kernel,
+            dim=max(self._capacity, self._reset_world_mask.shape[0], 1),
+            inputs=[data, self._reset_world_mask],
+            device=device,
+        )
 
     def replay_matched(
         self,
@@ -1054,7 +1060,6 @@ class ContactMatcher:
         data.margin1 = margin1
         data.body_q = body_q
         data.shape_body = shape_body
-        data.pos_threshold_sq = self._pos_threshold_sq
 
         data.pos_threshold_sq = self._pos_threshold_sq
         wp.launch(_replay_matched_kernel, dim=self._capacity, inputs=[data], device=device)

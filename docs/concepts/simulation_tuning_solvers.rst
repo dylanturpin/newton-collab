@@ -67,14 +67,12 @@ Contact geometry
    See :ref:`Collisions`.
 
 Contact reduction
-   The boolean ``CollisionPipeline.reduce_contacts`` policy controls the
-   universally supported mesh/heightfield producer stage.  The optional
-   ``CollisionPipeline.ContactReductionConfig(body_pairs=True)`` postpass is a
-   different, solver-visible approximation intended for compound-body patches;
-   it is currently supported only by :class:`newton.solvers.SolverSteel`.
-   Keep it off unless measured end-to-end solver savings outweigh its fixed
-   collision cost and validate tipping- and yaw-sensitive behavior.  See
-   :ref:`Contact Reduction` for the stage and compatibility contracts.
+   ``CollisionPipeline(reduce_contacts=...)`` controls the mesh/heightfield
+   reduction every solver consumes. The opt-in
+   ``CollisionPipeline(body_pair_reduction=...)`` reduction changes which contacts
+   the solver sees and is supported by :class:`newton.solvers.SolverSteel`
+   only. Keep it off unless it lowers the
+   measured step time, and check tipping and yaw behavior when it is on.
 
 Contact material
    Shape material arrays such as :attr:`~Model.shape_material_mu`,
@@ -222,7 +220,7 @@ repository examples spend tuning effort, not a shared solver API.
        derivative bound. See
        :ref:`Tuning VBD` for the VBD-specific tuning page.
    * - :class:`~newton.solvers.SolverFeatherstone`
-     - ``angular_damping``, ``friction_smoothing``,
+     - ``angular_damping``,
        ``update_mass_matrix_interval``, ``use_tile_gemm``, ``fuse_cholesky``.
      - This semi-implicit articulated solver is tuned mainly through ``dt``,
        contact materials, drive gains, joint limits, and armature. Large stiffness
@@ -232,10 +230,10 @@ repository examples spend tuning effort, not a shared solver API.
    * - :class:`~newton.solvers.SolverSteel`
      - ``solve_mode``, ``iterations``, ``baumgarte``, ``cfm``, ``relaxation``,
        ``update_mass_matrix_interval``, ``enable_joint_limits``,
-       ``joint_limit_activation_gap``, ``enable_joint_velocity_limits``,
-       ``velocity_limit_activation_fraction``,
+       ``joint_limit_activation_gap``, ``enable_joint_friction``,
+       ``enable_joint_velocity_limits``, ``velocity_limit_activation_fraction``,
        ``articulation_constraint_max``, ``free_body_constraint_max``,
-       ``warn_constraint_overflow``, ``drive_mode``,
+       ``propagation_constraint_max``, ``warn_constraint_overflow``, ``drive_mode``,
        ``fuse_joint_velocity_limits``, ``enable_bilateral_preelimination``,
        ``bilateral_preelimination_include_mimics``, ``friction_anchor_beta``,
        ``contact_regularization``, ``velocity_iterations``,
@@ -249,7 +247,9 @@ repository examples spend tuning effort, not a shared solver API.
        ``sleep_quiet_time``, ``sleep_skip_constraints``,
        ``articulated_contact_response``, ``propagation_same_articulation_rows``,
        ``propagation_cached_response``, ``propagation_cached_response_body_max``,
-       ``propagation_color_order``,
+       ``propagation_color_order``, ``friction_combine``, ``restitution_combine``,
+       ``free_rigid_torsional_friction``,
+       ``free_rigid_rolling_friction``,
        ``contact_shared_anchor``, ``contact_friction_shared_anchor``,
        ``row_watermark``, ``row_schedule``, ``use_parallel_streams``,
        ``double_buffer``, ``friction_mode``.
@@ -257,8 +257,18 @@ repository examples spend tuning effort, not a shared solver API.
        Gauss-Seidel row recomputes ``J v`` and uses only its diagonal. ``solve_mode``
        sets the sweep order: ``"serial"`` (default) sweeps each world's rows in order,
        and ``"colored"`` sweeps the propagation contact rows in parallel colors (it
-       requires ``articulated_contact_response="propagation"``; see below). Joint limits are enforced only with
-       ``enable_joint_limits=True`` (off by default). Contacts and joint limits are hard
+       requires ``articulated_contact_response="propagation"``; see below).
+       Joint limits are enforced only with ``enable_joint_limits=True`` (off by
+       default). Joint friction (:attr:`~newton.Model.joint_friction`, for
+       example from MJCF ``frictionloss``) is enforced only with
+       ``enable_joint_friction=True`` (off by default). A positive per-DOF
+       ``steel:joint_friction_load_coefficient`` adds the joint friction law of
+       PhysX articulations before PhysX 5.6, a bound that grows with the force
+       and torque the joint transmits.
+       The solver sets up this load term only if some coefficient is positive
+       at construction; to randomize coefficients after construction, make at
+       least one positive before creating the solver.
+       Contacts and joint limits are hard
        constraints solved by projected Gauss-Seidel, so contact ``ke`` / ``kd``
        are not used; more ``iterations`` reduce residual penetration and
        slip, and ``baumgarte`` sets how much position error is corrected per
@@ -267,7 +277,8 @@ repository examples spend tuning effort, not a shared solver API.
        ``friction_anchor_beta=0`` selects point friction. A small
        ``contact_regularization`` (for example ``0.02``) makes the
        normal-force split of redundant contacts unique and helps stacks hold at
-       low iteration counts, at the cost of a small resting sag.
+       low iteration counts, at the cost of a small resting sag; it requires
+       the default ``friction_mode``.
        ``velocity_iterations`` remove the velocity that position correction
        adds, and ``contact_warmstart`` (with contact matching in the
        :class:`~newton.CollisionPipeline`) reuses the previous step's
@@ -280,19 +291,37 @@ repository examples spend tuning effort, not a shared solver API.
        Coulomb budget; the radius is an effective footprint (``2 R / 3`` for
        a uniformly loaded disk of radius ``R``). ``contact_torsion_device``
        prepares these rows on the device, which CUDA graph capture requires.
+       Contacts with a mesh that has ``enable_surface_velocity`` drive the
+       tangential surface velocity through the friction rows; contacts carry
+       only a linear surface velocity per point, so the torsion rows treat a
+       spinning surface as still and resist bodies co-rotating with it.
+       Free-body contacts get experimental spin and rolling friction rows
+       from shapes whose ``steel:condim`` is 4 (spin, bounded by
+       ``mu_torsional`` times the normal load) or 6 (also rolling, bounded by
+       ``mu_rolling`` times the normal load), under every
+       ``articulated_contact_response``.
        The experimental ``contact_compliance`` option solves hydroelastic
        contacts with positive stiffness as implicit spring-dampers instead, with
-       the ``"immediate"`` articulated contact response or ``solve_mode="colored"``; it uses point friction, and a captured step reports its input
-       errors through ``validate_contact_compliance()`` after replay.
+       the ``"immediate"`` articulated contact response or ``solve_mode="colored"``; it
+       uses point friction and prepares its rows on the device, so a compliant
+       step can be captured, and ``check_constraint_capacity()`` reports input
+       a captured step rejected.
        Joint drives are integrated implicitly by default, which keeps large
        drive gains stable at ordinary ``dt``; ``drive_mode="rows"`` solves
        them as PGS rows together with contacts and limits instead, and each
        driven DOF then uses one row of ``articulation_constraint_max``. Rows beyond ``articulation_constraint_max``
-       (articulated bodies) or ``free_body_constraint_max`` (free bodies) per world
-       are dropped and flagged in ``constraint_overflow`` (one entry per solver
-       world; global articulations solve in world 0); call
+       (articulated bodies), ``free_body_constraint_max`` (free bodies) or
+       ``propagation_constraint_max`` (propagation rows, see below) per world
+       are dropped and flagged in ``constraint_overflow`` (one entry per world
+       and a final entry for global articulations); call
        ``check_constraint_capacity()`` at an observation boundary, and raise the
-       capacity and reset the world when it reports a world. The same check
+       capacity and reset the world when it reports a world. To check a step
+       without waiting for the steps queued after it, call
+       ``snapshot_constraint_status()`` after that step and
+       ``check_constraint_capacity(snapshot=True)`` later; check the last
+       snapshot when you stop stepping. A reset retakes a checked snapshot and
+       keeps an unchecked one, so its check still reports the steps before the
+       reset. The same check
        reports a tree joint disabled through ``Model.joint_enabled`` after
        construction, which no capacity fixes: discard those steps' output,
        re-enable the joint and reset the world. Contacts of a
@@ -319,53 +348,62 @@ repository examples spend tuning effort, not a shared solver API.
        worth measuring on broad trees such as hands. The
        experimental ``enable_sleeping`` freezes settled, supported islands of
        articulations and skips their rows and dynamics until a force, state
-       change, contact with a moving body, reset or model notification wakes
-       them; it saves work on scenes where many objects rest, and costs a few
-       extra launches per step when nothing sleeps. ``articulated_contact_response``
+       change, contact with a moving body or a tangentially moving mesh
+       surface, reset or model notification wakes them; it saves work on
+       scenes where many objects rest, and costs a few extra launches per
+       step when nothing sleeps. ``articulated_contact_response``
        selects how contacts of articulated bodies are solved: ``"immediate"`` rows of
        the generalized coordinates, or the ``"propagation"`` response,
        which solves them as body-space rows and propagates their impulses through each
-       articulation tree. With ``"propagation"`` every
-       contact row, free bodies included, shares one family of ``free_body_constraint_max +
-       articulation_constraint_max`` rows per world (a scene whose bodies are all free keeps a
-       single dense row, since none of its rows can land there), or of
-       ``propagation_constraint_max`` rows when that is set, which lets
-       ``free_body_constraint_max`` shrink to the rows that stay matrix-free (the velocity-limit
-       rows). ``solve_mode="colored"`` sweeps them in
-       parallel batches of contacts that share no responding body, which pays off on
-       scenes with many contacts per world. A scene whose bodies are all free can also set
-       ``articulation_constraint_max=1``: none of its rows can land on the dense family, and
-       that capacity still sizes per-body Jacobian blocks and per-world row buffers.
-       ``propagation_cached_response`` replaces the
-       per-iteration tree walk with cached per-body responses (on by default); which is
-       faster depends on the model. The serial ``"propagation"`` sweep rejects
-       contact compliance; the propagation response rejects loop-closing joints, and falls
-       back from bilateral pre-elimination to iterative mimic rows with a warning.
-       ``"propagation"`` supports, in both solve modes,
-       contact torsion with ``contact_torsion_device=True`` and ``velocity_iterations=0``,
-       ``enable_torsional_rolling_friction``, and ``deterministic=True``
-       (``solve_mode="colored"`` without ``contact_warmstart``); ``solve_mode="colored"``
-       also supports sleeping, leaving sleeping articulations out of its trees, and the
-       ``friction_mode`` values other than ``"fixed_normal"``,
-       which it applies to articulated contacts as well; ``enable_torsional_rolling_friction``
-       requires ``"fixed_normal"`` and no contact compliance on every response.
-       ``use_parallel_streams`` and ``double_buffer`` overlap the work of
-       articulation-size groups and of consecutive steps without changing results;
-       measure the full step before relying on them.
+       articulation tree. With ``"propagation"`` contact
+       rows, free bodies included, share one family of ``free_body_constraint_max +
+       articulation_constraint_max`` rows per world, or of ``propagation_constraint_max`` rows
+       when that is set. Contacts between two links of one articulation stay dense rows of
+       ``articulation_constraint_max`` unless ``propagation_same_articulation_rows`` is set.
+       Setting ``propagation_constraint_max`` lets ``free_body_constraint_max`` shrink to the
+       free-body velocity-limit rows, the only free-body rows this response keeps.
+       ``solve_mode="colored"`` sweeps the propagation rows in parallel batches of contacts
+       that share no responding body, which pays off on scenes with many contacts per world.
+       ``propagation_cached_response`` replaces the per-iteration tree walk with cached
+       per-body responses (on by default); which is faster depends on the model.
+       ``propagation_color_order="longest_first"`` colors contacts with more rows first, which
+       shortens the colored sweep when one body carries contacts with
+       different row counts. The saving shrinks as the world count grows, and the changed
+       order can converge more slowly on stacks at a fixed iteration count, so measure the
+       full step at the target world count before switching. Both solve modes solve contact torsion with ``contact_torsion_device=True`` and
+       ``velocity_iterations=0``. ``solve_mode="serial"`` rejects contact compliance with ``"propagation"`` and
+       ``solve_mode="colored"`` accepts it without contact torsion, which rejects the
+       hydroelastic contacts that compliance needs. The propagation response rejects
+       loop-closing joints, and falls back from bilateral pre-elimination to iterative mimic rows
+       with a warning.
+       ``solve_mode="colored"`` supports sleeping, with or without contact compliance, leaving
+       sleeping articulations out of its trees, and the
+       ``friction_mode`` values other than ``"fixed_normal"``, which it applies to the articulated
+       contacts on its propagation rows as well. The serial ``"propagation"`` sweep rejects sleeping and requires
+       ``"fixed_normal"``.
+       ``use_parallel_streams`` overlaps the work of articulation-size groups and
+       ``double_buffer`` clears a step's buffers on a side stream, without changing
+       results; measure the full step before relying on them.
    * - :class:`~newton.solvers.SolverSemiImplicit`
-     - ``angular_damping``, ``friction_smoothing``, ``joint_attach_ke``,
+     - ``angular_damping``, ``joint_attach_ke``,
        ``joint_attach_kd``, ``enable_tri_contact``.
      - There is no iteration parameter. For instability, reduce ``dt``, reduce
        stiffness, add damping, or use a solver with an implicit or iterative
        constraint formulation. Examples mostly use constructor defaults; one
        tracked example disables triangle contact with ``enable_tri_contact``.
    * - :class:`~newton.solvers.SolverStyle3D`
-     - ``iterations``, ``linear_iterations``, ``drag_spring_stiff``,
-       ``enable_mouse_dragging``.
+     - :class:`~newton.solvers.SolverStyle3D.Config`, including ``iterations``,
+       ``linear_iterations``, ``drag_spring_stiff``, and ``enable_mouse_dragging``.
+       The public ``solver.config`` object can be edited between steps, and the
+       updated values take effect on the next step. Recapture CUDA graphs after
+       changing the configuration.
      - Cloth material stiffness is usually authored when calling
        :mod:`newton.solvers.style3d` helper functions. Examples tune
-       ``iterations`` on the solver and keep interaction-specific drag knobs
-       separate from material stiffness.
+       ``Config.iterations`` and keep interaction-specific drag knobs
+       separate from material stiffness. The original constructor keyword
+       options and solver attribute aliases are deprecated as of Newton 1.8;
+       use ``Config`` and ``solver.config`` instead. Deprecated constructor
+       options cannot be combined with an explicit ``config``.
    * - :class:`~newton.solvers.SolverKamino`
      - :class:`~newton.solvers.SolverKamino.Config`, including
        ``sparse_jacobian``, ``sparse_dynamics``, ``use_collision_detector``,

@@ -13,7 +13,10 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    WARP_DETERMINISM_OFF,
 )
+
+wp.set_module_options(WARP_DETERMINISM_OFF)
 
 
 @cache
@@ -22,7 +25,7 @@ def _get_pgs_solve_sparse_kernel(
     max_world_dofs: int,
     max_row_dofs: int,
     *,
-    mf_max_constraints: int = 0,
+    free_body_constraint_max: int = 0,
     free_row_dofs: int = 0,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
@@ -33,17 +36,16 @@ def _get_pgs_solve_sparse_kernel(
     once; physical free blocks store J and their response separately. All
     coordinates accumulate deltas from v_hat; only factor blocks need decoding.
 
-    This uses the existing interleaved row order and paired friction law,
-    including linked patch normal loads. The caller admits only augmented
-    drives, immediate response, and no warm start, torsion or ordinary joint
-    velocity-limit rows. Seeded patch impulses retain the ordinary delta semantics.
-    Independent free-body rows follow the articulated rows in every sweep,
-    retaining their own response, capacity, friction law, and impulse buffer.
+    The row order, the coupled Coulomb friction law and the early exit after a
+    stationary sweep are those of the dense matrix-free sweep. Joint velocity-limit
+    rows of articulations are not supported; the caller selects this kernel only
+    without them. Free-body rows follow the articulated rows in every sweep with
+    their own response, capacity, friction law and impulse buffer.
 
     Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
-    F = int(mf_max_constraints)
+    F = int(free_body_constraint_max)
     P = int(free_row_dofs)
     if M <= 0 or D <= 0 or S <= 0 or S > D or F < 0 or P < 0 or P > S:
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
@@ -88,11 +90,6 @@ def _get_pgs_solve_sparse_kernel(
             const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[global_row * 4]);
             const int kind = meta.w & 0xffff;
             const bool friction = kind == {friction_type};
-            if (friction && global_iteration < friction_start_iteration) {{
-                if (lane == 0) mf_impulse[row] = 0.0f;
-                __syncwarp(MASK);
-                continue;
-            }}
             const int parent = meta.w >> 16;
             if (friction && row != parent + 1) continue;
             const int sibling = friction ? parent + 2 : -1;
@@ -148,10 +145,7 @@ def _get_pgs_solve_sparse_kernel(
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
-                float normal_load = mf_impulse[parent];
-                for (int next = mf_meta.data[(mf_offset + parent) * 4 + 3] >> 16;
-                     next >= 0 && next != parent; next = mf_meta.data[(mf_offset + next) * 4 + 3] >> 16)
-                    normal_load += mf_impulse[next];
+                const float normal_load = mf_impulse[parent];
                 const float radius = fmaxf(mf_row_mu.data[global_row] * normal_load, 0.0f);
                 const float old_sibling = mf_impulse[sibling];
                 float2 pair = make_float2(0.0f, 0.0f);
@@ -227,16 +221,10 @@ def _get_pgs_solve_sparse_kernel(
     __syncwarp(MASK);
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
-        const int global_iteration = iteration_offset + iteration;
         int changed = 0;
         for (int row = 0; row < count; ++row) {{
             const int row_type = static_cast<int>(type[row]);
             const bool friction = row_type == {friction_type};
-            if (friction && global_iteration < friction_start_iteration) {{
-                if (lane == 0) impulse[row] = 0.0f;
-                __syncwarp(MASK);
-                continue;
-            }}
             const int parent = friction ? world_row_parent.data[offset + row] : -1;
             if (friction && row != parent + 1) continue;
             const int sibling = friction ? parent + 2 : -1;
@@ -284,10 +272,7 @@ def _get_pgs_solve_sparse_kernel(
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
-                float normal_load = impulse[parent];
-                for (int next = world_row_parent.data[offset + parent]; next >= 0 && next != parent;
-                     next = world_row_parent.data[offset + next])
-                    normal_load += impulse[next];
+                const float normal_load = impulse[parent];
                 const float radius = fmaxf(world_row_mu.data[offset + row] * normal_load, 0.0f);
                 const float old_sibling = impulse[sibling];
                 float2 pair = make_float2(0.0f, 0.0f);
@@ -325,7 +310,8 @@ def _get_pgs_solve_sparse_kernel(
             __syncwarp(MASK);
         }}
 {mf_sweep}
-        if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
+        // An exactly stationary sweep is a fixed point; later sweeps are redundant.
+        if (__ballot_sync(MASK, changed != 0) == 0u) break;
     }}
     for (int d = lane; d < {D}; d += 32) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += 32) world_impulses.data[offset + i] = impulse[i];
@@ -361,8 +347,6 @@ def _get_pgs_solve_sparse_kernel(
         mf_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
     ): ...
 
@@ -392,8 +376,6 @@ def _get_pgs_solve_sparse_kernel(
         mf_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
     ):
         block, lane = wp.tid()
@@ -425,11 +407,9 @@ def _get_pgs_solve_sparse_kernel(
                 mf_row_mu,
                 iterations,
                 omega,
-                friction_start_iteration,
-                iteration_offset,
                 factor_velocity_delta,
             )
 
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}"
     solve.__qualname__ = solve.__name__
-    return wp.kernel(enable_backward=False, module="unique")(solve)
+    return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(solve)

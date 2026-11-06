@@ -1,1 +1,0 @@
-Speed up `SolverSteel` `propagation` contacts on articulations with multi-DOF joints, such as MJCF humanoids, by computing the response split from the backward sweep instead of a second forward sweep.

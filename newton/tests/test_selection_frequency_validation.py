@@ -40,7 +40,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SHAPE layout is unavailable"):
             ArticulationView(model, "robot_*")
 
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.joint_count, 1)
         self.assertEqual(view.link_count, 1)
         self.assertIsNone(view.shape_count)
@@ -63,7 +63,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
             builder.end_world()
         model = builder.finalize()
 
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertIsNone(view.joint_count)
         self.assertIsNone(view.joint_names)
         with self.assertRaises(AttributeError):
@@ -81,7 +81,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         starts = model.articulation_start.numpy()
         self.assertEqual(starts[[0, 2, 4]].tolist(), [0, 3, 8])
-        view = ArticulationView(model, "target_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "target_*", homogeneous=False)
         self.assertEqual(view.joint_count, 2)
         self.assertEqual(len(view.joint_names), 2)
         self.assertFalse(view.joints_contiguous)
@@ -89,6 +89,8 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         assert_np_equal(view.get_attribute("joint_type", model).numpy(), model.joint_type.numpy()[joint_rows])
         model.joint_q.assign(np.arange(model.joint_coord_count, dtype=np.float32))
         assert_np_equal(view.get_dof_positions(model).numpy(), np.array([[[0.0], [1.0], [4.0]]]))
+        with self.assertRaisesRegex(ValueError, "not uniformly strided"):
+            ArticulationView(model, "target_*")
 
     def test_different_sparse_patterns_keep_uniform_metadata(self):
         """Preserve uniform counts when physical gaps disable access."""
@@ -110,7 +112,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "BODY layout is unavailable"):
             ArticulationView(model, "robot_*")
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.link_count, 2)
         self.assertEqual(len(view.link_names), 2)
         self.assertIsNone(view.links_contiguous)
@@ -213,7 +215,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
             builder.add_articulation(joints, label=f"robot_{label}")
         model = builder.finalize()
 
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.link_count, 2)
         self.assertEqual(view.shape_count, 2)
         with self.assertRaises(AttributeError):
@@ -264,7 +266,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
             builder.end_world()
         model = builder.finalize(device="cpu")
 
-        view = ArticulationView(model, "robot", include_joints=["hinge"], allow_partial_layouts=True)
+        view = ArticulationView(model, "robot", include_joints=["hinge"], homogeneous=False)
         self.assertEqual(view.get_dof_positions(model).shape, (2, 1, 1))
         self.assertEqual(view.get_dof_velocities(model).shape, (2, 1, 1))
 
@@ -313,7 +315,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "JOINT_DOF layout is unavailable"):
             ArticulationView(model, "robot_*")
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.joint_dof_count, 4)
         self.assertEqual(view.joint_coord_count, 5)
         with self.assertRaises(AttributeError):
@@ -344,7 +346,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "SHAPE layout is unavailable"):
             ArticulationView(model, "robot_*")
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.link_count, 2)
         self.assertEqual(view.shape_count, 2)
         self.assertEqual(view.get_attribute("body_mass", model).shape, (1, 2, 2))
@@ -366,7 +368,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "root metadata differs"):
             ArticulationView(model, "robot_*")
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertIsNone(view.root_joint_type)
         self.assertTrue(view.is_floating_base)
         self.assertFalse(view.is_fixed_base)
@@ -384,7 +386,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         builder.add_articulation([fixed_joint], label="robot_fixed")
         model = builder.finalize()
 
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertIsNone(view.root_joint_type)
         self.assertIsNone(view.is_fixed_base)
         self.assertIsNone(view.is_floating_base)
@@ -458,7 +460,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         for kwargs in ({"exclude_joints": []}, {"exclude_joint_types": []}, {"exclude_links": []}):
             with self.subTest(kwargs=kwargs):
-                view = ArticulationView(model, "robot_*", allow_partial_layouts=True, **kwargs)
+                view = ArticulationView(model, "robot_*", homogeneous=False, **kwargs)
                 self.assertIsNone(view.joint_count)
                 self.assertIsNone(view.link_count)
 
@@ -485,7 +487,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         model = builder.finalize()
 
         # coordinate starts 0, 11, 22 are regular; DOF starts 0, 9, 19 are not
-        view = ArticulationView(model, "target_*")
+        view = ArticulationView(model, "target_*", homogeneous=False)
         q = np.arange(model.joint_coord_count, dtype=np.float32)
         qd = -np.arange(model.joint_dof_count, dtype=np.float32)
         model.joint_q.assign(q)
@@ -496,6 +498,8 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         assert_np_equal(view.get_dof_velocities(model).numpy(), qd[qd_rows][None])
         assert_np_equal(view.get_root_transforms(model).numpy().reshape(3, 7), q[q_rows])
         assert_np_equal(view.get_root_velocities(model).numpy().reshape(3, 6), qd[qd_rows])
+        with self.assertRaisesRegex(ValueError, "not uniformly strided"):
+            ArticulationView(model, "target_*")
 
     def test_unequal_world_totals_do_not_replace_affine_validation(self):
         """Keep a valid layout when unrelated world shape totals differ."""
@@ -535,7 +539,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "BODY layout is unavailable"):
             ArticulationView(model, "robot_*")
-        view = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        view = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertEqual(view.joint_count, 2)
         self.assertIsNone(view.link_count)
         self.assertIsNone(view.shape_count)
@@ -555,7 +559,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         joint_types[0, 1, 0] = newton.JointType.DISTANCE
         view.set_attribute("joint_type", model, joint_types)
 
-        refreshed = ArticulationView(model, "robot_*", allow_partial_layouts=True)
+        refreshed = ArticulationView(model, "robot_*", homogeneous=False)
         self.assertIsNone(refreshed.root_joint_type)
 
     def test_size_one_axes_keep_views_contiguous(self):
@@ -568,7 +572,7 @@ class TestSelectionFrequencyValidation(unittest.TestCase):
         robot.add_articulation([root_joint, tip_joint], label="robot")
 
         replicated = newton.ModelBuilder()
-        replicated.replicate(robot, world_count=3)
+        replicated.replicate(robot, copy_count=3)
         single = newton.ModelBuilder()
         single.add_builder(robot)
         shared_world = newton.ModelBuilder()

@@ -1,1 +1,1 @@
-Let `SolverSteel` colored contact rows share any kinematic articulation root, not only kinematic free bodies, so contacts on a kinematic conveyor belt or turntable no longer serialize into one color each.
+Let `SolverSteel` contact rows with `solve_mode="colored"` share any kinematic articulation root, not only kinematic free bodies, so contacts on a kinematic conveyor belt or turntable no longer serialize into one color each. Adding or removing a kinematic articulation root warns that CUDA graphs of colored steps must be recaptured.

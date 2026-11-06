@@ -1,0 +1,1 @@
+Add the experimental `SolverSteel` constructor options `free_rigid_torsional_friction` and `free_rigid_rolling_friction`, solver-wide torsional and rolling coefficients [m] for every free-body contact that replace the shapes' `steel:condim` gate for that coefficient.
