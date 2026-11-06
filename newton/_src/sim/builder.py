@@ -3656,6 +3656,8 @@ class ModelBuilder:
     # creating an unused instance attribute whose targets are never applied.
     joint_target_pos = RemovedAttribute("joint_target_q", removed_in="1.5")
     joint_target_vel = RemovedAttribute("joint_target_qd", removed_in="1.5")
+    # Indexed by DOF; joint_rest_q is indexed by coordinate (joint_q_start), so no alias can stand in for it.
+    joint_spring_ref = RemovedAttribute("joint_rest_q", removed_in="1.9")
 
     @property
     def joint_spring_stiffness(self) -> list[float]:
@@ -3668,18 +3670,6 @@ class ModelBuilder:
             "joint_spring_stiffness is deprecated; use joint_stiffness instead.", NewtonDeprecationWarning, stacklevel=2
         )
         return self.joint_stiffness
-
-    @property
-    def joint_spring_ref(self) -> list[float]:
-        """Deprecated passive joint spring reference per coordinate.
-
-        .. deprecated:: 1.9
-            Use :attr:`joint_rest_q` instead.
-        """
-        warnings.warn(
-            "joint_spring_ref is deprecated; use joint_rest_q instead.", NewtonDeprecationWarning, stacklevel=2
-        )
-        return self.joint_rest_q
 
     @property
     def joint_twist_lower(self) -> list[float]:

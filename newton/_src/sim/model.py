@@ -748,7 +748,6 @@ class Model:
         "joint_spring_stiffness": AttributeSpec(
             AttributeFrequency.JOINT_DOF, alias_of="joint_stiffness", deprecated=True
         ),
-        "joint_spring_ref": AttributeSpec(AttributeFrequency.JOINT_COORD, alias_of="joint_rest_q", deprecated=True),
         "joint_limit_lower": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_upper": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_ke": AttributeSpec(AttributeFrequency.JOINT_DOF),
@@ -2088,6 +2087,8 @@ class Model:
 
     joint_target_pos = RemovedAttribute("joint_target_q", removed_in="1.5")
     joint_target_vel = RemovedAttribute("joint_target_qd", removed_in="1.5")
+    # Indexed by DOF; joint_rest_q is indexed by coordinate (joint_q_start), so no alias can stand in for it.
+    joint_spring_ref = RemovedAttribute("joint_rest_q", removed_in="1.9")
 
     @property
     def mesh_edge_indices(self) -> wp.array[wp.vec2i] | None:
@@ -2182,22 +2183,6 @@ class Model:
         """Replace the passive joint spring stiffness through the deprecated alias."""
         warn_deprecation("Model.joint_spring_stiffness is deprecated; use Model.joint_stiffness instead.")
         self.joint_stiffness = value
-
-    @property
-    def joint_spring_ref(self) -> wp.array[wp.float32] | None:
-        """Passive joint spring rest coordinates, shape [joint_coord_count], float.
-
-        .. deprecated:: 1.9
-            Use :attr:`joint_rest_q` instead.
-        """
-        warn_deprecation("Model.joint_spring_ref is deprecated; use Model.joint_rest_q instead.")
-        return self.joint_rest_q
-
-    @joint_spring_ref.setter
-    def joint_spring_ref(self, value: wp.array[wp.float32] | None) -> None:
-        """Replace the passive joint spring rest coordinates through the deprecated alias."""
-        warn_deprecation("Model.joint_spring_ref is deprecated; use Model.joint_rest_q instead.")
-        self.joint_rest_q = value
 
     @property
     def joint_twist_lower(self) -> wp.array[wp.float32] | None:

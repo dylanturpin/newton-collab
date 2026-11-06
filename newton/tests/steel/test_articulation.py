@@ -811,7 +811,11 @@ def test_imported_weld_with_zero_torquescale_leaves_rotation_free(test, device):
     </mujoco>
     """
     b = newton.ModelBuilder()
-    with test.assertLogs("newton", level="WARNING") as logs:
+    # The weld closes a loop over the hinge, which the builder reports as a parallel joint.
+    with (
+        test.assertLogs("newton", level="WARNING") as logs,
+        test.assertWarnsRegex(newton.exceptions.NewtonWarning, "Parallel joints"),
+    ):
         b.add_mjcf(mjcf)
     test.assertTrue(any("torquescale=0" in message for message in logs.output))
     model = b.finalize(device=device)
@@ -2085,14 +2089,14 @@ def test_deprecated_spring_spellings(test, device):
         newton.ModelBuilder.JointDofConfig(stiffness=1.0, spring_stiffness=3.0)
     with test.assertWarnsRegex(deprecated, "joint_stiffness instead"):
         test.assertEqual(builder.joint_spring_stiffness, [2.0])
-    with test.assertWarnsRegex(deprecated, "joint_rest_q instead"):
-        test.assertEqual(builder.joint_spring_ref, [0.25])
     model = builder.finalize(device=device)
     with test.assertWarnsRegex(deprecated, "Model.joint_stiffness instead"):
         test.assertIs(model.joint_spring_stiffness, model.joint_stiffness)
-    with test.assertWarnsRegex(deprecated, "Model.joint_rest_q instead"):
-        test.assertIs(model.joint_spring_ref, model.joint_rest_q)
     np.testing.assert_allclose(model.joint_rest_q.numpy(), [0.25])
+    # The DOF-indexed spring references have no coordinate-indexed alias.
+    for owner in (builder, model):
+        with test.subTest(owner=type(owner).__name__), test.assertRaisesRegex(AttributeError, "joint_rest_q"):
+            _ = owner.joint_spring_ref
 
 
 def test_deprecated_status_members(test, device):
