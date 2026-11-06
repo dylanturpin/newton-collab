@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import unittest
 
 import numpy as np
@@ -801,6 +802,12 @@ def test_kinematic_runtime_toggle(
         solver._update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
+    def toggle_warning():
+        # Colored Steel asks for a recapture when a kinematic articulation root appears or disappears.
+        if isinstance(solver, newton.solvers.SolverSteel) and solver._propagation_colored:
+            return test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs")
+        return contextlib.nullcontext()
+
     state_0, state_1 = model.state(), model.state()
     applied_wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -820,7 +827,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.DYNAMIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     # Phase 2: body is now dynamic — should move under applied force.
     for _ in range(phase_steps):
@@ -838,7 +846,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     pos_before_rekinematic = state_0.body_q.numpy()[body, :3].copy()
 

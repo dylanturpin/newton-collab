@@ -9008,7 +9008,9 @@ def Xform "Articulation" (
                 stage, frame0, frame1 = self._authored_weld_stage(target, closed_loop=True)
                 builder = newton.ModelBuilder()
                 SolverMuJoCo.register_custom_attributes(builder)
-                builder.add_usd(stage, load_sites=False, schema_resolvers=[usd.SchemaResolverMjc()])
+                # The closed loop's weld joins the same two bodies as their tree joint.
+                with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "Parallel joints"):
+                    builder.add_usd(stage, load_sites=False, schema_resolvers=[usd.SchemaResolverMjc()])
                 model = builder.finalize(device="cuda:0")
                 solver = newton.solvers.SolverSteel(model)
                 self.assertEqual(solver._connect_count, 1)

@@ -259,12 +259,14 @@ def test_weld_loop_holds_a_hinge(test, device):
         )
         b.add_articulation([j0, j1])
         if weld:
-            b.add_joint_fixed(
-                parent=l1,
-                child=l2,
-                parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
-                child_xform=wp.transform_identity(),
-            )
+            # The weld joins the hinge's own body pair.
+            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "Parallel joints"):
+                b.add_joint_fixed(
+                    parent=l1,
+                    child=l2,
+                    parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+                    child_xform=wp.transform_identity(),
+                )
         return b.finalize(device=device)
 
     def bend(model):

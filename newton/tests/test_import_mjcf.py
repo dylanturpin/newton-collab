@@ -6378,7 +6378,11 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
 </mujoco>
 """
         builder = newton.ModelBuilder()
-        with self.assertLogs("newton", level="WARNING") as logs:
+        # The welds close loops over the a-b hinge, which the builder reports as parallel joints.
+        with (
+            self.assertLogs("newton", level="WARNING") as logs,
+            self.assertWarnsRegex(newton.exceptions.NewtonWarning, "Parallel joints"),
+        ):
             builder.add_mjcf(mjcf)
         torquescale_warnings = [message for message in logs.output if "torquescale" in message]
         self.assertEqual(len(torquescale_warnings), 2, torquescale_warnings)
