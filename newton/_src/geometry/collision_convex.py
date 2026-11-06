@@ -82,6 +82,7 @@ def create_write_convex_query_result(
     post_process_contact: Any,
     use_precomputed_center: bool = False,
     face_clip: bool = False,
+    convex_mesh_patch: bool = False,
 ):
     """Create the manifold/write tail used after a convex distance query.
 
@@ -91,6 +92,7 @@ def create_write_convex_query_result(
         post_process_contact: Function that post-processes generated contacts.
         use_precomputed_center: Whether the geometry data supplies a cached center.
         face_clip: Whether box/plane versus convex-mesh manifolds clip the hull's contact patch.
+        convex_mesh_patch: Whether verified convex-mesh pairs whose sampled features are not flat get a vertex patch.
 
     Returns:
         The specialized manifold and contact writer.
@@ -131,7 +133,12 @@ def create_write_convex_query_result(
 
         return wp.static(
             create_build_manifold(
-                support_func, writer_func, post_process_contact, _support_funcs=support_funcs, face_clip=face_clip
+                support_func,
+                writer_func,
+                post_process_contact,
+                _support_funcs=support_funcs,
+                face_clip=face_clip,
+                convex_mesh_patch=convex_mesh_patch,
             )
         )(
             geom_a,
@@ -158,6 +165,7 @@ def create_solve_convex_multi_contact(
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
     face_clip: bool = False,
+    convex_mesh_patch: bool = False,
 ):
     """Create a fused MPR/GJK multi-contact solver.
 
@@ -168,6 +176,7 @@ def create_solve_convex_multi_contact(
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
         face_clip: Whether box/plane versus convex-mesh manifolds clip the hull's contact patch.
+        convex_mesh_patch: Whether verified convex-mesh pairs whose sampled features are not flat get a vertex patch.
 
     Returns:
         The specialized contact solver.
@@ -281,7 +290,12 @@ def create_solve_convex_multi_contact(
         # to avoid redundant world-space round-trip.
         count = wp.static(
             create_build_manifold(
-                support_func, writer_func, post_process_contact, _support_funcs=support_funcs, face_clip=face_clip
+                support_func,
+                writer_func,
+                post_process_contact,
+                _support_funcs=support_funcs,
+                face_clip=face_clip,
+                convex_mesh_patch=convex_mesh_patch,
             )
         )(
             geom_a,

@@ -1245,6 +1245,7 @@ def create_narrow_phase_kernel_gjk_mpr(
     post_process_contact: Any = None,
     speculative: bool = False,
     face_clip: bool = False,
+    convex_mesh_patch: bool = False,
 ):
     """
     Create a GJK/MPR narrow phase kernel for complex convex shape collisions.
@@ -1263,6 +1264,8 @@ def create_narrow_phase_kernel_gjk_mpr(
     _module = (
         f"narrow_phase_gjk_mpr_{external_aabb}_{speculative}_{writer_func.__name__}_{_sf}_{_ppc}_fc{int(face_clip)}"
     )
+    if convex_mesh_patch:
+        _module += "_cmp"
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
 
@@ -1444,6 +1447,7 @@ def create_narrow_phase_kernel_gjk_mpr(
                     support_func=support_func,
                     post_process_contact=post_process_contact,
                     face_clip=face_clip,
+                    convex_mesh_patch=convex_mesh_patch,
                 )
             )(
                 pos_a,
@@ -1475,6 +1479,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     post_process_contact: Any = None,
     speculative: bool = False,
     face_clip: bool = False,
+    convex_mesh_patch: bool = False,
 ):
     """Create graph-capturable MPR, GJK/refinement, and manifold work-queue kernels."""
     if support_func is None:
@@ -1489,12 +1494,19 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
-        support_func, writer_func, post_process_contact, use_precomputed_center=True, face_clip=face_clip
+        support_func,
+        writer_func,
+        post_process_contact,
+        use_precomputed_center=True,
+        face_clip=face_clip,
+        convex_mesh_patch=convex_mesh_patch,
     )
     suffix = (
         f"{external_aabb}_{writer_func.__name__}_{support_func.__name__}_{post_process_contact.__name__}_{speculative}"
         f"_fc{int(face_clip)}"
     )
+    if convex_mesh_patch:
+        suffix += "_cmp"
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
 
@@ -2725,6 +2737,7 @@ class NarrowPhase:
         contact_writer_warp_func: Any | None = None,
         box_box_sat: bool = False,
         convex_face_clip: bool = False,
+        convex_mesh_patch: bool = False,
         hydroelastic_sdf: HydroelasticSDF | None = None,
         has_meshes: bool = True,
         has_heightfields: bool = False,
@@ -2769,6 +2782,9 @@ class NarrowPhase:
             convex_face_clip: Build box/plane versus convex-mesh manifolds by clipping the hull's incident
                 face against the box or plane reference face. Selected at construction; experimental.
                 Defaults to False.
+            convex_mesh_patch: Give pairs of verified convex meshes whose sampled contact features are
+                not flat up to 7 vertex contacts with exact witnesses. Selected at construction;
+                experimental. Defaults to False.
             hydroelastic_sdf: Optional SDF hydroelastic instance. Set is_hydroelastic=True on shapes to enable hydroelastic collisions.
             has_meshes: Whether the scene contains any mesh shapes (GeoType.MESH). When False, mesh-related
                 kernel launches are skipped, improving performance for scenes with only primitive shapes.
@@ -2968,6 +2984,7 @@ class NarrowPhase:
                 post_process_contact=post_process_minkowski_only,
                 speculative=speculative,
                 face_clip=convex_face_clip,
+                convex_mesh_patch=convex_mesh_patch,
             )
         else:
             self.narrow_phase_kernel = create_narrow_phase_kernel_gjk_mpr(
@@ -2976,6 +2993,7 @@ class NarrowPhase:
                 support_func=support_map_accelerated if convex_support_acceleration else support_map,
                 speculative=speculative,
                 face_clip=convex_face_clip,
+                convex_mesh_patch=convex_mesh_patch,
             )
 
         if self.split_gjk_mpr:
@@ -2996,6 +3014,7 @@ class NarrowPhase:
                 post_process_contact=split_post_process,
                 speculative=speculative,
                 face_clip=convex_face_clip,
+                convex_mesh_patch=convex_mesh_patch,
             )
         else:
             self.narrow_phase_mpr_kernel = None
