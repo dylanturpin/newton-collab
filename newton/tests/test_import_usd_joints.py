@@ -695,7 +695,7 @@ def Xform "World" (
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_newton_joint_api_d6(self):
-        """Broadcast NewtonJointAPI attributes across a D6 joint's linear and angular DOFs."""
+        """Broadcast joint properties, including registered MuJoCo stiffness, across D6 DOFs."""
         from pxr import Usd
 
         deg2rad = math.pi / 180.0
@@ -760,6 +760,7 @@ def Xform "Articulation" (
         float newton:velocityLimit = 100.0
         float newton:limitStiffness = 200.0
         float newton:limitDamping = 5.0
+        float mjc:stiffness = 3.0
     }
 }
 """
@@ -767,6 +768,7 @@ def Xform "Articulation" (
         stage.GetRootLayer().ImportFromString(usd_content)
 
         builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
         builder.add_usd(stage)
         model = builder.finalize()
 
@@ -776,6 +778,7 @@ def Xform "Articulation" (
         # The linear transX DOF is created before the angular rotX DOF.
         d_lin = dof_start
         d_ang = dof_start + 1
+        np.testing.assert_array_equal(model.joint_stiffness.numpy()[d_lin : d_ang + 1], [3.0, 3.0])
 
         limit_ke = model.joint_limit_ke.numpy()
         limit_kd = model.joint_limit_kd.numpy()
@@ -953,7 +956,8 @@ def Xform "Articulation" (
         builder.add_usd(stage, schema_resolvers=[SchemaResolverNewton(), SchemaResolverMjc()])
         model = builder.finalize()
 
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        joint = model.joint_label.index("/Articulation/Joint")
+        dof = int(model.joint_qd_start.numpy()[joint])
         # Authored -inf must select builder defaults (999.0 / 88.0), NOT the MuJoCo
         # solreflimit-derived values.
         self.assertAlmostEqual(float(model.joint_limit_ke.numpy()[dof]), 999.0, places=2)
@@ -1031,7 +1035,8 @@ def Xform "Articulation" (
         builder.add_usd(stage, schema_resolvers=[SchemaResolverNewton(), SchemaResolverMjc()])
         model = builder.finalize()
 
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        joint = model.joint_label.index("/Articulation/Joint")
+        dof = int(model.joint_qd_start.numpy()[joint])
         # Native MuJoCo solref remains available to SolverMuJoCo without being
         # converted into the generic gains used by other Newton solvers.
         limit_ke = float(model.joint_limit_ke.numpy()[dof])
@@ -1121,9 +1126,11 @@ def Xform "Articulation" (
             scene_attrs='    custom uniform token mjc:compiler:angle = "radian"',
         )
         model = self._import_spring_stage(usda)
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 2.62, places=6)
+        joint = model.joint_label.index("/Articulation/Joint")
+        dof = int(model.joint_qd_start.numpy()[joint])
+        coord = int(model.joint_q_start.numpy()[joint])
+        self.assertAlmostEqual(float(model.joint_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_rest_q.numpy()[coord]), 2.62, places=6)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_joint_spring_degree_default(self):
@@ -1148,9 +1155,11 @@ def Xform "Articulation" (
     }""",
         )
         model = self._import_spring_stage(usda)
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), math.radians(150.0), places=5)
+        joint = model.joint_label.index("/Articulation/Joint")
+        dof = int(model.joint_qd_start.numpy()[joint])
+        coord = int(model.joint_q_start.numpy()[joint])
+        self.assertAlmostEqual(float(model.joint_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_rest_q.numpy()[coord]), math.radians(150.0), places=5)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_joint_spring_prismatic_no_conversion(self):
@@ -1170,9 +1179,11 @@ def Xform "Articulation" (
     }""",
         )
         model = self._import_spring_stage(usda)
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 40.0, places=5)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 0.02, places=6)
+        joint = model.joint_label.index("/Articulation/Joint")
+        dof = int(model.joint_qd_start.numpy()[joint])
+        coord = int(model.joint_q_start.numpy()[joint])
+        self.assertAlmostEqual(float(model.joint_stiffness.numpy()[dof]), 40.0, places=5)
+        self.assertAlmostEqual(float(model.joint_rest_q.numpy()[coord]), 0.02, places=6)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_joint_springs_survive_stacked_joint_d6_merge(self):
@@ -1208,12 +1219,13 @@ def Xform "Articulation" (
         model = self._import_spring_stage(usda)
         joint = model.joint_label.index("/Articulation/JointX")
         dof = int(model.joint_qd_start.numpy()[joint])
+        coord = int(model.joint_q_start.numpy()[joint])
 
         self.assertEqual(int(model.joint_type.numpy()[joint]), int(newton.JointType.D6))
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 1.2, places=6)
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof + 1]), 0.07, places=6)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof + 1]), 2.3, places=6)
+        self.assertAlmostEqual(float(model.joint_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_rest_q.numpy()[coord]), 1.2, places=6)
+        self.assertAlmostEqual(float(model.joint_stiffness.numpy()[dof + 1]), 0.07, places=6)
+        self.assertAlmostEqual(float(model.joint_rest_q.numpy()[coord + 1]), 2.3, places=6)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_joint_ordering(self):

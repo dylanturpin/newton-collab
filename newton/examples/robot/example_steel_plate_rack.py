@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lift a free dinner plate and place it in a wire rack beside two resting plates.
 
-Command: python -m newton.examples steel_plate_rack
+Success criteria:
+- The robot lifts the free plate clear of the table.
+- The plate ends up standing in the rack, supported by its wires, next to the two resting plates.
+
+Runs:
+- `python -m newton.examples steel_plate_rack`
 """
 
 import numpy as np

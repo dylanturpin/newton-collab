@@ -33,7 +33,14 @@ import inspect
 
 import warp as wp
 
+from ...core.reset import reset_world_selected
 from ...math.spatial import velocity_at_point
+from .friction import contact_tangent_basis
+
+# Steel orders its own order-dependent atomics; Warp's deterministic lowering would overflow on its loops.
+# Every Steel kernel module sets this option.
+WARP_DETERMINISM_OFF = {"deterministic": wp.DeterministicMode.NOT_GUARANTEED}
+wp.set_module_options(WARP_DETERMINISM_OFF)
 
 
 @wp.struct
@@ -209,9 +216,9 @@ def _prepare(
     if free_rigid_route and b >= 0:
         free_rigid_route = free_rigid_route_body[b] != 0
     if free_rigid_route:
-        for s in range(2):
+        for side in range(2):
             shape = sa
-            if s == 1:
+            if side == 1:
                 shape = sb
             if shape >= 0:
                 angular = wp.vec2(
@@ -272,7 +279,14 @@ def _pose_motion(q: wp.array[wp.transform], previous_q: wp.array[wp.transform], 
         previous = previous_q[body]
         x0 = wp.transform_get_translation(previous)
         x1 = wp.transform_get_translation(current)
-        rotation = wp.transform_get_rotation(current) * wp.quat_inverse(wp.transform_get_rotation(previous))
+        r0 = wp.transform_get_rotation(previous)
+        r1 = wp.transform_get_rotation(current)
+        # An unchanged pose has no motion. The quaternion product below is not exactly the
+        # identity in float32 (fused multiply-adds), and its residual times the lever arm
+        # would accumulate into the anchor displacement of a resting body every step.
+        if x0 == x1 and r0[0] == r1[0] and r0[1] == r1[1] and r0[2] == r1[2] and r0[3] == r1[3]:
+            return motion
+        rotation = r1 * wp.quat_inverse(r0)
         if rotation[3] < 0.0:
             rotation = -rotation
         vector = wp.vec3(rotation[0], rotation[1], rotation[2])
@@ -599,8 +613,8 @@ def _build(
 
     Frozen pairs carried by :func:`_carry_frozen_pairs` are skipped.
 
-    With ``flooded``, pairs with more than ``_FLOOD_MIN_CONTACTS`` contacts were grown by
-    :func:`_flood_regions`; their seeds own themselves and each region's first location,
+    With ``flooded``, pairs with more than ``_FLOOD_MIN_CONTACTS`` contacts, including frozen pairs whose carry
+    failed, were grown by :func:`_flood_regions`; their seeds own themselves and each region's first location,
     member range and farthest member are stored. Other pairs flood here.
     """
     start = wp.tid()
@@ -640,8 +654,6 @@ def _build(
 
     member_stop = start
     remaining = stop - start
-    # Pairs with more than _FLOOD_MIN_CONTACTS contacts were grown by _flood_regions,
-    # including frozen pairs whose carry failed.
     pair_flooded = int(0)
     if flooded != 0 and remaining > _FLOOD_MIN_CONTACTS:
         pair_flooded = 1
@@ -993,12 +1005,12 @@ def _build(
 
 
 @wp.func
-def _pair_frozen(frozen_bodies: wp.array[int], frame: _PatchFrame, start: int):
-    """Whether either body of the sorted pair starting at ``start`` is frozen."""
+def _pair_frozen(frozen_bodies: wp.array[int], frame: _PatchFrame, index: int):
+    """Whether either body of the pair of sorted contact ``index`` is frozen; a pair's contacts share their bodies."""
     if frozen_bodies.shape[0] == 0:
         return False
-    a = frame.body_a[frame.indices[start]]
-    b = frame.body_b[frame.indices[start]]
+    a = frame.body_a[frame.indices[index]]
+    b = frame.body_b[frame.indices[index]]
     return (a >= 0 and frozen_bodies[a] != 0) or (b >= 0 and frozen_bodies[b] != 0)
 
 
@@ -1039,9 +1051,9 @@ def _check_frozen_carry(count: wp.array[int], frozen_bodies: wp.array[int], fram
     key = frame.keys[i]
     if key == wp.int64(0x7FFFFFFFFFFFFFFF):
         return
-    start, stop = _sorted_range(frame.keys, end, key)
-    if not _pair_frozen(frozen_bodies, frame, start):
+    if not _pair_frozen(frozen_bodies, frame, i):
         return
+    start, stop = _sorted_range(frame.keys, end, key)
     prev_start, prev_stop = _sorted_range(prev.keys, n, key)
     if prev_stop - prev_start != stop - start:
         frame.carry_failed[start] = 1
@@ -1071,8 +1083,10 @@ def _carry_frozen_pairs(
     key = frame.keys[i]
     if key == wp.int64(0x7FFFFFFFFFFFFFFF):
         return
+    if not _pair_frozen(frozen_bodies, frame, i):
+        return
     start, stop = _sorted_range(frame.keys, end, key)
-    if not _pair_frozen(frozen_bodies, frame, start) or frame.carry_failed[start] != 0:
+    if frame.carry_failed[start] != 0:
         return
     prev_start, _prev_stop = _sorted_range(prev.keys, n, key)
     c = frame.indices[i]
@@ -1101,10 +1115,8 @@ def _carry_frozen_pairs(
 @wp.kernel(enable_backward=False)
 def _store_history(
     q: wp.array[wp.transform],
-    body_world: wp.array[int],
     frame: _PatchFrame,
     prev: _PatchFrame,
-    previous_world: wp.array[int],
     previous_q: wp.array[wp.transform],
 ):
     """Carry contact history and input poses, independent of solver velocity passes."""
@@ -1132,15 +1144,29 @@ def _store_history(
     prev.surface_b[c] = frame.surface_b[c]
     prev.valid[c] = frame.valid[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
-    world = int(-1)
-    if frame.valid[c] != 0:
-        if frame.body_a[c] >= 0:
-            world = body_world[frame.body_a[c]]
-        if world < 0 and frame.body_b[c] >= 0:
-            world = body_world[frame.body_b[c]]
-        # The solver maps the default, unpartitioned world (-1) to world zero.
-        world = wp.max(world, 0)
-    previous_world[c] = world
+
+
+@wp.kernel(enable_backward=False)
+def _reset_history(world_mask: wp.array[wp.bool], world_count: int, body_world: wp.array[int], prev: _PatchFrame):
+    """Discard the carried anchors of the selected worlds, or of every world without a mask.
+
+    The mask has the ``(world_count + 1,)`` reset layout; an anchor is discarded when either
+    of its bodies belongs to a selected world (the final entry selects global bodies).
+    """
+    c = wp.tid()
+    if prev.valid[c] == 0:
+        return
+    if world_mask:
+        selected = False
+        a = prev.body_a[c]
+        b = prev.body_b[c]
+        if a >= 0 and reset_world_selected(body_world[a], world_mask, world_count):
+            selected = True
+        if b >= 0 and reset_world_selected(body_world[b], world_mask, world_count):
+            selected = True
+        if not selected:
+            return
+    prev.valid[c] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -1231,6 +1257,18 @@ def _mark_changed_geometry(
     seen_is_solid[s] = shape_is_solid[s]
 
 
+# Shape fields whose change retires friction-anchor history, in _mark_changed_geometry order.
+_GEOMETRY_FIELDS = (
+    "shape_body",
+    "shape_transform",
+    "shape_scale",
+    "shape_type",
+    "shape_source_ptr",
+    "shape_margin",
+    "shape_is_solid",
+)
+
+
 # Fields of the previous frame that _store_history writes and later steps read.
 _CARRIED_HISTORY_FIELDS = frozenset(
     (
@@ -1257,17 +1295,15 @@ _CARRIED_HISTORY_FIELDS = frozenset(
 @wp.kernel(enable_backward=False)
 def _copy_carried_history(
     src: _PatchFrame,
-    src_world: wp.array[int],
     src_q: wp.array[wp.transform],
     dst: _PatchFrame,
-    dst_world: wp.array[int],
     dst_q: wp.array[wp.transform],
 ):
     """Copy the carried patch history written by _store_history."""
     c = wp.tid()
     if c < src_q.shape[0]:
         dst_q[c] = src_q[c]
-    if c >= src_world.shape[0]:
+    if c >= src.valid.shape[0]:
         return
     dst.keys[c] = src.keys[c]
     dst.indices[c] = src.indices[c]
@@ -1285,19 +1321,6 @@ def _copy_carried_history(
     dst.surface_b[c] = src.surface_b[c]
     dst.valid[c] = src.valid[c]
     dst.tangent_impulse[c] = src.tangent_impulse[c]
-    dst_world[c] = src_world[c]
-
-
-# Shape fields whose change retires friction-anchor history, in _mark_changed_geometry order.
-_GEOMETRY_FIELDS = (
-    "shape_body",
-    "shape_transform",
-    "shape_scale",
-    "shape_type",
-    "shape_source_ptr",
-    "shape_margin",
-    "shape_is_solid",
-)
 
 
 class _FrictionPatchState:
@@ -1325,7 +1348,8 @@ class _FrictionPatchState:
         self._changed_bodies = wp.zeros(model.body_count, dtype=int, device=device)
         self.current = self._frame(capacity, device)
         self.previous = self._frame(capacity, device)
-        self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
+        # Only the current frame flags failed carries.
+        self.previous.carry_failed = wp.zeros(0, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
         # Body pairs large enough for the warp flood: at most one per _FLOOD_MIN_CONTACTS + 1
         # contacts, grown by a fixed grid of warps so the launch does not scale with capacity.
@@ -1334,16 +1358,18 @@ class _FrictionPatchState:
         self._flood_pair_count = wp.zeros(1, dtype=int, device=device)
         self._flood_tiles = min(pair_capacity, 1024)
         self._no_frozen_bodies = wp.zeros(0, dtype=int, device=device)
+        self._no_route_bodies = wp.zeros(0, dtype=wp.int32, device=device)
 
     def update_geometry(self, model):
         """Refresh body radii and retire history whose geometry changed, on the device."""
         self._refresh_body_radius(model)
-        if model.shape_body.shape[0] == 0:
+        shape_count = model.shape_body.shape[0]
+        if shape_count == 0:
             return
         self._changed_bodies.zero_()
         wp.launch(
             _mark_changed_geometry,
-            dim=model.shape_body.shape[0],
+            dim=shape_count,
             inputs=[*(getattr(model, name) for name in _GEOMETRY_FIELDS), *self._seen_geometry],
             outputs=[self._changed_shapes, self._changed_bodies],
             device=model.device,
@@ -1414,18 +1440,18 @@ class _FrictionPatchState:
         state,
         contacts,
         *,
+        shape_material_mu,
         contact_gap_limit=float("inf"),
         friction_gap_limit=float("inf"),
         frozen_bodies=None,
-        shape_material_mu=None,
-        angular_mu=None,
         dt=0.0,
+        angular_mu=None,
     ):
         """Build this step's friction patches.
 
-        ``angular_mu`` is (torsional, rolling, route) when free-rigid angular rows are enabled: the gated per-shape
-        coefficient arrays [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
-        contacts then share a patch only if their pair coefficients match; other contacts group as before.
+        ``angular_mu`` is ``(torsional, rolling, route)`` with free-rigid angular rows: the gated per-shape
+        coefficients [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
+        contacts then share a patch only if their pair coefficients match.
         """
         wp.launch(
             _prepare,
@@ -1440,7 +1466,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
                 model.shape_body,
-                model.shape_material_mu if shape_material_mu is None else shape_material_mu,
+                shape_material_mu,
                 model.shape_gap,
                 self.body_radius,
                 state.body_q,
@@ -1449,7 +1475,7 @@ class _FrictionPatchState:
                 int(angular_mu is not None),
                 angular_mu[0] if angular_mu is not None else model.shape_gap,
                 angular_mu[1] if angular_mu is not None else model.shape_gap,
-                angular_mu[2] if angular_mu is not None else self._no_frozen_bodies,
+                angular_mu[2] if angular_mu is not None else self._no_route_bodies,
                 self.current,
                 self.view,
             ],
@@ -1534,29 +1560,29 @@ class _FrictionPatchState:
             for name in _PatchFrame.vars:
                 count = self.capacity if name in _CARRIED_HISTORY_FIELDS else 0
                 setattr(frame, name, wp.empty(count, dtype=getattr(self.previous, name).dtype, device=device))
-            self._history_snapshot = (frame, wp.empty_like(self.previous_world), wp.empty_like(self.previous_q))
+            self._history_snapshot = (frame, wp.empty_like(self.previous_q))
 
     def snapshot_history(self):
         """Save the carried history so a repeated solve of the same step can restore it."""
         if not self.view.enabled:
             return
         self.reserve_history_snapshot()
-        frame, world, q = self._history_snapshot
-        self._copy_history(self.previous, self.previous_world, self.previous_q, frame, world, q)
+        frame, q = self._history_snapshot
+        self._copy_history(self.previous, self.previous_q, frame, q)
 
     def restore_history(self):
         """Restore the history saved by :meth:`snapshot_history`."""
         if not self.view.enabled or self._history_snapshot is None:
             return
-        frame, world, q = self._history_snapshot
-        self._copy_history(frame, world, q, self.previous, self.previous_world, self.previous_q)
+        frame, q = self._history_snapshot
+        self._copy_history(frame, q, self.previous, self.previous_q)
 
-    def _copy_history(self, src, src_world, src_q, dst, dst_world, dst_q):
+    def _copy_history(self, src, src_q, dst, dst_q):
         wp.launch(
             _copy_carried_history,
             dim=max(self.capacity, src_q.shape[0]),
-            inputs=[src, src_world, src_q],
-            outputs=[dst, dst_world, dst_q],
+            inputs=[src, src_q],
+            outputs=[dst, dst_q],
             device=src_q.device,
         )
 
@@ -1564,15 +1590,17 @@ class _FrictionPatchState:
         wp.launch(
             _store_history,
             dim=max(self.capacity, self.previous_q.shape[0]),
-            inputs=[
-                state.body_q,
-                self.body_world,
-                self.current,
-                self.previous,
-                self.previous_world,
-                self.previous_q,
-            ],
+            inputs=[state.body_q, self.current, self.previous, self.previous_q],
             device=state.body_q.device,
+        )
+
+    def reset(self, world_mask, world_count):
+        """Discard the carried anchors of the worlds selected by a ``(world_count + 1,)`` mask."""
+        wp.launch(
+            _reset_history,
+            dim=self.capacity,
+            inputs=[world_mask, world_count, self.body_world, self.previous],
+            device=self.body_world.device,
         )
 
 
@@ -1634,14 +1662,12 @@ def link_patch_rows(
 
 
 @wp.func
-def contact_tangent_basis(n: wp.vec3):
-    """Return the deterministic tangent pair every Steel friction row uses for ``n``."""
-    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
-    if wp.length_sq(tangent0) < 1.0e-12:
-        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
-    tangent0 = wp.normalize(tangent0)
-    tangent1 = wp.normalize(wp.cross(n, tangent0))
-    return tangent0, tangent1
+def warmstart_dt_scale(dt: float, history: wp.array[float]):
+    """Ratio of the step to the previous solver step stored in ``history[0]``; 1 without history."""
+    previous = history[0]
+    if previous > 0.0:
+        return dt / previous
+    return 1.0
 
 
 @wp.kernel(enable_backward=False)
@@ -1658,12 +1684,14 @@ def seed_patch_impulses(
     parents: wp.array2d[int],
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
-    scale: float,
-    dt_scale: wp.array[float],
+    decay: float,
+    dt: float,
+    history: wp.array[float],
 ):
     """Transport cached patch impulses and project every anchor's seed onto its patch cone.
 
     Anchors without patch history keep the contact-matched warm start, bounded by the region's load.
+    Carried impulses are scaled by ``decay`` and by the step ratio :func:`warmstart_dt_scale`.
     """
     c = wp.tid()
     if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] < 3:
@@ -1673,7 +1701,7 @@ def seed_patch_impulses(
     value = wp.vec2(impulses[w, s + 1], impulses[w, s + 2])
     source = frame.source[c]
     if source >= 0:
-        tangent = prev.tangent_impulse[source] * (scale * dt_scale[0])
+        tangent = prev.tangent_impulse[source] * (decay * warmstart_dt_scale(dt, history))
         if frame.body_a[c] >= 0:
             tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
         n = frame.normal[c]
@@ -1692,10 +1720,16 @@ def seed_patch_impulses(
 
 @wp.func
 def _point_velocity(
-    q: wp.array[wp.transform], qd: wp.array[wp.spatial_vector], com: wp.array[wp.vec3], body: int, anchor: wp.vec3
+    q: wp.array[wp.transform],
+    qd: wp.array[wp.spatial_vector],
+    com: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+    body: int,
+    anchor: wp.vec3,
 ):
+    # Contact rows see a body outside every articulation at zero velocity, so its published velocity is ignored.
     velocity = wp.vec3(0.0)
-    if body >= 0:
+    if body >= 0 and body_to_articulation[body] >= 0:
         velocity = velocity_at_point(qd[body], wp.transform_vector(q[body], anchor - com[body]))
     return velocity
 
@@ -1716,6 +1750,7 @@ def finish_patch_impulses(
     q_out: wp.array[wp.transform],
     qd_out: wp.array[wp.spatial_vector],
     com: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
     contact_surface_velocity: wp.array[wp.vec3],
     world: wp.array[int],
     slot: wp.array[int],
@@ -1766,8 +1801,8 @@ def finish_patch_impulses(
         stored = wp.transform_vector(wp.transform_inverse(q[a]), tangent)
     frame.tangent_impulse[c] = stored
     radius = wp.max(mu[w, s + 1] * load, 0.0)
-    speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
-        q_out, qd_out, com, b, frame.anchor_b[c]
+    speed = _point_velocity(q_out, qd_out, com, body_to_articulation, a, frame.anchor_a[c]) - _point_velocity(
+        q_out, qd_out, com, body_to_articulation, b, frame.anchor_b[c]
     )
     if contact_surface_velocity:
         if frame.flipped[c] == 0:

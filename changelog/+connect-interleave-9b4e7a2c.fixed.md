@@ -1,1 +1,0 @@
-Fix `SolverSteel` silently dropping connect (loop-closure) rows when another articulation's joints interleave between an articulation's tree joints and its loop-closing joints. Classify closures from their child body's articulation ownership and preserve that ownership independently of joint-index order.

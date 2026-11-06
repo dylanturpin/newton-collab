@@ -185,6 +185,7 @@ _LEGACY_SPANNING = {
 
 
 def test_rounded_hull_rests_on_face(test, device):
+    """Check that a rounded hull resting on a face keeps a spanning manifold of hull vertices."""
     vertices, indices = _rounded_hull((0.012, 0.009, 0.008))
     for support in ("plane", "box", "finite_plane"):
         for euler in ((0.0, 0.0, 0.0), (7.0, 3.0, 0.0), (20.0, 0.0, 10.0), (90.0, 0.0, 30.0)):

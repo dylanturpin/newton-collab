@@ -1,1 +1,0 @@
-Allow experimental `enable_sleeping=True` with Steel `solve_mode="colored"`. With `sleep_skip_constraints`, sleeping islands' contacts are left out of the coloring and the colored sweep; a world whose propagation rows overflow stays awake, as with the other row families.

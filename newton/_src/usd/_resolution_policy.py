@@ -10,6 +10,7 @@ import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..exceptions import NewtonWarning
 from ..sim.enums import JointTargetMode
 from ..solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE, SOLREF_MODE_MJCF_DEFAULT, SOLREF_MODE_RAW
 from . import utils as usd
@@ -95,8 +96,6 @@ class _DofParams:
     armature: float
     friction: float
     damping: float
-    spring_stiffness: float
-    spring_ref: float
     velocity_limit: float | None
     limit_lower: float
     limit_upper: float
@@ -115,14 +114,13 @@ class _DofParams:
 
 
 def _shift_joint_limits_for_reference(dof: _DofParams, joint_custom_attrs: dict[str, Any]) -> None:
-    """Convert absolute MuJoCo joint limits and spring reference to Newton joint coordinates."""
+    """Convert absolute MuJoCo joint limits to Newton joint coordinates."""
     ref_key = "mujoco:dof_ref"
     if ref_key not in joint_custom_attrs:
         return
     ref = float(joint_custom_attrs[ref_key])
     dof.limit_lower -= ref
     dof.limit_upper -= ref
-    dof.spring_ref -= ref
 
 
 @dataclass
@@ -139,11 +137,7 @@ class _UsdJointProperties:
     limit_gains_configured: bool
     """Whether the sampled limit gains differ from the builder's standard defaults."""
     mjc_resolver: SchemaResolver | None
-    mjc_angle_scale: float
-    """Radians per unit of authored ``mjc:springref`` on angular DOFs."""
     verbose: bool
-    legacy_angular_velocity_units: bool = False
-    legacy_springref_units: bool = False
 
     # Keep source tracking local until schema applicability and provenance are modeled globally (#3307).
     def _mjc_joint_limit_source(self, prim: Usd.Prim) -> Literal["mjc_authored", "mjc_default"] | None:
@@ -208,24 +202,6 @@ class _UsdJointProperties:
                     return damping, damping * angular_scale
         return self.default_damping, self.default_damping
 
-    def resolve_joint_spring(self, prim: Usd.Prim, is_angular: bool) -> tuple[float, float]:
-        """Resolve an ``MjcJointAPI`` passive spring ``(stiffness, reference)`` for one DOF in Newton units.
-
-        ``mjc:stiffness`` is always per radian; ``mjc:springref`` follows ``mjc:compiler:angle``.
-        """
-        stiffness, ref = 0.0, 0.0
-        if self.mjc_resolver is None or not usd.has_applied_api_schema(prim, "MjcJointAPI"):
-            return stiffness, ref
-        authored_stiffness = self.mjc_resolver.get_value(prim, PrimType.JOINT, "spring_stiffness")
-        authored_ref = self.mjc_resolver.get_value(prim, PrimType.JOINT, "spring_ref")
-        if authored_stiffness is not None or authored_ref is not None:
-            self.resolver._collect_on_first_use(self.mjc_resolver, prim)
-        if authored_stiffness is not None:
-            stiffness = float(authored_stiffness)
-        if authored_ref is not None:
-            ref = float(authored_ref) * (self.mjc_angle_scale if is_angular else 1.0)
-        return stiffness, ref
-
     def resolve_dof_params(
         self,
         jp_prim: Usd.Prim,
@@ -250,7 +226,6 @@ class _UsdJointProperties:
         )
         linear_damping, angular_damping = self.resolve_joint_damping(jp_prim)
         damping = angular_damping if is_revolute else linear_damping
-        spring_stiffness, spring_ref = self.resolve_joint_spring(jp_prim, is_revolute)
         velocity_limit = self.resolver.get_value(
             jp_prim, prim_type=PrimType.JOINT, key="velocity_limit", default=None, verbose=self.verbose
         )
@@ -327,15 +302,13 @@ class _UsdJointProperties:
                 velocity_limit *= self.degrees_to_radian
             if initial_position is not None:
                 initial_position *= self.degrees_to_radian
-            if initial_velocity is not None and not self.legacy_angular_velocity_units:
+            if initial_velocity is not None:
                 initial_velocity *= self.degrees_to_radian
 
         return _DofParams(
             armature=armature,
             friction=friction,
             damping=damping,
-            spring_stiffness=spring_stiffness,
-            spring_ref=spring_ref,
             velocity_limit=velocity_limit,
             limit_lower=limit_lower,
             limit_upper=limit_upper,
@@ -390,6 +363,7 @@ def _resolve_physics_material(
     if not math.isfinite(desc.density):
         warnings.warn(
             f"{prim.GetPath()}: authored material density must be finite; treating it as unspecified.",
+            NewtonWarning,
             stacklevel=3,
         )
 
@@ -456,6 +430,7 @@ def _resolve_shape_offsets(
             warnings.warn(
                 f"Prim '{prim.GetPath()}': legacy translation yields "
                 f"negative margin (mjc_margin={margin_val}, mjc_gap={mjc_gap}).",
+                NewtonWarning,
                 stacklevel=4,
             )
         margin_val = newton_margin
@@ -536,6 +511,7 @@ def _resolve_shape_sdf(
             f"{prim.GetPath()}: NewtonSDFCollisionAPI and NewtonMeshCollisionAPI are "
             f"independent collision representations and should not be co-applied; "
             f"SDF configuration will be used.",
+            NewtonWarning,
             stacklevel=4,
         )
 
@@ -551,6 +527,7 @@ def _resolve_shape_sdf(
         warnings.warn(
             f"{prim.GetPath()}: newton:sdfTargetVoxelSize={sdf_target_voxel_size!r} is invalid "
             f"(must be > 0); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_target_voxel_size = None
@@ -564,6 +541,7 @@ def _resolve_shape_sdf(
         warnings.warn(
             f"{prim.GetPath()}: newton:sdfMaxResolution={sdf_max_resolution!r} is invalid "
             f"(must be > 0); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_max_resolution = None
@@ -571,6 +549,7 @@ def _resolve_shape_sdf(
         warnings.warn(
             f"{prim.GetPath()}: newton:sdfMaxResolution={sdf_max_resolution!r} must be "
             f"divisible by 8 (SDF volumes are allocated in 8x8x8 tiles); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_max_resolution = None
@@ -578,6 +557,7 @@ def _resolve_shape_sdf(
         warnings.warn(
             f"{prim.GetPath()}: both newton:sdfTargetVoxelSize and newton:sdfMaxResolution "
             f"are set; sdfTargetVoxelSize takes precedence.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_max_resolution = None
@@ -613,6 +593,7 @@ def _resolve_shape_sdf(
         warnings.warn(
             f"{prim.GetPath()}: newton:sdfTextureFormat={sdf_texture_format!r} is invalid "
             f"(expected one of {list(_valid_sdf_tex_fmts)}); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_texture_format = None
@@ -625,6 +606,7 @@ def _resolve_shape_sdf(
     elif sdf_padding is not None and sdf_padding < 0:
         warnings.warn(
             f"{prim.GetPath()}: newton:sdfPadding={sdf_padding!r} is invalid (must be >= 0); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         sdf_padding = None
@@ -658,6 +640,7 @@ def _resolve_shape_hydroelastic(
     elif kh is not None and kh <= 0:
         warnings.warn(
             f"{prim.GetPath()}: newton:hydroelasticStiffness={kh!r} is invalid (must be > 0); falling back to default.",
+            NewtonWarning,
             stacklevel=4,
         )
         kh = None
@@ -685,6 +668,7 @@ def _resolve_shape_hydroelastic(
             f"{prim.GetPath()}: hydroelastic mesh requires newton:sdfMaxResolution "
             f"or newton:sdfTargetVoxelSize so an SDF can be generated; "
             f"disabling hydroelastic for this shape.",
+            NewtonWarning,
             stacklevel=4,
         )
         is_hydroelastic = False
@@ -708,6 +692,7 @@ def _resolve_shape_shell(
         else:
             warnings.warn(
                 f"Shape {prim.GetPath()}: negative shell thickness {shell_thickness_val}; falling back to margin.",
+                NewtonWarning,
                 stacklevel=4,
             )
             inertia_margin = margin_val

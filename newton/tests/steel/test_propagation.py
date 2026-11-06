@@ -1,42 +1,549 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Propagation contact responses, colored sweeps and tree-parallel kernels of SolverSteel."""
+"""Propagation contact responses, colored sweeps, tree-parallel kernels and row schedules of SolverSteel."""
 
-from __future__ import annotations
-
-import contextlib
+import ctypes
 import inspect
-import io
-import os
-import sys
-import tempfile
-import types
 import unittest
-from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.steel.kernels import PROPAGATION_UNIT_META, PROPAGATION_UNIT_RING
-from newton._src.solvers.steel.solver_steel import (
+from newton._src.solvers.steel._testing import kernel_overrides
+from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
+    PGS_CONSTRAINT_TYPE_TORSION,
     PROPAGATION_COLOR_TAIL,
+    PROPAGATION_UNIT_META,
+    PROPAGATION_UNIT_RING,
+)
+from newton._src.solvers.steel.solver_steel import (
     _colored_staging_supported,
     _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
 )
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import (
-    N_WORLDS,
-    _build_free_root_chain_model,
+    CONTACT_MAX,
+    _build_branched_model,
+    _build_contact_model,
+    _build_model,
     _build_scissor_model,
-    _contact_rows,
+    _dynamics_fields,
+    _heap,
+    _poison,
+    _run_stage1,
+    _solver,
     set_torsion_radius,
     steel_mode_options,
 )
-from newton.tests.unittest_utils import LIBC
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+
+DENSE_PATH = 0
+
+
+PROPAGATION_PATH = 2
+
+
+RESPONSES = ("propagation", "colored")
+
+
+def _chain(builder, x, n_links, root_z, joint="revolute"):
+    """Add a fixed-base chain whose links can touch the ground."""
+    parent = -1
+    joints = []
+    for i in range(n_links):
+        link = builder.add_link(xform=wp.transform(wp.vec3(x, 0.0, root_z - 0.25 * i), wp.quat_identity()))
+        builder.add_shape_capsule(link, radius=0.04, half_height=0.1)
+        if parent < 0:
+            parent_xform = wp.transform(wp.vec3(x, 0.0, root_z + 0.12), wp.quat_rpy(0.7, 0.3, 0.0))
+        else:
+            parent_xform = wp.transform(wp.vec3(0.0, 0.0, -0.12), wp.quat_identity())
+        child_xform = wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity())
+        if joint == "ball":
+            joints.append(builder.add_joint_ball(parent, link, parent_xform=parent_xform, child_xform=child_xform))
+        else:
+            joints.append(
+                builder.add_joint_revolute(
+                    parent, link, axis=wp.vec3(0.0, 1.0, 0.0), parent_xform=parent_xform, child_xform=child_xform
+                )
+            )
+        parent = link
+    builder.add_articulation(joints)
+
+
+def _floating_base(builder, x):
+    """Add a floating box base with four revolute legs resting near the ground."""
+    root = builder.add_link(xform=wp.transform(wp.vec3(x, 0.0, 0.22), wp.quat_rpy(0.1, 0.05, 0.0)))
+    builder.add_shape_box(root, hx=0.2, hy=0.1, hz=0.05)
+    joints = [builder.add_joint_free(root)]
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            leg = builder.add_link(xform=wp.transform(wp.vec3(x + 0.18 * sx, 0.1 * sy, 0.08), wp.quat_identity()))
+            builder.add_shape_capsule(leg, radius=0.03, half_height=0.1)
+            joints.append(
+                builder.add_joint_revolute(
+                    root,
+                    leg,
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    parent_xform=wp.transform(wp.vec3(0.18 * sx, 0.1 * sy, -0.03), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.13), wp.quat_identity()),
+                )
+            )
+    builder.add_articulation(joints)
+
+
+def _scene(device, kind, worlds=2):
+    """Build ``worlds`` copies of a scene whose articulated bodies start in ground contact."""
+    world = newton.ModelBuilder()
+    if kind == "revolute":
+        _chain(world, 0.0, 3, 0.3)
+    elif kind == "ball":
+        _chain(world, 0.0, 3, 0.3, joint="ball")
+    else:
+        _floating_base(world, 0.0)
+    box = world.add_body(xform=wp.transform(wp.vec3(0.6, 0.0, 0.09), wp.quat_identity()))
+    world.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+    builder = newton.ModelBuilder()
+    builder.replicate(world, worlds)
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
+def _step(model, solver, steps=1, dt=1.0 / 240.0):
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    # Sorted contacts, so solvers compared on separate pipelines see the same rows in the same order.
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    control = model.control()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, dt)
+        state_0, state_1 = state_1, state_0
+    return state_0, contacts
+
+
+def test_contact_effective_mass_matches_dense_response(test, device):
+    """Match each propagation row's exact response to its dense immediate row, and step it with the split response.
+
+    Covers the native 0/1-DOF and free-root tree kernels, the generic kernels and
+    multi-DOF (ball) joints. The rows of contacts between an articulated body and the
+    ground are compared at the same state, before any solve.
+    """
+    cases = (
+        ("revolute", "auto"),
+        ("revolute", "generic"),
+        ("floating", "auto"),
+        ("floating", "generic"),
+        ("ball", "auto"),
+        ("ball", "generic"),
+    )
+    for kind, tree_kernel in cases:
+        with test.subTest(scene=kind, tree_kernel=tree_kernel):
+            model = _scene(device, kind)
+            # Point friction: the propagation rows have no friction patches.
+            # An articulation-local solve writes its rows' diagonals when it runs, so iterate once.
+            reference = SolverSteel(model, iterations=1, articulation_constraint_max=96, friction_anchor_beta=0.0)
+            _, contacts = _step(model, reference)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            with kernel_overrides({"propagation_tree_kernel": tree_kernel}):
+                solver = SolverSteel(
+                    model,
+                    iterations=0,
+                    articulation_constraint_max=96,
+                    friction_anchor_beta=0.0,
+                    articulated_contact_response="propagation",
+                )
+            test.assertEqual(solver._propagation_native_tree[solver._propagation_tree_sizes[0]], tree_kernel == "auto")
+            _step(model, solver)
+
+            ref_path = reference._contact_path.numpy()[:count]
+            ref_slot = reference._contact_slot.numpy()[:count]
+            path = solver._contact_path.numpy()[:count]
+            slot = solver._contact_slot.numpy()[:count]
+            world = solver._contact_world.numpy()[:count]
+            dense_diag = reference._diag.numpy()
+            eff_mass_inv = solver._propagation_eff_mass_inv.numpy()
+            body_a = solver._propagation_body_a.numpy()
+            J_a = solver._propagation_J_a.numpy()
+            J_b = solver._propagation_J_b.numpy()
+            # Each compared row has the ground on one side.
+            row_body = np.maximum(body_a, solver._propagation_body_b.numpy())
+            response = solver._propagation_body_response.numpy()
+            response_split = solver._propagation_body_response_split.numpy()
+            checked = 0
+            # Contacts between links of one articulation stay dense in both responses.
+            for c in np.flatnonzero((ref_path == DENSE_PATH) & (ref_slot >= 0) & (path == PROPAGATION_PATH)):
+                for row in range(3):
+                    w, s = world[c], slot[c] + row
+                    body = row_body[w, s]
+                    J = J_a[w, s] if body_a[w, s] >= 0 else J_b[w, s]
+                    dense = float(dense_diag[w, ref_slot[c] + row])
+                    test.assertAlmostEqual(float(J @ response[body] @ J) + solver.cfm, dense, delta=2.0e-4 * dense)
+                    expected = float(J @ response_split[body] @ J) + solver.cfm
+                    got = 1.0 / float(eff_mass_inv[w, s])
+                    test.assertAlmostEqual(got, expected, delta=2.0e-4 * expected)
+                    checked += 1
+            test.assertGreater(checked, 0, "no articulated contact rows were compared")
+
+
+def test_native_tree_kernels_match_generic(test, device):
+    """Step identically with the native one-warp tree kernels and the generic per-articulation kernels.
+
+    The ball chain takes the multi-DOF native kernels.
+    """
+    for kind in ("revolute", "floating", "ball"):
+        for response in RESPONSES:
+            with test.subTest(scene=kind, response=response):
+                results = []
+                for tree_kernel in ("auto", "generic"):
+                    model = _scene(device, kind)
+                    with kernel_overrides({"propagation_tree_kernel": tree_kernel}):
+                        solver = SolverSteel(
+                            model, iterations=8, articulation_constraint_max=64, **steel_mode_options(response)
+                        )
+                    size = solver._propagation_tree_sizes[0]
+                    test.assertEqual(solver._propagation_multidof_tree[size], kind == "ball" and tree_kernel == "auto")
+                    state, _ = _step(model, solver)
+                    results.append(state.joint_qd.numpy())
+                # The ball chain's near-zero components carry the float32 rounding of its large joint velocities.
+                atol = 1.0e-5 * max(1.0, float(np.abs(results[1]).max())) if kind == "ball" else 1.0e-5
+                np.testing.assert_allclose(results[0], results[1], rtol=1.0e-4, atol=atol)
+
+
+def test_propagation_row_overflow_is_flagged_and_reset(test, device):
+    """Flag a world whose propagation rows exceed their capacity until that world is reset."""
+    builder = newton.ModelBuilder()
+    for root_z in (0.3, 3.0):
+        # World 1's chain hangs far above the ground and makes no contact.
+        world = newton.ModelBuilder()
+        _chain(world, 0.0, 2, root_z)
+        builder.add_world(world)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    for response, capacity in (
+        # Dense rows hold the two rows of each joint limit; one contact's three rows fit.
+        ("propagation", {"free_body_constraint_max": 1, "articulation_constraint_max": 4}),
+        ("colored", {"free_body_constraint_max": 1, "articulation_constraint_max": 4}),
+    ):
+        with test.subTest(response=response):
+            solver = SolverSteel(model, **steel_mode_options(response), warn_constraint_overflow=False, **capacity)
+            state, contacts = _step(model, solver)
+            test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 1)
+            np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True, False, False])
+            test.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), 3)
+            with test.assertRaisesRegex(RuntimeError, r"worlds \[0\]"):
+                solver.check_constraint_capacity()
+            solver.reset(state, wp.array([True, False, False], dtype=wp.bool, device=device))
+            np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False, False])
+
+
+def test_captured_steps_match_eager(test, device):
+    """Replay a captured collide + step, including the first step, exactly like eager stepping."""
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            model = _scene(device, "floating")
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            control = model.control()
+
+            def run(capture, model=model, pipeline=pipeline, contacts=contacts, control=control, response=response):
+                solver = SolverSteel(model, articulation_constraint_max=64, **steel_mode_options(response))
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+
+                def substeps():
+                    for _ in range(2):
+                        pipeline.collide(state_0, contacts)
+                        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+                        state_0.assign(state_1)
+
+                if capture:
+                    with wp.ScopedCapture(device=device) as graph:
+                        substeps()
+                    for _ in range(30):
+                        wp.capture_launch(graph.graph)
+                else:
+                    for _ in range(30):
+                        substeps()
+                return state_0.joint_q.numpy(), state_0.joint_qd.numpy()
+
+            eager_q, eager_qd = run(False)
+            captured_q, captured_qd = run(True)
+            np.testing.assert_allclose(captured_q, eager_q, atol=1.0e-6)
+            np.testing.assert_allclose(captured_qd, eager_qd, atol=1.0e-5)
+
+
+def _chains_on_global_floor(device, floor):
+    """Two worlds with one chain each over a floor box whose top is at z = 0; ``floor`` is static or kinematic."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    for _ in range(2):
+        # Worlds do not collide with each other, so both chains share one place on the floor.
+        world = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        _chain(world, 0.0, 2, 0.24)
+        builder.add_world(world)
+    floor_body = -1 if floor == "static" else builder.add_body(is_kinematic=True, mass=1.0)
+    builder.add_shape_box(
+        floor_body,
+        xform=wp.transform(wp.vec3(0.0, 0.0, -0.5), wp.quat_identity()) if floor == "static" else None,
+        hx=5.0,
+        hy=5.0,
+        hz=0.5,
+    )
+    model = builder.finalize(device=device)
+    if floor != "static":
+        joint_q = model.joint_q.numpy()
+        joint_q[-5] = -0.5
+        model.joint_q.assign(joint_q)
+    return model
+
+
+def test_global_kinematic_floor_moves_articulated_bodies(test, device):
+    """Solve articulated contacts against a global kinematic floor in every world through the row target."""
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            results = {}
+            for floor, floor_velocity in (("static", 0.0), ("kinematic", 0.0), ("kinematic", 0.5)):
+                model = _chains_on_global_floor(device, floor)
+                solver = SolverSteel(
+                    model,
+                    iterations=50,
+                    articulation_constraint_max=64,
+                    friction_anchor_beta=0.0,
+                    **steel_mode_options(response),
+                )
+                state_0, state_1 = model.state(), model.state()
+                joint_qd = state_0.joint_qd.numpy()
+                joint_qd[:4] = -1.0
+                if floor == "kinematic":
+                    joint_qd[-4] = floor_velocity
+                state_0.joint_qd.assign(joint_qd)
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, model.control(), contacts, 0.01)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                test.assertGreater(count, 0)
+                np.testing.assert_array_equal(solver._contact_path.numpy()[:count], PROPAGATION_PATH)
+                np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False, False])
+                results[(floor, floor_velocity)] = state_1.body_qd.numpy()[:4]
+            # Both worlds respond to the global kinematic floor like to world geometry. The kinematic
+            # floor's contacts differ from the static floor's by float32 rounding of its body frame,
+            # the colored sweep orders the two floors' contacts differently, and the 50 unconverged
+            # iterations amplify both.
+            np.testing.assert_allclose(results[("kinematic", 0.0)], results[("static", 0.0)], rtol=1.0e-4, atol=5.0e-5)
+            np.testing.assert_allclose(results[("static", 0.0)][:2], results[("static", 0.0)][2:], atol=1.0e-5)
+            # The floor's prescribed velocity enters every world's contact target.
+            moving = results[("kinematic", 0.5)]
+            test.assertGreater(float(np.sum(moving[:, 2] - results[("static", 0.0)][:, 2])), 0.05)
+            np.testing.assert_allclose(moving[:2], moving[2:], atol=1.0e-5)
+
+
+def test_phased_sweeps_touch_only_their_row_family(test, device):
+    """Restrict each phased matrix-free sweep of the propagation schedule to its row family.
+
+    Phase 3 solves the dense joint-limit rows, phase 4 the dense and free-body contact rows
+    and phase 5 the velocity-limit rows. The scene has an active joint limit, a penetrating
+    contact between two links of one articulation (a dense row under the default routing)
+    and a falling free body above its velocity bound.
+    """
+    builder = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(builder)
+    builder.default_shape_cfg.mu = 0.5
+    base = builder.add_link()
+    builder.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05)
+    joints = [
+        builder.add_joint_revolute(
+            -1,
+            base,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            limit_lower=-0.01,
+            limit_upper=0.01,
+        )
+    ]
+    for side in (1.0, -1.0):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.12, hy=0.03, hz=0.04)
+        joints.append(
+            builder.add_joint_revolute(
+                base,
+                link,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.06, side * 0.028, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+    builder.add_articulation(joints)
+    builder.add_body(
+        xform=wp.transform(wp.vec3(2.0, 0.0, 2.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3) * 1.0e-2),
+        custom_attributes={
+            "steel:rigid_body_max_linear_velocity": 0.001,
+            "steel:rigid_body_max_angular_velocity": 0.001,
+        },
+    )
+    model = builder.finalize(device=device)
+    joint_qd = model.joint_qd.numpy()
+    # Fast enough to close the 0.01 rad gap to the upper limit within one step.
+    joint_qd[0] = 5.0
+    model.joint_qd.assign(joint_qd)
+    solver = SolverSteel(model, iterations=0, enable_joint_limits=True, articulated_contact_response="propagation")
+    _step(model, solver)
+
+    dense_count = int(solver._constraint_count.numpy()[0])
+    row_type = solver._row_type.numpy()[0, :dense_count]
+    limit_rows = row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+    contact_rows = (row_type == PGS_CONSTRAINT_TYPE_CONTACT) | (row_type == PGS_CONSTRAINT_TYPE_FRICTION)
+    test.assertTrue(limit_rows.any() and contact_rows.any())
+    mf_count = int(solver._mf_constraint_count.numpy()[0])
+    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
+    test.assertGreater(mf_count, mf_contact_end)
+
+    touched = {}
+    for row_phase in (3, 4, 5):
+        solver._impulses.zero_()
+        solver._mf_impulses.zero_()
+        wp.copy(solver._v_out, solver._v_hat)
+        solver._launch_mf_gs_phase(row_phase)
+        dense = np.abs(solver._impulses.numpy()[0, :dense_count]) > 0.0
+        velocity_limits = np.abs(solver._mf_impulses.numpy()[0, mf_contact_end:mf_count]) > 0.0
+        touched[row_phase] = (
+            bool(dense[limit_rows].any()),
+            bool(dense[contact_rows].any()),
+            bool(velocity_limits.any()),
+        )
+    test.assertEqual(touched[3], (True, False, False))
+    test.assertEqual(touched[4], (False, True, False))
+    test.assertEqual(touched[5], (False, False, True))
+
+
+def _build_box_chain(device, links, boxes, articulations=1):
+    """Build revolute chains in zero gravity with ``boxes`` free boxes pressed into their links."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.default_shape_cfg.density = 1000.0
+    builder.default_shape_cfg.mu = 0.75
+    builder.default_shape_cfg.margin = 0.0
+    builder.default_shape_cfg.gap = 0.0
+    link_hx, link_hy, link_hz, cube_h = 0.15, 0.06, 0.045, 0.04
+    slots = np.ceil(boxes / links)
+    if slots > 2:
+        link_hy = max(link_hy, 0.5 * (slots - 1) * 0.09 + cube_h + 0.01)
+    for art in range(articulations):
+        origin = wp.vec3(0.0, 0.55 * art, 0.5)
+        parent = -1
+        joints = []
+        for _ in range(links):
+            link = builder.add_link()
+            builder.add_shape_box(link, hx=link_hx, hy=link_hy, hz=link_hz)
+            parent_xform = wp.transform(origin if parent == -1 else wp.vec3(link_hx, 0.0, 0.0), wp.quat_identity())
+            joints.append(
+                builder.add_joint_revolute(
+                    parent,
+                    link,
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    parent_xform=parent_xform,
+                    child_xform=wp.transform(wp.vec3(-link_hx, 0.0, 0.0), wp.quat_identity()),
+                )
+            )
+            parent = link
+        builder.add_articulation(joints)
+        # Spread the boxes over the links, side by side when a link carries several.
+        per_link = [[] for _ in range(links)]
+        if boxes <= links:
+            chosen = sorted({int(round(v)) for v in np.linspace(0, links - 1, boxes)}) if boxes > 1 else [links - 1]
+            for link_index in chosen:
+                per_link[link_index].append(0)
+        else:
+            for box in range(boxes):
+                per_link[box % links].append(box // links)
+        for link_index, link_slots in enumerate(per_link):
+            for slot in range(len(link_slots)):
+                y = 0.0 if len(link_slots) == 1 else (slot - 0.5 * (len(link_slots) - 1)) * 0.09
+                position = wp.vec3(
+                    (2.0 * link_index + 1.0) * link_hx, float(origin[1]) + y, 0.5 + link_hz + cube_h - 0.012
+                )
+                cube = builder.add_body(xform=wp.transform(position, wp.quat_identity()))
+                builder.add_shape_box(cube, hx=cube_h, hy=cube_h, hz=cube_h)
+    return builder.finalize(device=device)
+
+
+def test_propagation_matches_immediate_when_converged(test, device):
+    """Agree with the immediate response on articulated-free multi-box contacts at 32 iterations.
+
+    The responses sweep rows in different orders, so after a few iterations they differ
+    legitimately; converged, the step must agree.
+    """
+    cases = ((4, 1, 1), (4, 2, 1), (2, 2, 1), (4, 4, 1), (4, 1, 2))
+    for links, boxes, articulations in cases:
+        model = _build_box_chain(device, links, boxes, articulations)
+        initial = model.state()
+        newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        pipeline.collide(initial, contacts)
+        capacity = 16 * articulations * boxes
+        results = {}
+        for response in ("immediate", *RESPONSES):
+            solver = SolverSteel(
+                model,
+                **steel_mode_options(response),
+                iterations=32,
+                friction_anchor_beta=0.0,
+                articulation_constraint_max=capacity,
+                free_body_constraint_max=16,
+            )
+            state_out = model.state()
+            solver.step(initial, state_out, model.control(), contacts, 1.0 / 240.0)
+            solver.check_constraint_capacity()
+            if response != "immediate":
+                test.assertGreater(int(solver._propagation_constraint_count.numpy().sum()), 0)
+            results[response] = {
+                name: getattr(state_out, name).numpy().astype(np.float64)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd")
+            }
+        reference = results["immediate"]
+        for response in RESPONSES:
+            with test.subTest(links=links, boxes=boxes, articulations=articulations, response=response):
+                result = results[response]
+                rel_l2 = np.linalg.norm(result["joint_qd"] - reference["joint_qd"]) / max(
+                    np.linalg.norm(reference["joint_qd"]), 1.0e-30
+                )
+                state_linf = max(np.max(np.abs(result[name] - reference[name])) for name in reference)
+                test.assertLess(rel_l2, 1.0e-4)
+                test.assertLess(state_linf, 1.0e-4)
+
+
+class TestSteelPropagation(unittest.TestCase):
+    pass
+
+
+devices = get_cuda_test_devices()
+
+
+for _name in (
+    "test_contact_effective_mass_matches_dense_response",
+    "test_native_tree_kernels_match_generic",
+    "test_propagation_row_overflow_is_flagged_and_reset",
+    "test_captured_steps_match_eager",
+    "test_global_kinematic_floor_moves_articulated_bodies",
+    "test_phased_sweeps_touch_only_their_row_family",
+    "test_propagation_matches_immediate_when_converged",
+):
+    add_function_test(TestSteelPropagation, _name, globals()[_name], devices=devices)
+
+
+N_WORLDS = 4
+
 
 DT = 1.0 / 240.0
 
@@ -44,13 +551,7 @@ DT = 1.0 / 240.0
 def _add_floating_chain(
     builder: newton.ModelBuilder, *, n_links: int, base_z: float, base_y: float, spheres: tuple[str, ...]
 ) -> None:
-    """A floating box base (free joint) trailing ``n_links`` revolute links.
-
-    ``spheres`` selects which bodies carry a collision sphere ("base", "mid",
-    "deep"); all other shapes are density-only. Multiple spheres per world
-    give several simultaneously contact-active bodies on one articulation,
-    which is what exercises the cached cross response blocks B_ab.
-    """
+    """A floating box base trailing ``n_links`` revolute links, with collision spheres on ``spheres``."""
     no_collision = builder.default_shape_cfg.copy()
     no_collision.has_shape_collision = False
     no_collision.collision_group = 0
@@ -85,16 +586,7 @@ def _add_floating_chain(
 def _add_fixed_chain(
     builder: newton.ModelBuilder, *, n_links: int, base_z: float, base_y: float, spheres: tuple[str, ...]
 ) -> None:
-    """A world-anchored all-revolute chain: the fixed-base extraction variant.
-
-    No free root — the first joint is a world-rooted revolute, so every joint
-    is 1-DOF and the articulation takes the cached-response extraction's
-    fixed-base (single-DOF) variant, the default shape of a fixed-base arm.
-    ``spheres`` selects collision spheres on the first ("base"), middle
-    ("mid"), and last ("deep") link; the chain droops under gravity onto the
-    ground plane, so several bodies are simultaneously contact-active and the
-    cross response blocks B_ab carry real impulses.
-    """
+    """A world-anchored all-revolute chain drooping onto the ground, with collision spheres on ``spheres``."""
     no_collision = builder.default_shape_cfg.copy()
     no_collision.has_shape_collision = False
     no_collision.collision_group = 0
@@ -128,16 +620,10 @@ def _add_fixed_chain(
     builder.add_articulation(joints)
 
 
-def _build_model(
+def _build_chain_model(
     device: str, *, chains: tuple[int, ...], spheres: tuple[str, ...], fixed_base: bool = False
 ) -> newton.Model:
-    """N_WORLDS identical worlds, each holding one chain per entry of ``chains``.
-
-    Multiple chain lengths inside one world create several articulation
-    DOF-size groups while keeping per-world DOF totals homogeneous (the
-    propagation modes reject heterogeneous per-world DOF counts).
-    ``fixed_base`` swaps the floating chains for world-anchored ones.
-    """
+    """N_WORLDS identical worlds, each holding one chain per entry of ``chains``."""
     scene = newton.ModelBuilder()
     add_chain = _add_fixed_chain if fixed_base else _add_floating_chain
     for _ in range(N_WORLDS):
@@ -152,26 +638,16 @@ def _build_model(
 
 
 def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
-    """A fixed-base arm plus free-rigid clutter boxes resting on the ground.
+    """A fixed-base arm plus free spheres resting on the ground.
 
-    The clutter bodies are contact-active every step but never take the
-    cached GEMV path (free bodies keep the sweep-estimate + flush path), so
-    they must not count against the cache capacity: only the arm's bodies
-    are cache-eligible. Clutter is frictionless spheres: one normal-only
-    ground row per clutter body keeps every clutter row's state fully
-    disjoint, so the lockstep gate's tree-walk determinism precondition
-    survives the atomic (run-varying) row ordering — box corner contacts or
-    friction pairs share a body and reorder its float accumulation between
-    runs.
+    The spheres are frictionless so each has one disjoint row, which keeps the tree walk reproducible.
     """
     scene = newton.ModelBuilder()
     for _ in range(N_WORLDS):
         world = newton.ModelBuilder()
         world.default_shape_cfg.density = 1000.0
         world.default_shape_cfg.mu = 0.7
-        # Anchor low enough that every arm sphere starts pressed into the
-        # ground: a marginal (flickering) tip contact makes the active-body
-        # set differ between the lockstepped solvers.
+        # Every arm sphere starts pressed into the ground, so the active-body set is stable.
         _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
         clutter_cfg = world.default_shape_cfg.copy()
         clutter_cfg.mu = 0.0
@@ -186,20 +662,79 @@ def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
     return scene.finalize(device=device)
 
 
-def _build_shared_floor_model(device) -> tuple[newton.Model, int]:
-    """N_WORLDS fixed-base chains pressed into one jointless kinematic floor outside every world."""
-    scene = newton.ModelBuilder()
-    for _ in range(N_WORLDS):
-        world = newton.ModelBuilder()
-        world.default_shape_cfg.density = 1000.0
-        world.default_shape_cfg.mu = 0.7
-        _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
-        scene.add_world(world)
-    floor = scene.add_link(is_kinematic=True)
-    scene.add_shape_box(
-        floor, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity())
-    )
-    return scene.finalize(device=device), floor
+def _tree_inputs(model, solver, art):
+    return {
+        "S": solver._propagation_joint_S_flat.numpy().astype(np.float64),
+        "U": solver._propagation_tree_U.numpy().astype(np.float64),
+        "Dinv": solver._propagation_tree_D_inv.numpy().astype(np.float64),
+        "com": solver._propagation_body_com_rel.numpy().astype(np.float64),
+        "jp": model.joint_parent.numpy(),
+        "jc": model.joint_child.numpy(),
+        "qd_start": model.joint_qd_start.numpy(),
+        "j0": int(model.articulation_start.numpy()[art]),
+        "j1": int(model.articulation_start.numpy()[art + 1]),
+    }
+
+
+def _xlt_wrench(w, e):
+    return np.concatenate([w[:3], w[3:] + np.cross(e, w[:3])])
+
+
+def _xlt_twist(v, e):
+    return np.concatenate([v[:3] + np.cross(v[3:], e), v[3:]])
+
+
+def _ref_propagate(ti, imp_by_body, v_out):
+    """Mirror of kernels.propagate_tree_impulses_for_size (one articulation)."""
+    S, U, Dinv, com = ti["S"], ti["U"], ti["Dinv"], ti["com"]
+    jp, jc, qd_start = ti["jp"], ti["jc"], ti["qd_start"]
+    j0, j1 = ti["j0"], ti["j1"]
+    pA = {}
+    u = np.zeros(S.shape[0])
+    body_delta = {}
+    for j in range(j0, j1):
+        pA[int(jc[j])] = -np.asarray(imp_by_body.get(int(jc[j]), np.zeros(6)), dtype=np.float64)
+        body_delta[int(jc[j])] = np.zeros(6)
+    for j in range(j1 - 1, j0 - 1, -1):
+        child, parent = int(jc[j]), int(jp[j])
+        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
+        for g in range(d0, d1):
+            u[g] = -np.dot(S[g], pA[child])
+        if parent >= 0:
+            p = pA[child].copy()
+            for a in range(d0, d1):
+                coeff = sum(Dinv[j, a - d0, b - d0] * u[b] for b in range(d0, d1))
+                p += U[a] * coeff
+            pA[parent] += _xlt_wrench(p, com[child] - com[parent])
+    for j in range(j0, j1):
+        child, parent = int(jc[j]), int(jp[j])
+        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
+        pd = np.zeros(6)
+        if parent >= 0:
+            pd = _xlt_twist(body_delta[parent], com[child] - com[parent])
+        qdd = np.zeros(d1 - d0)
+        for a in range(d0, d1):
+            acc = 0.0
+            for b in range(d0, d1):
+                pt = np.dot(U[b], pd) if parent >= 0 else 0.0
+                acc += Dinv[j, a - d0, b - d0] * (u[b] - pt)
+            qdd[a - d0] = acc
+            v_out[a] += acc
+        body_delta[child] = pd + sum(S[a] * qdd[a - d0] for a in range(d0, d1))
+    # Recompute body twists from the updated v_out.
+    body_qd = {}
+    twist = {}
+    for j in range(j0, j1):
+        child, parent = int(jc[j]), int(jp[j])
+        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
+        val = np.zeros(6)
+        if parent >= 0:
+            val = _xlt_twist(twist[parent], com[child] - com[parent])
+        for a in range(d0, d1):
+            val = val + S[a] * v_out[a]
+        twist[child] = val
+        body_qd[child] = val
+    return v_out, body_qd
 
 
 def _make_solver(
@@ -209,7 +744,7 @@ def _make_solver(
         model,
         **steel_mode_options(response),
         iterations=8,
-        contact_warmstart=False,
+        friction_anchor_beta=0.0,
         propagation_cached_response=cached,
         propagation_cached_response_body_max=cache_max_bodies,
         **solver_kwargs,
@@ -221,17 +756,11 @@ def _seed_joint_qd(model: newton.Model) -> np.ndarray:
     return (0.4 * np.sin(0.7 * np.arange(n, dtype=np.float64) + 0.3)).astype(np.float32)
 
 
-def _active_body_qd(solver) -> dict[int, np.ndarray]:
-    """Live COM twists keyed by body, restricted to contact-active bodies.
-
-    The cached path deliberately leaves NON-active bodies' propagation_body_qd
-    stale between forced refreshes (the GS sweep only ever reads active
-    bodies, and every pass setup force-refreshes all bodies from v_out), so
-    only active entries are comparable across paths.
-    """
+def _active_body_qd(solver, body_map_solver) -> dict[int, np.ndarray]:
+    """COM twists of the contact-active bodies in ``body_map_solver``'s body list."""
     qd = solver._propagation_body_qd.numpy()
-    counts = solver._propagation_body_count.numpy()
-    body_list = solver._propagation_body_list.numpy()
+    counts = body_map_solver._propagation_body_count.numpy()
+    body_list = body_map_solver._propagation_body_list.numpy()
     out: dict[int, np.ndarray] = {}
     for world in range(body_list.shape[0]):
         n = min(int(counts[world]), body_list.shape[1])
@@ -249,13 +778,10 @@ class _LockstepStats:
         self.total_rows = 0
 
 
-def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int = 8, **solver_kwargs):
-    """Advance a tree-walk reference trajectory; at every step, run the cached
-    solver one step from the identical input state and record output diffs.
+def _run_lockstep(model, response, n_steps, *, cache_max_bodies: int = 8, **solver_kwargs):
+    """Step the cached solver from each state of a tree-walk trajectory and record the output diffs.
 
-    A second tree-walk solver steps alongside as a bitwise determinism
-    precondition: if the fallback itself were not reproducible from shared
-    inputs, the cached-vs-fallback diff would be meaningless.
+    A second tree-walk solver must match the first bitwise, so the diffs measure the cache alone.
     """
     ref = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies, **solver_kwargs)
     ref2 = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies, **solver_kwargs)
@@ -268,15 +794,13 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
     control = model.control()
     state_in.joint_qd.assign(_seed_joint_qd(model))
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    collision_pipeline = newton.CollisionPipeline(model)
+    collision_pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = collision_pipeline.contacts()
 
     stats = _LockstepStats()
     for _ in range(n_steps):
         state_in.clear_forces()
-        # A fresh collide before each solver isolates them from any contact
-        # buffer bookkeeping a step might do; collide is deterministic in
-        # state, so all three consume identical contact sets.
+        # A deterministic collide before each solver gives all three the same contacts.
         collision_pipeline.collide(state_in, contacts)
         test.step(state_in, test_out, control, contacts, DT)
         collision_pipeline.collide(state_in, contacts)
@@ -285,7 +809,6 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
         ref.step(state_in, ref_out, control, contacts, DT)
         wp.synchronize()
 
-        # determinism precondition
         for key in ("joint_q", "joint_qd"):
             np.testing.assert_array_equal(
                 getattr(ref_out, key).numpy(),
@@ -299,496 +822,488 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
         stats.max_diffs["v_out"] = max(
             stats.max_diffs["v_out"], float(np.max(np.abs(test._v_out.numpy() - ref._v_out.numpy())))
         )
-        ref_body_qd = _active_body_qd(ref)
-        test_body_qd = _active_body_qd(test)
-        test_case.assertEqual(sorted(ref_body_qd), sorted(test_body_qd), "active body sets differ")
+        # The tree walk builds no body list, so both read the cached solver's.
+        ref_body_qd = _active_body_qd(ref, test)
+        test_body_qd = _active_body_qd(test, test)
         for body, ref_qd in ref_body_qd.items():
             diff = float(np.max(np.abs(test_body_qd[body] - ref_qd)))
             stats.max_diffs["active_body_qd"] = max(stats.max_diffs["active_body_qd"], diff)
 
-        counts = ref._propagation_body_count.numpy()
+        counts = test._propagation_body_count.numpy()
         stats.max_active_bodies = max(stats.max_active_bodies, int(counts.max()))
         stats.total_rows += int(ref._propagation_constraint_count.numpy().sum())
 
-        # advance the shared trajectory along the reference solve
         state_in, ref_out = ref_out, state_in
     return stats, ref, test
 
 
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-class TestPropagationCachedResponse(unittest.TestCase):
-    TOL = 1.0e-4
-
-    @classmethod
-    def setUpClass(cls):
-        cls.device = "cuda:0"
-        cls.model_multi = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"))
-        cls.model_two_groups = _build_model(cls.device, chains=(6, 3), spheres=("base", "deep"))
-        cls.model_single = _build_model(cls.device, chains=(6,), spheres=("base",))
-        cls.model_fixed = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=True)
-
-    def test_cached_path_detected(self):
-        solver = _make_solver(self.model_multi, "colored", cached=True)
-        self.assertTrue(solver._propagation_cached_response_active)
-        self.assertIsNotNone(solver._propagation_cached_gemv_kernel)
-        self.assertIsNotNone(solver._propagation_cache_R)
-        self.assertIsNotNone(solver._propagation_cache_B)
-        self.assertIsNotNone(solver._propagation_cache_qd_base)
-        self.assertIsNotNone(solver._propagation_cache_world_flag)
-        self.assertEqual(
-            solver._propagation_cache_max_bodies,
-            min(solver._max_propagation_bodies, solver._propagation_cached_response_body_max),
-        )
-        sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
-        for size in sizes:
-            self.assertIsNotNone(
-                solver._cached_response_tree_warp_kernels_by_size.get(size),
-                f"no cached-response kernel for size group {size}",
-            )
-        # eligibility must exclude nothing here: all arts are free-root trees
-        self.assertTrue(np.all(solver._propagation_cache_art_eligible.numpy() == 1))
-
-        off = _make_solver(self.model_multi, "colored", cached=False)
-        self.assertFalse(off._propagation_cached_response_active)
-        self.assertIsNone(off._propagation_cache_R)
-
-    def _assert_stats(self, stats, *, expect_min_bodies):
-        self.assertGreater(stats.total_rows, 0, "no propagation contact rows produced")
-        self.assertGreaterEqual(
-            stats.max_active_bodies,
-            expect_min_bodies,
-            "scene did not produce the expected number of simultaneously active bodies",
-        )
-        for key, diff in stats.max_diffs.items():
-            self.assertLessEqual(diff, self.TOL, f"{key} per-step max abs diff {diff:.3e} exceeds {self.TOL:g}")
-
-    def test_lockstep_multi_contact_bodies(self):
-        """Three contact spheres per articulation: cross blocks B_ab are live."""
-        stats, _, test = _run_lockstep(self, self.model_multi, "colored", 40)
-        self.assertTrue(np.all(test._propagation_cache_world_flag.numpy() == 1))
-        self._assert_stats(stats, expect_min_bodies=2)
-
-    def test_lockstep_second_size_group(self):
-        """Two articulations per world -> two DOF-size groups, both cached."""
-        stats, _, test = _run_lockstep(self, self.model_two_groups, "colored", 40)
-        sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
-        self.assertEqual(len(sizes), 2, f"expected two size groups, got {sizes}")
-        for size in sizes:
-            self.assertIsNotNone(test._cached_response_tree_warp_kernels_by_size.get(size))
-        self._assert_stats(stats, expect_min_bodies=2)
-
-    def test_lockstep_serial_propagation_mode(self):
-        """Non-colored 'propagation' mode; one contact per world keeps the
-        serial row sweep deterministic (same constraint as the free-root
-        warp tests)."""
-        stats, _, _ = _run_lockstep(self, self.model_single, "propagation", 40)
-        self._assert_stats(stats, expect_min_bodies=1)
-
-    def test_lockstep_fixed_base_single_dof(self):
-        """Fixed-base all-revolute chains: the single-DOF extraction variant.
-
-        Every prior lockstep scene is floating-base, which takes the
-        free-root extraction variant; a fixed-base arm — the default shape of
-        every table-mounted robot — takes the other one, so gate it
-        explicitly against the tree walk on the same contact-rich scene.
-        """
-        stats, _, test = _run_lockstep(self, self.model_fixed, "colored", 40)
-        sizes = [int(s) for s in test._size_groups if test._n_arts_by_size[s] > 0]
-        for size in sizes:
-            # A fully single-DOF group takes the plain fixed-base extraction
-            # variant (the kernel factories receive has_free_root=not
-            # single_dof), even though a 1-DOF world-rooted chain also
-            # satisfies the free-root SHAPE check.
-            self.assertTrue(
-                test._propagation_tree_single_dof_by_size.get(size, False),
-                f"size group {size} did not take the fixed-base single-DOF variant",
-            )
-            self.assertIsNotNone(test._cached_response_tree_warp_kernels_by_size.get(size))
-        self.assertTrue(np.all(test._propagation_cache_world_flag.numpy() == 1))
-        self._assert_stats(stats, expect_min_bodies=2)
-
-    def test_overflow_falls_back_to_tree_walk(self):
-        """Cache capacity below the active-body count: every world must take
-        the device-side tree-walk fallback and match the cached=False run."""
-        stats, ref, test = _run_lockstep(self, self.model_multi, "colored", 40, cache_max_bodies=2)
-        self.assertTrue(test._propagation_cached_response_active)
-        self.assertEqual(test._propagation_cache_max_bodies, 2)
-        flags = test._propagation_cache_world_flag.numpy()
-        counts = ref._propagation_body_count.numpy()
-        self.assertTrue(np.all(counts > 2), f"scene must overflow the cap, got counts {counts}")
-        self.assertTrue(np.all(flags == 0), f"overflowing worlds must clear the cache flag, got {flags}")
-        self._assert_stats(stats, expect_min_bodies=3)
-
-    def test_clutter_does_not_evict_cache(self):
-        """Free-rigid clutter must not count against the cache capacity.
-
-        A fixed-base arm (three contact-active tree bodies) plus two free
-        spheres on the ground against a cache capacity of 4: the TOTAL active
-        count (5) exceeds the cap, but only the arm's bodies are
-        cache-eligible, so every world must stay on the cached GEMV path —
-        and still match the tree walk in lockstep. Before the partitioned
-        capacity gate this scene silently self-disabled the cache. Clutter is
-        kept small because larger free-body counts make the tree-walk
-        REFERENCE itself non-reproducible run-to-run on this branch
-        (reassociation-level, and near the default 32-row cap much larger),
-        which invalidates the lockstep gate's determinism precondition.
-        """
-        model = _build_clutter_model(self.device, n_boxes=2)
-        stats, ref, test = _run_lockstep(
-            self, model, "colored", 40, cache_max_bodies=4, articulation_constraint_max=128
-        )
-        self.assertTrue(test._propagation_cached_response_active)
-        counts = ref._propagation_body_count.numpy()
-        self.assertTrue(np.all(counts > 4), f"scene must overflow the TOTAL active-body count, got {counts}")
-        eligible_counts = test._propagation_cache_body_count.numpy()
-        self.assertTrue(
-            np.all((eligible_counts >= 2) & (eligible_counts <= 4)),
-            f"expected 2..4 eligible arm bodies per world, got {eligible_counts}",
-        )
-        self.assertTrue(
-            np.all(test._propagation_cache_world_flag.numpy() == 1),
-            "clutter must not evict the arm from the cached path",
-        )
-        # Partition invariant: cache-eligible bodies occupy the slot prefix.
-        art_eligible = test._propagation_cache_art_eligible.numpy()
-        body_to_art = test._body_to_articulation.numpy()
-        body_list = test._propagation_body_list.numpy()
-        test_counts = test._propagation_body_count.numpy()
-        for world in range(body_list.shape[0]):
-            n_elig = int(eligible_counts[world])
-            for slot in range(min(int(test_counts[world]), body_list.shape[1])):
-                body = int(body_list[world, slot])
-                self.assertGreaterEqual(body, 0)
-                is_eligible = int(art_eligible[int(body_to_art[body])]) == 1
-                self.assertEqual(is_eligible, slot < n_elig, f"world {world} slot {slot}: eligible prefix violated")
-        self._assert_stats(stats, expect_min_bodies=5)
-
-    def test_cached_matrices_match_numpy_reference(self):
-        """Floating-base R/B against the float64 tree-walk mirror."""
-        self._check_cached_matrices_vs_numpy(self.model_multi)
-
-    def test_fixed_base_cached_matrices_match_numpy_reference(self):
-        """Fixed-base (single-DOF variant) R/B against the same mirror."""
-        self._check_cached_matrices_vs_numpy(self.model_fixed)
-
-    def _check_cached_matrices_vs_numpy(self, model):
-        """R and B against a float64 mirror of the serial tree-walk algorithm.
-
-        R_b column j is the qdd over all articulation DOFs from a unit basis
-        wrench j at body b; B_ab column j is the resulting COM twist delta at
-        body a. Both fall out of _ref_propagate run at zero initial velocity.
-        """
-        solver = _make_solver(model, "colored", cached=True)
-        state_in, state_out = model.state(), model.state()
-        control = model.control()
-        state_in.joint_qd.assign(_seed_joint_qd(model))
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        collision_pipeline = newton.CollisionPipeline(model)
-        contacts = collision_pipeline.contacts()
-        for _ in range(20):
-            state_in.clear_forces()
-            collision_pipeline.collide(state_in, contacts)
-            solver.step(state_in, state_out, control, contacts, DT)
-            state_in, state_out = state_out, state_in
-        wp.synchronize()
-
-        counts = solver._propagation_body_count.numpy()
-        body_list = solver._propagation_body_list.numpy()
-        body_to_art = solver._body_to_articulation.numpy()
-        flags = solver._propagation_cache_world_flag.numpy()
-        art_dof_start = solver.model.joint_qd_start.numpy()[solver.model.articulation_start.numpy()[:-1]]
-        R = solver._propagation_cache_R.numpy()
-        B = solver._propagation_cache_B.numpy()
-
-        checked_pairs = 0
-        for world in range(min(2, body_list.shape[0])):
-            self.assertEqual(int(flags[world]), 1)
-            n = int(counts[world])
-            self.assertGreaterEqual(n, 2, "need at least two active bodies for cross blocks")
-            for slot_b in range(n):
-                body_b = int(body_list[world, slot_b])
-                art = int(body_to_art[body_b])
-                ti = _tree_inputs(model, solver, art)
-                dof0 = int(art_dof_start[art])
-                n_dofs = int(ti["qd_start"][ti["j1"]] - ti["qd_start"][ti["j0"]])
-                for basis in range(6):
-                    imp = np.zeros(6)
-                    imp[basis] = 1.0
-                    v_ref, body_qd_ref = _ref_propagate(
-                        ti, {body_b: imp}, np.zeros(solver._v_out.shape[0], dtype=np.float64)
-                    )
-                    got_R = R[world, slot_b, :n_dofs, basis]
-                    ref_R = v_ref[dof0 : dof0 + n_dofs]
-                    scale = max(1.0, float(np.max(np.abs(ref_R))))
-                    self.assertLess(
-                        float(np.max(np.abs(got_R - ref_R))),
-                        1e-4 * scale,
-                        f"R mismatch world {world} slot {slot_b} basis {basis}",
-                    )
-                    for slot_a in range(n):
-                        body_a = int(body_list[world, slot_a])
-                        if int(body_to_art[body_a]) == art:
-                            ref_col = body_qd_ref[body_a]
-                        else:
-                            ref_col = np.zeros(6)
-                        got_col = B[world, slot_a, slot_b].reshape(6, 6)[:, basis]
-                        scale = max(1.0, float(np.max(np.abs(ref_col))))
-                        self.assertLess(
-                            float(np.max(np.abs(got_col - ref_col))),
-                            1e-4 * scale,
-                            f"B mismatch world {world} a {slot_a} b {slot_b} basis {basis}",
-                        )
-                        checked_pairs += 1
-        self.assertGreater(checked_pairs, 0)
-
-    def test_impulses_consumed(self):
-        """Deferred body impulses must be cleared by the GEMV each iteration."""
-        model = self.model_multi
-        solver = _make_solver(model, "colored", cached=True)
-        state_in, state_out = model.state(), model.state()
-        control = model.control()
-        state_in.joint_qd.assign(_seed_joint_qd(model))
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        collision_pipeline = newton.CollisionPipeline(model)
-        contacts = collision_pipeline.contacts()
-        for _ in range(10):
-            state_in.clear_forces()
-            collision_pipeline.collide(state_in, contacts)
-            solver.step(state_in, state_out, control, contacts, DT)
-            state_in, state_out = state_out, state_in
-        wp.synchronize()
-        self.assertEqual(float(np.max(np.abs(solver._propagation_body_impulses.numpy()))), 0.0)
+TOL = 1.0e-4
 
 
-def _build_arm_world_model(device: str, *, mu: float, base_z: tuple[float, ...], gravity: float = -9.81):
-    """Identical fixed-base arms with contact spheres on links 0, 3 and 5, one per world, at the given base heights."""
-    scene = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
-    for z in base_z:
-        world = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
-        world.default_shape_cfg.density = 1000.0
-        world.default_shape_cfg.mu = mu
-        _add_fixed_chain(world, n_links=6, base_z=z, base_y=0.0, spheres=("base", "mid", "deep"))
-        scene.add_world(world)
-    scene.add_ground_plane()
-    return scene.finalize(device=device)
+def _assert_stats(test, stats, *, expect_min_bodies):
+    test.assertGreater(stats.total_rows, 0, "no propagation contact rows produced")
+    test.assertGreaterEqual(stats.max_active_bodies, expect_min_bodies)
+    for key, diff in stats.max_diffs.items():
+        test.assertLessEqual(diff, TOL, f"{key} per-step max abs diff {diff:.3e} exceeds {TOL:g}")
 
 
-def _cached_rollout(model, response, n_steps, **solver_kwargs):
-    """Step a cached-response solver on deterministic contacts; return per-step joint state and the solver."""
-    solver = _make_solver(model, response, cached=True, articulation_constraint_max=64, **solver_kwargs)
+def _step_cached(model, steps):
+    solver = _make_solver(model, "propagation", cached=True)
     state_in, state_out = model.state(), model.state()
-    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     control = model.control()
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-    contacts = pipeline.contacts()
-    history = []
-    max_active = 0
-    for _ in range(n_steps):
+    state_in.joint_qd.assign(_seed_joint_qd(model))
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    collision_pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = collision_pipeline.contacts()
+    for _ in range(steps):
         state_in.clear_forces()
-        pipeline.collide(state_in, contacts)
+        collision_pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, DT)
-        history.append(np.concatenate([state_out.joint_q.numpy(), state_out.joint_qd.numpy()]))
-        max_active = max(max_active, int(solver._propagation_body_count.numpy().max()))
         state_in, state_out = state_out, state_in
-    return np.stack(history), solver, max_active
+    wp.synchronize()
+    return solver
 
 
-@wp.kernel
-def _rank_propagation_body_map_descending(
-    propagation_body_count: wp.array[int],
-    propagation_cache_body_count: wp.array[int],
-    max_propagation_bodies: int,
-    claimed_body_list: wp.array2d[int],
-    propagation_body_list: wp.array2d[int],
-    propagation_body_local_slot: wp.array[int],
-):
-    """Same partitions as the solver's ranking, but in descending body order: a fixed, different slot order."""
-    world, i = wp.tid()
-    n = wp.min(propagation_body_count[world], max_propagation_bodies)
-    if i >= n:
-        return
-    split = wp.min(propagation_cache_body_count[world], n)
-    lo = int(0)
-    hi = split
-    if i >= split:
-        lo = split
-        hi = n
-    body = claimed_body_list[world, i]
-    rank = lo
-    for j in range(lo, hi):
-        if claimed_body_list[world, j] > body:
-            rank += 1
-    propagation_body_list[world, rank] = body
-    propagation_body_local_slot[body] = rank
+def test_cached_path_detected(test, device):
+    """Build a cached kernel per size group and only with the option on."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+    solver = _make_solver(model, "propagation", cached=True)
+    test.assertIsNotNone(solver._propagation_cached_gemv_kernel)
+    test.assertEqual(
+        solver._propagation_cache_max_bodies,
+        min(solver._max_propagation_bodies, solver.propagation_cached_response_body_max),
+    )
+    for size in solver._propagation_tree_sizes:
+        test.assertIn(size, solver._propagation_cached_kernels)
+    test.assertTrue(np.all(solver._propagation_cache_art_eligible.numpy() == 1))
+
+    off = _make_solver(model, "propagation", cached=False)
+    test.assertFalse(off._propagation_cached_kernels)
+    test.assertIsNone(off._propagation_cached_gemv_kernel)
 
 
-@wp.kernel
-def _claim_propagation_body_map_reversed(
-    propagation_constraint_count: wp.array[int],
-    propagation_body_a: wp.array2d[int],
-    propagation_body_b: wp.array2d[int],
-    propagation_max_constraints: int,
-    max_propagation_bodies: int,
-    body_to_articulation: wp.array[int],
-    propagation_cache_art_eligible: wp.array[int],
-    want_eligible: int,
-    propagation_body_seen: wp.array[int],
-    propagation_body_list: wp.array2d[int],
-    propagation_body_count: wp.array[int],
-    propagation_body_local_slot: wp.array[int],
-):
-    """Claim like the partitioned map, but one thread per world walking rows backwards: an adverse claim order."""
-    world = wp.tid()
-    m = wp.min(propagation_constraint_count[world], propagation_max_constraints)
-    for r in range(m):
-        i = m - 1 - r
-        for side in range(2):
-            body = propagation_body_a[world, i]
-            if side == 0:
-                body = propagation_body_b[world, i]
-            if body < 0:
-                continue
-            art = body_to_articulation[body]
-            elig = int(0)
-            if art >= 0:
-                elig = propagation_cache_art_eligible[art]
-            if elig != want_eligible or propagation_body_seen[body] != 0:
-                continue
-            propagation_body_seen[body] = 1
-            slot = propagation_body_count[world]
-            propagation_body_count[world] = slot + 1
-            if slot < max_propagation_bodies:
-                propagation_body_list[world, slot] = body
-                propagation_body_local_slot[body] = slot
+def test_lockstep_multi_contact_bodies(test, device):
+    """Match the tree walk with three contact spheres per articulation, so cross blocks are live."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+    stats, _, cached = _run_lockstep(model, "propagation", 40)
+    test.assertTrue(np.all(cached._propagation_cache_world_flag.numpy() == 1))
+    _assert_stats(test, stats, expect_min_bodies=2)
 
 
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-class TestPropagationBodyMapOrder(unittest.TestCase):
-    """The cached response must not depend on the order in which GPU threads claim body slots.
+def test_lockstep_second_size_group(test, device):
+    """Match the tree walk with two articulation sizes per world, both cached."""
+    model = _build_chain_model(device, chains=(6, 3), spheres=("base", "deep"))
+    stats, _, cached = _run_lockstep(model, "propagation", 40)
+    sizes = cached._propagation_tree_sizes
+    test.assertEqual(len(sizes), 2, f"expected two size groups, got {sizes}")
+    for size in sizes:
+        test.assertIn(size, cached._propagation_cached_kernels)
+    _assert_stats(test, stats, expect_min_bodies=2)
 
-    The solver runs with ``deterministic=False`` (its default); contacts come from
-    ``CollisionPipeline(deterministic=True)`` so their order is fixed. Frictionless spheres
-    give one row per contact body, so the plain serial sweep is order-free too.
+
+def test_lockstep_single_contact(test, device):
+    """Match the tree walk with one contact sphere per world."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base",))
+    stats, _, _ = _run_lockstep(model, "propagation", 40)
+    _assert_stats(test, stats, expect_min_bodies=1)
+
+
+def test_lockstep_colored(test, device):
+    """Match the tree walk under the colored sweep."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+    stats, _, cached = _run_lockstep(model, "colored", 40)
+    test.assertTrue(cached._propagation_cached_kernels)
+    test.assertTrue(np.all(cached._propagation_cache_world_flag.numpy() == 1))
+    _assert_stats(test, stats, expect_min_bodies=2)
+
+
+def test_lockstep_fixed_base_single_dof(test, device):
+    """Match the tree walk with fixed-base all-revolute chains, the single-DOF extraction."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=True)
+    stats, _, cached = _run_lockstep(model, "propagation", 40)
+    for size in cached._propagation_tree_sizes:
+        test.assertFalse(cached._propagation_free_root_tree[size])
+        test.assertIn(size, cached._propagation_cached_kernels)
+    test.assertTrue(np.all(cached._propagation_cache_world_flag.numpy() == 1))
+    _assert_stats(test, stats, expect_min_bodies=2)
+
+
+def test_overflow_falls_back_to_tree_walk(test, device):
+    """Take the per-world tree walk when the active bodies exceed the cache capacity."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+    stats, _, cached = _run_lockstep(model, "propagation", 40, cache_max_bodies=2)
+    test.assertEqual(cached._propagation_cache_max_bodies, 2)
+    counts = cached._propagation_body_count.numpy()
+    flags = cached._propagation_cache_world_flag.numpy()
+    test.assertTrue(np.all(counts > 2), f"scene must overflow the cap, got counts {counts}")
+    test.assertTrue(np.all(flags == 0), f"overflowing worlds must clear the cache flag, got {flags}")
+    _assert_stats(test, stats, expect_min_bodies=3)
+
+
+def test_clutter_does_not_evict_cache(test, device):
+    """Count only the articulation's bodies against the cache capacity, not free clutter."""
+    model = _build_clutter_model(device, n_boxes=2)
+    stats, _, cached = _run_lockstep(model, "propagation", 40, cache_max_bodies=4, articulation_constraint_max=128)
+    counts = cached._propagation_body_count.numpy()
+    test.assertTrue(np.all(counts > 4), f"scene must overflow the total active-body count, got {counts}")
+    eligible_counts = cached._propagation_cache_body_count.numpy()
+    test.assertTrue(np.all((eligible_counts >= 2) & (eligible_counts <= 4)), f"eligible counts {eligible_counts}")
+    test.assertTrue(np.all(cached._propagation_cache_world_flag.numpy() == 1))
+    # Eligible bodies occupy the prefix of each world's body list.
+    art_eligible = cached._propagation_cache_art_eligible.numpy()
+    body_to_art = cached._body_to_articulation.numpy()
+    body_list = cached._propagation_body_list.numpy()
+    for world in range(body_list.shape[0]):
+        for slot in range(min(int(counts[world]), body_list.shape[1])):
+            body = int(body_list[world, slot])
+            test.assertGreaterEqual(body, 0)
+            is_eligible = int(art_eligible[int(body_to_art[body])]) == 1
+            test.assertEqual(is_eligible, slot < int(eligible_counts[world]), f"world {world} slot {slot}")
+    _assert_stats(test, stats, expect_min_bodies=5)
+
+
+def test_cached_matrices_match_numpy_reference(test, device, fixed_base=False):
+    """Match R and B to a float64 mirror of the tree walk.
+
+    R_b column j is the joint response to a unit wrench j at body b; B_ab column j is the twist of body a.
     """
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=fixed_base)
+    solver = _step_cached(model, 20)
+    counts = solver._propagation_body_count.numpy()
+    body_list = solver._propagation_body_list.numpy()
+    body_to_art = solver._body_to_articulation.numpy()
+    flags = solver._propagation_cache_world_flag.numpy()
+    art_dof_start = model.joint_qd_start.numpy()[model.articulation_start.numpy()[:-1]]
+    R = solver._propagation_cache_R.numpy()
+    B = solver._propagation_cache_B.numpy()
 
-    STEPS = 60
+    checked_pairs = 0
+    for world in range(min(2, body_list.shape[0])):
+        test.assertEqual(int(flags[world]), 1)
+        n = int(counts[world])
+        test.assertGreaterEqual(n, 2, "need at least two active bodies for cross blocks")
+        for slot_b in range(n):
+            body_b = int(body_list[world, slot_b])
+            art = int(body_to_art[body_b])
+            ti = _tree_inputs(model, solver, art)
+            dof0 = int(art_dof_start[art])
+            n_dofs = int(ti["qd_start"][ti["j1"]] - ti["qd_start"][ti["j0"]])
+            for basis in range(6):
+                imp = np.zeros(6)
+                imp[basis] = 1.0
+                v_ref, body_qd_ref = _ref_propagate(
+                    ti, {body_b: imp}, np.zeros(solver._v_out.shape[0], dtype=np.float64)
+                )
+                got_R = R[world, slot_b, :n_dofs, basis]
+                ref_R = v_ref[dof0 : dof0 + n_dofs]
+                scale = max(1.0, float(np.max(np.abs(ref_R))))
+                test.assertLess(float(np.max(np.abs(got_R - ref_R))), 1e-4 * scale, f"R {world} {slot_b} {basis}")
+                for slot_a in range(n):
+                    body_a = int(body_list[world, slot_a])
+                    ref_col = body_qd_ref[body_a] if int(body_to_art[body_a]) == art else np.zeros(6)
+                    got_col = B[world, slot_a, slot_b].reshape(6, 6)[:, basis]
+                    scale = max(1.0, float(np.max(np.abs(ref_col))))
+                    test.assertLess(
+                        float(np.max(np.abs(got_col - ref_col))), 1e-4 * scale, f"B {world} {slot_a} {slot_b} {basis}"
+                    )
+                    checked_pairs += 1
+    test.assertGreater(checked_pairs, 0)
 
-    def _assert_repeatable(self, response, mu):
-        model = _build_arm_world_model("cuda:0", mu=mu, base_z=(0.095,) * N_WORLDS)
-        first, solver, max_active = _cached_rollout(model, response, self.STEPS)
-        second, _, _ = _cached_rollout(model, response, self.STEPS)
-        self.assertTrue(solver._propagation_cached_response_active)
-        self.assertGreaterEqual(max_active, 2, "scene must keep several bodies of one arm contact-active")
-        np.testing.assert_array_equal(first, second, err_msg="run-to-run")
-        coords = model.joint_coord_count // N_WORLDS
-        dofs = model.joint_dof_count // N_WORLDS
-        q, qd = first[:, : model.joint_coord_count], first[:, model.joint_coord_count :]
-        for world in range(1, N_WORLDS):
-            np.testing.assert_array_equal(q[:, world * coords : (world + 1) * coords], q[:, :coords])
-            np.testing.assert_array_equal(qd[:, world * dofs : (world + 1) * dofs], qd[:, :dofs])
 
-    def test_colored_is_bitwise_repeatable(self):
-        """Repeat colored steps bitwise across runs and identical worlds."""
-        self._assert_repeatable("colored", mu=0.7)
+def test_impulses_consumed(test, device):
+    """Clear the deferred body impulses in the GEMV of every iteration."""
+    model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+    solver = _step_cached(model, 10)
+    test.assertEqual(float(np.max(np.abs(solver._propagation_body_impulses.numpy()))), 0.0)
 
-    def test_colored_frictionless_is_bitwise_repeatable(self):
-        """Repeat frictionless colored steps bitwise across runs and identical worlds."""
-        self._assert_repeatable("colored", mu=0.0)
 
-    def test_plain_frictionless_is_bitwise_repeatable(self):
-        """Repeat frictionless plain propagation steps bitwise across runs and identical worlds."""
-        self._assert_repeatable("propagation", mu=0.0)
+def test_captured_cached_response_matches_eager(test, device):
+    """Replay a captured step of the cached response, with a capacity overflow, with the eager result."""
+    for cache_max_bodies in (8, 2):
+        finals = []
+        for capture in (False, True):
+            model = _build_chain_model(device, chains=(6,), spheres=("base", "mid", "deep"))
+            solver = _make_solver(model, "propagation", cached=True, cache_max_bodies=cache_max_bodies)
+            state_0, state_1 = model.state(), model.state()
+            state_0.joint_qd.assign(_seed_joint_qd(model))
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            control = model.control()
 
-    def test_body_list_is_sorted_within_partitions(self):
-        """Sort each partition of the body list by body index and keep the slot map its inverse."""
-        model = _build_clutter_model("cuda:0", n_boxes=2)
-        for response in ("propagation", "colored"):
-            _, solver, _ = _cached_rollout(model, response, 20, cache_max_bodies=4)
-            counts = solver._propagation_body_count.numpy()
-            split = solver._propagation_cache_body_count.numpy()
-            body_list = solver._propagation_body_list.numpy()
-            local_slot = solver._propagation_body_local_slot.numpy()
-            for world in range(body_list.shape[0]):
-                n, k = int(counts[world]), int(split[world])
-                self.assertGreater(k, 0)
-                self.assertGreater(n, k, "scene must fill both partitions")
-                for part in (body_list[world, :k], body_list[world, k:n]):
-                    self.assertTrue(np.all(np.diff(part) > 0), f"{response} world {world}: {part}")
-                np.testing.assert_array_equal(local_slot[body_list[world, :n]], np.arange(n))
+            def substep(
+                state_0=state_0, state_1=state_1, solver=solver, pipeline=pipeline, contacts=contacts, control=control
+            ):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, DT)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    wp.copy(getattr(state_0, name), getattr(state_1, name))
 
-    def test_slot_order_changes_the_cached_sum(self):
-        """Fail-before reproducer: a fixed descending slot order changes the result, so claim order mattered."""
-        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        ascending, _, _ = _cached_rollout(model, "colored", self.STEPS)
-        module = inspect.getmodule(SolverSteel)
-        with patch.object(module, "rank_propagation_body_map", _rank_propagation_body_map_descending):
-            descending, _, max_active = _cached_rollout(model, "colored", self.STEPS)
-        self.assertGreaterEqual(max_active, 2)
-        differs = np.any(ascending != descending, axis=1)
-        self.assertTrue(differs.any(), "slot order did not reach the cached sum")
-        # The first difference is reassociation-sized; later steps compound it.
-        first = int(np.argmax(differs))
-        self.assertLess(float(np.max(np.abs(ascending[first] - descending[first]))), 1.0e-5)
-
-    def test_adverse_claim_order_gives_the_same_step(self):
-        """Claiming bodies in reverse row order must not change any result."""
-        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        reference, _, _ = _cached_rollout(model, "colored", self.STEPS)
-        module = inspect.getmodule(SolverSteel)
-        launch = wp.launch
-
-        def adverse_launch(kernel, dim, *args, **kwargs):
-            if kernel is module.build_propagation_body_map_partitioned:
-                kernel, dim = _claim_propagation_body_map_reversed, model.world_count
-            return launch(kernel, dim, *args, **kwargs)
-
-        with patch.object(module.wp, "launch", adverse_launch):
-            adverse, solver, max_active = _cached_rollout(model, "colored", self.STEPS)
-        self.assertGreaterEqual(max_active, 2)
-        np.testing.assert_array_equal(adverse, reference)
-        claimed = solver._propagation_body_claim_list.numpy()
-        ranked = solver._propagation_body_list.numpy()
-        counts = solver._propagation_body_count.numpy()
-        self.assertTrue(
-            any(not np.array_equal(claimed[w, : counts[w]], ranked[w, : counts[w]]) for w in range(len(counts))),
-            "the adverse claim order never differed from the ranked order",
-        )
-
-    def test_zero_and_one_active_body_worlds(self):
-        """A world with no contacts and a world with one contact body rank without touching other slots."""
-        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(1.0, 0.095), gravity=0.0)
-        # Only the second world's base sphere starts in contact; its other spheres are lifted clear.
-        q = model.joint_q.numpy()
-        q[model.joint_coord_count // 2 :] = np.array([0.0, -0.6, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        model.joint_q.assign(q)
-        first, solver, _ = _cached_rollout(model, "colored", 20)
-        second, _, _ = _cached_rollout(model, "colored", 20)
-        np.testing.assert_array_equal(first, second)
-        self.assertTrue(np.isfinite(first).all())
-        np.testing.assert_array_equal(solver._propagation_body_count.numpy(), [0, 1])
-        self.assertEqual(int(solver._propagation_cache_body_count.numpy()[1]), 1)
-        self.assertGreaterEqual(int(solver._propagation_body_list.numpy()[1, 0]), 0)
-
-    def test_cache_capacity_boundary(self):
-        """At exactly the cap the world stays cached and matches the tree walk; one over the cap falls back."""
-        model = _build_arm_world_model("cuda:0", mu=0.7, base_z=(0.095,) * N_WORLDS)
-        _, solver, _ = _cached_rollout(model, "colored", self.STEPS)
-        active = int(solver._propagation_cache_body_count.numpy().min())
-        self.assertGreaterEqual(active, 2)
-        for cap in (active, active - 1):
-            stats, _, test = _run_lockstep(self, model, "colored", 30, cache_max_bodies=cap)
-            flags = test._propagation_cache_world_flag.numpy()
-            counts = test._propagation_cache_body_count.numpy()
-            np.testing.assert_array_equal(flags, (counts <= cap).astype(flags.dtype), err_msg=f"cap {cap}")
-            if cap == active:
-                self.assertTrue(np.any(counts == cap), f"no world exactly at cap {cap}: counts {counts}")
+            substep()
+            if capture:
+                with wp.ScopedCapture(device) as scope:
+                    substep()
+                for _ in range(5):
+                    wp.capture_launch(scope.graph)
             else:
-                self.assertTrue(np.any(counts > cap), f"no world over cap {cap}: counts {counts}")
-            for key, diff in stats.max_diffs.items():
-                self.assertLessEqual(diff, TestPropagationCachedResponse.TOL, f"cap {cap} {key}: {diff:.3e}")
-            first, _, _ = _cached_rollout(model, "colored", 30, cache_max_bodies=cap)
-            second, _, _ = _cached_rollout(model, "colored", 30, cache_max_bodies=cap)
-            np.testing.assert_array_equal(first, second, err_msg=f"cap {cap}")
+                for _ in range(5):
+                    substep()
+            finals.append(state_0.joint_qd.numpy())
+        np.testing.assert_allclose(finals[1], finals[0], rtol=0.0, atol=1.0e-5)
+
+
+class TestSteelPropagationCachedResponse(unittest.TestCase):
+    pass
+
+
+for _fn in (
+    test_cached_path_detected,
+    test_lockstep_multi_contact_bodies,
+    test_lockstep_second_size_group,
+    test_lockstep_single_contact,
+    test_lockstep_colored,
+    test_lockstep_fixed_base_single_dof,
+    test_overflow_falls_back_to_tree_walk,
+    test_clutter_does_not_evict_cache,
+    test_cached_matrices_match_numpy_reference,
+    test_impulses_consumed,
+    test_captured_cached_response_matches_eager,
+):
+    add_function_test(TestSteelPropagationCachedResponse, _fn.__name__, _fn, devices=devices)
+
+
+add_function_test(
+    TestSteelPropagationCachedResponse,
+    "test_fixed_base_cached_matrices_match_numpy_reference",
+    test_cached_matrices_match_numpy_reference,
+    devices=devices,
+    fixed_base=True,
+)
+
+
+def _combination_scene(device, restitution=0.0, mimic=False):
+    """A driven, limited three-link chain over the ground with three boxes falling onto it, in two worlds."""
+    template = newton.ModelBuilder()
+    template.default_shape_cfg.mu = 0.6
+    template.default_shape_cfg.restitution = restitution
+    parent = -1
+    joints = []
+    for _ in range(3):
+        link = template.add_link()
+        template.add_shape_box(link, hx=0.15, hy=0.06, hz=0.045)
+        joints.append(
+            template.add_joint_revolute(
+                parent,
+                link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(
+                    wp.vec3(0.0, 0.0, 0.3) if parent < 0 else wp.vec3(0.15, 0.0, 0.0), wp.quat_identity()
+                ),
+                child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
+                target_ke=40.0,
+                target_kd=2.0,
+                target_q=0.2,
+                limit_lower=-0.6,
+                limit_upper=0.6,
+            )
+        )
+        parent = link
+    template.add_articulation(joints)
+    if mimic:
+        template.set_joint_mimic(joints[2], joints[1], coeffs=(0.0, 1.0))
+    for x in (0.15, 0.45, 0.75):
+        box = template.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.45), wp.quat_identity()))
+        template.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    template.add_ground_plane()
+    builder = newton.ModelBuilder()
+    builder.replicate(template, 2)
+    return builder.finalize(device=device)
+
+
+def _combination_solver(model, **kwargs):
+    options = {"articulation_constraint_max": 128, "free_body_constraint_max": 128, "friction_anchor_beta": 0.0}
+    options.update(kwargs)
+    return SolverSteel(model, **options)
+
+
+def _pipeline(model, warmstart=False):
+    return newton.CollisionPipeline(model, deterministic=True, contact_matching="latest" if warmstart else "disabled")
+
+
+def _settled_state(model, steps):
+    """Return a mid-trajectory state of the immediate response (boxes landing on the chain)."""
+    solver = _combination_solver(model, iterations=32)
+    pipeline = _pipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return state_0
+
+
+def _one_step(model, state, **kwargs):
+    solver = _combination_solver(model, **kwargs)
+    pipeline = _pipeline(model, kwargs.get("contact_warmstart", False))
+    contacts = pipeline.contacts()
+    state_out = model.state()
+    pipeline.collide(state, contacts)
+    solver.step(state, state_out, model.control(), contacts, 1.0 / 240.0)
+    solver.check_constraint_capacity()
+    return solver, contacts, state_out.body_qd.numpy()
+
+
+CASES = {
+    "point friction": {},
+    "friction patches": {"friction_anchor_beta": 0.2},
+    "regularization": {"contact_regularization": 0.05},
+    "velocity iterations": {"velocity_iterations": 300},
+    "drive rows": {"drive_mode": "rows"},
+    "drive rows and velocity limits": {
+        "drive_mode": "rows",
+        "enable_joint_velocity_limits": True,
+        "velocity_limit_activation_fraction": 0.5,
+    },
+    "joint limits": {"enable_joint_limits": True},
+}
+
+
+def test_options_match_the_immediate_response_at_convergence(test, device):
+    """Converge each option to the immediate response's step from the same state, in both responses."""
+    for name, options in CASES.items():
+        model = _combination_scene(device)
+        if "velocity_limit_activation_fraction" in options:
+            model.joint_velocity_limit.fill_(0.5)
+        state = _settled_state(model, 40)
+        _, _, reference = _one_step(model, state, iterations=300, **options)
+        for response in RESPONSES:
+            with test.subTest(option=name, response=response):
+                solver, contacts, body_qd = _one_step(
+                    model, state, iterations=300, **steel_mode_options(response), **options
+                )
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                test.assertTrue((solver._contact_path.numpy()[:count] == PROPAGATION_PATH).any())
+                np.testing.assert_allclose(body_qd, reference, rtol=0.0, atol=2.0e-3)
+
+
+def test_restitution_rebounds_on_propagation_rows(test, device):
+    """Rebound a box falling onto the chain with its restitution through the propagation rows."""
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            model = _combination_scene(device, restitution=0.8)
+            state = model.state()
+            # The first box sits just above link 0 and moves down at 2 m/s.
+            box_joint = 3
+            q_start = int(model.joint_q_start.numpy()[box_joint])
+            qd_start = int(model.joint_qd_start.numpy()[box_joint])
+            joint_q = state.joint_q.numpy()
+            joint_q[q_start + 2] = 0.3 + 0.045 + 0.05 + 0.002
+            state.joint_q.assign(joint_q)
+            joint_qd = state.joint_qd.numpy()
+            joint_qd[qd_start + 2] = -2.0
+            state.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            solver, contacts, after = _one_step(
+                model, state, iterations=64, **steel_mode_options(response), enable_joint_limits=True
+            )
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertTrue((solver._contact_path.numpy()[:count] == PROPAGATION_PATH).any())
+            test.assertGreater(float(np.abs(solver._propagation_restitution_bias.numpy()).max()), 1.0)
+            test.assertGreater(float(after[3, 2]), 0.5)
+            _, _, reference = _one_step(model, state, iterations=64, enable_joint_limits=True)
+            np.testing.assert_allclose(after[3], reference[3], rtol=0.0, atol=1.0e-2)
+
+
+def test_regularization_weights_reach_the_propagation_rows(test, device):
+    """Write the regularization weight of penetrating propagation contact rows.
+
+    A row regularizes against its unsplit diagonal ``d``: ``w = 1 / (1 + g d / d_s)`` for the split diagonal ``d_s``.
+    """
+    model = _combination_scene(device)
+    state = _settled_state(model, 90)
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            solver, _, _ = _one_step(
+                model, state, iterations=8, **steel_mode_options(response), contact_regularization=1.0
+            )
+            count = int(solver._propagation_constraint_count.numpy()[0])
+            rows = solver._propagation_row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+            penetrating = solver._propagation_phi.numpy()[0, :count] <= 0.0
+            weights = solver._propagation_row_w.numpy()[0, :count]
+            # The unsplit diagonal from the bodies' own responses.
+            body_response = solver._propagation_body_response.numpy()
+            d = np.full(count, solver.cfm)
+            for body, J in (
+                (solver._propagation_body_a.numpy()[0, :count], solver._propagation_J_a.numpy()[0, :count]),
+                (solver._propagation_body_b.numpy()[0, :count], solver._propagation_J_b.numpy()[0, :count]),
+            ):
+                has_body = body >= 0
+                d[has_body] += np.einsum("ri,rij,rj->r", J[has_body], body_response[body[has_body]], J[has_body])
+            d_split = 1.0 / solver._propagation_eff_mass_inv.numpy()[0, :count]
+            checked = rows & penetrating
+            test.assertTrue((checked & (d_split > 1.01 * d)).any(), "no mass-split row was checked")
+            np.testing.assert_allclose(weights[checked], (1.0 / (1.0 + d / d_split))[checked], rtol=1.0e-4)
+
+
+def test_warm_start_seeds_the_propagation_rows(test, device):
+    """Carry the propagation impulses of resting contacts into the next step."""
+    model = _combination_scene(device)
+    state = _settled_state(model, 150)
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            solver = _combination_solver(model, iterations=64, contact_warmstart=True, **steel_mode_options(response))
+            pipeline = _pipeline(model, warmstart=True)
+            contacts = pipeline.contacts()
+            state_0, state_1 = model.state(), model.state()
+            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                wp.copy(getattr(state_0, name), getattr(state, name))
+            for _ in range(3):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+                state_0, state_1 = state_1, state_0
+            solved = solver._propagation_impulses.numpy().copy()
+            # Without iterations the step publishes the seeded impulses unchanged.
+            solver._iterations = 0
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+            seeded = solver._propagation_impulses.numpy()
+            test.assertGreater(float(np.abs(solved).max()), 0.0)
+            np.testing.assert_allclose(seeded.sum(axis=1), solved.sum(axis=1), rtol=0.1)
+
+
+def test_mimic_rows_hold_with_propagation(test, device):
+    """Keep a mimic follower on its leader with the propagation responses."""
+    for response in RESPONSES:
+        with test.subTest(response=response):
+            model = _combination_scene(device, mimic=True)
+            solver = _combination_solver(model, iterations=32, **steel_mode_options(response))
+            pipeline = _pipeline(model)
+            contacts = pipeline.contacts()
+            state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            for _ in range(60):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+                state_0, state_1 = state_1, state_0
+            joint_q = state_0.joint_q.numpy()
+            test.assertGreater(solver._mimic_count, 0)
+            test.assertLess(abs(float(joint_q[2] - joint_q[1])), 5.0e-3)
+
+
+class TestSteelPropagationCombinations(unittest.TestCase):
+    pass
+
+
+for _fn in (
+    test_options_match_the_immediate_response_at_convergence,
+    test_restitution_rebounds_on_propagation_rows,
+    test_regularization_weights_reach_the_propagation_rows,
+    test_warm_start_seeds_the_propagation_rows,
+    test_mimic_rows_hold_with_propagation,
+):
+    add_function_test(TestSteelPropagationCombinations, _fn.__name__, _fn, devices=devices)
 
 
 PROPAGATION_RESPONSES = ("propagation", "colored")
@@ -802,6 +1317,7 @@ PROPAGATION_ROUTES = (
     ("propagation", False),
     ("propagation", True),
     ("colored", False),
+    ("colored", True),
 )
 
 
@@ -912,17 +1428,17 @@ def _linkage_gripper_model(device):
     return builder.finalize(device=device), palm, box
 
 
-def _solver(model, response, iterations, cached=False, **kwargs):
-    return SolverSteel(
-        model,
+def _coupled_solver(model, response, iterations, cached=False, **kwargs):
+    options = {
         **steel_mode_options(response),
-        propagation_cached_response=cached,
-        friction_anchor_beta=0.0,
-        articulation_constraint_max=96,
-        free_body_constraint_max=96,
-        iterations=iterations,
-        **kwargs,
-    )
+        "propagation_cached_response": cached,
+        "friction_anchor_beta": 0.0,
+        "articulation_constraint_max": 96,
+        "free_body_constraint_max": 96,
+        "iterations": iterations,
+    }
+    options.update(kwargs)
+    return SolverSteel(model, **options)
 
 
 def _rollout(model, solver, joint_qd, steps):
@@ -930,7 +1446,7 @@ def _rollout(model, solver, joint_qd, steps):
     control = model.control()
     state_0.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     for _ in range(steps):
         pipeline.collide(state_0, contacts)
@@ -939,217 +1455,178 @@ def _rollout(model, solver, joint_qd, steps):
         yield state_0.joint_qd.numpy()
 
 
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
-class TestPropagationSharedBody(unittest.TestCase):
-    def test_shared_body_without_response_is_static_to_the_rows(self):
-        """Rows of every world touch a shared jointless floor as static geometry and leave its scratch untouched."""
-        model, floor = _build_shared_floor_model(wp.get_cuda_device())
-        floor_shapes = np.flatnonzero(model.shape_body.numpy() == floor)
-        for response in ("propagation", "colored"):
-            with self.subTest(response=response):
-                solver = _make_solver(model, response, cached=False)
-                pipeline = newton.CollisionPipeline(model)
-                contacts = pipeline.contacts()
-                state_in, state_out = model.state(), model.state()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, DT)
-
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                on_floor = np.isin(contacts.rigid_contact_shape0.numpy()[:count], floor_shapes) | np.isin(
-                    contacts.rigid_contact_shape1.numpy()[:count], floor_shapes
-                )
-                propagation = solver._contact_path.numpy()[:count] == 2
-                floor_worlds = solver._contact_world.numpy()[:count][on_floor & propagation]
-                self.assertEqual(sorted(set(floor_worlds.tolist())), list(range(N_WORLDS)))
-                rows = solver._propagation_constraint_count.numpy()
-                for side in (solver._propagation_body_a.numpy(), solver._propagation_body_b.numpy()):
-                    for world, n in enumerate(rows):
-                        self.assertNotIn(floor, side[world, :n])
-                np.testing.assert_array_equal(solver._propagation_body_impulses.numpy()[floor], np.zeros(6))
-                np.testing.assert_array_equal(solver._propagation_body_qd.numpy()[floor], np.zeros(6))
-                self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
+def test_shared_dof_feet_reach_rest(test, device):
+    """Stop three feet on one prismatic DOF at the plane for every sweep count."""
+    model = _three_foot_slider_model(device)
+    for response in PROPAGATION_RESPONSES:
+        for iterations in (1, 2, 12, 13):
+            with test.subTest(response=response, iterations=iterations):
+                solver = _coupled_solver(model, response, iterations, baumgarte=0.0, cfm=0.0)
+                (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
+                test.assertLess(abs(float(qd[0])), 1.0e-3)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "propagation responses require CUDA")
-class TestPropagationCoupledContacts(unittest.TestCase):
-    def test_shared_dof_feet_reach_rest(self):
-        """Three feet on one prismatic DOF stop at the plane for every sweep count."""
-        model = _three_foot_slider_model("cuda:0")
-        for response in PROPAGATION_RESPONSES:
-            for iterations in (1, 2, 12, 13):
-                with self.subTest(response=response, iterations=iterations):
-                    solver = _solver(model, response, iterations, baumgarte=0.0, cfm=0.0)
-                    (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
-                    self.assertLess(abs(float(qd[0])), 1.0e-3)
+def test_shared_dof_feet_split_their_whole_response(test, device):
+    """Split all of the response of feet whose only mobility is one shared DOF, on the native and generic kernels."""
+    model = _three_foot_slider_model(device)
+    feet = [1, 2, 3]
+    for tree_kernel in ("auto", "generic"):
+        with test.subTest(tree_kernel=tree_kernel):
+            with kernel_overrides({"propagation_tree_kernel": tree_kernel}):
+                solver = _coupled_solver(model, "propagation", 1, baumgarte=0.0, cfm=0.0)
+            test.assertEqual(solver._propagation_native_tree[solver._propagation_tree_sizes[0]], tree_kernel == "auto")
+            list(_rollout(model, solver, np.array([-1.0], dtype=np.float32), 1))
+            exact = solver._propagation_body_response.numpy()[feet]
+            split = solver._propagation_body_response_split.numpy()[feet]
+            test.assertGreater(float(np.abs(exact).max()), 0.0)
+            np.testing.assert_allclose(split, 3.0 * exact, rtol=1.0e-5, atol=1.0e-7)
 
-    def test_shared_dof_feet_split_their_whole_response(self):
-        """Feet whose only mobility is one shared DOF split all of it, on the warp and the serial response kernels."""
-        model = _three_foot_slider_model("cuda:0")
-        feet = [1, 2, 3]
-        for serial in (False, True):
-            with self.subTest(serial=serial):
-                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
-                solver = _solver(model, "colored", 1, baumgarte=0.0, cfm=0.0)
-                if serial:
-                    _force_serial_fallback(solver)
-                list(_rollout(model, solver, np.array([-1.0], dtype=np.float32), 1))
-                exact = solver._propagation_body_response.numpy()[feet]
-                split = solver._propagation_body_response_split.numpy()[feet]
-                self.assertGreater(float(np.abs(exact).max()), 0.0)
-                np.testing.assert_allclose(split, 3.0 * exact, rtol=1.0e-5, atol=1.0e-7)
 
-    def test_shared_root_split_matches_across_kernels(self):
-        """Split only the shared free root of four feet with private leg joints, alike on the warp and serial kernels."""
-        model = _quadruped_model("cuda:0")
-        feet = [1, 2, 3, 4]
-        responses = []
-        for serial in (False, True):
-            with self.subTest(serial=serial):
-                # The colored response always maps its row-bearing bodies, which the serial kernel reads.
-                solver = _solver(model, "colored", 1)
-                self.assertIsNotNone(solver._response_tree_warp_kernels_by_size[int(solver._size_groups[0])])
-                if serial:
-                    _force_serial_fallback(solver)
-                list(_rollout(model, solver, np.zeros(model.joint_dof_count, dtype=np.float32), 1))
-                np.testing.assert_array_equal(solver._propagation_joint_split.numpy(), [4, 1, 1, 1, 1])
-                exact = solver._propagation_body_response.numpy()[feet]
-                split = solver._propagation_body_response_split.numpy()[feet]
-                # The split differs from both the exact response and the whole-response split.
-                self.assertGreater(float(np.abs(split - exact).max()), 1.0e-3 * float(np.abs(exact).max()))
-                self.assertGreater(float(np.abs(4.0 * exact - split).max()), 1.0e-3 * float(np.abs(exact).max()))
-                responses.append((exact, split))
-        for warp, serial in zip(*responses, strict=True):
-            np.testing.assert_allclose(serial, warp, rtol=1.0e-4, atol=1.0e-5 * float(np.abs(warp).max()))
+def test_shared_root_split_matches_across_kernels(test, device):
+    """Split only the shared free root of four feet with private leg joints, alike on the native and generic kernels."""
+    model = _quadruped_model(device)
+    feet = [1, 2, 3, 4]
+    responses = []
+    for tree_kernel in ("auto", "generic"):
+        with kernel_overrides({"propagation_tree_kernel": tree_kernel}):
+            solver = _coupled_solver(model, "propagation", 1)
+        test.assertEqual(solver._propagation_native_tree[solver._propagation_tree_sizes[0]], tree_kernel == "auto")
+        list(_rollout(model, solver, np.zeros(model.joint_dof_count, dtype=np.float32), 1))
+        np.testing.assert_array_equal(solver._propagation_joint_split.numpy(), [4, 1, 1, 1, 1])
+        exact = solver._propagation_body_response.numpy()[feet]
+        split = solver._propagation_body_response_split.numpy()[feet]
+        # The split differs from both the exact response and the whole-response split.
+        test.assertGreater(float(np.abs(split - exact).max()), 1.0e-3 * float(np.abs(exact).max()))
+        test.assertGreater(float(np.abs(4.0 * exact - split).max()), 1.0e-3 * float(np.abs(exact).max()))
+        responses.append((exact, split))
+    for native, generic in zip(*responses, strict=True):
+        np.testing.assert_allclose(generic, native, rtol=1.0e-4, atol=1.0e-5 * float(np.abs(native).max()))
 
-    def test_regularized_feet_reach_immediate_equilibrium(self):
-        """Splitting leaves the regularized contact fixed point of three coupled feet unchanged."""
-        model = _three_foot_slider_model("cuda:0")
-        for iterations in (32, 128):
-            solver = _solver(model, "immediate", iterations, **REGULARIZED)
-            (expected,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
-            for response, cached in PROPAGATION_ROUTES:
-                with self.subTest(response=response, cached=cached, iterations=iterations):
-                    solver = _solver(model, response, iterations, cached=cached, **REGULARIZED)
-                    (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
-                    self.assertAlmostEqual(float(qd[0]), float(expected[0]), delta=1.0e-4)
 
-    def test_graph_replay_matches_eager_steps(self):
-        """A captured step pair recounts the coupled bodies on every replay."""
-        model = _three_foot_slider_model("cuda:0")
+def test_regularized_feet_reach_immediate_equilibrium(test, device):
+    """Keep the regularized contact fixed point of three coupled feet under the split."""
+    model = _three_foot_slider_model(device)
+    for iterations in (32, 128):
+        solver = _coupled_solver(model, "immediate", iterations, **REGULARIZED)
+        (expected,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
         for response, cached in PROPAGATION_ROUTES:
-            with self.subTest(response=response, cached=cached):
-                eager = _solver(model, response, 12, cached=cached, **REGULARIZED)
-                expected = list(_rollout(model, eager, np.array([-1.0], dtype=np.float32), 7))[-1]
-                solver = _solver(model, response, 12, cached=cached, **REGULARIZED)
-                state, output = model.state(), model.state()
-                control = model.control()
-                state.joint_qd.assign(np.array([-1.0], dtype=np.float32))
-                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                pipeline = newton.CollisionPipeline(model)
-                contacts = pipeline.contacts()
-                pipeline.collide(state, contacts)
-                solver.step(state, output, control, contacts, DT)
-                with wp.ScopedCapture(device=model.device) as capture:
-                    for source, target in ((output, state), (state, output)):
-                        pipeline.collide(source, contacts)
-                        solver.step(source, target, control, contacts, DT)
-                for _ in range(3):
-                    wp.capture_launch(capture.graph)
-                np.testing.assert_allclose(output.joint_qd.numpy(), expected, atol=1.0e-6)
-                self.assertEqual(int(solver._propagation_joint_split.numpy().max()), 3)
+            with test.subTest(response=response, cached=cached, iterations=iterations):
+                solver = _coupled_solver(model, response, iterations, cached=cached, **REGULARIZED)
+                (qd,) = _rollout(model, solver, np.array([-1.0], dtype=np.float32), 1)
+                test.assertAlmostEqual(float(qd[0]), float(expected[0]), delta=1.0e-4)
 
-    def test_linkage_gripper_holds_lifted_box(self):
-        """Pads whose mobility is their own passive linkage keep their unsplit step and hold a box through a lift."""
-        model, palm, box = _linkage_gripper_model("cuda:0")
-        for response in PROPAGATION_RESPONSES:
-            with self.subTest(response=response):
-                solver = SolverSteel(
-                    model,
-                    **steel_mode_options(response),
-                    iterations=64,
-                    friction_anchor_beta=0.0,
-                    contact_friction_gap_max=0.001,
-                    enable_sleeping=False,
-                )
-                pipeline = newton.CollisionPipeline(model)
-                contacts = pipeline.contacts()
-                state, output, control = model.state(), model.state(), model.control()
-                newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-                with wp.ScopedCapture(device=model.device) as capture:
-                    pipeline.collide(state, contacts)
-                    for source, target in ((state, output), (output, state)) * 2:
-                        source.clear_forces()
-                        solver.step(source, target, control, contacts, 1.0 / 800.0)
-                joint_target = model.joint_target_q.numpy()
-                grasped = None
-                # Close the driver, then lift by 0.2 m along a smoothstep and hold.
-                joint_target[2] = 0.8
-                for tick in range(110):
-                    lift = min(max(tick - 40, 0) / 50.0, 1.0)
-                    joint_target[0] = 0.2 * lift * lift * (3.0 - 2.0 * lift)
-                    control.joint_target_q.assign(joint_target)
-                    wp.capture_launch(capture.graph)
-                    if tick == 39:
-                        grasped = self._box_below_palm(state, palm, box)
-                self.assertLess(abs(grasped - self._box_below_palm(state, palm, box)), 0.01)
 
-    @staticmethod
-    def _box_below_palm(state, palm, box):
+def test_graph_replay_matches_eager_steps(test, device):
+    """Recount the per-joint split on every replay of a captured step pair."""
+    model = _three_foot_slider_model(device)
+    for response, cached in PROPAGATION_ROUTES:
+        with test.subTest(response=response, cached=cached):
+            eager = _coupled_solver(model, response, 12, cached=cached, **REGULARIZED)
+            expected = list(_rollout(model, eager, np.array([-1.0], dtype=np.float32), 7))[-1]
+            solver = _coupled_solver(model, response, 12, cached=cached, **REGULARIZED)
+            state, output = model.state(), model.state()
+            control = model.control()
+            state.joint_qd.assign(np.array([-1.0], dtype=np.float32))
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            pipeline.collide(state, contacts)
+            solver.step(state, output, control, contacts, DT)
+            with wp.ScopedCapture(device=model.device) as capture:
+                for source, target in ((output, state), (state, output)):
+                    pipeline.collide(source, contacts)
+                    solver.step(source, target, control, contacts, DT)
+            for _ in range(3):
+                wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(output.joint_qd.numpy(), expected, atol=1.0e-6)
+            test.assertEqual(int(solver._propagation_joint_split.numpy().max()), 3)
+
+
+def test_linkage_gripper_holds_lifted_box(test, device):
+    """Hold a box through a lift with pads whose mobility is their own passive linkage."""
+    model, palm, box = _linkage_gripper_model(device)
+
+    def box_below_palm(state):
         body_q = state.body_q.numpy()
         return float(body_q[palm, 2] - body_q[box, 2])
 
-    def test_floating_quadruped_with_joint_velocities_stays_bounded(self):
-        """Four feet coupled through a light free root keep their roll rate physical."""
-        model = _quadruped_model("cuda:0")
-        joint_qd = np.linspace(-1.5, 1.5, model.joint_dof_count).astype(np.float32)
-        for response in PROPAGATION_RESPONSES:
-            with self.subTest(response=response):
-                solver = _solver(model, response, 12)
-                trajectory = list(_rollout(model, solver, joint_qd, 120))
-                self.assertLess(float(np.abs(trajectory[0][3:6]).max()), 10.0)
-                self.assertTrue(np.isfinite(trajectory[-1]).all())
-                self.assertLess(float(np.abs(np.stack(trajectory)).max()), 50.0)
+    for response in PROPAGATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = SolverSteel(
+                model,
+                **steel_mode_options(response),
+                iterations=64,
+                friction_anchor_beta=0.0,
+                contact_friction_gap_max=0.001,
+            )
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            state, output, control = model.state(), model.state(), model.control()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            with wp.ScopedCapture(device=model.device) as capture:
+                pipeline.collide(state, contacts)
+                for source, target in ((state, output), (output, state)) * 2:
+                    source.clear_forces()
+                    solver.step(source, target, control, contacts, 1.0 / 800.0)
+            joint_target = model.joint_target_q.numpy()
+            grasped = None
+            # Close the driver, then lift by 0.2 m along a smoothstep and hold.
+            joint_target[2] = 0.8
+            for tick in range(110):
+                lift = min(max(tick - 40, 0) / 50.0, 1.0)
+                joint_target[0] = 0.2 * lift * lift * (3.0 - 2.0 * lift)
+                control.joint_target_q.assign(joint_target)
+                wp.capture_launch(capture.graph)
+                if tick == 39:
+                    grasped = box_below_palm(state)
+            test.assertLess(abs(grasped - box_below_palm(state)), 0.01)
 
 
-CONTACT_ROW_TYPE = 0
+def test_floating_quadruped_with_joint_velocities_stays_bounded(test, device):
+    """Keep the roll rate of four feet coupled through a light free root physical."""
+    model = _quadruped_model(device)
+    joint_qd = np.linspace(-1.5, 1.5, model.joint_dof_count).astype(np.float32)
+    for response in PROPAGATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = _coupled_solver(model, response, 12)
+            trajectory = list(_rollout(model, solver, joint_qd, 120))
+            test.assertLess(float(np.abs(trajectory[0][3:6]).max()), 10.0)
+            test.assertTrue(np.isfinite(trajectory[-1]).all())
+            test.assertLess(float(np.abs(np.stack(trajectory)).max()), 50.0)
 
 
-DENSE_PATH = 0
+class TestSteelPropagationCoupledContacts(unittest.TestCase):
+    pass
 
 
-PROPAGATION_PATH = 2
+for _fn in (
+    test_shared_dof_feet_reach_rest,
+    test_shared_dof_feet_split_their_whole_response,
+    test_shared_root_split_matches_across_kernels,
+    test_regularized_feet_reach_immediate_equilibrium,
+    test_graph_replay_matches_eager_steps,
+    test_linkage_gripper_holds_lifted_box,
+    test_floating_quadruped_with_joint_velocities_stays_bounded,
+):
+    add_function_test(TestSteelPropagationCoupledContacts, _fn.__name__, _fn, devices=devices)
 
 
-def _zero_iteration_step(model: newton.Model, solver: SolverSteel):
+PGS_CFM = 1.0e-6
+
+
+def _step_once(model, solver):
     state_in = model.state()
     state_out = model.state()
     control = model.control()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    collision_pipeline = newton.CollisionPipeline(model)
-    contacts = collision_pipeline.contacts()
-    state_in.clear_forces()
-    collision_pipeline.collide(state_in, contacts)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
-    solver._test_live_contact_count = int(contacts.rigid_contact_count.numpy()[0])
-    return state_in
+    return state_in, int(contacts.rigid_contact_count.numpy()[0])
 
 
-def _make_solver_propagation_same_articulation(model: newton.Model, mode: str, **kwargs) -> SolverSteel:
-    return SolverSteel(
-        model,
-        **steel_mode_options(mode),
-        iterations=0,
-        velocity_iterations=0,
-        contact_friction_scale=0.0,
-        articulation_constraint_max=64,
-        free_body_constraint_max=16,
-        contact_warmstart=False,
-        **kwargs,
-    )
-
-
-def _analytic_H_and_X(model: newton.Model, state) -> tuple[np.ndarray, np.ndarray]:
+def _analytic_H_and_X(model, state):
     """Joint-space inertia H [D,D] and per-body kinematic maps X [bodies,6,D]
     for single-world revolute trees, world frame, velocities as
     [v_com_lin, omega] (the propagation body convention)."""
@@ -1224,27 +1701,213 @@ def _analytic_H_and_X(model: newton.Model, state) -> tuple[np.ndarray, np.ndarra
     return H, X
 
 
-def _propagation_operator_diag(solver: SolverSteel) -> np.ndarray:
-    count = int(solver._propagation_constraint_count.numpy()[0])
-    J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
-    J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
-    MiJt_a = solver._propagation_MiJt_a.numpy()[0, :count].astype(np.float64)
-    MiJt_b = solver._propagation_MiJt_b.numpy()[0, :count].astype(np.float64)
-    body_a = solver._propagation_body_a.numpy()[0, :count].astype(np.int32)
-    body_b = solver._propagation_body_b.numpy()[0, :count].astype(np.int32)
-    diag = np.zeros(count, dtype=np.float64)
-    for row in range(count):
-        if body_a[row] >= 0:
-            diag[row] += float(np.dot(J_a[row], MiJt_a[row]))
-        if body_b[row] >= 0:
-            diag[row] += float(np.dot(J_b[row], MiJt_b[row]))
-    return diag
+def test_scissor_scene_produces_same_articulation_contact(test, device):
+    """Route a contact between two links of one articulation to the dense articulated rows."""
+    model = _build_scissor_model(device)
+    solver = SolverSteel(model, iterations=0, cfm=PGS_CFM)
+    _, contact_count = _step_once(model, solver)
+    test.assertGreater(contact_count, 0, "scissor scene produced no link-link contact")
+    paths = solver._contact_path.numpy()[:contact_count]
+    slots = solver._contact_slot.numpy()[:contact_count]
+    routed = (paths == DENSE_PATH) & (slots >= 0)
+    test.assertTrue(routed.any(), "no same-articulation contact reached the dense rows")
+    test.assertEqual(int(solver._mf_constraint_count.numpy()[0]), 0)
+
+
+def test_scissor_dense_diagonal_matches_reference(test, device):
+    """Match each dense row's effective mass to ``J H^-1 J^T`` from an analytic joint-space inertia."""
+    model = _build_scissor_model(device)
+    solver = SolverSteel(model, iterations=0, cfm=PGS_CFM)
+    state, _ = _step_once(model, solver)
+    H, _ = _analytic_H_and_X(model, state)
+    count = int(solver._constraint_count.numpy()[0])
+    test.assertGreater(count, 0)
+    D = H.shape[0]
+    # One articulation: the world rows are that articulation's grouped rows.
+    J = solver._J_by_size[D].numpy()[0, :count, :D].astype(np.float64)
+    reference = np.einsum("rd,rd->r", J, np.linalg.solve(H, J.T).T) + PGS_CFM
+    got = solver._diag.numpy()[0, :count].astype(np.float64)
+    np.testing.assert_allclose(got, reference, rtol=1.0e-3, atol=1.0e-6)
+
+
+def _routed_slots(solver, contact_count, path):
+    """Map each contact routed to ``path`` in world 0 to its normal-row slot."""
+    paths = solver._contact_path.numpy()[:contact_count]
+    slots = solver._contact_slot.numpy()[:contact_count]
+    worlds = solver._contact_world.numpy()[:contact_count]
+    return {c: int(slots[c]) for c in range(contact_count) if paths[c] == path and slots[c] >= 0 and worlds[c] == 0}
 
 
 SAME_ARTICULATION_RESPONSES = ("propagation", "colored")
 
 
-def _closing_gripper_model(world_count: int) -> newton.Model:
+def test_default_routing_keeps_same_articulation_rows_dense(test, device):
+    """Keep same-articulation contacts on the dense rows by default on both propagation responses."""
+    model = _build_scissor_model(device)
+    for response in SAME_ARTICULATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = SolverSteel(model, iterations=0, cfm=PGS_CFM, **steel_mode_options(response))
+            _, contact_count = _step_once(model, solver)
+            test.assertGreater(len(_routed_slots(solver, contact_count, DENSE_PATH)), 0)
+            test.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), 0)
+
+
+def test_cross_response_effective_mass_matches_reference_operator(test, device):
+    """Match each same-articulation propagation row's ``J M^-1 J^T`` to the analytic operator, on both responses.
+
+    The generalized row Jacobian is ``g = X_a^T j_a + X_b^T j_b`` from the solver's own
+    body-space rows; the reference effective mass is ``g^T H^-1 g``. Per-link responses
+    alone would miss the cross term between the two links.
+    """
+    model = _build_scissor_model(device)
+    reference = SolverSteel(model, iterations=0, cfm=PGS_CFM)
+    _, contact_count = _step_once(model, reference)
+    dense_slots = _routed_slots(reference, contact_count, DENSE_PATH)
+    test.assertGreater(len(dense_slots), 0)
+
+    for response in SAME_ARTICULATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = SolverSteel(
+                model,
+                iterations=0,
+                cfm=PGS_CFM,
+                **steel_mode_options(response),
+                propagation_same_articulation_rows=True,
+            )
+            state, routed_count = _step_once(model, solver)
+            test.assertEqual(routed_count, contact_count)
+            rows = _routed_slots(solver, contact_count, PROPAGATION_PATH)
+            test.assertEqual(
+                set(rows), set(dense_slots), "same-articulation contacts were not routed to propagation rows"
+            )
+
+            count = int(solver._propagation_constraint_count.numpy()[0])
+            J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
+            J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
+            MiJt_a = solver._propagation_MiJt_a.numpy()[0, :count].astype(np.float64)
+            MiJt_b = solver._propagation_MiJt_b.numpy()[0, :count].astype(np.float64)
+            body_a = solver._propagation_body_a.numpy()[0, :count]
+            body_b = solver._propagation_body_b.numpy()[0, :count]
+            eff_mass_inv = solver._propagation_eff_mass_inv.numpy()[0, :count].astype(np.float64)
+            row_type = solver._propagation_row_type.numpy()[0, :count]
+            parent = solver._propagation_row_parent.numpy()[0, :count]
+            H, X = _analytic_H_and_X(model, state)
+            width = int(reference._world_dof_count.numpy()[0])
+            Y = reference._Y_world.numpy()[0].astype(np.float64)
+
+            checked = {PGS_CONSTRAINT_TYPE_CONTACT: 0, PGS_CONSTRAINT_TYPE_FRICTION: 0}
+            for contact, row in sorted(rows.items()):
+                test.assertGreaterEqual(int(body_a[row]), 0)
+                test.assertGreaterEqual(int(body_b[row]), 0)
+                g = X[body_a[row]].T @ J_a[row] + X[body_b[row]].T @ J_b[row]
+                y_ref = np.linalg.solve(H, g)
+                # Pin frames and ordering first: the dense row response is H^-1 g up to the row sign.
+                y_got = Y[dense_slots[contact], :width]
+                err = min(np.linalg.norm(y_got - y_ref), np.linalg.norm(y_got + y_ref))
+                test.assertLess(err / max(np.linalg.norm(y_ref), 1.0e-12), 1.0e-3)
+
+                # The contact's friction rows follow its normal row and name it as their parent.
+                friction = [
+                    r
+                    for r in (row + 1, row + 2)
+                    if r < count and row_type[r] == PGS_CONSTRAINT_TYPE_FRICTION and parent[r] == row
+                ]
+                for r in (row, *friction):
+                    g = X[body_a[r]].T @ J_a[r] + X[body_b[r]].T @ J_b[r]
+                    expected = float(g @ np.linalg.solve(H, g))
+                    diagonal = float(J_a[r] @ MiJt_a[r] + J_b[r] @ MiJt_b[r])
+                    test.assertAlmostEqual(1.0 / eff_mass_inv[r], diagonal + PGS_CFM, delta=1.0e-6 * (diagonal + 1.0))
+                    if expected < 1.0e-6:
+                        # Kinematically locked direction: the true diagonal is zero.
+                        test.assertLess(abs(diagonal), 1.0e-6)
+                        continue
+                    checked[int(row_type[r])] += 1
+                    test.assertLess(
+                        abs(diagonal - expected) / expected,
+                        1.0e-3,
+                        f"row {r} of contact {contact}: cross response term missing",
+                    )
+            test.assertGreater(checked[PGS_CONSTRAINT_TYPE_CONTACT], 0, "no non-degenerate normal rows were checked")
+            test.assertGreater(checked[PGS_CONSTRAINT_TYPE_FRICTION], 0, "no non-degenerate friction rows were checked")
+
+
+def test_same_articulation_torsion_rows_carry_the_cross_response(test, device):
+    """Give the torsion rows of same-articulation propagation contacts the exact two-link response, on both responses."""
+    # Hinged about the contact normal, the siblings spin against each other on a base that couples them.
+    model = _build_scissor_model(device, axis=(0.0, 1.0, 0.0))
+    set_torsion_radius(model, 0.01)
+    for response in SAME_ARTICULATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = SolverSteel(
+                model,
+                iterations=0,
+                cfm=PGS_CFM,
+                **steel_mode_options(response),
+                propagation_same_articulation_rows=True,
+                contact_torsion_device=True,
+                velocity_iterations=0,
+                contact_warmstart=False,
+            )
+            state, _ = _step_once(model, solver)
+            count = int(solver._propagation_constraint_count.numpy()[0])
+            row_type = solver._propagation_row_type.numpy()[0, :count]
+            J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
+            J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
+            MiJt_a = solver._propagation_MiJt_a.numpy()[0, :count].astype(np.float64)
+            MiJt_b = solver._propagation_MiJt_b.numpy()[0, :count].astype(np.float64)
+            body_a = solver._propagation_body_a.numpy()[0, :count]
+            body_b = solver._propagation_body_b.numpy()[0, :count]
+            eff_mass_inv = solver._propagation_eff_mass_inv.numpy()[0, :count].astype(np.float64)
+            body_art = solver._body_to_articulation.numpy()
+            H, X = _analytic_H_and_X(model, state)
+            # Hosted torsion rows have both bodies; reserved rows that host no group have none.
+            spins = [r for r in np.flatnonzero(row_type == PGS_CONSTRAINT_TYPE_TORSION) if body_a[r] >= 0]
+            test.assertGreater(len(spins), 0, "no torsion row was hosted")
+            for r in spins:
+                test.assertGreaterEqual(int(body_b[r]), 0)
+                test.assertEqual(body_art[body_a[r]], body_art[body_b[r]])
+                g = X[body_a[r]].T @ J_a[r] + X[body_b[r]].T @ J_b[r]
+                expected = float(g @ np.linalg.solve(H, g))
+                diagonal = float(J_a[r] @ MiJt_a[r] + J_b[r] @ MiJt_b[r])
+                test.assertAlmostEqual(1.0 / eff_mass_inv[r], diagonal + PGS_CFM, delta=1.0e-6 * (diagonal + 1.0))
+                test.assertGreater(expected, 1.0e-6)
+                test.assertLess(abs(diagonal - expected) / expected, 1.0e-3, f"torsion row {r}: cross response missing")
+
+
+def test_closing_gripper_stops_at_finger_contact(test, device):
+    """Stop squeezed fingers at contact in one sweep, which needs the cross response between the two links."""
+    model = _closing_gripper_model(device, world_count=3)
+    for response in SAME_ARTICULATION_RESPONSES:
+        with test.subTest(response=response):
+            solver = SolverSteel(
+                model,
+                **steel_mode_options(response),
+                propagation_same_articulation_rows=True,
+                iterations=1,
+                articulation_constraint_max=64,
+            )
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states, control = [model.state(), model.state()], model.control()
+            control.joint_f.assign(np.tile(np.array([0.0, -2.0, 2.0], dtype=np.float32), 3))
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            gaps = []
+            for _ in range(100):
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 1.0 / 200.0)
+                states.reverse()
+                q = states[0].joint_q.numpy().reshape(3, 3)
+                gaps.append(0.16 + q[:, 1] - q[:, 2])
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertGreater(count, 0)
+            np.testing.assert_array_equal(solver._contact_path.numpy()[:count], PROPAGATION_PATH)
+            test.assertGreater(float(np.min(gaps)), -1.0e-5)
+            np.testing.assert_allclose(q[:, 1:], [[-0.08, 0.08]] * 3, atol=1.0e-5)
+            np.testing.assert_allclose(q[:, 0], 0.0, atol=1.0e-5)
+            np.testing.assert_allclose(states[0].joint_qd.numpy(), 0.0, atol=1.0e-5)
+
+
+def _closing_gripper_model(device, world_count):
     """Two prismatic fingers on a sliding base, pushed together by equal and opposite joint forces."""
     gripper = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     inertia = wp.mat33(np.eye(3) * 0.01)
@@ -1265,691 +1928,176 @@ def _closing_gripper_model(world_count: int) -> newton.Model:
     gripper.add_articulation(joints)
     scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     scene.replicate(gripper, world_count)
-    return scene.finalize(device="cuda:0")
+    return scene.finalize(device=device)
 
 
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestPropagationSameArticulation(unittest.TestCase):
-    def test_scissor_scene_produces_same_articulation_contact(self):
-        model = _build_scissor_model("cuda:0")
-        solver = _make_solver_propagation_same_articulation(model, "immediate")
-        _zero_iteration_step(model, solver)
-        dense_rows = _contact_rows(solver, DENSE_PATH)
-        self.assertGreater(len(dense_rows), 0, "scissor scene produced no dense link-link contact")
-
-    def test_default_routing_keeps_same_articulation_rows_dense(self):
-        model = _build_scissor_model("cuda:0")
-        for response in SAME_ARTICULATION_RESPONSES:
-            with self.subTest(response=response):
-                solver = _make_solver_propagation_same_articulation(model, response)
-                _zero_iteration_step(model, solver)
-                self.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), 0)
-                self.assertGreater(len(_contact_rows(solver, DENSE_PATH)), 0)
-
-    def test_flag_requires_propagation_mode(self):
-        model = _build_scissor_model("cuda:0")
-        with self.assertRaises(ValueError):
-            _make_solver_propagation_same_articulation(model, "immediate", propagation_same_articulation_rows=True)
-
-    def test_cross_response_effective_mass_matches_reference_operator(self):
-        """The defining check: with same-articulation rows routed to propagation,
-        each row's J M^-1 J^T must match the analytic reference including the
-        cross term between the two links."""
-        model = _build_scissor_model("cuda:0")
-
-        reference = _make_solver_propagation_same_articulation(model, "immediate")
-        _zero_iteration_step(model, reference)
-        dense_rows = _contact_rows(reference, DENSE_PATH)
-        self.assertGreater(len(dense_rows), 0)
-
-        for response in SAME_ARTICULATION_RESPONSES:
-            with self.subTest(response=response):
-                solver = _make_solver_propagation_same_articulation(
-                    model, response, propagation_same_articulation_rows=True
-                )
-                state = _zero_iteration_step(model, solver)
-                prop_rows = _contact_rows(solver, PROPAGATION_PATH)
-                self.assertEqual(
-                    set(prop_rows.keys()),
-                    set(dense_rows.keys()),
-                    "same-articulation contacts were not routed to propagation rows",
-                )
-                prop_diag = _propagation_operator_diag(solver)
-
-                # Analytic reference: generalized row Jacobian g = X_a^T j_a + X_b^T j_b
-                # from the solver's own row geometry, W_kk = g^T H^-1 g.
-                H, X = _analytic_H_and_X(model, state)
-                count = int(solver._propagation_constraint_count.numpy()[0])
-                J_a = solver._propagation_J_a.numpy()[0, :count].astype(np.float64)
-                J_b = solver._propagation_J_b.numpy()[0, :count].astype(np.float64)
-                body_a = solver._propagation_body_a.numpy()[0, :count].astype(np.int32)
-                body_b = solver._propagation_body_b.numpy()[0, :count].astype(np.int32)
-
-                # Convention check: the reference solver's Y rows must equal H^-1 g
-                # (up to overall row sign) — this pins frames/ordering before we
-                # trust the reference for the real assertion.
-                width = int(reference._world_dof_count.numpy()[0])
-                Y = reference._Y_world.numpy()[0].astype(np.float64)
-                for contact, dense_slot in sorted(dense_rows.items()):
-                    row = prop_rows[contact]
-                    g = X[body_a[row]].T @ J_a[row] + X[body_b[row]].T @ J_b[row]
-                    y_ref = np.linalg.solve(H, g)
-                    y_got = Y[dense_slot, :width]
-                    err = min(np.linalg.norm(y_got - y_ref), np.linalg.norm(y_got + y_ref))
-                    self.assertLess(
-                        err / max(np.linalg.norm(y_ref), 1e-12),
-                        1.0e-3,
-                        f"analytic reference disagrees with solver Y row {dense_slot}: {y_got} vs {y_ref}",
-                    )
-
-                checked = 0
-                for contact in sorted(dense_rows):
-                    row = prop_rows[contact]
-                    g = X[body_a[row]].T @ J_a[row] + X[body_b[row]].T @ J_b[row]
-                    ref = float(g @ np.linalg.solve(H, g))
-                    got = prop_diag[row]
-                    if ref < 1.0e-6:
-                        # Kinematically locked direction: true W_kk is zero, both
-                        # sides must be at float noise level.
-                        self.assertLess(abs(got), 1.0e-6)
-                        continue
-                    checked += 1
-                    rel = abs(got - ref) / ref
-                    self.assertLess(
-                        rel,
-                        1.0e-3,
-                        f"contact {contact}: propagation W_kk {got:.6e} vs reference {ref:.6e} "
-                        f"(rel {rel:.3e}) — cross response term missing or wrong",
-                    )
-                self.assertGreater(checked, 0, "no non-degenerate same-articulation rows were checked")
-
-    def test_closing_gripper_stops_at_finger_contact(self):
-        """Stop squeezed fingers at contact in one sweep, which needs the cross response between the two links."""
-        model = _closing_gripper_model(world_count=3)
-        for response in SAME_ARTICULATION_RESPONSES:
-            with self.subTest(response=response):
-                solver = SolverSteel(
-                    model,
-                    **steel_mode_options(response),
-                    propagation_same_articulation_rows=True,
-                    iterations=1,
-                    articulation_constraint_max=64,
-                )
-                pipeline = newton.CollisionPipeline(model)
-                contacts = pipeline.contacts()
-                states, control = [model.state(), model.state()], model.control()
-                control.joint_f.assign(np.tile(np.array([0.0, -2.0, 2.0], dtype=np.float32), 3))
-                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-                gaps = []
-                for _ in range(100):
-                    pipeline.collide(states[0], contacts)
-                    solver.step(states[0], states[1], control, contacts, 1.0 / 200.0)
-                    states.reverse()
-                    q = states[0].joint_q.numpy().reshape(3, 3)
-                    gaps.append(0.16 + q[:, 1] - q[:, 2])
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                self.assertGreater(count, 0)
-                np.testing.assert_array_equal(solver._contact_path.numpy()[:count], PROPAGATION_PATH)
-                self.assertGreater(float(np.min(gaps)), -1.0e-5)
-                np.testing.assert_allclose(q[:, 1:], [[-0.08, 0.08]] * 3, atol=1.0e-5)
-                np.testing.assert_allclose(q[:, 0], 0.0, atol=1.0e-5)
-                np.testing.assert_allclose(states[0].joint_qd.numpy(), 0.0, atol=1.0e-5)
+    pass
 
 
-_WARP_KERNEL_DICTS = (
-    "_propagate_tree_warp_kernels_by_size",
-    "_factor_tree_warp_kernels_by_size",
-    "_response_tree_warp_kernels_by_size",
-    "_refresh_tree_warp_kernels_by_size",
-)
+for _name in (
+    "test_scissor_scene_produces_same_articulation_contact",
+    "test_scissor_dense_diagonal_matches_reference",
+    "test_default_routing_keeps_same_articulation_rows_dense",
+    "test_cross_response_effective_mass_matches_reference_operator",
+    "test_same_articulation_torsion_rows_carry_the_cross_response",
+    "test_closing_gripper_stops_at_finger_contact",
+):
+    add_function_test(TestPropagationSameArticulation, _name, globals()[_name], devices=devices)
 
 
-def _make_solver_propagation_free_root_warp(model: newton.Model, response: str) -> SolverSteel:
-    # propagation_cached_response=False pins the per-iteration tree-walk
-    # propagation path these tests compare (warp vs serial variants). The
-    # cached-response GEMV replacement has its own equivalence gate in this module.
-    return SolverSteel(
-        model,
-        **steel_mode_options(response),
-        iterations=8,
-        contact_warmstart=False,
-        propagation_cached_response=False,
-    )
-
-
-def _force_serial_fallback(solver: SolverSteel) -> None:
-    for name in _WARP_KERNEL_DICTS:
-        kernels = getattr(solver, name, None)
-        if kernels:
-            setattr(solver, name, dict.fromkeys(kernels, None))
-
-
-def _step_n(model, solver, n_steps, *, state_in=None):
-    state_in = model.state() if state_in is None else state_in
-    state_out = model.state()
-    control = model.control()
-    state_in.joint_qd.assign(_seed_joint_qd(model))
-    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    collision_pipeline = newton.CollisionPipeline(model)
-    contacts = collision_pipeline.contacts()
-    for _ in range(n_steps):
-        state_in.clear_forces()
-        collision_pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, control, contacts, DT)
-        state_in, state_out = state_out, state_in
-    wp.synchronize()
-    return state_in
-
-
-def _tree_inputs(model, solver, art):
-    return {
-        "S": solver._propagation_joint_S_flat.numpy().astype(np.float64),
-        "U": solver._propagation_tree_U.numpy().astype(np.float64),
-        "Dinv": solver._propagation_tree_D_inv.numpy().astype(np.float64),
-        "com": solver._propagation_body_com_rel.numpy().astype(np.float64),
-        "jp": model.joint_parent.numpy(),
-        "jc": model.joint_child.numpy(),
-        "qd_start": model.joint_qd_start.numpy(),
-        "j0": int(model.articulation_start.numpy()[art]),
-        "j1": int(model.articulation_start.numpy()[art + 1]),
-    }
-
-
-def _xlt_wrench(w, e):
-    return np.concatenate([w[:3], w[3:] + np.cross(e, w[:3])])
-
-
-def _xlt_twist(v, e):
-    return np.concatenate([v[:3] + np.cross(v[3:], e), v[3:]])
-
-
-def _ref_propagate(ti, imp_by_body, v_out):
-    """Mirror of kernels.propagate_tree_impulses_for_size (one articulation)."""
-    S, U, Dinv, com = ti["S"], ti["U"], ti["Dinv"], ti["com"]
-    jp, jc, qd_start = ti["jp"], ti["jc"], ti["qd_start"]
-    j0, j1 = ti["j0"], ti["j1"]
-    pA = {}
-    u = np.zeros(S.shape[0])
-    body_delta = {}
-    for j in range(j0, j1):
-        pA[int(jc[j])] = -np.asarray(imp_by_body.get(int(jc[j]), np.zeros(6)), dtype=np.float64)
-        body_delta[int(jc[j])] = np.zeros(6)
-    for j in range(j1 - 1, j0 - 1, -1):
-        child, parent = int(jc[j]), int(jp[j])
-        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
-        for g in range(d0, d1):
-            u[g] = -np.dot(S[g], pA[child])
-        if parent >= 0:
-            p = pA[child].copy()
-            for a in range(d0, d1):
-                coeff = sum(Dinv[j, a - d0, b - d0] * u[b] for b in range(d0, d1))
-                p += U[a] * coeff
-            pA[parent] += _xlt_wrench(p, com[child] - com[parent])
-    for j in range(j0, j1):
-        child, parent = int(jc[j]), int(jp[j])
-        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
-        pd = np.zeros(6)
-        if parent >= 0:
-            pd = _xlt_twist(body_delta[parent], com[child] - com[parent])
-        qdd = np.zeros(d1 - d0)
-        for a in range(d0, d1):
-            acc = 0.0
-            for b in range(d0, d1):
-                pt = np.dot(U[b], pd) if parent >= 0 else 0.0
-                acc += Dinv[j, a - d0, b - d0] * (u[b] - pt)
-            qdd[a - d0] = acc
-            v_out[a] += acc
-        body_delta[child] = pd + sum(S[a] * qdd[a - d0] for a in range(d0, d1))
-    # third pass: recompute body twists from the updated v_out
-    body_qd = {}
-    twist = {}
-    for j in range(j0, j1):
-        child, parent = int(jc[j]), int(jp[j])
-        d0, d1 = int(qd_start[j]), int(qd_start[j + 1])
-        val = np.zeros(6)
-        if parent >= 0:
-            val = _xlt_twist(twist[parent], com[child] - com[parent])
-        for a in range(d0, d1):
-            val = val + S[a] * v_out[a]
-        twist[child] = val
-        body_qd[child] = val
-    return v_out, body_qd
-
-
-def _ref_body_response(ti, body):
-    """6x6 response of ``body``: column = body twist delta per unit basis wrench."""
-    R = np.zeros((6, 6))
-    for basis in range(6):
-        imp = np.zeros(6)
-        imp[basis] = 1.0
-        # At zero initial generalized velocity the recomputed body twist for a
-        # unit test wrench equals the body's velocity response column.
-        _, body_qd = _ref_propagate(ti, {body: imp}, np.zeros(ti["S"].shape[0]))
-        R[:, basis] = body_qd[body]
-    return R
-
-
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-class TestPropagationFreeRootWarp(unittest.TestCase):
-    ref_rtol = 0.0  # the numpy-reference gate is absolute on the free-root chains
-
-    @classmethod
-    def setUpClass(cls):
-        cls.device = "cuda:0"
-        # contact-free model: floating chains tumbling in space
-        cls.model_free = _build_free_root_chain_model(cls.device, base_z=2.0, contact_sphere=None, ground=False)
-
-    def test_free_root_shape_detected(self):
-        solver = _make_solver_propagation_free_root_warp(self.model_free, "colored")
-        sizes = [int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0]
-        self.assertEqual(len(sizes), 1)
-        size = sizes[0]
-        self.assertFalse(solver._propagation_tree_single_dof_by_size[size])
-        self.assertTrue(solver._propagation_tree_free_root_by_size[size])
-        for name in _WARP_KERNEL_DICTS:
-            kernels = getattr(solver, name, None)
-            self.assertIsNotNone(kernels, name)
-            self.assertIsNotNone(kernels.get(size), f"{name}[{size}] should hold a warp variant")
-
-    def _paired_solvers(self, n_steps):
-        """Two solvers advanced identically on a contact-free trajectory.
-
-        Without contact rows the tree kernels do not influence the
-        trajectory, and no atomically-ordered contact bookkeeping runs, so
-        both solvers reach bitwise-identical states and tree factorizations
-        are computed from identical inputs.
-        """
-        solver_w = _make_solver_propagation_free_root_warp(self.model_free, "colored")
-        solver_s = _make_solver_propagation_free_root_warp(self.model_free, "colored")
-        _force_serial_fallback(solver_s)
-        state_w = _step_n(self.model_free, solver_w, n_steps)
-        state_s = _step_n(self.model_free, solver_s, n_steps)
-        np.testing.assert_array_equal(state_w.joint_q.numpy(), state_s.joint_q.numpy())
-        return solver_w, solver_s
-
-    def test_factor_matches_serial(self):
-        model = self.model_free
-        qd_start = model.joint_qd_start.numpy()
-        n_joints = model.joint_count
-        for n_steps in (1, 12, 25):
-            with self.subTest(n_steps=n_steps):
-                solver_w, solver_s = self._paired_solvers(n_steps)
-                U_w = solver_w._propagation_tree_U.numpy()
-                U_s = solver_s._propagation_tree_U.numpy()
-                Dc_w = solver_w._propagation_tree_D_chol.numpy()
-                Dc_s = solver_s._propagation_tree_D_chol.numpy()
-                Di_w = solver_w._propagation_tree_D_inv.numpy()
-                Di_s = solver_s._propagation_tree_D_inv.numpy()
-                for j in range(n_joints):
-                    dc = int(qd_start[j + 1] - qd_start[j])
-                    if dc == 0:
-                        continue
-                    d0 = int(qd_start[j])
-                    scale = max(1.0, float(np.max(np.abs(U_s[d0 : d0 + dc]))))
-                    self.assertLess(float(np.max(np.abs(U_w[d0 : d0 + dc] - U_s[d0 : d0 + dc]))), 1e-5 * scale)
-                    scale = max(1.0, float(np.max(np.abs(Di_s[j, :dc, :dc]))))
-                    self.assertLess(float(np.max(np.abs(Di_w[j, :dc, :dc] - Di_s[j, :dc, :dc]))), 1e-5 * scale)
-                    scale = max(1.0, float(np.max(np.abs(Dc_s[j, :dc, :dc]))))
-                    self.assertLess(float(np.max(np.abs(Dc_w[j, :dc, :dc] - Dc_s[j, :dc, :dc]))), 1e-5 * scale)
-
-    def test_propagate_matches_serial(self):
-        model = self.model_free
-        rng = np.random.default_rng(1234)
-        solver_w, solver_s = self._paired_solvers(20)
-        bodies_per_world = model.body_count // N_WORLDS
-        patterns = [rng.normal(scale=0.5, size=(model.body_count, 6)).astype(np.float32)]
-        for body in (0, 1, bodies_per_world - 1):  # root, first link, deepest link
-            p = np.zeros((model.body_count, 6), dtype=np.float32)
-            p[body] = rng.normal(scale=1.0, size=6)
-            patterns.append(p)
-        for pi, imps in enumerate(patterns):
-            with self.subTest(pattern=pi):
-                v0 = rng.normal(scale=0.1, size=solver_w._v_out.shape).astype(np.float32)
-                for s in (solver_w, solver_s):
-                    s._propagation_body_impulses.assign(imps)
-                    s._v_out.assign(v0)
-                    s._propagation_body_qd.zero_()
-                solver_w._propagate_response()
-                solver_s._propagate_response()
-                wp.synchronize()
-                dv = solver_w._v_out.numpy() - solver_s._v_out.numpy()
-                dqd = solver_w._propagation_body_qd.numpy() - solver_s._propagation_body_qd.numpy()
-                scale = max(1.0, float(np.max(np.abs(solver_s._v_out.numpy()))))
-                self.assertLess(float(np.max(np.abs(dv))), 1e-5 * scale)
-                self.assertLess(float(np.max(np.abs(dqd))), 1e-5 * scale)
-                # deferred impulses must be consumed
-                self.assertEqual(float(np.max(np.abs(solver_w._propagation_body_impulses.numpy()))), 0.0)
-
-    def test_propagate_matches_numpy_reference(self):
-        model = self.model_free
-        rng = np.random.default_rng(99)
-        solver_w, _ = self._paired_solvers(20)
-        ti = _tree_inputs(model, solver_w, art=0)
-        bodies_per_world = model.body_count // N_WORLDS
-        imps = np.zeros((model.body_count, 6), dtype=np.float32)
-        imps[:bodies_per_world] = rng.normal(scale=0.5, size=(bodies_per_world, 6))
-        solver_w._propagation_body_impulses.assign(imps)
-        solver_w._v_out.zero_()
-        solver_w._propagation_body_qd.zero_()
-        solver_w._propagate_response()
-        wp.synchronize()
-        n_dofs_w0 = int(model.joint_dof_count) // N_WORLDS
-        ref_v, ref_body_qd = _ref_propagate(
-            ti,
-            {b: imps[b].astype(np.float64) for b in range(bodies_per_world)},
-            np.zeros(ti["S"].shape[0]),
-        )
-        got_v = solver_w._v_out.numpy()[:n_dofs_w0]
-        np.testing.assert_allclose(got_v, ref_v[:n_dofs_w0], rtol=self.ref_rtol, atol=1e-4)
-        got_qd = solver_w._propagation_body_qd.numpy()
-        for b in range(bodies_per_world):
-            np.testing.assert_allclose(got_qd[b], ref_body_qd[b], rtol=self.ref_rtol, atol=1e-4)
-
-    def test_refresh_matches_serial(self):
-        rng = np.random.default_rng(4321)
-        solver_w, solver_s = self._paired_solvers(20)
-        v0 = rng.normal(scale=0.5, size=solver_w._v_out.shape).astype(np.float32)
-        for s in (solver_w, solver_s):
-            s._v_out.assign(v0)
-            s._propagation_body_qd.zero_()
-        solver_w._refresh_propagation_body_qd_from_vout(force=True)
-        solver_s._refresh_propagation_body_qd_from_vout(force=True)
-        wp.synchronize()
-        qd_w = solver_w._propagation_body_qd.numpy()
-        qd_s = solver_s._propagation_body_qd.numpy()
-        scale = max(1.0, float(np.max(np.abs(qd_s))))
-        self.assertLess(float(np.max(np.abs(qd_w - qd_s))), 1e-5 * scale)
-
-    def test_response_matches_numpy_reference(self):
-        """Warp free-root response vs the serial tree-solve semantics.
-
-        The serial fallback for free-root groups is the path-restricted
-        generic kernel, which only fills rows for contact-active bodies; the
-        warp variant fills every link (the single-DOF revolute contract). Both
-        must equal the exact articulated-body response, so the warp output is
-        gated against a float64 reference of the serial algorithm.
-        """
-        model = self.model_free
-        solver_w, _ = self._paired_solvers(20)
-        size = next(int(s) for s in solver_w._size_groups if solver_w._n_arts_by_size[s] > 0)
-        self.assertIsNotNone(solver_w._response_tree_warp_kernels_by_size.get(size))
-        ti = _tree_inputs(model, solver_w, art=0)
-        resp = solver_w._propagation_body_response.numpy()
-        bodies_per_world = model.body_count // N_WORLDS
-        for body in range(bodies_per_world):
-            ref = _ref_body_response(ti, body)
-            scale = max(1.0, float(np.max(np.abs(ref))))
-            self.assertLess(
-                float(np.max(np.abs(resp[body] - ref))),
-                1e-4 * scale,
-                f"body {body} response mismatch",
-            )
-
-    def test_end_to_end_single_contact(self):
-        """Full stepping over ground with one contact sphere per world.
-
-        A single contact point keeps the contact pipeline's atomic slot
-        allocation trivially deterministic, so the warp-vs-serial trajectory
-        difference reflects only the tree-kernel float reassociation.
-        """
-        for contact_sphere, base_z in (("base", 0.115), ("deep", 0.12)):
-            model = _build_free_root_chain_model(self.device, base_z=base_z, contact_sphere=contact_sphere, ground=True)
-            for response in ("colored", "propagation"):
-                with self.subTest(contact=contact_sphere, articulated_contact_response=response):
-                    results = {}
-                    for mode in ("warp", "serial", "serial2"):
-                        solver = _make_solver_propagation_free_root_warp(model, response)
-                        if mode != "warp":
-                            _force_serial_fallback(solver)
-                        state = _step_n(model, solver, 40)
-                        results[mode] = {
-                            "joint_q": state.joint_q.numpy().copy(),
-                            "joint_qd": state.joint_qd.numpy().copy(),
-                            "propagation_body_qd": solver._propagation_body_qd.numpy().copy(),
-                            "rows": int(solver._propagation_constraint_count.numpy().sum()),
-                        }
-                    self.assertGreater(results["warp"]["rows"], 0, "no propagation contact rows produced")
-                    # precondition: the scene is pipeline-deterministic
-                    for key in ("joint_q", "joint_qd"):
-                        np.testing.assert_array_equal(
-                            results["serial"][key],
-                            results["serial2"][key],
-                            err_msg=f"serial trajectory not reproducible for {key}; scene invalidates the gate",
-                        )
-                    # The warp and serial paths differ only by float reassociation, but 40 steps of
-                    # contact dynamics amplify that seed chaotically: measured joint_qd diffs are
-                    # ~5e-7 at 10 steps, 1e-5..4e-5 at 20 and 4e-5..1.2e-4 at 40, with the 40-step
-                    # value swinging by 3x across GPU architectures (8.1e-5 on sm_120 vs 1.2e-4 on
-                    # sm_86 at the same commit) and across physically equivalent trajectory changes.
-                    # The gate is set ~4x above the observed band to stay deterministic per
-                    # hardware; structural kernel bugs produce diffs of 1e-2 or more and still trip
-                    # it comfortably.
-                    for key in ("joint_q", "joint_qd", "propagation_body_qd"):
-                        diff = float(np.max(np.abs(results["warp"][key] - results["serial"][key])))
-                        self.assertLessEqual(
-                            diff,
-                            5e-4,
-                            f"{key} max abs diff {diff:.3e} exceeds 5e-4",
-                        )
-
-
-_VARIANT_ENV = (
-    "STEEL_COLORED_PREFETCH",
-    "STEEL_COLORED_STAGED",
-    "STEEL_COLORED_PACKED",
-    "STEEL_COLORED_STRAIGHT_LINE",
-)
-
-
-def _solver_colored_pipeline(model, env, regularization=0.0):
-    """Build the colored solver with only ``env`` set among the kernel-variant switches."""
-    with mock.patch.dict(os.environ, env):
-        for key in _VARIANT_ENV:
-            if key not in env:
-                os.environ.pop(key, None)
-        return newton.solvers.SolverSteel(
+def _colored_variant_solver(model, regularization, **overrides):
+    """Build the colored solver with the given sweep-variant overrides."""
+    with kernel_overrides(overrides):
+        return SolverSteel(
             model,
             solve_mode="colored",
             articulated_contact_response="propagation",
             iterations=8,
-            free_body_constraint_max=8192,
+            free_body_constraint_max=CONTACT_MAX,
             articulation_constraint_max=64,
             contact_regularization=regularization,
         )
 
 
-class TestSteelColoredStagingSelection(unittest.TestCase):
-    def test_staging_requires_cp_async_and_few_worlds(self):
-        """Staging emits cp.async (compute capability 8.0+) and is for a few worlds only."""
-        self.assertFalse(_colored_staging_supported(75, 1, 1, 60), "SM75 cannot compile cp.async")
-        self.assertTrue(_colored_staging_supported(80, 1, 1, 60))
-        self.assertTrue(_colored_staging_supported(120, 1, 16, 60))
-        self.assertFalse(_colored_staging_supported(120, 1, 17, 60), "many worlds keep the packed kernel")
-        self.assertFalse(_colored_staging_supported(120, 2, 1, 60), "staging needs the lane-per-unit body")
-        self.assertFalse(_colored_staging_supported(120, 1, 1, 400), "staging must fit static shared memory")
-
-
-@unittest.skipUnless(wp.get_device().is_cuda, "propagation_colored requires CUDA")
-class TestSteelColoredPipeline(unittest.TestCase):
-    def test_pipelined_variants_match_the_reference_bitwise(self):
-        """Prefetched and (where supported) staged sweeps match the reference unit body."""
-        for regularization in (0.0, 0.01):
-            with self.subTest(regularization=regularization):
-                self._check_variants(regularization)
-
-    def test_straight_line_units_match_the_row_loop(self):
-        """Standard units solved straight-line agree with the generic row loop.
-
-        Every variant shares the straight-line code, so the bitwise check above cannot see
-        a mistake in it; this compares it with the row loop it replaces. The two differ
-        only in summation order (pairwise dot products), so one step (eight sweeps) agrees
-        to rounding, impulses included. Later steps are not compared: friction-patch
-        decisions taken from those impulses may relayout the rows.
-        """
-        for regularization in (0.0, 0.01):
-            with self.subTest(regularization=regularization):
-                model, contacts, control, start = self._settled_heap(regularization)
-                results = {}
-                for name, env in (("row loop", {"STEEL_COLORED_STRAIGHT_LINE": "0"}), ("straight line", {})):
-                    solver = _solver_colored_pipeline(model, env, regularization)
-                    results[name] = self._run(solver, model, contacts, control, start, 1)
-                    if name == "straight line":
-                        n = int(solver._color_world_offsets.numpy()[-1])
-                        kinds = solver._color_unit_meta.numpy().reshape(-1, PROPAGATION_UNIT_META)[:n]
-                        kinds = kinds[:, 6 + PROPAGATION_UNIT_RING]
-                        self.assertGreater(int(np.sum(kinds == 1)), n // 2, "few units took the straight-line path")
-                for label, got, want in zip(
-                    ("body_q", "body_qd", "impulses"), results["straight line"], results["row loop"], strict=True
-                ):
-                    np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6, err_msg=label)
-
-    def _settled_heap(self, regularization):
-        model, _ = _heap(nx=6, ny=6, nz=3)
-        model.rigid_contact_max = 8192
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
-        contacts = pipeline.contacts()
-        control = model.control()
-        state_0, state_1 = model.state(), model.state()
-        warm = _solver_colored_pipeline(model, {}, regularization)
-        for _ in range(8):  # settle into resting contact with patch history
-            pipeline.collide(state_0, contacts)
-            warm.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-            state_0, state_1 = state_1, state_0
+def _settled_heap(device, regularization):
+    """A heap settled into resting contact with patch history, and its contacts."""
+    model = _heap(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=CONTACT_MAX, deterministic=True)
+    contacts = pipeline.contacts()
+    control = model.control()
+    state_0, state_1 = model.state(), model.state()
+    warm = _colored_variant_solver(model, regularization)
+    for _ in range(8):
         pipeline.collide(state_0, contacts)
-        start = {name: getattr(state_0, name).numpy().copy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
-        return model, contacts, control, start
+        warm.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+    pipeline.collide(state_0, contacts)
+    start = {name: getattr(state_0, name).numpy().copy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
+    return model, contacts, control, start
 
-    @staticmethod
-    def _run(solver, model, contacts, control, start, steps):
-        a, b = model.state(), model.state()
-        for field, value in start.items():
-            getattr(a, field).assign(value)
-        solver.reset(a, flags=0)
-        for _ in range(steps):
-            solver.step(a, b, control, contacts, 1.0 / 240.0)
-            a, b = b, a
-        return a.body_q.numpy(), a.body_qd.numpy(), solver._propagation_impulses.numpy()
 
-    def _check_variants(self, regularization):
-        """Prefetched and shared-memory-staged sweeps reproduce the reference unit body.
+def _run(solver, model, contacts, control, start, steps):
+    state_0, state_1 = model.state(), model.state()
+    for name, value in start.items():
+        getattr(state_0, name).assign(value)
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+    return state_0.body_q.numpy(), state_0.body_qd.numpy(), solver._propagation_impulses.numpy()
 
-        A settling heap of boxes with friction patches (the default) gives colors with
-        many units, contact rows with friction pairs, and patch rings. Contacts are
-        generated once so every solver sees identical input; the variants then run the
-        same steps and must agree bit for bit on body state and row impulses. Without
-        regularization the row-weight buffer is a one-element placeholder the kernels
-        must not read; with it the weights are real rows.
-        """
-        model, _ = _heap(nx=6, ny=6, nz=3)
-        model.rigid_contact_max = 8192
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
-        contacts = pipeline.contacts()
-        control = model.control()
-        state_0, state_1 = model.state(), model.state()
-        warm = _solver_colored_pipeline(model, {}, regularization)
-        for _ in range(8):  # settle into resting contact with patch history
-            pipeline.collide(state_0, contacts)
-            warm.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-            state_0, state_1 = state_1, state_0
-        pipeline.collide(state_0, contacts)
-        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 400)
-        start = {name: getattr(state_0, name).numpy().copy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
 
+def test_staging_requires_cp_async_and_few_worlds(test, device):
+    """Stage only with cp.async (compute capability 8.0), a few worlds and fitting shared memory."""
+    test.assertFalse(_colored_staging_supported(75, 1, 60))
+    test.assertTrue(_colored_staging_supported(80, 1, 60))
+    test.assertTrue(_colored_staging_supported(120, 16, 60))
+    test.assertFalse(_colored_staging_supported(120, 17, 60))
+    test.assertFalse(_colored_staging_supported(120, 1, 400))
+
+
+def test_sweep_variants_match_the_reference_bitwise(test, device):
+    """Reproduce the reference sweep with the prefetched, packed and staged sweeps.
+
+    Without regularization the row-weight buffer is a placeholder the sweeps must not read.
+    """
+    for regularization in (0.0, 0.01):
+        model, contacts, control, start = _settled_heap(device, regularization)
+        test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 400)
+        staged = _colored_staging_supported(
+            model.device.arch, 1, _colored_variant_solver(model, regularization)._max_propagation_bodies
+        )
         variants = {
-            "reference": ({"STEEL_COLORED_PREFETCH": "0"}, "_pf0_st0"),
-            "prefetch": ({"STEEL_COLORED_PACKED": "0"}, "_pf1_st0_pk0"),
-            "default": ({}, "_pf1_st0_pk1"),
-            "staged": ({"STEEL_COLORED_STAGED": "1"}, None),
+            "reference": ({"colored_prefetch": False}, "_pf0_st0"),
+            "prefetch": ({"colored_packed": False}, "_pf1_st0_pk0"),
+            "packed": ({}, "_pf1_st0_pk1"),
+            "staged": ({"colored_staged": True}, "_pf1_st1" if staged else "_pf1_st0_pk1"),
         }
         results = {}
-        for name, (env, expected) in variants.items():
-            solver = _solver_colored_pipeline(model, env, regularization)
-            kernel = solver._pgs_solve_propagation_colored_warp_kernel
-            self.assertIsNotNone(kernel)
-            tag = expected
-            if tag is None:
-                # Staging needs cp.async (SM80+); older devices take the unstaged packed
-                # kernel, which must match as well.
-                staged = _colored_staging_supported(
-                    int(model.device.arch), 1, solver._world_count, int(solver._max_propagation_bodies)
-                )
-                tag = "_pf1_st1" if staged else "_pf1_st0_pk1"
-            self.assertIn(tag, kernel.key, f"{name} did not build its kernel variant")
-            a, b = model.state(), model.state()
-            for field, value in start.items():
-                getattr(a, field).assign(value)
-            solver.reset(a, flags=0)
-            for _ in range(5):
-                solver.step(a, b, control, contacts, 1.0 / 240.0)
-                a, b = b, a
-            results[name] = (a.body_q.numpy(), a.body_qd.numpy(), solver._propagation_impulses.numpy())
-
-        ref = results["reference"]
-        self.assertTrue(all(np.isfinite(x).all() for x in ref))
-        self.assertGreater(np.abs(ref[2]).max(), 0.0, "no contact impulses were solved")
-        for name in ("prefetch", "default", "staged"):
-            for label, got, want in zip(("body_q", "body_qd", "impulses"), results[name], ref, strict=True):
-                np.testing.assert_array_equal(got, want, err_msg=f"{name} {label} differs from the reference")
+        for name, (overrides, tag) in variants.items():
+            solver = _colored_variant_solver(model, regularization, **overrides)
+            test.assertIn(tag, solver._pgs_solve_propagation_colored_warp_kernel.key)
+            results[name] = _run(solver, model, contacts, control, start, 5)
+        reference = results["reference"]
+        test.assertTrue(all(np.isfinite(x).all() for x in reference))
+        test.assertGreater(np.abs(reference[2]).max(), 0.0)
+        for name in ("prefetch", "packed", "staged"):
+            for label, got, want in zip(("body_q", "body_qd", "impulses"), results[name], reference, strict=True):
+                with test.subTest(regularization=regularization, variant=name, field=label):
+                    np.testing.assert_array_equal(got, want)
 
 
-def _heap(nx=6, ny=6, nz=3, pitch=0.042, half=0.02, kinematic_tray=False):
-    """A dense heap of touching boxes on the ground, optionally inside a kinematic tray."""
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-    builder.rigid_gap = 0.002
-    builder.add_ground_plane()
-    tray = -1
-    if kinematic_tray:
-        # One kinematic body under the whole heap: every box rests on it, so it is a hub
-        # touching every contact unit of the bottom layer.
-        tray = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.01), wp.quat_identity()), is_kinematic=True)
-        builder.add_shape_box(tray, hx=nx * pitch, hy=ny * pitch, hz=0.01)
-    z0 = 0.04 if kinematic_tray else 0.021
-    for ix in range(nx):
-        for iy in range(ny):
-            for iz in range(nz):
-                b = builder.add_body(
-                    xform=wp.transform(
-                        wp.vec3((ix - nx / 2) * pitch, (iy - ny / 2) * pitch, z0 + iz * (2 * half + 0.001)),
-                        wp.quat_identity(),
-                    )
-                )
-                builder.add_shape_box(b, hx=half, hy=half, hz=half)
-    return builder.finalize(), tray
+def test_straight_line_units_match_the_row_loop(test, device):
+    """Agree with the row loop to rounding when standard units are solved straight-line.
+
+    One step is compared: friction-patch decisions taken from the impulses may relayout later rows.
+    """
+    for regularization in (0.0, 0.01):
+        model, contacts, control, start = _settled_heap(device, regularization)
+        results = {}
+        for name, overrides in (("row loop", {"colored_straight_line": False}), ("straight line", {})):
+            solver = _colored_variant_solver(model, regularization, **overrides)
+            results[name] = _run(solver, model, contacts, control, start, 1)
+            if name == "straight line":
+                n = int(solver._color_world_offsets.numpy()[-1])
+                records = solver._color_unit_meta.numpy().reshape(-1, PROPAGATION_UNIT_META)[:n]
+                test.assertGreater(int(np.sum(records[:, 6 + PROPAGATION_UNIT_RING] == 1)), n // 2)
+        for label, got, want in zip(
+            ("body_q", "body_qd", "impulses"), results["straight line"], results["row loop"], strict=True
+        ):
+            with test.subTest(regularization=regularization, field=label):
+                np.testing.assert_allclose(got, want, rtol=1.0e-4, atol=1.0e-6)
 
 
-def _color_counts(solver):
-    """Units per color for world 0; the last live entry is the serial overflow tail."""
-    entries = PROPAGATION_COLOR_TAIL + 2
-    offsets = solver._color_world_offsets.numpy()[:entries].astype(np.int64)
-    counts = np.diff(offsets)
-    return counts[:PROPAGATION_COLOR_TAIL], int(counts[PROPAGATION_COLOR_TAIL])
+class TestSteelColoredPipeline(unittest.TestCase):
+    pass
 
 
-def _settle(model, steps=12, **solver_kwargs):
-    model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
-    solver = newton.solvers.SolverSteel(
-        model,
-        solve_mode="colored",
-        articulated_contact_response="propagation",
-        iterations=6,
-        free_body_constraint_max=8192,
-        articulation_constraint_max=64,
-        **solver_kwargs,
-    )
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
+add_function_test(
+    TestSteelColoredPipeline,
+    "test_staging_requires_cp_async_and_few_worlds",
+    test_staging_requires_cp_async_and_few_worlds,
+    devices=get_test_devices(),
+)
+
+
+for _fn in (test_sweep_variants_match_the_reference_bitwise, test_straight_line_units_match_the_row_loop):
+    add_function_test(TestSteelColoredPipeline, _fn.__name__, _fn, devices=get_cuda_test_devices())
+
+
+def _colored_solver(model, **kwargs):
+    options = {
+        "solve_mode": "colored",
+        "articulated_contact_response": "propagation",
+        "iterations": 6,
+        "free_body_constraint_max": CONTACT_MAX,
+        "articulation_constraint_max": 64,
+    }
+    options.update(kwargs)
+    return SolverSteel(model, **options)
+
+
+def _settle(model, solver, steps=12):
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=CONTACT_MAX, deterministic=True)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     for _ in range(steps):
-        state_0.clear_forces()
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
-    return solver, state_0, int(contacts.rigid_contact_count.numpy()[0])
+    return state_0, int(contacts.rigid_contact_count.numpy()[0])
+
+
+def _color_counts(solver):
+    """Units per color of world 0, and the units of the serial tail."""
+    offsets = solver._color_world_offsets.numpy()[: PROPAGATION_COLOR_TAIL + 2].astype(np.int64)
+    counts = np.diff(offsets)
+    return counts[:PROPAGATION_COLOR_TAIL], int(counts[PROPAGATION_COLOR_TAIL])
 
 
 def _first_fit_reference(solver, world=0):
-    """Reference coloring of world 0's units."""
+    """Color world 0's units on the host in the solver's color order."""
     stride = solver._propagation_max_constraints
     n = min(int(solver._color_world_unit_cursor.numpy()[world]), stride)
     base = world * stride
@@ -1994,9 +2142,9 @@ def _sweep_cost(color, length):
     return colored + int(length[tail].sum())
 
 
-def _run_prebuild(worlds, max_constraints, max_body_span, longest_first):
+def _run_prebuild(device, worlds, max_constraints, max_body_span, longest_first):
     """Color per-world unit lists ``(contact, body_a, body_b, length)`` with the pre-build kernel."""
-    device = wp.get_device("cuda:0")
+    device = wp.get_device(device)
     entries = PROPAGATION_COLOR_TAIL + 2
     words = (PROPAGATION_COLOR_TAIL + 31) // 32
     stride = 1 << max(max_constraints - 1, 0).bit_length()
@@ -2050,234 +2198,152 @@ def _run_prebuild(worlds, max_constraints, max_body_span, longest_first):
     ]
 
 
-@unittest.skipUnless(wp.get_device().is_cuda, "propagation_colored requires CUDA")
-class TestSteelColoredScheduling(unittest.TestCase):
-    def test_dense_heap_colors_without_a_serial_tail(self):
-        """A dense heap must color into few colors with nothing left for the serial tail.
+def test_dense_heap_colors_without_a_serial_tail(test, device):
+    """Color a dense heap into few, full colors with nothing left for the serial tail."""
+    model = _heap(device)
+    solver = _colored_solver(model)
+    state, contact_count = _settle(model, solver)
+    test.assertTrue(np.isfinite(state.body_q.numpy()).all())
+    test.assertGreater(contact_count, 400)
+    counts, tail = _color_counts(solver)
+    used = int(np.sum(counts > 0))
+    test.assertEqual(tail, 0)
+    test.assertLess(used, PROPAGATION_COLOR_TAIL // 2)
+    test.assertGreater(counts[counts > 0].mean(), 8.0)
 
-        Round-based ticket bidding admitted only the units holding the maximum ticket on
-        both of their bodies, which on a heap is a handful per round: it exhausted the
-        color budget and spilled most units into the ordered serial tail, making the
-        sweep serial. First-fit greedy edge coloring is bounded by 2*degree-1 colors.
-        """
-        model, _ = _heap()
-        solver, state, contacts = _settle(model)
-        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
-        self.assertGreater(contacts, 400, "heap did not generate a dense contact set")
 
+def test_kinematic_hub_does_not_serialize_its_contacts(test, device):
+    """Leave a kinematic body out of the conflicts, so a tray under the heap adds few colors."""
+    colors = {}
+    for tray in (False, True):
+        model = _heap(device, kinematic_tray=tray)
+        solver = _colored_solver(model)
+        state, _ = _settle(model, solver)
+        test.assertTrue(np.isfinite(state.body_q.numpy()).all())
         counts, tail = _color_counts(solver)
-        used = int(np.sum(counts > 0))
-        self.assertEqual(tail, 0, f"{tail} units spilled into the serial overflow tail")
-        self.assertLess(used, PROPAGATION_COLOR_TAIL // 2, f"coloring used {used} colors")
-        self.assertGreater(
-            counts[counts > 0].mean(), 8.0, "colors hold too few units each; the sweep is effectively serial"
-        )
+        test.assertEqual(tail, 0)
+        colors[tray] = int(np.sum(counts > 0))
+    test.assertLessEqual(colors[True], 1.5 * colors[False] + 8)
 
-    def test_kinematic_hub_does_not_serialize_its_contacts(self):
-        """One kinematic body under the whole heap must not multiply the color count.
 
-        A prescribed body takes no velocity update from a row, so rows touching it cannot
-        conflict with each other. Counting it as a conflicting body gives every contact
-        against the tray its own color, so the count scales with the number of boxes
-        resting on it; exempting it keeps the coloring close to the tray-free heap.
-        """
-        model_free, _ = _heap()
-        solver_free, _, _ = _settle(model_free)
-        counts_free, tail_free = _color_counts(solver_free)
-        colors_free = int(np.sum(counts_free > 0))
+def test_kinematic_free_body_is_recorded_as_static(test, device):
+    """Record a kinematic free body as -1 in the units, and keep dynamic bodies."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.add_ground_plane()
+    kinematic = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.099), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(kinematic, hx=0.1, hy=0.1, hz=0.1)
+    dynamic = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.298), wp.quat_identity()))
+    builder.add_shape_box(dynamic, hx=0.1, hy=0.1, hz=0.1)
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = CONTACT_MAX
+    solver = _colored_solver(model, free_body_constraint_max=256)
+    _settle(model, solver, steps=1)
+    n = int(solver._color_world_unit_cursor.numpy()[0])
+    bodies = np.concatenate([solver._color_unit_body_a.numpy()[:n], solver._color_unit_body_b.numpy()[:n]])
+    test.assertGreater(n, 0)
+    test.assertNotIn(kinematic, bodies)
+    test.assertIn(dynamic, bodies)
 
-        model_hub, tray = _heap(kinematic_tray=True)
-        self.assertGreaterEqual(tray, 0)
-        solver_hub, state, _ = _settle(model_hub)
-        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
-        counts_hub, tail_hub = _color_counts(solver_hub)
-        colors_hub = int(np.sum(counts_hub > 0))
 
-        self.assertEqual(tail_free, 0)
-        self.assertEqual(tail_hub, 0)
-        self.assertLessEqual(
-            colors_hub,
-            1.5 * colors_free + 8,
-            f"a kinematic hub raised the color count from {colors_free} to {colors_hub}",
-        )
+def test_colored_result_matches_the_immediate_response(test, device):
+    """Settle the heap like the immediate response in either color order."""
+    variants = {
+        "immediate": {"solve_mode": "serial", "articulated_contact_response": "immediate"},
+        "contact": {"propagation_color_order": "contact"},
+        "longest_first": {"propagation_color_order": "longest_first"},
+    }
+    finals = {}
+    for name, options in variants.items():
+        model = _heap(device, nx=4, ny=4, nz=2)
+        solver = _colored_solver(model, row_watermark=True, **options)
+        state, _ = _settle(model, solver, steps=24)
+        test.assertEqual(solver.constraint_row_watermarks()["free_body_dropped_contact_rows_high_water"], 0)
+        finals[name] = state.body_q.numpy()[:, :3]
+    test.assertTrue(np.isfinite(finals["immediate"]).all())
+    # A different sweep order, so the heights agree only to a tolerance.
+    for name in ("contact", "longest_first"):
+        test.assertLess(float(np.max(np.abs(finals[name][:, 2] - finals["immediate"][:, 2]))), 0.01, name)
 
-    def test_colored_result_matches_the_immediate_response(self):
-        """The colored schedule must settle the heap like the reference row path."""
-        model, _ = _heap(nx=4, ny=4, nz=2)
-        _, colored, _ = _settle(model, steps=24)
-        model_ref, _ = _heap(nx=4, ny=4, nz=2)
-        model_ref.rigid_contact_max = 8192
-        solver = newton.solvers.SolverSteel(
-            model_ref,
-            articulated_contact_response="immediate",
-            iterations=6,
-            free_body_constraint_max=8192,
-            articulation_constraint_max=64,
-            row_watermark=True,
-        )
-        pipeline = newton.CollisionPipeline(model_ref, rigid_contact_max=8192)
-        contacts = pipeline.contacts()
-        s0, s1 = model_ref.state(), model_ref.state()
-        control = model_ref.control()
-        for _ in range(24):
-            s0.clear_forces()
-            pipeline.collide(s0, contacts)
-            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
-            s0, s1 = s1, s0
 
-        # An undersized reference drops rows in atomic order, which makes it nondeterministic.
-        self.assertEqual(solver.constraint_row_watermarks()["free_body_dropped_contact_rows_high_water"], 0)
-        a = colored.body_q.numpy()[:, :3]
-        b = s0.body_q.numpy()[:, :3]
-        self.assertTrue(np.isfinite(b).all())
-        # Different sweep order, so not bitwise equal; the heap must still stand.
-        self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
+def test_coloring_is_deterministic_for_a_fixed_contact_set(test, device):
+    """Give the same partition and velocities for the same state and contacts.
 
-    def test_coloring_is_deterministic_for_a_fixed_contact_set(self):
-        """Same state and contacts must give the same partition and the same velocities.
+    The units are gathered with an atomic cursor, so the coloring sorts them (by row count and) by contact first.
+    """
+    model = _heap(device)
+    state, _ = _settle(model, _colored_solver(model))
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=CONTACT_MAX)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    control = model.control()
+    results = []
+    for _ in range(3):
+        state_in, state_out = model.state(), model.state()
+        for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+            wp.copy(getattr(state_in, name), getattr(state, name))
+        solver = _colored_solver(model)
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        offsets = solver._color_world_offsets.numpy()[: PROPAGATION_COLOR_TAIL + 2].copy()
+        order = solver._color_unit_sorted.numpy()[: offsets[-1]].copy()
+        results.append((offsets, order, state_out.body_qd.numpy().copy()))
+    offsets, order, body_qd = results[0]
+    test.assertGreater(int(offsets[-1]), 400)
+    for other_offsets, other_order, other_qd in results[1:]:
+        np.testing.assert_array_equal(other_offsets, offsets)
+        np.testing.assert_array_equal(other_order, order)
+        np.testing.assert_array_equal(other_qd, body_qd)
 
-        The unit list is gathered with an atomic cursor, so its order differs between
-        launches; the coloring must not inherit that order. The pre-build kernel sorts
-        units by row count and global contact index before the order-dependent greedy pass.
-        """
-        model, _ = _heap()
-        _, state, _ = _settle(model)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
-        contacts = pipeline.contacts()
-        state.clear_forces()
-        pipeline.collide(state, contacts)
-        control = model.control()
-        results = []
-        for _ in range(3):
-            state_in, state_out = model.state(), model.state()
-            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
-                getattr(state_in, name).assign(getattr(state, name))
-            trial = newton.solvers.SolverSteel(
-                model,
-                solve_mode="colored",
-                articulated_contact_response="propagation",
-                iterations=6,
-                contact_warmstart=False,
-                free_body_constraint_max=8192,
-                articulation_constraint_max=64,
-            )
-            trial.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-            entries = PROPAGATION_COLOR_TAIL + 2
-            offsets = trial._color_world_offsets.numpy()[:entries].copy()
-            order = trial._color_unit_sorted.numpy()[: offsets[-1]].copy()
-            results.append((offsets, order, state_out.body_qd.numpy().copy()))
-        offsets, order, body_qd = results[0]
-        self.assertGreater(int(offsets[-1]), 400)
-        for other_offsets, other_order, other_qd in results[1:]:
-            np.testing.assert_array_equal(other_offsets, offsets)
-            np.testing.assert_array_equal(other_order, order)
-            np.testing.assert_array_equal(other_qd, body_qd)
 
-    def test_prescribed_mask_marks_kinematic_roots(self):
-        """Kinematic bodies, free or articulation roots, have zero response and may be shared by a color.
-
-        A dynamic link below a kinematic root keeps its own response and stays a conflict.
-        """
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.add_ground_plane()
-        free_kinematic = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True
-        )
-        builder.add_shape_box(free_kinematic, hx=0.1, hy=0.1, hz=0.1)
-        free_dynamic = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
-        builder.add_shape_box(free_dynamic, hx=0.1, hy=0.1, hz=0.1)
-        # add_link, not add_body: add_body wraps each body in its own free-joint articulation.
-        root = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
-        builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
-        j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
-        link = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.8), wp.quat_identity()))
-        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
-        j_link = builder.add_joint_revolute(
-            parent=root,
-            child=link,
-            axis=wp.vec3(0.0, 1.0, 0.0),
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
-        )
-        builder.add_articulation([j_root, j_link], label="kinematic_root_chain")
-        model = builder.finalize()
-        model.rigid_contact_max = 256
-        solver = newton.solvers.SolverSteel(
-            model,
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-            free_body_constraint_max=256,
-        )
-        prescribed = solver._body_prescribed.numpy()
-        self.assertEqual(int(prescribed[free_kinematic]), 1)
-        self.assertEqual(int(prescribed[free_dynamic]), 0)
-        self.assertEqual(int(prescribed[root]), 1)
-        self.assertEqual(int(prescribed[link]), 0)
-
-    def test_prebuild_matches_the_first_fit_reference(self):
-        """The device coloring reproduces the first-fit reference exactly in either color order.
-
-        The prebuild stages units in shared memory for its serial passes, sorts packed
-        keys in shared memory when a world has at most 4096 units, and keeps the
-        used-color masks in shared memory when the unit bodies span at most 256
-        indices. The large heap spans more bodies than that and takes the global masks.
-        """
-        for shape, order in (((6, 6, 3), "longest_first"), ((7, 7, 6), "longest_first"), ((7, 7, 6), "contact")):
-            model, _ = _heap(*shape)
-            solver, state, _ = _settle(model, steps=4, propagation_color_order=order)
-            self.assertTrue(np.isfinite(state.body_q.numpy()).all())
+def test_prebuild_matches_the_first_fit_reference(test, device):
+    """Reproduce the host first-fit coloring exactly in either order, with shared and with global used-color masks."""
+    for shape, order in (((6, 6, 3), "longest_first"), ((7, 7, 6), "longest_first"), ((7, 7, 6), "contact")):
+        with test.subTest(shape=shape, order=order):
+            model = _heap(device, *shape)
+            # The large heap overflows the rows; the coloring covers the units that were allocated.
+            solver = _colored_solver(model, warn_constraint_overflow=False, propagation_color_order=order)
+            state, _ = _settle(model, solver, steps=4)
+            test.assertTrue(np.isfinite(state.body_q.numpy()).all())
             n, color, offsets, row_start, sorted_contact = _first_fit_reference(solver)
-            self.assertGreater(n, 400)
-            entries = PROPAGATION_COLOR_TAIL + 2
-            np.testing.assert_array_equal(
-                solver._color_unit_color.numpy()[:n], color, err_msg=f"{shape} {order} colors"
-            )
-            np.testing.assert_array_equal(
-                solver._color_world_offsets.numpy()[:entries], offsets, err_msg=f"{shape} {order}"
-            )
-            np.testing.assert_array_equal(
-                solver._color_world_row_order.numpy()[:n], row_start, err_msg=f"{shape} {order}"
-            )
-            np.testing.assert_array_equal(
-                solver._color_unit_sorted.numpy()[:n], sorted_contact, err_msg=f"{shape} {order}"
-            )
+            test.assertGreater(n, 400)
+            np.testing.assert_array_equal(solver._color_unit_color.numpy()[:n], color)
+            np.testing.assert_array_equal(solver._color_world_offsets.numpy()[: PROPAGATION_COLOR_TAIL + 2], offsets)
+            np.testing.assert_array_equal(solver._color_world_row_order.numpy()[:n], row_start)
+            np.testing.assert_array_equal(solver._color_unit_sorted.numpy()[:n], sorted_contact)
 
-    def test_longest_first_reaches_the_hub_lower_bound(self):
-        """Long units mixed with short ones on a hub cost only the hub's own rows with longest_first.
 
-        Every hub unit needs its own color, so a sweep walks at least the hub units' rows. Here
-        a star of long units with the lowest contact indices and ground contacts on the hub's
-        partners fill the colors of short hub units under the contact order, which costs more.
-        """
-        k, star = 6, 4
-        hub, star_center = 0, 50
-        units = []
-        for j in range(star):
-            units.append((j, star_center, star_center + 1 + j, 6))
-        for j in range(k):
-            units.append((10 + 2 * j, hub, 1 + j, 1))
-            units.append((11 + 2 * j, hub, 1 + k + j, 6))
-        for j in range(k):
-            units.append((100 + j, -1, 1 + j, 3))
-        contact, body_a, body_b, length = (np.array(f, dtype=np.int32) for f in zip(*units, strict=True))
-        rng = np.random.default_rng(0)
-        perm = rng.permutation(len(contact))
-        contact, body_a, body_b, length = contact[perm], body_a[perm], body_b[perm], length[perm]
-        hub_rows = int(length[(body_a == hub) | (body_b == hub)].sum())
+def test_longest_first_reaches_the_hub_lower_bound(test, device):
+    """Cost only the hub's own rows with longest_first when long and short units share a hub.
 
-        by_contact = _first_fit_coloring(contact, body_a, body_b, length, longest_first=False)[0]
-        contact_rows = _sweep_cost(by_contact, length)
-        self.assertGreater(contact_rows, hub_rows, "the case does not discriminate the order")
-        for longest_first, span in ((True, 0), (True, 256), (False, 0), (False, 256)):
+    Every hub unit needs its own color, so a sweep walks at least the hub units' rows. A star of
+    long units with the lowest contact indices and ground contacts on the hub's partners fill the
+    colors of short hub units under the contact order, which then costs more.
+    """
+    k, star = 6, 4
+    hub, star_center = 0, 50
+    units = [(j, star_center, star_center + 1 + j, 6) for j in range(star)]
+    for j in range(k):
+        units.append((10 + 2 * j, hub, 1 + j, 1))
+        units.append((11 + 2 * j, hub, 1 + k + j, 6))
+    units.extend((100 + j, -1, 1 + j, 3) for j in range(k))
+    contact, body_a, body_b, length = (np.array(f, dtype=np.int32) for f in zip(*units, strict=True))
+    perm = np.random.default_rng(0).permutation(len(contact))
+    contact, body_a, body_b, length = contact[perm], body_a[perm], body_b[perm], length[perm]
+    hub_rows = int(length[(body_a == hub) | (body_b == hub)].sum())
+
+    contact_rows = _sweep_cost(_first_fit_coloring(contact, body_a, body_b, length, longest_first=False)[0], length)
+    test.assertGreater(contact_rows, hub_rows, "the case does not discriminate the order")
+    # The sort-paths test's kernels; its larger world covers the global used-color masks.
+    for longest_first in (True, False):
+        with test.subTest(longest_first=longest_first):
             color, offsets, row_start, sorted_contact, slot = _run_prebuild(
-                [(contact, body_a, body_b, length)], 64, span, longest_first
+                device, [(contact, body_a, body_b, length)], 8192, 256, longest_first
             )[0]
-            expected_rows = hub_rows if longest_first else contact_rows
-            self.assertEqual(_sweep_cost(color, length), expected_rows, f"longest_first {longest_first} span {span}")
-            self.assertFalse(np.any(color == PROPAGATION_COLOR_TAIL))
+            test.assertEqual(_sweep_cost(color, length), hub_rows if longest_first else contact_rows)
+            test.assertFalse(np.any(color == PROPAGATION_COLOR_TAIL))
             for c in np.unique(color):
                 bodies = np.concatenate([body_a[color == c], body_b[color == c]])
                 bodies = bodies[bodies >= 0]
-                self.assertEqual(len(bodies), len(np.unique(bodies)), f"color {c} shares a body")
+                test.assertEqual(len(bodies), len(np.unique(bodies)), f"color {c} shares a body")
             expected = _first_fit_coloring(contact, body_a, body_b, length, longest_first)
             np.testing.assert_array_equal(color, expected[0])
             np.testing.assert_array_equal(offsets, expected[1])
@@ -2285,536 +2351,75 @@ class TestSteelColoredScheduling(unittest.TestCase):
             np.testing.assert_array_equal(sorted_contact, expected[3])
             np.testing.assert_array_equal(slot[sorted_contact], row_start)
 
-    def test_prebuild_matches_the_reference_on_both_sort_paths(self):
-        """A world over 4096 units sorts in global memory; both paths give the reference coloring in either order.
 
-        Each world is colored twice from differently shuffled unit lists, as the atomic gather
-        would produce, and both launches must match the reference exactly.
-        """
-        rng = np.random.default_rng(1)
-        worlds, next_contact, body_base = [], 0, 0
-        for n_units, n_bodies in ((700, 40), (5000, 400)):
-            contact = np.sort(rng.choice(4 * n_units, n_units, replace=False)).astype(np.int32) + next_contact
-            next_contact = int(contact.max()) + 1
-            body_a = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
-            body_b = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
-            body_b[body_b == body_a] = -1
-            body_a[rng.random(n_units) < 0.2] = -1
-            length = rng.choice(np.array([1, 3, 6, 7], dtype=np.int32), n_units)
-            worlds.append((contact, body_a, body_b, length))
-            body_base += n_bodies
-        for longest_first, trial in ((True, 0), (True, 1), (False, 0), (False, 1)):
-            shuffled = []
-            for units in worlds:
-                perm = rng.permutation(len(units[0]))
-                shuffled.append(tuple(f[perm] for f in units))
-            results = _run_prebuild(shuffled, 8192, 256, longest_first)
-            for w, (units, result) in enumerate(zip(shuffled, results, strict=True)):
-                expected = _first_fit_coloring(*units, longest_first)
-                for name, got, want in zip(
-                    ("color", "offsets", "row start", "contact"), result, expected, strict=False
-                ):
-                    np.testing.assert_array_equal(
-                        got, want, err_msg=f"longest_first {longest_first} trial {trial} world {w} {name}"
-                    )
+def test_prebuild_matches_the_reference_on_both_sort_paths(test, device):
+    """Match the reference in either order whether a world sorts in shared memory or, above 4096 units, in global memory.
 
-    def test_color_order_option_is_validated(self):
-        """Reject an unknown propagation_color_order and keep the option read-only."""
-        model, _ = _heap(nx=2, ny=2, nz=1)
-        model.rigid_contact_max = 256
-        kwargs = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
-        with self.assertRaisesRegex(ValueError, "propagation_color_order must be"):
-            newton.solvers.SolverSteel(model, propagation_color_order="longest", **kwargs)
-        solver = newton.solvers.SolverSteel(model, propagation_color_order="contact", **kwargs)
-        self.assertEqual(solver.propagation_color_order, "contact")
-        with self.assertRaises(AttributeError):
-            solver.propagation_color_order = "longest_first"
-
-    def test_colored_accepts_a_large_row_budget(self):
-        """The coloring keeps per-unit state in global scratch, so no staging cap applies."""
-        model, _ = _heap(nx=2, ny=2, nz=1)
-        model.rigid_contact_max = 65536
-        solver = newton.solvers.SolverSteel(
-            model,
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-            free_body_constraint_max=32768,
-            articulation_constraint_max=2048,
-        )
-        self.assertEqual(int(solver._propagation_max_constraints), 32768 + 2048)
-
-
-def _add_arm_on_heap(world, *, heap=(5, 2, 2), tight_limits=False, links=6):
-    """A fixed-base arm of ``links`` revolute links drooping onto a box heap; spheres on links 0, 3 and the last."""
-    world.default_shape_cfg.density = 1000.0
-    world.default_shape_cfg.mu = 0.7
-    no_collision = world.default_shape_cfg.copy()
-    no_collision.has_shape_collision = False
-    no_collision.collision_group = 0
-    limits = {"limit_lower": -0.15, "limit_upper": 0.15, "velocity_limit": 4.0} if tight_limits else {}
-    prev, joints = -1, []
-    for i in range(links):
-        link = world.add_link()
-        world.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=no_collision)
-        if i in (0, 3, links - 1):
-            world.add_shape_sphere(link, radius=0.08)
-        parent_xform = wp.transform(
-            wp.vec3(0.0, 0.0, 0.32) if prev == -1 else wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()
-        )
-        joints.append(
-            world.add_joint_revolute(
-                parent=prev,
-                child=link,
-                axis=wp.vec3(0.0, 1.0, 0.0),
-                parent_xform=parent_xform,
-                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
-                **limits,
-            )
-        )
-        prev = link
-    world.add_articulation(joints)
-    nx, ny, nz = heap
-    for ix in range(nx):
-        for iy in range(ny):
-            for iz in range(nz):
-                body = world.add_body(
-                    xform=wp.transform(
-                        wp.vec3(0.15 + 0.216 * ix, 0.083 * (iy - (ny - 1) / 2), 0.041 + 0.082 * iz),
-                        wp.quat_rpy(0.0, 0.0, 0.05 * (ix + iy + iz)),
-                    )
+    Each world is colored twice from differently shuffled unit lists, as the atomic gather would
+    produce, and both launches must match the reference exactly.
+    """
+    rng = np.random.default_rng(1)
+    worlds, next_contact, body_base = [], 0, 0
+    for n_units, n_bodies in ((700, 40), (5000, 400)):
+        contact = np.sort(rng.choice(4 * n_units, n_units, replace=False)).astype(np.int32) + next_contact
+        next_contact = int(contact.max()) + 1
+        body_a = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
+        body_b = (rng.integers(0, n_bodies, n_units) + body_base).astype(np.int32)
+        body_b[body_b == body_a] = -1
+        body_a[rng.random(n_units) < 0.2] = -1
+        length = rng.choice(np.array([1, 3, 6, 7], dtype=np.int32), n_units)
+        worlds.append((contact, body_a, body_b, length))
+        body_base += n_bodies
+    for longest_first, trial in ((True, 0), (True, 1), (False, 0), (False, 1)):
+        shuffled = []
+        for units in worlds:
+            perm = rng.permutation(len(units[0]))
+            shuffled.append(tuple(f[perm] for f in units))
+        results = _run_prebuild(device, shuffled, 8192, 256, longest_first)
+        for w, (units, result) in enumerate(zip(shuffled, results, strict=True)):
+            expected = _first_fit_coloring(*units, longest_first)
+            for name, got, want in zip(("color", "offsets", "row start", "contact"), result, expected, strict=False):
+                np.testing.assert_array_equal(
+                    got, want, err_msg=f"longest_first {longest_first} trial {trial} world {w} {name}"
                 )
-                world.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
 
 
-def _build_arm_heap_model(device: str, worlds: int = N_WORLDS, **world_kwargs) -> newton.Model:
-    scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
-    scene.rigid_gap = 0.005
-    for _ in range(worlds):
-        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        world.rigid_gap = 0.005
-        _add_arm_on_heap(world, **world_kwargs)
-        scene.add_world(world)
-    scene.add_ground_plane()
-    model = scene.finalize(device=device)
-    model.rigid_contact_max = 4096 * worlds
-    return model
+def test_color_order_option_is_validated(test, device):
+    """Reject an unknown propagation_color_order and keep the option read-only."""
+    model = _heap(device, nx=2, ny=2, nz=1)
+    with test.assertRaisesRegex(ValueError, "propagation_color_order must be"):
+        _colored_solver(model, propagation_color_order="longest")
+    solver = _colored_solver(model, propagation_color_order="longest_first")
+    test.assertEqual(solver.propagation_color_order, "longest_first")
+    with test.assertRaises(AttributeError):
+        solver.propagation_color_order = "contact"
 
 
-_STATE_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
+def test_colored_accepts_a_large_row_budget(test, device):
+    """Keep the per-unit coloring state in global scratch, so the row budget is uncapped."""
+    model = _heap(device, nx=2, ny=2, nz=1)
+    model.rigid_contact_max = 65536
+    solver = _colored_solver(model, free_body_constraint_max=32768, articulation_constraint_max=2048)
+    test.assertEqual(solver._propagation_max_constraints, 32768 + 2048)
 
 
-def _colored_deterministic_solver(model, **kwargs):
-    args = {
-        "solve_mode": "colored",
-        "articulated_contact_response": "propagation",
-        "deterministic": True,
-        "iterations": 16,
-        "contact_regularization": 0.01,
-        "free_body_constraint_max": 1024,
-        "articulation_constraint_max": 128,
-        "enable_joint_limits": True,
-        "row_watermark": True,
-    }
-    args.update(kwargs)
-    return SolverSteel(model, **args)
+class TestSteelColoredScheduling(unittest.TestCase):
+    pass
 
 
-class _Stepper:
-    """One solver, one deterministic pipeline and a state pair advanced in place, so steps can be captured."""
-
-    def __init__(self, model, **solver_kwargs):
-        self.model = model
-        self.solver = _colored_deterministic_solver(model, **solver_kwargs)
-        self.pipeline = newton.CollisionPipeline(model, rigid_contact_max=model.rigid_contact_max, deterministic=True)
-        self.contacts = self.pipeline.contacts()
-        self.state_in, self.state_out = model.state(), model.state()
-        self.control = model.control()
-
-    def step(self):
-        self.state_in.clear_forces()
-        self.pipeline.collide(self.state_in, self.contacts)
-        self.solver.step(self.state_in, self.state_out, self.control, self.contacts, DT)
-        for name in _STATE_FIELDS:
-            wp.copy(getattr(self.state_in, name), getattr(self.state_out, name))
-
-    def snapshot(self):
-        return {name: getattr(self.state_in, name).numpy().copy() for name in _STATE_FIELDS}
-
-
-def _world_slices(model, worlds):
-    """Per-field index slices of each world's rows, for replicated worlds."""
-    counts = {"body_q": model.body_count, "body_qd": model.body_count}
-    counts.update(joint_q=model.joint_coord_count, joint_qd=model.joint_dof_count)
-    return {name: [slice(w * n // worlds, (w + 1) * n // worlds) for w in range(worlds)] for name, n in counts.items()}
-
-
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-class TestSteelColoredDeterministic(unittest.TestCase):
-    """``deterministic=True`` on the colored response: repeatable within the mode; bitwise agreement with immediate is not guaranteed."""
-
-    STEPS = 80
-
-    def _rollout(self, model, steps, capture_at=None, **solver_kwargs):
-        stepper = _Stepper(model, **solver_kwargs)
-        graph = None
-        history = []
-        for k in range(steps):
-            if k == capture_at:
-                with wp.ScopedCapture() as capture:
-                    stepper.step()
-                graph = capture.graph
-            elif graph is not None:
-                wp.capture_launch(graph)
-            else:
-                stepper.step()
-            history.append(stepper.snapshot())
-        return history, stepper
-
-    def _assert_bitwise(self, model, steps=STEPS, capture_at=None, **solver_kwargs):
-        first, stepper = self._rollout(model, steps, capture_at=capture_at, **solver_kwargs)
-        second, _ = self._rollout(model, steps, capture_at=capture_at, **solver_kwargs)
-        slices = _world_slices(model, N_WORLDS)
-        for k, (a, b) in enumerate(zip(first, second, strict=True)):
-            for name in _STATE_FIELDS:
-                np.testing.assert_array_equal(a[name], b[name], err_msg=f"run-to-run {name} at step {k}")
-                for world in range(1, N_WORLDS):
-                    np.testing.assert_array_equal(
-                        a[name][slices[name][world]], a[name][slices[name][0]], err_msg=f"world {world} {name} step {k}"
-                    )
-        return stepper
-
-    def test_gate_admits_colored_without_warm_start(self):
-        """Accept deterministic colored; reject it with contact warm start."""
-        model = _build_arm_heap_model("cuda:0", worlds=1)
-        _colored_deterministic_solver(model)
-        with self.assertRaisesRegex(ValueError, "with contact_warmstart requires"):
-            _colored_deterministic_solver(model, contact_warmstart=True)
-
-    def test_arm_on_heap_is_bitwise_repeatable(self):
-        """Repeat an arm pressing into a heap bitwise across runs and identical worlds."""
-        stepper = self._assert_bitwise(_build_arm_heap_model("cuda:0"))
-        self.assertGreaterEqual(int(stepper.solver._propagation_body_count.numpy().max()), 2)
-
-    def test_arm_on_heap_is_bitwise_repeatable_uncached(self):
-        """Repeat the arm-on-heap rollout bitwise with the cached response off."""
-        self._assert_bitwise(_build_arm_heap_model("cuda:0"), propagation_cached_response=False)
-
-    def test_overflow_with_limit_rows_is_bitwise_repeatable(self):
-        """Repeat bitwise while dense joint-limit, velocity-limit and propagation rows overflow their capacity."""
-        model = _build_arm_heap_model("cuda:0", tight_limits=True)
-        with _capture_device_stdout() as printed:
-            stepper = self._assert_bitwise(
-                model,
-                enable_joint_velocity_limits=True,
-                velocity_limit_activation_fraction=0.0,
-                free_body_constraint_max=160,
-                articulation_constraint_max=24,
-            )
-        # Each of the two rollouts warns once per overflowing row family.
-        self.assertEqual(printed.text.count("dense constraint-row overflow"), 2, printed.text)
-        self.assertEqual(printed.text.count("propagation constraint-row overflow"), 2, printed.text)
-        marks = stepper.solver.constraint_row_watermarks()
-        self.assertGreater(marks["propagation_overflow_world_steps"], 0, "scene must overflow its propagation rows")
-
-    def test_mixed_rows_are_bitwise_repeatable(self):
-        """Repeat bitwise with joint-limit and velocity-limit rows active alongside colored contact rows."""
-        stepper = self._assert_bitwise(
-            _build_arm_heap_model("cuda:0", tight_limits=True),
-            enable_joint_velocity_limits=True,
-            velocity_limit_activation_fraction=0.0,
-        )
-        marks = stepper.solver.constraint_row_watermarks()
-        self.assertGreater(marks["articulation_high_water"], 0, "scene must keep dense limit rows")
-        self.assertEqual(marks["propagation_overflow_world_steps"], 0)
-
-    def test_captured_rollout_is_bitwise_repeatable(self):
-        """Repeat bitwise when most steps replay a captured graph."""
-        self._assert_bitwise(_build_arm_heap_model("cuda:0"), capture_at=2)
-
-    def test_cold_capture_replays_like_eager_steps(self):
-        """Capture the first step of a fresh solver, then match an eager twin over repeated replays."""
-        model = _build_arm_heap_model("cuda:0")
-        for env in ({}, {"STEEL_COLORED_PREFETCH": "0"}, {"STEEL_COLORED_STAGED": "1"}):
-            with self.subTest(env=env), mock.patch.dict(os.environ, env):
-                graph_stepper = _Stepper(model)
-                eager = _Stepper(model)
-                # Capture records the first step without running it; each replay then pairs with one eager step.
-                with wp.ScopedCapture() as capture:
-                    graph_stepper.step()
-                for k in range(60):
-                    wp.capture_launch(capture.graph)
-                    eager.step()
-                    a, b = graph_stepper.snapshot(), eager.snapshot()
-                    for name in _STATE_FIELDS:
-                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
-
-    def test_moving_hub_cold_capture_replays_like_eager_steps(self):
-        """Cold-capture a moving kinematic hub with both passes folding, then match an eager twin on each route."""
-        for env in ({}, {"STEEL_COLORED_LANES": "3"}):
-            with self.subTest(env=env), mock.patch.dict(os.environ, env):
-                model, tray = _heap(nx=3, ny=3, nz=1, kinematic_tray=True)
-                model.rigid_contact_max = 2048
-                tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
-                tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
-                captured, eager = (
-                    _Stepper(
-                        model,
-                        iterations=4,
-                        velocity_iterations=2,
-                        free_body_constraint_max=512,
-                        articulation_constraint_max=64,
-                    )
-                    for _ in range(2)
-                )
-                for stepper in (captured, eager):
-                    qd = stepper.state_in.joint_qd.numpy()
-                    qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
-                    stepper.state_in.joint_qd.assign(qd)
-                    newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
-                with wp.ScopedCapture() as capture:
-                    captured.step()
-                # An eager step after recording must fold afresh rather than reuse the unexecuted capture's fold.
-                captured.step()
-                eager.step()
-                for k in range(12):
-                    wp.capture_launch(capture.graph)
-                    eager.step()
-                    a, b = captured.snapshot(), eager.snapshot()
-                    for name in _STATE_FIELDS:
-                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
-                count = int(captured.solver._propagation_constraint_count.numpy()[0])
-                self.assertGreater(count, 0)
-                swept = np.concatenate(
-                    [captured.solver._color_body_a.numpy()[0, :count], captured.solver._color_body_b.numpy()[0, :count]]
-                )
-                self.assertNotIn(tray, swept)
-
-    def test_graph_captured_before_a_body_turns_kinematic_keeps_folding(self):
-        """Replay a graph captured while every body was dynamic after one turns kinematic, and match an eager twin."""
-        for env in ({}, {"STEEL_COLORED_LANES": "3"}):
-            with self.subTest(env=env), mock.patch.dict(os.environ, env):
-                model, tray = _heap(nx=4, ny=4, nz=1, kinematic_tray=True)
-                model.rigid_contact_max = 2048
-                flags = model.body_flags.numpy()
-                flags[tray] &= ~int(newton.BodyFlags.KINEMATIC)
-                model.body_flags.assign(flags)
-                tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
-                tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
-                captured, eager = (
-                    _Stepper(
-                        model,
-                        iterations=4,
-                        velocity_iterations=2,
-                        free_body_constraint_max=512,
-                        articulation_constraint_max=64,
-                    )
-                    for _ in range(2)
-                )
-                with wp.ScopedCapture() as capture:
-                    captured.step()
-                flags[tray] |= int(newton.BodyFlags.KINEMATIC)
-                model.body_flags.assign(flags)
-                for stepper in (captured, eager):
-                    stepper.solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-                    qd = stepper.state_in.joint_qd.numpy()
-                    qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
-                    stepper.state_in.joint_qd.assign(qd)
-                    newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
-                for k in range(12):
-                    wp.capture_launch(capture.graph)
-                    eager.step()
-                    a, b = captured.snapshot(), eager.snapshot()
-                    for name in _STATE_FIELDS:
-                        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{env} replay {k} {name}")
-                solver = captured.solver
-                count = int(solver._propagation_constraint_count.numpy()[0])
-                rows = np.concatenate(
-                    [solver._propagation_body_a.numpy()[0, :count], solver._propagation_body_b.numpy()[0, :count]]
-                )
-                swept = np.concatenate(
-                    [solver._color_body_a.numpy()[0, :count], solver._color_body_b.numpy()[0, :count]]
-                )
-                self.assertIn(tray, rows)
-                self.assertNotIn(tray, swept, "the replayed sweep still addresses the now-kinematic tray")
-                shape_body = model.shape_body.numpy()
-                shape0 = captured.contacts.rigid_contact_shape0.numpy()
-                shape1 = captured.contacts.rigid_contact_shape1.numpy()
-                offsets = solver._color_world_offsets.numpy()[: PROPAGATION_COLOR_TAIL + 2]
-                units = solver._color_unit_sorted.numpy()
-                tray_units = [
-                    sum(
-                        any(sh >= 0 and shape_body[sh] == tray for sh in (shape0[c], shape1[c]))
-                        for c in units[offsets[i] : offsets[i + 1]]
-                    )
-                    for i in range(PROPAGATION_COLOR_TAIL + 1)
-                ]
-                self.assertGreaterEqual(max(tray_units), 8, "the tray must be shared by many units of one color")
-
-    def test_partial_reset_keeps_synced_and_untouched_worlds_in_lockstep(self):
-        """Copy world 0 into world 1, reset only those two, and keep every field bitwise in lockstep."""
-        model = _build_arm_heap_model("cuda:0")
-        slices = _world_slices(model, N_WORLDS)
-        synced, reference = _Stepper(model), _Stepper(model)
-        for stepper in (synced, reference):
-            q = stepper.state_in.joint_q.numpy()
-            q[slices["joint_q"][1]] += 0.05
-            stepper.state_in.joint_q.assign(q)
-            newton.eval_fk(model, stepper.state_in.joint_q, stepper.state_in.joint_qd, stepper.state_in)
-        for _ in range(30):
-            synced.step()
-            reference.step()
-        for name in _STATE_FIELDS:
-            for state in (synced.state_in, synced.state_out):
-                values = getattr(state, name).numpy()
-                values[slices[name][1]] = values[slices[name][0]]
-                getattr(state, name).assign(values)
-        mask = np.zeros(N_WORLDS, dtype=bool)
-        mask[:2] = True
-        synced.solver.reset(synced.state_in, world_mask=wp.array(mask, dtype=wp.bool, device=model.device))
-        synced.pipeline.reset_contact_matching(wp.array(np.append(mask, False), dtype=wp.bool, device=model.device))
-        for k in range(60):
-            synced.step()
-            reference.step()
-            a, b = synced.snapshot(), reference.snapshot()
-            for name in _STATE_FIELDS:
-                np.testing.assert_array_equal(a[name][slices[name][1]], a[name][slices[name][0]], err_msg=f"{name} {k}")
-                for world in (2, 3):
-                    np.testing.assert_array_equal(
-                        a[name][slices[name][world]], b[name][slices[name][world]], err_msg=f"world {world} {name} {k}"
-                    )
-
-    def test_unit_gather_order_does_not_change_the_rollout(self):
-        """Gather each world's units serially in reverse contact order and keep the rollout bitwise."""
-        model = _build_arm_heap_model("cuda:0")
-        reference, _ = self._rollout(model, 40)
-        module = inspect.getmodule(SolverSteel)
-        launch = wp.launch
-
-        def adverse_launch(kernel, dim, *args, **kwargs):
-            if kernel is module.collect_propagation_units:
-                kernel, dim = _collect_propagation_units_reversed, model.world_count
-            return launch(kernel, dim, *args, **kwargs)
-
-        with patch.object(module.wp, "launch", adverse_launch):
-            adverse, _ = self._rollout(model, 40)
-        for k, (a, b) in enumerate(zip(reference, adverse, strict=True)):
-            for name in _STATE_FIELDS:
-                np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} step {k}")
-
-    def test_moving_kinematic_hub_is_never_written(self):
-        """Keep the sweep off a moving kinematic tray shared by many units of one color; it still drives the heap, repeatably."""
-        model, tray = _heap(nx=5, ny=5, nz=2, kinematic_tray=True)
-        model.rigid_contact_max = 8192
-        tray_joint = int(np.flatnonzero(model.joint_child.numpy() == tray)[0])
-        tray_dof = int(model.joint_qd_start.numpy()[tray_joint])
-        for velocity_iterations in (0, 2):
-            with self.subTest(velocity_iterations=velocity_iterations):
-                self._check_kinematic_hub(model, tray, tray_dof, velocity_iterations)
-
-    def _check_kinematic_hub(self, model, tray, tray_dof, velocity_iterations):
-        def rollout(response):
-            solver = SolverSteel(
-                model,
-                **steel_mode_options(response),
-                deterministic=True,
-                velocity_iterations=velocity_iterations,
-                iterations=16,
-                free_body_constraint_max=8192,
-                articulation_constraint_max=64,
-            )
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192, deterministic=True)
-            contacts = pipeline.contacts()
-            state_in, state_out = model.state(), model.state()
-            qd = state_in.joint_qd.numpy()
-            qd[tray_dof : tray_dof + 6] = (0.2, 0.0, 0.0, 0.0, 0.0, 0.3)
-            state_in.joint_qd.assign(qd)
-            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            control = model.control()
-            for _ in range(40):
-                state_in.clear_forces()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-                state_in, state_out = state_out, state_in
-            return solver, contacts, state_in.body_qd.numpy().copy(), state_in.body_q.numpy().copy()
-
-        solver, contacts, body_qd, body_q = rollout("colored")
-        _, _, repeat_qd, repeat_q = rollout("colored")
-        np.testing.assert_array_equal(body_qd, repeat_qd)
-        np.testing.assert_array_equal(body_q, repeat_q)
-        immediate_qd = rollout("immediate")[2]
-        shape_body = model.shape_body.numpy()
-        shape0 = contacts.rigid_contact_shape0.numpy()
-        shape1 = contacts.rigid_contact_shape1.numpy()
-
-        def touches_tray(contact):
-            return any(s >= 0 and shape_body[s] == tray for s in (shape0[contact], shape1[contact]))
-
-        entries = PROPAGATION_COLOR_TAIL + 2
-        offsets = solver._color_world_offsets.numpy()[:entries]
-        sorted_contacts = solver._color_unit_sorted.numpy()
-        per_color = [
-            sum(touches_tray(c) for c in sorted_contacts[offsets[i] : offsets[i + 1]]) for i in range(entries - 1)
-        ]
-        self.assertGreaterEqual(max(per_color), 8, "the tray must be shared by many units of one color")
-        m = int(solver._propagation_constraint_count.numpy()[0])
-        rows = np.concatenate([solver._propagation_body_a.numpy()[0, :m], solver._propagation_body_b.numpy()[0, :m]])
-        swept = np.concatenate([solver._color_body_a.numpy()[0, :m], solver._color_body_b.numpy()[0, :m]])
-        self.assertIn(tray, rows)
-        self.assertNotIn(tray, swept, "the colored sweep still addresses the kinematic tray")
-        # The tray's prescribed motion still reaches the boxes resting on it.
-        bottom = [b for b in range(model.body_count) if b != tray and body_q[b, 2] < 0.065]
-        self.assertGreater(len(bottom), 10)
-        colored_vx = float(np.mean(body_qd[bottom, 0]))
-        immediate_vx = float(np.mean(immediate_qd[bottom, 0]))
-        self.assertGreater(colored_vx, 0.05)
-        # Without a velocity pass this fixture is sensitive to tiny start perturbations; gate parity where it is not.
-        if velocity_iterations > 0:
-            # Empirical bound from perturbed calibration runs on two GPU architectures, not a derived guarantee.
-            self.assertLess(abs(colored_vx - immediate_vx), 0.02)
-
-
-@wp.kernel
-def _collect_propagation_units_reversed(
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_world: wp.array[int],
-    contact_shape0: wp.array[int],
-    contact_shape1: wp.array[int],
-    shape_body: wp.array[int],
-    body_prescribed: wp.array[int],
-    contact_slots_needed: wp.array[int],
-    propagation_max_constraints: int,
-    world_unit_cursor: wp.array[int],
-    unit_contact: wp.array[int],
-    unit_body_a: wp.array[int],
-    unit_body_b: wp.array[int],
-    unit_len: wp.array[int],
+for _fn in (
+    test_dense_heap_colors_without_a_serial_tail,
+    test_kinematic_hub_does_not_serialize_its_contacts,
+    test_kinematic_free_body_is_recorded_as_static,
+    test_colored_result_matches_the_immediate_response,
+    test_coloring_is_deterministic_for_a_fixed_contact_set,
+    test_prebuild_matches_the_first_fit_reference,
+    test_longest_first_reaches_the_hub_lower_bound,
+    test_prebuild_matches_the_reference_on_both_sort_paths,
+    test_color_order_option_is_validated,
+    test_colored_accepts_a_large_row_budget,
 ):
-    """Gather like ``collect_propagation_units``, one thread per world walking contacts backwards."""
-    world = wp.tid()
-    for r in range(contact_count[0]):
-        c = contact_count[0] - 1 - r
-        if contact_path[c] != 2 or contact_world[c] != world:
-            continue
-        idx = world_unit_cursor[world]
-        world_unit_cursor[world] = idx + 1
-        if idx >= propagation_max_constraints:
-            continue
-        base = world * propagation_max_constraints
-        body_a = int(-1)
-        body_b = int(-1)
-        if contact_shape0[c] >= 0:
-            body_a = shape_body[contact_shape0[c]]
-            if body_a >= 0 and body_prescribed[body_a] != 0:
-                body_a = -1
-        if contact_shape1[c] >= 0:
-            body_b = shape_body[contact_shape1[c]]
-            if body_b >= 0 and body_prescribed[body_b] != 0:
-                body_b = -1
-        unit_contact[base + idx] = c
-        unit_body_a[base + idx] = body_a
-        unit_body_b[base + idx] = body_b
-        unit_len[base + idx] = contact_slots_needed[c]
+    add_function_test(TestSteelColoredScheduling, _fn.__name__, _fn, devices=devices)
 
 
 RADIUS = 0.05
@@ -2826,19 +2431,11 @@ ROW_CAPACITY = 6
 CONTACT_COUNT = 4
 
 
-FRICTION_GAP_THRESHOLD = 0.0
-
-
-def _build_mixed_gap_model(device: str) -> newton.Model:
-    """Build four disjoint spheres whose ground contacts use one or three rows."""
+def _mixed_gap_model(device):
+    """Four disjoint spheres whose ground contacts take one or three rows."""
     scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     world = newton.ModelBuilder()
-    cfg = newton.ModelBuilder.ShapeConfig(
-        density=0.0,
-        mu=0.6,
-        margin=0.0,
-        gap=0.015,
-    )
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.6, margin=0.0, gap=0.015)
     for index, gap in enumerate((-0.001, 0.004, 0.007, 0.010)):
         body = world.add_link(
             xform=wp.transform(wp.vec3(0.25 * index, 0.0, RADIUS + gap), wp.quat_identity()),
@@ -2853,624 +2450,316 @@ def _build_mixed_gap_model(device: str) -> newton.Model:
     return scene.finalize(device=device)
 
 
-def _make_solver_colored_unit_capacity(model: newton.Model, response: str) -> SolverSteel:
-    """Build a serial or colored propagation solver with six contact rows."""
-    solver = SolverSteel(
+def _unit_capacity_solver(model, response):
+    """Six propagation rows; friction only on the penetrating contact."""
+    return SolverSteel(
         model,
         **steel_mode_options(response),
         iterations=8,
-        contact_warmstart=False,
         propagation_cached_response=False,
+        friction_anchor_beta=0.0,
         articulation_constraint_max=3,
         free_body_constraint_max=3,
-        contact_friction_gap_max=FRICTION_GAP_THRESHOLD,
+        contact_friction_gap_max=0.0,
         contact_speculative_scale=0.0,
-        use_parallel_streams=False,
     )
-    solver._rigid_body_angular_damping.zero_()
-    return solver
 
 
-def _seed_state(model: newton.Model, state: newton.State) -> tuple[np.ndarray, np.ndarray]:
-    """Give every sphere the same downward speed and a distinct tangent speed."""
-    joint_q = state.joint_q.numpy().copy()
+def _seed(model, state):
+    """Give every sphere the same downward speed and a distinct tangential speed."""
     joint_qd = np.zeros(state.joint_qd.shape, dtype=np.float32)
     dof_starts = model.joint_qd_start.numpy()
     for index in range(CONTACT_COUNT):
-        dof = int(dof_starts[index])
-        joint_qd[dof] = 0.15 + 0.03 * index
-        joint_qd[dof + 2] = -0.1
-    state.joint_q.assign(joint_q)
+        joint_qd[int(dof_starts[index])] = 0.15 + 0.03 * index
+        joint_qd[int(dof_starts[index]) + 2] = -0.1
     state.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    return joint_q, joint_qd
 
 
-def _unit_impulses(model: newton.Model, solver: SolverSteel, contacts: newton.Contacts):
-    """Return propagation impulses keyed by the dynamic body of each contact."""
+def _unit_impulses(model, solver, contacts):
+    """Propagation impulses keyed by the dynamic body of each contact."""
     count = int(contacts.rigid_contact_count.numpy()[0])
-    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
-    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
     shape_body = model.shape_body.numpy()
+    shapes = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
     slots = solver._contact_slot.numpy()[:count]
     lengths = solver._contact_slots_needed.numpy()[:count]
-    paths = solver._contact_path.numpy()[:count]
     rows = solver._propagation_impulses.numpy()[0]
     result = {}
-    for contact in range(count):
-        if int(paths[contact]) != 2:
-            continue
-        body_a = int(shape_body[int(shape0[contact])]) if shape0[contact] >= 0 else -1
-        body_b = int(shape_body[int(shape1[contact])]) if shape1[contact] >= 0 else -1
-        body = max(body_a, body_b)
-        slot = int(slots[contact])
-        length = int(lengths[contact])
-        result[body] = rows[slot : slot + length].copy()
+    for contact in np.flatnonzero(solver._contact_path.numpy()[:count] == 2):
+        body = max(int(shape_body[shape[contact]]) if shape[contact] >= 0 else -1 for shape in shapes)
+        result[body] = rows[slots[contact] : slots[contact] + lengths[contact]].copy()
     return result
 
 
-def _assert_mixed_topology(test: unittest.TestCase, solver: SolverSteel, contacts: newton.Contacts) -> None:
-    """Keep all four mixed-length units in the first color and preserve their rows."""
+def _assert_mixed_topology(test, solver, contacts):
+    """Put all four disjoint units of one or three rows into the first color."""
     count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertEqual(count, CONTACT_COUNT)
-    paths = solver._contact_path.numpy()[:count]
-    np.testing.assert_array_equal(paths, np.full(CONTACT_COUNT, 2, dtype=np.int32))
-    lengths = solver._contact_slots_needed.numpy()[:count]
-    test.assertEqual(sorted(lengths.tolist()), [1, 1, 1, 3])
+    np.testing.assert_array_equal(solver._contact_path.numpy()[:count], 2)
+    test.assertEqual(sorted(solver._contact_slots_needed.numpy()[:count].tolist()), [1, 1, 1, 3])
     test.assertEqual(int(solver._propagation_constraint_count.numpy()[0]), ROW_CAPACITY)
-    test.assertEqual(int(solver._color_world_unit_cursor.numpy()[0]), CONTACT_COUNT)
-
     offsets = solver._color_world_offsets.numpy().reshape(solver._world_count, -1)[0]
-    bucket_counts = np.diff(offsets)
+    counts = np.diff(offsets)
     test.assertEqual(int(offsets[-1]), CONTACT_COUNT)
-    # Coloring now stages up to the row capacity, rather than row_capacity // 3.
-    # All four disjoint units fit even though three only have a normal row.
-    test.assertEqual(int(offsets[-2]), CONTACT_COUNT)
-    test.assertEqual(int(bucket_counts[0]), CONTACT_COUNT)
-    np.testing.assert_array_equal(bucket_counts[1:-1], np.zeros_like(bucket_counts[1:-1]))
-    test.assertEqual(int(bucket_counts[-1]), 0)
-
-    ordered = solver._color_unit_sorted.numpy()[:CONTACT_COUNT]
-    test.assertEqual(sorted(ordered.tolist()), list(range(CONTACT_COUNT)))
+    test.assertEqual(int(counts[0]), CONTACT_COUNT)
+    test.assertFalse(counts[1:].any())
+    test.assertEqual(sorted(solver._color_unit_sorted.numpy()[:CONTACT_COUNT].tolist()), list(range(CONTACT_COUNT)))
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "propagation_colored requires CUDA")
-class TestSteelColoredUnitCapacity(unittest.TestCase):
-    def test_mixed_gap_matches_serial_propagation(self):
-        """Match impulses, body velocity, and a short trajectory with mixed-length units."""
-        device = "cuda:0"
-        model = _build_mixed_gap_model(device)
-        colored = _make_solver_colored_unit_capacity(model, "colored")
-        serial = _make_solver_colored_unit_capacity(model, "propagation")
-        colored_in, colored_out = model.state(), model.state()
-        serial_in, serial_out = model.state(), model.state()
-        _seed_state(model, colored_in)
-        _seed_state(model, serial_in)
-        colored_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-        serial_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-        colored_contacts = colored_pipeline.contacts()
-        serial_contacts = serial_pipeline.contacts()
-        control = model.control()
-
-        for step in range(4):
-            colored_in.clear_forces()
-            serial_in.clear_forces()
-            colored_pipeline.collide(colored_in, colored_contacts)
-            serial_pipeline.collide(serial_in, serial_contacts)
-            colored.step(colored_in, colored_out, control, colored_contacts, DT)
-            serial.step(serial_in, serial_out, control, serial_contacts, DT)
-
-            if step == 0:
-                _assert_mixed_topology(self, colored, colored_contacts)
-            colored_impulses = _unit_impulses(model, colored, colored_contacts)
-            serial_impulses = _unit_impulses(model, serial, serial_contacts)
-            self.assertEqual(sorted(colored_impulses), sorted(serial_impulses))
-            for body, expected in serial_impulses.items():
-                np.testing.assert_allclose(colored_impulses[body], expected, rtol=2.0e-5, atol=2.0e-6)
-            np.testing.assert_allclose(
-                colored._propagation_body_qd.numpy(),
-                serial._propagation_body_qd.numpy(),
-                rtol=2.0e-5,
-                atol=2.0e-6,
-            )
-            np.testing.assert_allclose(
-                colored_out.joint_qd.numpy(), serial_out.joint_qd.numpy(), rtol=2.0e-5, atol=2.0e-6
-            )
-            np.testing.assert_allclose(
-                colored_out.joint_q.numpy(), serial_out.joint_q.numpy(), rtol=2.0e-5, atol=2.0e-6
-            )
-            colored_in, colored_out = colored_out, colored_in
-            serial_in, serial_out = serial_out, serial_in
-
-    def test_mixed_gap_cuda_graph_matches_eager(self):
-        """Replay a captured mixed-unit colored step with the same result as eager execution."""
-        device = wp.get_device("cuda:0")
-        model = _build_mixed_gap_model(str(device))
-        graph_solver = _make_solver_colored_unit_capacity(model, "colored")
-        eager_solver = _make_solver_colored_unit_capacity(model, "colored")
-        graph_state, graph_out = model.state(), model.state()
-        eager_state, eager_out = model.state(), model.state()
-        initial_q, initial_qd = _seed_state(model, graph_state)
-        _seed_state(model, eager_state)
-        graph_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-        eager_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-        graph_contacts = graph_pipeline.contacts()
-        eager_contacts = eager_pipeline.contacts()
-        graph_control = model.control()
-        eager_control = model.control()
-
-        def one_step(solver, pipeline, contacts, state_in, state_out, control):
-            state_in.clear_forces()
+def test_mixed_units_match_serial_propagation(test, device):
+    """Match the serial sweep's impulses, twists and trajectory with units of mixed row counts."""
+    model = _mixed_gap_model(device)
+    runs = {}
+    for response in ("colored", "propagation"):
+        solver = _unit_capacity_solver(model, response)
+        state_in, state_out = model.state(), model.state()
+        _seed(model, state_in)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        runs[response] = (solver, state_in, state_out, pipeline, pipeline.contacts())
+    control = model.control()
+    for step in range(4):
+        for response, (solver, state_in, state_out, pipeline, contacts) in runs.items():
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, control, contacts, DT)
-            wp.copy(state_in.body_q, state_out.body_q)
-            wp.copy(state_in.body_qd, state_out.body_qd)
-            wp.copy(state_in.joint_q, state_out.joint_q)
-            wp.copy(state_in.joint_qd, state_out.joint_qd)
-
-        one_step(graph_solver, graph_pipeline, graph_contacts, graph_state, graph_out, graph_control)
-        one_step(eager_solver, eager_pipeline, eager_contacts, eager_state, eager_out, eager_control)
-        for state in (graph_state, eager_state):
-            state.joint_q.assign(initial_q)
-            state.joint_qd.assign(initial_qd)
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-
-        with wp.ScopedCapture(device) as capture:
-            one_step(graph_solver, graph_pipeline, graph_contacts, graph_state, graph_out, graph_control)
-        wp.capture_launch(capture.graph)
-        one_step(eager_solver, eager_pipeline, eager_contacts, eager_state, eager_out, eager_control)
-
-        _assert_mixed_topology(self, graph_solver, graph_contacts)
-        np.testing.assert_allclose(graph_state.joint_q.numpy(), eager_state.joint_q.numpy(), rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(graph_state.joint_qd.numpy(), eager_state.joint_qd.numpy(), rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(
-            graph_solver._propagation_body_qd.numpy(),
-            eager_solver._propagation_body_qd.numpy(),
-            rtol=0.0,
-            atol=1.0e-6,
-        )
-
-
-def _build_model_leaf_publication(device="cpu", *, locked_d6=False, chain=False, leaves=7):
-    """Use real joints, nontrivial anchors/COMs, and unrelated moving bodies."""
-    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
-
-    def body(index):
-        return builder.add_link(
-            mass=0.5 + 0.1 * index,
-            com=wp.vec3(0.07, -0.03, 0.02),
-            inertia=wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5),
-        )
-
-    base = body(0)
-    root_kwargs = {
-        "parent": -1,
-        "child": base,
-        "parent_xform": wp.transform(wp.vec3(2.0, -1.0, 0.6), wp.quat_rpy(0.3, -0.2, 0.4)),
-        "child_xform": wp.transform(wp.vec3(0.2, -0.1, 0.05), wp.quat_rpy(-0.1, 0.2, 0.0)),
-    }
-    root = builder.add_joint_d6(**root_kwargs) if locked_d6 else builder.add_joint_fixed(**root_kwargs)
-    joints = [root]
-    leaf_bodies = []
-    for index in range(leaves):
-        child = body(index + 1)
-        leaf_bodies.append(child)
-        joints.append(
-            builder.add_joint_prismatic(
-                parent=(base if index == 0 else leaf_bodies[index - 1]) if chain else base,
-                child=child,
-                axis=wp.vec3(0.2 + 0.1 * index, 0.5, 0.9),
-                parent_xform=wp.transform(wp.vec3(0.1 * index, -0.05, 0.13), wp.quat_rpy(0.2, -0.1 * index, 0.3)),
-                child_xform=wp.transform(wp.vec3(-0.09, 0.04, 0.08), wp.quat_rpy(0.4, 0.2, -0.1)),
-                target_ke=3.0,
-                target_kd=0.2,
-                limit_lower=-0.5,
-                limit_upper=0.5,
+            runs[response] = (solver, state_out, state_in, pipeline, contacts)
+        colored, colored_state, _, _, colored_contacts = runs["colored"]
+        serial, serial_state, _, _, serial_contacts = runs["propagation"]
+        if step == 0:
+            _assert_mixed_topology(test, colored, colored_contacts)
+        colored_impulses = _unit_impulses(model, colored, colored_contacts)
+        serial_impulses = _unit_impulses(model, serial, serial_contacts)
+        test.assertEqual(sorted(colored_impulses), sorted(serial_impulses))
+        for body, expected in serial_impulses.items():
+            np.testing.assert_allclose(colored_impulses[body], expected, rtol=2.0e-5, atol=2.0e-6)
+        for name in ("joint_q", "joint_qd"):
+            np.testing.assert_allclose(
+                getattr(colored_state, name).numpy(), getattr(serial_state, name).numpy(), rtol=2.0e-5, atol=2.0e-6
             )
-        )
-    builder.add_articulation(joints)
-    arm = body(leaves + 1)
-    hinge = builder.add_joint_revolute(
-        parent=-1,
-        child=arm,
-        axis=newton.Axis.Y,
-        parent_xform=wp.transform(wp.vec3(-0.8, 0.1, 1.0), wp.quat_identity()),
-    )
-    builder.add_articulation([hinge])
-    free = body(leaves + 2)
-    builder.add_articulation([builder.add_joint_free(free)])
-    model = builder.finalize(device=device)
-    model.rigid_contact_max = 1
-    q = model.joint_q.numpy()
-    q[: leaves + 1] = np.linspace(-0.31, 0.27, leaves + 1)
-    model.joint_q.assign(q)
-    model.joint_qd.assign(np.linspace(-0.7, 0.8, model.joint_dof_count, dtype=np.float32))
-    # The specialized producer must not assume a unit axis.
-    axes = model.joint_axis.numpy()
-    axes[0] *= 1.4
-    model.joint_axis.assign(axes)
-    return model, joints, leaf_bodies
 
 
-def _build_branched_model(device="cpu", *, floating_root=False):
-    """Interleave terminal joints and internal parents with nonzero parent motion."""
-    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
-    bodies = [
-        builder.add_link(
-            mass=0.7 + 0.1 * index,
-            com=wp.vec3(0.03, -0.04, 0.02),
-            inertia=wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5),
-        )
-        for index in range(7)
-    ]
-    root_args = {"parent": -1, "child": bodies[0]}
-    root = builder.add_joint_free(**root_args) if floating_root else builder.add_joint_revolute(**root_args)
-    joints = [root]
-    # J1 is terminal despite preceding the internal J2. A prefix cannot express
-    # the retained traversal [J0, J2]; later leaves use both moving parents.
-    for index, kind in enumerate(("revolute", "revolute", "prismatic", "ball", "d6", "fixed"), start=1):
-        args = {
-            "parent": bodies[2] if index in (4, 5) else bodies[0],
-            "child": bodies[index],
-            "parent_xform": wp.transform(wp.vec3(0.1 * index, -0.07, 0.13), wp.quat_rpy(0.2, -0.1, 0.3)),
-            "child_xform": wp.transform(wp.vec3(-0.03, 0.04, 0.02), wp.quat_rpy(-0.1, 0.2, 0.1)),
-        }
-        if kind in ("revolute", "prismatic"):
-            args["axis"] = wp.vec3(0.2, 0.5, 0.9)
-        if kind == "d6":
-            args["linear_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X)]
-            args["angular_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Y)]
-        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
-    builder.add_articulation(joints)
-    model = builder.finalize(device=device)
-    q = model.joint_q.numpy()
-    starts = model.joint_q_start.numpy()
-    for joint in (1, 2, 3, 5):
-        q[starts[joint] : starts[joint + 1]] = 0.07 * joint
-    if floating_root:
-        q[:7] = (0.4, -0.2, 0.6, *wp.quat_rpy(0.3, -0.2, 0.1))
-    else:
-        q[0] = 0.31
-    model.joint_q.assign(q)
-    model.joint_qd.assign(np.linspace(-0.9, 0.8, model.joint_dof_count, dtype=np.float32))
-    return model, joints, bodies
+def test_mixed_units_graph_matches_eager(test, device):
+    """Replay a captured colored step with mixed units with the eager result."""
+    model = _mixed_gap_model(device)
+    finals = []
+    for capture in (False, True):
+        solver = _unit_capacity_solver(model, "colored")
+        state, output = model.state(), model.state()
+        _seed(model, state)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        contacts = pipeline.contacts()
+        control = model.control()
+
+        def substep(state=state, output=output, solver=solver, pipeline=pipeline, contacts=contacts, control=control):
+            pipeline.collide(state, contacts)
+            solver.step(state, output, control, contacts, DT)
+            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                wp.copy(getattr(state, name), getattr(output, name))
+
+        substep()
+        if capture:
+            with wp.ScopedCapture(device) as scope:
+                substep()
+            wp.capture_launch(scope.graph)
+            _assert_mixed_topology(test, solver, contacts)
+        else:
+            substep()
+        finals.append((state.joint_qd.numpy(), solver._propagation_body_qd.numpy()))
+    for got, want in zip(finals[1], finals[0], strict=True):
+        np.testing.assert_allclose(got, want, rtol=0.0, atol=1.0e-6)
 
 
-def _build_contact_model(device):
-    """Load three terminal joints against the ground under a moving root."""
-    builder = newton.ModelBuilder()
-    root = builder.add_link(mass=1.0, inertia=wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1))
-    joints = [
-        builder.add_joint_revolute(
-            parent=-1,
-            child=root,
-            axis=newton.Axis.Z,
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.185), wp.quat_identity()),
-        )
-    ]
-    for index, kind in enumerate(("revolute", "prismatic", "ball")):
-        child = builder.add_link(mass=0.5, inertia=wp.mat33(0.03, 0.0, 0.0, 0.0, 0.03, 0.0, 0.0, 0.0, 0.03))
-        args = {
-            "parent": root,
-            "child": child,
-            "parent_xform": wp.transform(wp.vec3(0.5 * (index - 1), 0.3, 0.0), wp.quat_identity()),
-        }
-        if kind != "ball":
-            args["axis"] = newton.Axis.Y if kind == "revolute" else newton.Axis.Z
-        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
-        builder.add_shape_sphere(child, radius=0.2)
-    builder.add_articulation(joints)
-    builder.add_ground_plane()
-    model = builder.finalize(device=device)
-    model.joint_qd.assign(np.linspace(-0.1, 0.15, model.joint_dof_count, dtype=np.float32))
-    return model
+class TestSteelColoredUnitCapacity(unittest.TestCase):
+    pass
 
 
-def _solver_leaf_publication(model, *, enabled, velocity_limits=False):
-    solver = SolverSteel(
-        model,
-        iterations=8,
-        update_mass_matrix_interval=2,
-        use_parallel_streams=False,
-        enable_joint_velocity_limits=velocity_limits,
-        parallel_tree=enabled,
-    )
-    if enabled and model.device.is_cuda:
-        assert solver._tree_plan is not None
-    if not enabled or model.device.is_cpu:
-        assert solver._tree_plan is None
-        assert solver._tree_net_wrenches == ()
-    # Exercise the production cached Stage 7 on CPU, where it is normally off.
-    if model.device.is_cpu:
-        solver._fk_id_cache_enabled = True
-    # CPU does not normally allocate the optional parallel-refresh terms.
-    if model.device.is_cpu:
-        solver._body_inertia_terms = wp.empty((model.body_count, 12), dtype=float, device=model.device)
-    solver._prepare_augmented_state(model.state(), model.state(), model.control())
-    return solver
+for _fn in (test_mixed_units_match_serial_propagation, test_mixed_units_graph_matches_eager):
+    add_function_test(TestSteelColoredUnitCapacity, _fn.__name__, _fn, devices=devices)
 
 
-def _fields(solver, state):
-    def dynamics(name):
-        return getattr(solver, f"_{name}")
+def _check_graph_publication(test, model):
+    """Publish body state eagerly and by CUDA graph replay into poisoned buffers."""
+    device = model.device
+    # Hold every finite limit row: these checks cover traversal, not row capacity.
+    rows = 2 * model.joint_dof_count
+    solvers = [_solver(model, enabled=value, articulation_constraint_max=rows) for value in (False, True)]
+    eager = []
+    for solver in solvers:
+        state = model.state()
+        fields = {"body_q": state.body_q, "body_qd": state.body_qd}
+        q, qd = state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()
+        _poison(fields)
+        solver._stage7_update_kinematics(state)
+        expected = {name: array.numpy().copy() for name, array in fields.items()}
+        test.assertTrue(all(np.isfinite(value).all() for value in expected.values()))
+        with wp.ScopedCapture(device=device) as capture:
+            solver._stage7_update_kinematics(state)
+        for _ in range(2):
+            _poison(fields)
+            wp.capture_launch(capture.graph)
+            for name, array in fields.items():
+                np.testing.assert_array_equal(array.numpy(), expected[name], err_msg=name)
+        np.testing.assert_array_equal(state.joint_q.numpy(), q)
+        np.testing.assert_array_equal(state.joint_qd.numpy(), qd)
+        eager.append(expected)
+    reference = model.state()
+    newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
+    for name in eager[0]:
+        np.testing.assert_allclose(eager[1][name], eager[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
+        np.testing.assert_allclose(eager[1][name], getattr(reference, name).numpy(), rtol=3e-6, atol=3e-6)
 
-    return {
-        "body_q": state.body_q,
-        "body_qd": state.body_qd,
-        "body_q_com": dynamics("body_q_com"),
-        "origin": dynamics("articulation_origin"),
-        "S": dynamics("joint_S_s"),
-        "v": dynamics("body_v_s"),
-        "a": dynamics("body_a_s"),
-        "I": dynamics("body_I_s"),
-        "terms": dynamics("body_inertia_terms"),
-        "f": dynamics("body_f_s"),
-        "valid": solver._fk_id_cache_valid,
-    }
+
+def test_cuda_actual_graph_publication(test, device):
+    """Match poisoned-buffer graph replays of the published state for broad and mixed moving trees."""
+    _check_graph_publication(test, _build_model(device, locked_d6=True, leaves=108)[0])
+    _check_graph_publication(test, _build_branched_model(device, floating_root=True)[0])
 
 
-class TestLeafPublication(unittest.TestCase):
-    def test_cuda_actual_graph_publication(self):
-        """Match poisoned-buffer graph replays for prismatic and mixed moving trees."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("CUDA graph replay requires CUDA")
-        for device in devices:
-            self._check_graph_publication(_build_model_leaf_publication(device, locked_d6=True, leaves=108)[0])
-            self._check_graph_publication(_build_branched_model(device, floating_root=True)[0])
-
-    def _check_graph_publication(self, model):
-        device = model.device
-        solvers = [_solver_leaf_publication(model, enabled=value) for value in (False, True)]
-        inputs = {
-            name: getattr(model, name)
-            for name in (
-                "joint_X_p",
-                "joint_X_c",
-                "joint_axis",
-                "body_com",
-                "body_mass",
-                "body_inertia",
-                "gravity",
-                "joint_type",
-                "joint_parent",
-                "joint_child",
-                "joint_q_start",
-                "joint_qd_start",
-            )
-        }
-        before = {name: array.numpy().copy() for name, array in inputs.items()}
-        for step in (0, 1):
-            eager = []
-            for solver in solvers:
-                state = model.state()
-                solver._step = step
-                fields = _fields(solver, state)
-                q, qd = state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()
-
-                def poison(outputs=fields):
-                    for name, array in outputs.items():
-                        array.fill_(-123 if name == "valid" else -123.25)
-
-                poison()
-                solver._stage7_update_kinematics(state, solver)
-                expected = {name: array.numpy().copy() for name, array in fields.items()}
-                self.assertTrue(all(np.isfinite(value).all() for value in expected.values()))
-                with wp.ScopedCapture(device=device) as capture:
-                    solver._stage7_update_kinematics(state, solver)
-                for _ in range(2):
-                    poison()
-                    wp.capture_launch(capture.graph)
-                    for name, array in fields.items():
-                        np.testing.assert_array_equal(array.numpy(), expected[name], err_msg=name)
-                np.testing.assert_array_equal(state.joint_q.numpy(), q)
-                np.testing.assert_array_equal(state.joint_qd.numpy(), qd)
-                eager.append(expected)
-            for name in eager[0]:
-                np.testing.assert_allclose(eager[1][name], eager[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
-        for name, array in inputs.items():
-            np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
-
-    def test_interleaved_mixed_leaves_and_moving_parents(self):
-        """Keep internal joints in order and preserve general moving-parent kinematics."""
-        for floating in (False, True):
-            model, _, bodies = _build_branched_model(floating_root=floating)
-            solvers = [_solver_leaf_publication(model, enabled=value) for value in (False, True)]
+def test_interleaved_mixed_leaves_and_moving_parents(test, device):
+    """Keep internal joints in order and match the serial forward pass with moving parents."""
+    for floating in (False, True):
+        with test.subTest(floating_root=floating):
+            model, _, bodies = _build_branched_model(device, floating_root=floating)
+            solvers = [_solver(model, enabled=value) for value in (False, True)]
             leaves = [bodies[index] for index in (1, 3, 4, 5, 6)]
             snapshots = []
             for solver in solvers:
-                state = model.state()
-                solver._step = 1
-                for name, array in _fields(solver, state).items():
-                    array.fill_(-123 if name == "valid" else -123.25)
-                solver._stage7_update_kinematics(state, solver)
-                snapshots.append({name: array.numpy().copy() for name, array in _fields(solver, state).items()})
+                state, following = model.state(), model.state()
+                _poison(_dynamics_fields(solver, state))
+                _run_stage1(solver, state, following)
+                snapshots.append(
+                    {name: array.numpy().copy() for name, array in _dynamics_fields(solver, state).items()}
+                )
             for name in snapshots[0]:
                 np.testing.assert_allclose(snapshots[1][name], snapshots[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
-            self.assertGreater(float(np.max(np.abs(snapshots[1]["a"][leaves]))), 1e-3)
+            test.assertGreater(float(np.max(np.abs(snapshots[1]["a"][leaves]))), 1e-3)
             reference = model.state()
             newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
             np.testing.assert_allclose(snapshots[1]["body_q"], reference.body_q.numpy(), rtol=3e-6, atol=3e-6)
-            # Ordinary Steel already differs from eval_fk for mixed D6
-            # translation/angular lever arms; its complete fields match above.
-            ordinary_velocity = model.joint_type.numpy() != int(newton.JointType.D6)
-            checked_bodies = model.joint_child.numpy()[ordinary_velocity]
+
+
+def test_current_frames_and_inertial_notifications(test, device):
+    """Read current joint frames, axes, COMs, masses, inertias and gravity after a notification."""
+    model, _, _ = _build_model(device)
+    solvers = [_solver(model, enabled=value) for value in (False, True)]
+    before = []
+    for solver in solvers:
+        state, following = model.state(), model.state()
+        _run_stage1(solver, state, following)
+        before.append(state.body_q.numpy().copy())
+    frames = model.joint_X_p.numpy()
+    frames[0, :3] += (0.3, -0.7, 0.5)
+    frames[1, :3] += (0.2, 0.4, -0.1)
+    model.joint_X_p.assign(frames)
+    child_frames = model.joint_X_c.numpy()
+    child_frames[1, :3] += (-0.1, 0.07, 0.09)
+    model.joint_X_c.assign(child_frames)
+    axes = model.joint_axis.numpy()
+    axes[0] = (0.4, -0.7, 1.2)
+    model.joint_axis.assign(axes)
+    model.body_com.assign(model.body_com.numpy() + np.array((0.01, 0.02, -0.03), dtype=np.float32))
+    model.body_mass.assign(model.body_mass.numpy() * 1.3)
+    model.body_inertia.assign(model.body_inertia.numpy() * 1.2)
+    model.gravity.assign(np.array([[1.0, -2.0, -8.0]], dtype=np.float32))
+    after = []
+    for solver in solvers:
+        solver.notify_model_changed(newton.ModelFlags.ALL)
+        state, following = model.state(), model.state()
+        _run_stage1(solver, state, following)
+        after.append({name: array.numpy().copy() for name, array in _dynamics_fields(solver, state).items()})
+        after[-1]["tau"] = solver._joint_tau.numpy().copy()
+    test.assertFalse(np.array_equal(before[1], after[1]["body_q"]))
+    for name in after[0]:
+        np.testing.assert_allclose(after[1][name], after[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
+
+
+def _check_full_steps_and_reset(test, model, *, loaded, velocity_limits=False):
+    contact_capacity = 32 if loaded else 1
+    model.rigid_contact_max = contact_capacity
+    if velocity_limits:
+        model.joint_velocity_limit.fill_(0.01)
+    solvers = [_solver(model, enabled=value, velocity_limits=velocity_limits) for value in (False, True)]
+    states = [[model.state(), model.state()] for _ in solvers]
+    controls = [model.control() for _ in solvers]
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity)
+    contacts = [pipeline.contacts() for _ in solvers]
+    saw_contacts = False
+    for pair in states:
+        newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+    for step in range(6):
+        for index, solver in enumerate(solvers):
+            current, following = states[index]
+            if step == 3:
+                solver.reset(current)
+            if loaded:
+                pipeline.collide(current, contacts[index])
+                saw_contacts |= int(contacts[index].rigid_contact_count.numpy()[0]) > 0
+            forces = np.zeros((model.body_count, 6), dtype=np.float32)
+            forces[1, :3] = (0.2 * step, -0.1, 0.3)
+            current.body_f.assign(forces)
+            controls[index].joint_f.assign(np.linspace(-0.1, 0.2, model.joint_dof_count, dtype=np.float32))
+            solver.step(current, following, controls[index], contacts[index], 1.0 / 240.0)
+            if velocity_limits and step == 0:
+                test.assertGreater(float(np.max(np.abs(solver._qd_work.numpy() - current.joint_qd.numpy()))), 0.01)
+            states[index] = [following, current]
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
             np.testing.assert_allclose(
-                snapshots[1]["body_qd"][checked_bodies],
-                reference.body_qd.numpy()[checked_bodies],
-                rtol=3e-6,
-                atol=3e-6,
+                getattr(states[1][0], name).numpy(),
+                getattr(states[0][0], name).numpy(),
+                rtol=1e-5,
+                atol=2e-6,
+                err_msg=f"step {step} {name}",
             )
-
-    def test_complete_canonical_publication_and_held_inertia(self):
-        """Match all canonical fields, preserving held I/terms on each cadence arm."""
-        model, _, leaves = _build_model_leaf_publication(locked_d6=True, leaves=108)
-        baseline = _solver_leaf_publication(model, enabled=False)
-        candidate = _solver_leaf_publication(model, enabled=True)
-        for step, compact in ((0, False), (1, False), (1, True)):
-            snapshots = []
-            for solver in (baseline, candidate):
-                state = model.state()
-                solver._step = step
-                # Only the identity check is consumed by Stage 7, no stream is used.
-                solver._global_inertia_stream = object() if compact else None
-                for name, array in _fields(solver, state).items():
-                    array.fill_(-123 if name == "valid" else -123.25)
-                solver._stage7_update_kinematics(state, solver)
-                snapshots.append({name: array.numpy().copy() for name, array in _fields(solver, state).items()})
-                solver._global_inertia_stream = None
-            for name in snapshots[0]:
-                np.testing.assert_allclose(snapshots[1][name], snapshots[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
-            np.testing.assert_array_equal(snapshots[1]["valid"], np.ones(model.articulation_count))
-            np.testing.assert_array_equal(snapshots[1]["a"][leaves], 0.0)
-            if step == 0 or compact:
-                np.testing.assert_array_equal(snapshots[1]["I"][leaves], -123.25)
-            if not compact:
-                np.testing.assert_array_equal(snapshots[1]["terms"][leaves], -123.25)
-            # Independent public FK computes COM velocities from q/qd, not our cache.
-            reference = model.state()
-            newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
-            np.testing.assert_allclose(snapshots[1]["body_q"], reference.body_q.numpy(), rtol=3e-6, atol=3e-6)
-            np.testing.assert_allclose(snapshots[1]["body_qd"], reference.body_qd.numpy(), rtol=3e-6, atol=3e-6)
-
-    def test_current_root_frames_and_inertial_notifications(self):
-        """Use notified current root/leaf frames, axes, COMs, mass, inertia, and gravity."""
-        self._check_current_frames_and_notifications("cpu")
-
-    def _check_current_frames_and_notifications(self, device):
-        model, _, _ = _build_model_leaf_publication(device)
-        solvers = [_solver_leaf_publication(model, enabled=value) for value in (False, True)]
-        before = []
-        for solver in solvers:
-            state = model.state()
-            solver._step = 1
-            solver._stage7_update_kinematics(state, solver)
-            before.append(state.body_q.numpy().copy())
-        frames = model.joint_X_p.numpy()
-        frames[0, :3] += (0.3, -0.7, 0.5)
-        frames[1, :3] += (0.2, 0.4, -0.1)
-        model.joint_X_p.assign(frames)
-        child_frames = model.joint_X_c.numpy()
-        child_frames[1, :3] += (-0.1, 0.07, 0.09)
-        model.joint_X_c.assign(child_frames)
-        axes = model.joint_axis.numpy()
-        axes[0] = (0.4, -0.7, 1.2)
-        model.joint_axis.assign(axes)
-        com = model.body_com.numpy()
-        com += (0.01, 0.02, -0.03)
-        model.body_com.assign(com)
-        model.body_mass.assign(model.body_mass.numpy() * 1.3)
-        model.body_inertia.assign(model.body_inertia.numpy() * 1.2)
-        model.gravity.assign(np.array([[1.0, -2.0, -8.0]], dtype=np.float32))
-        after = []
-        for solver in solvers:
-            solver.notify_model_changed(newton.ModelFlags.ALL)
-            np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
-            state = model.state()
-            solver._stage7_update_kinematics(state, solver)
-            after.append(
-                {name: array.numpy().copy() for name, array in _fields(solver, state).items() if name != "terms"}
-            )
-            self.assertIs(solver._fk_id_cache_source_state, state)
-            solver.reset(state)
-            np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
-        self.assertFalse(np.array_equal(before[1], after[1]["body_q"]))
-        for name in after[0]:
-            np.testing.assert_allclose(after[1][name], after[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
-
-    def test_cached_next_step_dynamics_and_reset(self):
-        """Feed publication back into original dynamics across refresh/reuse and reset."""
-        self._check_cached_next_step_dynamics_and_reset("cpu")
-        self._check_cached_next_step_dynamics_and_reset("cpu", loaded=True)
-
-    def test_cuda_cached_next_step_dynamics_and_reset(self):
-        """Preserve complete CUDA steps with cached publication."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("CUDA full-step coverage requires CUDA")
-        for device in devices:
-            self._check_current_frames_and_notifications(device)
-            with self.subTest(device=str(device)):
-                self._check_cached_next_step_dynamics_and_reset(device)
-                self._check_cached_next_step_dynamics_and_reset(device, loaded=True)
-            self._check_cached_next_step_dynamics_and_reset(device, loaded=True, velocity_limits=True)
-
-    def _check_cached_next_step_dynamics_and_reset(self, device, *, loaded=False, velocity_limits=False):
-        model = _build_contact_model(device) if loaded else _build_model_leaf_publication(device, leaves=4)[0]
-        contact_capacity = 32 if loaded else 1
-        model.rigid_contact_max = contact_capacity
-        if velocity_limits:
-            model.joint_velocity_limit.fill_(0.01)
-        solvers = [
-            _solver_leaf_publication(model, enabled=value, velocity_limits=velocity_limits) for value in (False, True)
-        ]
-        states = [[model.state(), model.state()] for _ in solvers]
-        controls = [model.control() for _ in solvers]
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity)
-        contacts = [pipeline.contacts() for _ in solvers]
-        saw_contacts = False
-        for pair in states:
-            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
-        for step in range(6):
-            for index, solver in enumerate(solvers):
-                current, following = states[index]
-                if step == 3:
-                    solver.reset(current)
-                if loaded:
-                    pipeline.collide(current, contacts[index])
-                    saw_contacts |= int(contacts[index].rigid_contact_count.numpy()[0]) > 0
-                forces = np.zeros((model.body_count, 6), dtype=np.float32)
-                forces[1, :3] = (0.2 * step, -0.1, 0.3)
-                current.body_f.assign(forces)
-                controls[index].joint_f.assign(np.linspace(-0.1, 0.2, model.joint_dof_count, dtype=np.float32))
-                solver.step(current, following, controls[index], contacts[index], 1.0 / 240.0)
-                if velocity_limits and step == 0:
-                    self.assertGreater(float(np.max(np.abs(solver._qd_work.numpy() - current.joint_qd.numpy()))), 0.01)
-                states[index] = [following, current]
+        np.testing.assert_allclose(solvers[1]._v_hat.numpy(), solvers[0]._v_hat.numpy(), rtol=1e-5, atol=2e-6)
+    if loaded:
+        test.assertTrue(saw_contacts, "the loaded fixture must create contact rows")
+        graphs = []
+        for index, solver in enumerate(solvers):
+            pair = states[index]
+            with wp.ScopedCapture(device=model.device) as capture:
+                for phase in (0, 1):
+                    pipeline.collide(pair[phase], contacts[index])
+                    solver.step(pair[phase], pair[1 - phase], controls[index], contacts[index], 1.0 / 240.0)
+            graphs.append(capture.graph)
+        for replay in range(2):
+            if replay == 1:
+                model.body_mass.assign(model.body_mass.numpy() * 1.03)
+                model.body_inertia.assign(model.body_inertia.numpy() * 1.03)
+                for index, solver in enumerate(solvers):
+                    solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+                    solver.reset(states[index][0])
+            for graph in graphs:
+                wp.capture_launch(graph)
             for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
                 np.testing.assert_allclose(
                     getattr(states[1][0], name).numpy(),
                     getattr(states[0][0], name).numpy(),
                     rtol=1e-5,
                     atol=2e-6,
-                    err_msg=f"step {step} {name}",
+                    err_msg=f"captured replay {replay}: {name}",
                 )
-            np.testing.assert_allclose(solvers[1]._v_hat.numpy(), solvers[0]._v_hat.numpy(), rtol=1e-5, atol=2e-6)
-            for size in solvers[0]._L_by_size:
-                np.testing.assert_allclose(
-                    solvers[1]._L_by_size[size].numpy(),
-                    solvers[0]._L_by_size[size].numpy(),
-                    rtol=1e-5,
-                    atol=2e-6,
-                )
-        if loaded:
-            self.assertTrue(saw_contacts, "The full-step fixture must exercise loaded contact rows")
-        if loaded and model.device.is_cuda:
-            graphs = []
-            for index, solver in enumerate(solvers):
-                pair = states[index]
-                with wp.ScopedCapture(device=model.device) as capture:
-                    for phase in (0, 1):
-                        pipeline.collide(pair[phase], contacts[index])
-                        solver.step(pair[phase], pair[1 - phase], controls[index], contacts[index], 1.0 / 240.0)
-                graphs.append(capture.graph)
-            for replay in range(2):
-                if replay == 1:
-                    model.body_mass.assign(model.body_mass.numpy() * 1.03)
-                    model.body_inertia.assign(model.body_inertia.numpy() * 1.03)
-                    for index, solver in enumerate(solvers):
-                        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-                        solver.reset(states[index][0])
-                for graph in graphs:
-                    wp.capture_launch(graph)
-                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
-                    np.testing.assert_allclose(
-                        getattr(states[1][0], name).numpy(),
-                        getattr(states[0][0], name).numpy(),
-                        rtol=1e-5,
-                        atol=2e-6,
-                        err_msg=f"captured replay {replay}: {name}",
-                    )
+
+
+def test_full_steps_and_reset(test, device):
+    """Match serial traversal over complete steps, a reset, contacts, velocity limits and graph replay."""
+    with test.subTest(fixture="tree"):
+        _check_full_steps_and_reset(test, _build_model(device, leaves=4)[0], loaded=False)
+    with test.subTest(fixture="contacts"):
+        _check_full_steps_and_reset(test, _build_contact_model(device), loaded=True)
+    with test.subTest(fixture="contacts", velocity_limits=True):
+        _check_full_steps_and_reset(test, _build_contact_model(device), loaded=True, velocity_limits=True)
+
+
+class TestLeafPublication(unittest.TestCase):
+    pass
+
+
+for _name in (
+    "test_cuda_actual_graph_publication",
+    "test_interleaved_mixed_leaves_and_moving_parents",
+    "test_current_frames_and_inertial_notifications",
+    "test_full_steps_and_reset",
+):
+    add_function_test(TestLeafPublication, _name, globals()[_name], devices=devices)
 
 
 def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False):
@@ -3534,60 +2823,22 @@ def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged
     return model
 
 
+def _tree_ends(model):
+    return model.articulation_start.numpy()[1:]
+
+
 class TestSteelTreePlan(unittest.TestCase):
     def test_parallel_tree_is_keyword_only_and_defaults_to_serial(self):
-        """Require an explicit construction-only opt-in without shifting positional arguments."""
+        """Require an explicit keyword-only opt-in."""
         parameters = inspect.signature(SolverSteel).parameters
         self.assertIn("parallel_tree", parameters)
         self.assertIs(parameters["parallel_tree"].default, False)
         self.assertEqual(parameters["parallel_tree"].kind, inspect.Parameter.KEYWORD_ONLY)
 
-    def test_serial_selection_skips_tree_setup(self):
-        """Keep default and explicit serial execution free of tree plans and scratch."""
-        for device in (wp.get_device("cpu"), *wp.get_cuda_devices()):
-            model = _build_fingers(device, articulations=1)
-            states = []
-            for options in ({}, {"parallel_tree": False}):
-                with self.subTest(device=str(device), options=options):
-                    with patch.object(_SteelTreePlan, "build", wraps=_SteelTreePlan.build) as build:
-                        solver = SolverSteel(model, use_parallel_streams=False, **options)
-                    build.assert_not_called()
-                    self.assertIsNone(solver._tree_plan)
-                    self.assertEqual(solver._tree_net_wrenches, ())
-                    state = model.state()
-                    solver._prepare_augmented_state(state, model.state(), model.control())
-                    solver._stage7_update_kinematics(state, solver)
-                    states.append(state)
-            for name in ("body_q", "body_qd"):
-                np.testing.assert_array_equal(getattr(states[0], name).numpy(), getattr(states[1], name).numpy())
-
-    def test_explicit_parallel_preserves_eligibility_fallback(self):
-        """Admit CUDA branches while retaining CPU and serial-tree fallback."""
-        for device in (wp.get_device("cpu"), *wp.get_cuda_devices()):
-            with self.subTest(device=str(device), topology="branched"):
-                model = _build_fingers(device, articulations=1)
-                with patch.object(_SteelTreePlan, "build", wraps=_SteelTreePlan.build) as build:
-                    solver = SolverSteel(model, parallel_tree=True, use_parallel_streams=False)
-                if device.is_cuda:
-                    build.assert_called_once()
-                    self.assertIsNotNone(solver._tree_plan)
-                    self.assertTrue(any(group.lanes > 1 for group in solver._tree_plan.groups))
-                    self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
-                else:
-                    build.assert_not_called()
-                    self.assertIsNone(solver._tree_plan)
-                    self.assertEqual(solver._tree_net_wrenches, ())
-            with self.subTest(device=str(device), topology="chain"):
-                model = _build_model_leaf_publication(device, chain=True)[0]
-                solver = SolverSteel(model, parallel_tree=True, use_parallel_streams=False)
-                self.assertIsNone(solver._tree_plan)
-                self.assertEqual(solver._tree_net_wrenches, ())
-
     def test_complete_finger_levels_and_serial_group(self):
-        """Schedule every finger segment and retain serial trees as one-lane groups."""
+        """Schedule every finger segment, parents before children, and keep serial trees in one-lane groups."""
         model = _build_fingers(include_chain=True)
-        solver = SolverSteel(model, use_parallel_streams=False)
-        plan = _SteelTreePlan.build(model, solver._articulation_joint_end)
+        plan = _SteelTreePlan.build(model, _tree_ends(model))
         self.assertIsNotNone(plan)
         self.assertTrue(any(group.lanes > 1 for group in plan.groups))
         self.assertTrue(any(group.lanes == 1 for group in plan.groups))
@@ -3628,7 +2879,7 @@ class TestSteelTreePlan(unittest.TestCase):
         self.assertEqual(sorted(seen), list(range(model.joint_count)))
 
     def test_comb_retains_joint_levels_when_chain_compression_adds_rounds(self):
-        """Keep overlapping comb teeth parallel when compressed chains increase span."""
+        """Keep comb teeth parallel when compressing unary chains would lengthen the schedule."""
         builder = newton.ModelBuilder()
         joints = []
         parent = -1
@@ -3643,7 +2894,6 @@ class TestSteelTreePlan(unittest.TestCase):
             parent = spine
         builder.add_articulation(joints)
         model = builder.finalize(device="cpu")
-        ends = wp.array(model.articulation_start.numpy()[1:], dtype=wp.int32, device=model.device)
 
         # Compression delays the next fork until the whole preceding tooth ends.
         compressed_lengths = [[1], [4, 1], [4, 1], [4, 5]]
@@ -3652,7 +2902,7 @@ class TestSteelTreePlan(unittest.TestCase):
         joint_rounds = sum((width + 3) // 4 for width in joint_widths)
         self.assertEqual((compressed_rounds, joint_rounds), (14, 8))
 
-        plan = _SteelTreePlan.build(model, ends)
+        plan = _SteelTreePlan.build(model, _tree_ends(model))
         self.assertIsNotNone(plan)
         self.assertEqual(len(plan.groups), 1)
         group = plan.groups[0]
@@ -3665,15 +2915,13 @@ class TestSteelTreePlan(unittest.TestCase):
         self.assertEqual(sorted(group.segment_joints.numpy().tolist()), list(range(model.joint_count)))
 
     def test_serial_and_unsafe_topologies_fall_back(self):
-        """Retain wholly serial, aliased, cross-articulation and loop topologies."""
-        model, _, _ = _build_model_leaf_publication(chain=True)
-        solver = SolverSteel(model, use_parallel_streams=False)
-        self.assertIsNone(_SteelTreePlan.build(model, solver._articulation_joint_end))
+        """Return no plan for wholly serial, aliased, cross-articulation and loop-trimmed topologies."""
+        model, _, _ = _build_model(chain=True)
+        self.assertIsNone(_SteelTreePlan.build(model, _tree_ends(model)))
         for unsafe in ("alias", "foreign_parent", "loop"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
-                solver = SolverSteel(model, use_parallel_streams=False)
-                ends = solver._articulation_joint_end.numpy().copy()
+                ends = _tree_ends(model).copy()
                 if unsafe == "alias":
                     children = model.joint_child.numpy().copy()
                     children[2] = children[1]
@@ -3684,287 +2932,579 @@ class TestSteelTreePlan(unittest.TestCase):
                     model.joint_parent.assign(parents)
                 else:
                     ends[0] -= 1
-                plan = _SteelTreePlan.build(model, wp.array(ends, dtype=wp.int32, device=model.device))
-                self.assertIsNone(plan)
+                self.assertIsNone(_SteelTreePlan.build(model, ends))
+
+
+def test_serial_selection_skips_tree_setup(test, device):
+    """Build no tree plan and no branch scratch under default or explicit serial execution."""
+    model = _build_fingers(device, articulations=1)
+    states = []
+    for options in ({}, {"parallel_tree": False}):
+        with test.subTest(options=options):
+            with patch.object(_SteelTreePlan, "build", wraps=_SteelTreePlan.build) as build:
+                solver = SolverSteel(model, **options)
+            build.assert_not_called()
+            test.assertIsNone(solver._tree_plan)
+            test.assertEqual(solver._tree_net_wrenches, ())
+            state = model.state()
+            solver._prepare_augmented_state(state)
+            solver._stage7_update_kinematics(state)
+            states.append(state)
+    for name in ("body_q", "body_qd"):
+        np.testing.assert_array_equal(getattr(states[0], name).numpy(), getattr(states[1], name).numpy())
+
+
+def test_explicit_parallel_preserves_eligibility_fallback(test, device):
+    """Build a plan for branched trees and fall back to serial traversal for an unbranched chain."""
+    model = _build_fingers(device, articulations=1)
+    with patch.object(_SteelTreePlan, "build", wraps=_SteelTreePlan.build) as build:
+        solver = SolverSteel(model, parallel_tree=True)
+    build.assert_called_once()
+    test.assertIsNotNone(solver._tree_plan)
+    test.assertTrue(any(group.lanes > 1 for group in solver._tree_plan.groups))
+    test.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
+    model = _build_model(device, chain=True)[0]
+    solver = SolverSteel(model, parallel_tree=True)
+    test.assertIsNone(solver._tree_plan)
+    test.assertEqual(solver._tree_net_wrenches, ())
+
+
+def test_backward_torques_with_live_forces_and_passive_terms(test, device):
+    """Match serial joint torques and subtree wrenches with external forces, joint forces, drives and damping."""
+    for velocity_limits in (False, True):
+        with test.subTest(velocity_limits=velocity_limits):
+            model = _build_fingers(device, ragged=True)
+            model.joint_velocity_limit.fill_(0.05)
+            damping = np.linspace(0.1, 0.4, model.joint_dof_count, dtype=np.float32)
+            model.joint_damping.assign(damping)
+            model.joint_target_ke.assign(np.linspace(0.0, 4.0, model.joint_dof_count, dtype=np.float32))
+            model.joint_target_kd.assign(np.linspace(0.5, 0.0, model.joint_dof_count, dtype=np.float32))
+            # Hold every finite limit row: these checks cover traversal, not row capacity.
+            options = {"velocity_limits": velocity_limits, "articulation_constraint_max": 2 * model.joint_dof_count}
+            solvers = [_solver(model, enabled=value, **options) for value in (False, True)]
+            states = [model.state() for _ in solvers]
+            following = [model.state() for _ in solvers]
+            controls = [model.control() for _ in solvers]
+            seed = np.linspace(-0.4, 0.3, model.joint_dof_count, dtype=np.float32)
+            previous_tau = None
+            for force_phase in range(2):
+                for index, solver in enumerate(solvers):
+                    state = states[index]
+                    solver._stage1_fk_id(state, solver, following[index])
+                    wrench = np.arange(model.body_count * 6, dtype=np.float32).reshape(-1, 6)
+                    wrench = (wrench % 11 - 5) * (0.03 + force_phase * 0.04)
+                    state.body_f.assign(wrench)
+                    controls[index].joint_f.assign(seed * (1.0 + force_phase))
+                    solver._joint_tau.fill_(-123.25)
+                    for scratch in solver._tree_net_wrenches:
+                        scratch.fill_(-123.25)
+                    solver._stage1_joint_tau(state, solver, following[index], controls[index], 1.0 / 240.0)
+                for name in ("_body_ft_s", "_joint_tau", "_aug_row_counts", "_aug_row_dof_index", "_aug_row_K"):
+                    np.testing.assert_allclose(
+                        getattr(solvers[1], name).numpy(),
+                        getattr(solvers[0], name).numpy(),
+                        rtol=3e-6,
+                        atol=3e-6,
+                        err_msg=f"forces {force_phase}: {name}",
+                    )
+                tau = solvers[1]._joint_tau.numpy().copy()
+                if previous_tau is not None:
+                    test.assertGreater(float(np.max(np.abs(tau - previous_tau))), 0.01)
+                previous_tau = tau
+
+
+def test_stage1_matches_serial_with_velocity_prescale(test, device):
+    """Match every forward-pass field across partial warps, a state edit and active velocity prescaling."""
+    for velocity_limits in (False, True):
+        with test.subTest(velocity_limits=velocity_limits):
+            model = _build_fingers(device, ragged=True)
+            model.joint_velocity_limit.fill_(0.05)
+            # Hold every finite limit row: these checks cover traversal, not row capacity.
+            options = {"velocity_limits": velocity_limits, "articulation_constraint_max": 2 * model.joint_dof_count}
+            solvers = [_solver(model, enabled=value, **options) for value in (False, True)]
+            states = [model.state() for _ in solvers]
+            outputs = [model.state() for _ in solvers]
+            for solver, state in zip(solvers, states, strict=True):
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                _poison(_dynamics_fields(solver, state), keep=("body_q",))
+            original_qd = model.joint_qd.numpy().copy()
+            for phase in ("first", "edited"):
+                for solver, state, following in zip(solvers, states, outputs, strict=True):
+                    if phase == "edited":
+                        q = state.joint_q.numpy().copy()
+                        start, end = model.articulation_start.numpy()[1:3]
+                        q0, q1 = model.joint_q_start.numpy()[[start, end]]
+                        q[q0:q1] += 0.1
+                        state.joint_q.assign(q)
+                    predictor_qd = _run_stage1(solver, state, following)
+                    np.testing.assert_array_equal(state.joint_qd.numpy(), original_qd)
+                    if velocity_limits:
+                        test.assertGreater(float(np.max(np.abs(predictor_qd.numpy() - original_qd))), 0.01)
+                fields = [_dynamics_fields(solver, state) for solver, state in zip(solvers, states, strict=True)]
+                for name, actual in fields[1].items():
+                    np.testing.assert_allclose(
+                        actual.numpy(), fields[0][name].numpy(), rtol=3e-6, atol=3e-6, err_msg=f"{phase}: {name}"
+                    )
+                if velocity_limits:
+                    np.testing.assert_array_equal(solvers[1]._qd_work.numpy(), solvers[0]._qd_work.numpy())
+
+
+def test_publication_matches_public_fk(test, device):
+    """Publish FREE and mixed D6 states with the public forward-kinematics convention."""
+    model, _, _ = _build_branched_model(device, floating_root=True)
+    solver = _solver(model, enabled=True)
+    state = model.state()
+    state.body_q.fill_(-123.25)
+    state.body_qd.fill_(-123.25)
+    solver._stage7_update_kinematics(state)
+    reference = model.state()
+    newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
+    for name in ("body_q", "body_qd"):
+        np.testing.assert_allclose(
+            getattr(state, name).numpy(), getattr(reference, name).numpy(), rtol=3e-6, atol=3e-6, err_msg=name
+        )
+
+
+def test_contact_trajectory_matches_serial(test, device):
+    """Match serial traversal over a contact-loaded trajectory with a branched articulation."""
+    model = _build_contact_model(device)
+    model.rigid_contact_max = 32
+    results = []
+    for parallel in (False, True):
+        solver = _solver(model, enabled=parallel)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+        contacts = pipeline.contacts()
+        state, following = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        for _ in range(40):
+            pipeline.collide(state, contacts)
+            solver.step(state, following, control, contacts, 1.0 / 240.0)
+            state, following = following, state
+        test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        results.append(state)
+    for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+        np.testing.assert_allclose(
+            getattr(results[1], name).numpy(), getattr(results[0], name).numpy(), rtol=1e-5, atol=2e-6, err_msg=name
+        )
+
+
+def _run_cpu_fingers(device, parallel_tree):
+    model = _build_fingers(device, articulations=2, ragged=True)
+    solver = SolverSteel(model, parallel_tree=parallel_tree)
+    state, next_state = model.state(), model.state()
+    control = model.control()
+    for _ in range(10):
+        solver.step(state, next_state, control, None, 1.0 / 240.0)
+        state, next_state = next_state, state
+    solver.check_constraint_capacity()
+    return solver, state.body_q.numpy(), state.body_qd.numpy()
+
+
+class TestSteelCpuTree(unittest.TestCase):
+    def test_branched_cpu_keeps_serial_passes(self):
+        """Run branched trees on CPU with the serial traversal and scalar composite inertia.
+
+        A requested parallel traversal falls back to the serial one bitwise, and the CPU trajectory
+        matches the CUDA solve, whose cooperative kernels do not run on CPU.
+        """
+        serial = _run_cpu_fingers("cpu", False)
+        parallel = _run_cpu_fingers("cpu", True)
+        for solver in (serial[0], parallel[0]):
+            self.assertIsNone(solver._tree_plan)
+            self.assertIsNone(solver._composite_inertia_warp_kernel)
+            self.assertGreater(solver._composite_articulation_count, 0)
+        for cpu, fallback in zip(serial[1:], parallel[1:], strict=True):
+            self.assertTrue(np.isfinite(cpu).all())
+            np.testing.assert_array_equal(cpu, fallback)
+        if wp.is_cuda_available():
+            cuda = _run_cpu_fingers("cuda:0", False)
+            for cpu, gpu in zip(serial[1:], cuda[1:], strict=True):
+                np.testing.assert_allclose(cpu, gpu, rtol=1.0e-4, atol=1.0e-4)
 
 
 class TestSteelTreeExecution(unittest.TestCase):
-    def test_cuda_tree_and_device_torsion_initialize_together(self):
-        """Retain both opt-in initializers and torsion capture preparation after merging."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("Device torsion and parallel trees require CUDA")
-        for device in devices:
-            with self.subTest(device=str(device)):
-                model = _build_contact_model(device)
-                set_torsion_radius(model, 0.01)
-                solver = SolverSteel(
-                    model,
-                    parallel_tree=True,
-                    contact_torsion_device=True,
-                    friction_anchor_beta=0.0,
-                    use_parallel_streams=False,
-                )
-                self.assertIsNotNone(solver._tree_plan)
-                self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
-                self.assertIsNotNone(getattr(solver, "_device_torsion", None))
-                solver.check_constraint_capacity()
-
-    def test_cuda_backward_torques_with_live_forces_and_passive_terms(self):
-        """Preserve child reductions, additive torque and original-velocity damping."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("Parallel backward tree execution requires CUDA")
-        for device in devices:
-            for velocity_limits in (False, True):
-                with self.subTest(device=str(device), velocity_limits=velocity_limits):
-                    model = _build_fingers(device, ragged=True)
-                    model.joint_velocity_limit.fill_(0.05)
-                    damping = np.linspace(0.1, 0.4, model.joint_dof_count, dtype=np.float32)
-                    model.joint_damping.assign(damping)
-                    model.joint_spring_stiffness.assign(np.linspace(0.3, 0.8, model.joint_dof_count, dtype=np.float32))
-                    model.joint_spring_ref.fill_(0.1)
-                    solvers = [
-                        _solver_leaf_publication(model, enabled=value, velocity_limits=velocity_limits)
-                        for value in (False, True)
-                    ]
-                    states = [model.state() for _ in solvers]
-                    following = [model.state() for _ in solvers]
-                    controls = [model.control() for _ in solvers]
-                    seed = np.linspace(-0.4, 0.3, model.joint_dof_count, dtype=np.float32)
-                    previous_tau = None
-                    for force_phase in range(2):
-                        overwritten = None
-                        for additive in (False, True):
-                            for index, solver in enumerate(solvers):
-                                state = states[index]
-                                if force_phase == 0 and not additive:
-                                    solver._stage1_fk_id(state, solver, following[index])
-                                elif force_phase == 1 and not additive:
-                                    solver._fk_id_cache_valid.fill_(1)
-                                    solver._stage1_fk_id(state, solver, following[index])
-                                wrench = np.arange(model.body_count * 6, dtype=np.float32).reshape(-1, 6)
-                                wrench = (wrench % 11 - 5) * (0.03 + force_phase * 0.04)
-                                state.body_f.assign(wrench)
-                                controls[index].joint_f.assign(seed * (1.0 + force_phase))
-                                solver._joint_tau.assign(seed)
-                                solver._body_ft_s.fill_(-123.25)
-                                for scratch in solver._tree_net_wrenches:
-                                    scratch.fill_(-123.25)
-                                solver._launch_rigid_tau(state, solver, controls[index], add_to_existing=additive)
-                            for name in ("_body_ft_s", "_joint_tau"):
-                                np.testing.assert_allclose(
-                                    getattr(solvers[1], name).numpy(),
-                                    getattr(solvers[0], name).numpy(),
-                                    rtol=3e-6,
-                                    atol=3e-6,
-                                    err_msg=f"forces {force_phase}, additive {additive}: {name}",
-                                )
-                            tau = solvers[1]._joint_tau.numpy().copy()
-                            if additive:
-                                np.testing.assert_allclose(tau - overwritten, seed, rtol=3e-6, atol=3e-6)
-                            else:
-                                overwritten = tau
-                        if previous_tau is not None:
-                            self.assertGreater(float(np.max(np.abs(overwritten - previous_tau))), 0.01)
-                        previous_tau = overwritten
-                    model.joint_damping.zero_()
-                    for index, solver in enumerate(solvers):
-                        solver._refresh_passive_joint_damping()
-                        solver._launch_rigid_tau(states[index], solver, controls[index])
-                        np.testing.assert_allclose(
-                            previous_tau - solver._joint_tau.numpy(),
-                            -damping * states[index].joint_qd.numpy(),
-                            rtol=3e-5,
-                            atol=3e-6,
-                        )
-
-    def test_cuda_stage1_cold_mixed_cache_and_velocity_prescale(self):
-        """Match every canonical dynamics field across partial warps and active prescaling."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("Parallel tree execution requires CUDA")
-        for device in devices:
-            for velocity_limits in (False, True):
-                with self.subTest(device=str(device), velocity_limits=velocity_limits):
-                    model = _build_fingers(device, ragged=True)
-                    model.joint_velocity_limit.fill_(0.05)
-                    solvers = []
-                    states = []
-                    outputs = []
-                    for parallel in (False, True):
-                        solver = SolverSteel(
-                            model,
-                            iterations=8,
-                            use_parallel_streams=False,
-                            enable_joint_velocity_limits=velocity_limits,
-                            parallel_tree=parallel,
-                        )
-                        if parallel:
-                            self.assertIsNotNone(solver._tree_plan)
-                        else:
-                            self.assertIsNone(solver._tree_plan)
-                        state, following = model.state(), model.state()
-                        solver._prepare_augmented_state(state, following, model.control())
-                        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                        for name, array in _fields(solver, state).items():
-                            if name not in ("body_q", "body_qd", "valid"):
-                                array.fill_(-123.25)
-                        solver._fk_id_cache_valid.zero_()
-                        solvers.append(solver)
-                        states.append(state)
-                        outputs.append(following)
-                    original_qd = model.joint_qd.numpy().copy()
-                    for phase in ("cold", "mixed", "warm"):
-                        for solver, state, following in zip(solvers, states, outputs, strict=True):
-                            if phase == "mixed":
-                                q = state.joint_q.numpy().copy()
-                                start, end = model.articulation_start.numpy()[1:3]
-                                q0, q1 = model.joint_q_start.numpy()[[start, end]]
-                                q[q0:q1] += 0.1
-                                state.joint_q.assign(q)
-                                solver._fk_id_cache_valid.fill_(1)
-                                solver.notify_state_changed(wp.array([1], dtype=wp.int32, device=device))
-                                np.testing.assert_array_equal(
-                                    solver._fk_id_cache_valid.numpy(),
-                                    [1, 0, 1] if solver._fk_id_cache_enabled else [1, 1, 1],
-                                )
-                            elif phase == "warm":
-                                solver._fk_id_cache_valid.fill_(1)
-                            _, predictor_qd = solver._stage1_fk_id(state, solver, following)
-                            np.testing.assert_array_equal(state.joint_qd.numpy(), original_qd)
-                            if velocity_limits:
-                                self.assertGreater(float(np.max(np.abs(predictor_qd.numpy() - original_qd))), 0.01)
-                        for name, actual in _fields(solvers[1], states[1]).items():
-                            np.testing.assert_allclose(
-                                actual.numpy(),
-                                _fields(solvers[0], states[0])[name].numpy(),
-                                rtol=3e-6,
-                                atol=3e-6,
-                                err_msg=f"{phase}: {name}",
-                            )
-                        if velocity_limits:
-                            np.testing.assert_array_equal(solvers[1]._qd_work.numpy(), solvers[0]._qd_work.numpy())
-
-    def test_cuda_uncached_publication_matches_public_fk(self):
-        """Publish uncached FREE and mixed D6 states using the public FK convention."""
-        devices = wp.get_cuda_devices()
-        if not devices:
-            self.skipTest("Parallel tree publication requires CUDA")
-        for device in devices:
-            model, _, _ = _build_branched_model(device, floating_root=True)
-            solver = _solver_leaf_publication(model, enabled=True)
-            solver._fk_id_cache_enabled = False
-            state = model.state()
-            state.body_q.fill_(-123.25)
-            state.body_qd.fill_(-123.25)
-            solver._stage7_update_kinematics(state, solver)
-            reference = model.state()
-            newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
-            for name in ("body_q", "body_qd"):
-                np.testing.assert_allclose(
-                    getattr(state, name).numpy(), getattr(reference, name).numpy(), rtol=3e-6, atol=3e-6, err_msg=name
-                )
+    pass
 
 
-@contextlib.contextmanager
-def _capture_device_stdout():
-    """Capture what reaches file descriptor 1, where device printf writes, also inside an enclosing capture."""
-    wp.synchronize()
-    sys.stdout.flush()
-    if LIBC is not None:
-        LIBC.fflush(None)
-    captured = types.SimpleNamespace(text="")
-    saved_fd = os.dup(1)
-    with tempfile.TemporaryFile() as sink:
-        os.dup2(sink.fileno(), 1)
-        try:
-            yield captured
-        finally:
-            try:
-                wp.synchronize()
-                sys.stdout.flush()
-                if LIBC is not None:
-                    LIBC.fflush(None)
-            finally:
-                os.dup2(saved_fd, 1)
-                os.close(saved_fd)
-            sink.seek(0)
-            captured.text = sink.read().decode("utf-8", errors="replace")
+for _name in (
+    "test_serial_selection_skips_tree_setup",
+    "test_explicit_parallel_preserves_eligibility_fallback",
+    "test_backward_torques_with_live_forces_and_passive_terms",
+    "test_stage1_matches_serial_with_velocity_prescale",
+    "test_publication_matches_public_fk",
+    "test_contact_trajectory_matches_serial",
+):
+    add_function_test(TestSteelTreeExecution, _name, globals()[_name], devices=devices)
 
 
-def _build_ball_tree_model(device: str) -> newton.Model:
-    """Contact-free fixed-base trees with ball joints past the root, ``N_WORLDS`` copies.
+SCHEDULES = ("interleaved", "contact_then_internal", "phased")
 
-    A world-rooted revolute link carries two ball-joint chains (a branch: one parent, two children) and
-    a fixed leaf, so the tree is neither single-DOF nor free-root and takes the multi-DOF warp kernels.
+
+# Scissor link offset whose links start just apart, with speculative contact rows.
+_SPECULATIVE_OFFSET = 0.031
+
+
+def _schedule_scene(device, worlds=1, offset=0.028):
+    """A limited, driven three-link scissor next to a free body above its speed bound.
+
+    At the default ``offset`` the two links overlap slightly, so the first step has contact rows.
     """
-    scene = newton.ModelBuilder()
-    for _ in range(N_WORLDS):
-        builder = newton.ModelBuilder()
-        no_collision = builder.default_shape_cfg.copy()
-        no_collision.has_shape_collision = False
-        no_collision.collision_group = 0
-        hub = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()))
-        builder.add_shape_box(hub, hx=0.1, hy=0.1, hz=0.1, cfg=no_collision)
-        joints = [
-            builder.add_joint_revolute(
-                parent=-1,
-                child=hub,
-                axis=wp.vec3(0.0, 0.0, 1.0),
-                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()),
+    template = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(template)
+    template.default_shape_cfg.mu = 0.5
+    base = template.add_link()
+    template.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05)
+    joints = [
+        template.add_joint_revolute(
+            -1,
+            base,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            limit_lower=-0.001,
+            limit_upper=0.001,
+        )
+    ]
+    for side in (1.0, -1.0):
+        link = template.add_link()
+        template.add_shape_box(link, hx=0.12, hy=0.03, hz=0.04)
+        joints.append(
+            template.add_joint_revolute(
+                base,
+                link,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.06, side * offset, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+                target_ke=50.0 if side > 0 else 0.0,
+                target_kd=2.0 if side > 0 else 0.0,
+                target_q=0.3,
             )
-        ]
-        for side in (-1.0, 1.0):
-            prev = hub
-            for i in range(3):
-                link = builder.add_link()
-                builder.add_shape_capsule(link, radius=0.03, half_height=0.1, cfg=no_collision)
-                joints.append(
-                    builder.add_joint_ball(
-                        parent=prev,
-                        child=link,
-                        parent_xform=wp.transform(
-                            wp.vec3(0.0, 0.12 * side if i == 0 else 0.0, -0.12), wp.quat_identity()
-                        ),
-                        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
-                    )
-                )
-                prev = link
-        tip = builder.add_link()
-        builder.add_shape_box(tip, hx=0.05, hy=0.05, hz=0.05, cfg=no_collision)
-        joints.append(builder.add_joint_fixed(parent=prev, child=tip))
-        builder.add_articulation(joints)
-        scene.add_world(builder)
-    return scene.finalize(device=device)
+        )
+    template.add_articulation(joints)
+    template.add_body(
+        xform=wp.transform(wp.vec3(2.0, 0.0, 2.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3) * 1.0e-2),
+        custom_attributes={
+            "steel:rigid_body_max_linear_velocity": 0.001,
+            "steel:rigid_body_max_angular_velocity": 0.001,
+        },
+    )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds)
+    model = builder.finalize(device=device)
+    joint_qd = model.joint_qd.numpy()
+    # Fast enough to close the 0.001 rad gap to the upper limit within one step.
+    joint_qd[0::4] = 5.0
+    model.joint_qd.assign(joint_qd)
+    return model
 
 
-class TestPropagationMultiDofWarp(TestPropagationFreeRootWarp):
-    """Ball joints past the root take the multi-DOF warp kernels: the free-root checks on a ball tree."""
-
-    ref_rtol = 1e-4  # the light ball links reach joint velocities of ~2e3
-
-    @classmethod
-    def setUpClass(cls):
-        cls.device = "cuda:0"
-        cls.model_free = _build_ball_tree_model(cls.device)
-
-    def test_free_root_shape_detected(self):
-        solver = _make_solver_propagation_free_root_warp(self.model_free, "colored")
-        size = next(int(s) for s in solver._size_groups if solver._n_arts_by_size[s] > 0)
-        self.assertFalse(solver._propagation_tree_single_dof_by_size[size])
-        self.assertFalse(solver._propagation_tree_free_root_by_size[size])
-        self.assertTrue(solver._propagation_tree_multidof_by_size[size])
-        for name in _WARP_KERNEL_DICTS:
-            self.assertIsNotNone(getattr(solver, name)[size], f"{name}[{size}] should hold a warp variant")
-
-    def test_end_to_end_single_contact(self):
-        self.skipTest("builds its own free-root chain scenes")
+def _schedule_solver(model, **kwargs):
+    options = {
+        "enable_joint_limits": True,
+        "friction_anchor_beta": 0.0,
+        "drive_mode": "rows",
+        "articulation_constraint_max": 64,
+    }
+    options.update(kwargs)
+    return SolverSteel(model, **options)
 
 
-def _build_latency_scene(device: str) -> newton.Model:
-    """``N_WORLDS`` worlds with every latency-mode role: a fixed-base revolute arm, a ball-joint chain on a
-    floating base, and free boxes, all colliding with the ground."""
+def _schedule_step(model, solver, steps=1):
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    control = model.control()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return state_0
+
+
+def test_schedule_validation(test, device):
+    """Accept the three schedules and reject unknown names and unsupported combinations."""
+    model = _schedule_scene(device)
+    for schedule in SCHEDULES:
+        test.assertEqual(SolverSteel(model, row_schedule=schedule).row_schedule, schedule)
+    with test.assertRaisesRegex(ValueError, "row_schedule"):
+        SolverSteel(model, row_schedule="bad")
+    for schedule in SCHEDULES[1:]:
+        with test.subTest(schedule=schedule):
+            set_torsion_radius(model, 0.01)
+            with test.assertRaisesRegex(NotImplementedError, "contact torsion.*row_schedule='interleaved'"):
+                SolverSteel(model, row_schedule=schedule)
+            set_torsion_radius(model, 0.0)
+            with test.assertRaisesRegex(NotImplementedError, "contact_compliance.*row_schedule='interleaved'"):
+                SolverSteel(model, row_schedule=schedule, contact_compliance=True, friction_anchor_beta=0.0)
+    for response in ("propagation", "colored"):
+        for schedule in SCHEDULES[1:]:
+            with test.subTest(response=response, schedule=schedule):
+                solver = SolverSteel(model, row_schedule=schedule, **steel_mode_options(response))
+                test.assertEqual(solver.row_schedule, schedule)
+
+
+def test_row_phases_touch_only_their_row_families(test, device):
+    """Restrict each row phase of the matrix-free kernel to its row families.
+
+    The scene has a PGS drive row, an active joint limit, contacts between two links of one
+    articulation (dense rows) and a free body above its velocity bound (velocity-limit rows).
+    """
+    model = _schedule_scene(device)
+    solver = _schedule_solver(model, iterations=0, row_schedule="phased")
+    _schedule_step(model, solver)
+    dense_count = int(solver._constraint_count.numpy()[0])
+    row_type = solver._row_type.numpy()[0, :dense_count]
+    families = {
+        "drive": row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET,
+        "limit": row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+        "contact": (row_type == PGS_CONSTRAINT_TYPE_CONTACT) | (row_type == PGS_CONSTRAINT_TYPE_FRICTION),
+    }
+    for name, mask in families.items():
+        test.assertTrue(mask.any(), name)
+    mf_count = int(solver._mf_constraint_count.numpy()[0])
+    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
+    test.assertGreater(mf_count, mf_contact_end)
+
+    touched = {}
+    for row_phase in (1, 2, 3, 4, 5):
+        solver._impulses.zero_()
+        solver._mf_impulses.zero_()
+        wp.copy(solver._v_out, solver._v_hat)
+        solver._launch_mf_gs_phase(row_phase)
+        dense = np.abs(solver._impulses.numpy()[0, :dense_count]) > 0.0
+        velocity_limits = np.abs(solver._mf_impulses.numpy()[0, mf_contact_end:mf_count]) > 0.0
+        touched[row_phase] = (*(bool(dense[mask].any()) for mask in families.values()), bool(velocity_limits.any()))
+    # (drive, limit, contact, velocity limit)
+    test.assertEqual(touched[1], (False, False, True, False))
+    test.assertEqual(touched[2], (True, True, False, True))
+    test.assertEqual(touched[3], (True, True, False, False))
+    test.assertEqual(touched[4], (False, False, True, False))
+    test.assertEqual(touched[5], (False, False, False, True))
+
+
+def test_phased_keeps_the_interleaved_row_order(test, device):
+    """Match the interleaved sweep: the dense layout already puts internal rows before contacts."""
+    for iterations in (1, 12):
+        results = []
+        for schedule in ("interleaved", "phased"):
+            model = _schedule_scene(device, worlds=2, offset=_SPECULATIVE_OFFSET)
+            results.append(
+                _schedule_step(
+                    model, _schedule_solver(model, iterations=iterations, row_schedule=schedule)
+                ).joint_qd.numpy()
+            )
+        np.testing.assert_allclose(results[1], results[0], rtol=0.0, atol=1.0e-6)
+
+
+def test_contact_then_internal_gives_internal_rows_the_last_word(test, device):
+    """Leave the internal rows at their fixed point after the contact iterations, unlike one interleaved sweep."""
+    changes = {}
+    for schedule, iterations in (("contact_then_internal", 12), ("interleaved", 1)):
+        model = _schedule_scene(device, offset=_SPECULATIVE_OFFSET)
+        solver = _schedule_solver(model, iterations=iterations, row_schedule=schedule)
+        _schedule_step(model, solver)
+        dense_count = int(solver._constraint_count.numpy()[0])
+        row_type = solver._row_type.numpy()[0, :dense_count]
+        internal = (row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET) | (row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+        before = solver._impulses.numpy()[0, :dense_count][internal].copy()
+        solver._launch_mf_gs_phase(3)
+        after = solver._impulses.numpy()[0, :dense_count][internal]
+        changes[schedule] = float(np.abs(after - before).max())
+    test.assertLess(changes["contact_then_internal"], 1.0e-4)
+    test.assertGreater(changes["interleaved"], 1.0e-3)
+
+
+def test_propagation_schedules(test, device):
+    """Run the propagation response with every schedule; phased is its interleaved order."""
+    results = {}
+    for schedule in SCHEDULES:
+        model = _schedule_scene(device, offset=_SPECULATIVE_OFFSET)
+        solver = _schedule_solver(
+            model,
+            drive_mode="augmented",
+            iterations=200,
+            row_schedule=schedule,
+            articulated_contact_response="propagation",
+        )
+        results[schedule] = _schedule_step(model, solver, steps=3).joint_qd.numpy()
+        test.assertTrue(np.isfinite(results[schedule]).all())
+    np.testing.assert_array_equal(results["phased"], results["interleaved"])
+
+
+def test_captured_schedules_match_eager(test, device):
+    """Replay every schedule's step in a CUDA graph with the eager result."""
+    for schedule in SCHEDULES:
+        with test.subTest(schedule=schedule):
+            finals = []
+            for capture in (False, True):
+                model = _schedule_scene(device, offset=_SPECULATIVE_OFFSET)
+                solver = _schedule_solver(model, iterations=4, row_schedule=schedule)
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                pipeline = newton.CollisionPipeline(model, deterministic=True)
+                contacts = pipeline.contacts()
+                control = model.control()
+
+                def substep(
+                    state_0=state_0,
+                    state_1=state_1,
+                    contacts=contacts,
+                    solver=solver,
+                    pipeline=pipeline,
+                    control=control,
+                ):
+                    pipeline.collide(state_0, contacts)
+                    solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+                    for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                        wp.copy(getattr(state_0, name), getattr(state_1, name))
+
+                substep()
+                if capture:
+                    with wp.ScopedCapture(device) as scope:
+                        substep()
+                    wp.capture_launch(scope.graph)
+                else:
+                    substep()
+                finals.append(state_0.joint_qd.numpy())
+            np.testing.assert_allclose(finals[1], finals[0], rtol=0.0, atol=1.0e-5)
+
+
+def _turntable(device, spin=0.0, boxes=6):
+    """Build ``boxes`` free boxes resting on a kinematic turntable, a revolute articulation root spun at ``spin``."""
+    builder = newton.ModelBuilder()
+    table = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(table, hx=0.6, hy=0.6, hz=0.05)
+    joint = builder.add_joint_revolute(
+        parent=-1,
+        child=table,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+    )
+    builder.add_articulation([joint])
+    builder.joint_qd[builder.joint_qd_start[joint]] = spin
+    for k in range(boxes):
+        angle = 2.0 * np.pi * k / boxes
+        position = wp.vec3(0.35 * np.cos(angle), 0.35 * np.sin(angle), 0.149)
+        box = builder.add_body(xform=wp.transform(position, wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = CONTACT_MAX
+    return model, table
+
+
+def test_prescribed_mask_marks_kinematic_roots(test, device):
+    """Mark kinematic articulation roots, free or jointed, and leave dynamic links below them unmarked."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    free_kinematic = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(free_kinematic, hx=0.1, hy=0.1, hz=0.1)
+    free_dynamic = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(free_dynamic, hx=0.1, hy=0.1, hz=0.1)
+    # add_link, not add_body: add_body wraps each body in its own free-joint articulation.
+    root = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
+    j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
+    link = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.8), wp.quat_identity()))
+    builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+    j_link = builder.add_joint_revolute(
+        parent=root,
+        child=link,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
+    )
+    builder.add_articulation([j_root, j_link])
+    solver = _colored_solver(builder.finalize(device=device))
+    prescribed = solver._body_prescribed.numpy()
+    test.assertEqual(int(prescribed[free_kinematic]), 1)
+    test.assertEqual(int(prescribed[free_dynamic]), 0)
+    test.assertEqual(int(prescribed[root]), 1)
+    test.assertEqual(int(prescribed[link]), 0)
+
+
+def test_kinematic_root_contacts_share_colors(test, device):
+    """Color contacts on a kinematic articulation root by their dynamic bodies only.
+
+    Every box's contacts would otherwise conflict on the turntable and take a color each.
+    """
+    model, _ = _turntable(device)
+    solver = _colored_solver(model)
+    _, contact_count = _settle(model, solver, steps=2)
+    counts, tail = _color_counts(solver)
+    test.assertGreaterEqual(contact_count, 12)
+    test.assertEqual(int(counts.sum()), contact_count)
+    test.assertEqual(tail, 0)
+    # Only a box's own contacts conflict.
+    test.assertLessEqual(int(np.count_nonzero(counts)), contact_count // 6)
+
+
+def test_kinematic_root_velocity_drives_the_colored_rows(test, device):
+    """Carry boxes along a spinning kinematic turntable, its velocity folded into the colored rows.
+
+    The table keeps its prescribed spin, and the colored sweep moves the boxes as the serial sweep does.
+    """
+    spin = 1.5
+    twists = {}
+    for mode in ("propagation", "colored"):
+        model, table = _turntable(device, spin=spin)
+        solver = SolverSteel(
+            model,
+            **steel_mode_options(mode),
+            iterations=6,
+            free_body_constraint_max=CONTACT_MAX,
+            articulation_constraint_max=64,
+        )
+        state, _ = _settle(model, solver, steps=120)
+        test.assertAlmostEqual(float(state.joint_qd.numpy()[0]), spin, places=4)
+        boxes = [body for body in range(model.body_count) if body != table]
+        body_q = state.body_q.numpy()[boxes]
+        twists[mode] = state.body_qd.numpy()[boxes]
+        # Newton body twists are (linear, angular): each box moves along the table's rotation.
+        tangent = np.stack([-body_q[:, 1], body_q[:, 0]], axis=1) * spin
+        along = np.sum(twists[mode][:, :2] * tangent, axis=1) / np.sum(tangent * tangent, axis=1)
+        np.testing.assert_array_less(0.5, along)
+    np.testing.assert_allclose(twists["colored"], twists["propagation"], atol=1.0e-2 * spin * 0.35)
+
+
+def test_colored_rows_fold_only_with_kinematic_roots(test, device):
+    """Fold the colored rows only while an articulation root is kinematic, and warn when that changes."""
+    model, table = _turntable(device)
+    solver = _colored_solver(model)
+    test.assertTrue(solver._has_body_prescribed)
+    flags = model.body_flags.numpy()
+    flags[table] &= ~int(newton.BodyFlags.KINEMATIC)
+    model.body_flags.assign(flags)
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs of colored steps"):
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    test.assertFalse(solver._has_body_prescribed)
+    test.assertFalse(np.any(solver._body_prescribed.numpy()))
+    # Without a prescribed body the sweep reads the rows as built.
+    _settle(model, solver, steps=2)
+    body_a, _body_b, rhs = solver._prepare_colored_sweep(solver._propagation_rhs)
+    test.assertIs(body_a, solver._propagation_body_a)
+    test.assertIs(rhs, solver._propagation_rhs)
+
+
+class TestSteelColoredKinematicRoots(unittest.TestCase):
+    pass
+
+
+for _fn in (
+    test_prescribed_mask_marks_kinematic_roots,
+    test_kinematic_root_contacts_share_colors,
+    test_kinematic_root_velocity_drives_the_colored_rows,
+    test_colored_rows_fold_only_with_kinematic_roots,
+):
+    add_function_test(TestSteelColoredKinematicRoots, _fn.__name__, _fn, devices=get_cuda_test_devices())
+
+
+def _build_latency_scene(device):
+    """Build ``N_WORLDS`` worlds with every latency-mode role, all touching the ground.
+
+    Each world has a fixed-base revolute arm with limits, a ball-joint chain on a floating base and a stack of free boxes.
+    """
     scene = newton.ModelBuilder()
     for _ in range(N_WORLDS):
         builder = newton.ModelBuilder()
@@ -4004,7 +3544,7 @@ def _build_latency_scene(device: str) -> newton.Model:
             prev = link
         builder.add_articulation(joints)
         for k in range(3):
-            # a slightly interpenetrating stack on the ground: contact rows on free bodies from the first step
+            # A slightly interpenetrating stack: free-body contact rows from the first step.
             box = builder.add_body(xform=wp.transform(wp.vec3(-0.4, 0.0, 0.048 + 0.098 * k), wp.quat_identity()))
             builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
         scene.add_world(builder)
@@ -4013,7 +3553,7 @@ def _build_latency_scene(device: str) -> newton.Model:
 
 
 def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
-    """Every non-empty CUDA value array (not struct arrays of handles) reachable through attributes, dicts, lists."""
+    """Collect every non-empty CUDA value array reachable through attributes, dicts, lists and tuples."""
     seen = set() if seen is None else seen
     out = {} if out is None else out
     if id(obj) in seen or depth > 3:
@@ -4037,48 +3577,79 @@ def _solver_arrays(obj, prefix="", depth=0, seen=None, out=None):
     return out
 
 
+def _kernel_param_bytes(kernel: wp.Kernel) -> int:
+    """End of a kernel's CUDA parameter block, laid out from the ctypes Warp packs for its bounds and arguments."""
+    kernel.adj.get_references()  # sets kernel_dim, the launch bounds' rank, before the module is built
+    fields = [("bounds", type(wp._src.types.launch_bounds_t((0,) * kernel.adj.kernel_dim)))]
+    for i, arg in enumerate(kernel.adj.args):
+        if wp.types.is_array(arg.type):
+            ctype = type(arg.type.__ctype__())
+        elif wp.types.type_is_struct(arg.type):
+            ctype = type(arg.type().__ctype__())
+        elif wp.types.type_is_composite(arg.type):
+            ctype = arg.type  # vectors, matrices and transforms are ctypes arrays of their scalars
+        else:
+            ctype = arg.type._type_
+        fields.append((f"arg{i}", ctype))
+    layout = type("KernelParams", (ctypes.Structure,), {"_fields_": fields})
+    return getattr(layout, fields[-1][0]).offset + ctypes.sizeof(fields[-1][1])
+
+
+@wp.kernel
+def _param_layout_probe(count: int, offset: wp.vec3d, values: wp.array[float]):
+    values[wp.tid()] = float(count) + float(offset[0])
+
+
+@wp.kernel
+def _param_layout_oversized(weights: wp.types.matrix((32, 32), float), values: wp.array[float]):
+    values[wp.tid()] = weights[0, 0]
+
+
+class TestKernelParamBytes(unittest.TestCase):
+    def test_counts_launch_bounds_composites_and_alignment(self):
+        """The layout adds the launch bounds, counts every vector scalar and pads each argument to its alignment."""
+        # 24-byte 1-D launch bounds, a 4-byte int padded to 8, a 24-byte vec3d, a 56-byte array descriptor
+        self.assertEqual(_kernel_param_bytes(_param_layout_probe), 112)
+
+    def test_oversized_kernel_exceeds_4kb(self):
+        """A 4 KB matrix argument puts the parameter block over 4096 bytes."""
+        self.assertGreater(_kernel_param_bytes(_param_layout_oversized), 4096)
+
+
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
-class TestLatencyFusedLoop(unittest.TestCase):
-    """The one-launch propagation PGS loop writes exactly what the per-pass launches write."""
+class TestSteelLatencyFused(unittest.TestCase):
+    """The one-launch colored propagation loop writes exactly what the per-pass launches write."""
 
-    def _check_fused_matches(self, model, *, min_wide_colors: int = 0, **solver_options):
-        """Run the chain and the fused loop from identical state on real loop calls; require bitwise equality."""
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", **solver_options
-        )
+    def _check_fused_matches(self, model, *, min_wide_colors=0, **solver_options):
+        """Run the per-pass loop and the fused loop from identical state on real loop calls; require equal bits."""
+        solver = SolverSteel(model, **steel_mode_options("colored"), **solver_options)
         self.assertTrue(solver._latency_fused)
-        wide = [0]
-        loop = type(solver)._launch_matrix_free_gs_solve_propagation_tree
+        loop = type(solver)._launch_propagation_solve
         checked = []
-
+        wide = [0]
         calls = [0]
 
-        def compare(self_, **kwargs):
+        def compare(self_, *args, **kwargs):
             calls[0] += 1
-            if len(checked) >= 3 or calls[0] < 20 or int(solver._propagation_constraint_count.numpy().max()) == 0:
-                return loop(self_, **kwargs)
+            if len(checked) >= 3 or calls[0] < 20 or int(self_._propagation_constraint_count.numpy().max()) == 0:
+                return loop(self_, *args, **kwargs)
             offsets = self_._color_world_offsets.numpy().reshape(self_._world_count, -1)
             sizes = np.diff(offsets, axis=1)[:, :-1]
             if min_wide_colors and sizes.max() <= 32:
-                return loop(self_, **kwargs)  # compare only calls whose colors exercise the block-wide sweep
+                return loop(self_, *args, **kwargs)
             wp.synchronize_device()
             before = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
-            refs = {k: v for k, v in vars(self_).items() if isinstance(v, wp.array)}
             scalars = {k: v for k, v in vars(self_).items() if not isinstance(v, (wp.array, dict, list, set))}
             self_._latency_fused = False
-            loop(self_, **kwargs)
+            loop(self_, *args, **kwargs)
             chain = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
             for k, v in _solver_arrays(self_).items():
                 if k in before:
                     v.assign(before[k])
-            for k in {k for k, v in vars(self_).items() if isinstance(v, wp.array)} - refs.keys():
-                delattr(self_, k)  # created lazily during the call; the second run recreates it
-            for k, v in refs.items():
-                setattr(self_, k, v)  # rebound during the call (e.g. _color_fold_rhs, which gates the fold)
             for k, v in scalars.items():
                 setattr(self_, k, v)
             self_._latency_fused = True
-            loop(self_, **kwargs)
+            loop(self_, *args, **kwargs)
             fused = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
             for k, a in chain.items():
                 b = fused[k]
@@ -4090,7 +3661,7 @@ class TestLatencyFusedLoop(unittest.TestCase):
             wide[0] = max(wide[0], int((sizes > 32).sum()))
             return None
 
-        with patch.object(type(solver), "_launch_matrix_free_gs_solve_propagation_tree", compare):
+        with patch.object(type(solver), "_launch_propagation_solve", compare):
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             state_0, state_1, control = model.state(), model.state(), model.control()
@@ -4100,41 +3671,32 @@ class TestLatencyFusedLoop(unittest.TestCase):
                 solver.step(state_0, state_1, control, contacts, DT)
                 state_0, state_1 = state_1, state_0
         self.assertEqual(len(checked), 3, "the scene never reached the loop with contacts")
-        # the comparison covered real work: the loop changed velocities and impulses
+        # The compared calls did work: the loop changed velocities and impulses.
         self.assertTrue(all(n >= 3 for n in checked), checked)
         self.assertGreaterEqual(wide[0], min_wide_colors, "the scene never had a color wider than one warp")
 
     def test_fused_loop_matches_per_pass_launches(self):
-        # trees (revolute arm with limits, ball chain) and free boxes in every role of the block
+        """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
 
     def test_fused_loop_velocity_passes_match(self):
-        # velocity_iterations > 0 runs the soft_relax pass, which folds a second right-hand side
+        """Match the per-pass launches in the velocity pass, which solves its own right-hand side."""
         self._check_fused_matches(
             _build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True, velocity_iterations=2
         )
 
-    def test_debug_hooks_take_the_per_pass_launches(self):
-        # stage timing and kernel capture observe the per-pass launches, so latency mode steps aside for them
-        model = _build_latency_scene("cuda:0")
-        solver = SolverSteel(
-            model, solve_mode="colored", articulated_contact_response="propagation", iterations=4
+    def test_fused_loop_contact_then_internal_matches(self):
+        """Match the per-pass launches when the internal rows follow the contact iterations in their own launch."""
+        self._check_fused_matches(
+            _build_latency_scene("cuda:0"),
+            iterations=8,
+            enable_joint_limits=True,
+            row_schedule="contact_then_internal",
         )
-        self.assertTrue(solver._latency_fused)
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        state_0, state_1, control = model.state(), model.state(), model.control()
-        with (
-            patch.object(solver, "_sync_timing_active", return_value=True),
-            patch.object(solver, "_launch_latency_fused") as fused,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            pipeline.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, DT)
-        fused.assert_not_called()
 
     def test_fused_loop_wide_colors_match(self):
-        # one world of free boxes on the ground: colors wider than a warp take the whole block
+        """Match the per-pass launches when colors wider than a warp take the whole block."""
+        # One world of free boxes on the ground.
         builder = newton.ModelBuilder()
         for i in range(10):
             for j in range(10):
@@ -4145,8 +3707,55 @@ class TestLatencyFusedLoop(unittest.TestCase):
             builder.finalize(device="cuda:0"), min_wide_colors=1, iterations=8, propagation_constraint_max=8192
         )
 
+    def _rollout(self, model, use_graph):
+        """Twenty-two steps of the latency scene, the last twenty eager or replayed from one captured graph."""
+        solver = SolverSteel(
+            model,
+            **steel_mode_options("colored"),
+            iterations=8,
+            enable_joint_limits=True,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
+        self.assertTrue(solver._latency_fused)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+
+        def two_steps():
+            for src, dst in ((state_0, state_1), (state_1, state_0)):
+                pipeline.collide(src, contacts)
+                solver.step(src, dst, control, contacts, DT)
+
+        two_steps()
+        if use_graph:
+            with patch.object(solver, "_launch_latency_fused", wraps=solver._launch_latency_fused) as fused:
+                with wp.ScopedCapture(device=model.device) as capture:
+                    two_steps()
+            self.assertGreater(fused.call_count, 0)
+        for _ in range(10):
+            if use_graph:
+                wp.capture_launch(capture.graph)
+            else:
+                two_steps()
+        return {k: getattr(state_0, k).numpy() for k in ("body_q", "body_qd", "joint_q", "joint_qd")}
+
+    def test_fused_loop_graph_capture_matches_eager(self):
+        """A captured graph of latency-mode steps replays to the eager steps' state bit for bit."""
+        model = _build_latency_scene("cuda:0")
+        eager = self._rollout(model, use_graph=False)
+        replayed = self._rollout(model, use_graph=True)
+        for k, a in eager.items():
+            np.testing.assert_array_equal(a.view(np.uint32), replayed[k].view(np.uint32), err_msg=k)
+        self.assertGreater(np.abs(eager["body_qd"]).max(), 0.0)
+
+    def test_fused_loop_arguments_fit_4kb(self):
+        """The fused loop's parameters fit the 4 KB that some drivers can capture into a CUDA graph."""
+        solver = SolverSteel(_build_latency_scene("cuda:0"), **steel_mode_options("colored"))
+        self.assertTrue(solver._latency_fused)
+        self.assertLessEqual(_kernel_param_bytes(solver._latency_fused_kernel), 4096)
+
     def test_off_past_one_world_per_sm(self):
-        # one block per world: off once the worlds no longer fit one block per SM
+        """Stay off once the worlds no longer fit one block per SM."""
         scene = newton.ModelBuilder()
         for _ in range(wp.get_device("cuda:0").sm_count + 1):
             world = newton.ModelBuilder()
@@ -4154,12 +3763,118 @@ class TestLatencyFusedLoop(unittest.TestCase):
             world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
             scene.add_world(world)
         scene.add_ground_plane()
-        solver = SolverSteel(
-            scene.finalize(device="cuda:0"),
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-        )
+        solver = SolverSteel(scene.finalize(device="cuda:0"), **steel_mode_options("colored"))
         self.assertFalse(solver._latency_fused)
+
+    def test_off_with_a_global_articulation_and_several_worlds(self):
+        """Stay off when a global articulation would be solved in world 0 beside other worlds."""
+        scene = newton.ModelBuilder()
+        for _ in range(2):
+            world = newton.ModelBuilder()
+            box = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+            world.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+            scene.add_world(world)
+        # A shapeless global arm: its tree work belongs to every world, so no block owns it.
+        link = scene.add_link(
+            xform=wp.transform(wp.vec3(2.0, 0.0, 1.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3))
+        )
+        scene.add_articulation([scene.add_joint_revolute(-1, link, axis=wp.vec3(0.0, 1.0, 0.0))])
+        scene.add_ground_plane()
+        model = scene.finalize(device="cuda:0")
+        self.assertTrue(np.any(model.articulation_world.numpy() < 0))
+        solver = SolverSteel(model, **steel_mode_options("colored"))
+        self.assertFalse(solver._latency_fused)
+
+
+def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+    solver = SolverSteel(
+        model,
+        articulated_contact_response=mode,
+        iterations=iterations,
+        velocity_iterations=0,
+        articulation_constraint_max=32,
+        free_body_constraint_max=32,
+        contact_warmstart=False,
+        **options,
+    )
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
+    rows = (
+        int(solver._constraint_count.numpy().sum()),
+        int(solver._propagation_constraint_count.numpy().sum()),
+    )
+    return state_out.joint_qd.numpy(), rows
+
+
+def test_multi_dof_contact_rows(test, device):
+    """Propagation solves the contact rows of a 6-DOF D6 link like the immediate response."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cfg = newton.ModelBuilder.JointDofConfig
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, hx=0.12, hy=0.08, hz=0.06)
+    joint = builder.add_joint_d6(
+        parent=-1,
+        child=link,
+        linear_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        angular_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+    )
+    builder.add_articulation([joint])
+    cube = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.588), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.04)
+    model = builder.finalize(device=device)
+
+    state = model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+    qd_immediate, rows_immediate = _step_d6_contact_case(model, contacts, "immediate")
+    test.assertGreater(rows_immediate[0], 0)
+    test.assertEqual(rows_immediate[1], 0)
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            qd, rows = _step_d6_contact_case(model, contacts, "propagation", solve_mode=solve_mode)
+            test.assertEqual(rows[0], 0)
+            test.assertGreater(rows[1], 0)
+            np.testing.assert_allclose(qd, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+    # Longest-first sweeps the 3-row units first, unlike the immediate row order, so it is compared once converged.
+    qd_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
+    qd_longest_first = _step_d6_contact_case(
+        model, contacts, "propagation", iterations=32, solve_mode="colored", propagation_color_order="longest_first"
+    )[0]
+    np.testing.assert_allclose(qd_longest_first, qd_converged, rtol=1.0e-5, atol=1.0e-5)
+
+
+class TestSteelMultiDofContactRows(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelMultiDofContactRows, "test_multi_dof_contact_rows", test_multi_dof_contact_rows, devices=get_test_devices()
+)
+
+
+class TestSteelSchedule(unittest.TestCase):
+    pass
+
+
+cuda_devices = get_cuda_test_devices()
+
+
+for _fn in (
+    test_schedule_validation,
+    test_row_phases_touch_only_their_row_families,
+    test_phased_keeps_the_interleaved_row_order,
+    test_contact_then_internal_gives_internal_rows_the_last_word,
+    test_propagation_schedules,
+    test_captured_schedules_match_eager,
+):
+    add_function_test(TestSteelSchedule, _fn.__name__, _fn, devices=cuda_devices)
 
 
 if __name__ == "__main__":

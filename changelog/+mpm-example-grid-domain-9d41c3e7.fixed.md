@@ -1,1 +1,1 @@
-The rigid/MPM coupled example pads its fixed MPM grid using a conservative single-flight estimate for grains thrown by the box impacts, and caps MPM particle advection speed: grains that left the former grid got runaway velocities that launched the boxes and made the sand non-finite.
+Fix the rigid/MPM coupled example (`mujoco_mpm_coupled_solver`) launching its boxes and turning the sand non-finite when thrown grains left the fixed MPM grid: the grid padding now covers a single-flight estimate of thrown grains and MPM particle advection speed is capped.

@@ -1,1 +1,0 @@
-Remove `SolverSteel(solve_mode="dense")` in favor of the default `solve_mode`. The dense path solved free-rigid contacts inside the dense Delassus system, where they exhausted the per-world row budget on piles.

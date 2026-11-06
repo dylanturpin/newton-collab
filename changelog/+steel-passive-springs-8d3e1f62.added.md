@@ -1,0 +1,1 @@
+Apply passive joint springs (`Model.joint_stiffness` toward `Model.joint_rest_q`) on PRISMATIC, REVOLUTE and D6 DOFs in `SolverSteel`, refreshed on `JOINT_DOF_PROPERTIES`, `JOINT_DOF_FORCE_PROPERTIES` and `JOINT_REFERENCE_POSE_PROPERTIES` notifications. Construction warns when other joint types have nonzero stiffness, which Steel ignores.

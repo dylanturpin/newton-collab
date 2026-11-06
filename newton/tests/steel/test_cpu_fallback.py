@@ -43,7 +43,7 @@ def _add_arm(builder, x, top, *, links=3, free_root=False):
                 limit_upper=0.6,
                 target_ke=200.0,
                 target_kd=5.0,
-                target_pos=0.5,
+                target_q=0.5,
             )
         )
         parent = link
@@ -115,7 +115,7 @@ def _rollout(device, scene, mode):
         articulation_constraint_max=64,
         free_body_constraint_max=64,
         # Fixed contact and row order, so the two devices solve the same rows in the same sequence.
-        deterministic=True,
+        deterministic=wp.DeterministicMode.RUN_TO_RUN,
         **_SCENES[scene][1],
     )
     pipeline = newton.CollisionPipeline(model, deterministic=True)
@@ -140,6 +140,7 @@ _MODES = (("serial", "immediate"), ("serial", "propagation"), ("colored", "propa
 
 class TestSteelCpuFallback(unittest.TestCase):
     def test_cpu_rollouts_move_and_stay_finite(self):
+        """CPU rollouts of every mode stay finite, hold contacts and move under their drives."""
         for scene in _SCENES:
             for mode in _MODES:
                 with self.subTest(scene=scene, mode=mode):
@@ -152,6 +153,7 @@ class TestSteelCpuFallback(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
     def test_cpu_tracks_cuda(self):
+        """CPU rollouts follow CUDA rollouts of the same scene and mode."""
         for scene in _SCENES:
             for mode in _MODES:
                 with self.subTest(scene=scene, mode=mode):
@@ -163,13 +165,13 @@ class TestSteelCpuFallback(unittest.TestCase):
                     np.testing.assert_allclose(qd_cpu, qd_gpu, atol=0.15)
 
     def test_cuda_only_features_raise_on_cpu(self):
+        """Options implemented only on CUDA raise ``NotImplementedError`` on CPU."""
         model = _build("cpu", "box_stack")
         for options in (
-            {"nesterov_momentum": True},
             {"friction_mode": "bisection", "friction_anchor_beta": 0.0},
-            {"enable_torsional_rolling_friction": True},
             {"free_rigid_torsional_friction": 0.01},
             {"enable_joint_friction": True},
+            {"solve_mode": "colored", "articulated_contact_response": "propagation", "enable_sleeping": True},
         ):
             with self.subTest(options=options), self.assertRaisesRegex(NotImplementedError, "require CUDA"):
                 SolverSteel(model, **options)

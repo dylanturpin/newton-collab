@@ -1,22 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
+"""Example Franka Cloth Block (proxy coupling)
 
-###########################################################################
-# Example Franka Cloth Block (proxy coupling)
-#
-# A rigid block rests on a VBD cloth hammock pinned along two edges, as in
-# the cloth Franka example but at meter scale and with a block between the
-# robot and the cloth. A fixed-base Franka, simulated by MuJoCo or
-# Steel, picks the block up off the sagging cloth with GPU IK and
-# places it on a table beside the hammock. SolverCoupledProxy exposes the
-# block and the gripper to VBD as proxies: the cloth carries the block's
-# weight and sags under it, and springs back once the robot lifts the
-# block off.
-#
-# Command: python -m newton.examples franka_cloth_block
-#          python -m newton.examples franka_cloth_block --rigid-solver steel
-#
-###########################################################################
+A rigid block rests on a VBD cloth hammock pinned along two edges, as in
+the cloth Franka example but at meter scale and with a block between the
+robot and the cloth. A fixed-base Franka, simulated by MuJoCo or
+Steel, picks the block up off the sagging cloth with GPU IK and
+places it on a table beside the hammock. SolverCoupledProxy exposes the
+block and the gripper to VBD as proxies: the cloth carries the block's
+weight and sags under it, and springs back once the robot lifts the
+block off.
+
+Success criteria:
+- The cloth sags under the block, the Franka lifts the block off it and places it on the table.
+- The cloth springs back once the block is lifted, without tearing or exploding.
+
+Runs:
+- `python -m newton.examples franka_cloth_block`
+- `python -m newton.examples franka_cloth_block --rigid-solver steel`
+"""
 
 from __future__ import annotations
 
@@ -216,7 +218,7 @@ class Example:
         joints_per_world = template.joint_count
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        builder.replicate(template, world_count=self.world_count)
+        builder.replicate(template, copy_count=self.world_count)
         builder.add_ground_plane()
         # The table is global like the ground so every entry's view keeps it.
         builder.add_shape_box(
@@ -257,7 +259,7 @@ class Example:
                     view,
                     iterations=24,
                     enable_joint_limits=True,
-                    articulation_constraint_max=256,
+                    articulation_constraint_max=320,
                 )
 
         else:

@@ -1,56 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Row capacities, overflow reporting, watermarks and heterogeneous worlds of SolverSteel."""
-
-from __future__ import annotations
+"""Row capacities, overflow reporting, watermarks and heterogeneous-world guards of SolverSteel."""
 
 import gc
+import sys
 import unittest
+import weakref
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton._src.solvers.steel.friction_patches import FrictionPatches
-from newton._src.solvers.steel.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
-    PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
-    PGS_CONSTRAINT_TYPE_TORSION,
-    allocate_world_contact_slots,
-    collect_propagation_units,
-    finalize_mf_constraint_counts,
-)
-from newton._src.solvers.steel.solver_steel import (
-    PROPAGATION_COLOR_TAIL,
-    _get_color_propagation_prebuild_kernel,
-)
+from newton._src.solvers.steel.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import set_torsion_radius
-from newton.tests.steel.test_propagation import _add_arm_on_heap, _Stepper
-from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
-
-
-class TestSteelCapacityStatus(unittest.TestCase):
-    def test_capacity_failure_is_observable_without_watermarks(self):
-        """Expose dropped contacts even when optional detailed telemetry is off."""
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cpu")
-        solver = SolverSteel(model, free_body_constraint_max=1)
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        state_in, state_out = model.state(), model.state()
-        pipeline.collide(state_in, contacts)
-        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
-        with self.assertRaisesRegex(RuntimeError, "capacity"):
-            solver.check_constraint_capacity()
-        self.assertTrue(solver.constraint_overflow.numpy()[0])
-        solver.reset(state_out)
-        solver.check_constraint_capacity()
+from newton.tests.steel._fixtures import steel_mode_options
+from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
 
 
 def _box_on_ground(device, worlds=1):
@@ -63,10 +29,10 @@ def _box_on_ground(device, worlds=1):
     return builder.finalize(device=device)
 
 
-def test_capacity_failure_is_observable(test, device, solve_mode="serial"):
+def test_capacity_failure_is_observable(test, device):
     """Flag dropped free-body contact rows until reset, without optional telemetry."""
     model = _box_on_ground(device)
-    solver = SolverSteel(model, solve_mode=solve_mode, free_body_constraint_max=1, warn_constraint_overflow=False)
+    solver = SolverSteel(model, free_body_constraint_max=1, warn_constraint_overflow=False)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_in, state_out = model.state(), model.state()
@@ -80,8 +46,80 @@ def test_capacity_failure_is_observable(test, device, solve_mode="serial"):
     solver.check_constraint_capacity()
 
 
+def test_dense_capacity_failure_is_world_local(test, device):
+    """Flag only the world whose dense rows overflow."""
+    template = newton.ModelBuilder()
+    link = template.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+    template.add_shape_box(link, hx=0.3, hy=0.3, hz=0.1)
+    joint = template.add_joint_prismatic(-1, link, axis=newton.Axis.Z)
+    template.add_articulation([joint])
+    # The second world's slider starts high above the ground: no contacts there.
+    lifted = newton.ModelBuilder()
+    lifted_link = lifted.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()))
+    lifted.add_shape_box(lifted_link, hx=0.3, hy=0.3, hz=0.1)
+    lifted.add_articulation([lifted.add_joint_prismatic(-1, lifted_link, axis=newton.Axis.Z)])
+    builder = newton.ModelBuilder()
+    builder.add_world(template)
+    builder.add_world(lifted)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+
+    solver = SolverSteel(model, articulation_constraint_max=3, warn_constraint_overflow=False)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    pipeline.collide(state_in, contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 1)
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+    np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True, False, False])
+    test.assertLessEqual(int(solver._constraint_count.numpy()[0]), 3)
+
+
+def test_overflow_warning_is_printed_once(test, device, response="immediate"):
+    """Print one device-side warning per overflowing row family, inside this test."""
+    if wp.get_device(device).is_cpu and sys.platform == "win32":
+        test.skipTest("Warp CPU printf capture is unreliable on Windows")
+    model = _box_on_ground(device, worlds=2)
+    if response == "propagation":
+        # The propagation rows hold every contact, in free_body_constraint_max + articulation_constraint_max rows.
+        solver = SolverSteel(
+            model, free_body_constraint_max=1, articulation_constraint_max=1, **steel_mode_options(response)
+        )
+    else:
+        solver = SolverSteel(model, free_body_constraint_max=1)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    step_output = []
+    for _ in range(2):
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+        finally:
+            # Flush the device printf into this capture, also when the step raises.
+            try:
+                wp.synchronize()
+            finally:
+                output = capture.end()
+        step_output.append(
+            [
+                line
+                for line in output.splitlines()
+                if line.strip() and not (line.startswith("Module") and "load on device" in line)
+            ]
+        )
+    family = "propagation" if response == "propagation" else "matrix-free"
+    test.assertEqual(len(step_output[0]), 1, step_output[0])
+    test.assertRegex(step_output[0][0], rf"^Warning: Steel {family} constraint-row overflow in world [01]:")
+    test.assertEqual(step_output[1], [])
+    expected = [0, 0, 0, 1, 0] if response == "propagation" else [0, 1, 0, 0, 0]
+    np.testing.assert_array_equal(solver._row_overflow_warning_emitted.numpy(), expected)
+
+
 def test_status_snapshot_reports_status_at_snapshot(test, device):
-    """Report the status as copied by snapshot_constraint_status, unchanged by later steps and resets."""
+    """Report the status as copied by snapshot_constraint_status, unchanged by later steps, and retaken by a reset."""
     model = _box_on_ground(device)
     solver = SolverSteel(model, free_body_constraint_max=1, warn_constraint_overflow=False)
     with test.assertRaisesRegex(RuntimeError, "snapshot_constraint_status"):
@@ -94,16 +132,39 @@ def test_status_snapshot_reports_status_at_snapshot(test, device):
     solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
     solver.check_constraint_capacity(snapshot=True)
     solver.snapshot_constraint_status()
+    with test.assertRaisesRegex(RuntimeError, "dropped contacts or constraint rows"):
+        solver.check_constraint_capacity(snapshot=True)
+    solver.reset(state_out)
+    solver.check_constraint_capacity(snapshot=True)
+    solver.check_constraint_capacity()
+    for name, pattern in (
+        ("_disabled_tree_joint", "articulation tree joint"),
+        ("_joint_friction_invalid", "joint_friction was invalid"),
+    ):
+        getattr(solver, name).fill_(True)
+        solver.snapshot_constraint_status()
+        getattr(solver, name).fill_(False)
+        with test.assertRaisesRegex(RuntimeError, pattern):
+            solver.check_constraint_capacity(snapshot=True)
+        solver.check_constraint_capacity()
+
+
+def test_unchecked_status_snapshot_is_kept_by_reset(test, device):
+    """Report an unchecked snapshot's error after a reset, and retake the snapshot on a reset once it is checked."""
+    model = _box_on_ground(device)
+    solver = SolverSteel(model, free_body_constraint_max=1, warn_constraint_overflow=False)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+    solver.snapshot_constraint_status()
     solver.reset(state_out)
     solver.check_constraint_capacity()
-    with test.assertRaisesRegex(RuntimeError, "capacity"):
+    with test.assertRaisesRegex(RuntimeError, "dropped contacts or constraint rows"):
         solver.check_constraint_capacity(snapshot=True)
-    solver.snapshot_constraint_status()
+    solver.reset(state_out)
     solver.check_constraint_capacity(snapshot=True)
-    solver._disabled_tree_joint.fill_(True)
-    solver.snapshot_constraint_status()
-    with test.assertRaisesRegex(RuntimeError, "articulation tree joint"):
-        solver.check_constraint_capacity(snapshot=True)
 
 
 def test_released_snapshot_solver_keeps_another_capture_valid(test, device):
@@ -115,14 +176,25 @@ def test_released_snapshot_solver_keeps_another_capture_valid(test, device):
     counter = wp.zeros(1, dtype=int, device=device)
     with wp.ScopedCapture(device) as capture:
         counter.fill_(1)
+        reference = weakref.ref(solver)
         del solver
         gc.collect()
+        test.assertIsNone(reference())
         counter.fill_(2)
     wp.capture_launch(capture.graph)
     test.assertEqual(int(counter.numpy()[0]), 2)
 
 
-class TestSteelCapacityStatusUpstream(unittest.TestCase):
+def test_status_snapshot_is_refused_during_capture(test, device):
+    """Refuse a snapshot inside CUDA graph capture."""
+    model = _box_on_ground(device)
+    solver = SolverSteel(model)
+    with wp.ScopedCapture(device):
+        with test.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
+            solver.snapshot_constraint_status()
+
+
+class TestSteelCapacityStatus(unittest.TestCase):
     pass
 
 
@@ -130,427 +202,359 @@ devices = get_cuda_test_devices()
 
 
 add_function_test(
-    TestSteelCapacityStatusUpstream,
+    TestSteelCapacityStatus,
     "test_capacity_failure_is_observable",
     test_capacity_failure_is_observable,
     devices=devices,
 )
+
+
 add_function_test(
-    TestSteelCapacityStatusUpstream,
+    TestSteelCapacityStatus,
+    "test_dense_capacity_failure_is_world_local",
+    test_dense_capacity_failure_is_world_local,
+    devices=devices,
+)
+
+
+# The warning tests check their own output: CheckOutput's capture would receive the device printf.
+add_function_test(
+    TestSteelCapacityStatus,
+    "test_overflow_warning_is_printed_once",
+    test_overflow_warning_is_printed_once,
+    devices=devices,
+    check_output=False,
+)
+
+
+add_function_test(
+    TestSteelCapacityStatus,
+    "test_status_snapshot_reports_status_at_snapshot",
+    test_status_snapshot_reports_status_at_snapshot,
+    devices=devices,
+)
+
+
+add_function_test(
+    TestSteelCapacityStatus,
+    "test_unchecked_status_snapshot_is_kept_by_reset",
+    test_unchecked_status_snapshot_is_kept_by_reset,
+    devices=devices,
+)
+
+
+add_function_test(
+    TestSteelCapacityStatus,
     "test_released_snapshot_solver_keeps_another_capture_valid",
     test_released_snapshot_solver_keeps_another_capture_valid,
     devices=devices,
 )
+
+
 add_function_test(
-    TestSteelCapacityStatusUpstream,
-    "test_status_snapshot_reports_status_at_snapshot",
-    test_status_snapshot_reports_status_at_snapshot,
-    devices=get_test_devices(),
+    TestSteelCapacityStatus,
+    "test_status_snapshot_is_refused_during_capture",
+    test_status_snapshot_is_refused_during_capture,
+    devices=devices,
 )
 
 
-def _driven_model(count=1, worlds=1, device="cpu"):
+add_function_test(
+    TestSteelCapacityStatus,
+    "test_overflow_warning_is_printed_once_propagation",
+    test_overflow_warning_is_printed_once,
+    devices=devices,
+    check_output=False,
+    response="propagation",
+)
+
+
+def _driven_model(device, worlds=2):
+    """One driven slider per world plus one global (world -1) free body, without gravity."""
+    template = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    joint = template.add_joint_prismatic(
+        -1, body, axis=newton.Axis.X, target_ke=10000.0, target_kd=0.0, armature=0.0, damping=0.0
+    )
+    template.add_articulation([joint])
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    for _ in range(count):
-        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-        joint = builder.add_joint_prismatic(
-            -1, body, axis=newton.Axis.X, target_ke=10000.0, target_kd=0.0, armature=0.0, damping=0.0
-        )
-        builder.add_articulation([joint])
-    if worlds > 1:
-        replicated = newton.ModelBuilder(gravity=wp.vec3(0.0))
-        replicated.replicate(builder, worlds, spacing=(1.0, 0.0, 0.0))
-        builder = replicated
+    for _ in range(worlds):
+        builder.add_world(template)
+    builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
     return builder.finalize(device=device)
 
 
-class TestSteelSafety(unittest.TestCase):
-    def test_partial_reset_refreshes_only_selected_mass_factors(self):
-        """Preserve factor reuse in worlds outside a partial episode reset."""
-        devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
-        for device in devices:
-            with self.subTest(device=str(device)):
-                model = _driven_model(worlds=2, device=device)
-                solver = SolverSteel(model, update_mass_matrix_interval=100)
-                state, output = model.state(), model.state()
-                control = model.control()
-                solver.step(state, output, control, None, 0.01)
-                mask = wp.array([True, False], dtype=wp.bool, device=device)
-                solver.reset(state, mask)
-                solver.step(state, output, control, None, 0.01)
-                np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [1, 0])
-                if wp.get_device(device).is_cuda:
-                    first_mask = wp.empty_like(solver._mass_update_mask)
-                    with wp.ScopedCapture(device=device) as capture:
-                        solver.reset(state, mask)
-                        solver.step(state, output, control, None, 0.01)
-                        wp.copy(first_mask, solver._mass_update_mask)
-                        solver.step(state, output, control, None, 0.01)
-                    mask.assign(np.array([False, True]))
-                    wp.capture_launch(capture.graph)
-                    np.testing.assert_array_equal(first_mask.numpy(), [0, 1])
-                    # The request is consumed by the first step; the next reuses both factors.
-                    np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [0, 0])
+def test_partial_reset_refreshes_only_selected_mass_factors(test, device):
+    """Refresh only the selected world's (or the global slot's) factors, eagerly and under graph replay."""
+    model = _driven_model(device)
+    solver = SolverSteel(model, update_mass_matrix_interval=100)
+    state, output = model.state(), model.state()
+    control = model.control()
+    solver.step(state, output, control, None, 0.01)
 
-    def test_unmatched_pipeline_clears_stale_contact_identity(self):
-        """Cold-start a matched buffer when its current producer disables matching."""
-        builder = newton.ModelBuilder()
-        _cylinder_foot(builder, wp.vec3(0.0, 0.0, 0.015))
-        builder.add_ground_plane()
-        model = builder.finalize(device="cpu")
-        config = newton.CollisionPipeline.ContactReductionConfig(body_pairs=True)
-        matched = newton.CollisionPipeline(model, contact_matching="latest")
-        unmatched = newton.CollisionPipeline(model, deterministic=True, reduce_contacts=config)
-        state, contacts = model.state(), matched.contacts()
-        matched.collide(state, contacts)
-        matched.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertTrue(np.any(contacts.rigid_contact_match_index.numpy()[:count] >= 0))
-        unmatched.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertGreater(count, 0)
-        self.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] == -1))
+    mask = wp.array([True, False, False], dtype=wp.bool, device=device)
+    solver.reset(state, mask)
+    solver.step(state, output, control, None, 0.01)
+    np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [1, 0, 0])
+    if not wp.get_device(device).is_cuda:
+        return
 
-    def test_contact_reset_clears_reduction_without_matching(self):
-        """Clear selected patch history even when the matcher is disabled."""
-        template = newton.ModelBuilder()
-        _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
-        builder = newton.ModelBuilder()
-        builder.replicate(template, 2, spacing=(1.0, 0.0, 0.0))
-        builder.add_ground_plane()
-        model = builder.finalize(device="cpu")
-        pipeline = newton.CollisionPipeline(
-            model,
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True, body_pair_hysteresis=0.001
-            ),
+    first_mask = wp.empty_like(solver._mass_update_mask)
+    with wp.ScopedCapture(device=device) as capture:
+        solver.reset(state, mask)
+        solver.step(state, output, control, None, 0.01)
+        wp.copy(first_mask, solver._mass_update_mask)
+        solver.step(state, output, control, None, 0.01)
+
+    for selected, expected in (([False, True, False], [0, 1, 0]), ([False, False, True], [0, 0, 1])):
+        with test.subTest(mask=selected):
+            mask.assign(np.array(selected))
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(first_mask.numpy(), expected)
+            # The request is consumed by the first step; the second reuses every factor.
+            np.testing.assert_array_equal(solver._mass_update_mask.numpy(), [0, 0, 0])
+
+
+def _cylinder_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
+    """Add one free body whose collision is ``num_cyl`` small cylinders in a row."""
+    body = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()), mass=1.0)
+    for i in range(num_cyl):
+        x = (i - (num_cyl - 1) / 2.0) * (2.2 * radius)
+        builder.add_shape_cylinder(
+            body, xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()), radius=radius, half_height=half_height
         )
-        contacts = pipeline.contacts()
-        pipeline.collide(model.state(), contacts)
-        before = pipeline._body_pair_reducer.history_generation.numpy().copy()
-        pipeline.reset_contact_matching(wp.array([True, False, False], dtype=wp.bool, device=model.device))
-        after = pipeline._body_pair_reducer.history_generation.numpy()
-        self.assertGreater(after[0], before[0])
-        self.assertEqual(after[1], before[1])
+    return body
 
 
-def _build_model():
-    """Build one articulated body for contact-capacity tests."""
+def test_unmatched_pipeline_clears_stale_contact_identity(test, device):
+    """Cold-start a matched buffer when its current producer disables matching.
+
+    Warm starting reads ``rigid_contact_match_index``; a stale index left by an earlier
+    matching producer would seed impulses into unrelated contacts.
+    """
     builder = newton.ModelBuilder()
-    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    joint = builder.add_joint_free(parent=-1, child=body)
-    builder.add_articulation([joint])
-    model = builder.finalize(device="cpu")
-    model.rigid_contact_max = 1
-    return model
+    _cylinder_foot(builder, wp.vec3(0.0, 0.0, 0.015))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    matched = newton.CollisionPipeline(model, contact_matching="latest")
+    unmatched = newton.CollisionPipeline(model, deterministic=True)
+    state, contacts = model.state(), matched.contacts()
+    matched.collide(state, contacts)
+    matched.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertTrue(np.any(contacts.rigid_contact_match_index.numpy()[:count] >= 0))
+    unmatched.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+    test.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] == -1))
 
 
-class TestSteelContactCapacity(unittest.TestCase):
-    def _assert_mixed_units_are_all_scheduled(
-        self,
-        *,
-        contact_phi: tuple[float, ...],
-        friction_gap_threshold: float,
-        patch_friction: bool,
-    ):
-        """Build and color a row-capacity-filling mixture of contact units."""
-        device = wp.get_device("cuda:0")
-        contact_count = len(contact_phi)
-        row_capacity = 6
-        color_entries = contact_count + 2  # one color per unit, plus the tail and total entries
-        order_stride = 8  # power of two >= row_capacity
+def test_first_step_capture_survives_a_released_graph(test, device):
+    """Capture a new solver's first step with no warmup, release that graph, and replay a later capture."""
+    model = _box_on_ground(device)
+    solver = SolverSteel(model)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    pipeline.collide(state_in, contacts)
+    with wp.ScopedCapture(device) as first:
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+    with wp.ScopedCapture(device) as second:
+        for _ in range(3):
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+    del first
+    gc.collect()
+    wp.capture_launch(second.graph)
+    wp.synchronize_device(device)
+    test.assertTrue(np.all(np.isfinite(state_out.body_q.numpy())))
 
-        contact_count_array = wp.array([contact_count], dtype=wp.int32, device=device)
-        contact_shape0 = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-        contact_shape1 = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
-        contact_point0_np = np.zeros((contact_count, 3), dtype=np.float32)
-        contact_point0_np[:, 2] = contact_phi
-        contact_point0 = wp.array(contact_point0_np, dtype=wp.vec3, device=device)
-        contact_point1 = wp.zeros((contact_count,), dtype=wp.vec3, device=device)
-        contact_normal = wp.array(
-            np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (contact_count, 1)),
-            dtype=wp.vec3,
-            device=device,
-        )
-        contact_slot = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
-        contact_path = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
-        contact_world = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-        contact_slots_needed = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-        propagation_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
-        patches = FrictionPatches()
-        if patch_friction:
-            patches.enabled = 1
-            patches.weight = wp.array([1.0] + [0.0] * (contact_count - 1), dtype=float, device=device)
+class TestSteelSafety(unittest.TestCase):
+    pass
 
-        wp.launch(
-            allocate_world_contact_slots,
-            dim=contact_count,
-            inputs=[
-                contact_count_array,
-                contact_count,
-                contact_shape0,
-                contact_shape1,
-                contact_point0,
-                contact_point1,
-                contact_normal,
-                wp.zeros((contact_count,), dtype=wp.float32, device=device),
-                wp.zeros((contact_count,), dtype=wp.float32, device=device),
-                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.array([6], dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.ones((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                0,
-                1,
-                1,
-                0,
-                float("inf"),
-                row_capacity,
-                row_capacity,
-                row_capacity,
-                friction_gap_threshold,
-                patches,
-                0,
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                0,
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                0,
-                0,
-            ],
-            outputs=[
-                contact_world,
-                contact_slot,
-                wp.full((contact_count,), -1, dtype=wp.int32, device=device),
-                wp.full((contact_count,), -1, dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                contact_path,
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                propagation_slot_counter,
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                contact_slots_needed,
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.zeros((contact_count,), dtype=wp.int32, device=device),
-            ],
-            device=device,
-        )
 
-        unit_cursor = wp.zeros((1,), dtype=wp.int32, device=device)
-        unit_contact = wp.full((row_capacity,), -1, dtype=wp.int32, device=device)
-        unit_body_a = wp.full((row_capacity,), -1, dtype=wp.int32, device=device)
-        unit_body_b = wp.full((row_capacity,), -1, dtype=wp.int32, device=device)
-        unit_len = wp.zeros((row_capacity,), dtype=wp.int32, device=device)
-        wp.launch(
-            collect_propagation_units,
-            dim=contact_count,
-            inputs=[
-                contact_count_array,
-                contact_path,
-                contact_world,
-                contact_shape0,
-                contact_shape1,
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),  # body_prescribed: none here
-                contact_slots_needed,
-                row_capacity,
-            ],
-            outputs=[unit_cursor, unit_contact, unit_body_a, unit_body_b, unit_len],
-            device=device,
-        )
+add_function_test(
+    TestSteelSafety,
+    "test_first_step_capture_survives_a_released_graph",
+    test_first_step_capture_survives_a_released_graph,
+    devices=get_cuda_test_devices(),
+)
 
-        row_order = wp.full((row_capacity,), -1, dtype=wp.int32, device=device)
-        color_offsets = wp.full((color_entries,), -1, dtype=wp.int32, device=device)
-        sorted_contact = wp.full((row_capacity,), -1, dtype=wp.int32, device=device)
-        kernel = _get_color_propagation_prebuild_kernel(
-            row_capacity,
-            color_entries,
-            64,
-            order_stride,
-            str(device.arch),
-        )
-        wp.launch_tiled(
-            kernel,
-            dim=[1],
-            inputs=[
-                1,
-                unit_cursor,
-                unit_contact,
-                unit_body_a,
-                unit_body_b,
-                unit_len,
-                wp.zeros(((PROPAGATION_COLOR_TAIL + 31) // 32,), dtype=wp.int32, device=device),  # body 0 mask
-                wp.zeros((order_stride,), dtype=wp.int32, device=device),
-                wp.zeros((row_capacity,), dtype=wp.int32, device=device),
-                contact_slot,
-                row_order,
-                color_offsets,
-                sorted_contact,
-            ],
-            block_dim=64,
-            device=device,
-        )
 
-        slots_needed_np = contact_slots_needed.numpy()
-        self.assertEqual(sorted(slots_needed_np.tolist()), [1, 1, 1, 3])
-        np.testing.assert_array_equal(contact_path.numpy(), np.full(contact_count, 2, dtype=np.int32))
-        self.assertEqual(int(propagation_slot_counter.numpy()[0]), row_capacity)
-        self.assertEqual(int(unit_cursor.numpy()[0]), contact_count)
+add_function_test(
+    TestSteelSafety,
+    "test_partial_reset_refreshes_only_selected_mass_factors",
+    test_partial_reset_refreshes_only_selected_mass_factors,
+    devices=get_cuda_test_devices(),
+)
 
-        # Every unit is colored (no staging cap, so nothing spills into the tail). All
-        # units share body 0, so each takes its own color, in contact-index order.
-        offsets_np = color_offsets.numpy()
-        self.assertEqual(int(offsets_np[-1]), contact_count)
-        self.assertEqual(int(offsets_np[-1] - offsets_np[-2]), 0)
-        self.assertEqual(offsets_np[: contact_count + 1].tolist(), list(range(contact_count + 1)))
 
-        sorted_contact_np = sorted_contact.numpy()[:contact_count]
-        self.assertEqual(sorted_contact_np.tolist(), list(range(contact_count)))
-        contact_slot_np = contact_slot.numpy()
-        row_order_np = row_order.numpy()
-        row_acc = 0
-        for position, contact in enumerate(sorted_contact_np):
-            self.assertEqual(int(row_order_np[position]), row_acc)
-            self.assertEqual(int(contact_slot_np[contact]), row_acc)
-            row_acc += int(slots_needed_np[contact])
-        self.assertEqual(row_acc, row_capacity)
-
-    def test_allocator_rejects_incomplete_contact_frame(self):
-        """Ignore a frame whose reported contact count exceeds its materialized capacity."""
-        capacity = 2
-        device = "cpu"
-        contact_slot = wp.full((capacity,), -7, dtype=wp.int32, device=device)
-        contact_path = wp.full((capacity,), -7, dtype=wp.int32, device=device)
-        world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
-
-        wp.launch(
-            allocate_world_contact_slots,
-            dim=capacity,
-            inputs=[
-                wp.array([capacity + 1], dtype=wp.int32, device=device),
-                capacity,
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-                wp.full((capacity,), -1, dtype=wp.int32, device=device),
-                wp.zeros((capacity,), dtype=wp.vec3, device=device),
-                wp.zeros((capacity,), dtype=wp.vec3, device=device),
-                wp.array([wp.vec3(0.0, 0.0, 1.0)] * capacity, dtype=wp.vec3, device=device),
-                wp.zeros((capacity,), dtype=wp.float32, device=device),
-                wp.zeros((capacity,), dtype=wp.float32, device=device),
-                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([6], dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.ones((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                0,
-                0,
-                0,
-                0,
-                float("inf"),
-                8,
-                8,
-                8,
-                0.0,
-                FrictionPatches(),
-                0,
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                0,
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                0,
-                0,
-            ],
-            outputs=[
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-                contact_slot,
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-                world_slot_counter,
-                contact_path,
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.zeros((1,), dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-                wp.zeros((capacity,), dtype=wp.int32, device=device),
-            ],
-            device=device,
-        )
-
-        np.testing.assert_array_equal(contact_slot.numpy(), np.full(capacity, -1, dtype=np.int32))
-        np.testing.assert_array_equal(contact_path.numpy(), np.full(capacity, -1, dtype=np.int32))
-        self.assertEqual(int(world_slot_counter.numpy()[0]), 0)
-
-    def test_step_rejects_contacts_larger_than_scratch(self):
-        """Reject oversized contact input before it can overwrite solver scratch."""
-        model = _build_model()
-        solver = SolverSteel(model)
-        contacts = newton.Contacts(rigid_contact_max=2, soft_contact_max=0, device=model.device)
-
-        with self.assertRaisesRegex(ValueError, "contact capacity"):
-            solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "propagation_colored prebuild requires CUDA")
-    def test_colored_prebuild_preserves_mixed_contact_units(self):
-        """Schedule friction-gap and patch-selected one-row units alongside three-row units."""
-        scenarios = {
-            "friction_gap": ((-0.01, 0.01, 0.02, 0.03), 0.0, 0),
-            "patch_friction": ((-0.01, -0.01, -0.01, -0.01), float("inf"), 1),
-        }
-        for name, (contact_phi, friction_gap_threshold, patch_friction) in scenarios.items():
-            with self.subTest(name=name):
-                self._assert_mixed_units_are_all_scheduled(
-                    contact_phi=contact_phi,
-                    friction_gap_threshold=friction_gap_threshold,
-                    patch_friction=patch_friction,
-                )
+add_function_test(
+    TestSteelSafety,
+    "test_unmatched_pipeline_clears_stale_contact_identity",
+    test_unmatched_pipeline_clears_stale_contact_identity,
+    devices=get_test_devices(),
+)
 
 
 _UNBOUNDED = 2**31 - 1
 
 
-def _allocate_overflowing_contacts(device, contact_count, row_capacity):
-    """Route ``contact_count`` contacts into one world with ``row_capacity`` rows.
+def _point_friction(device):
+    """Return the disabled friction-patch view: every contact gets point friction rows."""
+    patches = FrictionPatches()
+    patches.enabled = 0
+    patches.weight = wp.zeros(0, dtype=float, device=device)
+    patches.next_contact = wp.zeros(0, dtype=int, device=device)
+    patches.point_a = wp.zeros(0, dtype=wp.vec3, device=device)
+    patches.point_b = wp.zeros(0, dtype=wp.vec3, device=device)
+    patches.phi = wp.zeros(1, dtype=wp.vec2, device=device)
+    return patches
 
-    Contacts alternate between penetrating (three rows: normal plus two friction) and
-    separated within the gap (one speculative normal row). Mixed reservation sizes are
-    what let a rolled-back counter re-admit a contact behind a rejected one.
-    """
-    contact_shape0 = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-    contact_shape1 = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
-    points = np.zeros((contact_count, 3), dtype=np.float32)
-    points[:, 2] = np.where(np.arange(contact_count) % 2 == 0, -0.01, 0.01)
-    contact_point0 = wp.array(points, dtype=wp.vec3, device=device)
-    contact_point1 = wp.zeros((contact_count,), dtype=wp.vec3, device=device)
-    contact_normal = wp.array(
-        np.tile([0.0, 0.0, -1.0], (contact_count, 1)).astype(np.float32), dtype=wp.vec3, device=device
+
+def test_allocator_rejects_incomplete_contact_frame(test, device):
+    """Route no contact of a frame whose reported count exceeds its materialized capacity."""
+    capacity = 2
+    contact_slot = wp.full((capacity,), -7, dtype=wp.int32, device=device)
+    contact_path = wp.full((capacity,), -7, dtype=wp.int32, device=device)
+    world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
+    wp.launch(
+        allocate_world_contact_slots,
+        dim=capacity,
+        inputs=[
+            wp.array([capacity + 1], dtype=wp.int32, device=device),
+            capacity,
+            wp.zeros((capacity,), dtype=wp.int32, device=device),
+            wp.full((capacity,), -1, dtype=wp.int32, device=device),
+            wp.zeros((capacity,), dtype=wp.vec3, device=device),
+            wp.zeros((capacity,), dtype=wp.vec3, device=device),
+            wp.zeros((capacity,), dtype=wp.vec3, device=device),
+            wp.zeros((capacity,), dtype=wp.float32, device=device),
+            wp.zeros((capacity,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.transform, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([6], dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.ones((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            0,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            float("inf"),
+            float("inf"),
+            _point_friction(device),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            0,
+        ],
+        outputs=[
+            wp.zeros((capacity,), dtype=wp.int32, device=device),
+            contact_slot,
+            wp.zeros((capacity,), dtype=wp.int32, device=device),
+            wp.zeros((capacity,), dtype=wp.int32, device=device),
+            wp.zeros((capacity,), dtype=wp.int32, device=device),
+            world_slot_counter,
+            contact_path,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+        ],
+        device=device,
     )
+    np.testing.assert_array_equal(contact_slot.numpy(), np.full(capacity, -1, dtype=np.int32))
+    np.testing.assert_array_equal(contact_path.numpy(), np.full(capacity, -1, dtype=np.int32))
+    test.assertEqual(int(world_slot_counter.numpy()[0]), 0)
+
+
+def test_step_rejects_contacts_larger_than_scratch(test, device):
+    """Reject a contact buffer larger than the solver's contact scratch before it is read."""
+    builder = newton.ModelBuilder()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=body)])
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 1
+    solver = SolverSteel(model)
+    contacts = newton.Contacts(rigid_contact_max=2, soft_contact_max=0, device=model.device)
+    with test.assertRaisesRegex(ValueError, "contact capacity"):
+        solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
+
+
+def test_overflowed_contact_count_invalidates_every_world(test, device):
+    """Flag every world when the narrow phase reports more contacts than the buffer holds."""
+    template = newton.ModelBuilder()
+    body = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+    template.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    builder = newton.ModelBuilder()
+    builder.replicate(template, 2, spacing=(1.0, 0.0, 0.0))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    pipeline.collide(state_in, contacts)
+    contacts.rigid_contact_count.fill_(contacts.rigid_contact_max + 1)
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+    np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True, True, True])
+    np.testing.assert_array_equal(solver._contact_path.numpy()[: contacts.rigid_contact_max], -1)
+
+
+class TestSteelContactCapacity(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelContactCapacity,
+    "test_allocator_rejects_incomplete_contact_frame",
+    test_allocator_rejects_incomplete_contact_frame,
+    devices=get_test_devices(),
+)
+
+
+add_function_test(
+    TestSteelContactCapacity,
+    "test_step_rejects_contacts_larger_than_scratch",
+    test_step_rejects_contacts_larger_than_scratch,
+    devices=devices,
+)
+
+
+add_function_test(
+    TestSteelContactCapacity,
+    "test_overflowed_contact_count_invalidates_every_world",
+    test_overflowed_contact_count_invalidates_every_world,
+    devices=devices,
+)
+
+
+def _allocate_overflowing_contacts(device, contact_count, row_capacity, propagation=False):
+    """Route ``contact_count`` free-body contacts into one world with ``row_capacity`` rows.
+
+    With ``propagation`` the contacts go to the propagation rows of the propagation response.
+    """
     contact_slot = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
     contact_path = wp.full((contact_count,), -1, dtype=wp.int32, device=device)
-    contact_world = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-    slots_needed = wp.zeros((contact_count,), dtype=wp.int32, device=device)
-    counter = wp.zeros((1,), dtype=wp.int32, device=device)
-    dropped = wp.zeros((1,), dtype=wp.int32, device=device)
-    first_rejected = wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device)
+    counters = [wp.zeros((1,), dtype=wp.int32, device=device) for _ in range(3)]
+    dropped = [wp.zeros((1,), dtype=wp.int32, device=device) for _ in range(3)]
+    first_rejected = [wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device) for _ in range(3)]
+    family = 2 if propagation else 1
     count = wp.zeros((1,), dtype=wp.int32, device=device)
     wp.launch(
         allocate_world_contact_slots,
@@ -558,225 +562,113 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
         inputs=[
             wp.array([contact_count], dtype=wp.int32, device=device),
             contact_count,
-            contact_shape0,
-            contact_shape1,
-            contact_point0,
-            contact_point1,
-            contact_normal,
+            wp.zeros((contact_count,), dtype=wp.int32, device=device),
+            wp.full((contact_count,), -1, dtype=wp.int32, device=device),
+            wp.zeros((contact_count,), dtype=wp.vec3, device=device),
+            wp.zeros((contact_count,), dtype=wp.vec3, device=device),
+            wp.full((contact_count,), wp.vec3(0.0, 0.0, 1.0), dtype=wp.vec3, device=device),
             wp.zeros((contact_count,), dtype=wp.float32, device=device),
             wp.zeros((contact_count,), dtype=wp.float32, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.zeros((1,), dtype=wp.transform, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.array([6], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.ones((1,), dtype=wp.int32, device=device),
+            wp.ones((1,), dtype=wp.int32, device=device),
+            1,
+            int(propagation),
+            0,
+            int(propagation),
+            row_capacity,
+            row_capacity,
+            row_capacity,
             wp.zeros((1,), dtype=wp.int32, device=device),
-            0,
-            1,
-            1,
-            0,
             float("inf"),
-            row_capacity,
-            row_capacity,
-            row_capacity,
-            0.0,
-            FrictionPatches(),
+            float("inf"),
+            _point_friction(device),
             0,
-            wp.zeros((1,), dtype=wp.float32, device=device),
-            wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
-            0,
             0,
         ],
         outputs=[
-            contact_world,
+            wp.zeros((contact_count,), dtype=wp.int32, device=device),
             contact_slot,
             wp.full((contact_count,), -1, dtype=wp.int32, device=device),
             wp.full((contact_count,), -1, dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            contact_path,
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            counter,
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            slots_needed,
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            dropped,
-            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
-            wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
-            first_rejected,
             wp.zeros((contact_count,), dtype=wp.int32, device=device),
+            counters[0],
+            contact_path,
+            counters[1],
+            counters[2],
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            dropped[0],
+            dropped[1],
+            dropped[2],
+            first_rejected[0],
+            first_rejected[1],
+            first_rejected[2],
+            wp.zeros((2,), dtype=wp.int32, device=device),
         ],
         device=device,
     )
     wp.launch(
         finalize_mf_constraint_counts,
         dim=1,
-        inputs=[counter, row_capacity, first_rejected],
+        inputs=[counters[family], row_capacity, 3, first_rejected[family]],
         outputs=[count],
         device=device,
     )
     return (
         contact_slot.numpy(),
-        slots_needed.numpy(),
+        contact_path.numpy(),
         int(count.numpy()[0]),
-        int(counter.numpy()[0]),
-        int(dropped.numpy()[0]),
+        int(counters[family].numpy()[0]),
+        int(dropped[family].numpy()[0]),
     )
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "the allocation race needs concurrent GPU reservations")
+def test_overflow_keeps_every_accepted_contact_below_the_count(test, device, propagation=False):
+    """Keep every accepted contact's rows inside the finalized count while thousands overflow."""
+    row_capacity = 48
+    for _ in range(20):
+        slot, path, count, counter, dropped = _allocate_overflowing_contacts(device, 3000, row_capacity, propagation)
+        accepted = slot >= 0
+        test.assertTrue(np.all(path[accepted] == (2 if propagation else 1)))
+        test.assertTrue(np.all(path[~accepted] == -1))
+        test.assertEqual(count, 3 * int(accepted.sum()))
+        test.assertLessEqual(count, row_capacity)
+        test.assertEqual(counter, 3 * int(accepted.sum()) + dropped)
+        test.assertTrue(np.all(slot[accepted] + 3 <= count))
+        np.testing.assert_array_equal(np.sort(slot[accepted]), np.arange(0, count, 3))
+
+
 class TestSteelRowAllocation(unittest.TestCase):
-    def test_overflow_keeps_every_accepted_contact_below_the_count(self):
-        """No accepted contact may hold rows at or past the finalized count.
+    pass
 
-        Rolling the shared counter back for a rejected reservation raced with concurrent
-        reservations: a contact accepted at slot s could see the counter end below s, so
-        its rows were built but never solved while patch links still chained into them.
-        With 3000 mixed one- and three-row contacts into 48 rows nearly every reservation
-        is rejected, which makes the race easy to hit.
-        """
-        device = wp.get_device()
-        worst_excess = 0
-        for _ in range(40):
-            slot, needed, count, counter, dropped = _allocate_overflowing_contacts(device, 3000, 48)
-            accepted = slot >= 0
-            self.assertLessEqual(count, 48)
-            self.assertEqual(
-                counter,
-                int(needed[accepted].sum()) + dropped,
-                "counter must equal accepted rows plus rejected reservations",
-            )
-            excess = int(np.max(slot[accepted] + needed[accepted])) - count if accepted.any() else 0
-            worst_excess = max(worst_excess, excess)
-            self.assertEqual(int(np.sum(needed[accepted])), count, "accepted rows must fill exactly [0, count)")
-        self.assertLessEqual(worst_excess, 0, f"accepted rows reach {worst_excess} past the row count")
 
-    def test_dense_capacity_keeps_room_for_same_articulation_contacts(self):
-        """Propagation modes must not shrink the dense budget when contacts can still route there.
+add_function_test(
+    TestSteelRowAllocation,
+    "test_overflow_keeps_every_accepted_contact_below_the_count",
+    test_overflow_keeps_every_accepted_contact_below_the_count,
+    devices=get_test_devices(),
+)
 
-        Contacts between two links of one articulation stay on the dense family unless
-        ``propagation_same_articulation_rows`` routes them; a 16-row internal reserve
-        drops most of them every step.
-        """
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.add_ground_plane()
-        root = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
-        builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
-        j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
-        link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.8), wp.quat_identity()))
-        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
-        j_link = builder.add_joint_revolute(
-            parent=root,
-            child=link,
-            axis=wp.vec3(0.0, 1.0, 0.0),
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
-        )
-        builder.add_articulation([j_root, j_link], label="chain")
-        model = builder.finalize()
-        model.rigid_contact_max = 256
-        dense_routed = newton.solvers.SolverSteel(
-            model,
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-            articulation_constraint_max=320,
-            free_body_constraint_max=256,
-        )
-        self.assertEqual(int(dense_routed._articulation_constraint_max), 320)
-        propagation_routed = newton.solvers.SolverSteel(
-            model,
-            solve_mode="colored",
-            articulated_contact_response="propagation",
-            articulation_constraint_max=320,
-            free_body_constraint_max=256,
-            propagation_same_articulation_rows=True,
-        )
-        self.assertLess(int(propagation_routed._articulation_constraint_max), 320)
 
-    def test_propagation_constraint_max_sizes_the_propagation_family(self):
-        """``propagation_constraint_max`` sets the propagation row capacity on its own.
+add_function_test(
+    TestSteelRowAllocation,
+    "test_overflow_keeps_every_accepted_contact_below_the_count_propagation",
+    test_overflow_keeps_every_accepted_contact_below_the_count,
+    devices=get_cuda_test_devices(),
+    propagation=True,
+)
 
-        In the propagation responses every contact row lives on the propagation family, so its
-        capacity defaulted to the sum of the free-body and articulation budgets: shrinking the
-        matrix-free budget to the rows it still holds (joint velocity limits) also starved the
-        contact rows. The explicit capacity decouples the two.
-        """
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.add_ground_plane()
-        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize()
-        model.rigid_contact_max = 256
-        kwargs = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
-        summed = newton.solvers.SolverSteel(
-            model, articulation_constraint_max=32, free_body_constraint_max=256, **kwargs
-        )
-        self.assertEqual(int(summed._propagation_max_constraints), 256 + 32)
-        self.assertIsNone(summed.propagation_constraint_max)
-        decoupled = newton.solvers.SolverSteel(
-            model,
-            articulation_constraint_max=32,
-            free_body_constraint_max=16,
-            propagation_constraint_max=288,
-            **kwargs,
-        )
-        self.assertEqual(int(decoupled._propagation_max_constraints), 288)
-        self.assertEqual(decoupled.propagation_constraint_max, 288)
-        self.assertEqual(int(decoupled._free_body_constraint_max), 16)
-        with self.assertRaises(ValueError):
-            newton.solvers.SolverSteel(model, propagation_constraint_max=0, **kwargs)
-        with self.assertRaises(ValueError):
-            newton.solvers.SolverSteel(model, articulated_contact_response="immediate", propagation_constraint_max=64)
 
-    def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget(self):
-        """With the propagation family sized to the contacts, a tiny free-body budget drops no contact rows."""
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.add_ground_plane()
-        for i in range(3):
-            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1 + 0.2 * i), wp.quat_identity()))
-            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize()
-        model.rigid_contact_max = 256
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
-        contacts = pipeline.contacts()
-        for name, value in (
-            ("rigid_contact_stiffness", 0.0),
-            ("rigid_contact_damping", 0.0),
-            ("rigid_contact_friction", 1.0),
-        ):
-            setattr(contacts, name, wp.full(256, value, dtype=float))
-
-        def dropped(**options):
-            solver = newton.solvers.SolverSteel(
-                model,
-                solve_mode="colored",
-                articulated_contact_response="propagation",
-                free_body_constraint_max=4,
-                row_watermark=True,
-                warn_constraint_overflow=False,
-                **options,
-            )
-            state, nxt = model.state(), model.state()
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-            control = model.control()
-            for _ in range(5):
-                state.clear_forces()
-                pipeline.collide(state, contacts)
-                solver.step(state, nxt, control, contacts, 0.005)
-                state, nxt = nxt, state
-            marks = solver.constraint_row_watermarks()
-            return marks["propagation_dropped_contact_rows_high_water"], marks["propagation_high_water"]
-
-        starved, _ = dropped()
-        self.assertGreater(starved, 0, "a 4-row free-body budget must starve the summed propagation family")
-        sized, used = dropped(propagation_constraint_max=256)
-        self.assertEqual(sized, 0)
-        self.assertGreater(used, 4)
+_FAMILY_KEYS = ("high_water", "raw_high_water", "dropped_contact_rows_high_water", "overflow_excess_high_water")
 
 
 def _scene(device):
@@ -804,8 +696,101 @@ def _scene(device):
     return builder.finalize(device=device)
 
 
+def _run(model, solver, steps):
+    """Step and return the host-side per-step maxima of every row family and the contact count."""
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    observed = {"dense": 0, "dense_raw": 0, "mf": 0, "mf_raw": 0, "contact": 0}
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        observed["dense"] = max(observed["dense"], int(solver._constraint_count.numpy().max()))
+        observed["dense_raw"] = max(observed["dense_raw"], int(solver._slot_counter.numpy().max()))
+        observed["mf"] = max(observed["mf"], int(solver._mf_constraint_count.numpy().max()))
+        observed["mf_raw"] = max(observed["mf_raw"], int(solver._mf_slot_counter.numpy().max()))
+        observed["contact"] = max(observed["contact"], int(contacts.rigid_contact_count.numpy()[0]))
+        if solver._propagation_active:
+            observed["propagation"] = max(
+                observed.get("propagation", 0), int(solver._propagation_constraint_count.numpy().max())
+            )
+    return observed, state_0
+
+
+def test_watermarks_are_zero_when_disabled(test, device):
+    """Report zeros and allocate nothing without ``row_watermark``."""
+    model = _scene(device)
+    solver = SolverSteel(model)
+    _run(model, solver, 4)
+    test.assertIsNone(solver._row_watermarks)
+    marks = solver.constraint_row_watermarks()
+    test.assertEqual(len(marks), 16)
+    test.assertTrue(all(value == 0 for value in marks.values()))
+
+
+def test_watermarks_track_the_largest_row_counts(test, device):
+    """Match the per-step maxima of the retained and requested rows and the contact count."""
+    model = _scene(device)
+    solver = SolverSteel(model, row_watermark=True, friction_anchor_beta=0.0)
+    observed, state = _run(model, solver, 30)
+    marks = solver.constraint_row_watermarks()
+    test.assertGreater(observed["dense"], 0)
+    test.assertGreater(observed["mf"], 0)
+    test.assertEqual(marks["articulation_high_water"], observed["dense"])
+    test.assertEqual(marks["articulation_raw_high_water"], observed["dense_raw"])
+    test.assertEqual(marks["free_body_high_water"], observed["mf"])
+    test.assertEqual(marks["free_body_raw_high_water"], observed["mf_raw"])
+    test.assertEqual(marks["contact_high_water"], observed["contact"])
+    for family in ("articulation", "free_body", "propagation"):
+        with test.subTest(family=family):
+            test.assertEqual(marks[f"{family}_dropped_contact_rows_high_water"], 0)
+            test.assertEqual(marks[f"{family}_overflow_excess_high_water"], 0)
+            test.assertEqual(marks[f"{family}_overflow_world_steps"], 0)
+    # The marks survive a reset; they cover the whole run.
+    solver.reset(state)
+    test.assertEqual(solver.constraint_row_watermarks(), marks)
+
+
+def test_watermarks_track_propagation_rows(test, device):
+    """Track the propagation row family of the propagation response."""
+    model = _scene(device)
+    solver = SolverSteel(model, row_watermark=True, articulated_contact_response="propagation")
+    observed, _ = _run(model, solver, 10)
+    marks = solver.constraint_row_watermarks()
+    test.assertGreater(observed["propagation"], 0)
+    test.assertEqual(marks["propagation_high_water"], observed["propagation"])
+    test.assertEqual(marks["propagation_overflow_world_steps"], 0)
+
+
+def test_watermarks_record_capacity_overflow(test, device):
+    """Record the dropped rows, the excess over capacity and the overflowing world-steps."""
+    model = _scene(device)
+    capacity = 3
+    solver = SolverSteel(
+        model,
+        row_watermark=True,
+        friction_anchor_beta=0.0,
+        free_body_constraint_max=capacity,
+        warn_constraint_overflow=False,
+    )
+    steps = 5
+    observed, _ = _run(model, solver, steps)
+    marks = solver.constraint_row_watermarks()
+    test.assertGreater(observed["mf_raw"], capacity)
+    test.assertEqual(marks["free_body_high_water"], capacity)
+    test.assertEqual(marks["free_body_raw_high_water"], observed["mf_raw"])
+    test.assertEqual(marks["free_body_overflow_excess_high_water"], observed["mf_raw"] - capacity)
+    test.assertGreater(marks["free_body_dropped_contact_rows_high_water"], 0)
+    # Only the world with the resting box overflows, in every step.
+    test.assertEqual(marks["free_body_overflow_world_steps"], steps)
+    test.assertEqual(marks["articulation_overflow_world_steps"], 0)
+
+
 def test_watermarks_accumulate_in_captured_steps(test, device):
-    """Accumulate the same marks under CUDA graph replay as in eager steps."""
+    """Accumulate the same marks under CUDA graph replay as in eager steps; reading them during capture raises."""
     results = []
     for capture in (False, True):
         model = _scene(device)
@@ -830,6 +815,8 @@ def test_watermarks_accumulate_in_captured_steps(test, device):
             substep()
             with wp.ScopedCapture(device) as capture_scope:
                 substep()
+                with test.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
+                    solver.constraint_row_watermarks()
             for _ in range(9):
                 wp.capture_launch(capture_scope.graph)
         else:
@@ -845,6 +832,22 @@ class TestSteelRowWatermark(unittest.TestCase):
 
 
 cuda_devices = get_cuda_test_devices()
+
+
+for _fn in (
+    test_watermarks_are_zero_when_disabled,
+    test_watermarks_track_the_largest_row_counts,
+    test_watermarks_record_capacity_overflow,
+):
+    add_function_test(TestSteelRowWatermark, _fn.__name__, _fn, devices=cuda_devices)
+
+
+add_function_test(
+    TestSteelRowWatermark,
+    "test_watermarks_track_propagation_rows",
+    test_watermarks_track_propagation_rows,
+    devices=cuda_devices,
+)
 
 
 add_function_test(
@@ -884,26 +887,23 @@ def _make_chain_world(n_links: int, root_height: float = 1.0, free_box: bool = F
     return builder
 
 
-def _build_chain_worlds(world_link_counts: list[int], device, root_height=1.0, free_box=None) -> newton.Model:
-    """One chain world per entry in ``world_link_counts``, plus a ground plane.
-
-    ``root_height`` and ``free_box`` are either one value for every world or one entry per world.
-    """
-    count = len(world_link_counts)
-    heights = root_height if isinstance(root_height, list) else [root_height] * count
-    boxes = free_box if free_box is not None else [False] * count
+def _build_model(world_link_counts: list[int], device, root_height: float = 1.0, free_box=None) -> newton.Model:
+    """One chain world per entry in ``world_link_counts``, plus a ground plane."""
     scene = newton.ModelBuilder()
-    for n_links, height, box in zip(world_link_counts, heights, boxes, strict=True):
-        scene.add_world(_make_chain_world(n_links, height, box))
+    for world, n_links in enumerate(world_link_counts):
+        scene.add_world(_make_chain_world(n_links, root_height, free_box is not None and free_box[world]))
     scene.add_ground_plane()
     return scene.finalize(device=device)
 
 
-def _final_joint_q(model, steps=60, solve_mode="serial", response="immediate", from_fk=False):
+def _final_joint_q(model, steps=60, response="immediate", from_fk=False, deterministic=False):
     solver = SolverSteel(
-        model, solve_mode=solve_mode, articulation_constraint_max=64, articulated_contact_response=response
+        model,
+        articulation_constraint_max=64,
+        **steel_mode_options(response),
+        deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else None,
     )
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     if from_fk:
@@ -919,32 +919,31 @@ def _final_joint_q(model, steps=60, solve_mode="serial", response="immediate", f
 
 def test_hetero_matrix_free_constructs(test, device):
     """Construct on worlds whose DOF counts differ."""
-    solver = SolverSteel(_build_chain_worlds([1, 3, 1, 3], device))
+    solver = SolverSteel(_build_model([1, 3, 1, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [1, 3, 1, 3])
 
 
 def test_homogeneous_matrix_free_constructs(test, device):
     """Construct on worlds with identical DOF counts."""
-    solver = SolverSteel(_build_chain_worlds([3, 3, 3, 3], device))
+    solver = SolverSteel(_build_model([3, 3, 3, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
 
-def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="serial"):
+def test_hetero_worlds_match_isolated_worlds(test, device):
     """Simulate each world of a heterogeneous model exactly as it simulates alone."""
-    combined = _final_joint_q(_build_chain_worlds([1, 3], device), solve_mode=solve_mode)
-    single = _final_joint_q(_build_chain_worlds([1], device), solve_mode=solve_mode)
-    triple = _final_joint_q(_build_chain_worlds([3], device), solve_mode=solve_mode)
+    combined = _final_joint_q(_build_model([1, 3], device))
+    single = _final_joint_q(_build_model([1], device))
+    triple = _final_joint_q(_build_model([3], device))
     np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-5)
 
 
 def test_homogeneous_propagation_constructs(test, device):
-    """Construct every propagation response on worlds with identical DOF counts."""
-    model = _build_chain_worlds([3, 3, 3, 3], device)
-    for solve_mode in ("serial", "colored"):
-        with test.subTest(solve_mode=solve_mode):
-            solver = SolverSteel(model, solve_mode=solve_mode, articulated_contact_response="propagation")
-            test.assertEqual(solver._solve_mode, solve_mode)
-            test.assertEqual(solver._articulated_contact_response, "propagation")
+    """Construct both propagation responses on worlds with identical DOF counts."""
+    model = _build_model([3, 3, 3, 3], device)
+    for response in ("propagation", "colored"):
+        with test.subTest(response=response):
+            solver = SolverSteel(model, **steel_mode_options(response))
+            test.assertEqual(solver.articulated_contact_response, "propagation")
             np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
 
@@ -954,53 +953,36 @@ def test_hetero_propagation_matches_isolated_worlds(test, device):
     The chains hang low enough to hit the ground, so every world solves propagation contact rows.
     """
 
-    def run(link_counts, free_box, solve_mode):
-        model = _build_chain_worlds(link_counts, device, 0.35, free_box)
-        return _final_joint_q(model, solve_mode=solve_mode, response="propagation", from_fk=True)
+    def run(link_counts, free_box, response):
+        model = _build_model(link_counts, device, 0.35, free_box)
+        # Without a deterministic mode these chains can reach a different contact outcome from run to run.
+        return _final_joint_q(model, response=response, from_fk=True, deterministic=True)
 
-    for solve_mode in ("serial", "colored"):
-        with test.subTest(solve_mode=solve_mode):
-            combined = run([1, 3], None, solve_mode)
-            single = run([1], None, solve_mode)
-            triple = run([3], None, solve_mode)
+    for response in ("propagation", "colored"):
+        with test.subTest(response=response):
+            combined = run([1, 3], None, response)
+            single = run([1], None, response)
+            triple = run([3], None, response)
             # The cached response sizes its reductions by the model's body capacity, so the sums reassociate.
             np.testing.assert_allclose(combined, np.concatenate([single, triple]), rtol=0.0, atol=1.0e-4)
             # One articulation size, with a free box that still makes the world DOF counts differ.
-            combined = run([3, 3], [False, True], solve_mode)
-            plain = run([3], [False], solve_mode)
-            boxed = run([3], [True], solve_mode)
+            combined = run([3, 3], [False, True], response)
+            plain = run([3], [False], response)
+            boxed = run([3], [True], response)
             np.testing.assert_allclose(combined, np.concatenate([plain, boxed]), rtol=0.0, atol=1.0e-4)
 
 
-def test_hetero_propagation_keeps_the_next_world_velocities(test, device):
-    """Keep a busy 3-DOF world from writing over the next, 9-DOF world in the propagation responses.
-
-    The first chain lies on the ground and solves many rows; the second hangs clear above a resting box.
-    """
-
-    def run(root_height, free_box, solve_mode):
-        model = _build_chain_worlds([3] * len(free_box), device, root_height, free_box)
-        return _final_joint_q(model, solve_mode=solve_mode, response="propagation", from_fk=True)
-
-    for solve_mode in ("serial", "colored"):
-        with test.subTest(solve_mode=solve_mode):
-            combined = run([0.03, 2.0], [False, True], solve_mode)
-            lying = run([0.03], [False], solve_mode)
-            hanging = run([2.0], [True], solve_mode)
-            np.testing.assert_allclose(combined, np.concatenate([lying, hanging]), rtol=0.0, atol=1.0e-4)
-
-
-class TestSteelHeteroWorlds(unittest.TestCase):
+class TestSteelHeteroGuard(unittest.TestCase):
     pass
 
 
 add_function_test(
-    TestSteelHeteroWorlds, "test_hetero_matrix_free_constructs", test_hetero_matrix_free_constructs, devices=devices
+    TestSteelHeteroGuard, "test_hetero_matrix_free_constructs", test_hetero_matrix_free_constructs, devices=devices
 )
 
 
 add_function_test(
-    TestSteelHeteroWorlds,
+    TestSteelHeteroGuard,
     "test_homogeneous_matrix_free_constructs",
     test_homogeneous_matrix_free_constructs,
     devices=devices,
@@ -1008,7 +990,7 @@ add_function_test(
 
 
 add_function_test(
-    TestSteelHeteroWorlds,
+    TestSteelHeteroGuard,
     "test_hetero_worlds_match_isolated_worlds",
     test_hetero_worlds_match_isolated_worlds,
     devices=devices,
@@ -1016,7 +998,7 @@ add_function_test(
 
 
 add_function_test(
-    TestSteelHeteroWorlds,
+    TestSteelHeteroGuard,
     "test_homogeneous_propagation_constructs",
     test_homogeneous_propagation_constructs,
     devices=devices,
@@ -1024,113 +1006,78 @@ add_function_test(
 
 
 add_function_test(
-    TestSteelHeteroWorlds,
+    TestSteelHeteroGuard,
     "test_hetero_propagation_matches_isolated_worlds",
     test_hetero_propagation_matches_isolated_worlds,
     devices=devices,
 )
 
 
-add_function_test(
-    TestSteelHeteroWorlds,
-    "test_hetero_propagation_keeps_the_next_world_velocities",
-    test_hetero_propagation_keeps_the_next_world_velocities,
-    devices=devices,
-)
-
-
-# Arm lengths and heaps differ per world, so DOF and body counts differ too.
-_HETERO_HEAPS = ({"links": 3, "heap": (2, 2, 1)}, {"links": 6, "heap": (4, 2, 1)})
-_HETERO_HEAP_STEPS = 90
-_HETERO_HEAP_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
-
-
-def _build_hetero_heap_model(worlds: tuple[dict, ...]) -> newton.Model:
-    scene = newton.ModelBuilder(up_axis=newton.Axis.Z)
-    scene.rigid_gap = 0.005
-    for world_kwargs in worlds:
-        world = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        world.rigid_gap = 0.005
-        _add_arm_on_heap(world, **world_kwargs)
-        scene.add_world(world)
-    scene.add_ground_plane()
-    model = scene.finalize(device="cuda:0")
-    model.rigid_contact_max = 4096 * len(worlds)
-    set_torsion_radius(model, 0.01)
-    return model
-
-
-def _hetero_heap_rollout(worlds: tuple[dict, ...], capture_at: int | None = None):
-    """Roll out the heap worlds with every colored contact feature on; return the final state and solver."""
-    stepper = _Stepper(
-        _build_hetero_heap_model(worlds),
-        contact_torsion_device=True,
-        free_rigid_torsional_friction=0.01,
-        free_rigid_rolling_friction=0.01,
-        enable_sleeping=True,
-        sleep_quiet_time=0.05,
+def test_propagation_constraint_max_sizes_the_propagation_family(test, device):
+    """Size the propagation rows from ``propagation_constraint_max`` instead of the summed budgets."""
+    model = _box_on_ground(device)
+    options = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    summed = SolverSteel(model, articulation_constraint_max=32, free_body_constraint_max=256, **options)
+    test.assertIsNone(summed.propagation_constraint_max)
+    test.assertEqual(summed._propagation_max_constraints, 256 + 32)
+    decoupled = SolverSteel(
+        model, articulation_constraint_max=32, free_body_constraint_max=16, propagation_constraint_max=288, **options
     )
-    graph = None
-    for step in range(_HETERO_HEAP_STEPS):
-        if step == capture_at:
-            with wp.ScopedCapture() as capture:
-                stepper.step()
-            graph = capture.graph
-        if graph is not None:
-            wp.capture_launch(graph)
-        else:
-            stepper.step()
-    return stepper.snapshot(), stepper.solver
+    test.assertEqual(decoupled.propagation_constraint_max, 288)
+    test.assertEqual(decoupled._propagation_max_constraints, 288)
+    test.assertEqual(decoupled.free_body_constraint_max, 16)
+    with test.assertRaisesRegex(ValueError, "propagation_constraint_max must be >= 1"):
+        SolverSteel(model, propagation_constraint_max=0, **options)
+    with test.assertRaisesRegex(ValueError, "propagation_constraint_max requires"):
+        SolverSteel(model, propagation_constraint_max=64)
 
 
-def _split_by_world(model: newton.Model, snapshot: dict) -> list[dict]:
-    body_world = model.body_world.numpy()
-    joint_world = model.joint_world.numpy()
-    q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
-    worlds = []
-    for world in range(model.world_count):
-        joints = np.flatnonzero(joint_world == world)
-        worlds.append(
-            {
-                "body_q": snapshot["body_q"][body_world == world],
-                "body_qd": snapshot["body_qd"][body_world == world],
-                "joint_q": np.concatenate([snapshot["joint_q"][q_start[j] : q_start[j + 1]] for j in joints]),
-                "joint_qd": np.concatenate([snapshot["joint_qd"][qd_start[j] : qd_start[j + 1]] for j in joints]),
-            }
+def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget(test, device):
+    """Keep every contact row when the propagation family is sized for them and the free-body budget is small."""
+    model = _box_on_ground(device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    pipeline.collide(state_in, contacts)
+
+    def step(response, free_body_constraint_max=1, **options):
+        # A summed capacity of 1 + 1 rows is far below the rows of one resting box.
+        solver = SolverSteel(
+            model,
+            **steel_mode_options(response),
+            free_body_constraint_max=free_body_constraint_max,
+            articulation_constraint_max=1,
+            row_watermark=True,
+            warn_constraint_overflow=False,
+            **options,
         )
-    return worlds
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+        return solver.constraint_row_watermarks(), state_out.body_qd.numpy()
+
+    for response in ("propagation", "colored"):
+        with test.subTest(response=response):
+            summed, _ = step(response)
+            test.assertGreater(summed["propagation_dropped_contact_rows_high_water"], 0)
+            sized, sized_qd = step(response, propagation_constraint_max=16)
+            test.assertEqual(sized["propagation_dropped_contact_rows_high_water"], 0)
+            test.assertEqual(sized["propagation_high_water"], summed["propagation_raw_high_water"])
+            # The retained rows reach the solve: it matches a summed budget large enough for them.
+            _, ample_qd = step(response, free_body_constraint_max=15)
+            np.testing.assert_allclose(sized_qd, ample_qd, atol=1e-6)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
-class TestSteelHeteroColored(unittest.TestCase):
-    """Deterministic colored propagation on worlds whose DOF and body counts differ."""
-
-    def test_rollouts_match_isolated_worlds_bitwise(self):
-        """Match isolated worlds, a repeat and a captured replay bitwise, with torsion, angular rows and sleeping."""
-        combined, solver = _hetero_heap_rollout(_HETERO_HEAPS)
-        repeat, _ = _hetero_heap_rollout(_HETERO_HEAPS)
-        captured, _ = _hetero_heap_rollout(_HETERO_HEAPS, capture_at=2)
-        for name in _HETERO_HEAP_FIELDS:
-            np.testing.assert_array_equal(repeat[name], combined[name], err_msg=f"repeat {name}")
-            np.testing.assert_array_equal(captured[name], combined[name], err_msg=f"captured {name}")
-        for world, (world_state, world_kwargs) in enumerate(
-            zip(_split_by_world(solver.model, combined), _HETERO_HEAPS, strict=True)
-        ):
-            isolated, _ = _hetero_heap_rollout((world_kwargs,))
-            for name in _HETERO_HEAP_FIELDS:
-                np.testing.assert_array_equal(world_state[name], isolated[name], err_msg=f"world {world} {name}")
-
-        counts = solver._world_dof_count.numpy()
-        self.assertNotEqual(counts[0], counts[1], "worlds must differ in DOF count")
-        rows = solver._propagation_constraint_count.numpy()
-        row_types = np.concatenate([solver._propagation_row_type.numpy()[w, :n] for w, n in enumerate(rows)])
-        for row_type in (
-            PGS_CONSTRAINT_TYPE_TORSION,
-            PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
-            PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
-        ):
-            self.assertGreater(int(np.sum(row_types == row_type)), 0, f"row type {row_type} must be active")
-        self.assertGreater(int(np.sum(solver._sleeping.body_awake.numpy() == 0)), 0, "some bodies must sleep")
+add_function_test(
+    TestSteelRowAllocation,
+    "test_propagation_constraint_max_sizes_the_propagation_family",
+    test_propagation_constraint_max_sizes_the_propagation_family,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelRowAllocation,
+    "test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget",
+    test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":

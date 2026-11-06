@@ -1,1 +1,1 @@
-Add an opt-in camera-origin distance bound for tiled-camera ray traversal, preserving the far limit when ray origins move to a near clipping plane.
+Add opt-in `SensorCamera.RenderConfig.max_distance_from_camera_origin`, which measures `max_distance` from the camera origin instead of each ray origin, so the far limit holds when ray origins move to a near clipping plane.

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import ctypes
+import sys
 import time
 import unittest
 from enum import Enum
@@ -225,37 +227,127 @@ def test_mc_corner_pair_selection(test, device):
 
 
 def test_scan_with_total_boundaries(test, device):
-    """Match hydroelastic count scans at empty, partial, clamped, and multi-chunk sizes."""
-    capacity = 4099
-    counts_np = (np.arange(capacity, dtype=np.int32) % 7) + 1
+    """Match hydroelastic count scans at empty, partial, clamped, single-tile and multi-tile sizes."""
+    for capacity in (2048, 4099):
+        counts_np = (np.arange(capacity, dtype=np.int32) % 7) + 1
+        for case, active_count in (
+            ("empty", 0),
+            ("partial", 37),
+            ("clamped", capacity + 19),
+            ("full", capacity),
+        ):
+            with test.subTest(capacity=capacity, case=case):
+                counts = wp.array(counts_np, dtype=wp.int32, device=device)
+                num_elements = wp.array([active_count], dtype=wp.int32, device=device)
+                fallback_prefix = wp.full(capacity, -1, dtype=wp.int32, device=device)
+                scratch_prefix = wp.full(capacity, -1, dtype=wp.int32, device=device)
+                fallback_total = wp.full(1, -1, dtype=wp.int32, device=device)
+                scratch_total = wp.full(1, -1, dtype=wp.int32, device=device)
+                scratch = wp.zeros(_scan_scratch_size(capacity, device), dtype=wp.int64, device=device)
 
-    for case, active_count in (
-        ("empty", 0),
-        ("partial", 37),
-        ("clamped", capacity + 19),
-        ("multi_chunk", capacity),
-    ):
-        with test.subTest(case=case):
-            counts = wp.array(counts_np, dtype=wp.int32, device=device)
-            num_elements = wp.array([active_count], dtype=wp.int32, device=device)
-            fallback_prefix = wp.full(capacity, -1, dtype=wp.int32, device=device)
-            scratch_prefix = wp.full(capacity, -1, dtype=wp.int32, device=device)
-            fallback_total = wp.full(1, -1, dtype=wp.int32, device=device)
-            scratch_total = wp.full(1, -1, dtype=wp.int32, device=device)
-            scratch = wp.zeros(_scan_scratch_size(capacity, device), dtype=wp.int32, device=device)
+                scan_with_total(counts, fallback_prefix, num_elements, fallback_total)
+                scan_with_total(counts, scratch_prefix, num_elements, scratch_total, scratch=scratch)
 
-            scan_with_total(counts, fallback_prefix, num_elements, fallback_total)
-            scan_with_total(counts, scratch_prefix, num_elements, scratch_total, scratch=scratch)
+                count = min(max(active_count, 0), capacity)
+                expected_prefix = np.zeros(count, dtype=np.int32)
+                if count > 1:
+                    expected_prefix[1:] = np.cumsum(counts_np[: count - 1], dtype=np.int32)
+                scratch_prefix_np = scratch_prefix.numpy()
+                np.testing.assert_array_equal(scratch_prefix_np[:count], expected_prefix)
+                np.testing.assert_array_equal(scratch_prefix_np[:count], fallback_prefix.numpy()[:count])
+                np.testing.assert_array_equal(scratch_prefix_np[count:], -1)
+                test.assertEqual(int(scratch_total.numpy()[0]), int(counts_np[:count].sum()))
+                test.assertEqual(int(scratch_total.numpy()[0]), int(fallback_total.numpy()[0]))
+                # The scan leaves its scratch zeroed for the next one.
+                test.assertFalse(scratch.numpy().any())
 
-            count = min(max(active_count, 0), capacity)
-            expected_prefix = np.zeros(count, dtype=np.int32)
-            if count > 1:
-                expected_prefix[1:] = np.cumsum(counts_np[: count - 1], dtype=np.int32)
-            scratch_prefix_np = scratch_prefix.numpy()[:count]
-            np.testing.assert_array_equal(scratch_prefix_np, expected_prefix)
-            np.testing.assert_array_equal(scratch_prefix_np, fallback_prefix.numpy()[:count])
-            test.assertEqual(int(scratch_total.numpy()[0]), int(counts_np[:count].sum()))
-            test.assertEqual(int(scratch_total.numpy()[0]), int(fallback_total.numpy()[0]))
+
+def test_scan_with_total_under_captures(test, device):
+    """Replay the scratch scan bitwise like ``array_scan`` in a Warp capture, a conditional body and a driver capture."""
+    # More tiles than scan blocks, so blocks loop over tiles.
+    capacity = 2 * wp.get_device(device).sm_count * 8 * 1024 + 1
+    counts_np = np.random.default_rng(3).integers(0, 9, capacity).astype(np.int32)
+    counts = wp.array(counts_np, dtype=wp.int32, device=device)
+    expected = wp.zeros(capacity, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, expected, inclusive=False)
+    expected_np = expected.numpy()
+    num_elements = wp.zeros(1, dtype=wp.int32, device=device)
+    prefix = wp.zeros(capacity, dtype=wp.int32, device=device)
+    total = wp.zeros(1, dtype=wp.int32, device=device)
+    scratch = wp.zeros(_scan_scratch_size(capacity, device), dtype=wp.int64, device=device)
+    condition = wp.zeros(1, dtype=wp.int32, device=device)
+
+    def scan():
+        scan_with_total(counts, prefix, num_elements, total, scratch=scratch)
+
+    def scan_once():
+        scan()
+        condition.zero_()
+
+    captures = {}
+    with wp.ScopedCapture(device=device) as capture:
+        scan()
+    captures["warp"] = lambda graph=capture.graph: wp.capture_launch(graph)
+    if wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device=device) as capture:
+            wp.capture_while(condition, scan_once)
+        captures["capture_while"] = lambda graph=capture.graph: (condition.fill_(1), wp.capture_launch(graph))
+    if sys.platform.startswith("linux"):
+        captures["driver"], release = _driver_capture(device, scan)
+    try:
+        for name, replay in captures.items():
+            with test.subTest(capture=name):
+                # The same scratch serves every replay, whatever the active count.
+                for active in (capacity, 37, 0, capacity // 3, 1, capacity) * 3:
+                    num_elements.fill_(active)
+                    prefix.zero_()
+                    replay()
+                    prefix_np = prefix.numpy()
+                    np.testing.assert_array_equal(prefix_np[:active], expected_np[:active])
+                    np.testing.assert_array_equal(prefix_np[active:], 0)
+                    test.assertEqual(int(total.numpy()[0]), int(counts_np[:active].sum()))
+                    test.assertFalse(scratch.numpy().any())
+    finally:
+        if sys.platform.startswith("linux"):
+            release()
+
+
+def _driver_capture(device, fn):
+    """Capture ``fn`` with the CUDA driver alone, as another framework would; return replay and release."""
+    cuda = ctypes.CDLL("libcuda.so.1")
+    handle = ctypes.c_void_p
+    cuda.cuStreamBeginCapture_v2.argtypes = [handle, ctypes.c_int]
+    cuda.cuStreamEndCapture.argtypes = [handle, ctypes.POINTER(handle)]
+    cuda.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(handle), handle, ctypes.c_ulonglong]
+    cuda.cuGraphLaunch.argtypes = [handle, handle]
+    cuda.cuGraphExecDestroy.argtypes = [handle]
+    cuda.cuGraphDestroy.argtypes = [handle]
+    stream = handle(wp.get_stream(device).cuda_stream)
+    graph, graph_exec = handle(), handle()
+    thread_local_mode = 1
+    if cuda.cuStreamBeginCapture_v2(stream, thread_local_mode) != 0:
+        raise RuntimeError("cuStreamBeginCapture failed")
+    try:
+        fn()
+    finally:
+        ended = cuda.cuStreamEndCapture(stream, ctypes.byref(graph))
+    if ended != 0:
+        raise RuntimeError(f"cuStreamEndCapture failed with {ended}")
+    instantiated = cuda.cuGraphInstantiateWithFlags(ctypes.byref(graph_exec), graph, ctypes.c_ulonglong(0))
+    if instantiated != 0:
+        cuda.cuGraphDestroy(graph)
+        raise RuntimeError(f"cuGraphInstantiateWithFlags failed with {instantiated}")
+
+    def replay():
+        launched = cuda.cuGraphLaunch(graph_exec, stream)
+        if launched != 0:
+            raise RuntimeError(f"cuGraphLaunch failed with {launched}")
+
+    def release():
+        cuda.cuGraphExecDestroy(graph_exec)
+        cuda.cuGraphDestroy(graph)
+
+    return replay, release
 
 
 # --- Helper functions ---
@@ -2974,6 +3066,13 @@ add_function_test(
 
 add_function_test(
     TestHydroelastic,
+    "test_scan_with_total_under_captures",
+    test_scan_with_total_under_captures,
+    devices=cuda_devices,
+)
+
+add_function_test(
+    TestHydroelastic,
     "test_reduced_vs_unreduced_contact_moments_deterministic",
     test_reduced_vs_unreduced_contact_moments_deterministic,
     devices=cuda_devices,
@@ -3575,6 +3674,36 @@ def test_hydroelastic_pair_buffer_grid_selection(test, device):
     test.assertEqual(int(hydro.block_broad_collide_count.numpy()[0]), blocks_b)
 
 
+def test_hydroelastic_subset_grid_order(test, device):
+    """Match runtime traversal-grid selection after narrow-phase type sorting."""
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(
+        is_hydroelastic=True, sdf_max_resolution=64, sdf_narrow_band_range=(-0.01, 0.01), sdf_padding=0.02, gap=0.01
+    )
+    builder.add_shape_box(builder.add_body(), hx=0.5, hy=0.5, hz=0.5, cfg=cfg)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.4, 0.0, 0.0)))
+    builder.add_shape_sphere(body, radius=0.5, cfg=cfg)
+    model = builder.finalize(device=device)
+    indices = model._shape_sdf_index.numpy()
+    sdf_data = model._texture_sdf_data.numpy()
+    # Exercise the tie rule independently of primitive SDF padding/resolution
+    # rounding: type sorting routes this pair as (sphere, box), retaining box B.
+    sdf_data["voxel_radius"] = sdf_data["voxel_radius"].max()
+    model._texture_sdf_data.assign(sdf_data)
+    expected_active = int(sdf_data[indices[0]]["num_subgrids"])
+    tex = model._texture_sdf_coarse_textures[indices[0]]
+    expected_tiles = (tex.width - 1) * (tex.height - 1) * (tex.depth - 1)
+    for broad_phase in ("sap", "explicit"):
+        with test.subTest(broad_phase=broad_phase):
+            pairs = wp.array([[0, 1]], dtype=wp.vec2i, device=device) if broad_phase == "explicit" else None
+            pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase, shape_pairs_filtered=pairs)
+            hydro = pipeline.hydroelastic_sdf
+            test.assertEqual(hydro.total_num_tiles, expected_tiles)
+            test.assertEqual(hydro.total_num_active_tiles, expected_active)
+            pipeline.collide(model.state(), pipeline.contacts())
+            test.assertEqual(int(hydro.normalized_shape_pairs.numpy()[0, 1]), 0)
+
+
 add_function_test(
     TestHydroelastic,
     "test_hydroelastic_replica_buffers_scale_with_traversed_grids",
@@ -3587,6 +3716,14 @@ add_function_test(
     TestHydroelastic,
     "test_hydroelastic_pair_buffer_grid_selection",
     test_hydroelastic_pair_buffer_grid_selection,
+    devices=cuda_devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestHydroelastic,
+    "test_hydroelastic_subset_grid_order",
+    test_hydroelastic_subset_grid_order,
     devices=cuda_devices,
     check_output=False,
 )
