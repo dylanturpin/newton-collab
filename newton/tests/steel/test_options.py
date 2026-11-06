@@ -1442,7 +1442,9 @@ class TestSteelPrivateApi(unittest.TestCase):
 def test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state(test, device):
     """Leave the kinematics carry off by default, publish eval_fk's body state bitwise, and report what runs."""
     model = _build_spinning_model(device)
-    solver = SolverSteel(model)
+    # The matrix-free solve is CUDA-only; the split solve is the CPU-capable mode.
+    mode = {"solve_mode": "split"} if wp.get_device(device).is_cpu else {}
+    solver = SolverSteel(model, **mode)
     test.assertFalse(solver.reuse_kinematics)
     test.assertFalse(solver._reuse_kinematics_enabled)
     state_in, state_out = model.state(), model.state()
@@ -1453,9 +1455,11 @@ def test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state(test, device)
     np.testing.assert_array_equal(state_out.body_q.numpy(), expected.body_q.numpy())
     np.testing.assert_array_equal(state_out.body_qd.numpy(), expected.body_qd.numpy())
     # The attribute reports whether the carry runs: joint velocity limits keep it off, and so does a CPU device.
-    limited = SolverSteel(model, reuse_kinematics=True, enable_joint_velocity_limits=True)
-    test.assertFalse(limited.reuse_kinematics)
-    test.assertEqual(SolverSteel(model, reuse_kinematics=True).reuse_kinematics, wp.get_device(device).is_cuda)
+    if wp.get_device(device).is_cuda:
+        # The split solve does not take joint velocity limits, so this case is the matrix-free solve's.
+        limited = SolverSteel(model, reuse_kinematics=True, enable_joint_velocity_limits=True)
+        test.assertFalse(limited.reuse_kinematics)
+    test.assertEqual(SolverSteel(model, reuse_kinematics=True, **mode).reuse_kinematics, wp.get_device(device).is_cuda)
 
 
 class TestSteelReuseKinematicsOption(unittest.TestCase):

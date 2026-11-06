@@ -1837,8 +1837,8 @@ add_function_test(
 def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
     """Reproduce the fused FK/ID kernel bitwise with the serial kinematics pass plus the per-body finaliser."""
     model = _build_contact_scene(device)
-    # Only the solver's index maps and augmented buffers are used.
-    solver = SolverSteel(model)
+    # Only the solver's index maps and augmented buffers are used; the split solve is the CPU-capable mode here.
+    solver = SolverSteel(model, solve_mode="split" if wp.get_device(device).is_cpu else "matrix_free")
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     rng = np.random.default_rng(3)
