@@ -3786,6 +3786,79 @@ class TestSteelLatencyFused(unittest.TestCase):
         self.assertFalse(solver._latency_fused)
 
 
+def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+    solver = SolverSteel(
+        model,
+        articulated_contact_response=mode,
+        iterations=iterations,
+        velocity_iterations=0,
+        articulation_constraint_max=32,
+        free_body_constraint_max=32,
+        contact_warmstart=False,
+        **options,
+    )
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
+    rows = (
+        int(solver._constraint_count.numpy().sum()),
+        int(solver._propagation_constraint_count.numpy().sum()),
+    )
+    return state_out.joint_qd.numpy(), rows
+
+
+def test_multi_dof_contact_rows(test, device):
+    """Propagation solves the contact rows of a 6-DOF D6 link like the immediate response."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cfg = newton.ModelBuilder.JointDofConfig
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, hx=0.12, hy=0.08, hz=0.06)
+    joint = builder.add_joint_d6(
+        parent=-1,
+        child=link,
+        linear_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        angular_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+    )
+    builder.add_articulation([joint])
+    cube = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.588), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.04)
+    model = builder.finalize(device=device)
+
+    state = model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+    qd_immediate, rows_immediate = _step_d6_contact_case(model, contacts, "immediate")
+    test.assertGreater(rows_immediate[0], 0)
+    test.assertEqual(rows_immediate[1], 0)
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            qd, rows = _step_d6_contact_case(model, contacts, "propagation", solve_mode=solve_mode)
+            test.assertEqual(rows[0], 0)
+            test.assertGreater(rows[1], 0)
+            np.testing.assert_allclose(qd, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+    # Longest-first sweeps the 3-row units first, unlike the immediate row order, so it is compared once converged.
+    qd_converged = _step_d6_contact_case(model, contacts, "immediate", iterations=32)[0]
+    qd_longest_first = _step_d6_contact_case(
+        model, contacts, "propagation", iterations=32, solve_mode="colored", propagation_color_order="longest_first"
+    )[0]
+    np.testing.assert_allclose(qd_longest_first, qd_converged, rtol=1.0e-5, atol=1.0e-5)
+
+
+class TestSteelMultiDofContactRows(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelMultiDofContactRows, "test_multi_dof_contact_rows", test_multi_dof_contact_rows, devices=get_test_devices()
+)
+
+
 class TestSteelSchedule(unittest.TestCase):
     pass
 

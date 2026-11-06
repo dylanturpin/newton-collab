@@ -140,6 +140,7 @@ _MODES = (("serial", "immediate"), ("serial", "propagation"), ("colored", "propa
 
 class TestSteelCpuFallback(unittest.TestCase):
     def test_cpu_rollouts_move_and_stay_finite(self):
+        """CPU rollouts of every mode stay finite, hold contacts and move under their drives."""
         for scene in _SCENES:
             for mode in _MODES:
                 with self.subTest(scene=scene, mode=mode):
@@ -152,6 +153,7 @@ class TestSteelCpuFallback(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
     def test_cpu_tracks_cuda(self):
+        """CPU rollouts follow CUDA rollouts of the same scene and mode."""
         for scene in _SCENES:
             for mode in _MODES:
                 with self.subTest(scene=scene, mode=mode):
@@ -163,6 +165,7 @@ class TestSteelCpuFallback(unittest.TestCase):
                     np.testing.assert_allclose(qd_cpu, qd_gpu, atol=0.15)
 
     def test_cuda_only_features_raise_on_cpu(self):
+        """Options implemented only on CUDA raise ``NotImplementedError`` on CPU."""
         model = _build("cpu", "box_stack")
         for options in (
             {"friction_mode": "bisection", "friction_anchor_beta": 0.0},

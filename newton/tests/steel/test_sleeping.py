@@ -1653,6 +1653,32 @@ def test_wake_crosses_alternating_old_and_current_islands(test, device):
     np.testing.assert_array_equal(solver._sleeping.quiet_age.numpy()[:6], np.zeros(6))
 
 
+def test_passive_spring_vetoes_sleep(test, device):
+    """Keep a quiet spring-loaded articulation awake without motor input."""
+    builder = newton.ModelBuilder()
+    base = builder.add_link()
+    child = builder.add_link()
+    builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1)
+    builder.add_shape_box(child, hx=0.1, hy=0.1, hz=0.1)
+    root = builder.add_joint_fixed(parent=-1, child=base)
+    slider = builder.add_joint_prismatic(
+        parent=base, child=child, axis=newton.Axis.X, target_ke=0.0, target_kd=0.0, stiffness=0.001, rest_q=0.1
+    )
+    builder.add_articulation([root, slider])
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    _pipeline, solver, state_in, state_out, control = _runtime(model)
+    _seed_sleep(solver, state_in, [0])
+    test.assertTrue(np.any(solver._passive_spring_stiffness.numpy() > 0.0))
+    np.testing.assert_array_equal(control.joint_f.numpy(), np.zeros(model.joint_dof_count))
+
+    solver.step(state_in, state_out, control, None, 0.001)
+
+    np.testing.assert_array_equal(solver._sleeping.art_awake.numpy(), [1])
+    test.assertGreater(float(state_out.joint_qd.numpy()[0]), 0.0)
+    test.assertLess(float(np.linalg.norm(state_out.body_qd.numpy()[child, :3])), solver._sleeping.linear_threshold)
+
+
 def test_nonfinite_trial_output_is_not_hidden(test, device):
     """Preserve evidence of invalid trial outputs instead of freezing over it."""
     for field in ("body_q", "body_qd", "joint_q", "joint_qd"):
@@ -1815,6 +1841,7 @@ for _name in (
     "test_fixed_table_does_not_merge_dynamic_islands",
     "test_lost_support_wakes_below_velocity_threshold",
     "test_wake_crosses_alternating_old_and_current_islands",
+    "test_passive_spring_vetoes_sleep",
     "test_nonfinite_trial_output_is_not_hidden",
     "test_aliased_states_are_rejected",
     "test_extended_state_outputs_are_accepted",
