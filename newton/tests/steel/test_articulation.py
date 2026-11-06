@@ -811,12 +811,9 @@ def test_imported_weld_with_zero_torquescale_leaves_rotation_free(test, device):
     </mujoco>
     """
     b = newton.ModelBuilder()
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with test.assertLogs("newton", level="WARNING") as logs:
         b.add_mjcf(mjcf)
-    test.assertTrue(
-        any("torquescale=0" in str(w.message) and w.category is newton.exceptions.NewtonWarning for w in caught)
-    )
+    test.assertTrue(any("torquescale=0" in message for message in logs.output))
     model = b.finalize(device=device)
     solver = SolverSteel(model, iterations=16)
     test.assertEqual(solver._connect_count, 1)

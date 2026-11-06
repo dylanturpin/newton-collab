@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from collections.abc import Sequence
 from typing import Any
@@ -11,7 +12,6 @@ import numpy as np
 import warp as wp
 
 from ...core.types import vec5
-from ...exceptions import NewtonWarning
 from .enums import EqType
 from .equality import (
     MJC_OBJ_BODY,
@@ -20,6 +20,8 @@ from .equality import (
     MjcEqualityTargetKind,
     _add_equality_constraint,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def solref_invalid_mask(solref: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -163,20 +165,19 @@ def mjc_add_equality_loop_joint(
         # The weld frames put the anchor on body2 and its held position (relpose) on body1, which is the point
         # MuJoCo's weld residual pins; a BALL joint on those frames pins it the same way and leaves rotation free.
         add_joint = builder.add_joint_ball
-        warnings.warn(
-            f"MuJoCo weld {label!r} has torquescale=0, which MuJoCo enforces as a point constraint with rotation "
-            "free; it is converted to a BALL loop joint (rotation free) instead of a FIXED one. SolverMuJoCo "
-            "enforces the original weld row.",
-            NewtonWarning,
-            stacklevel=3,
+        logger.warning(
+            "MuJoCo weld %r has torquescale=0, which MuJoCo enforces as a point constraint with rotation free; it is "
+            "converted to a BALL loop joint (rotation free) instead of a FIXED one. SolverMuJoCo enforces the "
+            "original weld row.",
+            label,
         )
     elif weld and torquescale != 1.0:
-        warnings.warn(
-            f"MuJoCo weld {label!r} has torquescale={torquescale:g}; it is converted to a FIXED loop joint, which "
-            "solvers that enforce loop joints (such as SolverSteel) hold as a hard weld: torquescale, solref and "
-            "solimp are not used. SolverMuJoCo enforces the original weld row.",
-            NewtonWarning,
-            stacklevel=3,
+        logger.warning(
+            "MuJoCo weld %r has torquescale=%g; it is converted to a FIXED loop joint, which solvers that enforce "
+            "loop joints (such as SolverSteel) hold as a hard weld: torquescale, solref and solimp are not used. "
+            "SolverMuJoCo enforces the original weld row.",
+            label,
+            torquescale,
         )
     joint_idx = add_joint(
         parent=parent,

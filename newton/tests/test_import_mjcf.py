@@ -6378,12 +6378,9 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
 </mujoco>
 """
         builder = newton.ModelBuilder()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with self.assertLogs("newton", level="WARNING") as logs:
             builder.add_mjcf(mjcf)
-        torquescale_caught = [w for w in caught if "torquescale" in str(w.message)]
-        self.assertTrue(all(w.category is newton.exceptions.NewtonWarning for w in torquescale_caught))
-        torquescale_warnings = [str(w.message) for w in torquescale_caught]
+        torquescale_warnings = [message for message in logs.output if "torquescale" in message]
         self.assertEqual(len(torquescale_warnings), 2, torquescale_warnings)
         self.assertIn("'weld_ts/point' has torquescale=0", torquescale_warnings[0])
         self.assertIn("'weld_ts/scaled' has torquescale=0.5", torquescale_warnings[1])
