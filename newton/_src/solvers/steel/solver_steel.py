@@ -1600,6 +1600,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 state_in, state_out = state_out, state_in
     """
 
+    supports_body_disable_gravity = True
+
     class ObservableKind(SolverBase.ObservableKind):
         """Standard and Steel-specific observable kinds.
 

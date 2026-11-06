@@ -480,6 +480,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
             reconciles owned state.
     """
 
+    supports_body_disable_gravity = True
+
     @dataclass(frozen=True)
     class Entry:
         """Public configuration for one sub-solver.

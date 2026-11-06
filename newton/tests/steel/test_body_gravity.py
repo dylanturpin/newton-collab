@@ -16,6 +16,20 @@ from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
 
 
 class TestSteelBodyGravity(unittest.TestCase):
+    def test_solvers_without_support_warn(self):
+        """Warn at construction only from solvers that ignore a disabled body's gravity exclusion."""
+        model = _free_pair().finalize(device="cpu")
+        for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverSemiImplicit):
+            with (
+                self.subTest(solver=solver_type.__name__),
+                self.assertWarnsRegex(newton.exceptions.NewtonWarning, "ignores Model.body_disable_gravity"),
+            ):
+                solver_type(model)
+        enabled = newton.ModelBuilder()
+        _add_free_body(enabled, "enabled", False)
+        newton.solvers.SolverXPBD(enabled.finalize(device="cpu"))
+        SolverFeatherstone(model)
+
     def test_parallel_tree_selective_world_gravity(self):
         """Match analytic axis accelerations with enabled and disabled tree leaves in distinct worlds."""
         if not wp.get_device().is_cuda:

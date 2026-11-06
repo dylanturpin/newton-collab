@@ -155,6 +155,8 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
 
     """
 
+    supports_body_disable_gravity = True
+
     SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.BODY_PARENT_F})
 
     def __init__(

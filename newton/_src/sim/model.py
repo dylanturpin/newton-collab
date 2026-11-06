@@ -1369,9 +1369,10 @@ class Model:
         self.body_mass: wp.array[wp.float32] | None = None
         """Rigid body mass [kg], shape [body_count], float."""
         self.body_disable_gravity: wp.array[wp.bool] | None = None
-        """Per-body gravity exclusion, shape [body_count], bool; supported by Steel and Featherstone.
+        """Per-body gravity exclusion, shape [body_count], bool.
 
-        After editing, notify the solver with :attr:`ModelFlags.BODY_PROPERTIES`.
+        Honored by solvers whose :attr:`~newton.solvers.SolverBase.supports_body_disable_gravity` is set; the others
+        warn at construction. After editing, notify the solver with :attr:`ModelFlags.BODY_PROPERTIES`.
         """
         self.body_inv_mass: wp.array[wp.float32] | None = None
         """Rigid body inverse mass [1/kg], shape [body_count], float."""

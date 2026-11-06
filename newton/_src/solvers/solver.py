@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import copy
@@ -15,6 +16,7 @@ from typing import Any, ClassVar
 import warp as wp
 
 from ..core.reset import normalize_reset_world_mask
+from ..exceptions import NewtonWarning
 from ..geometry import ParticleFlags
 from ..sim import BodyFlags, CollisionPipeline, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 
@@ -580,6 +582,13 @@ class SolverBase:
     detection externally instead).
     """
 
+    supports_body_disable_gravity: bool = False
+    """Whether this solver leaves the bodies flagged in :attr:`Model.body_disable_gravity` without gravity.
+
+    Constructing a solver that does not on a model with a flagged body emits a
+    :class:`~newton.exceptions.NewtonWarning`.
+    """
+
     _module_options_revision = 0
 
     SUPPORTED_OBSERVABLES: ClassVar[frozenset[str]] = frozenset()
@@ -612,6 +621,14 @@ class SolverBase:
                 slots retain their defaults.
         """
         self.model = model
+        if isinstance(model, Model) and not type(self).supports_body_disable_gravity:
+            disabled = model.body_disable_gravity
+            if disabled is not None and disabled.shape[0] > 0 and disabled.numpy().any():
+                warnings.warn(
+                    f"{type(self).__name__} ignores Model.body_disable_gravity; gravity acts on every body.",
+                    NewtonWarning,
+                    stacklevel=3,
+                )
         self._module_options: dict[Any, dict[str, Any]] = {}
         self._applied_module_options_revision = -1
 
