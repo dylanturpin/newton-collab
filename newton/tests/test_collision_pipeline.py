@@ -4463,6 +4463,28 @@ def test_convex_convex_with_sdf_routes_to_sdf_contact(test, device):
     test.assertGreater(contact_count, 0)
 
 
+def test_sdf_edge_pairs_get_mesh_pair_budget(test, device):
+    """Budget pairs routed to the SDF path, except box-box, at the mesh-pair cap in the automatic capacity."""
+    mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+    mesh.build_sdf(max_resolution=32, device=device)
+    box_cfg = newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32)
+    builder = newton.ModelBuilder()
+    for _ in range(2):
+        builder.begin_world()
+        for i in range(2):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, float(i)), wp.quat_identity()))
+            builder.add_shape_convex_hull(body=body, mesh=mesh)
+            body = builder.add_body(xform=wp.transform(wp.vec3(2.0, 0.0, float(i)), wp.quat_identity()))
+            builder.add_shape_box(body=body, hx=0.5, hy=0.5, hz=0.5, cfg=box_cfg)
+        builder.end_world()
+    model = builder.finalize(device=device)
+
+    # Per world: five SDF-routed pairs and one box-box pair.
+    test.assertEqual(model.shape_contact_pair_count, 12)
+    expected = 2 * (5 * _MESH_PAIR_MAX_CONTACTS + _CONVEX_PAIR_MAX_CONTACTS)
+    test.assertEqual(_estimate_rigid_contact_max(model), expected)
+
+
 def test_heightfield_convex_midphase_queries_margin_shell_at_lateral_edge(test, device):
     margin = 0.02
     gap = 0.005
@@ -5614,6 +5636,13 @@ add_function_test(
     test_convex_convex_with_sdf_routes_to_sdf_contact,
     devices=get_cuda_test_devices(),
     check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_edge_pairs_get_mesh_pair_budget",
+    test_sdf_edge_pairs_get_mesh_pair_budget,
+    devices=get_cuda_test_devices(),
 )
 
 add_function_test(

@@ -157,6 +157,18 @@ def _shape_may_be_mesh(model: Model, shape_types: np.ndarray, variant_options: _
     )
 
 
+def _shape_may_have_sdf_edges(model: Model, variant_options: _VariantOptions | None) -> np.ndarray:
+    """Shapes that have, or as variant rows can hold a colliding shape with, texture-SDF edge data."""
+    if getattr(model, "_shape_sdf_index", None) is None or getattr(model, "_shape_edge_range", None) is None:
+        return np.zeros(model.shape_count, dtype=bool)
+    mask = (model._shape_sdf_index.numpy() >= 0) & (model._shape_edge_range.numpy()[:, 1] > 0)
+    if variant_options is not None:
+        geometry = model._variant_shape_geometry
+        variant_edges = (geometry["_shape_sdf_index"].numpy() >= 0) & (geometry["_shape_edge_range"].numpy()[:, 1] > 0)
+        mask |= variant_options.any(variant_options.variant_collides & variant_edges)
+    return mask
+
+
 _ANALYTIC_PRIMITIVE_PAIRS = frozenset(
     {
         (int(GeoType.PLANE), int(GeoType.SPHERE)),
@@ -816,6 +828,11 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     colliding_mask = _shape_collide_mask(model, len(shape_types))
 
     mesh_mask = colliding_mask & _shape_may_be_mesh(model, shape_types, variant_options)
+    # Pairs of two shapes with SDF edges route to the mesh-mesh SDF path, except box-box pairs.
+    sdf_edge_mask = colliding_mask & ~mesh_mask & _shape_may_have_sdf_edges(model, variant_options)
+    fixed_box_mask = shape_types == int(GeoType.BOX)
+    if variant_options is not None:
+        fixed_box_mask &= ~variant_options.row_mask
 
     # ------------------------------------------------------------------
     # Pair-aware exact bound: sum of per-pair worst cases over the actual
@@ -842,6 +859,10 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
             hydro = count(within & hydro_mask)
             # Mesh/heightfield-involved pairs go through contact reduction.
             mesh = pairs - count(within & ~mesh_mask) - (hydro - count(within & hydro_mask & ~mesh_mask))
+            sdf_edge = within & sdf_edge_mask
+            sdf_edge_box = sdf_edge & fixed_box_mask
+            mesh += count(sdf_edge) - count(sdf_edge_box)
+            mesh -= count(sdf_edge & hydro_mask) - count(sdf_edge_box & hydro_mask)
             convex = pairs - mesh - hydro
             caps = convex * _CONVEX_PAIR_MAX_CONTACTS + mesh * _MESH_PAIR_MAX_CONTACTS
             return pairs, caps + hydro * _HYDRO_PAIR_MAX_CONTACTS
@@ -872,7 +893,7 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
                 else:
                     active = colliding_mask & ~plane_shape
                 shape_cap = np.full(int(np.count_nonzero(active)), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
-                shape_cap[mesh_mask[active]] = _MESH_PAIR_MAX_CONTACTS
+                shape_cap[(mesh_mask | sdf_edge_mask)[active]] = _MESH_PAIR_MAX_CONTACTS
                 shape_cap[hydro_mask[active]] = _HYDRO_PAIR_MAX_CONTACTS
                 nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
             locality_cap = plane_pair_contacts + nonplane_locality
