@@ -268,7 +268,7 @@ def test_defaults(test, device):
     test.assertEqual(solver.relaxation, 1.0)
     test.assertEqual(solver.update_mass_matrix_interval, 1)
     test.assertFalse(solver.enable_joint_limits)
-    test.assertEqual(solver.joint_limit_activation_gap, float("inf"))
+    test.assertIsNone(solver.joint_limit_activation_gap)
     test.assertFalse(solver.enable_joint_velocity_limits)
     test.assertEqual(solver.velocity_limit_activation_fraction, 0.0)
     test.assertEqual(solver.articulation_constraint_max, 32)
@@ -1742,6 +1742,9 @@ def test_velocity_limit_pass_visits_every_active_row(test, device):
                 arr(parents, int),
                 arr(mu),
                 *(zeros((worlds, rows)) for _ in range(5)),
+                # Velocity-limit slot tables, all unset: every row takes the reduction.
+                arr(np.full(2 * worlds * dofs, -1, np.int32), int),
+                zeros(2 * worlds * dofs),
                 zeros(worlds, int),
                 zeros(worlds, int),
                 zeros((worlds, 4), int),

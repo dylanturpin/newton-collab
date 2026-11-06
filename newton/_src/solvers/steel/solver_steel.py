@@ -2006,9 +2006,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 motion. Limit rows are speculative and apply no impulse while the joint cannot reach
                 its bound within the step, so the skipped rows are no-ops unless constraint impulses
                 in the solve, such as contacts, accelerate the joint toward the bound by more than
-                the margin in one step. Mimic and connect rows also act inside the solve, so mimic
-                endpoints, the tree joints a loop closure spans, and every joint below them always
-                have their rows. With ``drive_mode="rows"`` the drives act inside the solve too, so
+                the margin in one step. Mimic and connect rows also act inside the solve, so the tree
+                joints between the two ends of each mimic or loop closure, and every joint below them,
+                always have their rows. With ``drive_mode="rows"`` the drives act inside the solve too, so
                 ``None`` creates every limit row, as ``inf`` does. A bound at or beyond ``MAXVAL``,
                 the builder's unlimited default (``+/-1e10``), has no row. The constructor warns when
                 the finite limits alone exceed the capacity. The value is validated even when joint
@@ -4196,8 +4196,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_joint_limit_gap(self, model) -> None:
         """Build the per-DOF limit-row activation gap.
 
-        Under the default speed-aware gate, mimic endpoints, the tree joints a loop closure spans, and every
-        joint below them get ``inf``: mimic and connect rows move them inside the solve, which ``v_hat`` cannot see.
+        Under the default speed-aware gate, the tree joints between the two ends of each mimic or loop closure, and
+        every joint below them, get ``inf``: those rows move them inside the solve, which ``v_hat`` cannot see.
         """
         gap = np.full(model.joint_dof_count, self._joint_limit_gap_base, dtype=np.float32)
         coupled = self._mimic_count or self._connect_count
@@ -4218,12 +4218,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                     body = int(joint_parent[joint])
                 return joints
 
-            seeds = set()
+            pairs = []
             if self._mimic_count:
-                dofs = np.concatenate((self._mimic_dof0.numpy(), self._mimic_dof1.numpy()))
-                seeds.update((np.searchsorted(joint_qd_start, dofs, side="right") - 1).tolist())
-            for j in self._connect_joint_np.tolist() if self._connect_count else ():
-                seeds |= path(int(joint_parent[j])) ^ path(int(joint_child[j]))
+                ends = [
+                    np.searchsorted(joint_qd_start, dofs.numpy(), side="right") - 1
+                    for dofs in (self._mimic_dof0, self._mimic_dof1)
+                ]
+                pairs += [(joint_child[a], joint_child[b]) for a, b in zip(*ends, strict=True)]
+            if self._connect_count:
+                pairs += [(joint_parent[j], joint_child[j]) for j in self._connect_joint_np.tolist()]
+            seeds = set()
+            for a, b in pairs:
+                seeds |= path(int(a)) ^ path(int(b))
             for joint in tree.tolist():
                 if not seeds.isdisjoint(path(int(joint_child[joint]))):
                     gap[joint_qd_start[joint] : joint_qd_start[joint + 1]] = np.inf
@@ -16944,6 +16950,8 @@ _STATIC_SHARED_MEMORY_BYTES = 48 * 1024
 # Static shared memory one warp may use for the per-joint staging of the native
 # propagation tree kernels [B].
 _PROPAGATION_TREE_SHARED_BYTES = 40 * 1024
+# Static shared memory a one-warp level tree kernel may take (the 48 KB static limit, with headroom).
+_PROPAGATION_TREE_WARP_SHARED_MAX = 44 * 1024
 # 32-bit words of per-joint staging in the impulse propagation kernel (the larger of
 # the two staged kernels).
 _PROPAGATION_TREE_WORDS_PER_JOINT = 31

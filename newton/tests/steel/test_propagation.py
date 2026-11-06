@@ -3617,7 +3617,6 @@ class TestKernelParamBytes(unittest.TestCase):
         self.assertGreater(_kernel_param_bytes(_param_layout_oversized), 4096)
 
 
-@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 def _add_hand(builder: newton.ModelBuilder, *, floating: bool, base_z: float, collide: bool) -> None:
     """A palm with five four-joint fingers (one forking mid-finger) and a fixed leaf: a hand-like tree.
 
@@ -3867,6 +3866,7 @@ class TestPropagationLevelParallelTree(unittest.TestCase):
                 np.testing.assert_array_equal(x, y, err_msg=f"{name} at step {k}")
 
 
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestSteelLatencyFused(unittest.TestCase):
     """The one-launch colored propagation loop writes exactly what the per-pass launches write."""
 
@@ -3954,6 +3954,7 @@ class TestSteelLatencyFused(unittest.TestCase):
             _build_latency_scene("cuda:0"),
             iterations=8,
             enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
             row_schedule="contact_then_internal",
         )
 

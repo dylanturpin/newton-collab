@@ -533,16 +533,33 @@ def test_default_gap_holds_a_joint_accelerated_within_the_step(test, device):
             test.assertLessEqual(default, always + 1.0e-4)
 
 
-def _build_constrained_follower(device, *, closure: str, tip: bool = False):
+def _build_constrained_follower(device, *, closure: str, place: str = "follower"):
     """Build a passive revolute follower limited to 0.3 rad, resting at 0.24 rad, coupled to a leader driven past it.
 
     ``closure="mimic"`` couples the follower to the leader with an identity mimic; ``"connect"`` builds a
-    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. With ``tip`` the follower is
-    unlimited and carries a passive coaxial link limited to 0.3 rad, resting at -0.24 rad, which the follower's
-    swing turns toward its lower bound. Returns the model and the limited coordinate.
+    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. With ``place="tip"`` the
+    follower is unlimited and carries a passive coaxial link limited to 0.3 rad, resting at -0.24 rad, which the
+    follower's swing turns toward its lower bound. With ``place="parent"`` (mimic only) the unlimited follower hangs
+    from a passive link limited to 0.3 rad, resting at -0.24 rad, which the mimic's reaction turns toward its lower
+    bound. Returns the model and the limited coordinate.
     """
+    tip = place == "tip"
     inertia = wp.mat33(np.eye(3) * 0.1)
     limits = {"limit_lower": -0.3, "limit_upper": 0.3}
+    if place == "parent":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent = builder.add_link(mass=1.0, inertia=inertia)
+        follower = builder.add_link(mass=1.0, inertia=inertia)
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, parent, axis=newton.Axis.Z, **limits),
+            builder.add_joint_revolute(parent, follower, axis=newton.Axis.Z),
+            builder.add_joint_revolute(-1, leader, axis=newton.Axis.Z, target_ke=1.0e3, target_kd=10.0),
+        ]
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[1], joints[2])
+        builder.joint_q[:] = [-0.24, 0.0, 0.0]
+        return builder.finalize(device=device), 0
     if closure == "mimic":
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         leader = builder.add_link(mass=1.0, inertia=inertia)
@@ -574,11 +591,13 @@ def _build_constrained_follower(device, *, closure: str, tip: bool = False):
 
 
 def test_default_gap_holds_a_constrained_follower(test, device):
-    """A follower, or a link below it, that a mimic or loop closure carries across its bound in one step stops there."""
-    cases = itertools.product(("mimic", "connect"), (False, True), (1.0 / 60.0, 1.0 / 120.0))
-    for closure, tip, dt in cases:
-        with test.subTest(closure=closure, tip=tip, dt=dt):
-            model, coord = _build_constrained_follower(device, closure=closure, tip=tip)
+    """A follower, or a link above or below it, that a mimic or loop closure carries across its bound in one step stops there."""
+    cases = itertools.product(("mimic", "connect"), ("follower", "tip", "parent"), (1.0 / 60.0, 1.0 / 120.0))
+    for closure, place, dt in cases:
+        if closure == "connect" and place == "parent":
+            continue
+        with test.subTest(closure=closure, place=place, dt=dt):
+            model, coord = _build_constrained_follower(device, closure=closure, place=place)
             options = {"articulated_contact_response": "immediate"}
             always = _drive_jump_max_q(model, dt, 1.0, coord, joint_limit_activation_gap=float("inf"), **options)
             default = _drive_jump_max_q(model, dt, 1.0, coord, **options)
