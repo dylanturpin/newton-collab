@@ -2073,6 +2073,41 @@ def test_registration_adds_no_spring_attributes(test, device):
     test.assertFalse(any(key in builder.custom_attributes for key in SPRING_KEYS))
 
 
+def test_unsupported_joint_springs_warn(test, device):
+    """Warn about spring stiffness on a BALL joint, which Steel ignores, but not on a REVOLUTE joint."""
+
+    def single_joint(kind):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        if kind == "ball":
+            joint = builder.add_joint_ball(-1, link)
+            builder.joint_stiffness[-3:] = [10.0] * 3
+        else:
+            joint = builder.add_joint_revolute(-1, link, axis=wp.vec3(1.0, 0.0, 0.0), stiffness=10.0)
+        builder.add_articulation([joint])
+        model = builder.finalize(device=device)
+        state_0, state_1 = model.state(), model.state()
+        q = state_0.joint_q.numpy()
+        if kind == "ball":
+            q[:4] = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.4)
+        else:
+            q[0] = 0.4
+        state_0.joint_q.assign(q)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        return model, state_0, state_1
+
+    model, state_0, state_1 = single_joint("ball")
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "springs on 3 DOF"):
+        solver = SolverSteel(model)
+    solver.step(state_0, state_1, model.control(), None, 1.0e-3)
+    np.testing.assert_allclose(state_1.joint_qd.numpy(), 0.0)
+
+    model, state_0, state_1 = single_joint("revolute")
+    solver = SolverSteel(model)
+    solver.step(state_0, state_1, model.control(), None, 1.0e-3)
+    np.testing.assert_allclose(solver._joint_tau.numpy(), [-4.0], atol=1.0e-5)
+
+
 def test_deprecated_spring_spellings(test, device):
     """Map the deprecated spring spellings onto the passive spring stiffness and rest coordinate."""
     deprecated = newton.exceptions.NewtonDeprecationWarning
@@ -2146,6 +2181,12 @@ add_function_test(
 )
 add_function_test(
     TestSteelSprings, "test_deprecated_spring_spellings", test_deprecated_spring_spellings, devices=get_test_devices()
+)
+add_function_test(
+    TestSteelSprings,
+    "test_unsupported_joint_springs_warn",
+    test_unsupported_joint_springs_warn,
+    devices=get_test_devices(),
 )
 add_function_test(
     TestSteelSprings, "test_deprecated_status_members", test_deprecated_status_members, devices=get_test_devices()

@@ -4595,8 +4595,22 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _setup_passive_joint_forces(self, model) -> None:
         """Allocate the passive damping and spring buffers of the inverse-dynamics pass and fill them from the model.
 
-        Springs act on PRISMATIC, REVOLUTE and D6 DOFs as ``joint_stiffness * (joint_rest_q - q)``.
+        Springs act on PRISMATIC, REVOLUTE and D6 DOFs as ``joint_stiffness * (joint_rest_q - q)``; stiffness on
+        other joint types warns and is ignored.
         """
+        if model.joint_stiffness is not None and model.joint_dof_count:
+            stiffness = model.joint_stiffness.numpy()
+            if np.any(stiffness != 0.0):
+                dof_joint = np.repeat(np.arange(model.joint_count), np.diff(model.joint_qd_start.numpy()))
+                supported = (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
+                ignored = (stiffness != 0.0) & ~np.isin(model.joint_type.numpy()[dof_joint], supported)
+                if ignored.any():
+                    warnings.warn(
+                        f"SolverSteel: passive joint springs on {int(ignored.sum())} DOF(s) of unsupported joint "
+                        "types (only REVOLUTE/PRISMATIC/D6 are supported); those springs are ignored.",
+                        NewtonWarning,
+                        stacklevel=3,
+                    )
         n_dofs = max(int(model.joint_dof_count), 1)
         self._passive_joint_damping = wp.zeros(n_dofs, dtype=wp.float32, device=model.device)
         self._refresh_passive_joint_damping()
