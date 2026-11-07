@@ -3806,9 +3806,8 @@ def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
-    with warnings.catch_warnings():
-        # On CPU, solve_mode="colored" warns that it runs the serial sweep.
-        warnings.filterwarnings("ignore", message="SolverSteel: solve_mode='colored' runs", category=NewtonWarning)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         solver = SolverSteel(
             model,
             articulated_contact_response=mode,
@@ -3819,6 +3818,10 @@ def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
             contact_warmstart=False,
             **options,
         )
+    # On CPU, solve_mode="colored" warns that it runs the serial sweep; nothing else warns.
+    expected = ["solve_mode='colored' runs"] if options.get("solve_mode") == "colored" and model.device.is_cpu else []
+    messages = [str(w.message) for w in caught if issubclass(w.category, NewtonWarning)]
+    assert len(messages) == len(expected) and all(e in m for e, m in zip(expected, messages, strict=True)), messages
     solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
     rows = (
         int(solver._constraint_count.numpy().sum()),
