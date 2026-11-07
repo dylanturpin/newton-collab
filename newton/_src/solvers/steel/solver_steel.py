@@ -2008,11 +2008,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 in the solve, such as contacts, accelerate the joint toward the bound by more than
                 the margin in one step. Mimic and connect rows also act inside the solve, so the tree
                 joints between the two ends of each mimic or loop closure, and every joint below them,
-                always have their rows. With ``drive_mode="rows"`` the drives act inside the solve too, so
-                ``None`` creates every limit row, as ``inf`` does. A bound at or beyond ``MAXVAL``,
-                the builder's unlimited default (``+/-1e10``), has no row. The constructor warns when
-                the finite limits alone exceed the capacity. The value is validated even when joint
-                limits are disabled.
+                always have their rows. Joints above a closure's common ancestor carry both ends and
+                stay gated, which can miss a passive limited mount under opposed mimics. With
+                ``drive_mode="rows"`` the drives act inside the solve too, so ``None`` creates every
+                limit row, as ``inf`` does. A bound at or beyond ``MAXVAL``, the builder's unlimited
+                default (``+/-1e10``), has no row. The constructor warns when the finite limits alone
+                exceed the capacity. The value is validated even when joint limits are disabled.
             enable_joint_velocity_limits: Enforce :attr:`~newton.Model.joint_velocity_limit`
                 of PRISMATIC, REVOLUTE and D6 DOFs with one row pair per limited DOF, after
                 scaling articulation velocities that already exceed a limit. A DOF at the builder's
