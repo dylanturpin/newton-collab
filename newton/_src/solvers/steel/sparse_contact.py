@@ -471,9 +471,10 @@ def _get_sparse_contact_response_kernel(
             const float position = joint_q.data[q_index];
             const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
             gap = side == 0 ? position - bound : bound - position;
+            float reach = activation_gap.data[dof];
+            if (activation_speed_scale > 0.0f) reach += activation_speed_scale * dt * fabsf(v_hat.data[dof]);
             // |bound| >= MAXVAL (1e10) is the builder's unlimited axis: no row.
-            active = fabsf(bound) < 1.0e10f
-                && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
+            active = fabsf(bound) < 1.0e10f && (side == 0 ? position <= bound + reach : position >= bound - reach);
         }
 #if defined(__CUDA_ARCH__)
         const unsigned active_mask = __ballot_sync(MASK, active != 0);
@@ -569,7 +570,9 @@ def _build_sparse_joint_limit_rows(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    activation_gap: float,
+    activation_gap: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     dof_mask: wp.array[wp.uint64],
     inverse_permutation: wp.array[int],
     factor_lookup: wp.array2d[int],
@@ -600,7 +603,9 @@ def build_sparse_joint_limit_rows(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    activation_gap: float,
+    activation_gap: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     dof_mask: wp.array[wp.uint64],
     inverse_permutation: wp.array[int],
     factor_lookup: wp.array2d[int],
@@ -636,6 +641,8 @@ def build_sparse_joint_limit_rows(
         joint_limit_upper,
         joint_q,
         activation_gap,
+        activation_speed_scale,
+        dt,
         dof_mask,
         inverse_permutation,
         factor_lookup,

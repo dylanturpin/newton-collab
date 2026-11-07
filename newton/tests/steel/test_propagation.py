@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.steel import solver_steel
 from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -3616,6 +3617,255 @@ class TestKernelParamBytes(unittest.TestCase):
         self.assertGreater(_kernel_param_bytes(_param_layout_oversized), 4096)
 
 
+def _add_hand(builder: newton.ModelBuilder, *, floating: bool, base_z: float, collide: bool) -> None:
+    """A palm with five four-joint fingers (one forking mid-finger) and a fixed leaf: a hand-like tree.
+
+    Every finger joint carries a position drive, so the factorization folds augmented drive stiffness
+    into the joint-space blocks.
+    """
+    cfg = builder.default_shape_cfg.copy()
+    # the links touch only the world: no self-contacts (dense rows) between neighbouring capsules
+    cfg.collision_group = -1
+    if not collide:
+        cfg.has_shape_collision = False
+        cfg.collision_group = 0
+    inertia = wp.mat33(0.003, 0.0002, 0.0001, 0.0002, 0.004, 0.0003, 0.0001, 0.0003, 0.005)
+    palm = builder.add_link(
+        mass=1.0,
+        inertia=inertia,
+        com=wp.vec3(0.01, -0.02, 0.01),
+        xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()),
+    )
+    builder.add_shape_box(palm, hx=0.06, hy=0.08, hz=0.02, cfg=cfg)
+    if floating:
+        joints = [builder.add_joint_free(palm)]
+    else:
+        joints = [
+            builder.add_joint_revolute(
+                parent=-1,
+                child=palm,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()),
+            )
+        ]
+    drive = {"target_ke": 50.0, "target_kd": 2.0, "armature": 0.001}
+    for finger in range(5):
+        parent = palm
+        for segment in range(4):
+            link = builder.add_link(mass=0.05 + 0.01 * segment, inertia=inertia, com=wp.vec3(0.0, 0.0, -0.015))
+            builder.add_shape_capsule(link, radius=0.008, half_height=0.015, cfg=cfg)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=link,
+                    axis=newton.Axis.Y if segment % 2 else newton.Axis.X,
+                    parent_xform=wp.transform(
+                        wp.vec3(-0.05 + 0.025 * finger, 0.0, -0.04 if segment == 0 else -0.035),
+                        wp.quat_rpy(0.1 * finger, -0.05, 0.02) if segment == 0 else wp.quat_identity(),
+                    ),
+                    **drive,
+                )
+            )
+            parent = link
+            if finger == 2 and segment == 1:
+                side = builder.add_link(mass=0.03, inertia=inertia)
+                builder.add_shape_sphere(side, radius=0.01, cfg=cfg)
+                joints.append(
+                    builder.add_joint_revolute(
+                        parent=parent,
+                        child=side,
+                        axis=newton.Axis.Z,
+                        parent_xform=wp.transform(wp.vec3(0.02, 0.0, -0.01), wp.quat_identity()),
+                        **drive,
+                    )
+                )
+    leaf = builder.add_link(mass=0.1, inertia=inertia)
+    builder.add_shape_box(leaf, hx=0.02, hy=0.02, hz=0.01, cfg=cfg)
+    joints.append(
+        builder.add_joint_fixed(
+            parent=palm, child=leaf, parent_xform=wp.transform(wp.vec3(0.0, 0.09, 0.0), wp.quat_identity())
+        )
+    )
+    builder.add_articulation(joints)
+
+
+def _build_hand_tree_model(device: str, *, floating: bool) -> newton.Model:
+    """Contact-free hand-like trees (:func:`_add_hand`), ``N_WORLDS`` copies."""
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        builder = newton.ModelBuilder()
+        _add_hand(builder, floating=floating, base_z=1.0, collide=False)
+        scene.add_world(builder)
+    return scene.finalize(device=device)
+
+
+def _level_solver(model: newton.Model, *, level: bool, **solver_kwargs) -> SolverSteel:
+    """A colored solver with the level-parallel tree kernels forced on or off."""
+    with patch.object(solver_steel, "_PROPAGATION_TREE_LEVEL_MIN_SPEEDUP", 1.0 if level else float("inf")):
+        return SolverSteel(
+            model, **steel_mode_options("colored"), iterations=8, articulation_constraint_max=64, **solver_kwargs
+        )
+
+
+def _bits(array: wp.array) -> np.ndarray:
+    return np.ascontiguousarray(array.numpy()).view(np.uint32)
+
+
+_TREE_FACTOR_OUTPUTS = (
+    "_propagation_tree_U",
+    "_propagation_tree_D_chol",
+    "_propagation_tree_D_inv",
+    "_propagation_tree_Ia",
+    "_propagation_body_response",
+    "_propagation_body_response_split",
+)
+
+
+@unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
+class TestPropagationLevelParallelTree(unittest.TestCase):
+    """The level-parallel tree kernels write exactly what the serial joint walk writes."""
+
+    def _assert_level_matches_serial(self, model, *, steps=(1, 15), expect_level=True):
+        solver_l = _level_solver(model, level=True)
+        solver_s = _level_solver(model, level=False)
+        size = solver_l._propagation_tree_sizes[0]
+        self.assertEqual(solver_l._propagation_tree_level[size], expect_level)
+        self.assertFalse(solver_s._propagation_tree_level[size])
+        if not expect_level:
+            return
+        self.assertIn("_level_", solver_l._propagation_factor_kernels[size].key)
+        self.assertIn("_level_", solver_l._propagation_response_kernels[size].key)
+        self.assertTrue(solver_l._propagation_refresh_kernels[size].levels)
+        for n_steps in steps:
+            with self.subTest(n_steps=n_steps):
+                # Contact-free, so both reach bitwise-identical states and factor identical inputs.
+                state_l, _ = _step(model, solver_l, n_steps)
+                state_s, _ = _step(model, solver_s, n_steps)
+                np.testing.assert_array_equal(state_l.joint_q.numpy(), state_s.joint_q.numpy())
+                for name in _TREE_FACTOR_OUTPUTS:
+                    self.assertTrue(np.any(getattr(solver_s, name).numpy() != 0.0), name)
+                    np.testing.assert_array_equal(
+                        _bits(getattr(solver_l, name)), _bits(getattr(solver_s, name)), err_msg=name
+                    )
+        rng = np.random.default_rng(7)
+        v0 = rng.normal(scale=0.5, size=solver_l._v_out.shape).astype(np.float32)
+        for solver in (solver_l, solver_s):
+            solver._v_out.assign(v0)
+            solver._propagation_body_qd.zero_()
+            solver._propagation_refresh_twists(force=True)
+        np.testing.assert_array_equal(_bits(solver_l._propagation_body_qd), _bits(solver_s._propagation_body_qd))
+
+    def test_hand_tree_matches_serial_bitwise(self):
+        """Match the joint walk bitwise on fixed-base and floating hand trees."""
+        for floating in (False, True):
+            with self.subTest(floating=floating):
+                self._assert_level_matches_serial(_build_hand_tree_model("cuda:0", floating=floating))
+
+    def test_free_root_chains_match_serial_bitwise(self):
+        """Match the joint walk on a chain, one joint per level."""
+        model = _build_chain_model("cuda:0", chains=(6,), spheres=())
+        self._assert_level_matches_serial(model, steps=(12,))
+
+    def test_inactive_articulations_are_skipped_like_serial(self):
+        """Keep a sleeping articulation's factor, response and refreshed twists in both walks."""
+        model = _build_hand_tree_model("cuda:0", floating=True)
+        active = np.ones(model.articulation_count, dtype=np.int32)
+        active[1] = 0
+        mask = wp.array(active, dtype=wp.int32, device=model.device)
+        sentinel = 1234.5
+        outputs = (*_TREE_FACTOR_OUTPUTS, "_propagation_body_qd")
+        results = {}
+        with patch.object(SolverSteel, "_propagation_tree_activity", property(lambda _self: mask)):
+            for level in (True, False):
+                solver = _level_solver(model, level=level)
+                self.assertEqual(solver._propagation_tree_level[solver._propagation_tree_sizes[0]], level)
+                for name in outputs:
+                    getattr(solver, name).fill_(sentinel)
+                _step(model, solver)
+                solver._v_out.fill_(0.25)
+                solver._propagation_refresh_twists(force=True)
+                results[level] = {name: getattr(solver, name).numpy() for name in outputs}
+        # One articulation per world.
+        art_bodies = model.body_world.numpy() == 1
+        for name in outputs:
+            with self.subTest(name=name):
+                np.testing.assert_array_equal(
+                    results[True][name].view(np.uint32), results[False][name].view(np.uint32), err_msg=name
+                )
+                self.assertTrue(np.any(results[True][name] != sentinel), name)
+        np.testing.assert_array_equal(results[True]["_propagation_body_qd"][art_bodies], sentinel)
+
+    def test_multidof_trees_keep_the_serial_walk(self):
+        """Leave trees of multi-DOF joints on the joint walk."""
+        self._assert_level_matches_serial(_scene("cuda:0", "ball"), expect_level=False)
+
+    def test_selection_prefers_branched_trees(self):
+        """Select the level kernels for a hand and keep the joint walk for a chain."""
+        hand = SolverSteel(_build_hand_tree_model("cuda:0", floating=True), **steel_mode_options("colored"))
+        chain = SolverSteel(_build_chain_model("cuda:0", chains=(6,), spheres=()), **steel_mode_options("colored"))
+        for solver, expected in ((hand, True), (chain, False)):
+            self.assertEqual(solver._propagation_tree_level[solver._propagation_tree_sizes[0]], expected)
+
+    def test_level_order(self):
+        """Levels respect the tree, and siblings sit in descending-slot runs headed by their run length."""
+        model = _build_hand_tree_model("cuda:0", floating=False)
+        solver = SolverSteel(model, **steel_mode_options("colored"))
+        level_joint, level_run, level_offsets, level_art_start = (a.numpy() for a in solver._propagation_tree_levels)
+        starts = model.articulation_start.numpy()
+        parent_slot = solver._propagation_joint_parent_slot.numpy()
+        for art in range(model.articulation_count):
+            j0, j1 = int(starts[art]), int(starts[art + 1])
+            offsets = level_offsets[level_art_start[art] : level_art_start[art + 1]]
+            # Root; the palm's children (five fingers, the fixed leaf); finger segments, the fork with the third.
+            np.testing.assert_array_equal(np.diff(offsets), [1, 6, 5, 6, 5])
+            order = level_joint[j0:j1]
+            self.assertEqual(sorted(order.tolist()), list(range(j1 - j0)))
+            depth = {}
+            for level in range(len(offsets) - 1):
+                for k in range(offsets[level], offsets[level + 1]):
+                    slot = int(order[k])
+                    parent = int(parent_slot[j0 + slot])
+                    depth[slot] = 0 if parent < 0 else depth[parent] + 1
+                    self.assertEqual(depth[slot], level)
+                    run = int(level_run[j0 + k])
+                    if run:
+                        siblings = order[k : k + run]
+                        self.assertTrue(all(int(parent_slot[j0 + s]) == parent for s in siblings))
+                        self.assertEqual(siblings.tolist(), sorted(siblings.tolist(), reverse=True))
+            # Every non-root joint is in exactly one run.
+            self.assertEqual(int(level_run[j0:j1].sum()), j1 - j0 - 1)
+
+    def test_contact_rollout_matches_serial_bitwise(self):
+        """Drive a deterministic contact solve exactly like the joint walk."""
+        scene = newton.ModelBuilder()
+        for _ in range(2):
+            builder = newton.ModelBuilder()
+            _add_hand(builder, floating=True, base_z=0.17, collide=True)
+            scene.add_world(builder)
+        scene.add_ground_plane()
+        model = scene.finalize(device="cuda:0")
+        rollouts = []
+        for level in (True, False):
+            solver = _level_solver(model, level=level, deterministic=wp.DeterministicMode.RUN_TO_RUN)
+            self.assertEqual(solver._propagation_tree_level[solver._propagation_tree_sizes[0]], level)
+            state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            control = model.control()
+            history = []
+            for _ in range(40):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, DT)
+                state_0, state_1 = state_1, state_0
+                history.append([state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()])
+            rollouts.append(history)
+            self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        for k, (a, b) in enumerate(zip(*rollouts, strict=True)):
+            for name, x, y in zip(("joint_q", "joint_qd"), a, b, strict=True):
+                np.testing.assert_array_equal(x, y, err_msg=f"{name} at step {k}")
+
+
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestSteelLatencyFused(unittest.TestCase):
     """The one-launch colored propagation loop writes exactly what the per-pass launches write."""
@@ -3679,6 +3929,19 @@ class TestSteelLatencyFused(unittest.TestCase):
         """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
 
+    def test_fused_loop_with_level_trees_matches(self):
+        """Match the per-pass launches when hand trees take the level-walk refresh inside the fused loop."""
+        scene = newton.ModelBuilder()
+        for _ in range(N_WORLDS):
+            builder = newton.ModelBuilder()
+            _add_hand(builder, floating=True, base_z=0.17, collide=True)
+            scene.add_world(builder)
+        scene.add_ground_plane()
+        model = scene.finalize(device="cuda:0")
+        solver = SolverSteel(model, **steel_mode_options("colored"), iterations=8)
+        self.assertTrue(all(solver._propagation_refresh_kernels[s].levels for s in solver._propagation_tree_sizes))
+        self._check_fused_matches(model, iterations=8)
+
     def test_fused_loop_velocity_passes_match(self):
         """Match the per-pass launches in the velocity pass, which solves its own right-hand side."""
         self._check_fused_matches(
@@ -3691,6 +3954,7 @@ class TestSteelLatencyFused(unittest.TestCase):
             _build_latency_scene("cuda:0"),
             iterations=8,
             enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
             row_schedule="contact_then_internal",
         )
 

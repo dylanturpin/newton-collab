@@ -8161,6 +8161,14 @@ def scatter_qdd_from_groups(
         joint_qdd[dof_start + i] = qdd_group[idx, i, 0]
 
 
+@wp.func
+def joint_limit_effective_gap(activation_gap: float, speed_scale: float, dt: float, qd: float) -> float:
+    """Return a limit DOF's activation gap widened by ``speed_scale * dt * |qd|``, its reach this step."""
+    if speed_scale > 0.0:
+        return activation_gap + speed_scale * dt * wp.abs(qd)
+    return activation_gap
+
+
 @wp.kernel
 def build_joint_limit_rows(
     articulation_dof_start: wp.array[int],
@@ -8170,7 +8178,10 @@ def build_joint_limit_rows(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    activation_gap: float,
+    activation_gap: wp.array[float],
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     max_constraints: int,
     n_dofs: int,
     # outputs
@@ -8199,15 +8210,16 @@ def build_joint_limit_rows(
         if q_index < 0:
             continue
         q = joint_q[q_index]
+        gap = joint_limit_effective_gap(activation_gap[dof], activation_speed_scale, dt, joint_qd[dof])
         for side in range(2):
             bound = joint_limit_lower[dof]
             phi = q - bound
-            active = wp.abs(bound) < MAXVAL and q <= bound + activation_gap
+            active = wp.abs(bound) < MAXVAL and q <= bound + gap
             sign = 1.0
             if side == 1:
                 bound = joint_limit_upper[dof]
                 phi = bound - q
-                active = wp.abs(bound) < MAXVAL and q >= bound - activation_gap
+                active = wp.abs(bound) < MAXVAL and q >= bound - gap
                 sign = -1.0
             if not active:
                 continue
@@ -10252,7 +10264,9 @@ def prepare_fused_diagonal_joint_limits(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    activation_gap: float,
+    activation_gap: wp.array[float],
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
     pgs_beta: float,
     dt: float,
     # outputs
@@ -10276,14 +10290,17 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.abs(lower) < MAXVAL and q <= lower + activation_gap:
+            gap = joint_limit_effective_gap(
+                activation_gap[global_dof], activation_speed_scale, dt, joint_qd[global_dof]
+            )
+            if wp.abs(lower) < MAXVAL and q <= lower + gap:
                 phi = q - lower
                 scale = 1.0
                 if phi < 0.0:
                     scale = pgs_beta
                 rhs_lower = scale * phi * inv_dt
                 active |= 1
-            if wp.abs(upper) < MAXVAL and q >= upper - activation_gap:
+            if wp.abs(upper) < MAXVAL and q >= upper - gap:
                 phi = upper - q
                 scale = 1.0
                 if phi < 0.0:

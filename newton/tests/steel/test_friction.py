@@ -668,6 +668,9 @@ def _solve_contact_block(device, tangent_mass, rhs, initial, capacity=32):
             wp.full((1, capacity), 0.3, dtype=float, device=device),
             # Drive-row parameters: no drive rows.
             *(wp.zeros((1, 1), dtype=float, device=device) for _ in range(5)),
+            # Velocity-limit slot tables: no velocity-limit rows.
+            wp.full((2,), -1, dtype=int, device=device),
+            wp.zeros((2,), dtype=float, device=device),
             wp.zeros((1,), dtype=int, device=device),
             wp.zeros((1,), dtype=int, device=device),
             wp.zeros((1, 4), dtype=int, device=device),
@@ -1006,6 +1009,8 @@ def _coulomb_newton_mf_block(device, block):
             wp.full((1, 1), -1, dtype=int, device=device),
             wp.full((1, 1), -1, dtype=int, device=device),
             *(wp.zeros((1, 1), dtype=float, device=device) for _ in range(6)),
+            wp.full((2,), -1, dtype=int, device=device),
+            wp.zeros((2,), dtype=float, device=device),
             wp.array([3], dtype=int, device=device),
             wp.array([3], dtype=int, device=device),
             wp.array(meta.reshape(1, 16), dtype=int, device=device),

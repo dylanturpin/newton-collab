@@ -53,6 +53,8 @@ ROW_FIELDS = (
     "drive_impulse_multiplier",
     "drive_max_impulse",
     "drive_vel_limit",
+    "velocity_limit_slot",
+    "velocity_limit_sign",
     "mf_constraint_count",
     "mf_contact_rows_end",
     "mf_meta",
@@ -126,6 +128,8 @@ class RowArgs:
     drive_impulse_multiplier: wp.array2d[float]
     drive_max_impulse: wp.array2d[float]
     drive_vel_limit: wp.array2d[float]
+    velocity_limit_slot: wp.array[int]
+    velocity_limit_sign: wp.array[float]
     mf_constraint_count: wp.array[int]
     mf_contact_rows_end: wp.array[int]
     mf_meta: wp.array2d[int]
@@ -194,6 +198,10 @@ class TreeArgs:
     joint_child: wp.array[int]
     joint_qd_start: wp.array[int]
     joint_parent_slot: wp.array[int]
+    # Depth-level joint order, read by the level-walk refresh variants.
+    level_joint: wp.array[int]
+    level_offsets: wp.array[int]
+    level_art_start: wp.array[int]
     S_flat: wp.array2d[float]
     com_rel: wp.array2d[float]
     U: wp.array2d[float]
@@ -275,14 +283,15 @@ def get_fused_iteration_kernel(
     colored_native: Any,
     row_native: Any,
     gemv_native: Any | None,
-    tree_natives: tuple[tuple[Any, Any], ...],
+    tree_natives: tuple[tuple[Any, Any, bool], ...],
     has_phase3: bool,
     has_phase5: bool,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
     ``colored_native`` is the block-wide sweep built for the launch's block size, ``tree_natives`` holds
-    ``(propagate, refresh)`` per tree group in the order of the ``slots`` argument, and ``gemv_native`` is
+    ``(propagate, refresh, refresh_takes_levels)`` per tree group in the order of the ``slots`` argument (a
+    level-walk refresh also reads ``TreeArgs``' level order), and ``gemv_native`` is
     ``None`` without cached responses. Launch with ``dim=[world_count]`` and ``32 * warp_count(...)`` threads.
     """
     n_slots = len(tree_natives)
@@ -304,7 +313,7 @@ def get_fused_iteration_kernel(
             world, rows.constraint_count, rows.world_dof_indices, rows.rhs, rows.diag, rows.impulses,
             rows.J_world, rows.Y_world, rows.row_type, rows.row_parent, rows.row_mu, rows.drive_target_vel_bias,
             rows.drive_vel_multiplier, rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
-            rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses, rows.mf_J_a,
+            rows.velocity_limit_slot, rows.velocity_limit_sign, rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses, rows.mf_J_a,
             rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.row_w, rows.mf_row_w,
             rows.torsion_group, rows.torsion_row_radius, rows.dense_gamma, rows.mf_gamma, 1, omega, regularize,
             freeze_drive_rows, phase, friction_start_iteration, iteration, v_out,
@@ -349,12 +358,21 @@ def get_fused_iteration_kernel(
                 if warp_id == 1 + s:
                     slot = slots[s]
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
-                        wp.static(tree_natives[s][1])(
-                            slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
-                            tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
-                            tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
-                            tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
-                        )  # fmt: skip
+                        if wp.static(tree_natives[s][2]):
+                            wp.static(tree_natives[s][1])(
+                                slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
+                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
+                                tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
+                                tree[0].joint_parent_slot, tree[0].level_joint, tree[0].level_offsets,
+                                tree[0].level_art_start, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
+                            )  # fmt: skip
+                        else:
+                            wp.static(tree_natives[s][1])(
+                                slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
+                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
+                                tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
+                                tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
+                            )  # fmt: skip
             if warp_id == wp.static(free_warp):
                 _free_refresh(world, lane, free[0], v_out, body_qd)
             _block_sync()
