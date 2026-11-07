@@ -29,7 +29,6 @@ from newton._src.solvers.steel.solver_steel import (
     _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
 )
-from newton.exceptions import NewtonWarning
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import (
     CONTACT_MAX,
@@ -3818,9 +3817,9 @@ def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
             contact_warmstart=False,
             **options,
         )
-    # On CPU, solve_mode="colored" warns that it runs the serial sweep; nothing else warns.
+    # On CPU, solve_mode="colored" warns that it runs the serial sweep; construction emits no other warning.
     expected = ["solve_mode='colored' runs"] if options.get("solve_mode") == "colored" and model.device.is_cpu else []
-    messages = [str(w.message) for w in caught if issubclass(w.category, NewtonWarning)]
+    messages = [str(w.message) for w in caught]
     assert len(messages) == len(expected) and all(e in m for e, m in zip(expected, messages, strict=True)), messages
     solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
     rows = (
