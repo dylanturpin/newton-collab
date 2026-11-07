@@ -1508,6 +1508,7 @@ def finalize_body_dynamics(
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
+    body_disable_gravity: wp.array[bool],
     body_v_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
     body_active: wp.array[int],
@@ -1536,10 +1537,13 @@ def finalize_body_dynamics(
     if is_free_rigid[articulation] != 0:
         write_body_inertia = 1
     v_s = body_v_s[body]
+    gravity_s = wp.vec3(0.0)
+    if not body_disable_gravity[body]:
+        gravity_s = gravity[body_world[body]]
     write_body_dynamics(
         body,
         origin,
-        gravity[body_world[body]],
+        gravity_s,
         body_q_com[body],
         body_mass[body],
         body_inertia[body],
