@@ -883,7 +883,6 @@ def test_parent_wrench_excludes_joint_armature(test, device):
     Projected onto its motion subspace, every wrench is the applied joint force less ``armature * qdd``. The FREE
     body has no ``joint_f``, so it reports ``-armature * qdd``, and the weld reports its child's rigid-body wrench.
     """
-    configurations = [{}]
     for armature in (0.0, 9.0):
         model, state, control = _armature_scene(device, armature)
         joint_f = control.joint_f.numpy()
@@ -891,34 +890,29 @@ def test_parent_wrench_excludes_joint_armature(test, device):
             np.array(wp.transform_point(wp.transform(*X), wp.vec3(*com)))
             for X, com in zip(state.body_q.numpy(), model.body_com.numpy(), strict=True)
         ]
-        for options in configurations:
-            with test.subTest(armature=armature, **options):
-                solver = SolverSteel(model, **options)
-                solver._rigid_body_angular_damping.zero_()
-                wrench, qdd = _step_armature_scene(model, state, control, solver)
-                expected = joint_f - armature * qdd
-                np.testing.assert_allclose(wrench[0], expected[:6], rtol=1.0e-4, atol=1.0e-4)
-                if armature:
-                    test.assertGreater(np.abs(wrench[0]).max(), 1.0)
-                hinge = np.array([1.0, 0.0, 1.0])
-                hinge_torque = wrench[1, 3:] + np.cross(com_world[1] - hinge, wrench[1, :3])
-                test.assertAlmostEqual(
-                    float(hinge_torque[1]), float(expected[6]), delta=1.0e-4 * abs(expected[6]) + 1.0e-4
-                )
-                test.assertAlmostEqual(
-                    float(wrench[3, 2]), float(expected[7]), delta=1.0e-4 * abs(expected[7]) + 1.0e-4
-                )
-                socket = np.array([3.0, 0.0, 1.0])
-                ball_torque = wrench[4, 3:] + np.cross(com_world[4] - socket, wrench[4, :3])
-                np.testing.assert_allclose(ball_torque, expected[8:11], rtol=1.0e-4, atol=1.0e-4)
-                # The weld carries its child's mass times its acceleration from the hinge's start velocity and qdd.
-                omega = np.array([0.0, state.joint_qd.numpy()[6], 0.0])
-                alpha = np.array([0.0, qdd[6], 0.0])
-                lever = com_world[2] - hinge
-                accel = np.cross(alpha, lever) + np.cross(omega, np.cross(omega, lever))
-                weld_force = model.body_mass.numpy()[2] * (accel - np.array([0.0, 0.0, -9.81]))
-                np.testing.assert_allclose(wrench[2, :3], weld_force, rtol=1.0e-4, atol=1.0e-4)
-                np.testing.assert_allclose(wrench[2, 3:], 0.01 * alpha, rtol=1.0e-4, atol=1.0e-4)
+        with test.subTest(armature=armature):
+            solver = SolverSteel(model)
+            solver._rigid_body_angular_damping.zero_()
+            wrench, qdd = _step_armature_scene(model, state, control, solver)
+            expected = joint_f - armature * qdd
+            np.testing.assert_allclose(wrench[0], expected[:6], rtol=1.0e-4, atol=1.0e-4)
+            if armature:
+                test.assertGreater(np.abs(wrench[0]).max(), 1.0)
+            hinge = np.array([1.0, 0.0, 1.0])
+            hinge_torque = wrench[1, 3:] + np.cross(com_world[1] - hinge, wrench[1, :3])
+            test.assertAlmostEqual(float(hinge_torque[1]), float(expected[6]), delta=1.0e-4 * abs(expected[6]) + 1.0e-4)
+            test.assertAlmostEqual(float(wrench[3, 2]), float(expected[7]), delta=1.0e-4 * abs(expected[7]) + 1.0e-4)
+            socket = np.array([3.0, 0.0, 1.0])
+            ball_torque = wrench[4, 3:] + np.cross(com_world[4] - socket, wrench[4, :3])
+            np.testing.assert_allclose(ball_torque, expected[8:11], rtol=1.0e-4, atol=1.0e-4)
+            # The weld carries its child's mass times its acceleration from the hinge's start velocity and qdd.
+            omega = np.array([0.0, state.joint_qd.numpy()[6], 0.0])
+            alpha = np.array([0.0, qdd[6], 0.0])
+            lever = com_world[2] - hinge
+            accel = np.cross(alpha, lever) + np.cross(omega, np.cross(omega, lever))
+            weld_force = model.body_mass.numpy()[2] * (accel - np.array([0.0, 0.0, -9.81]))
+            np.testing.assert_allclose(wrench[2, :3], weld_force, rtol=1.0e-4, atol=1.0e-4)
+            np.testing.assert_allclose(wrench[2, 3:], 0.01 * alpha, rtol=1.0e-4, atol=1.0e-4)
 
 
 def test_parent_wrench_of_a_contact_stop_with_armature(test, device):

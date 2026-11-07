@@ -1336,8 +1336,8 @@ When building a link-break loop:
   even split is the usual choice). The weld's two frames must coincide at the
   authored pose; identity frames do when the two bodies share a pose.
 - All tree joints of the loop, from both branches, go into **one**
-  articulation, and the weld stays out of it. Steel ignores a weld between two
-  articulations with a warning.
+  articulation, and the weld stays out of it. Steel rejects a weld between two
+  dynamic articulations.
 - Cut on the far side of the loop from the articulation root so both branches
   stay short. Welding a long chain back onto its own root is valid but, in
   Steel, leaks more momentum.
@@ -1380,9 +1380,10 @@ MuJoCo's soft ``<weld>`` equality, but the MJCF and USD importers convert MuJoCo
 welds (``<weld>``, ``MjcEqualityWeldAPI``) to the same loop joints:
 
 - ``torquescale`` 0, which MuJoCo enforces as a point constraint with rotation
-  free, becomes a BALL loop joint on the weld's anchor, with a warning.
+  free, becomes a BALL loop joint on the weld's anchor, and the importer logs
+  a warning.
 - Any other ``torquescale`` becomes a FIXED loop joint. A value other than 1
-  warns, because the weld is then enforced in full.
+  logs a warning, because the weld is then enforced in full.
 - :class:`~newton.solvers.SolverSteel` solves loop closures as hard
   constraints and does not support ``solref`` or ``solimp`` (time constant,
   damping ratio, impedance) on them. :class:`~newton.solvers.SolverMuJoCo`
@@ -1440,8 +1441,8 @@ quaternions (xyzw) for default rotational rest configurations. Index it
 with :attr:`newton.Model.joint_q_start`. Scalar ``JointDofConfig.rest_q`` values cannot specify a
 quaternion; edit the joint's four entries in ``joint_rest_q`` instead.
 
-Featherstone, Steel and SemiImplicit apply springs only to REVOLUTE, PRISMATIC, and D6
-coordinates. MuJoCo
+Featherstone, Steel, and SemiImplicit apply springs only to REVOLUTE, PRISMATIC,
+and D6 coordinates. MuJoCo
 also supports isotropic BALL springs and quaternion rest orientations.
 :class:`newton.solvers.SolverVBD` uses ``joint_rest_q`` for ROD structural rest;
 its material stiffness and damping remain in ``joint_target_ke`` / ``joint_target_kd``.

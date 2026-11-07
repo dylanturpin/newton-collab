@@ -29,7 +29,7 @@ def _box_on_ground(device, worlds=1):
     return builder.finalize(device=device)
 
 
-def test_capacity_failure_is_observable(test, device):
+def test_capacity_failure_is_observable(test, device, solve_mode="serial"):
     """Flag dropped free-body contact rows until reset, without optional telemetry."""
     model = _box_on_ground(device)
     solver = SolverSteel(model, free_body_constraint_max=1, warn_constraint_overflow=False)
@@ -46,7 +46,7 @@ def test_capacity_failure_is_observable(test, device):
     solver.check_constraint_capacity()
 
 
-def test_dense_capacity_failure_is_world_local(test, device):
+def test_dense_capacity_failure_is_world_local(test, device, solve_mode="serial"):
     """Flag only the world whose dense rows overflow."""
     template = newton.ModelBuilder()
     link = template.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
@@ -75,7 +75,7 @@ def test_dense_capacity_failure_is_world_local(test, device):
     test.assertLessEqual(int(solver._constraint_count.numpy()[0]), 3)
 
 
-def test_overflow_warning_is_printed_once(test, device, response="immediate"):
+def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", response="immediate"):
     """Print one device-side warning per overflowing row family, inside this test."""
     if wp.get_device(device).is_cpu and sys.platform == "win32":
         test.skipTest("Warp CPU printf capture is unreliable on Windows")
@@ -118,7 +118,7 @@ def test_overflow_warning_is_printed_once(test, device, response="immediate"):
     np.testing.assert_array_equal(solver._row_overflow_warning_emitted.numpy(), expected)
 
 
-def test_status_snapshot_reports_status_at_snapshot(test, device):
+def test_status_snapshot_reports_status_at_snapshot(test, device, solve_mode="serial"):
     """Report the status as copied by snapshot_constraint_status, unchanged by later steps, and retaken by a reset."""
     model = _box_on_ground(device)
     solver = SolverSteel(model, free_body_constraint_max=1, warn_constraint_overflow=False)
@@ -205,7 +205,7 @@ add_function_test(
     TestSteelCapacityStatus,
     "test_capacity_failure_is_observable",
     test_capacity_failure_is_observable,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -213,7 +213,7 @@ add_function_test(
     TestSteelCapacityStatus,
     "test_dense_capacity_failure_is_world_local",
     test_dense_capacity_failure_is_world_local,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -222,7 +222,7 @@ add_function_test(
     TestSteelCapacityStatus,
     "test_overflow_warning_is_printed_once",
     test_overflow_warning_is_printed_once,
-    devices=devices,
+    devices=get_test_devices(),
     check_output=False,
 )
 
@@ -231,7 +231,7 @@ add_function_test(
     TestSteelCapacityStatus,
     "test_status_snapshot_reports_status_at_snapshot",
     test_status_snapshot_reports_status_at_snapshot,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -284,7 +284,7 @@ def _driven_model(device, worlds=2):
     return builder.finalize(device=device)
 
 
-def test_partial_reset_refreshes_only_selected_mass_factors(test, device):
+def test_partial_reset_refreshes_only_selected_mass_factors(test, device, solve_mode="serial"):
     """Refresh only the selected world's (or the global slot's) factors, eagerly and under graph replay."""
     model = _driven_model(device)
     solver = SolverSteel(model, update_mass_matrix_interval=100)
@@ -385,7 +385,7 @@ add_function_test(
     TestSteelSafety,
     "test_partial_reset_refreshes_only_selected_mass_factors",
     test_partial_reset_refreshes_only_selected_mass_factors,
-    devices=get_cuda_test_devices(),
+    devices=get_test_devices(),
 )
 
 
@@ -483,7 +483,7 @@ def test_allocator_rejects_incomplete_contact_frame(test, device):
     test.assertEqual(int(world_slot_counter.numpy()[0]), 0)
 
 
-def test_step_rejects_contacts_larger_than_scratch(test, device):
+def test_step_rejects_contacts_larger_than_scratch(test, device, solve_mode="serial"):
     """Reject a contact buffer larger than the solver's contact scratch before it is read."""
     builder = newton.ModelBuilder()
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
@@ -496,7 +496,7 @@ def test_step_rejects_contacts_larger_than_scratch(test, device):
         solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
 
 
-def test_overflowed_contact_count_invalidates_every_world(test, device):
+def test_overflowed_contact_count_invalidates_every_world(test, device, solve_mode="serial"):
     """Flag every world when the narrow phase reports more contacts than the buffer holds."""
     template = newton.ModelBuilder()
     body = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
@@ -532,7 +532,7 @@ add_function_test(
     TestSteelContactCapacity,
     "test_step_rejects_contacts_larger_than_scratch",
     test_step_rejects_contacts_larger_than_scratch,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -540,7 +540,7 @@ add_function_test(
     TestSteelContactCapacity,
     "test_overflowed_contact_count_invalidates_every_world",
     test_overflowed_contact_count_invalidates_every_world,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -720,7 +720,7 @@ def _run(model, solver, steps):
     return observed, state_0
 
 
-def test_watermarks_are_zero_when_disabled(test, device):
+def test_watermarks_are_zero_when_disabled(test, device, solve_mode="serial"):
     """Report zeros and allocate nothing without ``row_watermark``."""
     model = _scene(device)
     solver = SolverSteel(model)
@@ -731,7 +731,7 @@ def test_watermarks_are_zero_when_disabled(test, device):
     test.assertTrue(all(value == 0 for value in marks.values()))
 
 
-def test_watermarks_track_the_largest_row_counts(test, device):
+def test_watermarks_track_the_largest_row_counts(test, device, solve_mode="serial"):
     """Match the per-step maxima of the retained and requested rows and the contact count."""
     model = _scene(device)
     solver = SolverSteel(model, row_watermark=True, friction_anchor_beta=0.0)
@@ -765,7 +765,7 @@ def test_watermarks_track_propagation_rows(test, device):
     test.assertEqual(marks["propagation_overflow_world_steps"], 0)
 
 
-def test_watermarks_record_capacity_overflow(test, device):
+def test_watermarks_record_capacity_overflow(test, device, solve_mode="serial"):
     """Record the dropped rows, the excess over capacity and the overflowing world-steps."""
     model = _scene(device)
     capacity = 3
@@ -839,7 +839,7 @@ for _fn in (
     test_watermarks_track_the_largest_row_counts,
     test_watermarks_record_capacity_overflow,
 ):
-    add_function_test(TestSteelRowWatermark, _fn.__name__, _fn, devices=cuda_devices)
+    add_function_test(TestSteelRowWatermark, _fn.__name__, _fn, devices=get_test_devices())
 
 
 add_function_test(
@@ -896,7 +896,7 @@ def _build_model(world_link_counts: list[int], device, root_height: float = 1.0,
     return scene.finalize(device=device)
 
 
-def _final_joint_q(model, steps=60, response="immediate", from_fk=False, deterministic=False):
+def _final_joint_q(model, steps=60, solve_mode="serial", response="immediate", from_fk=False, deterministic=False):
     solver = SolverSteel(
         model,
         articulation_constraint_max=64,
@@ -917,19 +917,21 @@ def _final_joint_q(model, steps=60, response="immediate", from_fk=False, determi
     return state_0.joint_q.numpy()
 
 
-def test_hetero_matrix_free_constructs(test, device):
+def test_hetero_serial_constructs(test, device):
     """Construct on worlds whose DOF counts differ."""
     solver = SolverSteel(_build_model([1, 3, 1, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [1, 3, 1, 3])
+    test.assertEqual(solver._size_groups, [3, 1])
 
 
-def test_homogeneous_matrix_free_constructs(test, device):
+def test_homogeneous_serial_constructs(test, device):
     """Construct on worlds with identical DOF counts."""
     solver = SolverSteel(_build_model([3, 3, 3, 3], device))
     np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
+    test.assertEqual(solver._size_groups, [3])
 
 
-def test_hetero_worlds_match_isolated_worlds(test, device):
+def test_hetero_worlds_match_isolated_worlds(test, device, solve_mode="serial"):
     """Simulate each world of a heterogeneous model exactly as it simulates alone."""
     combined = _final_joint_q(_build_model([1, 3], device))
     single = _final_joint_q(_build_model([1], device))
@@ -940,9 +942,10 @@ def test_hetero_worlds_match_isolated_worlds(test, device):
 def test_homogeneous_propagation_constructs(test, device):
     """Construct both propagation responses on worlds with identical DOF counts."""
     model = _build_model([3, 3, 3, 3], device)
-    for response in ("propagation", "colored"):
-        with test.subTest(response=response):
-            solver = SolverSteel(model, **steel_mode_options(response))
+    for solve_mode in ("serial", "colored"):
+        with test.subTest(solve_mode=solve_mode):
+            solver = SolverSteel(model, solve_mode=solve_mode, articulated_contact_response="propagation")
+            test.assertEqual(solver.solve_mode, solve_mode)
             test.assertEqual(solver.articulated_contact_response, "propagation")
             np.testing.assert_array_equal(solver._world_dof_count.numpy(), [3, 3, 3, 3])
 
@@ -953,13 +956,13 @@ def test_hetero_propagation_matches_isolated_worlds(test, device):
     The chains hang low enough to hit the ground, so every world solves propagation contact rows.
     """
 
-    def run(link_counts, free_box, response):
+    def run(link_counts, free_box, solve_mode):
         model = _build_model(link_counts, device, 0.35, free_box)
         # Without a deterministic mode these chains can reach a different contact outcome from run to run.
-        return _final_joint_q(model, response=response, from_fk=True, deterministic=True)
+        return _final_joint_q(model, solve_mode=solve_mode, response="propagation", from_fk=True, deterministic=True)
 
-    for response in ("propagation", "colored"):
-        with test.subTest(response=response):
+    for response in ("serial", "colored"):
+        with test.subTest(solve_mode=response):
             combined = run([1, 3], None, response)
             single = run([1], None, response)
             triple = run([3], None, response)
@@ -977,15 +980,15 @@ class TestSteelHeteroGuard(unittest.TestCase):
 
 
 add_function_test(
-    TestSteelHeteroGuard, "test_hetero_matrix_free_constructs", test_hetero_matrix_free_constructs, devices=devices
+    TestSteelHeteroGuard, "test_hetero_serial_constructs", test_hetero_serial_constructs, devices=get_test_devices()
 )
 
 
 add_function_test(
     TestSteelHeteroGuard,
-    "test_homogeneous_matrix_free_constructs",
-    test_homogeneous_matrix_free_constructs,
-    devices=devices,
+    "test_homogeneous_serial_constructs",
+    test_homogeneous_serial_constructs,
+    devices=get_test_devices(),
 )
 
 
@@ -993,7 +996,7 @@ add_function_test(
     TestSteelHeteroGuard,
     "test_hetero_worlds_match_isolated_worlds",
     test_hetero_worlds_match_isolated_worlds,
-    devices=devices,
+    devices=get_test_devices(),
 )
 
 
@@ -1040,11 +1043,12 @@ def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_bu
     state_in, state_out = model.state(), model.state()
     pipeline.collide(state_in, contacts)
 
-    def step(response, free_body_constraint_max=1, **options):
+    def step(solve_mode, free_body_constraint_max=1, **options):
         # A summed capacity of 1 + 1 rows is far below the rows of one resting box.
         solver = SolverSteel(
             model,
-            **steel_mode_options(response),
+            solve_mode=solve_mode,
+            articulated_contact_response="propagation",
             free_body_constraint_max=free_body_constraint_max,
             articulation_constraint_max=1,
             row_watermark=True,
@@ -1054,8 +1058,8 @@ def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_bu
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         return solver.constraint_row_watermarks(), state_out.body_qd.numpy()
 
-    for response in ("propagation", "colored"):
-        with test.subTest(response=response):
+    for response in ("serial", "colored"):
+        with test.subTest(solve_mode=response):
             summed, _ = step(response)
             test.assertGreater(summed["propagation_dropped_contact_rows_high_water"], 0)
             sized, sized_qd = step(response, propagation_constraint_max=16)

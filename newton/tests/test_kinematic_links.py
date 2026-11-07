@@ -913,7 +913,8 @@ for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name in ("mujoco_warp",):
+        if device.is_cpu and solver_name in ("mujoco_warp", "steel_colored"):
+            # On CPU the colored mode runs the serial propagation sweep.
             continue
 
         add_function_test(

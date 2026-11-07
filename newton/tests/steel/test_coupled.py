@@ -439,6 +439,7 @@ def _undamped(solver):
 def test_articulated_graph_capture_matches_eager(test, device):
     """Match eager stepping with graph replay of an articulated source across proxy iterations and friction models."""
     options = {
+        "solve_mode": "serial",
         "articulated_contact_response": "immediate",
         "iterations": 16,
         "articulation_constraint_max": 32,

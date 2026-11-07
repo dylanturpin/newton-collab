@@ -3,34 +3,37 @@
 
 """Portable (CPU) twins of the matrix-free solve's native CUDA row kernels.
 
-The fused matrix-free Gauss-Seidel kernel and the propagation contact kernel are
-warp-cooperative CUDA snippets that compile to no-ops on the CPU. The kernels here
-run one thread per world and visit the rows in the same order with the same update
-math, so a CPU solve tracks the CUDA one to float round-off (the CUDA kernels reduce
-dot products in a different order).
+The fused matrix-free Gauss-Seidel kernel and the propagation contact kernel
+are warp-cooperative CUDA snippets that compile to no-ops on the CPU. The
+kernels here run one thread per world and visit the rows in the same order
+with the same update math, so a CPU solve tracks the CUDA one to float
+round-off (the CUDA kernels reduce dot products in a different order).
 
-Only the configurations the CPU accepts are mirrored: ``friction_mode="fixed_normal"``
-without contact torsion, joint friction, free-rigid angular friction or contact compliance.
+Only the configurations the CPU accepts are mirrored: ``friction_mode=
+"fixed_normal"`` without contact torsion, contact compliance, joint friction or
+free-rigid angular friction.
 """
 
 import warp as wp
 
 from .friction import friction_pair_candidate
-from .friction_patches import patch_normal_load
+from .friction_patches import WARP_DETERMINISM_OFF, patch_normal_load
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    WARP_DETERMINISM_OFF,
 )
 
 wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
 
 
-def reject_cpu_unsupported_features(solver, enable_sleeping: bool) -> None:
-    """Raise for the options whose rows only have native CUDA kernels."""
+def reject_cpu_unsupported_features(solver, *, enable_sleeping: bool) -> None:
+    """Raise :class:`NotImplementedError` for matrix-free features that only have native CUDA row kernels.
+
+    Contact torsion rejects CPU devices when it is configured, so it is not repeated here.
+    """
     unsupported = []
     if solver._contact_compliance:
         unsupported.append("contact_compliance=True")
@@ -40,13 +43,14 @@ def reject_cpu_unsupported_features(solver, enable_sleeping: bool) -> None:
         unsupported.append("enable_joint_friction=True")
     if solver._free_rigid_angular_rows:
         unsupported.append("free-rigid torsional/rolling friction (steel:condim >= 4 or free_rigid_*_friction)")
-    if solver._contact_torsion_enabled:
-        unsupported.append("contact torsion (steel:min_torsional_patch_radius > 0)")
-    if solver._solve_mode == "colored" and enable_sleeping:
-        unsupported.append("enable_sleeping=True with solve_mode='colored'")
     if unsupported:
         raise NotImplementedError(
             "SolverSteel on CPU does not support " + ", ".join(unsupported) + "; these features require CUDA."
+        )
+    if enable_sleeping and solver._solve_mode == "colored":
+        raise NotImplementedError(
+            "Experimental sleeping with solve_mode='colored' requires CUDA: on CPU the colored mode runs the "
+            "serial propagation sweep, which sleeping does not support"
         )
 
 
@@ -104,23 +108,22 @@ def _mf_apply(
 @wp.kernel(enable_backward=False)
 def pgs_solve_mf_gs_cpu(
     max_world_dofs: int,
-    has_drive_rows: int,
-    has_dense_velocity_limit_rows: int,
-    fuse_vel_limits: int,
     world_constraint_count: wp.array[int],
     world_dof_indices: wp.array2d[int],
     rhs_bias: wp.array2d[float],
     world_diag: wp.array2d[float],
+    world_row_w: wp.array2d[float],
     J_world: wp.array3d[float],
     Y_world: wp.array3d[float],
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
-    world_row_mu: wp.array2d[float],
-    world_drive_target_vel_bias: wp.array2d[float],
-    world_drive_vel_multiplier: wp.array2d[float],
-    world_drive_impulse_multiplier: wp.array2d[float],
-    world_drive_max_impulse: wp.array2d[float],
-    world_drive_vel_limit: wp.array2d[float],
+    has_drive_rows: int,
+    fuse_vel_limits: int,
+    drive_target_vel_bias: wp.array2d[float],
+    drive_vel_multiplier: wp.array2d[float],
+    drive_impulse_multiplier: wp.array2d[float],
+    drive_max_impulse: wp.array2d[float],
+    drive_vel_limit: wp.array2d[float],
     mf_constraint_count: wp.array[int],
     mf_contact_rows_end: wp.array[int],
     mf_dof_a: wp.array2d[int],
@@ -133,8 +136,8 @@ def pgs_solve_mf_gs_cpu(
     mf_J_b: wp.array3d[float],
     mf_MiJt_a: wp.array3d[float],
     mf_MiJt_b: wp.array3d[float],
+    world_row_mu: wp.array2d[float],
     mf_row_mu: wp.array2d[float],
-    world_row_w: wp.array2d[float],
     mf_row_w: wp.array2d[float],
     iterations: int,
     omega: float,
@@ -149,12 +152,15 @@ def pgs_solve_mf_gs_cpu(
     v_scratch: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """World-serial twin of ``_get_pgs_solve_mf_gs_kernel`` with the fixed-normal friction update.
+    """World-serial twin of ``_get_pgs_solve_mf_gs_kernel`` (fixed-normal friction).
 
-    Per sweep: the dense rows through ``J_world`` / ``Y_world``, then the free-body contact rows on their
-    6 + 6 body DOFs, then the dense and free-body velocity limits and the fused drive velocity clamp.
-    ``row_phase`` selects row families as in the CUDA kernel. The world velocity is staged in ``v_scratch``
-    as the CUDA kernel stages it in shared memory.
+    Per sweep: the dense rows through ``J_world``/``Y_world``, then the free-body contact
+    rows on their 6+6 body DOFs, then the velocity limits (dense velocity-limit rows, the
+    fused clamp of driven DOFs and the free-body velocity-limit rows). ``row_phase``
+    restricts a sweep to row families as the CUDA kernel does: ``1`` and ``4`` the
+    contact rows, ``2`` the internal rows and velocity limits, ``3`` the internal rows,
+    ``5`` the velocity limits and ``0`` every family. The world velocity is staged in
+    ``v_scratch`` as the CUDA kernel stages it in shared memory.
     """
     world = wp.tid()
     m_dense = world_constraint_count[world]
@@ -163,6 +169,7 @@ def pgs_solve_mf_gs_cpu(
         return
     m_dense = wp.min(m_dense, world_impulses.shape[1])
     m_mf = wp.min(m_mf, mf_impulses.shape[1])
+    # Free-body rows are laid out as [contacts and friction][velocity limits].
     mf_contact_end = wp.min(mf_contact_rows_end[world], m_mf)
     D = max_world_dofs
 
@@ -195,6 +202,7 @@ def pgs_solve_mf_gs_cpu(
         global_iter = iteration_offset + it
         changed = int(0)
 
+        # Dense rows.
         for i in range(dense_main_end):
             row_type = world_row_type[world, i]
             if row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
@@ -221,6 +229,7 @@ def pgs_solve_mf_gs_cpu(
             jv = _dense_dot(J_world, world, i, v_scratch, D)
             old_impulse = world_impulses[world, i]
             residual = jv + rhs_bias[world, i]
+            # Regularized rows (weight w < 1) also relax the impulse toward zero.
             w = float(1.0)
             if regularize != 0:
                 w = world_row_w[world, i]
@@ -229,16 +238,18 @@ def pgs_solve_mf_gs_cpu(
                 delta = -residual / denom * w - (1.0 - w) * old_impulse
             new_impulse = old_impulse + omega * delta
 
-            if has_drive_rows != 0 and row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-                max_impulse = world_drive_max_impulse[world, i]
+            if row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET and has_drive_rows != 0:
+                # PhysX force-drive update; not relaxed by omega.
+                max_impulse = drive_max_impulse[world, i]
                 new_impulse = (
-                    old_impulse * world_drive_impulse_multiplier[world, i]
-                    + jv * world_drive_vel_multiplier[world, i]
-                    + world_drive_target_vel_bias[world, i]
+                    old_impulse * drive_impulse_multiplier[world, i]
+                    + jv * drive_vel_multiplier[world, i]
+                    + drive_target_vel_bias[world, i]
                 )
                 new_impulse = wp.min(wp.max(new_impulse, -max_impulse), max_impulse)
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 sib = parent + 2
+                # A patch's normal rows form a cycle through their parent links and share its load.
                 radius = wp.max(
                     world_row_mu[world, i] * patch_normal_load(world_row_parent, world_impulses, world, parent), 0.0
                 )
@@ -270,6 +281,7 @@ def pgs_solve_mf_gs_cpu(
             elif new_impulse < 0.0 and (
                 row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
             ):
+                # Contact and joint-limit rows are unilateral; mimic and connect rows are bilateral.
                 new_impulse = 0.0
 
             delta_impulse = new_impulse - old_impulse
@@ -278,12 +290,13 @@ def pgs_solve_mf_gs_cpu(
                 changed = 1
                 _dense_apply(Y_world, world, i, delta_impulse, v_scratch, D)
 
+        # Free-body contact and friction rows.
         i = int(0)
         while i < mf_main_end:
+            rt = mf_row_type[world, i]
+            parent = mf_row_parent[world, i]
             cur = i
-            rt = mf_row_type[world, cur]
-            parent = mf_row_parent[world, cur]
-            # The first row of a sliding pair also solves the second, so the sweep steps over it.
+            # The first row of a friction pair also solves the second, so the sweep steps over it.
             i = cur + 1
             if rt == PGS_CONSTRAINT_TYPE_FRICTION and cur == parent + 1:
                 i = cur + 2
@@ -308,7 +321,8 @@ def pgs_solve_mf_gs_cpu(
 
             dof_a = mf_dof_a[world, cur]
             dof_b = mf_dof_b[world, cur]
-            residual = _mf_dot(mf_J_a, mf_J_b, world, cur, dof_a, dof_b, v_scratch) + mf_rhs[world, cur]
+            jv = _mf_dot(mf_J_a, mf_J_b, world, cur, dof_a, dof_b, v_scratch)
+            residual = jv + mf_rhs[world, cur]
             old_impulse = mf_impulses[world, cur]
             delta = -residual * mf_diag
             if rt == PGS_CONSTRAINT_TYPE_CONTACT:
@@ -368,23 +382,26 @@ def pgs_solve_mf_gs_cpu(
                 changed = 1
                 _mf_apply(mf_MiJt_a, mf_MiJt_b, world, cur, dof_a, dof_b, delta_impulse, v_scratch)
 
-        # Velocity limits last: dense joint velocity limits, the fused clamp of driven DOFs, then free-body limits.
+        # Velocity limits last: dense joint velocity limits, the fused clamp of driven DOFs,
+        # then free-body velocity limits.
         if velocity_limit_pass != 0:
-            if has_dense_velocity_limit_rows != 0:
-                for i in range(m_dense):
-                    if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                        continue
-                    denom = world_diag[world, i]
-                    if denom <= 0.0:
-                        continue
-                    residual = _dense_dot(J_world, world, i, v_scratch, D) + rhs_bias[world, i]
-                    delta_impulse = float(0.0)
-                    if residual < 0.0:
-                        delta_impulse = -residual / denom
-                    world_impulses[world, i] = delta_impulse
-                    if delta_impulse != 0.0:
-                        changed = 1
-                        _dense_apply(Y_world, world, i, delta_impulse, v_scratch, D)
+            for i in range(m_dense):
+                if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                    continue
+                denom = world_diag[world, i]
+                if denom <= 0.0:
+                    continue
+                # Stateless projection onto the velocity box: each visit applies only the
+                # impulse needed for the current overshoot.
+                residual = _dense_dot(J_world, world, i, v_scratch, D) + rhs_bias[world, i]
+                delta_impulse = float(0.0)
+                if residual < 0.0:
+                    delta_impulse = -residual / denom
+                world_impulses[world, i] = delta_impulse
+                if delta_impulse != 0.0:
+                    changed = 1
+                    _dense_apply(Y_world, world, i, delta_impulse, v_scratch, D)
+
             if fuse_vel_limits != 0:
                 for i in range(m_dense):
                     if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_TARGET:
@@ -392,13 +409,14 @@ def pgs_solve_mf_gs_cpu(
                     denom = world_diag[world, i]
                     if denom <= 0.0:
                         continue
-                    qdot_max = world_drive_vel_limit[world, i]
+                    qdot_max = drive_vel_limit[world, i]
                     jv = _dense_dot(J_world, world, i, v_scratch, D)
                     if wp.abs(jv) > qdot_max:
                         delta_clamp = (wp.min(wp.max(jv, -qdot_max), qdot_max) - jv) / denom
                         if delta_clamp != 0.0:
                             changed = 1
                             _dense_apply(Y_world, world, i, delta_clamp, v_scratch, D)
+
             for i in range(mf_contact_end, m_mf):
                 if mf_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
                     continue
@@ -437,10 +455,10 @@ def pgs_solve_propagation_contact_cpu(
     propagation_J_b: wp.array3d[float],
     propagation_eff_mass_inv: wp.array2d[float],
     propagation_rhs: wp.array2d[float],
+    propagation_row_w: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
-    propagation_row_w: wp.array2d[float],
     omega: float,
     regularize: int,
     friction_start_iteration: int,
@@ -450,11 +468,11 @@ def pgs_solve_propagation_contact_cpu(
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
 ):
-    """World-serial twin of one sweep of ``_get_pgs_solve_propagation_contact_kernel`` (contact and sliding rows).
+    """World-serial twin of one sweep of ``_get_pgs_solve_propagation_contact_kernel`` (contact and friction rows).
 
-    Each row reads the current body twists, updates its impulse, and applies ``M^-1 J^T delta`` to
-    ``propagation_body_qd`` and ``J^T delta`` to ``propagation_body_impulses``; the tree propagation then
-    applies the accumulated impulses to the joint velocities.
+    Each row reads the current body twists, updates its impulse, and applies ``MiJt * delta``
+    to ``propagation_body_qd`` and ``J * delta`` to ``propagation_body_impulses``; the tree
+    propagation then makes the twists exact.
     """
     world = wp.tid()
     m = wp.min(propagation_constraint_count[world], propagation_impulses.shape[1])
@@ -478,6 +496,7 @@ def pgs_solve_propagation_contact_cpu(
         old_impulse = propagation_impulses[world, i]
         delta = -residual * eff_inv
         if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
+            # Regularized rows (weight w < 1) also relax the impulse toward zero.
             w = propagation_row_w[world, i]
             delta = delta * w - (1.0 - w) * old_impulse
         new_impulse = old_impulse + omega * delta
@@ -487,6 +506,7 @@ def pgs_solve_propagation_contact_cpu(
         elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
             parent = propagation_row_parent[world, i]
             if i != parent + 1:
+                # The first tangent row solves both tangents of its contact.
                 new_impulse = old_impulse
             else:
                 radius = wp.max(
@@ -494,7 +514,7 @@ def pgs_solve_propagation_contact_cpu(
                     * patch_normal_load(propagation_row_parent, propagation_impulses, world, parent),
                     0.0,
                 )
-                sib = i + 1
+                sib = parent + 2
                 other = propagation_impulses[world, sib]
                 sibling_residual = propagation_rhs[world, sib]
                 cross = float(0.0)
