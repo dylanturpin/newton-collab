@@ -6,6 +6,7 @@
 import ctypes
 import inspect
 import unittest
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -28,6 +29,7 @@ from newton._src.solvers.steel.solver_steel import (
     _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
 )
+from newton.exceptions import NewtonWarning
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import (
     CONTACT_MAX,
@@ -3804,16 +3806,19 @@ def _step_d6_contact_case(model, contacts, mode, iterations=2, **options):
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
-    solver = SolverSteel(
-        model,
-        articulated_contact_response=mode,
-        iterations=iterations,
-        velocity_iterations=0,
-        articulation_constraint_max=32,
-        free_body_constraint_max=32,
-        contact_warmstart=False,
-        **options,
-    )
+    with warnings.catch_warnings():
+        # On CPU, solve_mode="colored" warns that it runs the serial sweep.
+        warnings.filterwarnings("ignore", message="SolverSteel: solve_mode='colored' runs", category=NewtonWarning)
+        solver = SolverSteel(
+            model,
+            articulated_contact_response=mode,
+            iterations=iterations,
+            velocity_iterations=0,
+            articulation_constraint_max=32,
+            free_body_constraint_max=32,
+            contact_warmstart=False,
+            **options,
+        )
     solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
     rows = (
         int(solver._constraint_count.numpy().sum()),
