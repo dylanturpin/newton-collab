@@ -587,6 +587,22 @@ def test_enabling_equality_constraint_at_runtime_raises(test, device):
     solver.notify_model_changed(newton.ModelFlags.CONSTRAINT_PROPERTIES)
 
 
+def test_non_default_tile_threads_compiles_and_steps(test, device):
+    """Step forced tiled factor and response kernels at a large row capacity."""
+    model = _build_chain_model(device)
+    forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
+    with kernel_overrides(forced):
+        solver = SolverSteel(model, articulation_constraint_max=384)
+    test.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver._size_groups))
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(5):
+        solver.step(state_0, state_1, control, None, 1.0 / 600.0)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
+    test.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
+
+
 def test_joint_limit_solver_compatibility_validation(test, device):
     """Accept joint velocity limits in every solve mode and reject unknown solve modes."""
     model = _build_chain_model(device, num_links=2, num_worlds=1)
@@ -932,6 +948,12 @@ add_function_test(
     "test_joint_limit_solver_compatibility_validation",
     test_joint_limit_solver_compatibility_validation,
     devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelLaunchConfig,
+    "test_non_default_tile_threads_compiles_and_steps",
+    test_non_default_tile_threads_compiles_and_steps,
+    devices=devices,
 )
 
 
