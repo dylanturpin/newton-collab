@@ -19,7 +19,7 @@ from newton._src.geometry.contact_reduction_global import (
 from newton._src.geometry.contact_reduction_hydroelastic import HydroelasticContactReduction
 from newton.solvers import SolverSemiImplicit
 from newton.solvers.experimental.coupled import SolverCoupled
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
 @wp.kernel
@@ -361,7 +361,7 @@ add_function_test(
     TestContactReductionOverflow,
     "test_reducer_failures_reach_solver_status",
     test_reducer_failures_reach_solver_status,
-    devices=get_cuda_test_devices(),
+    devices=devices,
 )
 
 add_function_test(

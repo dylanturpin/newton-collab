@@ -174,17 +174,7 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.
-    It runs on CUDA and on CPU, where world-serial kernels cover all but a few CUDA-only contact
-    features. ``solve_mode`` selects the Gauss-Seidel sweep order of its
-    matrix-free solver: ``"serial"`` (default) or ``"colored"``, which requires
-    ``articulated_contact_response="propagation"``.
-
-.. experimental::
-    :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.
-    It runs on CUDA and on CPU, where world-serial kernels cover all but a few CUDA-only contact
-    features. ``solve_mode`` selects the Gauss-Seidel sweep order of its
-    matrix-free solver: ``"serial"`` (default) or ``"colored"``, which requires
-    ``articulated_contact_response="propagation"``.
+    Its matrix-free solve runs on CPU and CUDA; contact torsion, contact compliance, joint friction, the non-default ``friction_mode`` values and sleeping with ``solve_mode="colored"`` require CUDA, and ``solve_mode="colored"`` runs the serial propagation sweep on CPU.
 
 .. experimental::
     :class:`~newton.solvers.SolverKamino`'s public API and behavior may change without prior notice.
@@ -504,7 +494,7 @@ motion; see :ref:`passive-joint-springs` for details.
 | :sup:`6` MuJoCo lowers each joint-owned relationship to joint equality constraints. Multi-axis D6 relationships produce one equality constraint per axis.
 | :sup:`7` VBD interprets ``joint_target_kd`` and ``joint_limit_kd`` as absolute damping coefficients in physical units.
 | :sup:`8` Steel rejects models with disabled articulation joints instead of ignoring them; a disabled loop-closing joint starts as a released closure.
-| :sup:`9` Steel enforces dry joint friction of PRISMATIC, REVOLUTE, BALL, and D6 DOFs as one bounded constraint row per DOF when constructed with ``enable_joint_friction=True`` (off by default, experimental); ``steel:joint_friction_load_coefficient`` adds the load-proportional joint friction of PhysX articulations before PhysX 5.6.
+| :sup:`9` Steel enforces dry joint friction of PRISMATIC, REVOLUTE, BALL, and D6 DOFs as one bounded constraint row per DOF when constructed with ``enable_joint_friction=True`` on CUDA (off by default, experimental); ``steel:joint_friction_load_coefficient`` adds the load-proportional joint friction of PhysX articulations before PhysX 5.6.
 | :sup:`10` Steel enforces joint limits as hard unilateral constraint rows when constructed with ``enable_joint_limits=True`` (off by default).
 | :sup:`11` Steel clamps the explicit joint drive force to the effort limit. With the default ``drive_mode="augmented"`` the implicit stiffness and damping response is unbounded, so under a large external load the drive reaction can exceed the limit; the PGS drive rows of ``drive_mode="rows"`` bound the complete reaction.
 | :sup:`12` Steel enforces velocity limits of PRISMATIC, REVOLUTE, and D6 DOFs when constructed with ``enable_joint_velocity_limits=True``. With ``drive_mode="rows"``, driven DOFs are clamped at the end of every solver iteration instead of using velocity-limit rows (``fuse_joint_velocity_limits``).

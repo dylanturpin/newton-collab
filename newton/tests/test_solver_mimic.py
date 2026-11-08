@@ -8,7 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.sim.joint_mimic import eval_joint_mimic_coordinate, eval_joint_mimic_velocity
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
 def _build_mimic_model(device, vectorized, *, kinematic_reference=False, small_mismatch=False):
@@ -411,9 +411,7 @@ add_function_test(
     test_mimic_compound_d6_coordinate_gradients,
     devices=devices,
 )
-# Steel requires CUDA.
-for device in get_cuda_test_devices():
-    add_function_test(TestSolverMimic, "test_steel_mimic", test_steel_mimic, devices=[device])
+add_function_test(TestSolverMimic, "test_steel_mimic", test_steel_mimic, devices=devices)
 
 
 if __name__ == "__main__":

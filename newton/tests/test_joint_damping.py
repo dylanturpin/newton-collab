@@ -246,10 +246,7 @@ solvers = {
     "featherstone": (lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0), False),
     "semi_implicit": (lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0), True),
     "kamino": (newton.solvers.SolverKamino, False),
-    "steel": (
-        newton.solvers.SolverSteel,
-        False,
-    ),
+    "steel": (newton.solvers.SolverSteel, False),
 }
 
 for device in devices:

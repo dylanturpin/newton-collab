@@ -843,7 +843,7 @@ def test_overflow_warning_enabled_after_construction_latches(test, device):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
-    solver = SolverSteel(model, articulation_constraint_max=1, warn_constraint_overflow=False)
+    solver = SolverSteel(model, friction_anchor_beta=0.0, articulation_constraint_max=1, warn_constraint_overflow=False)
     solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
     test.assertTrue(solver.constraint_overflow.numpy().any())
     test.assertEqual(solver._row_overflow_warning_emitted.numpy().tolist(), [0, 0, 0, 0, 0])
@@ -860,6 +860,14 @@ def test_overflow_warning_enabled_after_construction_latches(test, device):
     test.assertRegex(printed, "constraint-row overflow")
     test.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
     test.assertTrue(np.isfinite(output.joint_q.numpy()).all())
+
+
+def test_disabled_restitution_ignores_threshold_edits(test, device):
+    """Keep restitution off after a threshold edit when ``enable_restitution=False``."""
+    model, _ = _build_plane_model(device, separation=1.0e-3, restitution=0.5, scene="articulated")
+    solver = SolverSteel(model, enable_restitution=False)
+    solver.restitution_velocity_threshold = 0.5
+    test.assertEqual(solver._rebound_velocity_threshold, float(np.finfo(np.float32).max))
 
 
 class TestSteelContactControls(unittest.TestCase):
@@ -884,6 +892,7 @@ for _fn in (
     test_gap_gate_keeps_contacts_at_threshold,
     test_allocator_skips_contacts_without_response_dofs,
     test_friction_gap_max_keeps_the_constructed_row_layout,
+    test_disabled_restitution_ignores_threshold_edits,
 ):
     add_function_test(TestSteelContactControls, _fn.__name__, _fn, devices=devices)
 # The test captures the device warning it expects.
@@ -918,7 +927,7 @@ def _box_on_ground(device, gravity=None, mu=None):
     return builder.finalize(device=device)
 
 
-def test_resting_box_reports_weight_as_linear_force(test, device, response="immediate"):
+def test_resting_box_reports_weight_as_linear_force(test, device, solve_mode="serial", response="immediate"):
     """Report the resting box's weight through the linear contact force and leave the torque zero."""
     model = _box_on_ground(device)
     solver = SolverSteel(model, iterations=32, **steel_mode_options(response))
@@ -946,7 +955,7 @@ def test_resting_box_reports_weight_as_linear_force(test, device, response="imme
     np.testing.assert_array_equal(wrench[:, 3:], np.zeros((count, 3)))
 
 
-def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, response="immediate"):
+def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, solve_mode="serial", response="immediate"):
     """Box on the ground under gravity tilted by ``slope_angle``, as on an incline; return its x velocity."""
     g = 9.81
     gravity = (g * np.sin(slope_angle), 0.0, -g * np.cos(slope_angle))
@@ -963,14 +972,14 @@ def _tilted_gravity_box_velocity(device, slope_angle, mu, steps, response="immed
     return float(state_0.body_qd.numpy()[0, 0])
 
 
-def test_friction_holds_inside_the_cone(test, device, response="immediate"):
+def test_friction_holds_inside_the_cone(test, device, solve_mode="serial", response="immediate"):
     """Hold the box at rest when the tangential load is inside the friction cone."""
     # tan(0.3) = 0.31 < mu = 0.5.
     velocity = _tilted_gravity_box_velocity(device, slope_angle=0.3, mu=0.5, steps=120, response=response)
     test.assertLess(abs(velocity), 1.0e-3)
 
 
-def test_friction_slides_at_the_coulomb_bound(test, device, response="immediate"):
+def test_friction_slides_at_the_coulomb_bound(test, device, solve_mode="serial", response="immediate"):
     """Accelerate the box at ``g (sin a - mu cos a)`` when the load exceeds the friction cone."""
     slope_angle, mu, steps = 0.6, 0.3, 120
     velocity = _tilted_gravity_box_velocity(device, slope_angle=slope_angle, mu=mu, steps=steps, response=response)
@@ -1021,7 +1030,7 @@ def _impact(model, solver, joint_qd):
     return state_out.joint_qd.numpy()[:6], observables.contact_f.numpy()[:count, :3].sum(axis=0)
 
 
-def test_free_body_contact_response_includes_armature(test, device, response="immediate"):
+def test_free_body_contact_response_includes_armature(test, device, solve_mode="serial", response="immediate"):
     """Respond on free-body rows with the same armature-augmented inertia as on articulated rows."""
     stop = (0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
     for armature, expected in ((0.0, 100.0), (9.0, 1000.0)):
@@ -1055,7 +1064,7 @@ def test_free_body_contact_response_includes_armature(test, device, response="im
     test.assertAlmostEqual(abs(float(force[2])), 1000.0, delta=5.0)
 
 
-def test_free_body_impact_shares_armature_momentum(test, device, response="immediate"):
+def test_free_body_impact_shares_armature_momentum(test, device, solve_mode="serial", response="immediate"):
     """Conserve the armature-augmented momentum in a frictionless plastic impact between free bodies."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
@@ -1158,7 +1167,7 @@ def _anchored_sphere_cases():
     }
 
 
-def test_rotated_anchor_free_body_matches_world_aligned(test, device, response="immediate"):
+def test_rotated_anchor_free_body_matches_world_aligned(test, device, solve_mode="serial", response="immediate"):
     """Give a FREE body the same world motion whatever the rotation of its parent anchor."""
     for case, (world_twist, gravity, steps, dt, max_speed, inertia) in _anchored_sphere_cases().items():
         twists = []
@@ -1177,7 +1186,9 @@ def test_rotated_anchor_free_body_matches_world_aligned(test, device, response="
             np.testing.assert_allclose(twists[1], twists[0], rtol=0.0, atol=2.0e-4)
 
 
-def test_rotated_anchor_free_body_on_articulation_matches_world_aligned(test, device, response="immediate"):
+def test_rotated_anchor_free_body_on_articulation_matches_world_aligned(
+    test, device, solve_mode="serial", response="immediate"
+):
     """Give a FREE body rolling on a driven articulated plate the same world motion whatever its anchor rotation."""
     twists = []
     for rotation in (wp.quat_identity(), ANCHOR_ROTATION):
@@ -1224,7 +1235,7 @@ def test_rotated_anchor_free_body_on_articulation_matches_world_aligned(test, de
     np.testing.assert_allclose(twists[1], twists[0], rtol=0.0, atol=1.0e-4)
 
 
-def test_free_anchor_rotated_after_construction(test, device, response="immediate"):
+def test_free_anchor_rotated_after_construction(test, device, solve_mode="serial", response="immediate"):
     """Follow a FREE body's parent anchor rotated after construction, eagerly and in a replayed graph."""
     world_twist, gravity, steps, dt, _, _ = _anchored_sphere_cases()["gravity"]
     rotation = ANCHOR_ROTATION
@@ -1275,6 +1286,9 @@ class TestSteelContactForce(unittest.TestCase):
     pass
 
 
+all_devices = get_test_devices()
+
+
 for _name in (
     "test_resting_box_reports_weight_as_linear_force",
     "test_friction_holds_inside_the_cone",
@@ -1285,7 +1299,7 @@ for _name in (
     "test_rotated_anchor_free_body_on_articulation_matches_world_aligned",
     "test_free_anchor_rotated_after_construction",
 ):
-    add_function_test(TestSteelContactForce, _name, globals()[_name], devices=devices)
+    add_function_test(TestSteelContactForce, _name, globals()[_name], devices=all_devices)
     # The propagation response solves these contacts as body-space rows.
     add_function_test(
         TestSteelContactForce, f"{_name}_propagation", globals()[_name], devices=devices, response="propagation"
@@ -1302,7 +1316,8 @@ for _name in (
         f"{_name}_colored",
         globals()[_name],
         devices=devices,
-        response="colored",
+        solve_mode="colored",
+        response="propagation",
     )
 
 
@@ -1601,7 +1616,7 @@ add_function_test(
     TestSteelContactObservable,
     "test_contact_f_reports_each_box_weight",
     test_contact_f_reports_each_box_weight,
-    devices=cuda_devices,
+    devices=all_devices,
 )
 
 
@@ -2282,6 +2297,7 @@ def test_bouncing_ball_settles_to_rest_under_gravity(test, device):
     test.assertGreater(float(tail_heights.min()), RADIUS - 1.5e-3, "resting contact sank into the plane")
 
 
+# "colored" is the colored sweep of the propagation response.
 RESPONSE_MODES = ("immediate", "propagation", "colored")
 
 
@@ -2453,7 +2469,8 @@ def _pressed_solver(model, response, drive_mode="augmented"):
         model,
         iterations=16,
         restitution_velocity_threshold=PRESSED_THRESHOLD,
-        **steel_mode_options(response),
+        solve_mode="colored" if response == "colored" else "serial",
+        articulated_contact_response="propagation" if response == "colored" else response,
         drive_mode=drive_mode,
     )
 

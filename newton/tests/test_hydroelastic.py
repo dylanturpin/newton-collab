@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import ctypes
 import sys
 import time
 import unittest
@@ -15,6 +14,7 @@ from newton._src.geometry.contact_reduction_hydroelastic import (
     FIXED_EXP_NONE,
     SPECULATIVE_BIN_OFFSET,
     _fixed_mantissa_bits,
+    _fixed_shift,
     _from_fixed,
     _to_fixed,
 )
@@ -32,6 +32,7 @@ from newton._src.geometry.utils import _scan_scratch_size, scan_with_total
 from newton.geometry import HydroelasticSDF
 from newton.tests.unittest_utils import (
     add_function_test,
+    capture_with_cuda_driver,
     get_selected_cuda_test_devices,
     get_test_devices,
 )
@@ -84,11 +85,13 @@ def _test_fixed_point_extreme_exponents(
     mantissa_bits: int,
     fixed_values: wp.array[wp.int64],
     roundtrip_values: wp.array[wp.float32],
+    shifts: wp.array[wp.float64],
 ):
     """Convert sentinel and high finite pressure contributions in fixed point."""
     tid = wp.tid()
     fixed_values[tid] = _to_fixed(values[tid], exponents[tid], mantissa_bits)
     roundtrip_values[tid] = _from_fixed(fixed_values[tid], exponents[tid], mantissa_bits)
+    shifts[tid] = _fixed_shift(exponents[tid], mantissa_bits)
 
 
 @wp.kernel
@@ -293,7 +296,7 @@ def test_scan_with_total_under_captures(test, device):
             wp.capture_while(condition, scan_once)
         captures["capture_while"] = lambda graph=capture.graph: (condition.fill_(1), wp.capture_launch(graph))
     if sys.platform.startswith("linux"):
-        captures["driver"], release = _driver_capture(device, scan)
+        captures["driver"], release = capture_with_cuda_driver(device, scan)
     try:
         for name, replay in captures.items():
             with test.subTest(capture=name):
@@ -310,44 +313,6 @@ def test_scan_with_total_under_captures(test, device):
     finally:
         if sys.platform.startswith("linux"):
             release()
-
-
-def _driver_capture(device, fn):
-    """Capture ``fn`` with the CUDA driver alone, as another framework would; return replay and release."""
-    cuda = ctypes.CDLL("libcuda.so.1")
-    handle = ctypes.c_void_p
-    cuda.cuStreamBeginCapture_v2.argtypes = [handle, ctypes.c_int]
-    cuda.cuStreamEndCapture.argtypes = [handle, ctypes.POINTER(handle)]
-    cuda.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(handle), handle, ctypes.c_ulonglong]
-    cuda.cuGraphLaunch.argtypes = [handle, handle]
-    cuda.cuGraphExecDestroy.argtypes = [handle]
-    cuda.cuGraphDestroy.argtypes = [handle]
-    stream = handle(wp.get_stream(device).cuda_stream)
-    graph, graph_exec = handle(), handle()
-    thread_local_mode = 1
-    if cuda.cuStreamBeginCapture_v2(stream, thread_local_mode) != 0:
-        raise RuntimeError("cuStreamBeginCapture failed")
-    try:
-        fn()
-    finally:
-        ended = cuda.cuStreamEndCapture(stream, ctypes.byref(graph))
-    if ended != 0:
-        raise RuntimeError(f"cuStreamEndCapture failed with {ended}")
-    instantiated = cuda.cuGraphInstantiateWithFlags(ctypes.byref(graph_exec), graph, ctypes.c_ulonglong(0))
-    if instantiated != 0:
-        cuda.cuGraphDestroy(graph)
-        raise RuntimeError(f"cuGraphInstantiateWithFlags failed with {instantiated}")
-
-    def replay():
-        launched = cuda.cuGraphLaunch(graph_exec, stream)
-        if launched != 0:
-            raise RuntimeError(f"cuGraphLaunch failed with {launched}")
-
-    def release():
-        cuda.cuGraphExecDestroy(graph_exec)
-        cuda.cuGraphDestroy(graph)
-
-    return replay, release
 
 
 # --- Helper functions ---
@@ -2641,20 +2606,22 @@ def test_scalar_sdf_texture_hydroelastic_contacts(test, device):
 
 
 def test_fixed_point_extreme_exponents(test, device):
-    """Handle sentinel and high finite pressure contributions without overflow."""
+    """Use exact binary scales across finite float32 exponents without overflow."""
     mantissa_bits = _fixed_mantissa_bits(1024)
     high_value = np.finfo(np.float32).max
-    values_np = np.array([0.0, high_value, -high_value], dtype=np.float32)
-    exponents_np = np.array([int(FIXED_EXP_NONE), 127, 127], dtype=np.int32)
+    binary_exponents = np.arange(-149, 128, dtype=np.int32)
+    values_np = np.concatenate(([0.0, high_value, -high_value], np.ldexp(1.0, binary_exponents))).astype(np.float32)
+    exponents_np = np.concatenate(([int(FIXED_EXP_NONE), 127, 127], binary_exponents)).astype(np.int32)
     values = wp.array(values_np, dtype=wp.float32, device=device)
     exponents = wp.array(exponents_np, dtype=wp.int32, device=device)
     fixed_values = wp.empty(len(values_np), dtype=wp.int64, device=device)
     roundtrip_values = wp.empty(len(values_np), dtype=wp.float32, device=device)
+    shifts = wp.empty(len(values_np), dtype=wp.float64, device=device)
 
     wp.launch(
         _test_fixed_point_extreme_exponents,
         dim=len(values_np),
-        inputs=[values, exponents, mantissa_bits, fixed_values, roundtrip_values],
+        inputs=[values, exponents, mantissa_bits, fixed_values, roundtrip_values, shifts],
         device=device,
     )
 
@@ -2664,6 +2631,9 @@ def test_fixed_point_extreme_exponents(test, device):
     test.assertEqual(roundtrip_np[0], 0.0)
     test.assertTrue(np.all(np.abs(fixed_np[1:]) < np.iinfo(np.int64).max))
     np.testing.assert_array_equal(roundtrip_np[1:], values_np[1:])
+    expected_shifts = np.zeros(len(values_np), dtype=np.float64)
+    expected_shifts[1:] = np.ldexp(1.0, mantissa_bits - exponents_np[1:])
+    np.testing.assert_array_equal(shifts.numpy(), expected_shifts)
 
 
 # --- Test class ---

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import ctypes
 import gc
 import hashlib
 import os
@@ -28,8 +27,14 @@ from newton._src.solvers.steel.kernels import (
     crba_fill_par_dof,
 )
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import _build_four_bar, steel_mode_options
-from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.steel._fixtures import _build_four_bar
+from newton.tests.unittest_utils import (
+    StdOutCapture,
+    add_function_test,
+    capture_with_cuda_driver,
+    get_cuda_test_devices,
+    get_test_devices,
+)
 
 RUN_TO_RUN = wp.DeterministicMode.RUN_TO_RUN
 
@@ -52,7 +57,11 @@ SERIAL_OPTIONS = {
 
 # Device-prepared contact torsion rows follow the contact rows of their world.
 TORSION_OPTIONS = {**SERIAL_OPTIONS, "contact_torsion_device": True, "articulation_constraint_max": 512}
-TORSION_COLORED_OPTIONS = {**TORSION_OPTIONS, "solve_mode": "colored", "articulated_contact_response": "propagation"}
+TORSION_COLORED_OPTIONS = {
+    **TORSION_OPTIONS,
+    "solve_mode": "colored",
+    "articulated_contact_response": "propagation",
+}
 
 # Joint-friction rows alongside contact, drive, joint-limit and velocity-limit rows; unfused limits keep their rows.
 FRICTION_OPTIONS = {
@@ -65,8 +74,11 @@ FRICTION_OPTIONS = {
 # Warm-started impulses are matched through contact matching and carried across steps.
 WARMSTART_OPTIONS = {**SERIAL_OPTIONS, "contact_warmstart": True, "velocity_iterations": 2}
 
-# The body-space propagation responses; they also take the free-body contacts.
-PROPAGATION_RESPONSES = ("propagation", "colored")
+# The serial and colored sweeps of the body-space propagation response; it also takes the free-body contacts.
+PROPAGATION_RESPONSES = {
+    "propagation": {"articulated_contact_response": "propagation"},
+    "colored": {"solve_mode": "colored", "articulated_contact_response": "propagation"},
+}
 
 # Ants alone select the sparse mass factors and their one-warp joint-limit builder.
 SPARSE_OPTIONS = {
@@ -336,11 +348,11 @@ def test_deterministic_runs_are_bitwise_identical(test, device):
 def test_deterministic_propagation_runs_are_bitwise_identical(test, device):
     """Repeat warm-started rollouts of both propagation responses bitwise over a moving kinematic tray."""
     model = _build_contact_scene(device, kinematic_tray=True)
-    for response in PROPAGATION_RESPONSES:
+    for response, response_options in PROPAGATION_RESPONSES.items():
         for cached, graph in ((True, False), (False, False), (True, True)):
             options = {
                 **WARMSTART_OPTIONS,
-                **steel_mode_options(response),
+                **response_options,
                 "propagation_cached_response": cached,
             }
             with test.subTest(response=response, cached=cached, graph=graph):
@@ -392,46 +404,8 @@ def _capture_solve(device, solve, external):
         with wp.ScopedCapture(device=device) as capture:
             solve()
         return lambda: wp.capture_launch(capture.graph), lambda: None
-    cuda = ctypes.CDLL("libcuda.so.1")
-    handle = ctypes.c_void_p
-    cuda.cuStreamBeginCapture_v2.argtypes = [handle, ctypes.c_int]
-    cuda.cuStreamEndCapture.argtypes = [handle, ctypes.POINTER(handle)]
-    cuda.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(handle), handle, ctypes.c_ulonglong]
-    cuda.cuGraphLaunch.argtypes = [handle, handle]
-    cuda.cuGraphExecDestroy.argtypes = [handle]
-    cuda.cuGraphDestroy.argtypes = [handle]
-    stream = handle(wp.get_stream(device).cuda_stream)
-    graph, graph_exec = handle(), handle()
-    thread_local_mode = 1
-    began = cuda.cuStreamBeginCapture_v2(stream, thread_local_mode)
-    if began != 0:
-        raise RuntimeError(f"cuStreamBeginCapture failed with {began}")
-    try:
-        solve()
-    except BaseException:
-        if cuda.cuStreamEndCapture(stream, ctypes.byref(graph)) == 0:
-            cuda.cuGraphDestroy(graph)
-        raise
-    ended = cuda.cuStreamEndCapture(stream, ctypes.byref(graph))
-    if ended != 0:
-        raise RuntimeError(f"cuStreamEndCapture failed with {ended}")
-    # No instantiate flags: a graph holding an unfreed allocation fails to relaunch.
-    instantiated = cuda.cuGraphInstantiateWithFlags(ctypes.byref(graph_exec), graph, ctypes.c_ulonglong(0))
-    if instantiated != 0:
-        cuda.cuGraphDestroy(graph)
-        raise RuntimeError(f"cuGraphInstantiateWithFlags failed with {instantiated}")
-
-    def replay():
-        launched = cuda.cuGraphLaunch(graph_exec, stream)
-        if launched != 0:
-            raise RuntimeError(f"cuGraphLaunch failed with {launched}")
-        wp.synchronize_stream(wp.get_stream(device))
-
-    def release():
-        cuda.cuGraphExecDestroy(graph_exec)
-        cuda.cuGraphDestroy(graph)
-
-    return replay, release
+    # No auto-free: a graph holding an unfreed allocation fails to relaunch.
+    return capture_with_cuda_driver(device, solve)
 
 
 def _check_propagation_coverage(test, model, options):
@@ -584,9 +558,9 @@ def test_deterministic_propagation_launches_replay_identically(test, device):
             (
                 f"{response}_{name}",
                 model,
-                {**options, **steel_mode_options(response), "propagation_cached_response": cached},
+                {**options, **response_options, "propagation_cached_response": cached},
             )
-            for response in PROPAGATION_RESPONSES
+            for response, response_options in PROPAGATION_RESPONSES.items()
             for name, options, cached in (
                 ("cached", SERIAL_OPTIONS, True),
                 ("uncached_warmstart", WARMSTART_OPTIONS, False),
@@ -644,9 +618,11 @@ def test_deterministic_overflow_keeps_earliest_contacts(test, device):
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     pipeline.collide(state, contacts)
 
-    world, _, path, needed, _, _ = _route_contacts(model, state, contacts, free_body_constraint_max=4096)
+    world, _, path, needed, _, _ = _route_contacts(
+        model, state, contacts, friction_anchor_beta=0.0, free_body_constraint_max=4096
+    )
     small_world, slot, small_path, _, dropped, overflow = _route_contacts(
-        model, state, contacts, free_body_constraint_max=24
+        model, state, contacts, friction_anchor_beta=0.0, free_body_constraint_max=24
     )
     for w in range(model.world_count):
         routed = np.nonzero((path == 1) & (world == w))[0]
@@ -677,7 +653,9 @@ def test_overflow_warning_names_deterministic_mode(test, device):
     check_output = not (wp.get_device(device).is_cpu and sys.platform == "win32")
     for deterministic in (wp.DeterministicMode.NOT_GUARANTEED, RUN_TO_RUN):
         with test.subTest(deterministic=deterministic.name):
-            solver = SolverSteel(model, deterministic=deterministic, free_body_constraint_max=24)
+            solver = SolverSteel(
+                model, deterministic=deterministic, friction_anchor_beta=0.0, free_body_constraint_max=24
+            )
             capture = StdOutCapture()
             if check_output:
                 capture.begin()

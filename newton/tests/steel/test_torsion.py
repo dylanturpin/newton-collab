@@ -50,10 +50,17 @@ from newton.tests.steel._fixtures import (
     _patch_fixture,
     fixture,
     set_torsion_radius,
-    steel_mode_options,
 )
 from newton.tests.steel.test_propagation import _add_fixed_chain
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
+
+
+def _response(name: str) -> dict:
+    """Return the constructor options of a response label (``"immediate"``, ``"propagation"`` or ``"colored"``)."""
+    if name == "colored":
+        return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    return {"articulated_contact_response": name}
+
 
 # SAT box-box manifolds are a separate collision feature; their subcases run where it exists.
 _HAS_BOX_BOX_SAT = "box_box_sat" in inspect.signature(newton.CollisionPipeline.__init__).parameters
@@ -885,7 +892,7 @@ def test_patch_spanning_shape_pairs_takes_the_largest_radius(test, device):
         set_torsion_radius(model, np.array(radius_cases[radii], dtype=np.float32))
         solver = SolverSteel(
             model,
-            **steel_mode_options(response),
+            **_response(response),
             contact_torsion_device=preparation != "host",
             iterations=128,
             friction_anchor_beta=0.2,
@@ -2657,7 +2664,7 @@ def test_propagation_spin_decelerates_at_the_coulomb_rate_and_sticks(test, devic
     inertia_z = 0.00008
     for response in ("immediate", "propagation"):
         with test.subTest(response=response):
-            options = {**steel_mode_options(response), "contact_torsion_device": True}
+            options = {**_response(response), "contact_torsion_device": True}
             result, solver, *_ = fixture(0.01, device=device, spin=100.0, center_only=True, **options)
             if response == "immediate":
                 count = int(result["count"][0])
@@ -2681,7 +2688,7 @@ def test_propagation_friction_keeps_its_rows_with_a_spare(test, device):
         with test.subTest(patches=bool(patches)):
             results = {}
             for response in ("immediate", "propagation"):
-                options = {**steel_mode_options(response), "contact_torsion_device": True}
+                options = {**_response(response), "contact_torsion_device": True}
                 results[response], *_ = fixture(0.01, device=device, spin=10.0, sliding=0.2, **options, **patches)
             expected, actual = results["immediate"], results["propagation"]
             test.assertGreater(float(np.abs(expected["contact_f"][:, :2]).max()), 0.0)
@@ -2741,7 +2748,7 @@ def test_propagation_contact_order_changes_the_result_no_more_than_on_immediate(
                 spin=10.0,
                 sliding=0.2,
                 step=False,
-                **steel_mode_options(response),
+                **_response(response),
                 contact_torsion_device=True,
             )
             count = int(contacts.rigid_contact_count.numpy()[0])
@@ -2884,7 +2891,7 @@ def test_propagation_patch_impulse_matches_immediate(test, device):
     """Give a patch region the same torsion row count and final impulse as immediate at 128 sweeps."""
     impulses = {}
     for response in ("immediate", "propagation"):
-        options = {**steel_mode_options(response), "contact_torsion_device": True, "iterations": 128}
+        options = {**_response(response), "contact_torsion_device": True, "iterations": 128}
         result, solver, *_ = fixture(
             0.01, device=device, spin=1.0, center_only=True, center_count=4, **options, **PATCH_OPTIONS
         )
@@ -2944,7 +2951,7 @@ def test_propagation_rows_keep_a_shared_static_body_out(test, device):
                         friction_anchor_beta=0.0,
                         free_body_constraint_max=512,
                         articulation_constraint_max=128,
-                        **steel_mode_options(response),
+                        **_response(response),
                         contact_torsion_device=True,
                     )
                 pipeline = newton.CollisionPipeline(model)
@@ -3192,7 +3199,7 @@ def test_colored_contact_order_changes_the_result_no_more_than_on_immediate(test
                 spin=10.0,
                 sliding=0.2,
                 step=False,
-                **steel_mode_options(response),
+                **_response(response),
                 contact_torsion_device=True,
             )
             count = int(contacts.rigid_contact_count.numpy()[0])
@@ -3341,7 +3348,7 @@ def test_colored_mixed_families_track_plain_through_the_contact_lifecycle(test, 
             friction_anchor_beta=0.0,
             articulation_constraint_max=64,
             free_body_constraint_max=16,
-            **steel_mode_options(response),
+            **_response(response),
             contact_torsion_device=True,
         )
         pipeline = newton.CollisionPipeline(model, reduce_contacts=False, broad_phase="nxn", rigid_contact_max=256)
@@ -3744,7 +3751,7 @@ def _turntable(device, response, steps=8, variant=None):
     with _colored_variant(variant):
         solver = SolverSteel(
             model,
-            **steel_mode_options(response),
+            **_response(response),
             iterations=64,
             velocity_iterations=0,
             baumgarte=0.05,
@@ -3905,7 +3912,7 @@ def _spinner(device, response, iterations, radius, *, spin, steps=1, graph=False
     with _colored_variant(variant):
         solver = SolverSteel(
             model,
-            **steel_mode_options(response),
+            **_response(response),
             friction_anchor_beta=0.0,
             articulation_constraint_max=64,
             free_body_constraint_max=16,
