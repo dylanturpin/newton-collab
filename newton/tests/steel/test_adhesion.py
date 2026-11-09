@@ -266,7 +266,7 @@ def test_unused_is_bitwise_identical(test, device):
                 for i in range(3):
                     body = builder.add_body(xform=wp.transform((0.05 * i, 0.0, 0.11 + 0.21 * i), wp.quat_identity()))
                     builder.add_shape_box(body, hx=HALF, hy=HALF, hz=HALF)
-                run = _Run(builder.finalize(device=device), **options)
+                run = _Run(builder.finalize(device=device), deterministic=wp.DeterministicMode.RUN_TO_RUN, **options)
                 test.assertFalse(run.solver._adhesion_enabled)
                 run.step(30)
                 results.append(run.state.body_q.numpy())
