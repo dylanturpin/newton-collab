@@ -1,0 +1,1 @@
+Add `nesterov_momentum` to `SolverSteel`: the matrix-free Gauss-Seidel sweep extrapolates the impulses with Nesterov momentum, applies each row's change to the velocity through its response, and restarts when a sweep opposes the extrapolation, converging in fewer iterations on stacks, mass ratios and long chains. It requires the serial immediate interleaved sweep on CUDA.

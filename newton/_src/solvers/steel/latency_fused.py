@@ -70,6 +70,7 @@ ROW_FIELDS = (
     "torsion_row_radius",
     "dense_gamma",
     "mf_gamma",
+    "momentum_scratch",
 )
 
 # Fields in the order of ``SolverSteel._colored_sweep_inputs``, which fills them.
@@ -145,6 +146,7 @@ class RowArgs:
     torsion_row_radius: wp.array2d[float]
     dense_gamma: wp.array2d[float]
     mf_gamma: wp.array2d[float]
+    momentum_scratch: wp.array2d[float]
 
 
 @wp.struct
@@ -315,7 +317,7 @@ def get_fused_iteration_kernel(
             rows.drive_vel_multiplier, rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
             rows.velocity_limit_slot, rows.velocity_limit_sign, rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses, rows.mf_J_a,
             rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.row_w, rows.mf_row_w,
-            rows.torsion_group, rows.torsion_row_radius, rows.dense_gamma, rows.mf_gamma, 1, omega, regularize,
+            rows.torsion_group, rows.torsion_row_radius, rows.dense_gamma, rows.mf_gamma, rows.momentum_scratch, 1, omega, regularize,
             freeze_drive_rows, phase, friction_start_iteration, iteration, v_out,
         )  # fmt: skip
 
