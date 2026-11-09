@@ -79,7 +79,8 @@ class _Run:
         newton.eval_fk(model, model.joint_q, model.joint_qd, self.state)
         self.observables = None
         if observe:
-            self.observables = self.solver.observables({SolverSteel.ObservableKind.CONTACT_F}, contacts=self.contacts)
+            kinds = {SolverSteel.ObservableKind.CONTACT_F, SolverSteel.ObservableKind.BODY_PARENT_F}
+            self.observables = self.solver.observables(kinds, contacts=self.contacts)
 
     def step(self, count=1):
         for _ in range(count):
@@ -197,6 +198,8 @@ def test_contact_force_is_net(test, device):
             # Shape 0 is the ceiling, so its force is the box's pull on it, downward.
             test.assertAlmostEqual(float(force[:, 2].sum()), -WEIGHT, delta=1.0e-3 * WEIGHT)
             test.assertTrue(np.all(force[:, 2] >= -adhesion * (1.0 + 1.0e-5)))
+            # The contacts carry the weight, so the joint (or free root) transmits no force.
+            np.testing.assert_allclose(run.observables.body_parent_f.numpy()[0, :3], 0.0, atol=1.0e-3 * WEIGHT)
         with test.subTest(kind=kind, case="separating"):
             # Too weak to hold: in the gap every contact pulls with its full adhesion and no friction.
             adhesion = 0.25 * WEIGHT / CONTACT_POINTS
