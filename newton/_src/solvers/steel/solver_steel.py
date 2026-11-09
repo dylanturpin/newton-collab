@@ -29,6 +29,14 @@ from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from . import latency_fused
 from ._testing import current_kernel_overrides
+from .contact_adhesion import (
+    allocate_contact_adhesion,
+    configure_contact_adhesion,
+    net_row_impulses,
+    prepare_contact_adhesion,
+    seed_row_impulses,
+    validate_contact_adhesion,
+)
 from .contact_angular_friction import (
     accumulate_free_rigid_angular_wrenches,
     configure_free_rigid_angular_friction,
@@ -1529,7 +1537,8 @@ class SolverSteel(SolverBase, CouplingInterface):
       regularization, warm start from the previous step's impulses, velocity-only
       iterations and gap gates for speculative contacts are configured on the
       constructor. Experimental contact torsion (per-shape ``steel:min_torsional_patch_radius``)
-      adds a load-bounded spin-friction row per contact group. Experimental rolling and spin
+      adds a load-bounded spin-friction row per contact group. Experimental contact adhesion
+      (per-shape ``steel:adhesion``) lets contacts pull within their gap. Experimental rolling and spin
       friction rows for free-body contacts are opt-in per shape (``steel:condim``, see
       :meth:`register_custom_attributes`), and experimental implicit compliance of
       hydroelastic contacts is opt-in (``contact_compliance``).
@@ -1568,7 +1577,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     every articulated (non-free-body) response group shares one joint topology with at most
     64 DOFs, joint velocity-limit and joint friction rows are disabled, the model has no mimic or loop-closing
     joints, drives are augmented and contacts use hard point friction or persistent friction patches
-    (no warm start, regularization, velocity-only iterations, friction gap threshold, restitution,
+    (no warm start, adhesion, regularization, velocity-only iterations, friction gap threshold, restitution,
     contact torsion or compliance): the mass matrix is assembled and factored in
     the fill-free pattern of the kinematic tree, and constraint rows keep only the DOFs
     that support them.
@@ -1818,6 +1827,30 @@ class SolverSteel(SolverBase, CouplingInterface):
           rebuilt to gain the rows. A negative or non-finite coefficient that a shape's condim enables
           raises :class:`ValueError` at the same points.
 
+        One experimental per-shape attribute makes contacts adhesive:
+
+        - ``steel:adhesion`` [N] (default 0) is the pull of each contact point of the shape, MuJoCo's geom
+          ``adhesion``, which the MJCF importer reads. A contact pulls with the sum of its two shapes' values
+          while it is within the pair's :attr:`~newton.ModelBuilder.ShapeConfig.gap`, so a gap makes shapes
+          attract at a distance. The solver applies the pull ``A dt`` to the contact's normal row and solves
+          its impulse in the unchanged contact cone, so the net normal impulse can reach ``-A dt``, friction is
+          bounded by ``mu`` times the net normal impulse plus ``A dt``, and resting penetration is unchanged.
+          Pull-off grows with the number of contact points of the pair. Within the gap, friction stays bounded
+          by the solved impulse, which is zero until the pull would close the gap within the step (MuJoCo
+          removes friction there). :attr:`~newton.solvers.SolverBase.Observables.contact_f` and
+          ``body_parent_f`` report the net force. The solver reads the values every step, so writing zero
+          releases a contact and writing the value engages it again, also between graph replays; a solver
+          built without a positive value ignores the attribute and must be rebuilt to gain adhesion.
+          Construction and :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` raise :class:`ValueError`
+          for a negative or non-finite value. Adhesion keeps the dense mass factors and raises
+          :class:`NotImplementedError` with ``enable_sleeping``, ``contact_compliance``,
+          ``contact_regularization > 0`` and contact torsion.
+
+          .. experimental::
+
+              ``steel:adhesion``, its USD name ``newton:steel:adhesion`` and its contact law may change
+              without the normal deprecation period.
+
         One per-DOF attribute makes joint friction grow with the load the joint transmits, see
         ``enable_joint_friction``:
 
@@ -1934,6 +1967,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 # The default MJCF/URDF name, condim, belongs to SolverMuJoCo's mujoco:condim.
                 mjcf_attribute_name="steel:condim",
                 urdf_attribute_name="steel:condim",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="adhesion",
+                namespace=_ATTRIBUTE_NAMESPACE,
+                frequency=Model.AttributeFrequency.SHAPE,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                mjcf_attribute_name="adhesion",
+                usd_attribute_name="newton:steel:adhesion",
             )
         )
         builder.add_custom_attribute(
@@ -2769,6 +2814,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 stacklevel=2,
             )
         configure_contact_torsion(self)
+        configure_contact_adhesion(self, bool(enable_sleeping))
         if self._enable_joint_friction:
             incompatible = [
                 name
@@ -3223,6 +3269,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._status_snapshot_event = None
         self._status_snapshot_checked = False
         self._status_readback_stream = None
+        if self._adhesion_enabled:
+            allocate_contact_adhesion(self)
 
     def _refresh_shape_materials(self) -> None:
         """Copy the model's current friction and restitution coefficients into the solver's fixed buffers."""
@@ -3569,6 +3617,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._warn_ignored_revolute_loop_inputs(stacklevel=3)
         if flags & ModelFlags.SHAPE_PROPERTIES and not capturing:
             validate_free_rigid_angular_friction(self)
+            validate_contact_adhesion(self)
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -4088,6 +4137,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             for name, enabled in (
                 ("enable_sleeping", self._sleeping is not None),
                 ("contact_warmstart", self._contact_warmstart),
+                ("steel:adhesion", self._adhesion_enabled),
                 ("contact_compliance", self._contact_compliance),
                 ("contact torsion", self._contact_torsion_enabled),
                 # The coupler routes contacts and sums coupling forces with atomics, so their order varies by run.
@@ -5188,7 +5238,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         normal row per contact and two tangent rows per point contact or surviving patch
         anchor, the patch load pooled over the region's linked normal rows), so the
         propagation responses, the other friction modes, contact torsion, free-body angular
-        friction rows, contact compliance, warm start, regularization, velocity-only iterations,
+        friction rows, contact compliance, warm start, adhesion, regularization, velocity-only iterations,
         a friction gap threshold and late friction (``contact_friction_position_iterations``)
         keep the dense path, and so does enabled restitution when a shape has a positive
         restitution coefficient (with all coefficients zero it does not).
@@ -5200,6 +5250,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             or self._free_rigid_angular_rows
             or self._contact_compliance
             or self._contact_warmstart
+            or self._adhesion_enabled
             or self._regularization_enabled
             or self._velocity_iterations > 0
             or not self._friction_every_contact
@@ -5286,6 +5337,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._nesterov_momentum
             and not self._regularization_enabled
             and not self._contact_warmstart
+            and not self._adhesion_enabled
             and self._iterations > 0
             and self._velocity_iterations == 0
             and self._row_schedule == "interleaved"
@@ -5403,6 +5455,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._enable_joint_velocity_limits
             and not self._enable_joint_friction
             and not self._contact_warmstart
+            and not self._adhesion_enabled
             and not self._preelim_active
             and not self._has_free_rigid_bodies
             and not self._regularization_enabled
@@ -5532,6 +5585,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and self._velocity_iterations == 0
             and self._friction_mode == "fixed_normal"
             and not self._contact_warmstart
+            and not self._adhesion_enabled
             and not self._preelim_active
             and self._local_solve_max_rows > 0
             # The local owners do not solve torsion or free-rigid angular rows.
@@ -8085,8 +8139,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
-    def _apply_mf_warmstart_velocity(self) -> None:
-        """Install the velocity of the seeded free-body impulses into ``v_out``."""
+    def _apply_mf_warmstart_velocity(self, impulses: wp.array) -> None:
+        """Install the velocity of the free-body ``impulses`` into ``v_out``."""
         model = self.model
         wp.launch(
             build_mf_body_map,
@@ -8119,7 +8173,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._mf_local_body_b,
                 self._mf_MiJt_a,
                 self._mf_MiJt_b,
-                self._mf_impulses,
+                impulses,
                 self._max_mf_bodies,
             ],
             outputs=[self._v_out],
@@ -8410,9 +8464,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         wp.copy(self._v_out, self._v_hat)
+        adhesive = self._adhesion_enabled and has_contacts
+        if adhesive:
+            prepare_contact_adhesion(self, contacts, dt)
+            if not self._contact_warmstart:
+                # Cold adhesive rows start at the pull, which leaves the velocity unchanged.
+                for route, impulses in enumerate((self._impulses, self._mf_impulses, self._propagation_impulses)):
+                    seed_row_impulses(self, route, impulses)
+        elif self._adhesion_enabled:
+            self._contact_adhesion_impulse.zero_()
         if self._contact_warmstart:
             # The solve updates the velocity from impulse deltas, so the seeded impulses'
-            # velocity must be installed before the first sweep.
+            # velocity, less the adhesive pull, must be installed before the first sweep.
             if self._max_world_dofs > 0:
                 wp.launch(
                     apply_world_impulses_to_velocity,
@@ -8422,13 +8485,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._world_dof_indices,
                         self._max_world_dofs,
                         self._Y_world,
-                        self._impulses,
+                        net_row_impulses(self, 0, self._impulses) if adhesive else self._impulses,
                     ],
                     outputs=[self._v_out],
                     device=model.device,
                 )
             if self._has_free_rigid_bodies:
-                self._apply_mf_warmstart_velocity()
+                self._apply_mf_warmstart_velocity(
+                    net_row_impulses(self, 1, self._mf_impulses) if adhesive else self._mf_impulses
+                )
         if self._preelim_active:
             # After the warm-start installs, so a carried contact impulse cannot reopen the projection.
             self._stage5_project_bilateral_velocity()
@@ -8446,7 +8511,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 if not self._contact_compliance:
                     self._propagation_setup(state_in, state_aug, dt)
                 if self._contact_warmstart:
-                    self._apply_propagation_warmstart_velocity()
+                    self._apply_propagation_warmstart_velocity(
+                        net_row_impulses(self, 2, self._propagation_impulses)
+                        if adhesive
+                        else self._propagation_impulses
+                    )
                 self._launch_propagation_solve(
                     self._rhs,
                     self._propagation_rhs,
@@ -8707,15 +8776,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         ]
 
     def _contact_row_impulse_inputs(self) -> list:
-        """Return the row arrays ``contact_row_impulses`` reads a contact's solved impulses from."""
+        """Return the row arrays ``contact_row_impulses`` reads a contact's solved net impulses from."""
+        impulses = (self._impulses, self._mf_impulses, self._propagation_impulses)
+        if self._adhesion_enabled:
+            impulses = tuple(net_row_impulses(self, route, family) for route, family in enumerate(impulses))
         return [
             self._contact_world,
             self._contact_slot,
             self._contact_path,
             self._contact_slots_needed,
-            self._impulses,
-            self._mf_impulses,
-            self._propagation_impulses,
+            *impulses,
             self._constraint_count,
             self._mf_constraint_count,
             self._propagation_constraint_count,
@@ -12587,8 +12657,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _apply_propagation_warmstart_velocity(self) -> None:
-        """Install the velocity of the seeded propagation impulses into the twists and ``v_out``."""
+    def _apply_propagation_warmstart_velocity(self, impulses: wp.array) -> None:
+        """Install the velocity of the propagation ``impulses`` into the twists and ``v_out``."""
         self._snapshot_propagation_cache_twists()
         # Ordered rows sum each body's seeded impulses in row order; the default scatters them atomically.
         if self._ordered_rows:
@@ -12609,7 +12679,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_J_b,
                 self._propagation_MiJt_a,
                 self._propagation_MiJt_b,
-                self._propagation_impulses,
+                impulses,
                 self._propagation_max_constraints,
             ],
             outputs=[self._propagation_body_qd, self._propagation_body_impulses],

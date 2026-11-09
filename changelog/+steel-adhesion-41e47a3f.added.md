@@ -1,0 +1,1 @@
+Add experimental contact adhesion to `newton.solvers.SolverSteel` through the per-shape `steel:adhesion` attribute [N], read from MuJoCo's geom `adhesion` on MJCF import: contacts within the pair's gap pull with the sum of their shapes' values, can carry tension up to it and have friction bounded by the normal load plus the pull.

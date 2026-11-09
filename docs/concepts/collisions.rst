@@ -2403,6 +2403,11 @@ and friction also act inside the adhesion zone. For
 :class:`~newton.solvers.SolverMuJoCo`, see
 :ref:`mujoco-contact-friction-solreffriction`.
 
+:class:`~newton.solvers.SolverSteel` ignores ``ka``; its contact adhesion is a
+force [N] per contact point, the custom attribute ``steel:adhesion`` (MuJoCo's
+geom ``adhesion``), which acts within the pair's ``gap``. See
+:meth:`~newton.solvers.SolverSteel.register_custom_attributes`.
+
 Let :math:`d` be the contact-space distance :math:`d = s - m` from
 :ref:`margin and gap semantics <margin-gap-semantics>`, where :math:`s` is the
 surface distance and :math:`m` the pair margin, so :math:`d` is negative once
