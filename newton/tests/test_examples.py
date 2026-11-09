@@ -1187,6 +1187,14 @@ add_example_test(
 
 add_example_test(
     TestSteelExamples,
+    name="steel.example_steel_magnetic_door",
+    devices=test_devices,
+    test_options={"num-frames": 420},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestSteelExamples,
     name="steel.example_steel_sleeping",
     devices=cuda_test_devices,
     test_options={"num-frames": 340},
