@@ -1,0 +1,1 @@
+Deprecate the USD attribute `newton:steel:joint_friction_load_coefficient`; author `newton:steel:jointFrictionLoadCoefficient` instead. `add_usd()` reads the old name with a `NewtonDeprecationWarning` when the new one is not authored on the joint.
