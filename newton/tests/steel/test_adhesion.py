@@ -124,17 +124,21 @@ def test_holds_until_pull_off(test, device):
 
 
 def test_solver_options(test, device):
-    """Hold the box with warm start, velocity-only iterations, point friction and late friction."""
-    for name, options in (
+    """Hold the box with warm start, velocity-only iterations, point/late friction and Nesterov momentum."""
+    cases = [
         ("warmstart", {"contact_warmstart": True}),
         ("velocity_iterations", {"velocity_iterations": 2}),
         ("point_friction", {"friction_anchor_beta": 0.0}),
         ("late_friction", {"contact_friction_position_iterations": 2}),
-    ):
+    ]
+    if wp.get_device(device).is_cuda:
+        # Momentum extrapolates the stored impulse, which is the shifted one; the pull is a constant offset.
+        cases.append(("nesterov_momentum", {"nesterov_momentum": True}))
+    for name, options in cases:
         matching = "latest" if options.get("contact_warmstart") else "disabled"
-        for factor, holds in ((1.1, True), (0.9, False)):
-            with test.subTest(options=name, holds=holds):
-                model = _hanging_box(device, "slider", adhesion=factor * WEIGHT / CONTACT_POINTS)[0]
+        for kind, factor, holds in (("slider", 1.1, True), ("free", 1.1, True), ("slider", 0.9, False)):
+            with test.subTest(options=name, kind=kind, holds=holds):
+                model = _hanging_box(device, kind, adhesion=factor * WEIGHT / CONTACT_POINTS)[0]
                 run = _Run(model, contact_matching=matching, **options)
                 run.step(120)
                 z = float(run.box_position()[2])
