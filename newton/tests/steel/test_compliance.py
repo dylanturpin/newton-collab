@@ -37,9 +37,15 @@ from newton.tests.steel._fixtures import (
     run_fixture,
     select_colored_variant,
     set_torsion_radius,
-    steel_mode_options,
 )
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+
+
+def _response(name: str) -> dict:
+    """Return the constructor options of a response label (``"immediate"``, ``"propagation"`` or ``"colored"``)."""
+    if name == "colored":
+        return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    return {"articulated_contact_response": name}
 
 
 def run_native_hydro_fixture(*, device, articulated=True, response="immediate"):
@@ -103,7 +109,7 @@ def run_native_hydro_fixture(*, device, articulated=True, response="immediate"):
                 articulation_constraint_max=2048,
                 free_body_constraint_max=32 if articulated else 2048,
                 baumgarte=0.05,
-                **steel_mode_options(response),
+                **_response(response),
             )
             output = model.state()
             step_input = model.state()
@@ -1080,7 +1086,7 @@ def test_colored_rising_kinematic_support_matches_immediate(test, device):
                 setattr(contacts, name, wp.zeros(32, dtype=float))
             solver = SolverSteel(
                 model,
-                **steel_mode_options(response),
+                **_response(response),
                 contact_compliance=True,
                 friction_anchor_beta=0.0,
                 iterations=8,
@@ -1299,7 +1305,7 @@ def test_colored_incompatible_options_rejected(test, device):
 
 
 class TestContactComplianceColored(unittest.TestCase):
-    """Compliant contacts on ``solve_mode="colored", articulated_contact_response="propagation"`` rows."""
+    """Compliant contacts on ``solve_mode="colored"`` rows."""
 
 
 for _fn in (
@@ -1330,7 +1336,7 @@ def _step_compliant(model, response, steps, *, stiffness, damping, **solver_opti
         setattr(contacts, name, wp.zeros(contact_max, dtype=float, device=model.device))
     solver = SolverSteel(
         model,
-        **steel_mode_options(response),
+        **_response(response),
         contact_compliance=True,
         friction_anchor_beta=0.0,
         iterations=8,

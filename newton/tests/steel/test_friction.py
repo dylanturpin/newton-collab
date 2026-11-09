@@ -41,9 +41,15 @@ from newton.tests.steel._fixtures import (
     fixture,
     select_colored_variant,
     set_torsion_radius,
-    steel_mode_options,
 )
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
+
+
+def _response_options(response):
+    """Return the solver options of a contact response; ``"colored"`` is the colored sweep of ``"propagation"``."""
+    if response == "colored":
+        return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    return {"articulated_contact_response": response}
 
 
 def _run_squeeze(tilt_deg, steps, dt=0.005, matching="latest", substeps=1, device=None, **solver_kwargs):
@@ -584,7 +590,7 @@ def _slide(
         cfm=0.0 if locked_tangent else 1.0e-6,
         free_body_constraint_max=128,
         articulation_constraint_max=32,
-        **steel_mode_options(response),
+        **_response_options(response),
         friction_mode=mode,
     )
     solver._rigid_body_angular_damping.zero_()
@@ -1044,7 +1050,7 @@ def _coulomb_newton_mf_block(device, block):
 def test_coulomb_newton_normal_impulse_stays_nonnegative(test, device):
     """Keep the coupled Coulomb Newton normal impulse at or above zero where the root search ends below zero load."""
     for name, block in _ZERO_LOAD_BLOCKS.items():
-        for route, solve in (("colored", _coulomb_newton_colored_block), ("matrix_free", _coulomb_newton_mf_block)):
+        for route, solve in (("colored", _coulomb_newton_colored_block), ("serial", _coulomb_newton_mf_block)):
             with test.subTest(block=name, route=route):
                 normal, *tangent = solve(device, np.array(block, dtype=np.float32))
                 test.assertGreaterEqual(normal, 0.0)
@@ -1100,7 +1106,7 @@ def _box_on_support(device, mode, articulated, support_speed, steps=60, window=3
     model = builder.finalize(device=device)
     solver = SolverSteel(
         model,
-        **steel_mode_options(response),
+        **_response_options(response),
         friction_mode=mode,
         friction_anchor_beta=0.0,
         iterations=32,
@@ -1234,7 +1240,7 @@ def test_surface_velocity_belt_drags_the_box(test, device):
             belt, _, box, step = _surface_belt(
                 device,
                 articulated=articulated,
-                **steel_mode_options(response),
+                **_response_options(response),
                 friction_mode=mode,
                 friction_anchor_beta=anchor_beta,
             )
@@ -2749,7 +2755,7 @@ class _ModeScene:
         builder.replicate(world, worlds)
         self.model = builder.finalize(device=device)
         args = {
-            **steel_mode_options(response),
+            **_response_options(response),
             "friction_mode": mode,
             "friction_anchor_beta": 0.0,
             "iterations": 32,
@@ -2911,7 +2917,7 @@ def test_colored_modes_keep_the_coupled_restrictions(test, device):
     model = _ModeScene(test, device, "immediate", "fixed_normal").model
     for mode in _COUPLED_MODES:
         with test.subTest(mode=mode):
-            colored = {"solve_mode": "colored", "articulated_contact_response": "propagation", "friction_mode": mode}
+            colored = {**_response_options("colored"), "friction_mode": mode}
             with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "point friction"):
                 solver = SolverSteel(model, **colored)
             test.assertEqual(solver.friction_anchor_beta, 0.0)
@@ -2924,7 +2930,7 @@ def test_colored_modes_keep_the_coupled_restrictions(test, device):
                 with test.assertRaisesRegex(ValueError, "contact_regularization"):
                     SolverSteel(
                         model,
-                        **steel_mode_options(response),
+                        **_response_options(response),
                         friction_mode=mode,
                         friction_anchor_beta=0.0,
                         contact_regularization=1.0,
@@ -2935,7 +2941,7 @@ def test_colored_modes_keep_the_coupled_restrictions(test, device):
                 )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        default = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
+        default = SolverSteel(model, **_response_options("colored"))
     test.assertFalse(default._pgs_solve_propagation_colored_warp_kernel.key.endswith(_COUPLED_MODES))
 
 

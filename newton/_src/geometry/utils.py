@@ -94,10 +94,15 @@ def compute_shape_radius(geo_type: int, scale: Vec3, src: Mesh | Heightfield | N
         # body frame).  Using the AABB diagonal gives a tighter and
         # always-correct enclosing radius regardless of where the
         # authoring origin sits relative to the geometry.
-        verts = np.asarray(src.vertices, dtype=np.float64) * np.asarray(scale, dtype=np.float64)
-        aabb_lo = verts.min(axis=0)
-        aabb_hi = verts.max(axis=0)
-        return float(0.5 * np.linalg.norm(aabb_hi - aabb_lo))
+        # Scaling a box only scales its extents, so shapes sharing a mesh reuse its cached bounds.
+        get_local_bounds = getattr(src, "_get_local_bounds", None)
+        if get_local_bounds is not None:
+            aabb_lo, aabb_hi = get_local_bounds()
+        else:
+            vertices = np.asarray(src.vertices, dtype=np.float64)
+            aabb_lo, aabb_hi = vertices.min(axis=0), vertices.max(axis=0)
+        extent = (aabb_hi - aabb_lo) * np.abs(np.asarray(scale, dtype=np.float64))
+        return float(0.5 * np.linalg.norm(extent))
     elif geo_type == GeoType.PLANE:
         # Use magnitudes for the finite-vs-infinite check so that legacy callers that
         # pass negative components still classify correctly. The infinite-plane sentinel
@@ -175,11 +180,28 @@ def compute_inertia_box_mesh(
         indices=np.asarray(indices).flatten().tolist(),
         is_solid=is_solid,
     )
+    return compute_inertia_box(volume, com, inertia_tensor)
 
+
+def compute_inertia_box(
+    volume: float, com: np.ndarray | wp.vec3, inertia: np.ndarray | wp.mat33
+) -> tuple[wp.vec3, wp.vec3, wp.quat]:
+    """Compute the equivalent inertia box of a body from its unit-density mass properties.
+
+    See :func:`compute_inertia_box_mesh` for the half-size formula.
+
+    Args:
+        volume: Volume [m^3], or the surface area [m^2] of a shell: the mass at unit density.
+        com: Center of mass [m].
+        inertia: Inertia tensor about the center of mass at unit density, shape ``(3, 3)``.
+
+    Returns:
+        Tuple of ``(center, half_extents, rotation)`` as returned by :func:`compute_inertia_box_mesh`.
+    """
     if volume < 1e-12:
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()
 
-    inertia = np.array(inertia_tensor).reshape(3, 3)
+    inertia = np.array(inertia).reshape(3, 3)
     eigvals, eigvecs = np.linalg.eigh(inertia)
 
     # Sort eigenvalues (and eigenvectors) in ascending order.
@@ -198,9 +220,9 @@ def compute_inertia_box_mesh(
         arg = 6.0 * (eigvals[j] + eigvals[k] - eigvals[i]) / volume
         half_extents[i] = 0.5 * np.sqrt(max(arg, 0.0))
 
-    # Convert the eigenvector matrix (columns = principal axes in mesh frame)
-    # to a quaternion.
-    rotation = wp.quat_from_matrix(wp.mat33(*eigvecs.T.flatten().tolist()))
+    # The eigenvector matrix (columns = principal axes in mesh frame) rotates the
+    # principal-axis frame to the mesh frame; wp.mat33 takes its values row by row.
+    rotation = wp.quat_from_matrix(wp.mat33(*eigvecs.flatten().tolist()))
 
     return wp.vec3(*np.array(com)), wp.vec3(*half_extents), rotation
 

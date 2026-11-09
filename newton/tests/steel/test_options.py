@@ -16,7 +16,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.steel.solver_steel import _ConstructionOption, _StepOption
-from newton.exceptions import NewtonDeprecationWarning
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import (
     DT,
@@ -522,6 +521,10 @@ def test_disabled_restitution_lets_compliance_accept_restitution(test, device):
     np.testing.assert_array_equal(trace, reference)
 
 
+# solve_mode="colored" on CPU warns that it runs the serial propagation sweep.
+_CPU_COLORED_WARNING = "SolverSteel: solve_mode='colored' runs"
+
+
 class TestSteelAngularDamping(unittest.TestCase):
     pass
 
@@ -556,7 +559,7 @@ for _cls, _fn, _devices in (
     (TestSteelFrictionOptions, test_friction_position_iterations_validate_their_value, get_test_devices()),
     (TestSteelFrictionOptions, test_velocity_iterations_always_solve_friction, get_cuda_test_devices()),
     (TestSteelFrictionOptions, test_friction_position_iterations_survive_graph_capture, get_cuda_test_devices()),
-    (TestSteelRestitutionOptions, test_disabled_restitution_matches_inelastic_materials, get_cuda_test_devices()),
+    (TestSteelRestitutionOptions, test_disabled_restitution_matches_inelastic_materials, get_test_devices()),
     (
         TestSteelRestitutionOptions,
         test_disabled_restitution_lets_compliance_accept_restitution,
@@ -614,7 +617,7 @@ def _step_once(model, solver, floor_velocity=0.0, box_velocity=-1.0):
     return output.body_qd.numpy()[:, 2], contacts
 
 
-def test_global_kinematic_floor_supports_every_world(test, device, response="immediate"):
+def test_global_kinematic_floor_supports_every_world(test, device, solve_mode="serial", response="immediate"):
     """Stop the boxes of every world on a global kinematic floor exactly as on world geometry."""
     static_model = _floor_model(device, "static")
     static_v = _step_once(static_model, SolverSteel(static_model, **steel_mode_options(response)))[0][:2]
@@ -650,7 +653,7 @@ def test_global_kinematic_floor_supports_every_world(test, device, response="imm
     np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [False, False, False])
 
 
-def test_global_kinematic_floor_capture_replay(test, device, response="immediate"):
+def test_global_kinematic_floor_capture_replay(test, device, solve_mode="serial", response="immediate"):
     """Match eager stepping for both worlds on a global kinematic floor with captured collide and step."""
     model = _floor_model(device, "kinematic")
     pipeline = newton.CollisionPipeline(model)
@@ -730,7 +733,7 @@ def _expect_one_warning(test, category, pattern, call):
     return result
 
 
-def test_jointed_global_kinematic_flags_other_world_contacts(test, device, response="immediate"):
+def test_jointed_global_kinematic_flags_other_world_contacts(test, device, solve_mode="serial", response="immediate"):
     """Solve a jointed kinematic global articulation in world 0 and flag its other-world contacts."""
     model = _jointed_kinematic_floor_model(device)
     solver = _construct(test, model, True, warn_constraint_overflow=False, **steel_mode_options(response))
@@ -756,7 +759,7 @@ def test_jointed_global_kinematic_flags_other_world_contacts(test, device, respo
         solver.check_constraint_capacity()
 
 
-def test_construction_warns_about_unsolvable_global_contacts(test, device, response="immediate"):
+def test_construction_warns_about_unsolvable_global_contacts(test, device, solve_mode="serial", response="immediate"):
     """Warn once at construction when shapes allow contacts coupling a global articulation with another world."""
     kwargs = steel_mode_options(response)
     # Dynamic global bodies and jointed kinematic global articulations warn.
@@ -794,7 +797,7 @@ def _lift_box(model, world):
     model.joint_q.assign(joint_q)
 
 
-def test_dynamic_global_body_flags_other_world_contacts(test, device, response="immediate"):
+def test_dynamic_global_body_flags_other_world_contacts(test, device, solve_mode="serial", response="immediate"):
     """Let a dynamic global body interact with world 0, and drop and flag its contacts with another world."""
     # Only world 1's box touches the global dynamic floor.
     model = _floor_model(device, "dynamic")
@@ -849,7 +852,7 @@ def _place(model, state, z):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
 
-def test_global_overflow_has_its_own_reset_slot(test, device, response="immediate"):
+def test_global_overflow_has_its_own_reset_slot(test, device, solve_mode="serial", response="immediate"):
     """Latch global row loss in the global entry, and clear only its own status with each reset-mask entry."""
     model = _global_overflow_model(device)
     # One contact's rows fit; the propagation response holds every contact row in a family
@@ -1016,7 +1019,7 @@ def _check_global_slot_reset(test, device, model, z_contact, z_free, response):
     test.assertEqual(solver.constraint_overflow.numpy().tolist(), clear)
 
 
-def test_global_slot_reset_with_few_articulations(test, device, response="immediate"):
+def test_global_slot_reset_with_few_articulations(test, device, solve_mode="serial", response="immediate"):
     """Clear the global entry on every reset mask, even when articulations do not outnumber the status entries."""
     for name, model, z_contact, z_free in _few_articulation_models(device):
         with test.subTest(model=name):
@@ -1046,7 +1049,8 @@ for _name, _func in (
     ("test_global_overflow_has_its_own_reset_slot", test_global_overflow_has_its_own_reset_slot),
     ("test_global_slot_reset_with_few_articulations", test_global_slot_reset_with_few_articulations),
 ):
-    add_function_test(TestSteelGlobalWorld, _name, _func, devices=devices)
+    serial_devices = devices if _name == "test_global_kinematic_floor_capture_replay" else get_test_devices()
+    add_function_test(TestSteelGlobalWorld, _name, _func, devices=serial_devices)
     # The propagation response moves these free-body contacts to its body-space rows.
     add_function_test(TestSteelGlobalWorld, f"{_name}_propagation", _func, devices=devices, response="propagation")
 
@@ -1071,7 +1075,7 @@ def _floating_base_arm():
     return builder.finalize(), hinge
 
 
-def test_floating_base_drive_reads_its_own_target(test, device, drive_mode):
+def test_floating_base_drive_reads_its_own_target(test, device, drive_mode, solve_mode="serial"):
     """Read the target of a revolute drive after a free joint at joint_target_q_start, not its DOF index."""
     with wp.ScopedDevice(device):
         model, hinge = _floating_base_arm()
@@ -1097,7 +1101,7 @@ for _drive_mode in ("augmented", "rows"):
         TestSteelTargetLayout,
         f"test_floating_base_drive_reads_its_own_target_{_drive_mode}",
         test_floating_base_drive_reads_its_own_target,
-        devices=get_cuda_test_devices(),
+        devices=get_test_devices() if _drive_mode == "augmented" else get_cuda_test_devices(),
         drive_mode=_drive_mode,
     )
 
@@ -1136,6 +1140,61 @@ _KERNEL_FACTORIES = (
     "_get_pgs_solve_propagation_colored_warp_kernel",
     "_get_pgs_solve_propagation_colored_block_kernel",
 )
+
+
+class TestSteelSolveModeOptions(unittest.TestCase):
+    """Construction-only checks of the solve modes; they run on CPU, where Steel needs no CUDA device."""
+
+    def test_deprecated_spellings_map_to_the_new_options(self):
+        """Map each 1.8-prerelease spelling with a deprecation warning attributed to the caller."""
+        model, _ = _build_plane_model("cpu", separation=0.0, restitution=0.0)
+        deprecated = (
+            ({"solve_mode": "split"}, "solve_mode='serial'", ("serial", "immediate")),
+            ({"solve_mode": "matrix_free"}, "solve_mode='serial'", ("serial", "immediate")),
+            (
+                {"articulated_contact_response": "propagation_colored"},
+                "solve_mode='colored' with articulated_contact_response='propagation'",
+                ("colored", "propagation"),
+            ),
+            (
+                {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
+                "solve_mode='serial'",
+                ("serial", "propagation"),
+            ),
+        )
+        for kwargs, message, expected in deprecated:
+            with self.subTest(**kwargs):
+                with self.assertWarnsRegex(newton.exceptions.NewtonDeprecationWarning, re.escape(message)) as caught:
+                    warnings.filterwarnings(
+                        "ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning
+                    )
+                    solver = SolverSteel(model, **kwargs)
+                self.assertEqual(Path(caught.filename).resolve(), Path(__file__).resolve())
+                self.assertEqual((solver.solve_mode, solver.articulated_contact_response), expected)
+
+    def test_new_spellings_are_accepted_and_invalid_ones_rejected(self):
+        """Expose the normalized pair without warnings and reject unknown values and an unsupported pair."""
+        model, _ = _build_plane_model("cpu", separation=0.0, restitution=0.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", newton.exceptions.NewtonDeprecationWarning)
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            solver = SolverSteel(model)
+            self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
+            solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
+            self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("colored", "propagation"))
+        with self.assertRaisesRegex(ValueError, re.escape("requires articulated_contact_response='propagation'")):
+            SolverSteel(model, solve_mode="colored", articulated_contact_response="immediate")
+        with self.assertRaisesRegex(ValueError, "solve_mode must be 'serial' or 'colored'"):
+            SolverSteel(model, solve_mode="dense")
+        with self.assertRaisesRegex(ValueError, "articulated_contact_response must be 'immediate' or 'propagation'"):
+            SolverSteel(model, articulated_contact_response="colored")
+
+    def test_colored_sleeping_requires_cuda(self):
+        """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
+        model = _floor_model("cpu", "static")
+        with warnings.catch_warnings(), self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
 
 
 class TestSteelPrivateApi(unittest.TestCase):
@@ -1193,11 +1252,13 @@ class TestSteelPrivateApi(unittest.TestCase):
         self.assertNotIn("angular_damping", parameters)
 
     def test_pgs_mode_selects_only_the_supported_solves(self):
-        """Offer exactly the serial and colored sweeps, with the serial sweep as the default."""
-        parameter = inspect.signature(SolverSteel.__init__).parameters["solve_mode"]
-        self.assertEqual(parameter.default, "serial")
-        self.assertEqual(typing.get_args(parameter.annotation), ("serial", "colored"))
+        """Offer the serial and colored sweeps and the immediate and propagation responses, serial/immediate by default."""
         parameters = inspect.signature(SolverSteel.__init__).parameters
+        self.assertEqual(parameters["solve_mode"].default, "serial")
+        self.assertEqual(typing.get_args(parameters["solve_mode"].annotation), ("serial", "colored"))
+        response = parameters["articulated_contact_response"]
+        self.assertEqual(response.default, "immediate")
+        self.assertEqual(typing.get_args(response.annotation), ("immediate", "propagation"))
         self.assertNotIn("delassus_kernel", parameters)
         self.assertNotIn("pgs_kernel", parameters)
         self.assertNotIn("pgs_chunk_size", parameters)
@@ -1253,8 +1314,8 @@ class TestSteelPrivateApi(unittest.TestCase):
                 self.assertEqual(SolverSteel(model).deterministic, mode.RUN_TO_RUN)
             if cuda_model is not None:
                 wp.config.deterministic = mode.RUN_TO_RUN
-                for response in ("propagation", "colored"):
-                    solver = SolverSteel(cuda_model, **steel_mode_options(response))
+                for solve_mode in ("serial", "colored"):
+                    solver = SolverSteel(cuda_model, solve_mode=solve_mode, articulated_contact_response="propagation")
                     self.assertEqual(solver.deterministic, mode.RUN_TO_RUN)
         finally:
             wp.config.deterministic = saved
@@ -1367,40 +1428,35 @@ class TestSteelPrivateApi(unittest.TestCase):
                     self.assertLess(calls[helper_name], first_continue)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "SolverSteel requires CUDA")
-class TestSteelSolveModeOptions(unittest.TestCase):
-    def test_solve_mode_and_response_spellings(self):
-        """Map the deprecated spellings with a warning, reject an unsupported pair and expose the normalized pair."""
-        model = _floor_model("cuda:0", "static")
-        deprecated = (
-            ({"solve_mode": "split"}, "solve_mode='serial'", ("serial", "immediate")),
-            ({"solve_mode": "matrix_free"}, "solve_mode='serial'", ("serial", "immediate")),
-            (
-                {"articulated_contact_response": "propagation_colored"},
-                "solve_mode='colored' with articulated_contact_response='propagation'",
-                ("colored", "propagation"),
-            ),
-            (
-                {"solve_mode": "matrix_free", "articulated_contact_response": "propagation"},
-                "solve_mode='serial'",
-                ("serial", "propagation"),
-            ),
-        )
-        for kwargs, message, expected in deprecated:
-            with self.subTest(**kwargs), self.assertWarnsRegex(NewtonDeprecationWarning, re.escape(message)):
-                solver = SolverSteel(model, **kwargs)
-            self.assertEqual((solver.solve_mode, solver.articulated_contact_response), expected)
+def test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state(test, device):
+    """Leave the kinematics carry off by default, publish eval_fk's body state bitwise, and report what runs."""
+    model = _build_spinning_model(device)
+    solver = SolverSteel(model)
+    test.assertFalse(solver.reuse_kinematics)
+    test.assertFalse(solver._reuse_kinematics_enabled)
+    state_in, state_out = model.state(), model.state()
+    _spin(model, state_in)
+    solver.step(state_in, state_out, model.control(), None, 1.0 / 240.0)
+    expected = model.state()
+    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, expected)
+    np.testing.assert_array_equal(state_out.body_q.numpy(), expected.body_q.numpy())
+    np.testing.assert_array_equal(state_out.body_qd.numpy(), expected.body_qd.numpy())
+    # The attribute reports whether the carry runs: joint velocity limits keep it off, and so does a CPU device.
+    limited = SolverSteel(model, reuse_kinematics=True, enable_joint_velocity_limits=True)
+    test.assertFalse(limited.reuse_kinematics)
+    test.assertEqual(SolverSteel(model, reuse_kinematics=True).reuse_kinematics, wp.get_device(device).is_cuda)
 
-        with self.assertRaisesRegex(ValueError, re.escape("requires articulated_contact_response='propagation'")):
-            SolverSteel(model, solve_mode="colored", articulated_contact_response="immediate")
-        # An unhashable value is an unsupported mode, not a lookup error.
-        with self.assertRaisesRegex(ValueError, "solve_mode must be"):
-            SolverSteel(model, solve_mode=["serial"])
 
-        solver = SolverSteel(model)
-        self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
-        solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
-        self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("colored", "propagation"))
+class TestSteelReuseKinematicsOption(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelReuseKinematicsOption,
+    "test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state",
+    test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state,
+    devices=get_test_devices(),
+)
 
 
 if __name__ == "__main__":

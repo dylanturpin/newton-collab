@@ -3,7 +3,6 @@
 
 """Experimental passive-island sleeping of SolverSteel."""
 
-import ctypes
 import functools
 import inspect
 import itertools
@@ -21,8 +20,16 @@ from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.friction_patches import _FLOOD_MIN_CONTACTS
 from newton._src.solvers.steel.sleeping import _SleepState
 from newton.solvers import SolverBase, SolverSteel
-from newton.tests.steel._fixtures import PROFILE, _advance, _articulations, _parent_wrench_scene, steel_mode_options
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
+from newton.tests.steel._fixtures import PROFILE, _advance, _articulations, _parent_wrench_scene
+from newton.tests.unittest_utils import add_function_test, capture_with_cuda_driver, get_cuda_test_devices
+
+
+def _response(name: str) -> dict:
+    """Return the constructor options of a response label (``"immediate"``, ``"propagation"`` or ``"colored"``)."""
+    if name == "colored":
+        return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+    return {"articulated_contact_response": name}
+
 
 DT = 0.005
 
@@ -503,7 +510,7 @@ def _compliance_scene(device, sleeping, response="immediate"):
         baumgarte=0.05,
         articulation_constraint_max=32,
         free_body_constraint_max=32,
-        **steel_mode_options(response),
+        **_response(response),
         deterministic=wp.DeterministicMode.RUN_TO_RUN,
         **(SLEEP if sleeping else {}),
     )
@@ -1436,6 +1443,37 @@ def _two_world_boxes(device):
     return model, pipeline, solver, [model.state(), model.state()]
 
 
+def test_stiffness_without_a_spring_lets_articulations_sleep(test, device):
+    """Sleep and step bitwise like zero stiffness when only FREE and BALL DOFs, which carry no spring, have stiffness."""
+    runs = []
+    for stiffness in (0.0, 50.0):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for x in (0.0, 1.0):
+            base = builder.add_link(xform=wp.transform((x, 0.0, 0.1), wp.quat_identity()))
+            builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1)
+            tip = builder.add_link(xform=wp.transform((x + 0.3, 0.0, 0.1), wp.quat_identity()))
+            builder.add_shape_box(tip, hx=0.1, hy=0.1, hz=0.1)
+            hinge = wp.transform((0.3, 0.0, 0.0), wp.quat_identity())
+            builder.add_articulation(
+                [builder.add_joint_free(child=base), builder.add_joint_ball(parent=base, child=tip, parent_xform=hinge)]
+            )
+        builder.joint_stiffness = [stiffness] * builder.joint_dof_count
+        model = builder.finalize(device=device)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
+        if stiffness:
+            # Steel warns about stiffness on DOFs it applies no spring to.
+            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "springs on 18 DOF"):
+                solver = newton.solvers.SolverSteel(model, **PROFILE)
+        else:
+            solver = newton.solvers.SolverSteel(model, **PROFILE)
+        states = [model.state(), model.state()]
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0, 0, 0])
+        runs.append(states[0].body_q.numpy())
+    np.testing.assert_array_equal(runs[1], runs[0])
+
+
 def _add_box(builder):
     body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
@@ -1522,6 +1560,7 @@ for _name in (
     "test_coincident_entity_counts_keep_property_owners",
     "test_solver_body_attribute_notification_wakes_its_island",
     "test_mimic_articulation_stays_awake",
+    "test_stiffness_without_a_spring_lets_articulations_sleep",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
 
@@ -2749,40 +2788,12 @@ def _capture_step(scene, mode):
 
         return replay, lambda: None
     # Capture that Warp does not track, as another framework's graph capture would start.
-    cuda = ctypes.CDLL("libcuda.so.1")
-    handle = ctypes.c_void_p
-    cuda.cuStreamBeginCapture_v2.argtypes = [handle, ctypes.c_int]
-    cuda.cuStreamEndCapture.argtypes = [handle, ctypes.POINTER(handle)]
-    cuda.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(handle), handle, ctypes.c_ulonglong]
-    cuda.cuGraphLaunch.argtypes = [handle, handle]
-    cuda.cuGraphExecDestroy.argtypes = [handle]
-    cuda.cuGraphDestroy.argtypes = [handle]
-    stream = ctypes.c_void_p(wp.get_stream(device).cuda_stream)
-    graph, graph_exec = ctypes.c_void_p(), ctypes.c_void_p()
-    thread_local_mode = 1
-    began = cuda.cuStreamBeginCapture_v2(stream, thread_local_mode)
-    assert began == 0, began
-    try:
-        solve()
-    finally:
-        ended = cuda.cuStreamEndCapture(stream, ctypes.byref(graph))
-    assert ended == 0, ended
     # The captured step allocates stream-ordered scratch, which the graph frees on each relaunch.
-    auto_free_on_launch = 1
-    instantiated = cuda.cuGraphInstantiateWithFlags(
-        ctypes.byref(graph_exec), graph, ctypes.c_ulonglong(auto_free_on_launch)
-    )
-    assert instantiated == 0, instantiated
+    launch, release = capture_with_cuda_driver(device, solve, auto_free_on_launch=True)
 
     def replay():
         scene.pipeline.collide(scene.state_in, scene.contacts)
-        launched = cuda.cuGraphLaunch(graph_exec, stream)
-        assert launched == 0, launched
-        wp.synchronize_stream(wp.get_stream(device))
-
-    def release():
-        cuda.cuGraphExecDestroy(graph_exec)
-        cuda.cuGraphDestroy(graph)
+        launch()
 
     return replay, release
 
@@ -2822,7 +2833,7 @@ class _Heap:
     ):
         self.model = model if model is not None else _arm_heap_model(device, worlds=worlds, heap=heap)
         args = {
-            **steel_mode_options(response),
+            **_response(response),
             "deterministic": wp.DeterministicMode.RUN_TO_RUN,
             "iterations": 16,
             "contact_regularization": 0.01,

@@ -306,21 +306,20 @@ for device in devices:
         devices=[device],
     )
 
-    if device.is_cuda:
-        # Steel (CUDA only) publishes the same COM-referenced incoming joint wrench.
-        for name, test_fn in (
-            ("test_parent_force_static_pendulum", test_parent_force_static_pendulum),
-            ("test_parent_force_centrifugal", test_parent_force_centrifugal),
-            ("test_apply_body_f", test_apply_body_f),
-            ("test_parent_force_solver_observables", test_parent_force_solver_observables),
-        ):
-            add_function_test(
-                TestParentForce,
-                f"{name}_steel",
-                test_fn,
-                devices=[device],
-                solver_fn=newton.solvers.SolverSteel,
-            )
+    # Steel publishes the same COM-referenced incoming joint wrench on every device.
+    for name, test_fn in (
+        ("test_parent_force_static_pendulum", test_parent_force_static_pendulum),
+        ("test_parent_force_centrifugal", test_parent_force_centrifugal),
+        ("test_apply_body_f", test_apply_body_f),
+        ("test_parent_force_solver_observables", test_parent_force_solver_observables),
+    ):
+        add_function_test(
+            TestParentForce,
+            f"{name}_steel",
+            test_fn,
+            devices=[device],
+            solver_fn=newton.solvers.SolverSteel,
+        )
 
 
 if __name__ == "__main__":

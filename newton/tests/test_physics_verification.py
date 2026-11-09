@@ -1723,6 +1723,13 @@ for device in devices:
             solver_fn=newton.solvers.SolverKamino,
             rebound_rtol=0.03,
         )
+    add_function_test(
+        TestPhysicsVerification,
+        "test_restitution_steel",
+        test_restitution,
+        devices=[device],
+        solver_fn=_steel,
+    )
 
     # Full rigid restitution sweep: endpoint and intermediate coefficients,
     # coarse and fine timesteps, and late (gap=0) and predictive contacts.

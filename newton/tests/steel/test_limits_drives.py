@@ -101,7 +101,7 @@ def _built_rows(
     return J_group.numpy()[0, :count, 0].tolist(), world_phi.numpy()[0, :count].tolist()
 
 
-def _make_layout_scene(device, *, enable_joint_velocity_limits=True, response="immediate", iterations=0):
+def _make_layout_scene(device, *, enable_joint_velocity_limits=True, response="immediate", iterations=0, **options):
     """Build a scene that produces every row family: limits, velocity limits and contacts."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     SolverSteel.register_custom_attributes(builder)
@@ -145,7 +145,8 @@ def _make_layout_scene(device, *, enable_joint_velocity_limits=True, response="i
         articulation_constraint_max=64,
         free_body_constraint_max=64,
         iterations=iterations,
-        **steel_mode_options(response),
+        articulated_contact_response=response,
+        **options,
     )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy()
@@ -185,6 +186,31 @@ def test_combined_row_families_follow_the_documented_layout(test, device):
     test.assertGreater(contact_rows.size, 0)
     test.assertLess(limit_rows.max(), velocity_limit_rows.min())
     test.assertLess(velocity_limit_rows.max(), contact_rows.min())
+
+    mf_count = int(solver._mf_constraint_count.numpy()[0])
+    mf_types = solver._mf_row_type.numpy()[0, :mf_count]
+    mf_contact_end = int(solver._mf_contact_rows_end.numpy()[0])
+    mf_contacts = np.flatnonzero((mf_types == PGS_CONSTRAINT_TYPE_CONTACT) | (mf_types == PGS_CONSTRAINT_TYPE_FRICTION))
+    mf_velocity_limits = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    test.assertGreater(mf_contacts.size, 0)
+    test.assertGreater(mf_velocity_limits.size, 0)
+    test.assertTrue(np.all(mf_contacts < mf_contact_end))
+    test.assertTrue(np.all(mf_velocity_limits >= mf_contact_end))
+
+
+def test_dense_row_families_respect_phase_bounds(test, device):
+    """Without joint velocity limits, lay out dense rows as limits, contacts; free-body rows as contacts, velocity limits."""
+    solver = _make_layout_run(device, enable_joint_velocity_limits=False)
+    dense_count = int(solver._constraint_count.numpy()[0])
+    dense_types = solver._row_type.numpy()[0, :dense_count]
+    limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+    contact_rows = np.flatnonzero(
+        (dense_types == PGS_CONSTRAINT_TYPE_CONTACT) | (dense_types == PGS_CONSTRAINT_TYPE_FRICTION)
+    )
+    test.assertGreater(limit_rows.size, 0)
+    test.assertGreater(contact_rows.size, 0)
+    test.assertEqual(int(np.sum(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 0)
+    test.assertLess(limit_rows.max(), contact_rows.min())
 
     mf_count = int(solver._mf_constraint_count.numpy()[0])
     mf_types = solver._mf_row_type.numpy()[0, :mf_count]
@@ -372,9 +398,11 @@ def test_disabled_joint_limits_build_no_rows(test, device, **mode_kwargs):
     test.assertAlmostEqual(float(state_1.joint_q.numpy()[0]), 0.2, places=6)
 
 
-def _run_layout_trajectory(device, response, iterations):
-    """Step the layout scene four times; record each step's row families, impulses and joint state."""
-    model, solver, state_0, state_1, pipeline = _make_layout_scene(device, response=response, iterations=iterations)
+def _run_layout_trajectory(device, solve_mode, iterations):
+    """Step the propagation layout scene four times; record each step's row families, impulses and joint state."""
+    model, solver, state_0, state_1, pipeline = _make_layout_scene(
+        device, response="propagation", solve_mode=solve_mode, iterations=iterations
+    )
     contacts = pipeline.contacts()
     control = model.control()
     samples = []
@@ -408,10 +436,10 @@ def test_propagation_solves_every_row_family(test, device):
     propagation rows and their tree propagation, then the velocity-limit rows. The scene's
     articulated link sits on its limit against the ground and its free body has velocity limits.
     """
-    for response in ("propagation", "colored"):
+    for solve_mode in ("serial", "colored"):
         for iterations in (1, 8):
-            with test.subTest(response=response, iterations=iterations):
-                samples = _run_layout_trajectory(device, response, iterations)
+            with test.subTest(solve_mode=solve_mode, iterations=iterations):
+                samples = _run_layout_trajectory(device, solve_mode, iterations)
                 for step, sample in enumerate(samples):
                     types = sample["row_type"]
                     # Dense rows hold only the joint rows; every contact touching the link is a propagation row.
@@ -689,9 +717,6 @@ for _name, _func in (
         test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step,
     ),
     ("test_zero_speed_scale_ignores_the_speed", test_zero_speed_scale_ignores_the_speed),
-    ("test_limit_holds_a_driven_joint", test_limit_holds_a_driven_joint),
-    ("test_disabled_joint_limits_are_not_enforced", test_disabled_joint_limits_are_not_enforced),
-    ("test_disabled_joint_limits_build_no_rows", test_disabled_joint_limits_build_no_rows),
     (
         "test_default_finite_limits_keep_rows_and_warn_at_capacity",
         test_default_finite_limits_keep_rows_and_warn_at_capacity,
@@ -712,7 +737,23 @@ for _name, _func in (
     add_function_test(TestSteelJointLimitActivationGap, _name, _func, devices=devices)
 
 
-split_devices = get_test_devices()
+all_devices = get_test_devices()
+
+
+add_function_test(
+    TestSteelJointLimitActivationGap,
+    "test_dense_row_families_respect_phase_bounds",
+    test_dense_row_families_respect_phase_bounds,
+    devices=all_devices,
+)
+
+
+for _name, _func in (
+    ("test_limit_holds_a_driven_joint", test_limit_holds_a_driven_joint),
+    ("test_disabled_joint_limits_are_not_enforced", test_disabled_joint_limits_are_not_enforced),
+    ("test_disabled_joint_limits_build_no_rows", test_disabled_joint_limits_build_no_rows),
+):
+    add_function_test(TestSteelJointLimitActivationGap, _name, _func, devices=all_devices)
 
 
 for _name, _func in (
@@ -732,7 +773,7 @@ for _name, _func in (
         TestSteelJointLimitActivationGap,
         f"{_name}_scalar_builder",
         _func,
-        devices=split_devices,
+        devices=all_devices,
         scalar_builder=True,
     )
 
@@ -1099,12 +1140,11 @@ for _name, _func in (
         "test_rigid_axis_past_threshold_allocates_rows_same_step",
         test_rigid_axis_past_threshold_allocates_rows_same_step,
     ),
-    ("test_free_body_velocity_limits_hold", test_free_body_velocity_limits_hold),
 ):
     add_function_test(TestSteelVelocityLimitActivationFraction, _name, _func, devices=devices)
 
 
-# The allocators are mode-independent kernels; free-body velocity limits are also rows in split mode.
+# The allocators are device-independent kernels.
 for _name, _func in (
     ("test_fraction_zero_allocates_every_joint_row", test_fraction_zero_allocates_every_joint_row),
     ("test_fraction_gates_static_joint_dof_to_zero_rows", test_fraction_gates_static_joint_dof_to_zero_rows),
@@ -1119,6 +1159,14 @@ for _name, _func in (
     add_function_test(
         TestSteelVelocityLimitActivationFraction, _name, _func, devices=[d for d in get_test_devices() if d.is_cpu]
     )
+
+
+add_function_test(
+    TestSteelVelocityLimitActivationFraction,
+    "test_free_body_velocity_limits_hold",
+    test_free_body_velocity_limits_hold,
+    devices=get_test_devices(),
+)
 
 
 def _max_arm_speed_and_fused_over_impact(
@@ -1642,7 +1690,7 @@ add_function_test(
     TestSteelPGSDrives,
     "test_count_pass_assigns_no_drive_slot_above_the_sentinel",
     test_count_pass_assigns_no_drive_slot_above_the_sentinel,
-    devices=split_devices,
+    devices=all_devices,
 )
 
 
@@ -1815,7 +1863,7 @@ for _name, _func in (
     ("test_drive_force_is_clamped_to_the_effort_limit", test_drive_force_is_clamped_to_the_effort_limit),
     ("test_passive_joint_damping_is_applied", test_passive_joint_damping_is_applied),
 ):
-    add_function_test(TestSteelAugmentedDrives, _name, _func, devices=devices)
+    add_function_test(TestSteelAugmentedDrives, _name, _func, devices=all_devices)
 
 
 DT_JOINT_FRICTION = 0.01
@@ -1984,9 +2032,12 @@ class TestSteelJointFriction(unittest.TestCase):
                 model = _vertical_slider_model(mass=1.0, half=0.1, friction=friction)
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
                 contacts = pipeline.contacts()
-                solver = _friction_solver(
-                    model, friction_anchor_beta=0.0, iterations=24, **steel_mode_options(response)
+                route = (
+                    {"solve_mode": "colored", "articulated_contact_response": "propagation"}
+                    if response == "colored"
+                    else {"articulated_contact_response": response}
                 )
+                solver = _friction_solver(model, friction_anchor_beta=0.0, iterations=24, **route)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
                 for _ in range(150):
