@@ -270,7 +270,7 @@ def test_zero_speed_scale_ignores_the_speed(test, device, scalar_builder=False):
 
 
 def test_infinite_gap_allocates_every_finite_limit(test, device, scalar_builder=False):
-    """Create both rows of every finite limit with the default infinite gap."""
+    """Create both rows of every finite limit with an infinite gap."""
     jacobian, phi = _built_rows(device, 0.0, gap=float("inf"), scalar_builder=scalar_builder)
     test.assertEqual(jacobian, [1.0, -1.0])
     test.assertEqual(phi, [1.0, 1.0])
@@ -569,11 +569,24 @@ def _build_constrained_follower(device, *, closure: str, place: str = "follower"
     follower is unlimited and carries a passive coaxial link limited to 0.3 rad, resting at -0.24 rad, which the
     follower's swing turns toward its lower bound. With ``place="parent"`` (mimic only) the unlimited follower hangs
     from a passive link limited to 0.3 rad, resting at -0.24 rad, which the mimic's reaction turns toward its lower
-    bound. Returns the model and the limited coordinate.
+    bound. With ``place="chain"`` (mimic only) the limited passive joint is itself the follower and the driven leader
+    hangs below it, 0.2 rad from the follower's upper bound. Returns the model and the limited
+    coordinate.
     """
-    tip = place == "tip"
     inertia = wp.mat33(np.eye(3) * 0.1)
     limits = {"limit_lower": -0.3, "limit_upper": 0.3}
+    tip = place == "tip"
+    if place == "chain":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        follower = builder.add_link(mass=10.0, inertia=wp.mat33(np.eye(3)))
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, limit_lower=-0.3, limit_upper=0.2),
+            builder.add_joint_revolute(follower, leader, axis=newton.Axis.Z, target_ke=1.0e4, target_kd=10.0),
+        ]
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[0], joints[1])
+        return builder.finalize(device=device), 0
     if place == "parent":
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         parent = builder.add_link(mass=1.0, inertia=inertia)
@@ -619,10 +632,14 @@ def _build_constrained_follower(device, *, closure: str, place: str = "follower"
 
 
 def test_default_gap_holds_a_constrained_follower(test, device):
-    """A follower, or a link above or below it, that a mimic or loop closure carries across its bound in one step stops there."""
-    cases = itertools.product(("mimic", "connect"), ("follower", "tip", "parent"), (1.0 / 60.0, 1.0 / 120.0))
+    """A follower, or a link above or below it, that a mimic or loop closure carries across its bound in one step stops.
+
+    ``chain`` makes one mimic end the other's ancestor.
+    """
+    places = ("follower", "tip", "parent", "chain")
+    cases = itertools.product(("mimic", "connect"), places, (1.0 / 60.0, 1.0 / 120.0))
     for closure, place, dt in cases:
-        if closure == "connect" and place == "parent":
+        if closure == "connect" and place in ("parent", "chain"):
             continue
         with test.subTest(closure=closure, place=place, dt=dt):
             model, coord = _build_constrained_follower(device, closure=closure, place=place)
@@ -3018,7 +3035,7 @@ class TestSteelUnlimitedAxisRows(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
         count = int(solver._constraint_count.numpy()[0])
         types = solver._row_type.numpy()[0, :count]
-        # The root's lower/upper pair of each family; the infinite default activation gap keeps both sides.
+        # The root's lower/upper pair of each family; the infinite activation gap keeps both sides.
         self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 2)
         self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 2)
 

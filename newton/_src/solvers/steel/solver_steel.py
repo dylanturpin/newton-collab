@@ -2058,9 +2058,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 motion. Limit rows are speculative and apply no impulse while the joint cannot reach
                 its bound within the step, so the skipped rows are no-ops unless constraint impulses
                 in the solve, such as contacts, accelerate the joint toward the bound by more than
-                the margin in one step. Mimic and connect rows also act inside the solve, so the tree
-                joints between the two ends of each mimic or loop closure, and every joint below them,
-                always have their rows. Joints above a closure's common ancestor carry both ends and
+                the margin in one step. Mimic and connect rows also act inside the solve, so both
+                mimic ends, the tree joints between the two ends of each mimic or loop closure, and
+                every joint below them always have their rows. Joints above a closure's common ancestor carry both ends and
                 stay gated, which can miss a passive limited mount under opposed mimics. With
                 ``drive_mode="rows"`` the drives act inside the solve too, so ``None`` creates every
                 limit row, as ``inf`` does. A bound at or beyond ``MAXVAL``, the builder's unlimited
@@ -4147,11 +4147,10 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _persistent_dense_rows_per_world(self, model) -> tuple[np.ndarray, np.ndarray]:
         """Count the joint-limit and joint-friction dense rows every step allocates regardless of the state, per world.
 
-        With ``enable_joint_limits`` each finite
-        position limit of a DOF whose activation gap is ``inf`` of a responding PRISMATIC, REVOLUTE or D6 DOF is a row in every step,
-        mirroring the joint-limit row builder; a bound at or beyond the builder's unlimited default
-        ``MAXVAL`` has no row. With ``enable_joint_friction``
-        each responding, non-kinematic DOF with positive friction is one row in every step.
+        With ``enable_joint_limits`` each finite position limit of a responding PRISMATIC, REVOLUTE or D6 DOF whose
+        activation gap is ``inf`` is a row in every step, mirroring the joint-limit row builder; a bound at or beyond
+        the builder's unlimited default ``MAXVAL`` has no row. With ``enable_joint_friction`` each responding,
+        non-kinematic DOF with positive friction is one row in every step.
         """
         limit_rows = np.zeros(max(self._world_count, 1), dtype=np.int64)
         friction_rows = np.zeros_like(limit_rows)
@@ -4358,8 +4357,9 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _build_joint_limit_gap(self, model) -> None:
         """Build the per-DOF limit-row activation gap.
 
-        Under the default speed-aware gate, the tree joints between the two ends of each mimic or loop closure, and
-        every joint below them, get ``inf``: those rows move them inside the solve, which ``v_hat`` cannot see.
+        Under the default speed-aware gate, both mimic ends, the tree joints between the two ends of each mimic or
+        loop closure, and every joint below them get ``inf``: those rows move them inside the solve, which ``v_hat``
+        cannot see.
         """
         gap = np.full(model.joint_dof_count, self._joint_limit_gap_base, dtype=np.float32)
         coupled = self._mimic_count or self._connect_count
@@ -4389,7 +4389,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 pairs += [(joint_child[a], joint_child[b]) for a, b in zip(*ends, strict=True)]
             if self._connect_count:
                 pairs += [(joint_parent[j], joint_child[j]) for j in self._connect_joint_np.tolist()]
-            seeds = set()
+            # The mimic row moves both ends directly, even an end on the other's root path.
+            seeds = {int(j) for end in ends for j in end.tolist()} if self._mimic_count else set()
             for a, b in pairs:
                 seeds |= path(int(a)) ^ path(int(b))
             for joint in tree.tolist():
