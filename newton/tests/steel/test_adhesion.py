@@ -11,7 +11,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverSteel
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 240.0
 HALF = 0.1
@@ -68,9 +68,9 @@ def _set_adhesion(model, shape, value):
 class _Run:
     """A solver, pipeline and state pair stepping ``model`` eagerly."""
 
-    def __init__(self, model, contact_matching="disabled", observe=False, **options):
+    def __init__(self, model, contact_matching="disabled", observe=False, solver=None, **options):
         self.model = model
-        self.solver = SolverSteel(model, **options)
+        self.solver = solver or SolverSteel(model, **options)
         deterministic = options.get("deterministic") is not None
         self.pipeline = newton.CollisionPipeline(model, contact_matching=contact_matching, deterministic=deterministic)
         self.contacts = self.pipeline.contacts()
@@ -302,6 +302,50 @@ def test_mjcf_import(test, device):
     test.assertAlmostEqual(float(model.shape_gap.numpy()[by_label["frame"]]), 0.003, places=6)
 
 
+def test_usd_import(test, device):
+    """Read ``newton:steel:adhesion`` from a USD shape and hold a box that falls without it."""
+    if not USD_AVAILABLE:
+        test.skipTest("Requires usd-core")
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+    adhesion = 1.1 * WEIGHT / CONTACT_POINTS
+    for authored in (adhesion, None):
+        with test.subTest(authored=authored):
+            stage = Usd.Stage.CreateInMemory()
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            UsdPhysics.Scene.Define(stage, "/physicsScene")
+            ceiling = UsdGeom.Cube.Define(stage, "/ceiling")
+            ceiling.CreateSizeAttr(1.0)
+            ceiling.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.05))
+            ceiling.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, 0.1))
+            UsdPhysics.CollisionAPI.Apply(ceiling.GetPrim())
+            if authored is not None:
+                ceiling.GetPrim().CreateAttribute("newton:steel:adhesion", Sdf.ValueTypeNames.Float).Set(authored)
+            box = UsdGeom.Xform.Define(stage, "/box")
+            box.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0 - HALF))
+            UsdPhysics.RigidBodyAPI.Apply(box.GetPrim())
+            geom = UsdGeom.Cube.Define(stage, "/box/geom")
+            geom.CreateSizeAttr(2.0 * HALF)
+            UsdPhysics.CollisionAPI.Apply(geom.GetPrim())
+            UsdPhysics.MassAPI.Apply(geom.GetPrim()).CreateDensityAttr(DENSITY)
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+            SolverSteel.register_custom_attributes(builder)
+            builder.add_usd(stage)
+            model = builder.finalize(device=device)
+            labels = list(model.shape_label)
+            values = model.steel.adhesion.numpy()
+            ceiling_shape = next(i for i, label in enumerate(labels) if label.startswith("/ceiling"))
+            test.assertAlmostEqual(float(values[ceiling_shape]), authored or 0.0, places=5)
+            run = _Run(model)
+            run.step(120)
+            z = float(run.box_position()[2])
+            if authored is not None:
+                test.assertAlmostEqual(z, 1.0 - HALF, delta=1.0e-4)
+            else:
+                test.assertLess(z, 0.7)
+
+
 def test_validation(test, device):
     """Reject invalid adhesion values and options the adhesion law does not cover."""
     for value in (-1.0, float("nan")):
@@ -315,6 +359,15 @@ def test_validation(test, device):
     _set_adhesion(model, ceiling, -1.0)
     with test.assertRaisesRegex(ValueError, "steel:adhesion"):
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    model.steel.adhesion = wp.ones(model.shape_count - 1, dtype=wp.float32, device=device)
+    with test.assertRaisesRegex(ValueError, "steel:adhesion has shape"):
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    # A valid replacement reaches the next eager step.
+    model.steel.adhesion = wp.zeros(model.shape_count, dtype=wp.float32, device=device)
+    solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    run = _Run(model, solver=solver)
+    run.step(60)
+    test.assertLess(float(run.box_position()[2]), 0.8)
     model, ceiling = _hanging_box(device)
     solver = SolverSteel(model)
     _set_adhesion(model, ceiling, 1.0)
@@ -338,6 +391,7 @@ for _fn in (
     test_determinism,
     test_unused_is_bitwise_identical,
     test_mjcf_import,
+    test_usd_import,
     test_validation,
 ):
     add_function_test(TestSteelAdhesion, _fn.__name__, _fn, devices=devices)

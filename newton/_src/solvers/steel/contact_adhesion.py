@@ -193,6 +193,8 @@ def _adhesion_values(solver) -> np.ndarray:
     if array is None:
         return np.zeros(0, dtype=np.float32)
     values = array.numpy()
+    if values.shape != (model.shape_count,):
+        raise ValueError(f"steel:adhesion has shape {values.shape}, expected ({model.shape_count},)")
     variant = model._variant_shape_custom.get(f"steel:{ATTRIBUTE}")
     if variant is not None:
         _rows, options = model._variant_row_options()
