@@ -154,7 +154,7 @@ class Example:
         self.time = wp.zeros(1, dtype=wp.float32)
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(1.2, -1.0, 0.9), pitch=-20.0, yaw=145.0)
+        self.viewer.set_camera(pos=wp.vec3(1.1, 0.8, 0.9), pitch=-19.0, yaw=-146.0)
 
         self.angles = []
         self.capture()
