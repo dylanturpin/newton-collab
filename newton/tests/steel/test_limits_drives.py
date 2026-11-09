@@ -31,10 +31,21 @@ from newton._src.solvers.steel.kernels import (
 )
 from newton._src.solvers.steel.solver_steel import _get_joint_limit_warp_kernel, _use_resident_mfgs_metadata
 from newton.solvers import SolverBase, SolverSteel
+from newton.tests.steel._fixtures import _build_four_bar, steel_mode_options
 from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_cuda_test_devices, get_test_devices
 
 
-def _built_rows(device, q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, scalar_builder=False):
+def _built_rows(
+    device,
+    q: float,
+    *,
+    gap: float,
+    lower: float = -1.0,
+    upper: float = 1.0,
+    qd: float = 0.0,
+    speed_scale: float = 0.0,
+    scalar_builder=False,
+):
     """Build the joint-limit rows of one single-DOF articulation and return ``(J, phi)``.
 
     ``scalar_builder`` selects the one-thread-per-articulation Warp builder of the CPU path
@@ -53,7 +64,10 @@ def _built_rows(device, q: float, *, gap: float, lower: float = -1.0, upper: flo
         wp.array([lower], dtype=wp.float32, device=device),
         wp.array([upper], dtype=wp.float32, device=device),
         wp.array([q], dtype=wp.float32, device=device),
-        gap,
+        wp.array([gap], dtype=wp.float32, device=device),
+        wp.array([qd], dtype=wp.float32, device=device),
+        speed_scale,
+        0.01,
         max_constraints,
     ]
     outputs = [
@@ -236,8 +250,27 @@ def test_finite_gap_does_not_activate_unlimited_sentinel_limits(test, device, sc
     )
 
 
+def test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step(test, device, scalar_builder=False):
+    """Widen the gap by ``speed_scale * dt * |qd|`` in either direction of motion."""
+    # gap 0.05 + 2 * dt (0.01) * |qd|: at rest a joint 1 rad from both bounds builds no row.
+    test.assertEqual(_built_rows(device, 0.0, gap=0.05, speed_scale=2.0, scalar_builder=scalar_builder), ([], []))
+    # 30 rad/s reaches 0.65 rad: still short of both bounds.
+    rows = _built_rows(device, 0.0, gap=0.05, qd=30.0, speed_scale=2.0, scalar_builder=scalar_builder)
+    test.assertEqual(rows, ([], []))
+    # 60 rad/s widens the gap to 1.25 rad, past both bounds.
+    jacobian, phi = _built_rows(device, 0.0, gap=0.05, qd=-60.0, speed_scale=2.0, scalar_builder=scalar_builder)
+    test.assertEqual(jacobian, [1.0, -1.0])
+    test.assertEqual(phi, [1.0, 1.0])
+
+
+def test_zero_speed_scale_ignores_the_speed(test, device, scalar_builder=False):
+    """Keep the fixed gap when the speed scale is zero, whatever the speed."""
+    test.assertEqual(_built_rows(device, 0.0, gap=0.2, qd=1.0e6, scalar_builder=scalar_builder), ([], []))
+    test.assertEqual(_built_rows(device, 0.0, gap=0.2, qd=float("nan"), scalar_builder=scalar_builder), ([], []))
+
+
 def test_infinite_gap_allocates_every_finite_limit(test, device, scalar_builder=False):
-    """Create both rows of every finite limit with the default infinite gap."""
+    """Create both rows of every finite limit with an infinite gap."""
     jacobian, phi = _built_rows(device, 0.0, gap=float("inf"), scalar_builder=scalar_builder)
     test.assertEqual(jacobian, [1.0, -1.0])
     test.assertEqual(phi, [1.0, 1.0])
@@ -304,7 +337,12 @@ def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
             model = _build_default_limit_chain(device, count, limit=1.0)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                solver = SolverSteel(model, enable_joint_limits=True, warn_constraint_overflow=False)
+                solver = SolverSteel(
+                    model,
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=float("inf"),
+                    warn_constraint_overflow=False,
+                )
             messages = [str(w.message) for w in caught if "joint position limits" in str(w.message)]
             test.assertEqual(len(messages), int(expect_warning), messages)
             if expect_warning:
@@ -318,7 +356,10 @@ def test_default_finite_limits_keep_rows_and_warn_at_capacity(test, device):
     model = _build_default_limit_chain(device, 17, limit=1.0)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        SolverSteel(model, enable_joint_limits=True, articulation_constraint_max=34)
+        SolverSteel(
+            model, enable_joint_limits=True, joint_limit_activation_gap=float("inf"), articulation_constraint_max=34
+        )
+        SolverSteel(model, enable_joint_limits=True)
         gap_solver = SolverSteel(model, enable_joint_limits=True, joint_limit_activation_gap=0.5)
     test.assertFalse([w for w in caught if "joint position limits" in str(w.message)])
     gap_solver.step(model.state(), model.state(), model.control(), None, 0.01)
@@ -425,6 +466,250 @@ def test_propagation_solves_every_row_family(test, device):
                 test.assertGreater(max(float(np.max(np.abs(i))) for i in velocity_limit_impulses), 0.0)
 
 
+def _build_spinning_limited_link(device, qd: float):
+    """Build one revolute link at q=0 between +/-0.5 rad limits, spinning at ``qd`` without gravity."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    joint = builder.add_joint_revolute(-1, link, axis=newton.Axis.Z, limit_lower=-0.5, limit_upper=0.5)
+    builder.add_articulation([joint])
+    builder.joint_qd[0] = qd
+    return builder.finalize(device=device)
+
+
+def _limit_rows_and_trajectory(model, steps: int, **solver_options):
+    solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
+    state_0, state_1 = model.state(), model.state()
+    row_counts, q = [], []
+    for _ in range(steps):
+        solver.step(state_0, state_1, model.control(), None, 0.01)
+        row_counts.append(int(solver._constraint_count.numpy()[0]))
+        q.append(float(state_1.joint_q.numpy()[0]))
+        state_0, state_1 = state_1, state_0
+    return row_counts, np.array(q)
+
+
+def test_default_gap_skips_distant_limit_rows(test, device):
+    """The default gate builds no row for a resting joint far from its bounds; ``inf`` builds both."""
+    model = _build_spinning_limited_link(device, 0.0)
+    default_rows, _ = _limit_rows_and_trajectory(model, 1)
+    always_rows, _ = _limit_rows_and_trajectory(model, 1, joint_limit_activation_gap=float("inf"))
+    test.assertEqual(default_rows, [0])
+    test.assertEqual(always_rows, [2])
+
+
+def test_default_gap_holds_a_fast_joint_like_always_allocate(test, device):
+    """A joint crossing 0.4 rad per step, past the 0.05 rad base gap, stops at its bound as with ``inf``."""
+    model = _build_spinning_limited_link(device, 40.0)
+    default_rows, default_q = _limit_rows_and_trajectory(model, 6)
+    _, always_q = _limit_rows_and_trajectory(model, 6, joint_limit_activation_gap=float("inf"))
+    # The speed term builds the upper row from the first step, before the joint is within 0.05 rad.
+    test.assertGreater(default_rows[0], 0)
+    test.assertLessEqual(float(default_q.max()), 0.5 + 1.0e-4)
+    np.testing.assert_allclose(default_q, always_q, rtol=0.0, atol=1.0e-5)
+
+
+def _build_drive_jump_link(device, *, driven_parent: bool):
+    """Build a limited revolute link resting 0.06 rad below its 0.3 rad bound, accelerated toward it within a step.
+
+    With ``driven_parent`` the limited joint is a passive coaxial child of a parent driven toward -1 rad, which
+    turns the child's relative angle toward its bound; otherwise its own stiff drive targets 1 rad, past the bound.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    inertia = wp.mat33(np.eye(3) * 0.1)
+    limits = {"limit_lower": -0.3, "limit_upper": 0.3}
+    if driven_parent:
+        parent = builder.add_link(mass=1.0, inertia=inertia)
+        child = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, parent, axis=newton.Axis.Z, target_ke=1.0e4, target_kd=10.0),
+            builder.add_joint_revolute(parent, child, axis=newton.Axis.Z, **limits),
+        ]
+    else:
+        link = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [builder.add_joint_revolute(-1, link, axis=newton.Axis.Z, target_ke=500.0, target_kd=10.0, **limits)]
+    builder.add_articulation(joints)
+    builder.joint_q[-1] = 0.24
+    return builder.finalize(device=device)
+
+
+def _drive_jump_max_q(model, dt: float, target: float, coord: int = -1, **solver_options) -> float:
+    """Step ``model`` with every drive target at ``target`` and return the largest magnitude of ``coord``."""
+    solver = SolverSteel(model, enable_joint_limits=True, iterations=8, **solver_options)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    control.joint_target_q.fill_(target)
+    peak = -np.inf
+    for _ in range(6):
+        solver.step(state_0, state_1, control, None, dt)
+        peak = max(peak, abs(float(state_1.joint_q.numpy()[coord])))
+        state_0, state_1 = state_1, state_0
+    return peak
+
+
+def test_default_gap_holds_a_joint_accelerated_within_the_step(test, device):
+    """A resting joint that its drive or a driven parent carries across its bound in one step stops there."""
+    cases = itertools.product(("augmented", "rows"), (False, True), (1.0 / 60.0, 1.0 / 120.0))
+    for drive_mode, driven_parent, dt in cases:
+        with test.subTest(drive_mode=drive_mode, driven_parent=driven_parent, dt=dt):
+            model = _build_drive_jump_link(device, driven_parent=driven_parent)
+            target = -1.0 if driven_parent else 1.0
+            always = _drive_jump_max_q(
+                model, dt, target, drive_mode=drive_mode, joint_limit_activation_gap=float("inf")
+            )
+            default = _drive_jump_max_q(model, dt, target, drive_mode=drive_mode)
+            test.assertLessEqual(always, 0.3 + 1.0e-3)
+            test.assertLessEqual(default, always + 1.0e-4)
+
+
+def _build_constrained_follower(device, *, closure: str, place: str = "follower"):
+    """Build a passive revolute follower limited to 0.3 rad, resting at 0.24 rad, coupled to a leader driven past it.
+
+    ``closure="mimic"`` couples the follower to the leader with an identity mimic; ``"connect"`` builds a
+    parallelogram four-bar whose BALL loop joint makes the rocker follow the crank. With ``place="tip"`` the
+    follower is unlimited and carries a passive coaxial link limited to 0.3 rad, resting at -0.24 rad, which the
+    follower's swing turns toward its lower bound. With ``place="parent"`` (mimic only) the unlimited follower hangs
+    from a passive link limited to 0.3 rad, resting at -0.24 rad, which the mimic's reaction turns toward its lower
+    bound. With ``place="chain"`` (mimic only) the limited passive joint is itself the follower and the driven leader
+    hangs below it, 0.2 rad from the follower's upper bound. Returns the model and the limited
+    coordinate.
+    """
+    inertia = wp.mat33(np.eye(3) * 0.1)
+    limits = {"limit_lower": -0.3, "limit_upper": 0.3}
+    tip = place == "tip"
+    if place == "chain":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        follower = builder.add_link(mass=10.0, inertia=wp.mat33(np.eye(3)))
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, limit_lower=-0.3, limit_upper=0.2),
+            builder.add_joint_revolute(follower, leader, axis=newton.Axis.Z, target_ke=1.0e4, target_kd=10.0),
+        ]
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[0], joints[1])
+        return builder.finalize(device=device), 0
+    if place == "parent":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent = builder.add_link(mass=1.0, inertia=inertia)
+        follower = builder.add_link(mass=1.0, inertia=inertia)
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(-1, parent, axis=newton.Axis.Z, **limits),
+            builder.add_joint_revolute(parent, follower, axis=newton.Axis.Z),
+            builder.add_joint_revolute(-1, leader, axis=newton.Axis.Z, target_ke=1.0e3, target_kd=10.0),
+        ]
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[1], joints[2])
+        builder.joint_q[:] = [-0.24, 0.0, 0.0]
+        return builder.finalize(device=device), 0
+    if closure == "mimic":
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        leader = builder.add_link(mass=1.0, inertia=inertia)
+        follower = builder.add_link(mass=1.0, inertia=inertia)
+        joints = [
+            builder.add_joint_revolute(
+                -1, leader, axis=newton.Axis.Z, target_ke=1.0e3, target_kd=10.0, limit_lower=-3.0, limit_upper=3.0
+            ),
+            builder.add_joint_revolute(-1, follower, axis=newton.Axis.Z, **({} if tip else limits)),
+        ]
+        if tip:
+            link = builder.add_link(mass=1.0, inertia=inertia)
+            joints.append(builder.add_joint_revolute(follower, link, axis=newton.Axis.Z, **limits))
+        builder.add_articulation(joints)
+        builder.set_joint_mimic(joints[1], joints[0])
+        builder.joint_q[:] = [0.24, 0.24, -0.24] if tip else [0.24, 0.24]
+        return builder.finalize(device=device), len(joints) - 1
+    builder = _build_four_bar((-0.3, 0.3) if tip else None)
+    builder.gravity = wp.vec3(0.0, 0.0, 0.0)
+    builder.joint_target_ke[0] = 1.0e3
+    builder.joint_target_kd[0] = 10.0
+    builder.joint_q[:3] = [0.24, -0.24, 0.24]
+    if tip:
+        builder.joint_q[3] = -0.24
+    else:
+        builder.joint_limit_lower[2] = -0.3
+        builder.joint_limit_upper[2] = 0.3
+    return builder.finalize(device=device), 3 if tip else 2
+
+
+def test_default_gap_holds_a_constrained_follower(test, device):
+    """A follower, or a link above or below it, that a mimic or loop closure carries across its bound in one step stops.
+
+    ``chain`` makes one mimic end the other's ancestor.
+    """
+    places = ("follower", "tip", "parent", "chain")
+    cases = itertools.product(("mimic", "connect"), places, (1.0 / 60.0, 1.0 / 120.0))
+    for closure, place, dt in cases:
+        if closure == "connect" and place in ("parent", "chain"):
+            continue
+        with test.subTest(closure=closure, place=place, dt=dt):
+            model, coord = _build_constrained_follower(device, closure=closure, place=place)
+            options = {"articulated_contact_response": "immediate"}
+            always = _drive_jump_max_q(model, dt, 1.0, coord, joint_limit_activation_gap=float("inf"), **options)
+            default = _drive_jump_max_q(model, dt, 1.0, coord, **options)
+            test.assertLessEqual(always, 0.3 + 0.02)
+            test.assertLessEqual(default, always + 1.0e-4)
+
+
+def _build_spinning_velocity_limited_chain(device):
+    """Build a three-link revolute chain spinning past its 1 rad/s velocity limits under gravity."""
+    builder = newton.ModelBuilder()
+    parent, joints = -1, []
+    for k in range(3):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05))
+        builder.add_shape_box(link, hx=0.05, hy=0.05, hz=0.2)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.X,
+                parent_xform=wp.transform((0.0, 0.0, -0.4 if k else 1.0), wp.quat_identity()),
+                child_xform=wp.transform((0.0, 0.0, 0.2), wp.quat_identity()),
+                velocity_limit=1.0,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.joint_qd[:] = [3.0, -2.0, 4.0]
+    return builder.finalize(device=device)
+
+
+def _velocity_limited_trajectory(model, *, unit_rows: bool, **solver_options):
+    solver = SolverSteel(model, enable_joint_velocity_limits=True, iterations=8, **solver_options)
+    if not unit_rows:
+        # All-unset slot tables leave every velocity-limit row on the D-wide J*v reduction.
+        dummies = (
+            wp.full((2 * model.joint_dof_count,), -1, dtype=wp.int32, device=model.device),
+            wp.zeros((2 * model.joint_dof_count,), dtype=wp.float32, device=model.device),
+        )
+        solver._mf_gs_velocity_limit_unit_args = lambda: dummies
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    qd, vlim_rows = [], 0
+    for _ in range(10):
+        solver.step(state_0, state_1, model.control(), None, 0.01)
+        count = int(solver._constraint_count.numpy()[0])
+        vlim_rows = max(
+            vlim_rows, int(np.sum(solver._row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))
+        )
+        qd.append(state_1.joint_qd.numpy().copy())
+        state_0, state_1 = state_1, state_0
+    return np.array(qd), vlim_rows
+
+
+def test_velocity_limit_unit_rows_match_the_reduction(test, device):
+    """Reading a velocity-limit row's J*v from its unit DOF matches the D-wide reduction bit for bit."""
+    model = _build_spinning_velocity_limited_chain(device)
+    colored = steel_mode_options("colored")
+    # 512 rows stream the MF-GS row metadata from global memory instead of keeping it resident.
+    for options in ({}, colored, {"articulation_constraint_max": 512}, {**colored, "articulation_constraint_max": 512}):
+        with test.subTest(**options):
+            unit_qd, unit_rows = _velocity_limited_trajectory(model, unit_rows=True, **options)
+            reduced_qd, _ = _velocity_limited_trajectory(model, unit_rows=False, **options)
+            test.assertEqual(unit_rows, 6)
+            np.testing.assert_array_equal(unit_qd, reduced_qd)
+            test.assertLessEqual(float(np.abs(unit_qd[-1]).max()), 1.0 + 1.0e-4)
+
+
 class TestSteelJointLimitActivationGap(unittest.TestCase):
     pass
 
@@ -445,10 +730,26 @@ for _name, _func in (
     ),
     ("test_infinite_gap_allocates_every_finite_limit", test_infinite_gap_allocates_every_finite_limit),
     (
+        "test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step",
+        test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step,
+    ),
+    ("test_zero_speed_scale_ignores_the_speed", test_zero_speed_scale_ignores_the_speed),
+    (
         "test_default_finite_limits_keep_rows_and_warn_at_capacity",
         test_default_finite_limits_keep_rows_and_warn_at_capacity,
     ),
     ("test_propagation_solves_every_row_family", test_propagation_solves_every_row_family),
+    ("test_default_gap_skips_distant_limit_rows", test_default_gap_skips_distant_limit_rows),
+    (
+        "test_default_gap_holds_a_fast_joint_like_always_allocate",
+        test_default_gap_holds_a_fast_joint_like_always_allocate,
+    ),
+    (
+        "test_default_gap_holds_a_joint_accelerated_within_the_step",
+        test_default_gap_holds_a_joint_accelerated_within_the_step,
+    ),
+    ("test_default_gap_holds_a_constrained_follower", test_default_gap_holds_a_constrained_follower),
+    ("test_velocity_limit_unit_rows_match_the_reduction", test_velocity_limit_unit_rows_match_the_reduction),
 ):
     add_function_test(TestSteelJointLimitActivationGap, _name, _func, devices=devices)
 
@@ -479,6 +780,11 @@ for _name, _func in (
         test_finite_gap_does_not_activate_unlimited_sentinel_limits,
     ),
     ("test_infinite_gap_allocates_every_finite_limit", test_infinite_gap_allocates_every_finite_limit),
+    (
+        "test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step",
+        test_speed_scale_widens_the_gap_by_the_distance_reachable_this_step,
+    ),
+    ("test_zero_speed_scale_ignores_the_speed", test_zero_speed_scale_ignores_the_speed),
 ):
     add_function_test(
         TestSteelJointLimitActivationGap,
@@ -498,9 +804,12 @@ def test_warp_builder_matches_reference_row_order_and_values(test, device, scala
     size = 6
     max_constraints = 2 * size
     dof_count = articulation_count * size
-    gap = 0.25
     rng = np.random.default_rng(42)
     q = rng.uniform(-1.2, 1.2, dof_count).astype(np.float32)
+    # Speeds that widen some gaps past their bound and leave others short of it.
+    qd = rng.uniform(-40.0, 40.0, dof_count).astype(np.float32)
+    gap = rng.choice([0.05, np.inf], dof_count).astype(np.float32)
+    reach = gap + np.float32(2.0 * 0.01) * np.abs(qd)
     lower = np.full(dof_count, -1.0, dtype=np.float32)
     upper = np.full(dof_count, 1.0, dtype=np.float32)
 
@@ -521,7 +830,10 @@ def test_warp_builder_matches_reference_row_order_and_values(test, device, scala
         wp.array(lower, dtype=wp.float32, device=device),
         wp.array(upper, dtype=wp.float32, device=device),
         wp.array(q, dtype=wp.float32, device=device),
-        gap,
+        wp.array(gap, dtype=wp.float32, device=device),
+        wp.array(qd, dtype=wp.float32, device=device),
+        2.0,
+        0.01,
         max_constraints,
     ]
     if scalar_builder:
@@ -551,8 +863,8 @@ def test_warp_builder_matches_reference_row_order_and_values(test, device, scala
         for local in range(size):
             dof = art * size + local
             for sign, value, active in (
-                (1.0, q[dof] - lower[dof], q[dof] <= lower[dof] + gap),
-                (-1.0, upper[dof] - q[dof], q[dof] >= upper[dof] - gap),
+                (1.0, q[dof] - lower[dof], q[dof] <= lower[dof] + reach[dof]),
+                (-1.0, upper[dof] - q[dof], q[dof] >= upper[dof] - reach[dof]),
             ):
                 if active:
                     expected_J[len(expected_phi), local] = sign
@@ -1956,7 +2268,11 @@ class TestSteelJointFriction(unittest.TestCase):
             r".* set joint_friction to zero",
         ):
             _friction_solver(
-                limited, enable_joint_limits=True, articulation_constraint_max=2, warn_constraint_overflow=False
+                limited,
+                enable_joint_limits=True,
+                joint_limit_activation_gap=float("inf"),
+                articulation_constraint_max=2,
+                warn_constraint_overflow=False,
             )
         states, control = [model.state(), model.state()], model.control()
         _advance_friction(solver, states, control, 1)
@@ -2710,6 +3026,7 @@ class TestSteelUnlimitedAxisRows(unittest.TestCase):
         solver = SolverSteel(
             model,
             enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
             enable_joint_velocity_limits=True,
             articulation_constraint_max=32,
         )
@@ -2718,7 +3035,7 @@ class TestSteelUnlimitedAxisRows(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
         count = int(solver._constraint_count.numpy()[0])
         types = solver._row_type.numpy()[0, :count]
-        # The root's lower/upper pair of each family; the infinite default activation gap keeps both sides.
+        # The root's lower/upper pair of each family; the infinite activation gap keeps both sides.
         self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 2)
         self.assertEqual(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)), 2)
 

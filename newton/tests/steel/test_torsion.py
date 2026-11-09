@@ -4238,6 +4238,8 @@ def _link_launch(kernel, inputs, friction_start, row_phase):
             arr(inputs["parents"], int),
             arr(inputs["mu"]),
             *(zeros(dense) for _ in range(5)),
+            arr([-1, -1], int),
+            zeros(2),
             zeros(worlds, int),
             zeros(worlds, int),
             zeros((worlds, 4), int),
