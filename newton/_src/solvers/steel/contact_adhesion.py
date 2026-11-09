@@ -63,8 +63,11 @@ def allocate_contact_adhesion(solver) -> None:
     solver._adhesion_scratch = {route: wp.empty_like(impulses) for route, impulses in enumerate(families)}
 
 
-def prepare_contact_adhesion(solver, contacts, dt: float) -> None:
-    """Write each contact's pull impulse ``A dt`` for the rows it has this step, zero for the others."""
+def prepare_contact_adhesion(solver, contacts, dt: float, seed: bool) -> None:
+    """Write each contact's pull impulse ``A dt`` for the rows it has this step, zero for the others.
+
+    With ``seed``, also add the pull to the contact's cold-started normal row.
+    """
     model = solver.model
     wp.launch(
         compute_contact_adhesion_impulse,
@@ -81,34 +84,31 @@ def prepare_contact_adhesion(solver, contacts, dt: float) -> None:
             solver._propagation_constraint_count,
             model.steel.adhesion,
             dt,
+            int(seed),
         ],
-        outputs=[solver._contact_adhesion_impulse],
+        outputs=[
+            solver._contact_adhesion_impulse,
+            solver._impulses,
+            solver._mf_impulses,
+            solver._propagation_impulses,
+        ],
         device=model.device,
     )
-
-
-def seed_row_impulses(solver, route: int, impulses: wp.array) -> None:
-    """Add each adhesive normal row's pull ``A dt`` to a cold-started row family's impulses."""
-    _add_contact_adhesion_impulse(solver, route, impulses, 1.0)
 
 
 def net_row_impulses(solver, route: int, impulses: wp.array) -> wp.array:
     """Return a copy of a row family's impulses with each adhesive normal row's pull ``A dt`` subtracted."""
     scratch = solver._adhesion_scratch[route]
     wp.copy(scratch, impulses)
-    _add_contact_adhesion_impulse(solver, route, scratch, -1.0)
-    return scratch
-
-
-def _add_contact_adhesion_impulse(solver, route: int, impulses: wp.array, sign: float) -> None:
     pull = solver._contact_adhesion_impulse
     wp.launch(
-        add_contact_adhesion_impulse,
+        subtract_contact_adhesion_impulse,
         dim=pull.shape[0],
-        inputs=[solver._contact_world, solver._contact_slot, solver._contact_path, pull, route, sign],
-        outputs=[impulses],
+        inputs=[solver._contact_world, solver._contact_slot, solver._contact_path, pull, route],
+        outputs=[scratch],
         device=solver.model.device,
     )
+    return scratch
 
 
 @wp.kernel
@@ -124,10 +124,17 @@ def compute_contact_adhesion_impulse(
     propagation_constraint_count: wp.array[wp.int32],
     shape_adhesion: wp.array[wp.float32],
     dt: float,
+    seed: int,
     # outputs
     contact_adhesion_impulse: wp.array[wp.float32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
 ):
-    """Write ``(a0 + a1) dt`` for a contact with a row, zero for dropped and absent contacts."""
+    """Write ``(a0 + a1) dt`` for a contact with a row, zero for dropped and absent contacts.
+
+    With ``seed``, also add it to the contact's normal row.
+    """
     c = wp.tid()
     impulse = float(0.0)
     if c < wp.min(contact_count[0], contact_shape0.shape[0]):
@@ -149,28 +156,34 @@ def compute_contact_adhesion_impulse(
                 if shape_b >= 0:
                     force += shape_adhesion[shape_b]
                 impulse = force * dt
+                if seed != 0 and impulse != 0.0:
+                    if path == 0:
+                        world_impulses[world, slot] = world_impulses[world, slot] + impulse
+                    elif path == 1:
+                        mf_impulses[world, slot] = mf_impulses[world, slot] + impulse
+                    else:
+                        propagation_impulses[world, slot] = propagation_impulses[world, slot] + impulse
     contact_adhesion_impulse[c] = impulse
 
 
 @wp.kernel
-def add_contact_adhesion_impulse(
+def subtract_contact_adhesion_impulse(
     contact_world: wp.array[wp.int32],
     contact_slot: wp.array[wp.int32],
     contact_path: wp.array[wp.int32],
     contact_adhesion_impulse: wp.array[wp.float32],
     route: int,
-    sign: float,
     # in/out
     impulses: wp.array2d[wp.float32],
 ):
-    """Add ``sign`` times each adhesive contact's pull to its normal row in the row family ``route``."""
+    """Subtract each adhesive contact's pull from its normal row in the row family ``route``."""
     c = wp.tid()
     impulse = contact_adhesion_impulse[c]
     if impulse != 0.0:
         if contact_path[c] == route:
             world = contact_world[c]
             slot = contact_slot[c]
-            impulses[world, slot] = impulses[world, slot] + sign * impulse
+            impulses[world, slot] = impulses[world, slot] - impulse
 
 
 def _adhesion_values(solver) -> np.ndarray:

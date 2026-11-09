@@ -34,7 +34,6 @@ from .contact_adhesion import (
     configure_contact_adhesion,
     net_row_impulses,
     prepare_contact_adhesion,
-    seed_row_impulses,
     validate_contact_adhesion,
 )
 from .contact_angular_friction import (
@@ -8467,11 +8466,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         wp.copy(self._v_out, self._v_hat)
         adhesive = self._adhesion_enabled and has_contacts
         if adhesive:
-            prepare_contact_adhesion(self, contacts, dt)
-            if not self._contact_warmstart:
-                # Cold adhesive rows start at the pull, which leaves the velocity unchanged.
-                for route, impulses in enumerate((self._impulses, self._mf_impulses, self._propagation_impulses)):
-                    seed_row_impulses(self, route, impulses)
+            # Cold adhesive rows start at the pull, which leaves the velocity unchanged.
+            prepare_contact_adhesion(self, contacts, dt, seed=not self._contact_warmstart)
         elif self._adhesion_enabled:
             self._contact_adhesion_impulse.zero_()
         if self._contact_warmstart:
