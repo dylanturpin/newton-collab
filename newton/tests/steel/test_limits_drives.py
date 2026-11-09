@@ -2724,34 +2724,29 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_usd_reads_only_the_steel_coefficient(self):
         """Import the authored Steel coefficient and leave physxJoint:jointFriction unmapped."""
-        from pxr import Sdf, Usd, UsdGeom, UsdPhysics
-
-        stage = Usd.Stage.CreateInMemory()
-        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-        UsdPhysics.Scene.Define(stage, "/physicsScene")
-        authored = (
-            ("steel", "newton:steel:jointFrictionLoadCoefficient", 0.3),
-            ("physx", "physxJoint:jointFriction", 0.5),
+        coefficients = _usd_hinge_coefficients(
+            {
+                "steel": {"newton:steel:jointFrictionLoadCoefficient": 0.3},
+                "physx": {"physxJoint:jointFriction": 0.5},
+            }
         )
-        for i, (name, attribute, value) in enumerate(authored):
-            body = UsdGeom.Cube.Define(stage, f"/World/{name}")
-            body.AddTranslateOp().Set((2.0 * i, 0.0, 1.0))
-            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
-            mass = UsdPhysics.MassAPI.Apply(body.GetPrim())
-            mass.CreateMassAttr(1.0)
-            mass.CreateDiagonalInertiaAttr((0.1, 0.1, 0.1))
-            joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/{name}_hinge")
-            joint.CreateBody1Rel().SetTargets([body.GetPath()])
-            joint.CreateAxisAttr("Y")
-            joint.CreateLocalPos0Attr((2.0 * i, 0.0, 1.0))
-            joint.GetPrim().CreateAttribute(attribute, Sdf.ValueTypeNames.Float).Set(value)
-        builder = newton.ModelBuilder()
-        SolverSteel.register_custom_attributes(builder)
-        builder.add_usd(stage)
-        model = builder.finalize()
-        coefficients = dict(zip(model.joint_label, _load_coefficient(model).numpy().tolist(), strict=True))
         self.assertAlmostEqual(coefficients["/World/steel_hinge"], 0.3, places=6)
         self.assertEqual(coefficients["/World/physx_hinge"], 0.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_usd_reads_the_legacy_coefficient_name_with_a_warning(self):
+        """Read newton:steel:joint_friction_load_coefficient with a deprecation warning unless the current name is set."""
+        legacy = "newton:steel:joint_friction_load_coefficient"
+        with self.assertWarnsRegex(newton.exceptions.NewtonDeprecationWarning, f"'{legacy}' on joint prim"):
+            coefficients = _usd_hinge_coefficients({"legacy": {legacy: 0.4}})
+        self.assertAlmostEqual(coefficients["/World/legacy_hinge"], 0.4, places=6)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", newton.exceptions.NewtonDeprecationWarning)
+            coefficients = _usd_hinge_coefficients(
+                {"both": {"newton:steel:jointFrictionLoadCoefficient": 0.3, legacy: 0.9}}
+            )
+        self.assertAlmostEqual(coefficients["/World/both_hinge"], 0.3, places=6)
 
     def test_disabled_friction_ignores_coefficients(self):
         """Leave the coefficients unused when enable_joint_friction is off."""
@@ -2759,6 +2754,33 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
         effort = 0.5 * LOAD_COEFFICIENT * GRAVITY
         _, qd = _advance_hinge(_friction_solver(model, enable_joint_friction=False), model, effort, 5)
         np.testing.assert_allclose(qd, effort / INERTIA_LOAD * DT_JOINT_FRICTION * np.arange(1, 6), rtol=1.0e-4)
+
+
+def _usd_hinge_coefficients(authored):
+    """Import one hinge per entry of ``{name: {attribute: value}}`` and return its load coefficient by joint label."""
+    from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdPhysics.Scene.Define(stage, "/physicsScene")
+    for i, (name, attributes) in enumerate(authored.items()):
+        body = UsdGeom.Cube.Define(stage, f"/World/{name}")
+        body.AddTranslateOp().Set((2.0 * i, 0.0, 1.0))
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        mass = UsdPhysics.MassAPI.Apply(body.GetPrim())
+        mass.CreateMassAttr(1.0)
+        mass.CreateDiagonalInertiaAttr((0.1, 0.1, 0.1))
+        joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/{name}_hinge")
+        joint.CreateBody1Rel().SetTargets([body.GetPath()])
+        joint.CreateAxisAttr("Y")
+        joint.CreateLocalPos0Attr((2.0 * i, 0.0, 1.0))
+        for attribute, value in attributes.items():
+            joint.GetPrim().CreateAttribute(attribute, Sdf.ValueTypeNames.Float).Set(value)
+    builder = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(builder)
+    builder.add_usd(stage)
+    model = builder.finalize()
+    return dict(zip(model.joint_label, _load_coefficient(model).numpy().tolist(), strict=True))
 
 
 def _friction_solver(model, **overrides):

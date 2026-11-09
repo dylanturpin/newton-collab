@@ -150,6 +150,54 @@ class _Rollout:
         return np.asarray(body_q)
 
 
+def test_no_contact_matches_standalone(test, device):
+    """Follow standalone Steel exactly for a box far from the cloth: no feedback, no double gravity."""
+    for iterations in (1, 3):
+        model, _ = _build_box_cloth(device, box_z=3.0, ground=True)
+        standalone_model, _ = _build_box_cloth(device, box_z=3.0, ground=True, cloth=False)
+        coupled = _Rollout(model, _coupled(model, None, iterations=iterations))
+        reference = _Rollout(standalone_model, _steel(standalone_model))
+        coupled_q = coupled.run(60)
+        reference_q = reference.run(60)
+        np.testing.assert_allclose(coupled_q, reference_q, atol=1.0e-6, err_msg=f"iterations={iterations}")
+        fall = reference_q[0, 0, 2] - reference_q[-1, 0, 2]
+        expected = 0.5 * 9.81 * ((60 * DT) ** 2 - DT**2)
+        test.assertAlmostEqual(fall, expected, delta=0.02 * expected)
+        feedback = coupled.solver._proxy_mappings[0].coupling_forces.numpy()
+        test.assertEqual(float(np.abs(feedback).max()), 0.0)
+
+
+def test_gravity_acceleration_omits_disabled_bodies(test, device):
+    """Report the gravity acceleration Steel applies to each body."""
+    builder = newton.ModelBuilder()
+    for disable_gravity in (False, True):
+        body = builder.add_body(disable_gravity=disable_gravity)
+        builder.add_shape_sphere(body, radius=0.1)
+    model = builder.finalize(device=device)
+    acceleration = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
+    _steel(model).coupling_eval_gravity_acceleration(acceleration, None)
+    np.testing.assert_allclose(acceleration.numpy(), [[0.0, 0.0, -9.81], [0.0, 0.0, 0.0]], atol=1.0e-6)
+
+
+def test_masked_reset(test, device):
+    """Accept the SolverBase world-mask layout in coupled and standalone resets, and reject other lengths."""
+    model, boxes = _build_box_cloth(device, box_masses=(5.0, 5.0))
+    rollout = _Rollout(model, _coupled(model, boxes))
+    rollout.run(10)
+    mask = wp.array([True, False, False], dtype=wp.bool, device=device)
+    rollout.solver.reset(rollout.state_0, world_mask=mask)
+    rollout.run(10)
+    test.assertTrue(np.all(np.isfinite(rollout.state_0.body_q.numpy())))
+
+    standalone_model, _ = _build_box_cloth(device, box_masses=(5.0, 5.0), cloth=False)
+    solver = _steel(standalone_model)
+    state = standalone_model.state()
+    solver.reset(state, world_mask=mask)
+    for length in (1, 2):
+        with test.assertRaisesRegex(ValueError, r"must equal model\.world_count \+ 1"):
+            solver.reset(state, world_mask=wp.ones(length, dtype=wp.bool, device=device))
+
+
 def test_in_place_restart_refreshes_kinematics(test, device):
     """Re-derive kinematics when an in-place source restarts instead of reusing the previous solve's."""
     kwargs = {"box_z": 3.0, "box_joint_qd": (0.3, 0.0, 0.0, 0.0, 2.0, 1.0)}
@@ -1026,6 +1074,8 @@ class TestCoupledSolverSteel(unittest.TestCase):
 
 
 for _name, _func in (
+    ("test_no_contact_matches_standalone", test_no_contact_matches_standalone),
+    ("test_masked_reset", test_masked_reset),
     ("test_iteration_restart_preserves_patch_history", test_iteration_restart_preserves_patch_history),
     ("test_in_place_restart_refreshes_kinematics", test_in_place_restart_refreshes_kinematics),
     ("test_coupled_mass_matrix_cadence", test_coupled_mass_matrix_cadence),
@@ -1074,6 +1124,12 @@ add_function_test(
     TestCoupledSolverSteel,
     "test_split_articulation_gets_free_root",
     test_split_articulation_gets_free_root,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestCoupledSolverSteel,
+    "test_gravity_acceleration_omits_disabled_bodies",
+    test_gravity_acceleration_omits_disabled_bodies,
     devices=get_test_devices(),
 )
 add_function_test(

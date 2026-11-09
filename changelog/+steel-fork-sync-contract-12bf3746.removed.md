@@ -1,0 +1,1 @@
+Remove the `collide_done_event` argument of `SolverSteel.step()`. Call `wp.get_stream(model.device).wait_event(event)` before `step()` instead. `step()` takes five positional arguments, and `observables` stays keyword-only. `SolverSteel.reset()` takes only the `(world_count + 1,)` world mask of `SolverBase.reset()` and raises `ValueError` for a mask with one entry per world.

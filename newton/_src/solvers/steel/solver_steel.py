@@ -259,6 +259,8 @@ _MATERIAL_COMBINE_MODES = {
     "max": int(MATERIAL_COMBINE_MAX),
 }
 _ATTRIBUTE_NAMESPACE = "steel"
+_JOINT_FRICTION_LOAD_COEFFICIENT_USD = "newton:steel:jointFrictionLoadCoefficient"
+_LEGACY_JOINT_FRICTION_LOAD_COEFFICIENT_USD = "newton:steel:joint_friction_load_coefficient"
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
@@ -1827,7 +1829,9 @@ class SolverSteel(SolverBase, CouplingInterface):
           component about the joint axis, so a joint's own applied effort raises its friction. This is the joint
           friction law of PhysX articulations before PhysX 5.6, and the sum mixes units as it does there. USD
           reads it only from an explicitly authored ``newton:steel:jointFrictionLoadCoefficient``, not from
-          ``physxJoint:jointFriction``, because the rows interact with drives differently from PhysX.
+          ``physxJoint:jointFriction``, because the rows interact with drives differently from PhysX. The
+          earlier spelling ``newton:steel:joint_friction_load_coefficient`` is read with a
+          :class:`~newton.exceptions.NewtonDeprecationWarning` when the current name is not authored.
 
           .. experimental::
 
@@ -1848,6 +1852,20 @@ class SolverSteel(SolverBase, CouplingInterface):
             if not np.isfinite(value):
                 return float("inf")
             return value * np.pi / 180.0
+
+        def _joint_friction_load_coefficient_from_usd(_value, context):
+            prim = context["prim"]
+            attr = prim.GetAttribute(_JOINT_FRICTION_LOAD_COEFFICIENT_USD)
+            if attr and attr.HasAuthoredValue():
+                return float(attr.Get())
+            attr = prim.GetAttribute(_LEGACY_JOINT_FRICTION_LOAD_COEFFICIENT_USD)
+            if attr and attr.HasAuthoredValue():
+                warn_deprecation(
+                    f"'{_LEGACY_JOINT_FRICTION_LOAD_COEFFICIENT_USD}' on joint prim is deprecated; "
+                    f"use '{_JOINT_FRICTION_LOAD_COEFFICIENT_USD}' instead."
+                )
+                return float(attr.Get())
+            return None
 
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
@@ -1937,7 +1955,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
                 default=0.0,
-                usd_attribute_name="newton:steel:jointFrictionLoadCoefficient",
+                usd_attribute_name="*",
+                usd_value_transformer=_joint_friction_load_coefficient_from_usd,
             )
         )
 
