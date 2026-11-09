@@ -1839,7 +1839,8 @@ class SolverSteel(SolverBase, CouplingInterface):
           by the solved impulse, which is zero until the pull would close the gap within the step (MuJoCo
           removes friction there). :attr:`~newton.solvers.SolverBase.Observables.contact_f` and
           ``body_parent_f`` report the net force. The solver reads the values every step, so writing zero
-          releases a contact and writing the value engages it again, also between graph replays; a solver
+          releases a contact and writing the value engages it again, also between graph replays (a captured
+          step keeps the array it was captured with, so recapture after replacing it); a solver
           built without a positive value ignores the attribute and must be rebuilt to gain adhesion.
           Construction and :meth:`notify_model_changed` with ``SHAPE_PROPERTIES`` raise :class:`ValueError`
           for a negative or non-finite value. Adhesion keeps the dense mass factors and raises
