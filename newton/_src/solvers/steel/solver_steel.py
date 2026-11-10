@@ -2061,7 +2061,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_same_articulation_rows: bool = False,
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
-        propagation_color_order: Literal["contact", "longest_first"] = "contact",
+        propagation_color_order: Literal["contact", "longest_first", "rotating"] = "contact",
         friction_combine: Literal["average", "min", "multiply", "max"] = "average",
         restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
         free_rigid_torsional_friction: float | None = None,
@@ -2364,7 +2364,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 start cold. Carried impulses are scaled by the
                 ratio of the step to the previous one, including under graph replay; tangent
                 impulses are rotated into the current tangent frame and clamped to the
-                current friction cone; other rows start cold.
+                current friction cone; other rows start cold. The pipeline's default matching
+                compares world-space contact midpoints, so contacts that two bodies carry
+                together farther than ``contact_matching_pos_threshold`` per step can lose their
+                match and start cold; ``contact_matching_body_frame=True`` also matches them in
+                their bodies' frames.
             contact_warmstart_decay: Non-negative scale applied to the carried impulses.
             enable_restitution: Apply contact restitution, the only restitution switch. The
                 default ``True`` leaves the shapes' coefficients in charge; they default to
@@ -2581,6 +2585,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact, so ``"longest_first"`` puts long contacts together, which shortens the
                 sweep where one body carries many contacts with different row counts; on some
                 stacked scenes it converges more slowly at a fixed iteration count.
+                ``"rotating"`` walks the contact-index order in a different deterministic
+                permutation every step. Gauss-Seidel favours the contacts it solves last, so a
+                fixed order over a sorted contact stream (``CollisionPipeline(deterministic=True)``
+                or contact matching) can favour the same contacts every step and twist a symmetric
+                grasp; rotating spreads that over the contacts. Equal contact streams and step
+                counts give equal orders; reproducible runs still need ``deterministic`` and a
+                deterministic pipeline. It supports fewer than 1,048,583 propagation rows per world.
                 ``solve_mode="serial"`` ignores it.
             friction_combine: How a contact combines its two shapes' friction coefficients:
                 ``"average"``, ``"min"``, ``"multiply"`` or ``"max"``, as PhysX's material combine modes. It applies
@@ -2882,9 +2893,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_cached_response_body_max = int(propagation_cached_response_body_max)
         if self._propagation_cached_response_body_max < 1:
             raise ValueError("propagation_cached_response_body_max must be at least 1")
-        if propagation_color_order not in ("contact", "longest_first"):
+        if propagation_color_order not in ("contact", "longest_first", "rotating"):
             raise ValueError(
-                f"propagation_color_order must be 'contact' or 'longest_first', got {propagation_color_order!r}"
+                "propagation_color_order must be 'contact', 'longest_first' or 'rotating', "
+                f"got {propagation_color_order!r}"
             )
         self._propagation_color_order = propagation_color_order
         if self._propagation_same_articulation_rows and articulated_contact_response != "propagation":
@@ -2907,6 +2919,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_max_constraints = self._free_body_constraint_max + self._requested_dense_max_constraints
         else:
             self._propagation_max_constraints = self._requested_dense_max_constraints
+        if propagation_color_order == "rotating" and self._propagation_max_constraints >= _ROTATING_WALK_PRIMES[0]:
+            raise ValueError(
+                f"propagation_color_order='rotating' supports fewer than {_ROTATING_WALK_PRIMES[0]} propagation "
+                f"rows per world, got {self._propagation_max_constraints}"
+            )
         if articulated_contact_response != "immediate":
             colored = solve_mode == "colored"
             unsupported = [
@@ -3809,6 +3826,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._ws_history_dt.zero_()
             self._ws_history_generation.fill_(CONTACT_GENERATION_NONE)
             self._ws_history_stream.zero_()
+            if self._propagation_colored:
+                self._color_step.zero_()
         if self._compliance is not None:
             # The compliance status is solver-wide; a cause that persists latches again on the next step.
             self._compliance.counts.zero_()
@@ -11625,6 +11644,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         # The coloring sorts each world's units over a power-of-two stride.
         self._color_order_stride = 1 << max(rows - 1, 0).bit_length()
         self._color_unit_order = wp.zeros((worlds * self._color_order_stride,), dtype=wp.int32, device=device)
+        # Steps colored so far; with propagation_color_order="rotating" it sets each step's start and direction.
+        self._color_step = wp.zeros(1, dtype=wp.int32, device=device)
         self._color_unit_color = wp.zeros((units,), dtype=wp.int32, device=device)
         self._color_world_offsets = wp.zeros((worlds * (PROPAGATION_COLOR_TAIL + 2),), dtype=wp.int32, device=device)
         self._color_world_row_order = wp.zeros((units,), dtype=wp.int32, device=device)
@@ -11825,6 +11846,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             device_arch,
             max_body_span=min(max(span, 1), 16384 // (color_words * 4)),
             longest_first=self._propagation_color_order == "longest_first",
+            rotating=self._propagation_color_order == "rotating",
         )
 
     def _propagation_clear_rows(self) -> None:
@@ -11887,11 +11909,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
                 device=model.device,
             )
+            rotating = self._propagation_color_order == "rotating"
             wp.launch_tiled(
                 self._color_prebuild_kernel,
                 dim=[self._world_count],
                 inputs=[
                     self._world_count,
+                    *([self._color_step] if rotating else []),
                     self._color_world_unit_cursor,
                     self._color_unit_contact,
                     self._color_unit_body_a,
@@ -11908,6 +11932,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 block_dim=_COLOR_PREBUILD_BLOCK_DIM,
                 device=model.device,
             )
+            if rotating:
+                wp.launch(advance_color_step, dim=1, inputs=[self._color_step], device=model.device)
             self._color_unit_meta_stale = True
         wp.launch(
             build_propagation_contact_rows,
@@ -17530,6 +17556,15 @@ def _propagate_tree_impulses_multidof_shared_bytes(max_joints: int) -> int:
     return joints_cap * ((4 * 6 + 3 * 36 + 3) * 4 + 4 * 4)
 
 
+_ROTATING_WALK_PRIMES = (1048583, 1048589, 1048601, 1048609, 1048627, 1048633, 1048661, 1048681)
+"""Strides of the rotating color walk: primes above the supported per-world row count, so each is coprime with it."""
+
+
+@wp.kernel
+def advance_color_step(color_step: wp.array[wp.int32]):
+    color_step[0] = color_step[0] + 1
+
+
 @cache
 def _get_color_propagation_prebuild_kernel(
     propagation_max_constraints: int,
@@ -17539,12 +17574,15 @@ def _get_color_propagation_prebuild_kernel(
     device_arch: str,
     max_body_span: int = 0,
     longest_first: bool = False,
+    rotating: bool = False,
 ) -> "wp.Kernel":
     """Build the per-world coloring of the propagation contact units, run before the rows are built.
 
     Each block owns one world: it sorts the units by contact index, after row count (longest first)
     when ``longest_first`` is set, colors them first-fit over
-    per-body used-color bitmasks, counting-sorts them by color and rewrites ``contact_slot`` so
+    per-body used-color bitmasks (with ``rotating``, walking that order in a per-step permutation
+    read from a leading ``color_step`` input),
+    counting-sorts them by color and rewrites ``contact_slot`` so
     every color's rows are contiguous. It also writes each unit's start slot in color order and
     the per-color unit offsets. The same contact set gives the same coloring on every launch.
     """
@@ -17601,6 +17639,27 @@ def _get_color_propagation_prebuild_kernel(
 
     greedy_global = greedy("body_used_mask.data[{x} * " + str(WORDS) + " + word]", "ba", "bb")
     greedy_shared = greedy("s_mask[{x} * " + str(WORDS) + " + word]", "ba - body_base", "bb - body_base")
+    if rotating:
+        # Position p of the walk: a per-step permutation p -> (a * p + shift) mod n of the sorted order. a is a prime
+        # above the per-world row capacity (checked at construction), so it is coprime with n and the map is a
+        # bijection; it scatters neighbouring contacts across the walk.
+        assert propagation_max_constraints < _ROTATING_WALK_PRIMES[0]
+        primes = ", ".join(f"{p}u" for p in _ROTATING_WALK_PRIMES)
+        rotation_decl = f"""    const unsigned color_step_value = (unsigned)color_step.data[0];
+    const long long walk_n = (long long)max(n_units, 1);
+    const unsigned walk_primes[8] = {{{primes}}};
+    const long long walk_a = (long long)walk_primes[color_step_value & 7u];
+    const long long walk_shift = (long long)((color_step_value * 0x9E3779B9u) % (unsigned)walk_n);"""
+
+        def walk(p: str) -> str:
+            return f"(int)((walk_a * (long long)({p}) + walk_shift) % walk_n)"
+
+    else:
+        rotation_decl = ""
+
+        def walk(p: str) -> str:
+            return p
+
     mask_decl = """    __shared__ int s_body_lo, s_body_hi;
     if (t == 0) { s_body_lo = 0x7FFFFFFF; s_body_hi = -1; }
     __syncthreads();"""
@@ -17618,6 +17677,7 @@ def _get_color_propagation_prebuild_kernel(
     }}
     const int world_base = world * {M};
     const int order_base = world * {OS};
+{rotation_decl}
     int n_pad = 1;
     while (n_pad < n_units) n_pad <<= 1;
 
@@ -17715,7 +17775,7 @@ def _get_color_propagation_prebuild_kernel(
     for (int base = 0; base < n_units; base += {CH}) {{
         const int cnt = min({CH}, n_units - base);
         for (int i = t; i < cnt; i += {B}) {{
-            const int u = unit_order.data[order_base + base + i];
+            const int u = unit_order.data[order_base + {walk("base + i")}];
             s_u[i] = u;
             s_x[i] = unit_body_a.data[world_base + u];
             s_y[i] = unit_body_b.data[world_base + u];
@@ -17752,7 +17812,7 @@ def _get_color_propagation_prebuild_kernel(
     for (int base = 0; base < n_units; base += {CH}) {{
         const int cnt = min({CH}, n_units - base);
         for (int i = t; i < cnt; i += {B}) {{
-            const int u = unit_order.data[order_base + base + i];
+            const int u = unit_order.data[order_base + {walk("base + i")}];
             s_u[i] = u;
             s_x[i] = unit_color.data[world_base + u];
         }}
@@ -17797,58 +17857,116 @@ def _get_color_propagation_prebuild_kernel(
 #endif
 """
 
-    @wp.func_native(snippet)
-    def color_propagation_prebuild_native(
-        tile: int,
-        world_count: int,
-        world_unit_cursor: wp.array[int],
-        unit_contact: wp.array[int],
-        unit_body_a: wp.array[int],
-        unit_body_b: wp.array[int],
-        unit_len: wp.array[int],
-        body_used_mask: wp.array[int],
-        unit_order: wp.array[int],
-        unit_color: wp.array[int],
-        contact_slot: wp.array[int],
-        world_row_order: wp.array[int],
-        world_color_offsets: wp.array[int],
-        unit_sorted_contact: wp.array[int],
-    ): ...
+    if rotating:
 
-    def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
-        world_count: int,
-        world_unit_cursor: wp.array[int],
-        unit_contact: wp.array[int],
-        unit_body_a: wp.array[int],
-        unit_body_b: wp.array[int],
-        unit_len: wp.array[int],
-        body_used_mask: wp.array[int],
-        unit_order: wp.array[int],
-        unit_color: wp.array[int],
-        contact_slot: wp.array[int],
-        world_row_order: wp.array[int],
-        world_color_offsets: wp.array[int],
-        unit_sorted_contact: wp.array[int],
-    ):
-        tile, _t = wp.tid()
-        color_propagation_prebuild_native(
-            tile,
-            world_count,
-            world_unit_cursor,
-            unit_contact,
-            unit_body_a,
-            unit_body_b,
-            unit_len,
-            body_used_mask,
-            unit_order,
-            unit_color,
-            contact_slot,
-            world_row_order,
-            world_color_offsets,
-            unit_sorted_contact,
-        )
+        @wp.func_native(snippet)
+        def color_propagation_prebuild_native(
+            tile: int,
+            world_count: int,
+            color_step: wp.array[int],
+            world_unit_cursor: wp.array[int],
+            unit_contact: wp.array[int],
+            unit_body_a: wp.array[int],
+            unit_body_b: wp.array[int],
+            unit_len: wp.array[int],
+            body_used_mask: wp.array[int],
+            unit_order: wp.array[int],
+            unit_color: wp.array[int],
+            contact_slot: wp.array[int],
+            world_row_order: wp.array[int],
+            world_color_offsets: wp.array[int],
+            unit_sorted_contact: wp.array[int],
+        ): ...
 
-    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}_mbw{MBW}{'_lf' if longest_first else ''}"
+        def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
+            world_count: int,
+            color_step: wp.array[int],
+            world_unit_cursor: wp.array[int],
+            unit_contact: wp.array[int],
+            unit_body_a: wp.array[int],
+            unit_body_b: wp.array[int],
+            unit_len: wp.array[int],
+            body_used_mask: wp.array[int],
+            unit_order: wp.array[int],
+            unit_color: wp.array[int],
+            contact_slot: wp.array[int],
+            world_row_order: wp.array[int],
+            world_color_offsets: wp.array[int],
+            unit_sorted_contact: wp.array[int],
+        ):
+            tile, _t = wp.tid()
+            color_propagation_prebuild_native(
+                tile,
+                world_count,
+                color_step,
+                world_unit_cursor,
+                unit_contact,
+                unit_body_a,
+                unit_body_b,
+                unit_len,
+                body_used_mask,
+                unit_order,
+                unit_color,
+                contact_slot,
+                world_row_order,
+                world_color_offsets,
+                unit_sorted_contact,
+            )
+
+    else:
+
+        @wp.func_native(snippet)
+        def color_propagation_prebuild_native(
+            tile: int,
+            world_count: int,
+            world_unit_cursor: wp.array[int],
+            unit_contact: wp.array[int],
+            unit_body_a: wp.array[int],
+            unit_body_b: wp.array[int],
+            unit_len: wp.array[int],
+            body_used_mask: wp.array[int],
+            unit_order: wp.array[int],
+            unit_color: wp.array[int],
+            contact_slot: wp.array[int],
+            world_row_order: wp.array[int],
+            world_color_offsets: wp.array[int],
+            unit_sorted_contact: wp.array[int],
+        ): ...
+
+        def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
+            world_count: int,
+            world_unit_cursor: wp.array[int],
+            unit_contact: wp.array[int],
+            unit_body_a: wp.array[int],
+            unit_body_b: wp.array[int],
+            unit_len: wp.array[int],
+            body_used_mask: wp.array[int],
+            unit_order: wp.array[int],
+            unit_color: wp.array[int],
+            contact_slot: wp.array[int],
+            world_row_order: wp.array[int],
+            world_color_offsets: wp.array[int],
+            unit_sorted_contact: wp.array[int],
+        ):
+            tile, _t = wp.tid()
+            color_propagation_prebuild_native(
+                tile,
+                world_count,
+                world_unit_cursor,
+                unit_contact,
+                unit_body_a,
+                unit_body_b,
+                unit_len,
+                body_used_mask,
+                unit_order,
+                unit_color,
+                contact_slot,
+                world_row_order,
+                world_color_offsets,
+                unit_sorted_contact,
+            )
+
+    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}_mbw{MBW}{'_lf' if longest_first else ''}{'_rot' if rotating else ''}"
     color_propagation_prebuild_template.__name__ = name
     color_propagation_prebuild_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(

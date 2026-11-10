@@ -1824,6 +1824,7 @@ class CollisionPipeline:
         convex_face_clip: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
+        contact_matching_body_frame: bool = False,
         contact_matching_normal_dot_threshold: float = 0.995,
         contact_report: bool = False,
         verify_buffers: bool = True,
@@ -1983,6 +1984,16 @@ class CollisionPipeline:
                 keep fresh geometry when either saved witness moves farther than this
                 from its fresh contact point under the current body transforms.
                 Defaults to ``0.0005``.
+            contact_matching_body_frame: Also match a contact that stayed put on
+                its bodies: both witness points moved less than
+                ``contact_matching_pos_threshold`` in their own bodies' frames (the
+                world frame for a static shape) and the normal turned less than
+                ``contact_matching_normal_dot_threshold`` in both frames. This keeps the
+                contacts that two bodies carry together, such as a grasp moving with
+                the hand, which move far more than the threshold in world space between
+                frames. Requires a non-disabled ``contact_matching``. Adds 48 bytes per
+                contact slot (24 in sticky mode, which already keeps the points).
+                Defaults to ``False``.
             contact_matching_normal_dot_threshold: Minimum dot product between
                 old and new contact normals for a match.
             contact_report: Allocate ``rigid_contact_new_indices`` /
@@ -2046,6 +2057,8 @@ class CollisionPipeline:
         matching_sticky = contact_matching == "sticky"
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
+        if contact_matching_body_frame and not matching_enabled:
+            raise ValueError('contact_matching_body_frame=True requires contact_matching != "disabled"')
         if body_pair_reduction is not None and not isinstance(body_pair_reduction, self.BodyPairReductionConfig):
             raise TypeError(
                 "body_pair_reduction must be CollisionPipeline.BodyPairReductionConfig or None, "
@@ -2735,6 +2748,7 @@ class CollisionPipeline:
                 normal_dot_threshold=contact_matching_normal_dot_threshold,
                 contact_report=contact_report,
                 sticky=matching_sticky,
+                body_frame=bool(contact_matching_body_frame),
                 device=device,
             )
         else:

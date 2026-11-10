@@ -68,11 +68,18 @@ def _set_adhesion(model, shape, value):
 class _Run:
     """A solver, pipeline and state pair stepping ``model`` eagerly."""
 
-    def __init__(self, model, contact_matching="disabled", observe=False, solver=None, **options):
+    def __init__(
+        self, model, contact_matching="disabled", observe=False, solver=None, body_frame_matching=False, **options
+    ):
         self.model = model
         self.solver = solver or SolverSteel(model, **options)
         deterministic = options.get("deterministic") is not None
-        self.pipeline = newton.CollisionPipeline(model, contact_matching=contact_matching, deterministic=deterministic)
+        self.pipeline = newton.CollisionPipeline(
+            model,
+            contact_matching=contact_matching,
+            contact_matching_body_frame=body_frame_matching,
+            deterministic=deterministic,
+        )
         self.contacts = self.pipeline.contacts()
         self.state, self.next = model.state(), model.state()
         self.control = model.control()
@@ -124,9 +131,11 @@ def test_holds_until_pull_off(test, device):
 
 
 def test_solver_options(test, device):
-    """Hold the box with warm start, velocity-only iterations, point/late friction and Nesterov momentum."""
+    """Hold the box with warm start (world- and body-frame matching), velocity-only iterations, point/late friction
+    and Nesterov momentum."""
     cases = [
         ("warmstart", {"contact_warmstart": True}),
+        ("warmstart_body_frame_matching", {"contact_warmstart": True, "body_frame_matching": True}),
         ("velocity_iterations", {"velocity_iterations": 2}),
         ("point_friction", {"friction_anchor_beta": 0.0}),
         ("late_friction", {"contact_friction_position_iterations": 2}),

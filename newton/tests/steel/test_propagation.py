@@ -26,6 +26,7 @@ from newton._src.solvers.steel.kernels import (
     PROPAGATION_UNIT_RING,
 )
 from newton._src.solvers.steel.solver_steel import (
+    _ROTATING_WALK_PRIMES,
     _colored_staging_supported,
     _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
@@ -2122,14 +2123,21 @@ def _first_fit_reference(solver, world=0):
     body_b = solver._color_unit_body_b.numpy()[base : base + n]
     length = solver._color_unit_len.numpy()[base : base + n]
     longest_first = solver.propagation_color_order == "longest_first"
-    return (n, *_first_fit_coloring(contact, body_a, body_b, length, longest_first))
+    # The rotating order of the last coloring, which ran before the step counter advanced.
+    step = int(solver._color_step.numpy()[0]) - 1 if solver.propagation_color_order == "rotating" else None
+    return (n, *_first_fit_coloring(contact, body_a, body_b, length, longest_first, rotation_step=step))
 
 
-def _first_fit_coloring(contact, body_a, body_b, length, longest_first):
-    """Sort units by contact (after row count, longest first, if asked), color first-fit, and counting-sort by color."""
+def _first_fit_coloring(contact, body_a, body_b, length, longest_first, rotation_step=None):
+    """Sort units by contact (after row count, longest first, if asked), color first-fit, and counting-sort by color.
+
+    With ``rotation_step``, walk the contact order as ``propagation_color_order="rotating"`` does on that step.
+    """
     entries = PROPAGATION_COLOR_TAIL + 2
     n = len(contact)
     order = np.lexsort((contact, -np.minimum(length, 15))) if longest_first else np.argsort(contact, kind="stable")
+    if rotation_step is not None:
+        order = order[_rotating_walk(n, rotation_step)]
     used = {}
     color = np.zeros(n, dtype=np.int64)
     for u in order:
@@ -2149,6 +2157,12 @@ def _first_fit_coloring(contact, body_a, body_b, length, longest_first):
         cursor[color[u]] += 1
     row_start = np.concatenate([[0], np.cumsum(length[position_unit])])[:n]
     return color, offsets, row_start, contact[position_unit]
+
+
+def _rotating_walk(n, step):
+    """Positions of the sorted order that ``propagation_color_order="rotating"`` visits on ``step``."""
+    shift = ((step * 0x9E3779B9) % (1 << 32)) % max(n, 1)
+    return (_ROTATING_WALK_PRIMES[step & 7] * np.arange(n, dtype=np.int64) + shift) % n
 
 
 def _sweep_cost(color, length):
@@ -2312,7 +2326,12 @@ def test_coloring_is_deterministic_for_a_fixed_contact_set(test, device):
 
 def test_prebuild_matches_the_first_fit_reference(test, device):
     """Reproduce the host first-fit coloring exactly in either order, with shared and with global used-color masks."""
-    for shape, order in (((6, 6, 3), "longest_first"), ((7, 7, 6), "longest_first"), ((7, 7, 6), "contact")):
+    for shape, order in (
+        ((6, 6, 3), "longest_first"),
+        ((7, 7, 6), "longest_first"),
+        ((7, 7, 6), "contact"),
+        ((6, 6, 3), "rotating"),
+    ):
         with test.subTest(shape=shape, order=order):
             model = _heap(device, *shape)
             # The large heap overflows the rows; the coloring covers the units that were allocated.
@@ -2411,6 +2430,20 @@ def test_color_order_option_is_validated(test, device):
         solver.propagation_color_order = "contact"
 
 
+def test_rotating_walk_is_a_permutation_up_to_its_bound(test, device):
+    """Visit every unit exactly once for unit counts up to the bound, and reject a row capacity at the bound."""
+    bound = _ROTATING_WALK_PRIMES[0]
+    for n in (1, 2, 3, 7, 64, 4096, 65536, bound - 1):
+        for step in (0, 1, 7, 8, 12345):
+            walk = _rotating_walk(n, step)
+            test.assertEqual(len(np.unique(walk)), n, f"n={n} step={step}")
+    # The construction-time bound: at the smallest stride, (a * p) mod n would revisit position 0.
+    test.assertEqual(len(np.unique((bound * np.arange(bound, dtype=np.int64)) % bound)), 1)
+    model = _heap(device, nx=2, ny=2, nz=1)
+    with test.assertRaisesRegex(ValueError, "supports fewer than"):
+        _colored_solver(model, propagation_color_order="rotating", propagation_constraint_max=bound)
+
+
 def test_colored_accepts_a_large_row_budget(test, device):
     """Keep the per-unit coloring state in global scratch, so the row budget is uncapped."""
     model = _heap(device, nx=2, ny=2, nz=1)
@@ -2434,6 +2467,7 @@ for _fn in (
     test_prebuild_matches_the_reference_on_both_sort_paths,
     test_color_order_option_is_validated,
     test_colored_accepts_a_large_row_budget,
+    test_rotating_walk_is_a_permutation_up_to_its_bound,
 ):
     add_function_test(TestSteelColoredScheduling, _fn.__name__, _fn, devices=devices)
 

@@ -288,7 +288,9 @@ repository examples spend tuning effort, not a shared solver API.
        ``velocity_iterations`` remove the velocity that position correction
        adds, and ``contact_warmstart`` (with contact matching in the
        :class:`~newton.CollisionPipeline`) reuses the previous step's
-       impulses. ``contact_gap_gate`` and ``contact_speculative_scale`` bound
+       impulses. A grasped object carried farther than the matching threshold per
+       step can lose its contact matches; ``contact_matching_body_frame=True`` on
+       the pipeline also matches contacts in their bodies' frames. ``contact_gap_gate`` and ``contact_speculative_scale`` bound
        the work and the closing allowance of speculative contacts.
        Experimental contact torsion adds spin friction to the contacts of
        articulated bodies whose shapes carry a positive
@@ -389,7 +391,11 @@ repository examples spend tuning effort, not a shared solver API.
        shortens the colored sweep when one body carries contacts with
        different row counts. The saving shrinks as the world count grows, and the changed
        order can converge more slowly on stacks at a fixed iteration count, so measure the
-       full step at the target world count before switching. Both solve modes of
+       full step at the target world count before switching.
+       ``propagation_color_order="rotating"`` walks the contact order in a different
+       permutation every step. Use it with a sorted contact stream (contact matching or a
+       deterministic pipeline), where the fixed order favours the same contacts in every
+       sweep and can twist a symmetric grasp. Both solve modes of
        ``"propagation"`` solve contact torsion with ``contact_torsion_device=True`` and
        ``velocity_iterations=0``. ``solve_mode="serial"`` rejects contact compliance with
        ``"propagation"``, and ``solve_mode="colored"`` accepts it without contact torsion, which

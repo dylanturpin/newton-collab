@@ -1,0 +1,1 @@
+Add `CollisionPipeline(contact_matching_body_frame=True)` to also match contacts whose witness points and normal stayed within the matching thresholds in their own bodies' frames. Contacts that two bodies carry together, such as a grasp moved by a robot hand, then keep their match, so `SolverSteel(contact_warmstart=True)` and contact reports follow them.
