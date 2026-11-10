@@ -2697,6 +2697,15 @@ as motion on both sides of the contact, not just one.
 - ``contact_matching_normal_dot_threshold`` — minimum dot product between old
   and new contact normals.  Below this the contact is reported as broken even
   if the key and position match.
+- ``contact_matching_body_frame`` — also match a contact that stayed put on its
+  bodies: both witness points moved less than the position threshold in their
+  own bodies' frames (the world frame for a static shape) and the normal stayed
+  within the normal threshold in both frames.  World-space matching can lose
+  the contacts that two bodies carry together once they move farther than
+  ``contact_matching_pos_threshold`` per frame, for example a grasp moved by a
+  robot hand; this option also matches them in their bodies' frames, so warm
+  starting and contact reports can follow the grasp.  A contact that slides on either body still needs its midpoint to stay
+  put in the world.  Defaults to ``False``.
 
 **Sticky mode**
 
@@ -2706,7 +2715,9 @@ rows are left untouched, so new and threshold-broken contacts keep their fresh
 narrow-phase geometry.  Matched contacts also keep fresh geometry if the
 fresh contact is separated, or if either saved witness, transformed by the
 current body pose, lies farther than ``contact_matching_pos_threshold`` from
-its corresponding fresh witness.  This prevents a rotating surface from
+its corresponding fresh witness, or if the saved world normal differs from the
+fresh one by more than ``contact_matching_normal_dot_threshold`` (a contact
+matched in its bodies' frames after both turned together).  This prevents a rotating surface from
 replaying a stale material point even when its geometric contact midpoint
 stays put.  These contacts retain their match indices and reports, and the
 fresh geometry becomes the saved history for the next frame.  The extra
@@ -2718,7 +2729,8 @@ offsets) are only allocated when the mode is ``"sticky"``; ``"latest"`` and
 
 Both enabled modes keep the previous frame's sorted keys, uniqueness claims,
 contact midpoints and normals in buffers owned by the pipeline: 40 bytes per
-``rigid_contact_max`` slot.  ``"sticky"`` adds 48 bytes per slot and
+``rigid_contact_max`` slot.  ``"sticky"`` adds 48 bytes per slot,
+``contact_matching_body_frame=True`` 48 (24 together with sticky), and
 ``contact_report=True`` adds 4.  ``"disabled"`` allocates no matching history.
 
 The deterministic pipeline's sorter omits the unused simple-layout scratch,

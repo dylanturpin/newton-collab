@@ -47,6 +47,16 @@ def _build_simple_scene(device):
     return model, state
 
 
+def _build_stacked_boxes(device):
+    """Two free boxes, the upper one resting on the lower one, away from any other shape."""
+    builder = newton.ModelBuilder()
+    for z in (0.5, 0.5 + 0.2 - 1.0e-4):
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, z)))
+        builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+    model = builder.finalize(device=device)
+    return model, model.state()
+
+
 def _collide_once(pipeline, state, contacts):
     """Clear and collide, returning the contact count on host."""
     contacts.clear()
@@ -1317,6 +1327,89 @@ def test_sticky_unmatched_rows_pass_through(test, device):
         )
 
 
+def _carry_and_slide(device, body_frame: bool):
+    """Collide stacked boxes, move them together by 5.8 cm and 1.1 deg, then slide the upper box 2 cm.
+
+    Returns the match indices after the carry and after the slide, and which contacts after the slide lie
+    on the slid box's own edge.
+    """
+    model, state = _build_stacked_boxes(device)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="nxn", contact_matching="latest", contact_matching_body_frame=body_frame
+    )
+    contacts = pipeline.contacts()
+    test_count = _collide_once(pipeline, state, contacts)
+    assert test_count > 0
+    q = state.body_q.numpy()
+    turn = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.02)
+    for i in range(len(q)):
+        pose = wp.transform(wp.vec3(0.05, 0.0, 0.03), turn) * wp.transform(wp.vec3(*q[i][:3]), wp.quat(*q[i][3:]))
+        q[i] = [*pose.p, *pose.q]
+    state.body_q.assign(q)
+    count = _collide_once(pipeline, state, contacts)
+    carried = contacts.rigid_contact_match_index.numpy()[:count].copy()
+    q = state.body_q.numpy()
+    q[1][0] += 0.02
+    state.body_q.assign(q)
+    count = _collide_once(pipeline, state, contacts)
+    slid = contacts.rigid_contact_match_index.numpy()[:count].copy()
+    p0 = contacts.rigid_contact_point0.numpy()[:count]
+    body0 = model.shape_body.numpy()[contacts.rigid_contact_shape0.numpy()[:count]]
+    # The slid box's own corners sit at its x = -0.1 edge (in the upper box frame, or -0.08 in the lower one).
+    own_edge = np.where(body0 == 1, np.isclose(p0[:, 0], -0.1, atol=1e-3), np.isclose(p0[:, 0], -0.08, atol=1e-3))
+    return carried, slid, own_edge
+
+
+def test_body_frame_matching_keeps_carried_contacts(test, device):
+    """Match contacts two bodies carry together far past the threshold; break the ones that slide on a body."""
+    with wp.ScopedDevice(device):
+        carried, slid, own_edge = _carry_and_slide(device, body_frame=True)
+        test.assertTrue(np.all(carried >= 0), f"carried contacts must stay matched, got {carried}")
+        test.assertEqual(int(own_edge.sum()), 2, "expected two corners on the slid box's edge")
+        test.assertTrue(np.all(slid[own_edge] == MATCH_BROKEN), f"sliding corners must break, got {slid}")
+
+
+def test_world_frame_matching_breaks_carried_contacts(test, device):
+    """Without body-frame matching, a carry beyond the threshold breaks every contact (the default policy)."""
+    with wp.ScopedDevice(device):
+        carried, _slid, _own_edge = _carry_and_slide(device, body_frame=False)
+        test.assertTrue(np.all(carried == MATCH_BROKEN), f"world-frame matching kept {carried}")
+
+
+def test_body_frame_matching_requires_matching(test, device):
+    with wp.ScopedDevice(device):
+        model, _state = _build_simple_scene(device)
+        with test.assertRaisesRegex(ValueError, "contact_matching_body_frame"):
+            newton.CollisionPipeline(model, contact_matching="disabled", contact_matching_body_frame=True)
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", contact_matching_body_frame=True)
+        test.assertTrue(pipeline._contact_matcher.is_body_frame)
+        test.assertIsNotNone(pipeline._contact_matcher._prev_normal0)
+        test.assertIsNone(pipeline._contact_matcher._prev_offset0)
+
+
+def test_sticky_body_frame_rotation_keeps_fresh_normal(test, device):
+    """A body-frame match after both bodies turn 1 rad together must not replay the stale world normal."""
+    with wp.ScopedDevice(device):
+        model, state = _build_stacked_boxes(device)
+        pipeline = newton.CollisionPipeline(
+            model, broad_phase="nxn", contact_matching="sticky", contact_matching_body_frame=True
+        )
+        contacts = pipeline.contacts()
+        count = _collide_once(pipeline, state, contacts)
+        before = contacts.rigid_contact_normal.numpy()[:count].copy()
+        q = state.body_q.numpy()
+        turn = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 1.0)
+        for i in range(len(q)):
+            pose = wp.transform(wp.vec3(0.05, 0.0, 0.03), turn) * wp.transform(wp.vec3(*q[i][:3]), wp.quat(*q[i][3:]))
+            q[i] = [*pose.p, *pose.q]
+        state.body_q.assign(q)
+        count = _collide_once(pipeline, state, contacts)
+        test.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] >= 0))
+        expected = np.array(wp.quat_rotate(turn, wp.vec3(*before[0])))
+        normals = contacts.rigid_contact_normal.numpy()[:count]
+        np.testing.assert_allclose(normals @ expected, 1.0, atol=1.0e-4)
+
+
 def test_sticky_disabled_no_sticky_buffers(test, device):
     """LATEST and DISABLED modes must not allocate sticky buffers."""
     with wp.ScopedDevice(device):
@@ -1385,6 +1478,12 @@ add_function_test(
     devices=cuda_devices,
 )
 add_function_test(TestContactMatching, "test_new_contact_detection", test_new_contact_detection, devices=devices)
+for _fn in (
+    test_body_frame_matching_keeps_carried_contacts,
+    test_world_frame_matching_breaks_carried_contacts,
+    test_body_frame_matching_requires_matching,
+):
+    add_function_test(TestContactMatching, _fn.__name__, _fn, devices=devices)
 add_function_test(
     TestContactMatching,
     "test_broken_pos_threshold_all_contacts",
@@ -1495,6 +1594,12 @@ add_function_test(
 
 add_function_test(
     TestContactMatchingSticky, "test_sticky_matched_rows_replayed", test_sticky_matched_rows_replayed, devices=devices
+)
+add_function_test(
+    TestContactMatchingSticky,
+    "test_sticky_body_frame_rotation_keeps_fresh_normal",
+    test_sticky_body_frame_rotation_keeps_fresh_normal,
+    devices=devices,
 )
 add_function_test(
     TestContactMatchingSticky,

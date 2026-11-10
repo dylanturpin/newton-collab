@@ -1,0 +1,1 @@
+Add `SolverSteel(propagation_color_order="rotating")`, which colors propagation contacts in a different deterministic permutation of the contact order every step, so a sorted contact stream does not favour the same contacts in every Gauss-Seidel sweep.

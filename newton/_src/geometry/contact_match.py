@@ -14,7 +14,11 @@ sorted keys for the ``(shape_a, shape_b)`` pair range — ignoring the
 range whose normal also passes the dot-product threshold.  "Closest" is
 measured in world space between the contact *midpoints*
 ``0.5 * (world(point0) + world(point1))``, i.e. symmetric in shape 0 and
-shape 1.  The result is a per-contact match index:
+shape 1.  With ``body_frame`` the matcher also accepts a previous contact
+whose two witness points each moved less than the threshold in their own
+bodies' frames, with the normal within the threshold in both frames: a contact
+two bodies carry together, which can move freely in the world.  The smaller of
+the two distances orders the candidates.  The result is a per-contact match index:
 
 - ``>= 0``: index of the matched contact in the previous frame's sorted buffer.
 - ``MATCH_NOT_FOUND (-1)``: shape pair has no prior contacts.
@@ -72,6 +76,8 @@ each), 40 bytes/contact in total.  None of it aliases the
 sorting and matching (for example a pass that compacts the sorted stream) may
 reuse that scratch without corrupting the history.  Sticky mode adds the
 body-frame points and offsets (48 bytes/contact) and replays the owned normal.
+Body-frame matching keeps the body-frame points and normals (48 bytes/contact;
+24 with sticky, which shares the points).
 The optional contact report adds one ``int32`` flag per contact.
 
 Per-frame call order (inside :class:`~newton.CollisionPipeline`)::
@@ -225,6 +231,12 @@ class _MatchData:
     prev_keys: wp.array[wp.int64]
     prev_pos_world: wp.array[wp.vec3]
     prev_normal: wp.array[wp.vec3]
+    # Witness points and normal in each shape's body frame (world for a static shape); read with has_body_frame.
+    prev_point0_body: wp.array[wp.vec3]
+    prev_point1_body: wp.array[wp.vec3]
+    prev_normal0_body: wp.array[wp.vec3]
+    prev_normal1_body: wp.array[wp.vec3]
+    has_body_frame: int
     prev_count: wp.array[wp.int32]
     # ``[buffer id, contact generation]`` of the previous frame.
     prev_frame: wp.array[wp.int32]
@@ -318,6 +330,13 @@ def _match_contacts_kernel(data: _MatchData):
 
     new_pos_w = 0.5 * (p0w + p1w)
     new_n = data.new_normal[tid]
+    new_n0 = new_n
+    new_n1 = new_n
+    if data.has_body_frame != 0:
+        if bid0 != -1:
+            new_n0 = wp.quat_rotate_inv(wp.transform_get_rotation(data.body_q[bid0]), new_n)
+        if bid1 != -1:
+            new_n1 = wp.quat_rotate_inv(wp.transform_get_rotation(data.body_q[bid1]), new_n)
 
     # Binary search the [range_lo, range_hi) interval of prev contacts
     # sharing the same (shape_a, shape_b) pair.  We ignore sort_sub_key
@@ -339,16 +358,23 @@ def _match_contacts_kernel(data: _MatchData):
     best_idx = int(-1)
     best_dist_sq = float(data.pos_threshold_sq)
     for old_idx in range(range_lo, range_hi):
-        old_pos = data.prev_pos_world[old_idx]
-        diff = new_pos_w - old_pos
-        dist_sq = wp.dot(diff, diff)
+        dist_sq = float(1.0e30)
+        diff = new_pos_w - data.prev_pos_world[old_idx]
+        if wp.dot(new_n, data.prev_normal[old_idx]) >= data.normal_dot_threshold:
+            dist_sq = wp.dot(diff, diff)
+        if data.has_body_frame != 0:
+            # Neither side slid on its own body: the contact moved with both bodies.
+            if (
+                wp.dot(new_n0, data.prev_normal0_body[old_idx]) >= data.normal_dot_threshold
+                and wp.dot(new_n1, data.prev_normal1_body[old_idx]) >= data.normal_dot_threshold
+            ):
+                diff0 = p0 - data.prev_point0_body[old_idx]
+                diff1 = p1 - data.prev_point1_body[old_idx]
+                dist_sq = wp.min(dist_sq, wp.max(wp.dot(diff0, diff0), wp.dot(diff1, diff1)))
 
         if dist_sq <= best_dist_sq:
-            old_n = data.prev_normal[old_idx]
-            ndot = wp.dot(new_n, old_n)
-            if ndot >= data.normal_dot_threshold:
-                best_dist_sq = dist_sq
-                best_idx = old_idx
+            best_dist_sq = dist_sq
+            best_idx = old_idx
 
     if best_idx >= 0:
         data.match_index[tid] = wp.int32(best_idx)
@@ -408,11 +434,12 @@ class _SaveStateData:
 
     ``src_point0`` / ``src_point1`` and their shape indices are consumed every
     frame to compute the symmetric world-space midpoint written into
-    ``dst_pos_world``.  ``src_offset*`` and the ``dst_*_body`` columns are
-    only consumed when ``has_sticky != 0``; when sticky is disabled the
-    matcher passes dummy arrays for those slots and the kernel's
-    ``if has_sticky`` guard skips the extra writes, so sticky-only columns
-    need zero allocation in the non-sticky path.
+    ``dst_pos_world``.  The ``dst_point*_body`` columns are written when
+    ``has_sticky != 0`` or ``has_body_frame != 0``, the ``dst_normal*_body``
+    columns only with ``has_body_frame``, and ``src_offset*`` and the
+    ``dst_offset*_body`` columns only with ``has_sticky``; a mode that keeps no
+    such column gets dummy arrays, which the guards never touch, so it needs
+    zero allocation for them.
     """
 
     src_keys: wp.array[wp.int64]
@@ -435,6 +462,8 @@ class _SaveStateData:
     dst_normal: wp.array[wp.vec3]
     dst_point0_body: wp.array[wp.vec3]
     dst_point1_body: wp.array[wp.vec3]
+    dst_normal0_body: wp.array[wp.vec3]
+    dst_normal1_body: wp.array[wp.vec3]
     dst_offset0_body: wp.array[wp.vec3]
     dst_offset1_body: wp.array[wp.vec3]
     dst_claim: wp.array[wp.int64]
@@ -443,6 +472,7 @@ class _SaveStateData:
     dst_frame: wp.array[wp.int32]
 
     has_sticky: int
+    has_body_frame: int
     has_report: int
 
 
@@ -484,11 +514,22 @@ def _save_sorted_state_kernel(data: _SaveStateData, reset_world_mask: wp.array[w
             p1w = wp.transform_point(data.body_q[bid1], p1)
 
         data.dst_pos_world[i] = 0.5 * (p0w + p1w)
-        data.dst_normal[i] = data.src_normal[i]
+        n = data.src_normal[i]
+        data.dst_normal[i] = n
 
-        if data.has_sticky != 0:
+        if data.has_sticky != 0 or data.has_body_frame != 0:
             data.dst_point0_body[i] = p0
             data.dst_point1_body[i] = p1
+        if data.has_body_frame != 0:
+            n0 = n
+            if bid0 != -1:
+                n0 = wp.quat_rotate_inv(wp.transform_get_rotation(data.body_q[bid0]), n)
+            n1 = n
+            if bid1 != -1:
+                n1 = wp.quat_rotate_inv(wp.transform_get_rotation(data.body_q[bid1]), n)
+            data.dst_normal0_body[i] = n0
+            data.dst_normal1_body[i] = n1
+        if data.has_sticky != 0:
             data.dst_offset0_body[i] = data.src_offset0[i]
             data.dst_offset1_body[i] = data.src_offset1[i]
 
@@ -538,6 +579,7 @@ class _ReplayData:
     body_q: wp.array[wp.transform]
     shape_body: wp.array[wp.int32]
     pos_threshold_sq: float
+    normal_dot_threshold: float
 
 
 @wp.kernel(enable_backward=False)
@@ -560,6 +602,11 @@ def _replay_matched_kernel(data: _ReplayData):
 
     fresh_gap = wp.dot(p1_world - p0_world, data.normal[tid]) - (data.margin0[tid] + data.margin1[tid])
     if fresh_gap > wp.float32(0.0):
+        return
+
+    # The saved normal is world-space: after both bodies turn together (a body-frame match) it no longer
+    # describes the contact, so keep the fresh geometry.
+    if wp.dot(data.prev_normal[idx], data.normal[tid]) < data.normal_dot_threshold:
         return
 
     # Body-local witnesses can leave the fresh contact when a body rotates.
@@ -675,6 +722,10 @@ class ContactMatcher:
             :meth:`replay_matched`, which replays the owned previous normal.
             When ``False`` these attributes are ``None`` and no extra kernel
             launches are added.
+        body_frame: Also match contacts whose witness points and normal stayed
+            within the thresholds in their own bodies' frames (contacts two bodies
+            carry together). Allocates the body-frame points (shared with sticky)
+            and normals.
         device: Device to allocate on.
     """
 
@@ -691,6 +742,7 @@ class ContactMatcher:
         normal_dot_threshold: float = 0.995,
         contact_report: bool = False,
         sticky: bool = False,
+        body_frame: bool = False,
         device: Devicelike = None,
     ):
         with wp.ScopedDevice(device):
@@ -740,16 +792,25 @@ class ContactMatcher:
             # properties are either key-derived or per-shape constants and so
             # identical on the next frame for a matched contact.
             self._sticky = sticky
-            if sticky:
+            self._body_frame = bool(body_frame)
+            if sticky or body_frame:
                 self._prev_point0 = wp.zeros(capacity, dtype=wp.vec3)
                 self._prev_point1 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_offset0 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_offset1 = wp.zeros(capacity, dtype=wp.vec3)
             else:
                 self._prev_point0 = None
                 self._prev_point1 = None
+            if sticky:
+                self._prev_offset0 = wp.zeros(capacity, dtype=wp.vec3)
+                self._prev_offset1 = wp.zeros(capacity, dtype=wp.vec3)
+            else:
                 self._prev_offset0 = None
                 self._prev_offset1 = None
+            if body_frame:
+                self._prev_normal0 = wp.zeros(capacity, dtype=wp.vec3)
+                self._prev_normal1 = wp.zeros(capacity, dtype=wp.vec3)
+            else:
+                self._prev_normal0 = None
+                self._prev_normal1 = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -759,6 +820,11 @@ class ContactMatcher:
     def has_report(self) -> bool:
         """Whether the contact report buffers are allocated."""
         return self._has_report
+
+    @property
+    def is_body_frame(self) -> bool:
+        """Whether contacts carried together by their bodies also match."""
+        return self._body_frame
 
     @property
     def is_sticky(self) -> bool:
@@ -865,6 +931,12 @@ class ContactMatcher:
         data.prev_keys = self._prev_sorted_keys
         data.prev_pos_world = self._prev_pos_world
         data.prev_normal = self._prev_normal
+        # Without body-frame matching the kernel never reads these; any vec3 array keeps the struct valid.
+        data.prev_point0_body = self._prev_point0 if self._body_frame else self._prev_pos_world
+        data.prev_point1_body = self._prev_point1 if self._body_frame else self._prev_pos_world
+        data.prev_normal0_body = self._prev_normal0 if self._body_frame else self._prev_pos_world
+        data.prev_normal1_body = self._prev_normal1 if self._body_frame else self._prev_pos_world
+        data.has_body_frame = 1 if self._body_frame else 0
         data.prev_count = self._prev_count
         data.prev_frame = self._prev_frame
         data.reset_world_mask = self._reset_world_mask
@@ -971,23 +1043,25 @@ class ContactMatcher:
 
         data.dst_prev_was_matched = self._prev_was_matched
         data.has_report = 1 if self._has_report else 0
+        # The struct requires a valid array for every field; the kernel's
+        # has_sticky / has_body_frame guards skip the columns a mode does not keep.
+        keeps_points = self._sticky or self._body_frame
+        data.dst_point0_body = self._prev_point0 if keeps_points else self._prev_pos_world
+        data.dst_point1_body = self._prev_point1 if keeps_points else self._prev_pos_world
+        data.dst_normal0_body = self._prev_normal0 if self._body_frame else self._prev_pos_world
+        data.dst_normal1_body = self._prev_normal1 if self._body_frame else self._prev_pos_world
+        data.has_body_frame = 1 if self._body_frame else 0
         if self._sticky:
             if sorted_offset0 is None or sorted_offset1 is None:
                 raise ValueError("save_sorted_state requires sorted_offset0/offset1 when sticky is enabled")
             data.src_offset0 = sorted_offset0
             data.src_offset1 = sorted_offset1
-            data.dst_point0_body = self._prev_point0
-            data.dst_point1_body = self._prev_point1
             data.dst_offset0_body = self._prev_offset0
             data.dst_offset1_body = self._prev_offset1
             data.has_sticky = 1
         else:
-            # The struct requires a valid array for every field -- the
-            # kernel guards with has_sticky==0 and never reads/writes them.
             data.src_offset0 = sorted_point0
             data.src_offset1 = sorted_point0
-            data.dst_point0_body = self._prev_pos_world
-            data.dst_point1_body = self._prev_pos_world
             data.dst_offset0_body = self._prev_pos_world
             data.dst_offset1_body = self._prev_pos_world
             data.has_sticky = 0
@@ -1062,6 +1136,7 @@ class ContactMatcher:
         data.shape_body = shape_body
 
         data.pos_threshold_sq = self._pos_threshold_sq
+        data.normal_dot_threshold = self._normal_dot_threshold
         wp.launch(_replay_matched_kernel, dim=self._capacity, inputs=[data], device=device)
 
     def build_report(
