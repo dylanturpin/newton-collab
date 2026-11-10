@@ -658,6 +658,11 @@ def compute_shape_aabbs(
 #   followed by an optional deepest-contact write).
 _CONVEX_PAIR_MAX_CONTACTS = 5
 #
+# * With ``CollisionPipeline(convex_mesh_patch=True)`` a CONVEX_MESH-CONVEX_MESH
+#   pair can write up to 7 patch contacts plus the deepest contact
+#   (``multicontact.py::build_convex_mesh_patch_manifold``).
+_CONVEX_MESH_PATCH_PAIR_MAX_CONTACTS = 8
+#
 # * Mesh/heightfield-involved pairs (mesh-convex, mesh-plane, mesh-mesh,
 #   heightfield-*) and hydroelastic SDF-SDF pairs route their per-triangle /
 #   per-vertex contacts through contact reduction, which retains at most
@@ -776,8 +781,10 @@ class _RigidContactCountEstimate:
     source: Literal["fallback", "minimum", "neighbor heuristic", "precomputed pairs", "pair caps", "pair locality"]
 
 
-def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
+def _estimate_rigid_contact_details(model: Model, convex_mesh_patch: bool = False) -> _RigidContactCountEstimate:
     """Estimate rigid-contact capacity and retain its diagnostic inputs.
+
+    ``convex_mesh_patch`` budgets convex-mesh pairs for the patch's larger per-pair cap.
 
     When precomputed contact pairs are available (``model.shape_contact_pairs``,
     populated by :meth:`ModelBuilder.finalize`), the estimate is the exact sum of per-pair worst-case contact counts
@@ -833,6 +840,13 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     fixed_box_mask = shape_types == int(GeoType.BOX)
     if variant_options is not None:
         fixed_box_mask &= ~variant_options.row_mask
+    convex_mesh_types = (int(GeoType.CONVEX_MESH),)
+    # Without the collision flags, so that a supplied pair array's endpoints count as well.
+    convex_mesh_mask = (
+        np.isin(shape_types, convex_mesh_types)
+        if variant_options is None
+        else variant_options.may_be(shape_types, convex_mesh_types)
+    )
 
     # ------------------------------------------------------------------
     # Pair-aware exact bound: sum of per-pair worst cases over the actual
@@ -851,8 +865,8 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
         def count(mask):
             return _shape_contact_pair_count_for_mask(model, mask)
 
-        def pair_caps(within):
-            """Return the per-pair worst-case contacts of the pairs whose two shapes are both in ``within``."""
+        def pair_routes(within):
+            """Return the pair, mesh-route and hydroelastic-route counts of pairs with both shapes in ``within``."""
             pairs = count(within)
             # Pairs where both shapes are hydroelastic route to the SDF-SDF hydroelastic path, whose anchor
             # export can exceed the reduction slots by one contact per normal bin.
@@ -863,9 +877,22 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
             sdf_edge_box = sdf_edge & fixed_box_mask
             mesh += count(sdf_edge) - count(sdf_edge_box)
             mesh -= count(sdf_edge & hydro_mask) - count(sdf_edge_box & hydro_mask)
+            return pairs, mesh, hydro
+
+        def pair_caps(within):
+            """Return the count and per-pair worst-case contacts of the pairs with both shapes in ``within``."""
+            pairs, mesh, hydro = pair_routes(within)
             convex = pairs - mesh - hydro
-            caps = convex * _CONVEX_PAIR_MAX_CONTACTS + mesh * _MESH_PAIR_MAX_CONTACTS
-            return pairs, caps + hydro * _HYDRO_PAIR_MAX_CONTACTS
+            caps = (
+                convex * _CONVEX_PAIR_MAX_CONTACTS + mesh * _MESH_PAIR_MAX_CONTACTS + hydro * _HYDRO_PAIR_MAX_CONTACTS
+            )
+            if convex_mesh_patch:
+                # Convex-mesh pairs on the convex route can carry the patch's extra contacts.
+                patch_pairs, patch_mesh, patch_hydro = pair_routes(within & convex_mesh_mask)
+                caps += (patch_pairs - patch_mesh - patch_hydro) * (
+                    _CONVEX_MESH_PATCH_PAIR_MAX_CONTACTS - _CONVEX_PAIR_MAX_CONTACTS
+                )
+            return pairs, caps
 
         total_pairs, pair_contacts = pair_caps(everything)
         if total_pairs > 0:
@@ -893,6 +920,8 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
                 else:
                     active = colliding_mask & ~plane_shape
                 shape_cap = np.full(int(np.count_nonzero(active)), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+                if convex_mesh_patch:
+                    shape_cap[convex_mesh_mask[active]] = _CONVEX_MESH_PATCH_PAIR_MAX_CONTACTS
                 shape_cap[(mesh_mask | sdf_edge_mask)[active]] = _MESH_PAIR_MAX_CONTACTS
                 shape_cap[hydro_mask[active]] = _HYDRO_PAIR_MAX_CONTACTS
                 nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
@@ -920,6 +949,11 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     num_non_planes = int(np.count_nonzero(non_plane_mask))
     num_primitives = num_non_planes - num_meshes
     num_planes = int(np.count_nonzero(plane_mask))
+    # Extra per-pair contacts the convex-mesh patch can add, counted once per convex mesh.
+    patch_extra = 0
+    if convex_mesh_patch:
+        num_convex_meshes = int(np.count_nonzero(colliding_mask & convex_mesh_mask))
+        patch_extra = num_convex_meshes * (_CONVEX_MESH_PATCH_PAIR_MAX_CONTACTS - _RIGID_CONTACTS_PER_PRIMITIVE_PAIR)
 
     # Weighted contacts from non-plane shape types.
     # Each shape's neighbor pairs are weighted by its type's contacts-per-pair.
@@ -927,11 +961,12 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     non_plane_contacts = (
         num_primitives * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR
         + num_meshes * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE * _RIGID_CONTACTS_PER_MESH_PAIR
+        + patch_extra * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE
     ) // 2
 
     # Weighted average contacts-per-pair based on the scene's shape mix.
     avg_cpp = (
-        (num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR)
+        (num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR + patch_extra)
         // max(num_non_planes, 1)
         if num_non_planes > 0
         else 0
@@ -974,7 +1009,9 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
         else:
             # Fallback: exact type-weighted sum (correct for single-world models).
             plane_contacts = num_planes * (
-                num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR
+                num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR
+                + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR
+                + patch_extra
             )
 
     heuristic_contacts = non_plane_contacts + plane_contacts
@@ -1005,9 +1042,9 @@ def _estimate_rigid_contact_details(model: Model) -> _RigidContactCountEstimate:
     )
 
 
-def _estimate_rigid_contact_max(model: Model) -> int:
+def _estimate_rigid_contact_max(model: Model, convex_mesh_patch: bool = False) -> int:
     """Estimate the rigid-contact capacity for the collision pipeline."""
-    return _estimate_rigid_contact_details(model).capacity
+    return _estimate_rigid_contact_details(model, convex_mesh_patch).capacity
 
 
 def _warn_large_rigid_contact_estimate(estimate: _RigidContactCountEstimate) -> None:
@@ -1822,6 +1859,7 @@ class CollisionPipeline:
         deterministic: bool = False,
         box_box_sat: bool = False,
         convex_face_clip: bool = False,
+        convex_mesh_patch: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_body_frame: bool = False,
@@ -1934,6 +1972,26 @@ class CollisionPipeline:
                 often keeps a single support vertex. Selected at construction and
                 fixed for the pipeline's lifetime. Experimental: the option and
                 its contacts may change without a deprecation period. Cannot be
+                combined with a prebuilt ``narrow_phase``. Defaults to False.
+            convex_mesh_patch: For a pair of convex meshes with verified hull
+                topology whose sampled contact features are not flat to 10 um,
+                ray-cast each hull's vertices within 20 um of its extreme plane
+                along the normal (80 um in a second pass if the first spans no
+                triangle) onto the other hull, and keep up to 7 of these
+                exact-witness contacts plus the GJK/MPR contact. Pairs the patch
+                does not cover keep the vertex-face or single-point manifold.
+                A pair can then report up to 8 contacts. The automatic
+                ``rigid_contact_max`` estimate counts 8 per convex-mesh pair when
+                this is set; a capacity taken from ``model.rigid_contact_max`` or
+                passed explicitly must allow for it, as must solver budgets sized
+                from the model (e.g. ``SolverMuJoCo``'s ``njmax``). The patch stores at
+                most 64 candidates per pair, but finding them tests each slab
+                vertex against the hulls' triangles, so cost grows with the
+                hulls' vertex and triangle counts. It suits decomposed hulls of
+                tens of vertices; a single hull of several hundred vertices
+                makes collision several times slower. Selected at construction and fixed for the pipeline's
+                lifetime. Experimental: the option and its
+                contacts may change without a deprecation period. Cannot be
                 combined with a prebuilt ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
@@ -2106,7 +2164,7 @@ class CollisionPipeline:
             if model_rigid_contact_max is not None:
                 rigid_contact_max = model_rigid_contact_max
             else:
-                rigid_contact_estimate = _estimate_rigid_contact_details(model)
+                rigid_contact_estimate = _estimate_rigid_contact_details(model, convex_mesh_patch)
                 rigid_contact_max = rigid_contact_estimate.capacity
                 _warn_large_rigid_contact_estimate(rigid_contact_estimate)
         self._rigid_contact_max = rigid_contact_max
@@ -2168,6 +2226,11 @@ class CollisionPipeline:
                 raise ValueError(
                     "convex_face_clip cannot be used when narrow_phase is provided; "
                     "construct the NarrowPhase with convex_face_clip=True instead"
+                )
+            if convex_mesh_patch:
+                raise ValueError(
+                    "convex_mesh_patch cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with convex_mesh_patch=True instead"
                 )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
@@ -2530,6 +2593,7 @@ class CollisionPipeline:
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 box_box_sat=box_box_sat,
                 convex_face_clip=convex_face_clip,
+                convex_mesh_patch=convex_mesh_patch,
                 convex_support_acceleration=model._convex_support_lut.shape[0] > 1,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
