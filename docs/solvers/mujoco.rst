@@ -726,6 +726,15 @@ automatic conversion between native ``Model.tendon_*`` routes and
 target resolution use the provider path; see
 :doc:`/concepts/usd_parsing` for supported path attributes.
 
+:class:`~newton.solvers.SolverSteel` simulates the same ``model.mujoco.tendon_*`` data,
+so one model runs on both solvers. Range limits and friction loss become constraint
+rows; armature, the stiffness/damping spring-damper and actuators with a tendon
+transmission are folded into the mass matrix along the tendon Jacobian, with the
+spring integration selected by its ``tendon_passive_mode`` option. Steel requires each
+tendon to move the DOFs of a single articulation and enforces limits rigidly: it does not
+model ``solref``/``solimp`` softening, force-space limit gains, actuator activation
+dynamics, or tendon equality constraints.
+
 For force-based limit gains, set ``model.mujoco.tendon_limit_ke`` (stiffness
 [N/m]) and ``tendon_limit_kd`` (damping [N s/m]), select force-space authoring
 with ``tendon_solref_limit_mode = 0``, then notify
