@@ -223,7 +223,12 @@ def test_tendon_across_articulations_is_ignored(test, device):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         run = _Run(mjcf, device, iterations=8)
-    test.assertTrue(any("cross-articulation" in str(w.message) for w in caught))
+    test.assertTrue(
+        any(
+            "cross-articulation" in str(w.message) and issubclass(w.category, newton.exceptions.NewtonWarning)
+            for w in caught
+        )
+    )
     test.assertIsNone(run.solver.tendon_lengths())
     run.step(1.0e-3, 100)
     test.assertAlmostEqual(run.qd("a"), -G * 0.1, delta=1.0e-3)

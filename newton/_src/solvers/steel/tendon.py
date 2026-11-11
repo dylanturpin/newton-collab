@@ -30,6 +30,7 @@ import numpy as np
 import warp as wp
 
 from ...core.reset import reset_world_selected
+from ...exceptions import NewtonWarning
 from ...geometry import GeoType
 from ...sim import BodyFlags
 from .kernels import (
@@ -1244,7 +1245,9 @@ class TendonPlan:
                 ]
                 if bad:
                     warnings.warn(
-                        f"SolverSteel: fixed tendon '{name}' references multi-DoF joints {bad}; ignored.", stacklevel=3
+                        f"SolverSteel: fixed tendon '{name}' references multi-DoF joints {bad}; ignored.",
+                        NewtonWarning,
+                        stacklevel=3,
                     )
                     continue
                 arts = {int(joint_articulation[j]) for j in joints}
@@ -1253,7 +1256,9 @@ class TendonPlan:
                 elements = range(start, start + int(wrap_num[k]))
                 if any(int(wrap_type[e]) == 2 and float(wrap_prm[e]) <= 0.0 for e in elements):
                     warnings.warn(
-                        f"SolverSteel: tendon '{name}' has a non-positive pulley divisor; ignored.", stacklevel=3
+                        f"SolverSteel: tendon '{name}' has a non-positive pulley divisor; ignored.",
+                        NewtonWarning,
+                        stacklevel=3,
                     )
                     continue
                 for e in elements:
@@ -1266,6 +1271,7 @@ class TendonPlan:
                 warnings.warn(
                     f"SolverSteel: tendon '{name}' must move DOFs of exactly one articulation "
                     f"(touches {sorted(arts)}); cross-articulation and DOF-free tendons are ignored.",
+                    NewtonWarning,
                     stacklevel=3,
                 )
                 continue
@@ -1447,6 +1453,7 @@ class TendonPlan:
                 warnings.warn(
                     f"SolverSteel: tendon actuator '{name}' needs activation dynamics or a non-affine gain/bias, "
                     "which Steel does not model; ignored.",
+                    NewtonWarning,
                     stacklevel=4,
                 )
                 continue
