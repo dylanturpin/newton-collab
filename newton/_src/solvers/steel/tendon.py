@@ -29,6 +29,7 @@ import warnings
 import numpy as np
 import warp as wp
 
+from ...core.reset import reset_world_selected
 from ...geometry import GeoType
 from ...sim import BodyFlags
 from .kernels import (
@@ -1106,6 +1107,22 @@ def apply_tendon_mass_terms_for_size(
             J_prev[k, d] = J_scratch[k, 0, d]
         has_prev[k] = 1
     else:
+        has_prev[k] = 0
+
+
+@wp.kernel
+def clear_tendon_armature_history(
+    world_mask: wp.array[wp.bool],
+    world_count: int,
+    tendon_art: wp.array[int],
+    articulation_world: wp.array[int],
+    # outputs
+    has_prev: wp.array[int],
+):
+    """Restart the armature ``dJ/dt`` backward difference of the tendons in the worlds ``world_mask`` selects."""
+    k = wp.tid()
+    art = tendon_art[k]
+    if art >= 0 and reset_world_selected(articulation_world[art], world_mask, world_count):
         has_prev[k] = 0
 
 

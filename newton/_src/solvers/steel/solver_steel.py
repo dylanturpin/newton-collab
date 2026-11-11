@@ -246,6 +246,7 @@ from .tendon import (
     TendonPlan,
     allocate_tendon_slots,
     apply_tendon_mass_terms_for_size,
+    clear_tendon_armature_history,
     gate_fixed_tendon_limit_rows,
     gate_tendon_limit_rows,
     gather_tendon_forces,
@@ -3812,8 +3813,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         With ``reuse_kinematics`` on, the solver keeps the kinematics and inverse-dynamics terms it
         formed when publishing a step, for the next step's input state. Overwriting or replacing
         that state's ``joint_q``, ``joint_qd`` or ``body_q`` makes them stale; call this so the next
-        step re-derives them for the selected worlds. :meth:`reset` does the same for its worlds
-        beside its other clears. Without the carry this is a no-op.
+        step re-derives them for the selected worlds. It also restarts the ``dJ/dt`` history of their
+        spatial-tendon armature, which a teleport would otherwise turn into an impulse. :meth:`reset`
+        does the same for its worlds beside its other clears.
 
         Args:
             state: The state the next step reads, whose joint or body arrays were written.
@@ -3824,6 +3826,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         """
         del state
         world_mask = self._normalize_reset_world_mask(world_mask)
+        self._clear_tendon_armature_history(world_mask)
         if not self._reuse_kinematics_enabled:
             return
         if world_mask is None:
@@ -3848,7 +3851,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         The simulation state is not modified. For the selected worlds this clears the
         capacity status in :attr:`constraint_overflow`, discards the warm-start impulses
-        and the friction-patch anchors, requests a mass-matrix refresh on the next step and,
+        and the friction-patch anchors, requests a mass-matrix refresh on the next step, restarts
+        the ``dJ/dt`` history of spatial-tendon armature and,
         with ``reuse_kinematics`` on, drops their carried kinematics, so a teleported
         articulation does not reuse a stale factorization, anchor or pose;
         other worlds keep their refresh cadence and history. An anchor between bodies of
@@ -3898,6 +3902,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             # The torsion status is solver-wide; a cause that persists latches again on the next step.
             self._device_torsion.clear_status()
         world_mask = self._normalize_reset_world_mask(world_mask)
+        self._clear_tendon_armature_history(world_mask)
         if self._sleeping is not None:
             if world_mask is None:
                 self._sleeping.wake()
@@ -4563,6 +4568,22 @@ class SolverSteel(SolverBase, CouplingInterface):
         per_world = np.zeros(max(int(self._world_count), 1), dtype=np.int64)
         np.add.at(per_world, self._tendon.world_np, self._tendon.reserve_np)
         return int(per_world.max())
+
+    def _clear_tendon_armature_history(self, world_mask: "wp.array[wp.bool] | None") -> None:
+        """Restart the spatial-tendon armature ``dJ/dt`` history of the selected worlds (``None``: all)."""
+        has_prev = getattr(self._tendon, "mass_has_prev", None)
+        if has_prev is None:
+            return
+        if world_mask is None:
+            has_prev.zero_()
+            return
+        wp.launch(
+            clear_tendon_armature_history,
+            dim=has_prev.shape[0],
+            inputs=[world_mask, int(self.model.world_count), self._tendon.art, self._articulation_model_world],
+            outputs=[has_prev],
+            device=self.model.device,
+        )
 
     def tendon_lengths(self) -> wp.array | None:
         """Tendon lengths [m or rad] evaluated at the input state of the last :meth:`step`.

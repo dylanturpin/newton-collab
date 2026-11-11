@@ -8,6 +8,7 @@ import unittest
 import warnings
 
 import numpy as np
+import warp as wp
 
 import newton
 from newton.solvers import SolverSteel
@@ -441,6 +442,39 @@ def test_tendon_spring_is_slack_inside_its_dead_band(test, device):
             test.assertAlmostEqual(float(run.solver.tendon_forces(dt).numpy()[0, 1]), 0.0, delta=1.0e-6)
 
 
+def test_tendon_armature_history_restarts_on_reset(test, device):
+    """A reset, or notify_state_changed, restarts the spatial-tendon armature dJ/dt history.
+
+    After a step from rest, the slider is teleported and reset. The next step must match a fresh solver started at
+    the teleported state; a stale previous Jacobian would turn the teleport into an armature impulse.
+    """
+    dt = 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody><site name="w" pos="0 0 2.5"/>{_frame(_slider("m", "1 0 1", axis="1 0 0"))}
+    </worldbody><tendon><spatial armature="1"><site site="w"/><site site="m_s"/></spatial></tendon></mujoco>"""
+    fresh = _Run(mjcf, device, q={"m": 1.0}, qd={"m": 1.0}, iterations=8)
+    fresh.step(dt, 1)
+    for how in ("reset", "masked reset", "notify_state_changed"):
+        with test.subTest(how=how):
+            run = _Run(mjcf, device, iterations=8)
+            run.step(dt, 1)
+            q, qd = run.state_0.joint_q.numpy(), run.state_0.joint_qd.numpy()
+            q[run.model.joint_q_start.numpy()[run.joint("m")]] = 1.0
+            qd[run.model.joint_qd_start.numpy()[run.joint("m")]] = 1.0
+            run.state_0.joint_q.assign(q)
+            run.state_0.joint_qd.assign(qd)
+            newton.eval_fk(run.model, run.state_0.joint_q, run.state_0.joint_qd, run.state_0)
+            mask = wp.array(np.ones(run.model.world_count + 1, dtype=bool), dtype=wp.bool, device=device)
+            if how == "reset":
+                run.solver.reset(run.state_0)
+            elif how == "masked reset":
+                run.solver.reset(run.state_0, world_mask=mask)
+            else:
+                run.solver.notify_state_changed(run.state_0, world_mask=mask)
+            run.step(dt, 1)
+            test.assertAlmostEqual(run.qd("m"), fresh.qd("m"), delta=1.0e-6)
+            test.assertAlmostEqual(run.q("m"), fresh.q("m"), delta=1.0e-6)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -463,6 +497,7 @@ for _name in (
     "test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons",
     "test_tendon_friction_follows_an_upper_only_limit_row",
     "test_tendon_spring_is_slack_inside_its_dead_band",
+    "test_tendon_armature_history_restarts_on_reset",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_cuda_test_devices())
 
