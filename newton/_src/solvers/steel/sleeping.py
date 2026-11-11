@@ -110,9 +110,12 @@ class _SleepState:
         root_parents = model.joint_parent.numpy()[starts]
         fixed = (root_types == int(JointType.FIXED)) & (root_parents < 0)
         self.anchored = wp.array(fixed.astype(np.int32), dtype=int, device=device)
-        self.pinned = wp.array(
-            _pinned_articulations(model, solver._body_to_articulation.numpy()), dtype=int, device=device
-        )
+        pinned = _pinned_articulations(model, solver._body_to_articulation.numpy())
+        if solver._tendon_count:
+            # Tendon rows and mass terms are rebuilt for their articulation every step, like loop rows.
+            tendon_art = solver._tendon.art_np
+            pinned[tendon_art[tendon_art >= 0]] = 1
+        self.pinned = wp.array(pinned, dtype=int, device=device)
         self.changed = wp.zeros(count, dtype=int, device=device)
         self.asleep_steps = wp.zeros(count, dtype=int, device=device)
         self.shared_boundaries = wp.zeros(model.body_count, dtype=int, device=device)

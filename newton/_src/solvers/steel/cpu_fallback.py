@@ -21,6 +21,7 @@ from .friction_patches import WARP_DETERMINISM_OFF, patch_normal_load
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
@@ -280,6 +281,10 @@ def pgs_solve_mf_gs_cpu(
                 if sib_delta != 0.0:
                     changed = 1
                     _dense_apply(Y_world, world, sib, sib_delta, v_scratch, D)
+            elif row_type == PGS_CONSTRAINT_TYPE_JOINT_FRICTION:
+                # Dry friction (tendon friction loss): box [-f dt, f dt], bound in the mu slot.
+                bound = world_row_mu[world, i]
+                new_impulse = wp.min(wp.max(new_impulse, -bound), bound)
             elif new_impulse < 0.0 and (
                 row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
             ):
