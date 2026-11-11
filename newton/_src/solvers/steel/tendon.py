@@ -873,7 +873,9 @@ def populate_tendon_rows_for_size(
     g = ctx.group_idx
     flags = tendon_flags[k]
     slot = base
-    # The base row holds +J. A lower limit keeps it; every other row is a signed copy.
+    # The base row holds +J. A lower limit keeps it; every other row is a signed copy. When the gate leaves only
+    # the upper limit, that row negates the base slot in place, and later copies undo the sign.
+    base_sign = float(1.0)
     if (flags & TENDON_ROW_LIMIT_LOWER) != 0:
         lo = tendon_range[k][0]
         _write_tendon_row(
@@ -884,6 +886,8 @@ def populate_tendon_rows_for_size(
     if (flags & TENDON_ROW_LIMIT_UPPER) != 0:
         hi = tendon_range[k][1]
         _copy_row(J_group, g, base, slot, n_dofs, -1.0)
+        if slot == base:
+            base_sign = -1.0
         _write_tendon_row(
             world, slot, PGS_CONSTRAINT_TYPE_JOINT_LIMIT, 0.0, hi - length, rate,
             world_row_type, world_row_parent, world_row_mu, world_phi, world_target_velocity,
@@ -891,7 +895,7 @@ def populate_tendon_rows_for_size(
         slot += 1
     if (flags & TENDON_ROW_FRICTION) != 0:
         if slot != base:
-            _copy_row(J_group, g, base, slot, n_dofs, 1.0)
+            _copy_row(J_group, g, base, slot, n_dofs, base_sign)
         bound = wp.max(tendon_frictionloss[k], 0.0) * dt
         _write_tendon_row(
             world, slot, PGS_CONSTRAINT_TYPE_JOINT_FRICTION, bound, 0.0, -rate,

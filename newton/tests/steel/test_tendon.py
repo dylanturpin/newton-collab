@@ -397,6 +397,32 @@ def test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons(test, device)
             test.assertEqual(run.solver.articulation_constraint_max, 32 + extra)
 
 
+def test_tendon_friction_follows_an_upper_only_limit_row(test, device):
+    """The friction row keeps the tendon Jacobian's sign when the gate gives the tendon only its upper limit row.
+
+    The slider sits near the upper bound of a wide range, so it reserves and activates the upper row alone. A push
+    away from the bound is held by friction, which must push back along +L, and the slide must stay stopped.
+    """
+    dt, push = 1.0e-3, 2.0
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody><tendon>
+      <fixed limited="true" range="-1 0.05" frictionloss="5"><joint joint="m" coef="1"/></fixed>
+    </tendon></mujoco>"""
+    for mode, gap in ((m, g) for m in _MODES for g in (None, float("inf"))):
+        with test.subTest(solve_mode=mode, tendon_limit_activation_gap=gap):
+            run = _Run(
+                mjcf,
+                device,
+                solve_mode=mode,
+                q={"m": 0.04},
+                joint_f={"m": -push},
+                iterations=16,
+                tendon_limit_activation_gap=gap,
+            )
+            run.step(dt, 20)
+            test.assertAlmostEqual(run.qd("m"), 0.0, delta=1.0e-5)
+            test.assertAlmostEqual(float(run.solver.tendon_forces(dt).numpy()[0, 2]), push, delta=1.0e-3)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -417,6 +443,7 @@ for _name in (
     "test_tendon_rows_beyond_the_contact_budget_are_kept",
     "test_tendon_limit_rows_are_gated_by_distance",
     "test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons",
+    "test_tendon_friction_follows_an_upper_only_limit_row",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_cuda_test_devices())
 
