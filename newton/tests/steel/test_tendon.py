@@ -75,7 +75,12 @@ class _Run:
         self.model.joint_qd.assign(joint_qd)
         if solve_mode == "colored":
             solver_kwargs.setdefault("articulated_contact_response", "propagation")
-        self.solver = SolverSteel(self.model, solve_mode=solve_mode, **solver_kwargs)
+        with warnings.catch_warnings():
+            # solve_mode="colored" on CPU warns that it runs the serial sweep; the CPU cases cover exactly that.
+            warnings.filterwarnings(
+                "ignore", message="SolverSteel: solve_mode='colored' runs", category=newton.exceptions.NewtonWarning
+            )
+            self.solver = SolverSteel(self.model, solve_mode=solve_mode, **solver_kwargs)
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
