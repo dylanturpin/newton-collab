@@ -563,6 +563,37 @@ def eval_tendon_lengths(
     tendon_length[tendon] = length
 
 
+@wp.func
+def _gate_limit_flags(
+    flags: int, length: float, speed: float, gap: float, one_side: int, speed_scale: float, dt: float, bounds: wp.vec2
+) -> tuple[int, int]:
+    """Return a tendon's row flags and row count for this step; see :func:`gate_tendon_limit_rows`."""
+    reach = float(gap)
+    if speed_scale > 0.0 and not wp.isinf(gap):
+        reach += speed_scale * dt * wp.abs(speed)
+    lo = bounds[0]
+    hi = bounds[1]
+    lower = length <= lo + reach
+    upper = length >= hi - reach
+    if lower and upper and one_side != 0:
+        predicted = length + dt * speed
+        if predicted - lo <= hi - predicted:
+            upper = False
+        else:
+            lower = False
+    out = flags & ~(TENDON_ROW_LIMIT_LOWER | TENDON_ROW_LIMIT_UPPER)
+    rows = int(0)
+    if lower:
+        out = out | TENDON_ROW_LIMIT_LOWER
+        rows += 1
+    if upper:
+        out = out | TENDON_ROW_LIMIT_UPPER
+        rows += 1
+    if (out & TENDON_ROW_FRICTION) != 0:
+        rows += 1
+    return out, rows
+
+
 @wp.kernel
 def gate_tendon_limit_rows(
     tendon_list: wp.array[int],
@@ -628,29 +659,49 @@ def gate_tendon_limit_rows(
         v_hat, no_J,
     )  # fmt: skip
     tendon_length[k] = length
-    gap = tendon_gap[k]
-    if speed_scale > 0.0 and not wp.isinf(gap):
-        gap += speed_scale * dt * wp.abs(speed)
-    lo = tendon_range[k][0]
-    hi = tendon_range[k][1]
-    lower = length <= lo + gap
-    upper = length >= hi - gap
-    if lower and upper and tendon_one_side[k] != 0:
-        predicted = length + dt * speed
-        if predicted - lo <= hi - predicted:
-            upper = False
-        else:
-            lower = False
-    flags = flags & ~(TENDON_ROW_LIMIT_LOWER | TENDON_ROW_LIMIT_UPPER)
-    rows = int(0)
-    if lower:
-        flags = flags | TENDON_ROW_LIMIT_LOWER
-        rows += 1
-    if upper:
-        flags = flags | TENDON_ROW_LIMIT_UPPER
-        rows += 1
-    if (flags & TENDON_ROW_FRICTION) != 0:
-        rows += 1
+    new_flags, rows = _gate_limit_flags(
+        flags, length, speed, tendon_gap[k], tendon_one_side[k], speed_scale, dt, tendon_range[k]
+    )
+    step_flags[k] = new_flags
+    step_rows[k] = rows
+
+
+@wp.kernel
+def gate_fixed_tendon_limit_rows(
+    tendon_list: wp.array[int],
+    tendon_flags: wp.array[int],
+    tendon_gap: wp.array[float],
+    tendon_one_side: wp.array[int],
+    speed_scale: float,
+    dt: float,
+    tendon_range: wp.array[wp.vec2],
+    tendon_joint_adr: wp.array[int],
+    tendon_joint_num: wp.array[int],
+    tendon_joint: wp.array[int],
+    tendon_coef: wp.array[float],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    v_hat: wp.array[float],
+    # outputs
+    step_flags: wp.array[int],
+    step_rows: wp.array[int],
+    tendon_length: wp.array[float],
+):
+    """:func:`gate_tendon_limit_rows` for fixed tendons: ``L = sum c q`` and ``dL/dt = sum c v_hat``."""
+    k = tendon_list[wp.tid()]
+    length = float(0.0)
+    speed = float(0.0)
+    adr = tendon_joint_adr[k]
+    for e in range(adr, adr + tendon_joint_num[k]):
+        joint = tendon_joint[e]
+        coef = tendon_coef[e]
+        length += coef * joint_q[joint_q_start[joint]]
+        speed += coef * v_hat[joint_qd_start[joint]]
+    tendon_length[k] = length
+    flags, rows = _gate_limit_flags(
+        tendon_flags[k], length, speed, tendon_gap[k], tendon_one_side[k], speed_scale, dt, tendon_range[k]
+    )
     step_flags[k] = flags
     step_rows[k] = rows
 
@@ -1101,6 +1152,8 @@ class TendonPlan:
         self.has_rows = False
         self.has_friction_rows = False
         self.gated = False
+        self.gate_fixed_index = None
+        self.gate_spatial_index = None
 
     @classmethod
     def build(
@@ -1317,12 +1370,18 @@ class TendonPlan:
         one_side = gated & (width > 2.0 * np.where(gated, gap, 0.0))
         self.gated = True
         self.reserve_np = self.rows_np - one_side.astype(np.int32)
-        self.gate_index = wp.array(np.flatnonzero(gated).astype(np.int32), dtype=wp.int32, device=device)
+        fixed = self._paths[0] == 0
+        self.gate_fixed_index = self._index_array(gated & fixed, device)
+        self.gate_spatial_index = self._index_array(gated & ~fixed, device)
         self.gap = wp.array(np.where(gated, gap, np.inf).astype(np.float32), dtype=float, device=device)
         self.one_side = wp.array(one_side.astype(np.int32), dtype=wp.int32, device=device)
         self.step_flags = wp.array(self.flags_np, dtype=wp.int32, device=device)
         self.step_rows = wp.array(self.rows_np, dtype=wp.int32, device=device)
         self.no_J = wp.zeros((1, 1, 1), dtype=float, device=device)
+
+    @staticmethod
+    def _index_array(mask: np.ndarray, device) -> wp.array | None:
+        return wp.array(np.flatnonzero(mask).astype(np.int32), dtype=wp.int32, device=device) if mask.any() else None
 
     class _ActuatorIndex(list):
         """Per tendon, the indices of the supported actuators that drive it."""

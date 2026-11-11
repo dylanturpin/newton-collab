@@ -246,6 +246,7 @@ from .tendon import (
     TendonPlan,
     allocate_tendon_slots,
     apply_tendon_mass_terms_for_size,
+    gate_fixed_tendon_limit_rows,
     gate_tendon_limit_rows,
     gather_tendon_forces,
     populate_tendon_rows_for_size,
@@ -5028,12 +5029,37 @@ class SolverSteel(SolverBase, CouplingInterface):
         tendon = self._tendon
         max_constraints = self._articulation_constraint_max
         m = model.mujoco
-        if tendon.gated:
+        if tendon.gate_fixed_index is not None:
+            joint_adr, joint_num, tendon_joint, tendon_coef = tendon.model_inputs(model)[1:5]
+            wp.launch(
+                gate_fixed_tendon_limit_rows,
+                dim=tendon.gate_fixed_index.shape[0],
+                inputs=[
+                    tendon.gate_fixed_index,
+                    tendon.flags,
+                    tendon.gap,
+                    tendon.one_side,
+                    self._tendon_limit_activation_speed_scale,
+                    dt,
+                    m.tendon_range,
+                    joint_adr,
+                    joint_num,
+                    tendon_joint,
+                    tendon_coef,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    state_in.joint_q,
+                    self._v_hat,
+                ],
+                outputs=[tendon.step_flags, tendon.step_rows, tendon.length],
+                device=model.device,
+            )
+        if tendon.gate_spatial_index is not None:
             wp.launch(
                 gate_tendon_limit_rows,
-                dim=tendon.gate_index.shape[0],
+                dim=tendon.gate_spatial_index.shape[0],
                 inputs=[
-                    tendon.gate_index,
+                    tendon.gate_spatial_index,
                     tendon.art,
                     tendon.flags,
                     tendon.gap,
