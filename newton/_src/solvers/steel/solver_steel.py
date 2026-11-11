@@ -9741,6 +9741,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     state_in.body_qd,
                     dt,
                     int(self._tendon_passive_mode == "implicit"),
+                    tendon.mass_scratch_index,
                 ],
                 outputs=[
                     tendon.mass_J,

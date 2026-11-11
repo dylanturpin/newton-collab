@@ -947,6 +947,7 @@ def apply_tendon_mass_terms_for_size(
     body_qd: wp.array[wp.spatial_vector],
     dt: float,
     implicit_spring: int,
+    scratch_index: wp.array[int],
     # in/out
     J_scratch: wp.array3d[float],
     J_prev: wp.array2d[float],
@@ -980,7 +981,9 @@ def apply_tendon_mass_terms_for_size(
     ctx = TendonRowContext()
     ctx.accumulate = 1
     ctx.art = art
-    ctx.group_idx = k
+    # Row of this tendon in the spatial-only Jacobian scratch (-1 for fixed tendons, which never read it).
+    s = scratch_index[k]
+    ctx.group_idx = s
     ctx.slot = 0
     ctx.dof_start = articulation_dof_start[art]
     ctx.origin = articulation_origin[art]
@@ -1002,7 +1005,7 @@ def apply_tendon_mass_terms_for_size(
             jqd += coef * joint_qd[joint_qd_start[joint]]
     else:
         for d in range(n_dofs):
-            J_scratch[k, 0, d] = 0.0
+            J_scratch[s, 0, d] = 0.0
         length, rate = evaluate_tendon(
             ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
             tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
@@ -1011,12 +1014,12 @@ def apply_tendon_mass_terms_for_size(
             joint_q, J_scratch,
         )  # fmt: skip
         for d in range(n_dofs):
-            jd = J_scratch[k, 0, d]
+            jd = J_scratch[s, 0, d]
             if jd != 0.0:
                 jqd += jd * joint_qd[ctx.dof_start + d]
         if armature != 0.0 and has_prev[k] != 0:
             for d in range(n_dofs):
-                jqd_prev += J_prev[k, d] * joint_qd[ctx.dof_start + d]
+                jqd_prev += J_prev[s, d] * joint_qd[ctx.dof_start + d]
     tendon_length[k] = length
     velocity = jqd + rate
 
@@ -1090,22 +1093,22 @@ def apply_tendon_mass_terms_for_size(
         return
     if K != 0.0 and mass_update_mask[art] != 0:
         for r in range(n_dofs):
-            jr = J_scratch[k, 0, r]
+            jr = J_scratch[s, 0, r]
             if jr != 0.0:
                 jr *= K
                 for c in range(n_dofs):
-                    jc = J_scratch[k, 0, c]
+                    jc = J_scratch[s, 0, c]
                     if jc != 0.0:
                         H_group[g, r, c] += jr * jc
     if force != 0.0:
         for d in range(n_dofs):
-            jd = J_scratch[k, 0, d]
+            jd = J_scratch[s, 0, d]
             if jd != 0.0:
                 joint_tau[ctx.dof_start + d] += jd * force
     # Only armature reads the previous Jacobian; without it, restart the backward difference cold.
     if armature != 0.0:
         for d in range(n_dofs):
-            J_prev[k, d] = J_scratch[k, 0, d]
+            J_prev[s, d] = J_scratch[s, 0, d]
         has_prev[k] = 1
     else:
         has_prev[k] = 0
@@ -1350,9 +1353,15 @@ class TendonPlan:
         plan.step_flags = plan.flags
         plan.step_rows = plan.rows
         if plan.mass_sizes:
-            max_size = int(max(plan.mass_sizes))
-            plan.mass_J = wp.zeros((n, 1, max_size), dtype=float, device=device)
-            plan.mass_J_prev = wp.zeros((n, max_size), dtype=float, device=device)
+            # Only spatial tendons use the dense Jacobian scratch rows; a fixed tendon's Jacobian is its coefficients.
+            spatial = mass_tendons[ttype[mass_tendons] != int(TENDON_TYPE_FIXED)]
+            scratch_index = np.full(n, -1, dtype=np.int32)
+            scratch_index[spatial] = np.arange(spatial.size, dtype=np.int32)
+            max_size = int(response_dof_count[art[spatial]].max()) if spatial.size else 1
+            rows_scratch = max(int(spatial.size), 1)
+            plan.mass_scratch_index = wp.array(scratch_index, dtype=wp.int32, device=device)
+            plan.mass_J = wp.zeros((rows_scratch, 1, max_size), dtype=float, device=device)
+            plan.mass_J_prev = wp.zeros((rows_scratch, max_size), dtype=float, device=device)
             plan.mass_has_prev = wp.zeros(n, dtype=wp.int32, device=device)
         return plan
 
@@ -1510,6 +1519,14 @@ class TendonPlan:
             actuators.ctrl = floats
         return actuators
 
+    def _placeholder(self, device, shape, dtype) -> wp.array:
+        """A cached zero array standing in for an absent kernel input, so steps allocate nothing."""
+        cache = self.__dict__.setdefault("_placeholders", {})
+        key = (str(device), shape, dtype)
+        if key not in cache:
+            cache[key] = wp.zeros(shape, dtype=dtype, device=device)
+        return cache[key]
+
     def model_inputs(self, model) -> list:
         """The ``mujoco:tendon_*`` arrays every tendon kernel reads, in kernel argument order."""
         m = model.mujoco
@@ -1517,7 +1534,7 @@ class TendonPlan:
         def arr(name, dtype):
             attr = getattr(m, name, None)
             if attr is None or attr.shape[0] == 0:
-                return wp.zeros(1, dtype=dtype, device=model.device)
+                return self._placeholder(model.device, 1, dtype)
             return attr
 
         return [
@@ -1551,9 +1568,9 @@ class TendonPlan:
                 model.body_com,
                 joint_q,
                 body_q,
-                wp.zeros(1, dtype=wp.int32, device=model.device),
-                wp.zeros(1, dtype=wp.spatial_vector, device=model.device),
-                wp.zeros((1, 1, 1), dtype=float, device=model.device),
+                self._placeholder(model.device, 1, wp.int32),
+                self._placeholder(model.device, 1, wp.spatial_vector),
+                self._placeholder(model.device, (1, 1, 1), float),
             ],
             outputs=[self.length],
             device=model.device,
