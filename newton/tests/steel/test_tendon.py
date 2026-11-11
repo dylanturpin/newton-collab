@@ -423,6 +423,24 @@ def test_tendon_friction_follows_an_upper_only_limit_row(test, device):
             test.assertAlmostEqual(float(run.solver.tendon_forces(dt).numpy()[0, 2]), push, delta=1.0e-3)
 
 
+def test_tendon_spring_is_slack_inside_its_dead_band(test, device):
+    """A tendon spring inside its springlength dead band exerts no force in either passive mode.
+
+    The slider moves at 1 m/s from L = 0.5 and stays inside the band [0, 2] for the whole run, so an undamped
+    spring must leave its velocity unchanged and report zero spring force.
+    """
+    dt, steps = 0.01, 10
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody><tendon>
+      <fixed stiffness="1000" springlength="0 2"><joint joint="m" coef="1"/></fixed>
+    </tendon></mujoco>"""
+    for passive in ("implicit_damping", "implicit"):
+        with test.subTest(tendon_passive_mode=passive):
+            run = _Run(mjcf, device, q={"m": 0.5}, qd={"m": 1.0}, iterations=8, tendon_passive_mode=passive)
+            run.step(dt, steps)
+            test.assertAlmostEqual(run.qd("m"), 1.0, delta=1.0e-6)
+            test.assertAlmostEqual(float(run.solver.tendon_forces(dt).numpy()[0, 1]), 0.0, delta=1.0e-6)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -444,6 +462,7 @@ for _name in (
     "test_tendon_limit_rows_are_gated_by_distance",
     "test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons",
     "test_tendon_friction_follows_an_upper_only_limit_row",
+    "test_tendon_spring_is_slack_inside_its_dead_band",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_cuda_test_devices())
 

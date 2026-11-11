@@ -965,7 +965,7 @@ def apply_tendon_mass_terms_for_size(
       step), as MuJoCo's tendon armature.
     - Spring-damper: ``f = -k (L - L_s) - b dL/dt`` (dead band ``[L_lo, L_hi]``); the damping is implicit
       (``K += b dt``) and, with ``implicit_spring``, the stiffness too (``K += k dt^2``, ``f -= k dt dL/dt``),
-      as Steel's passive joint modes.
+      as Steel's passive joint modes. Inside a dead band the spring is slack and adds no implicit stiffness.
     - Actuators on ``x = gear L``: the affine force ``f = c0 + c1 x + c2 dx/dt`` with its restoring part
       implicit like a joint drive (``K += gear^2 (k dt^2 + b dt)``, ``f -= k dt dx/dt``, ``k = max(-c1, 0)``,
       ``b = max(-c2, 0)``), the explicit force clamped to the force range as a drive's effort limit.
@@ -1034,7 +1034,9 @@ def apply_tendon_mass_terms_for_size(
             stretch = length - band[1]
         spring = -stiffness * stretch - damping * velocity
         K += damping * dt
-        if implicit_spring != 0:
+        # Inside a dead band [L_lo, L_hi] with L_lo < L_hi the spring is slack, so it adds no implicit stiffness.
+        slack = band[0] < band[1] and length >= band[0] and length <= band[1]
+        if implicit_spring != 0 and not slack:
             K += stiffness * dt * dt
             spring -= stiffness * dt * velocity
         tendon_force[k, 1] = spring
