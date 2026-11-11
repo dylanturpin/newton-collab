@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverSteel
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 G = 9.81
 _HEAD = (
@@ -499,7 +499,7 @@ for _name in (
     "test_tendon_spring_is_slack_inside_its_dead_band",
     "test_tendon_armature_history_restarts_on_reset",
 ):
-    add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_cuda_test_devices())
+    add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 
 
 if __name__ == "__main__":
