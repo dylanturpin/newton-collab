@@ -326,7 +326,11 @@ def _point_velocity(
 
 @wp.struct
 class TendonRowContext:
-    """Per-thread inputs for the tendon Jacobian accumulation (one articulation row)."""
+    """Per-thread inputs for the tendon Jacobian accumulation (one articulation row).
+
+    ``accumulate`` selects what :func:`evaluate_tendon` computes besides the length: ``0`` nothing, ``1`` the
+    Jacobian ``dL/dq`` into ``J_group``, ``2`` the rate ``J qd`` added to the returned prescribed rate.
+    """
 
     accumulate: int
     art: int
@@ -352,6 +356,7 @@ def _accumulate_span(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
+    qd: wp.array[float],
     J_group: wp.array3d[float],
 ) -> tuple[float, float]:
     """Add one straight span: returns its scaled length [m] and its prescribed rate [m/s].
@@ -386,7 +391,11 @@ def _accumulate_span(
                 S = joint_S_s[dof]
                 lin = wp.vec3(S[0], S[1], S[2])
                 ang = wp.vec3(S[3], S[4], S[5])
-                J_group[ctx.group_idx, ctx.slot, dof - ctx.dof_start] += sign * wp.dot(u, lin + wp.cross(ang, rel))
+                jac = sign * wp.dot(u, lin + wp.cross(ang, rel))
+                if ctx.accumulate == 1:
+                    J_group[ctx.group_idx, ctx.slot, dof - ctx.dof_start] += jac
+                else:
+                    rate += jac * qd[dof]
             curr = joint_ancestor[curr]
     return scale * length, rate
 
@@ -427,9 +436,10 @@ def evaluate_tendon(
     joint_q: wp.array[float],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
+    qd: wp.array[float],
     J_group: wp.array3d[float],
 ) -> tuple[float, float]:
-    """Return the tendon length [m or rad] and its prescribed rate; accumulate ``dL/dq`` into the row."""
+    """Return the tendon length [m or rad] and its rate; accumulate ``dL/dq`` into the row (see ``accumulate``)."""
     length = float(0.0)
     rate = float(0.0)
     if tendon_type[tendon] == TENDON_TYPE_FIXED:
@@ -438,8 +448,10 @@ def evaluate_tendon(
             joint = tendon_joint[e]
             coef = tendon_coef[e]
             length += coef * joint_q[joint_q_start[joint]]
-            if ctx.accumulate != 0:
+            if ctx.accumulate == 1:
                 J_group[ctx.group_idx, ctx.slot, joint_qd_start[joint] - ctx.dof_start] += coef
+            elif ctx.accumulate == 2:
+                rate += coef * qd[joint_qd_start[joint]]
         return length, rate
 
     adr = tendon_wrap_adr[tendon]
@@ -480,18 +492,18 @@ def evaluate_tendon(
             if wlen >= 0.0:
                 l0, r0 = _accumulate_span(
                     ctx, p0, b0, g0, bg, scale, body_to_articulation, body_to_joint, joint_ancestor,
-                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, J_group,
+                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, qd, J_group,
                 )  # fmt: skip
                 l1, r1 = _accumulate_span(
                     ctx, g1, bg, p1, b1, scale, body_to_articulation, body_to_joint, joint_ancestor,
-                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, J_group,
+                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, qd, J_group,
                 )  # fmt: skip
                 length += l0 + scale * wlen + l1
                 rate += r0 + r1
             else:
                 l0, r0 = _accumulate_span(
                     ctx, p0, b0, p1, b1, scale, body_to_articulation, body_to_joint, joint_ancestor,
-                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, J_group,
+                    joint_qd_start, joint_S_s, body_q, body_qd, body_com, qd, J_group,
                 )  # fmt: skip
                 length += l0
                 rate += r0
@@ -501,7 +513,7 @@ def evaluate_tendon(
         p1 = _site_position(site1, shape_body, shape_transform, body_q)
         l0, r0 = _accumulate_span(
             ctx, p0, b0, p1, shape_body[site1], scale, body_to_articulation, body_to_joint, joint_ancestor,
-            joint_qd_start, joint_S_s, body_q, body_qd, body_com, J_group,
+            joint_qd_start, joint_S_s, body_q, body_qd, body_com, qd, J_group,
         )  # fmt: skip
         length += l0
         rate += r0
@@ -546,9 +558,101 @@ def eval_tendon_lengths(
         ctx, tendon, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
         tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
         tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
-        body_com, no_int, no_int, no_int, no_S, joint_q, body_q, no_S, no_J,
+        body_com, no_int, no_int, no_int, no_S, joint_q, body_q, no_S, joint_q, no_J,
     )  # fmt: skip
     tendon_length[tendon] = length
+
+
+@wp.kernel
+def gate_tendon_limit_rows(
+    tendon_list: wp.array[int],
+    tendon_art: wp.array[int],
+    tendon_flags: wp.array[int],
+    tendon_gap: wp.array[float],
+    tendon_one_side: wp.array[int],
+    speed_scale: float,
+    dt: float,
+    tendon_range: wp.array[wp.vec2],
+    articulation_origin: wp.array[wp.vec3],
+    tendon_type: wp.array[int],
+    tendon_joint_adr: wp.array[int],
+    tendon_joint_num: wp.array[int],
+    tendon_joint: wp.array[int],
+    tendon_coef: wp.array[float],
+    tendon_wrap_adr: wp.array[int],
+    tendon_wrap_num: wp.array[int],
+    tendon_wrap_type: wp.array[int],
+    tendon_wrap_shape: wp.array[int],
+    tendon_wrap_sidesite: wp.array[int],
+    tendon_wrap_prm: wp.array[float],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    body_com: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    joint_q: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    v_hat: wp.array[float],
+    no_J: wp.array3d[float],
+    # outputs
+    step_flags: wp.array[int],
+    step_rows: wp.array[int],
+    tendon_length: wp.array[float],
+):
+    """Choose the limit rows of this step for the listed limited tendons (one thread per tendon).
+
+    A bound gets its row when the length is within the tendon's gap of it, widened by
+    ``speed_scale * dt * |dL/dt|`` with the rate taken at the unconstrained velocity ``v_hat``. A
+    one-sided tendon (range wider than twice its gap, so at most one limit row is reserved) keeps
+    only the bound nearer the predicted end-of-step length. The friction-loss row is kept as is. Writes the
+    length [m or rad], which the row writer skips for a tendon left without rows.
+    """
+    k = tendon_list[wp.tid()]
+    flags = tendon_flags[k]
+    ctx = TendonRowContext()
+    ctx.accumulate = 2
+    ctx.art = tendon_art[k]
+    ctx.origin = articulation_origin[ctx.art]
+    length, speed = evaluate_tendon(
+        ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
+        tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
+        tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+        body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
+        v_hat, no_J,
+    )  # fmt: skip
+    tendon_length[k] = length
+    gap = tendon_gap[k]
+    if speed_scale > 0.0 and not wp.isinf(gap):
+        gap += speed_scale * dt * wp.abs(speed)
+    lo = tendon_range[k][0]
+    hi = tendon_range[k][1]
+    lower = length <= lo + gap
+    upper = length >= hi - gap
+    if lower and upper and tendon_one_side[k] != 0:
+        predicted = length + dt * speed
+        if predicted - lo <= hi - predicted:
+            upper = False
+        else:
+            lower = False
+    flags = flags & ~(TENDON_ROW_LIMIT_LOWER | TENDON_ROW_LIMIT_UPPER)
+    rows = int(0)
+    if lower:
+        flags = flags | TENDON_ROW_LIMIT_LOWER
+        rows += 1
+    if upper:
+        flags = flags | TENDON_ROW_LIMIT_UPPER
+        rows += 1
+    if (flags & TENDON_ROW_FRICTION) != 0:
+        rows += 1
+    step_flags[k] = flags
+    step_rows[k] = rows
 
 
 @wp.kernel
@@ -711,7 +815,7 @@ def populate_tendon_rows_for_size(
         tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
         tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
         body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
-        J_group,
+        joint_q, J_group,
     )  # fmt: skip
     tendon_length[k] = length
 
@@ -847,7 +951,7 @@ def apply_tendon_mass_terms_for_size(
             tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
             tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
             body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
-            J_scratch,
+            joint_q, J_scratch,
         )  # fmt: skip
         for d in range(n_dofs):
             jd = J_scratch[k, 0, d]
@@ -996,6 +1100,7 @@ class TendonPlan:
         self.mass_sizes: dict[int, wp.array] = {}
         self.has_rows = False
         self.has_friction_rows = False
+        self.gated = False
 
     @classmethod
     def build(
@@ -1132,7 +1237,9 @@ class TendonPlan:
         plan.world_np = world
         plan.rows_np = rows
         plan.flags_np = flags
+        plan.range_np = trange
         plan.springlength_np = springlength
+        plan._paths = (ttype, joint_adr, joint_num, tjoint, wrap_adr, wrap_num, wrap_type, wrap_shape)
         plan.art = wp.array(art, dtype=wp.int32, device=device)
         plan.world = wp.array(world, dtype=wp.int32, device=device)
         plan.rows = wp.array(rows, dtype=wp.int32, device=device)
@@ -1157,12 +1264,65 @@ class TendonPlan:
         }
         plan.has_rows = bool(rows.sum())
         plan.has_friction_rows = bool(np.any(flags[active] & int(TENDON_ROW_FRICTION)))
+        plan.reserve_np = rows
+        plan.step_flags = plan.flags
+        plan.step_rows = plan.rows
         if plan.mass_sizes:
             max_size = int(max(plan.mass_sizes))
             plan.mass_J = wp.zeros((n, 1, max_size), dtype=float, device=device)
             plan.mass_J_prev = wp.zeros((n, max_size), dtype=float, device=device)
             plan.mass_has_prev = wp.zeros(n, dtype=wp.int32, device=device)
         return plan
+
+    def limited_np(self) -> np.ndarray:
+        """Mask of the enforced tendons with range-limit rows."""
+        limit = int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER)
+        return (self.art_np >= 0) & ((self.flags_np & limit) != 0)
+
+    def touched_joints(self, model, k: int) -> set[int]:
+        """Joints whose DOFs tendon ``k``'s length depends on: a fixed tendon's joints, or the tree joints above a
+        spatial tendon's site and wrap bodies."""
+        ttype, joint_adr, joint_num, tjoint, wrap_adr, wrap_num, wrap_type, wrap_shape = self._paths
+        if int(ttype[k]) == 0:
+            return {int(j) for j in tjoint[int(joint_adr[k]) : int(joint_adr[k]) + int(joint_num[k])]}
+        if getattr(self, "_parent_joint", None) is None:
+            tree = np.flatnonzero(model.joint_articulation.numpy() >= 0)
+            self._parent_joint = dict(zip(model.joint_child.numpy()[tree].tolist(), tree.tolist(), strict=True))
+            self._joint_parent = model.joint_parent.numpy()
+            self._shape_body = model.shape_body.numpy()
+        joints = set()
+        for e in range(int(wrap_adr[k]), int(wrap_adr[k]) + int(wrap_num[k])):
+            if int(wrap_type[e]) == 2:
+                continue
+            body = int(self._shape_body[int(wrap_shape[e])])
+            while body in self._parent_joint and self._parent_joint[body] not in joints:
+                joint = self._parent_joint[body]
+                joints.add(joint)
+                body = int(self._joint_parent[joint])
+        return joints
+
+    def configure_limit_gate(self, gap: np.ndarray, device) -> None:
+        """Gate the limit rows of the tendons with a finite ``gap`` [m or rad] (``inf`` keeps both rows every step).
+
+        A gated tendon whose range is wider than twice its gap reserves one limit row instead of two: both bounds
+        can be within the gap only when the range is at most twice it, so :func:`gate_tendon_limit_rows` keeps the
+        bound nearer the predicted length. ``reserve_np`` is each tendon's most rows in any step.
+        """
+        if not self.count:
+            return
+        gated = self.limited_np() & np.isfinite(gap)
+        if not gated.any():
+            return
+        width = self.range_np[:, 1].astype(np.float64) - self.range_np[:, 0]
+        one_side = gated & (width > 2.0 * np.where(gated, gap, 0.0))
+        self.gated = True
+        self.reserve_np = self.rows_np - one_side.astype(np.int32)
+        self.gate_index = wp.array(np.flatnonzero(gated).astype(np.int32), dtype=wp.int32, device=device)
+        self.gap = wp.array(np.where(gated, gap, np.inf).astype(np.float32), dtype=float, device=device)
+        self.one_side = wp.array(one_side.astype(np.int32), dtype=wp.int32, device=device)
+        self.step_flags = wp.array(self.flags_np, dtype=wp.int32, device=device)
+        self.step_rows = wp.array(self.rows_np, dtype=wp.int32, device=device)
+        self.no_J = wp.zeros((1, 1, 1), dtype=float, device=device)
 
     class _ActuatorIndex(list):
         """Per tendon, the indices of the supported actuators that drive it."""

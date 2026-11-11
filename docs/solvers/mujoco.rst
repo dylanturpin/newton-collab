@@ -730,7 +730,8 @@ target resolution use the provider path; see
 so one model runs on both solvers. Range limits and friction loss become constraint
 rows; armature, the stiffness/damping spring-damper and actuators with a tendon
 transmission are folded into the mass matrix along the tendon Jacobian, with the
-spring integration selected by its ``tendon_passive_mode`` option. Steel requires each
+spring integration selected by its ``tendon_passive_mode`` option. Limit rows are only
+created near a bound, as set by ``tendon_limit_activation_gap``. Steel requires each
 tendon to move the DOFs of a single articulation and enforces limits rigidly: it does not
 model ``solref``/``solimp`` softening, force-space limit gains, actuator activation
 dynamics, or tendon equality constraints.

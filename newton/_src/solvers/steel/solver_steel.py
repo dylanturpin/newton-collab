@@ -246,6 +246,7 @@ from .tendon import (
     TendonPlan,
     allocate_tendon_slots,
     apply_tendon_mass_terms_for_size,
+    gate_tendon_limit_rows,
     gather_tendon_forces,
     populate_tendon_rows_for_size,
 )
@@ -1741,6 +1742,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     velocity_limit_activation_fraction = _ConstructionOption()
     enable_joint_friction = _ConstructionOption()
     tendon_passive_mode = _ConstructionOption()
+    tendon_limit_activation_gap = _ConstructionOption()
     articulation_constraint_max = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
     propagation_constraint_max = _ConstructionOption()
@@ -2029,6 +2031,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         velocity_limit_activation_fraction: float = 0.0,
         enable_joint_friction: bool = False,
         tendon_passive_mode: Literal["implicit_damping", "implicit"] = "implicit_damping",
+        tendon_limit_activation_gap: float | None = None,
         articulation_constraint_max: int = 32,
         free_body_constraint_max: int = 512,
         propagation_constraint_max: int | None = None,
@@ -2200,6 +2203,20 @@ class SolverSteel(SolverBase, CouplingInterface):
                 default) keeps the spring force explicit, the scheme of MuJoCo's ``implicitfast``
                 integrator. Tendon actuators are always folded in like joint drives, with their force
                 range applied as an effort limit. Tendon range limits and friction loss are dense rows.
+            tendon_limit_activation_gap: Distance from a tendon range bound [m or rad, the tendon
+                length's unit] at which its limit row is created, the tendon counterpart of
+                ``joint_limit_activation_gap``. ``inf`` creates both limit rows of every limited tendon
+                each step; a smaller gap creates a bound's row only when ``L <= lower + gap`` or
+                ``L >= upper - gap``. ``None`` (the default) uses a speed-aware gap of
+                ``0.05 + 2 * dt * |dL/dt|`` per tendon, with the rate taken at the joints' unconstrained
+                end-of-step velocity, and ``inf`` for tendons that move a joint coupled by mimic or
+                loop-closure rows (see ``joint_limit_activation_gap``) or, with ``drive_mode="rows"``,
+                for every tendon. Limit rows are speculative, so a skipped row is a no-op unless
+                impulses inside the solve (contacts, other tendons' limit rows, mimic or loop rows)
+                move the tendon toward the bound by more than the gap in one step; it then overshoots
+                for that step and is corrected the next. A gated tendon whose range is wider than twice
+                its gap reserves one limit row instead of two and keeps only the bound nearer its
+                predicted length, which saves dense-row memory. Friction-loss rows are always created.
             articulation_constraint_max: Capacity of rows involving articulated bodies (mimic and
                 connect rows, contacts, enabled joint limits, joint velocity limits, joint friction
                 and, with ``drive_mode="rows"``, joint drives) per world. Rows beyond it are
@@ -2759,6 +2776,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 f"tendon_passive_mode must be 'implicit_damping' or 'implicit', got {tendon_passive_mode!r}"
             )
         self._tendon_passive_mode = tendon_passive_mode
+        if tendon_limit_activation_gap is None:
+            self._tendon_limit_activation_gap = None
+            rows = drive_mode == "rows"
+            self._tendon_limit_gap_base = float("inf") if rows else _AUTO_JOINT_LIMIT_ACTIVATION_GAP
+            self._tendon_limit_activation_speed_scale = 0.0 if rows else _AUTO_JOINT_LIMIT_ACTIVATION_SPEED_SCALE
+        else:
+            self._tendon_limit_activation_gap = float(tendon_limit_activation_gap)
+            if np.isnan(self._tendon_limit_activation_gap) or self._tendon_limit_activation_gap < 0.0:
+                raise ValueError("tendon_limit_activation_gap must be None, non-negative or inf")
+            self._tendon_limit_gap_base = self._tendon_limit_activation_gap
+            self._tendon_limit_activation_speed_scale = 0.0
         self._velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         frac = self._velocity_limit_activation_fraction
         if np.isnan(frac) or not (0.0 <= frac <= 1.0 or np.isinf(frac)):
@@ -4514,6 +4542,15 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._tendon_count = self._tendon.count
         self._tendon.resolve_spring_lengths(model)
+        if self._tendon.has_rows:
+            gap = np.full(self._tendon_count, self._tendon_limit_gap_base, dtype=np.float64)
+            if self._tendon_limit_activation_speed_scale > 0.0:
+                coupled = self._closure_coupled_joints(model)
+                if coupled:
+                    for k in np.flatnonzero(self._tendon.limited_np()):
+                        if not coupled.isdisjoint(self._tendon.touched_joints(model, int(k))):
+                            gap[k] = np.inf
+            self._tendon.configure_limit_gate(gap, model.device)
         self._tendon_mass_sizes = frozenset(self._tendon.mass_sizes)
         # Tendon friction loss uses the joint-friction row type and its box projection.
         self._dense_joint_friction_rows = bool(self._joint_friction_warp_kernels) or self._tendon.has_friction_rows
@@ -4523,7 +4560,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not self._tendon.has_rows:
             return 0
         per_world = np.zeros(max(int(self._world_count), 1), dtype=np.int64)
-        np.add.at(per_world, self._tendon.world_np, self._tendon.rows_np)
+        np.add.at(per_world, self._tendon.world_np, self._tendon.reserve_np)
         return int(per_world.max())
 
     def tendon_lengths(self) -> wp.array | None:
@@ -4560,7 +4597,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         wp.launch(
             gather_tendon_forces,
             dim=self._tendon_count,
-            inputs=[self._tendon.slot, self._tendon.world, self._tendon.flags, self._impulses, 1.0 / dt],
+            inputs=[self._tendon.slot, self._tendon.world, self._tendon.step_flags, self._impulses, 1.0 / dt],
             outputs=[self._tendon.force],
             device=self.model.device,
         )
@@ -4574,8 +4611,23 @@ class SolverSteel(SolverBase, CouplingInterface):
         cannot see.
         """
         gap = np.full(model.joint_dof_count, self._joint_limit_gap_base, dtype=np.float32)
-        coupled = self._mimic_count or self._connect_count
-        if self._joint_limit_activation_speed_scale > 0.0 and model.joint_count and coupled:
+        if self._joint_limit_activation_speed_scale > 0.0:
+            joint_qd_start = model.joint_qd_start.numpy()
+            for joint in self._closure_coupled_joints(model):
+                gap[joint_qd_start[joint] : joint_qd_start[joint + 1]] = np.inf
+        self._joint_limit_gap = wp.array(gap, dtype=float, device=model.device)
+
+    def _closure_coupled_joints(self, model) -> set[int]:
+        """Tree joints that mimic or connect rows move inside the solve, which the speed-aware limit gates cannot see.
+
+        These are both mimic ends, the tree joints between the two ends of each mimic or loop closure, and every
+        joint below them. Joints above a closure's common ancestor carry both ends and are not included.
+        """
+        cached = getattr(self, "_closure_coupled_joint_set", None)
+        if cached is not None:
+            return cached
+        coupled = set()
+        if model.joint_count and (self._mimic_count or self._connect_count):
             joint_parent = model.joint_parent.numpy()
             joint_child = model.joint_child.numpy()
             joint_qd_start = model.joint_qd_start.numpy()
@@ -4605,10 +4657,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             seeds = {int(j) for end in ends for j in end.tolist()} if self._mimic_count else set()
             for a, b in pairs:
                 seeds |= path(int(a)) ^ path(int(b))
-            for joint in tree.tolist():
-                if not seeds.isdisjoint(path(int(joint_child[joint]))):
-                    gap[joint_qd_start[joint] : joint_qd_start[joint + 1]] = np.inf
-        self._joint_limit_gap = wp.array(gap, dtype=float, device=model.device)
+            coupled = {joint for joint in tree.tolist() if not seeds.isdisjoint(path(int(joint_child[joint])))}
+        self._closure_coupled_joint_set = coupled
+        return coupled
 
     def _build_connect_plan(self, model) -> None:
         """Build the static lookup tables of the connect (loop-closure) rows.
@@ -4976,12 +5027,48 @@ class SolverSteel(SolverBase, CouplingInterface):
         model = self.model
         tendon = self._tendon
         max_constraints = self._articulation_constraint_max
+        m = model.mujoco
+        if tendon.gated:
+            wp.launch(
+                gate_tendon_limit_rows,
+                dim=tendon.gate_index.shape[0],
+                inputs=[
+                    tendon.gate_index,
+                    tendon.art,
+                    tendon.flags,
+                    tendon.gap,
+                    tendon.one_side,
+                    self._tendon_limit_activation_speed_scale,
+                    dt,
+                    m.tendon_range,
+                    self._articulation_origin,
+                    *tendon.model_inputs(model),
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.shape_body,
+                    model.shape_transform,
+                    model.shape_type,
+                    model.shape_scale,
+                    model.body_com,
+                    self._body_to_articulation,
+                    self._body_to_joint,
+                    model.joint_ancestor,
+                    state_aug._joint_S_s,
+                    state_in.joint_q,
+                    state_in.body_q,
+                    state_in.body_qd,
+                    self._v_hat,
+                    tendon.no_J,
+                ],
+                outputs=[tendon.step_flags, tendon.step_rows, tendon.length],
+                device=model.device,
+            )
 
         def launch_tendon(mode):
             wp.launch(
                 allocate_tendon_slots,
                 dim=self._tendon_count,
-                inputs=[tendon.rows, tendon.world, max_constraints],
+                inputs=[tendon.step_rows, tendon.world, max_constraints],
                 outputs=[
                     tendon.slot,
                     self._slot_counter,
@@ -4994,7 +5081,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
         self._reserve_rows(self._tendon_world_index, self._slot_counter, launch_tendon)
-        m = model.mujoco
         for size, tendon_list in tendon.sizes.items():
             wp.launch(
                 populate_tendon_rows_for_size,
@@ -5003,7 +5089,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     tendon_list,
                     tendon.art,
                     tendon.slot,
-                    tendon.flags,
+                    tendon.step_flags,
                     self._art_group_idx,
                     self._art_to_world,
                     self._articulation_dof_start,

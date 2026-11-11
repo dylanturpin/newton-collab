@@ -126,19 +126,27 @@ def test_tendon_atwood_machine(test, device):
 
 
 def test_tendon_slack_rope_jerks_plastically(test, device):
-    """A thrown mass slackens the rope (free fall), which then snaps taut with an inelastic impulse."""
+    """A thrown mass slackens the rope (free fall), which then snaps taut with an inelastic impulse.
+
+    The default speed-aware limit gate creates the rope's row before it snaps taut, so it matches the
+    ungated (``inf``) run and the analytic impulse.
+    """
     m1, m2, v0, dt = 1.5, 1.0, 2.0, 1.0e-3
     t_star = v0 / G
-    run = _Run(_atwood_mjcf(m1, m2), device, qd={"m2": v0}, iterations=32)
-    run.step(dt, int(0.15 / dt))
-    test.assertAlmostEqual(run.qd("m1"), -G * 0.15, delta=2.0e-3)  # no rope force while slack
-    test.assertAlmostEqual(run.qd("m2"), v0 - G * 0.15, delta=2.0e-3)
-    run.step(dt, int(0.15 / dt))
-    impulse = v0 / (1.0 / m1 + 1.0 / m2)
-    accel = (m1 - m2) * G / (m1 + m2)
-    after = 0.3 - t_star
-    test.assertAlmostEqual(run.qd("m1"), -v0 + impulse / m1 - accel * after, delta=0.02)
-    test.assertAlmostEqual(run.qd("m2"), impulse / m2 + accel * after, delta=0.02)
+    for gap in (None, float("inf")):
+        with test.subTest(tendon_limit_activation_gap=gap):
+            run = _Run(_atwood_mjcf(m1, m2), device, qd={"m2": v0}, iterations=32, tendon_limit_activation_gap=gap)
+            run.step(dt, int(0.15 / dt))
+            test.assertAlmostEqual(run.qd("m1"), -G * 0.15, delta=2.0e-3)  # no rope force while slack
+            test.assertAlmostEqual(run.qd("m2"), v0 - G * 0.15, delta=2.0e-3)
+            run.step(dt, int(0.15 / dt))
+            impulse = v0 / (1.0 / m1 + 1.0 / m2)
+            accel = (m1 - m2) * G / (m1 + m2)
+            after = 0.3 - t_star
+            test.assertAlmostEqual(run.qd("m1"), -v0 + impulse / m1 - accel * after, delta=0.02)
+            test.assertAlmostEqual(run.qd("m2"), impulse / m2 + accel * after, delta=0.02)
+            length = float(run.solver.tendon_lengths().numpy()[0])
+            test.assertLess(length - float(run.model.mujoco.tendon_range.numpy()[0][1]), 1.0e-5)
 
 
 def test_tendon_pulley_divisor_tackle(test, device):
@@ -332,6 +340,63 @@ def test_tendon_rows_beyond_the_contact_budget_are_kept(test, device):
             np.testing.assert_allclose(q, 0.05, atol=2.0e-3)
 
 
+def test_tendon_limit_rows_are_gated_by_distance(test, device):
+    """A limited tendon far from its range owns no limit row; one pushed into its bound gets a row that holds it.
+
+    A gated tendon whose range is wider than twice its gap reserves one limit row instead of two, so the dense
+    row capacity grows by one row per tendon instead of two.
+    """
+    dt, steps = 1.0e-3, 200
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>
+      {_frame(_slider("far", "0 -0.2 1", axis="1 0 0") + _slider("near", "0 0.2 1", axis="1 0 0"))}
+    </worldbody><tendon>
+      <fixed limited="true" range="-0.5 0.5"><joint joint="far" coef="1"/></fixed>
+      <fixed limited="true" range="-0.05 0.05"><joint joint="near" coef="2"/></fixed>
+    </tendon></mujoco>"""
+    for mode, gap in ((m, g) for m in _MODES for g in (None, 0.01, float("inf"))):
+        with test.subTest(solve_mode=mode, tendon_limit_activation_gap=gap):
+            run = _Run(
+                mjcf,
+                device,
+                solve_mode=mode,
+                q={"far": 0.1},
+                joint_f={"far": 1.0, "near": 10.0},
+                iterations=16,
+                tendon_limit_activation_gap=gap,
+            )
+            gated = gap is None or gap < float("inf")
+            test.assertEqual(run.solver.articulation_constraint_max, 32 + (2 if gated else 4))
+            run.step(dt, steps)
+            slots = run.solver._tendon.slot.numpy()
+            # the far slider covers 0.02 m of its 0.4 m way to the bound
+            test.assertEqual(slots[0] < 0, gated)
+            test.assertGreaterEqual(slots[1], 0)
+            test.assertAlmostEqual(run.q("near"), 0.025, delta=1.0e-3)
+            q_far = run.q("far")
+            test.assertAlmostEqual(q_far, 0.1 + 0.5 * (steps * dt) ** 2, delta=1.0e-3)
+            run.step(dt, 1)
+            np.testing.assert_allclose(run.solver.tendon_lengths().numpy(), [q_far, 0.05], atol=1.0e-4)
+
+
+def test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons(test, device):
+    """Under the default gate, tendons moving a mimic-coupled joint keep both limit rows; the others reserve one.
+
+    The mimic row moves its joints inside the solve, where the unconstrained velocity the gate reads cannot see it.
+    """
+    mjcf = f"""<mujoco>{_HEAD}<worldbody><site name="w" pos="0 0.6 3"/>
+      {_frame(_slider("a", "0 -0.2 1", axis="1 0 0") + _slider("b", "0 0.2 1", axis="1 0 0") + _slider("c", "0 0.6 1", axis="1 0 0"))}
+    </worldbody><equality><joint joint1="b" joint2="a" polycoef="0 1 0 0 0"/></equality><tendon>
+      <fixed limited="true" range="-1 1"><joint joint="a" coef="1"/></fixed>
+      <fixed limited="true" range="-1 1"><joint joint="c" coef="1"/></fixed>
+      <spatial limited="true" range="0 5"><site site="w"/><site site="a_s"/></spatial>
+      <spatial limited="true" range="0 5"><site site="w"/><site site="c_s"/></spatial>
+    </tendon></mujoco>"""
+    for gap, extra in ((None, 2 + 1 + 2 + 1), (0.02, 4), (float("inf"), 8)):
+        with test.subTest(tendon_limit_activation_gap=gap):
+            run = _Run(mjcf, device, tendon_limit_activation_gap=gap)
+            test.assertEqual(run.solver.articulation_constraint_max, 32 + extra)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -350,6 +415,8 @@ for _name in (
     "test_tendon_passive_mode_is_validated",
     "test_tendon_lengths_include_tendons_without_rows",
     "test_tendon_rows_beyond_the_contact_budget_are_kept",
+    "test_tendon_limit_rows_are_gated_by_distance",
+    "test_tendon_limit_gate_keeps_the_rows_of_mimic_coupled_tendons",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_cuda_test_devices())
 
